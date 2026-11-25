@@ -592,6 +592,9 @@ pub(super) fn project_harness_auth(
             recommended: None,
             choices,
             instructions: None,
+            group: None,
+            blocks_work: false,
+            outcome_unknown: phase == "unknown",
         });
     }
     Ok(())

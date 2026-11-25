@@ -91,6 +91,18 @@ pub struct OwnerInboxItem {
     /// Exact commands for the Owner when no single action does the work.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub instructions: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<OwnerInboxGroup>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub blocks_work: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub outcome_unknown: bool,
+}
+
+#[derive(JsonSchema, Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+pub struct OwnerInboxGroup {
+    pub id: String,
+    pub affected: usize,
 }
 
 impl OwnerInboxItem {
@@ -100,6 +112,47 @@ impl OwnerInboxItem {
 
     pub fn cursor(&self) -> String {
         format!("{}/{}", self.kind.as_str(), self.subject)
+    }
+
+    pub fn has_unknown_outcome(&self) -> bool {
+        self.outcome_unknown
+            || matches!(
+                self.kind,
+                OwnerInboxKind::UnknownCommand | OwnerInboxKind::UnknownTurn
+            )
+    }
+
+    pub fn page_key(&self) -> (u8, &'static str, &str) {
+        let priority = if self.blocks_work
+            || matches!(
+                self.kind,
+                OwnerInboxKind::HarnessRequest
+                    | OwnerInboxKind::Hold
+                    | OwnerInboxKind::BlockedGoal
+                    | OwnerInboxKind::LaunchQueue
+                    | OwnerInboxKind::HarnessCheck
+                    | OwnerInboxKind::HarnessAuth
+            ) {
+            0
+        } else if self.has_unknown_outcome() || self.kind == OwnerInboxKind::WorkNotInGit {
+            1
+        } else if self.recommended.is_some() {
+            2
+        } else {
+            3
+        };
+        (
+            priority,
+            self.kind.as_str(),
+            self.group
+                .as_ref()
+                .map_or(self.subject.as_str(), |group| &group.id),
+        )
+    }
+
+    pub fn page_cursor(&self) -> String {
+        let (priority, kind, subject) = self.page_key();
+        format!("{priority}/{kind}/{subject}")
     }
 
     pub fn matches(&self, item: &OwnerInboxItemRef) -> bool {
@@ -120,7 +173,12 @@ impl OwnerInboxRequest {
     pub fn effective_limit(&self) -> Result<usize> {
         let limit = self.limit.unwrap_or(50);
         if !(1..=Self::MAX_ROWS).contains(&limit)
-            || self.after.as_ref().is_some_and(|after| !valid_key(after))
+            || self.after.as_ref().is_some_and(|after| {
+                !valid_key(after)
+                    || !after
+                        .split_once('/')
+                        .is_some_and(|(priority, _)| matches!(priority, "0" | "1" | "2" | "3"))
+            })
         {
             return Err(Error::new("invalid", "invalid owner inbox page"));
         }

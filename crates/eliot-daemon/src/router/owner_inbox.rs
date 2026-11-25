@@ -83,7 +83,7 @@ impl Router {
         let mut page = projection.items;
         let next = if page.len() > limit {
             page.pop();
-            page.last().map(|item| item.cursor())
+            page.last().map(|item| item.page_cursor())
         } else {
             None
         };

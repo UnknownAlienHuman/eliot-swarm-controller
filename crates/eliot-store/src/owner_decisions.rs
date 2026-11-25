@@ -71,6 +71,8 @@ struct OwnerProjectionSink<'s, 'c> {
     snoozed: HashSet<(OwnerInboxKind, &'s str, &'s str)>,
     page: Option<OwnerInboxPage>,
     items: Vec<OwnerInboxItem>,
+    page_groups: HashMap<String, OwnerInboxItem>,
+    counted_groups: HashSet<String>,
     owner_inbox: BTreeMap<OwnerInboxKind, usize>,
     waiting_over_24h: usize,
     unreportable_stuck: usize,
@@ -86,18 +88,14 @@ impl OwnerProjectionSink<'_, '_> {
         let Some(page) = &self.page else {
             return;
         };
-        if page.aged_only && !item.waiting_over_24h() {
-            return;
-        }
         if let Some(after) = &page.after
-            && item.cursor() <= *after
+            && item.page_cursor() <= *after
         {
             return;
         }
-        let index = self.items.partition_point(|existing| {
-            (existing.kind.as_str(), existing.subject.as_str())
-                < (item.kind.as_str(), item.subject.as_str())
-        });
+        let index = self
+            .items
+            .partition_point(|existing| existing.page_key() < item.page_key());
         if index > page.limit {
             return;
         }
@@ -106,6 +104,53 @@ impl OwnerProjectionSink<'_, '_> {
         }
         self.items.insert(index, item);
     }
+
+    fn collect_page_item(&mut self, mut item: OwnerInboxItem) {
+        let Some(page) = &self.page else { return };
+        if page.aged_only && !item.waiting_over_24h() {
+            return;
+        }
+        let Some(group) = &item.group else {
+            self.push_page_item(item);
+            return;
+        };
+        match self.page_groups.entry(group.id.clone()) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(item);
+            }
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                let current = entry.get_mut();
+                let affected = current.group.as_ref().map_or(1, |group| group.affected) + 1;
+                if item.age_ms > current.age_ms
+                    || (item.age_ms == current.age_ms && item.subject < current.subject)
+                {
+                    std::mem::swap(current, &mut item);
+                }
+                if let Some(group) = &mut current.group {
+                    group.affected = affected;
+                }
+            }
+        }
+    }
+}
+
+fn count_inbox_item(
+    counts: &mut BTreeMap<OwnerInboxKind, usize>,
+    groups: &mut HashSet<String>,
+    item: &OwnerInboxItem,
+) {
+    if item
+        .group
+        .as_ref()
+        .is_none_or(|group| groups.insert(group.id.clone()))
+    {
+        *counts.entry(item.kind).or_default() += 1;
+    }
+}
+
+fn is_snoozed(item: &OwnerInboxItem, snoozed: &HashSet<(OwnerInboxKind, &str, &str)>) -> bool {
+    !item.has_unknown_outcome()
+        && snoozed.contains(&(item.kind, item.subject.as_str(), item.revision.as_str()))
 }
 
 impl OwnerInboxItemSink for OwnerProjectionSink<'_, '_> {
@@ -132,13 +177,10 @@ impl OwnerInboxItemSink for OwnerProjectionSink<'_, '_> {
             }
         }
 
-        if self
-            .snoozed
-            .contains(&(item.kind, item.subject.as_str(), item.revision.as_str()))
-        {
+        if is_snoozed(&item, &self.snoozed) {
             return;
         }
-        *self.owner_inbox.entry(item.kind).or_default() += 1;
+        count_inbox_item(&mut self.owner_inbox, &mut self.counted_groups, &item);
         if item.kind == OwnerInboxKind::BlockedGoal
             || (item.kind == OwnerInboxKind::Stuck && item.subject.starts_with("goal:"))
         {
@@ -147,12 +189,13 @@ impl OwnerInboxItemSink for OwnerProjectionSink<'_, '_> {
         if item.reason == super::owner_inbox::REPEATED_FAILURE_REASON {
             self.repeated_failure_inbox_items += 1;
         }
-        self.push_page_item(item);
+        self.collect_page_item(item);
     }
 }
 
 struct OwnerInboxCountSink<'s, 'c> {
     counts: BTreeMap<OwnerInboxKind, usize>,
+    groups: HashSet<String>,
     snoozed: HashSet<(OwnerInboxKind, &'s str, &'s str)>,
     confirmed: &'c StuckStates,
     now: i64,
@@ -160,14 +203,10 @@ struct OwnerInboxCountSink<'s, 'c> {
 
 impl OwnerInboxItemSink for OwnerInboxCountSink<'_, '_> {
     fn push(&mut self, item: OwnerInboxItem) {
-        if !is_reportable(&item, self.now, self.confirmed)
-            || self
-                .snoozed
-                .contains(&(item.kind, item.subject.as_str(), item.revision.as_str()))
-        {
+        if !is_reportable(&item, self.now, self.confirmed) || is_snoozed(&item, &self.snoozed) {
             return;
         }
-        *self.counts.entry(item.kind).or_default() += 1;
+        count_inbox_item(&mut self.counts, &mut self.groups, &item);
     }
 }
 
@@ -303,6 +342,8 @@ impl Store {
             snoozed,
             page,
             items: Vec::new(),
+            page_groups: HashMap::new(),
+            counted_groups: HashSet::new(),
             owner_inbox: OwnerInboxKind::ALL
                 .into_iter()
                 .map(|kind| (kind, 0))
@@ -316,6 +357,9 @@ impl Store {
             repeated_failure_inbox_items: 0,
         };
         let mut liveness = super::owner_inbox::project_into(connection, now, &mut sink)?;
+        for item in std::mem::take(&mut sink.page_groups).into_values() {
+            sink.push_page_item(item);
+        }
         liveness.stuck = liveness.stuck.saturating_sub(sink.unreportable_stuck);
         for (reason, count) in &sink.unreportable_reasons {
             if let Some(current) = liveness.reasons.get_mut(reason) {
@@ -366,6 +410,7 @@ impl Store {
                     .into_iter()
                     .map(|kind| (kind, 0))
                     .collect(),
+                groups: HashSet::new(),
                 snoozed,
                 confirmed,
                 now,
@@ -486,6 +531,12 @@ impl Store {
         let admission = if request.choice == "snooze" {
             if request.args.is_some() {
                 return Err(Error::new("invalid", "snooze accepts no arguments"));
+            }
+            if item.has_unknown_outcome() {
+                return Err(Error::new(
+                    "bad_state",
+                    "an unknown outcome remains visible until resolved",
+                ));
             }
             tx.execute(
                 "INSERT INTO owner_inbox_snoozes(kind, subject, revision) VALUES (?1, ?2, ?3)

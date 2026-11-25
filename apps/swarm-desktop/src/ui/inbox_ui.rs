@@ -638,6 +638,10 @@ impl DesktopApp {
         {
             let at = item.cursor();
             let choice = if snooze {
+                if item.has_unknown_outcome() {
+                    skipped += 1;
+                    continue;
+                }
                 SNOOZE
             } else {
                 match item
@@ -1000,10 +1004,13 @@ impl DesktopApp {
             || (item.kind == OwnerInboxKind::HarnessAuth
                 && inbox.auth_signing.contains(&auth_task));
         let agent = subject_agent(&item.subject);
-        let subject = match agent {
+        let mut subject = match agent {
             Some(agent) => self.agent_title(agent),
             None => item.subject.clone(),
         };
+        if let Some(group) = item.group.as_ref().filter(|group| group.affected > 1) {
+            subject.push_str(&format!(" · {} affected", group.affected));
+        }
         let age = crate::nav::short_age(item.age_ms, 0);
         let reason = choice_words(&eliot_core::reason_words(&item.reason));
         let kind = kind_word(item.kind);
@@ -1138,7 +1145,7 @@ impl DesktopApp {
         actions.push(KeyedView::new(
             "snooze",
             m3::icon_button(palette)
-                .is_enabled(!busy)
+                .is_enabled(!busy && !item.has_unknown_outcome())
                 .automation_name(format!("Snooze: {subject}"))
                 .on_click(decide(SNOOZE, "Snooze"))
                 .content(m3::icon(m3::glyph::SNOOZE)),

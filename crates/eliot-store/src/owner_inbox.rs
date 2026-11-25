@@ -84,6 +84,9 @@ fn artifact_capacity_item(connection: &Connection) -> eliot_core::Result<Option<
         instructions: Some(
             "Review safe candidates with swarm cleanup plan --scope all.".to_owned(),
         ),
+        group: None,
+        blocks_work: false,
+        outcome_unknown: false,
     }))
 }
 
@@ -171,7 +174,7 @@ pub(crate) fn project_item(
         OwnerInboxKind::Hold => (project_holds, subject),
         OwnerInboxKind::HarnessCheck => (project_harness_checks, subject),
         OwnerInboxKind::HarnessAuth => (super::auth_login::project_harness_auth, subject),
-        OwnerInboxKind::Agent => (project_agents, subject),
+        OwnerInboxKind::Agent => return Ok(None),
         OwnerInboxKind::BlockedGoal => (project_goals, subject),
         OwnerInboxKind::Handoff => (project_handoffs, subject),
         OwnerInboxKind::WorkNotInGit => (project_work_not_in_git, subject),
@@ -351,7 +354,11 @@ fn project_requests(
                   AND e.generation=r.generation AND e.kind IN ('request.opened','request.resolved','request.closed')
                   AND json_extract(e.data,'$.request_id')=r.request_id),0)
          FROM pending_requests r JOIN agents a ON a.id=r.agent AND a.generation=r.generation
-         WHERE r.state='pending' AND json_type(a.profile_snapshot, '$._harness_check') IS NULL", "r.agent=?1 AND r.generation=?2 AND r.request_id=?3", bindings)?;
+         WHERE r.state='pending' AND a.archived=0
+           AND a.state NOT IN ('stopped','failed','lost')
+           AND json_type(a.profile_snapshot, '$._harness_check') IS NULL
+           AND NOT EXISTS (SELECT 1 FROM agent_successors s
+             WHERE s.agent=r.agent AND s.generation=r.generation)", "r.agent=?1 AND r.generation=?2 AND r.request_id=?3", bindings)?;
     let rows = stmt
         .query_map(bindings, |r| {
             Ok((
@@ -563,7 +570,7 @@ fn project_unknown_commands(
                 {
                     choices.push(action("cancel", "command.cancel", json!({"command_id":id})));
                 }
-                items.push(item(
+                let mut projected = item(
                     OwnerInboxKind::Stuck,
                     format!("command:{id}"),
                     format!("state:{raw_state}:updated:{since}:event:{seq}"),
@@ -572,7 +579,9 @@ fn project_unknown_commands(
                     reason,
                     recommended,
                     choices,
-                ));
+                );
+                projected.blocks_work = true;
+                items.push(projected);
             }
             continue;
         }
@@ -703,6 +712,7 @@ fn project_unknown_commands(
         if let (Some(agent), Some(generation)) = (target, generation) {
             let queued = queued_sends_blocked_by(db, agent, generation, &projected.subject)?;
             if !queued.is_empty() {
+                projected.blocks_work = true;
                 let fence = format!(
                     "Unknown command {} ({verb}) closes the SEND outcome gate for queued SENDs: {}",
                     projected.subject,
@@ -861,6 +871,7 @@ fn project_unknown_turns(
         );
         let queued = queued_sends_blocked_by(db, agent, generation, &turn)?;
         if !queued.is_empty() {
+            projected.blocks_work = true;
             projected.detail = Some(format!(
                 "Unknown turn {turn} closes the SEND outcome gate for queued SENDs: {}",
                 queued
@@ -917,7 +928,7 @@ fn project_switch_fences(
                 json!({"command_id":id,"as":"failed","reason":null}),
             ),
         ];
-        items.push(item(
+        let mut projected = item(
             OwnerInboxKind::Stuck,
             format!("switch:{id}"),
             format!("fence:{updated}"),
@@ -926,7 +937,9 @@ fn project_switch_fences(
             SWITCH_FENCE_NEEDS_OWNER,
             None,
             choices,
-        ));
+        );
+        projected.blocks_work = true;
+        items.push(projected);
     }
     Ok(())
 }
@@ -943,8 +956,18 @@ fn project_handoffs(
         "SELECT e.seq, e.ts, CAST(json_extract(e.data,'$.switch_command') AS TEXT),
                 CAST(json_extract(e.data,'$.continued_to') AS TEXT)
          FROM events e INDEXED BY events_kind
+         LEFT JOIN commands c ON c.id = json_extract(e.data,'$.task_command')
+             AND c.target = e.agent AND c.generation = e.generation
+         LEFT JOIN turns t ON t.agent = c.target AND t.generation = c.generation
+             AND t.turn_id = c.turn_id
+         LEFT JOIN agents source ON source.id = c.target
          WHERE e.kind = 'handoff.settled' AND json_extract(e.data,'$.uncertain') = 1
-           AND json_extract(e.data,'$.state') = 'applied'",
+           AND json_extract(e.data,'$.state') = 'applied'
+           AND NOT COALESCE(
+               t.state = 'completed' OR (
+                 json_type(source.profile_snapshot, '$._harness_check') IS NULL
+                 AND (c.state = 'unknown' OR t.state = 'unknown')
+               ), 0)",
         "CAST(json_extract(e.data,'$.switch_command') AS TEXT) = ?1",
         bindings,
     )?;
@@ -960,7 +983,7 @@ fn project_handoffs(
         .map_err(sql_error)?;
     for row in rows {
         let (seq, since, switch, successor) = row.map_err(sql_error)?;
-        items.push(item(
+        let mut notice = item(
             OwnerInboxKind::Handoff,
             switch,
             format!("event:{seq}"),
@@ -969,13 +992,17 @@ fn project_handoffs(
             "handoff_after_uncertain_turn",
             None,
             vec![action("inspect", "agent.get", json!({"id": successor}))],
-        ));
+        );
+        notice.outcome_unknown = true;
+        items.push(notice);
     }
     let mut stmt = projection_query(
         db,
         "SELECT e.seq, e.ts, a.id, a.generation, json_extract(e.data,'$.message'),
                 json_extract(e.data,'$.reason'),
-                COALESCE(json_extract(e.data,'$.withheld_routes_blocked'),0)
+                a.harness, a.profile,
+                CASE WHEN json_type(a.profile_snapshot,'$.account') = 'text'
+                    THEN json_extract(a.profile_snapshot,'$.account') END
          FROM events e INDEXED BY events_kind
          JOIN agents a ON a.id = e.agent AND a.generation = e.generation
          WHERE e.kind = 'handoff.waiting' AND a.archived = 0
@@ -1023,30 +1050,21 @@ fn project_handoffs(
                 r.get::<_, i64>(3)?,
                 r.get::<_, String>(4)?,
                 r.get::<_, String>(5)?,
-                r.get::<_, bool>(6)?,
+                r.get::<_, String>(6)?,
+                r.get::<_, String>(7)?,
+                r.get::<_, Option<String>>(8)?,
             ))
         })
         .map_err(sql_error)?;
     for row in rows {
-        let (seq, since, agent, generation, message, reason, blocked) = row.map_err(sql_error)?;
+        let (seq, since, agent, generation, message, reason, harness, profile, account) =
+            row.map_err(sql_error)?;
         let inspect = action("inspect", "agent.get", json!({"id":format!("a{agent}")}));
-        let (choices, instructions) = if reason == "provider_response_withheld" || blocked {
-            (
-                vec![
-                    inspect,
-                    action(
-                        "review_profiles",
-                        "settings.read",
-                        json!({"sections":["profiles","routing"]}),
-                    ),
-                ],
-                Some(
-                    "Review configured profiles and routing to choose another preset, or leave this handoff pending.",
-                ),
-            )
-        } else {
-            (vec![inspect], None)
-        };
+        let review = action(
+            "review_profiles",
+            "settings.read",
+            json!({"sections":["profiles","routing"]}),
+        );
         let mut projected = item(
             OwnerInboxKind::Handoff,
             format!("waiting:a{agent}:g{generation}"),
@@ -1055,9 +1073,20 @@ fn project_handoffs(
             since,
             &message,
             None,
-            choices,
+            vec![inspect, review],
         );
-        projected.instructions = instructions.map(str::to_owned);
+        projected.blocks_work = true;
+        projected.group = Some(eliot_core::api::OwnerInboxGroup {
+            id: format!(
+                "routing:{}",
+                eliot_core::api::inference::sha256_hex(
+                    json!([reason, harness, profile, account, message])
+                        .to_string()
+                        .as_bytes(),
+                )
+            ),
+            affected: 1,
+        });
         items.push(projected);
     }
     Ok(())
@@ -1321,7 +1350,7 @@ fn project_holds(
                 .and_then(|raw| serde_json::from_str::<eliot_core::ProviderHoldSource>(raw).ok())
                 .and_then(|source| source.model_mismatch)
                 .map(|mismatch| mismatch.reason());
-            items.push(item(
+            let mut projected = item(
                 OwnerInboxKind::Hold,
                 scope,
                 format!("held:{since}:updated:{updated}:event:{seq}"),
@@ -1330,7 +1359,9 @@ fn project_holds(
                 mismatch_reason.as_deref().unwrap_or(reason),
                 None,
                 choices,
-            ));
+            );
+            projected.outcome_unknown = unknown;
+            items.push(projected);
         } else if let Mover::Stuck { reason } = result {
             let inspect = action("inspect", "provider.holds", json!({}));
             items.push(item(
@@ -1418,25 +1449,14 @@ fn project_agents(
     stats: &mut SwarmLiveness,
     bindings: &[&dyn ToSql],
 ) -> eliot_core::Result<()> {
-    let mut stmt = projection_query(db,
-        "WITH candidates(id) AS (
-             SELECT id FROM agents INDEXED BY agents_list_archived_state
-             WHERE archived=0 AND state IN ('created','starting','idle','busy','waiting','failed','lost','unknown')
-             UNION ALL
-             SELECT DISTINCT c.target FROM commands c INDEXED BY owner_inbox_resume_tip
-             CROSS JOIN agents stopped ON stopped.id=c.target AND stopped.generation=c.generation
-             WHERE c.verb='resume' AND c.principal='owner' AND c.state<>'cancelled'
-               AND c.state IN ('failed','rejected') AND stopped.state='stopped' AND stopped.archived=0
-         )
-         SELECT a.id,a.generation,a.state,a.updated_at,a.active_turn,a.archived,
-                a.native_scope,a.native_ref,a.observe_only,
-                CASE WHEN a.state IN ('created','starting','failed','lost') THEN EXISTS(SELECT 1 FROM commands c
+    let mut stmt = projection_query(
+        db,
+        "SELECT a.id,a.generation,a.state,a.updated_at,a.active_turn,
+                CASE WHEN a.state IN ('created','starting') THEN EXISTS(SELECT 1 FROM commands c
                   WHERE c.target=a.id AND (c.generation=a.generation OR c.expected_generation=a.generation)
                   AND c.verb IN ('launch','resume') AND c.state IN ('accepted','queued','dispatched')) ELSE 0 END,
                 EXISTS(SELECT 1 FROM processes p WHERE p.owner IN (
                   'agent:a'||a.id||'#'||a.generation,'workspace:a'||a.id||'#'||a.generation) AND p.state='running'),
-                CASE WHEN a.state IN ('failed','lost') THEN COALESCE((SELECT MAX(e.ts) FROM events e
-                  WHERE e.agent=a.id AND e.generation=a.generation AND e.kind IN ('agent.failed','agent.lost')),a.updated_at) ELSE a.updated_at END,
                 EXISTS(SELECT 1 FROM pending_requests r WHERE r.agent=a.id
                   AND r.generation=a.generation AND r.state='pending'),
                 EXISTS(SELECT 1 FROM turns t WHERE t.agent=a.id AND t.generation=a.generation
@@ -1455,14 +1475,8 @@ fn project_agents(
                   SELECT 1 FROM processes p WHERE p.owner='agent:a'||a.id||'#'||a.generation
                     AND p.role='plugin' AND p.state='running') ELSE 0 END,
                 aw.expires_at,aw.created_at,json_extract(aw.condition,'$.kind'),
-                json_extract(aw.condition,'$.seconds'), resume.id, resume.updated_at
-         FROM candidates CROSS JOIN agents a ON a.id=candidates.id
-         LEFT JOIN commands resume ON resume.id = CASE WHEN a.state IN ('failed','lost','stopped') THEN (
-             SELECT newest.id FROM commands newest INDEXED BY owner_inbox_resume_tip
-             WHERE newest.target=a.id AND newest.generation=a.generation
-               AND newest.verb='resume' AND newest.principal='owner' AND newest.state<>'cancelled'
-             ORDER BY newest.created_at DESC,newest.rowid DESC LIMIT 1
-         ) END AND resume.state IN ('rejected','failed')
+                json_extract(aw.condition,'$.seconds')
+         FROM agents a
          LEFT JOIN agent_wakes aw INDEXED BY agent_wakes_one_open_per_generation
             ON aw.agent=a.id AND aw.generation=a.generation
             AND aw.state IN ('waiting','satisfied','delivery_pending')
@@ -1474,17 +1488,18 @@ fn project_agents(
                       AND (a.active_turn IS NULL OR a.active_turn=aw.turn_id))
                     OR (a.state='waiting' AND a.active_turn=aw.turn_id AND wt.state='running'
                       AND (EXISTS(SELECT 1 FROM processes wp WHERE wp.owner IN (
-                             'agent:a'||a.id||'#'||a.generation,
-                             'workspace:a'||a.id||'#'||a.generation) AND wp.state='running')
+                             'agent:a'||a.id||'#'||a.generation,'workspace:a'||a.id||'#'||a.generation)
+                             AND wp.state='running')
                         OR EXISTS(SELECT 1 FROM source_state ws WHERE ws.agent=a.id
                              AND ws.generation=a.generation AND ws.state='open' AND ws.health IN ('ok','slow')
                              AND ws.source NOT IN ('daemon','os','git','workspace_process'))))
                   ))
          WHERE a.observe_only=0 AND a.archived=0
-           AND CASE WHEN a.state IN ('created','starting','idle','busy','waiting','failed','lost','unknown')
-                     OR resume.id IS NOT NULL
-               THEN json_type(a.profile_snapshot, '$._harness_check') IS NULL
-               ELSE 0 END", "a.id=?1", bindings)?;
+           AND a.state IN ('created','starting','idle','busy','waiting','unknown')
+           AND json_type(a.profile_snapshot, '$._harness_check') IS NULL",
+        "a.id=?1",
+        bindings,
+    )?;
     let rows = stmt
         .query_map(bindings, |r| {
             Ok((
@@ -1494,24 +1509,17 @@ fn project_agents(
                 r.get::<_, i64>(3)?,
                 r.get::<_, Option<String>>(4)?,
                 r.get::<_, bool>(5)?,
-                r.get::<_, Option<String>>(6)?,
-                r.get::<_, Option<String>>(7)?,
+                r.get::<_, bool>(6)?,
+                r.get::<_, bool>(7)?,
                 r.get::<_, bool>(8)?,
                 r.get::<_, bool>(9)?,
                 r.get::<_, bool>(10)?,
-                r.get::<_, i64>(11)?,
+                r.get::<_, bool>(11)?,
                 r.get::<_, bool>(12)?,
-                r.get::<_, bool>(13)?,
-                r.get::<_, bool>(14)?,
-                r.get::<_, bool>(15)?,
-                r.get::<_, bool>(16)?,
-                r.get::<_, bool>(17)?,
-                r.get::<_, Option<i64>>(18)?,
-                r.get::<_, Option<i64>>(19)?,
-                r.get::<_, Option<String>>(20)?,
-                r.get::<_, Option<i64>>(21)?,
-                r.get::<_, Option<String>>(22)?,
-                r.get::<_, Option<i64>>(23)?,
+                r.get::<_, Option<i64>>(13)?,
+                r.get::<_, Option<i64>>(14)?,
+                r.get::<_, Option<String>>(15)?,
+                r.get::<_, Option<i64>>(16)?,
             ))
         })
         .map_err(sql_error)?;
@@ -1522,13 +1530,8 @@ fn project_agents(
             raw_state,
             since,
             active_turn,
-            archived,
-            native_scope,
-            native_ref,
-            observe_only,
             launch_queued,
             process_running,
-            terminal_at,
             has_request,
             observed_turn,
             source_open,
@@ -1539,187 +1542,67 @@ fn project_agents(
             wake_created_at,
             wake_kind,
             wake_seconds,
-            resume_failure_id,
-            resume_failed_at,
         ) = row.map_err(sql_error)?;
-        let state = match raw_state.as_str() {
-            "created" => eliot_core::AgentState::Created,
-            "starting" => eliot_core::AgentState::Starting,
-            "idle" => eliot_core::AgentState::Idle,
-            "busy" => eliot_core::AgentState::Busy,
-            "waiting" => eliot_core::AgentState::Waiting,
-            "failed" => eliot_core::AgentState::Failed,
-            "lost" => eliot_core::AgentState::Lost,
-            "stopped" => eliot_core::AgentState::Stopped,
-            "unknown" => eliot_core::AgentState::Unknown,
-            _ => {
-                return Err(crate::Error::new(
-                    "corrupt",
-                    "invalid agent lifecycle state",
-                ));
-            }
-        };
-        if matches!(
-            state,
-            eliot_core::AgentState::Lost
-                | eliot_core::AgentState::Failed
-                | eliot_core::AgentState::Stopped
-        ) {
-            // A handoff closes this item: the work continues on the successor.
-            if archived || crate::handoff::current_successor(db, id)?.is_some() {
-                continue;
-            }
-            let resume_safe = state != eliot_core::AgentState::Stopped
-                && native_scope
-                    .as_deref()
-                    .is_some_and(|s| !s.trim().is_empty())
-                && native_ref.as_deref().is_some_and(|s| !s.trim().is_empty())
-                && active_turn.is_none()
-                && !launch_queued
-                && !process_running
-                && !observe_only;
-            let unknown_start = crate::unknown_start_command(db, id)?;
-            let choice = if let Some(command_id) = &unknown_start {
-                Some(action(
-                    "resolve",
-                    "command.resolve",
-                    json!({
-                        "command_id":command_id, "as":"failed", "reason":null
-                    }),
-                ))
-            } else {
-                resume_safe.then(|| action("resume","command.submit",json!({
-                    "verb":"resume","target":format!("a{id}"),"expected_generation":generation,"args":{}
-                })))
-            };
-            let reason = if unknown_start.is_some() {
-                if state == eliot_core::AgentState::Lost {
-                    "lost_agent_resolve_unknown_start_first"
-                } else {
-                    "failed_agent_resolve_unknown_start_first"
-                }
-            } else if raw_state == "lost" {
-                "lost_agent_needs_owner_attention"
-            } else if state == eliot_core::AgentState::Stopped {
-                "resume_failed"
-            } else {
-                "failed_agent_needs_owner_attention"
-            };
-            if state != eliot_core::AgentState::Stopped {
-                let result = liveness::mover(
-                    &LivenessObject::Agent {
-                        state,
-                        since: terminal_at,
-                        owner_item: true,
-                        launch_queued: false,
-                        active_turn: false,
-                        wait_evidence: None,
-                    },
+        let state = crate::parse_enum(&raw_state, "Agent state")?;
+        let result = liveness::mover(
+            &LivenessObject::Agent {
+                state,
+                since,
+                owner_item: has_request,
+                launch_queued: launch_queued
+                    || (state == eliot_core::AgentState::Starting && process_running),
+                active_turn: observed_turn && (source_open || process_running),
+                wait_evidence: agent_wait_evidence(
+                    wake_expires_at,
+                    wake_created_at,
+                    wake_kind.as_deref(),
+                    wake_seconds,
                     now,
-                );
-                tally(stats, &result);
-            }
+                ),
+            },
+            now,
+        );
+        tally(stats, &result);
+        if let Mover::Stuck { reason } = result {
             let event_seq = agent_inbox_revision_seq(db, id, generation)?;
-            let subject = format!("a{id}");
-            let mut choices: Vec<_> = choice.iter().cloned().collect();
-            let mut detail = None;
-            if let Some(command_id) = resume_failure_id {
-                let command = super::load_command(db, &command_id)?.ok_or_else(|| {
-                    crate::Error::new("source_integrity", "retained Resume failure disappeared")
-                })?;
-                let failure = eliot_core::api::AgentResumeFailure::from_command(&command)?;
-                detail = Some(match failure.detail {
-                    Some(detail) => format!(
-                        "Resume generation {generation} failed: {} — {detail}",
-                        failure.reason
-                    ),
-                    None => format!("Resume generation {generation} failed: {}", failure.reason),
-                });
-                choices.push(action("inspect_agent", "agent.get", json!({"id":subject})));
-                choices.push(action(
-                    "inspect_command",
-                    "command.get",
-                    json!({"id":command_id}),
-                ));
-            }
-            let mut entry = item(
-                OwnerInboxKind::Agent,
-                subject,
-                format!("g{generation}:updated:{since}:event:{event_seq}"),
+            let stop_safe = matches!(
+                state,
+                eliot_core::AgentState::Busy | eliot_core::AgentState::Waiting
+            ) && active_turn.is_none()
+                && !has_request
+                && !unsettled_turn
+                && !unsettled_command
+                && source_open
+                && owned_plugin_running;
+            let mut choices = Vec::new();
+            let recommended = if stop_safe {
+                let stop = action(
+                    "stop",
+                    "command.submit",
+                    json!({
+                        "verb":"stop",
+                        "target":format!("a{id}"),
+                        "expected_generation":generation,
+                        "args":{}
+                    }),
+                );
+                choices.push(stop.clone());
+                Some(stop)
+            } else {
+                None
+            };
+            let inspect = action("inspect", "agent.get", json!({"id":format!("a{id}")}));
+            choices.push(inspect);
+            items.push(item(
+                OwnerInboxKind::Stuck,
+                format!("a{id}:g{generation}"),
+                format!("state:{raw_state}:updated:{since}:event:{event_seq}"),
                 now,
-                if state == eliot_core::AgentState::Stopped {
-                    resume_failed_at.unwrap_or(terminal_at)
-                } else {
-                    terminal_at
-                },
+                since,
                 reason,
-                choice,
+                recommended,
                 choices,
-            );
-            entry.detail = detail;
-            items.push(entry);
-        } else {
-            let result = liveness::mover(
-                &LivenessObject::Agent {
-                    state,
-                    since,
-                    owner_item: has_request,
-                    launch_queued: launch_queued
-                        || (state == eliot_core::AgentState::Starting && process_running),
-                    active_turn: observed_turn && (source_open || process_running),
-                    wait_evidence: agent_wait_evidence(
-                        wake_expires_at,
-                        wake_created_at,
-                        wake_kind.as_deref(),
-                        wake_seconds,
-                        now,
-                    ),
-                },
-                now,
-            );
-            tally(stats, &result);
-            if let Mover::Stuck { reason } = result {
-                let event_seq = agent_inbox_revision_seq(db, id, generation)?;
-                let stop_safe = matches!(
-                    state,
-                    eliot_core::AgentState::Busy | eliot_core::AgentState::Waiting
-                ) && active_turn.is_none()
-                    && !has_request
-                    && !unsettled_turn
-                    && !unsettled_command
-                    && source_open
-                    && owned_plugin_running
-                    && !observe_only;
-                let mut choices = Vec::new();
-                let recommended = if stop_safe {
-                    let stop = action(
-                        "stop",
-                        "command.submit",
-                        json!({
-                            "verb":"stop",
-                            "target":format!("a{id}"),
-                            "expected_generation":generation,
-                            "args":{}
-                        }),
-                    );
-                    choices.push(stop.clone());
-                    Some(stop)
-                } else {
-                    None
-                };
-                let inspect = action("inspect", "agent.get", json!({"id":format!("a{id}")}));
-                choices.push(inspect);
-                items.push(item(
-                    OwnerInboxKind::Stuck,
-                    format!("a{id}:g{generation}"),
-                    format!("state:{raw_state}:updated:{since}:event:{event_seq}"),
-                    now,
-                    since,
-                    reason,
-                    recommended,
-                    choices,
-                ));
-            }
+            ));
         }
     }
     Ok(())
@@ -1794,10 +1677,18 @@ fn project_goals(
        COALESCE((SELECT MAX(e.seq) FROM events e WHERE e.agent=g.agent AND e.generation=g.generation AND e.kind='goal.changed'),0),
        json_extract(g.state,'$.cadence_anchor_ms') + json_extract(g.definition,'$.cadence_ms')
            * (COALESCE(json_extract(g.state,'$.last_committed_slot'),0) + 1),
-       COALESCE(json_extract(g.state,'$.paused_reason') = '{deferral_limit_reason}',0)
+       COALESCE(json_extract(g.state,'$.paused_reason') = '{deferral_limit_reason}',0),
+       EXISTS(SELECT 1 FROM goal_markers m WHERE m.agent=g.agent AND m.mode=g.mode
+            AND m.generation=g.generation AND m.revision=g.revision AND m.state='unknown')
        FROM goals g JOIN agents a ON a.id=g.agent WHERE (json_extract(g.state,'$.status') IN ('active','blocked')
          OR (json_extract(g.state,'$.status') = 'paused'
-             AND json_extract(g.state,'$.paused_reason') = '{deferral_limit_reason}'))");
+             AND json_extract(g.state,'$.paused_reason') = '{deferral_limit_reason}'))
+         AND ((a.archived=0 AND a.generation=g.generation
+                 AND a.state NOT IN ('stopped','lost','failed')
+                 AND NOT EXISTS(SELECT 1 FROM agent_successors s
+                   WHERE s.agent=g.agent AND s.generation=g.generation))
+              OR EXISTS(SELECT 1 FROM goal_markers m WHERE m.agent=g.agent AND m.mode=g.mode
+                   AND m.generation=g.generation AND m.revision=g.revision AND m.state='unknown'))");
     let mut stmt = projection_query(db, &sql, "g.agent=?1 AND g.mode=?2", bindings)?;
     let rows = stmt
         .query_map(bindings, |r| {
@@ -1814,6 +1705,7 @@ fn project_goals(
                 r.get::<_, i64>(9)?,
                 r.get::<_, Option<i64>>(10)?,
                 r.get::<_, bool>(11)?,
+                r.get::<_, bool>(12)?,
             ))
         })
         .map_err(sql_error)?;
@@ -1831,6 +1723,7 @@ fn project_goals(
             event_seq,
             timer_due,
             deferral_paused,
+            unknown,
         ) = row.map_err(sql_error)?;
         let state = match raw_state.as_str() {
             "active" => GoalStatus::Active,
@@ -1848,7 +1741,7 @@ fn project_goals(
             &LivenessObject::Goal {
                 state: status,
                 since,
-                owner_item: status == GoalStatus::Blocked || deferral_paused,
+                owner_item: status == GoalStatus::Blocked || deferral_paused || unknown,
                 round_active: round_active
                     || (!turn_active && reconciler_active && timer_due.is_none()),
                 turn_active: turn_active && reconciler_active,
@@ -1863,8 +1756,10 @@ fn project_goals(
             _ => return Err(crate::Error::new("corrupt", "invalid goal mode")),
         };
         let subject = format!("a{agent}:{}", mode_name(mode));
-        if status == GoalStatus::Blocked || deferral_paused {
-            let reason = if deferral_paused {
+        if status == GoalStatus::Blocked || deferral_paused || unknown {
+            let reason = if unknown {
+                "goal_round_outcome_unknown"
+            } else if deferral_paused {
                 deferral_limit_reason
             } else {
                 "goal_blocked"
@@ -1874,7 +1769,7 @@ fn project_goals(
                 "goal.clear",
                 json!({"agent":format!("a{agent}"),"mode":mode_name(mode)}),
             );
-            items.push(item(
+            let mut projected = item(
                 OwnerInboxKind::BlockedGoal,
                 subject,
                 format!("g{generation}:goal:{revision}:event:{event_seq}"),
@@ -1883,7 +1778,9 @@ fn project_goals(
                 reason,
                 None,
                 vec![clear],
-            ));
+            );
+            projected.outcome_unknown = unknown;
+            items.push(projected);
         } else if let Mover::Stuck { reason } = result {
             let inspect = action(
                 "inspect",
@@ -2221,5 +2118,8 @@ fn item(
         recommended,
         choices,
         instructions: None,
+        group: None,
+        blocks_work: false,
+        outcome_unknown: false,
     }
 }
