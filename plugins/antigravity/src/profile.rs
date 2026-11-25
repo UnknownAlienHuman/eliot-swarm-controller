@@ -328,13 +328,7 @@ impl Plan {
                 "Antigravity hook discovery directory is unavailable",
             ));
         }
-        let mut args = native_args(
-            model.as_deref().unwrap_or_default(),
-            mode.as_deref(),
-            skip_permissions,
-            resume.as_deref(),
-            hook_discovery_dir,
-        );
+        let mut args = native_args(skip_permissions, hook_discovery_dir);
         if let Some(root) = &mcp_root {
             args.extend([
                 OsString::from("--gemini-dir"),
@@ -847,13 +841,7 @@ pub(crate) fn reader_environment(snapshot: &Value) -> Result<TargetEnvironment> 
     Ok(environment)
 }
 
-fn native_args(
-    _model: &str,
-    _mode: Option<&str>,
-    skip_permissions: bool,
-    _resume: Option<&str>,
-    hook_discovery_dir: &Path,
-) -> Vec<OsString> {
+fn native_args(skip_permissions: bool, hook_discovery_dir: &Path) -> Vec<OsString> {
     // One ACP stdio server per generation. Model, thought level, session
     // mode and resume are ACP session facts now (set_config_option /
     // set_mode / session load), not CLI flags. Permission posture and the

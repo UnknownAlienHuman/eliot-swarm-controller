@@ -567,7 +567,7 @@ impl OversizedFrame {
     }
 
     /// Whether the bounded prefix proved the JSON-RPC 2.0 version field.
-    pub fn is_jsonrpc_v2(self) -> bool {
+    fn is_jsonrpc_v2(self) -> bool {
         self.jsonrpc_v2
     }
 
@@ -1111,7 +1111,7 @@ impl NativeChild {
         Ok((child, stdout))
     }
 
-    pub fn set_output_reader(&mut self, reader: tokio::task::JoinHandle<Result<()>>) {
+    fn set_output_reader(&mut self, reader: tokio::task::JoinHandle<Result<()>>) {
         self.output_reader = Some(reader);
     }
 
@@ -1636,7 +1636,7 @@ impl PendingCalls {
 
     /// Record-local fault: fail only the currently pending calls Unknown and
     /// keep registration open so the same reader routes later records.
-    pub fn fail_current(&self, error: Error) {
+    fn fail_current(&self, error: Error) {
         let pending = {
             let mut pending = self.calls.lock_recover();
             std::mem::take(&mut *pending)
@@ -1654,7 +1654,7 @@ impl Drop for PendingGuard {
 }
 
 /// Bounded native event queue between the stdout pump and the event task.
-pub fn native_frame_channel<Frame>() -> (mpsc::Sender<Frame>, mpsc::Receiver<Frame>) {
+fn native_frame_channel<Frame>() -> (mpsc::Sender<Frame>, mpsc::Receiver<Frame>) {
     mpsc::channel(NATIVE_EVENT_QUEUE)
 }
 

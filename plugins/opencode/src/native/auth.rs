@@ -141,13 +141,13 @@ pub struct AuthTransfer<'a> {
 /// `auth export <selector> --standalone`, in the installed help's order.
 /// The selector is positional and mandatory: omitting it would export every
 /// integration.
-pub fn export_argv(selector: &IntegrationSelector) -> [&str; 4] {
+fn export_argv(selector: &IntegrationSelector) -> [&str; 4] {
     ["auth", "export", selector.as_str(), "--standalone"]
 }
 
 /// `auth import --standalone` with no file argument, so the child reads the
 /// piped export document from stdin.
-pub fn import_argv() -> [&'static str; 3] {
+fn import_argv() -> [&'static str; 3] {
     ["auth", "import", "--standalone"]
 }
 

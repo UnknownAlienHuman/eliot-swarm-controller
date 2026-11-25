@@ -352,11 +352,7 @@ impl OpenCodeHttp {
     /// cursor: no directory, search, parent, project, subpath, or archived
     /// filters. The fixed `x-opencode-directory` header still binds the native
     /// directory context. A complete inventory must follow every `cursor.next`.
-    pub async fn list_sessions(
-        &self,
-        cursor: Option<&str>,
-        deadline: Instant,
-    ) -> Result<SessionPage> {
+    async fn list_sessions(&self, cursor: Option<&str>, deadline: Instant) -> Result<SessionPage> {
         let query: Vec<(&str, &str)> = match cursor {
             Some(cursor) => vec![("limit", "100"), ("cursor", cursor)],
             None => vec![("limit", "100")],
