@@ -81,6 +81,7 @@ impl Store {
         let write = AssignmentWrite::new(&request.id, CLAIM, principal, request, now)?;
         self.change_project_assignment(write, |tx| {
             let (registration, caller) = authorize_project(tx, principal, &request.project)?;
+            project_transfer::require_no_intent(tx, &request.project)?;
             let (id, generation) = match (&request.manager, &caller) {
                 (Some(ProjectManagerIdentity::Remote { .. }), _) => {
                     return Err(Error::new(
@@ -107,6 +108,24 @@ impl Store {
                 ));
             }
             let current = read_assignment(tx, &request.project)?;
+            if principal == "owner" && request.expected_revision.is_none() {
+                return Err(Error::new(
+                    "invalid",
+                    "Owner claim requires the current assignment revision",
+                ));
+            }
+            if request
+                .expected_revision
+                .is_some_and(|expected| expected != current.revision)
+            {
+                return Err(Error::new(
+                    "stale_assignment",
+                    format!(
+                        "assignment revision changed to {}; read it before claiming",
+                        current.revision
+                    ),
+                ));
+            }
             if current.manager.is_some() {
                 return Ok((
                     assignment_result(current, ProjectAssignmentOutcome::Occupied),
@@ -135,7 +154,24 @@ impl Store {
                     "claim requires a live, approved root Agent in the registered project",
                 ));
             }
+            require_no_retained_root_writers(tx, &request.project, Some(num))?;
+            let managed = workspace::load_workspace(tx, num)?;
+            if let Some(workspace) = &managed
+                && (workspace.phase != core::WorkspacePhase::Ready
+                    || workspace.target_generation != generation
+                    || agent.workspace.as_deref() != Some(workspace.worktree_path.as_str())
+                    || core::workspace_path_key(&workspace.repo_common_dir)
+                        != core::workspace_path_key(&registration.repo_common_dir))
+            {
+                return Err(Error::new(
+                    "bad_state",
+                    "retained manager worktree is not ready in the current registered repository",
+                ));
+            }
             write_next_assignment(tx, &current, Some((num, generation)), None)?;
+            if let Some(workspace) = managed {
+                bind_manager_workspace(tx, &request.project, &workspace.worktree_path, false)?;
+            }
             Ok((
                 assignment_result(
                     read_assignment(tx, &request.project)?,
@@ -175,6 +211,7 @@ impl Store {
                     Vec::new(),
                 ));
             }
+            require_no_retained_root_writers(tx, &request.project, None)?;
             let (mut launch, preparation) = prepared?;
             if launch.id != request.id
                 || launch.verb != "launch"
@@ -543,6 +580,23 @@ fn bind_manager_workspace(
         "UPDATE project_assignments SET workspace_path = ?1, workspace_adopted = ?2 WHERE project = ?3",
         params![path, i64::from(adopted), project],
     ));
+    Ok(())
+}
+
+fn require_no_retained_root_writers(
+    tx: &Transaction<'_>,
+    project: &str,
+    selected: Option<i64>,
+) -> Result<()> {
+    if let Some(other) = organization::retained_root_writers(tx, project, selected, 1)?.first() {
+        return Err(Error::new(
+            "legacy_project_writers",
+            format!(
+                "{} retains independent control or workspace custody in this project",
+                format_agent_id(*other)
+            ),
+        ));
+    }
     Ok(())
 }
 

@@ -71,6 +71,9 @@ pub struct ProjectAssignmentClaimRequest {
     pub id: String,
     pub project: String,
     pub manager: Option<ProjectManagerIdentity>,
+    /// Assignment revision read by the Owner before explicitly selecting a manager.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_revision: Option<i64>,
 }
 
 #[derive(Clone, Debug, JsonSchema, Serialize, Deserialize)]
@@ -119,6 +122,12 @@ impl ProjectAssignmentGetRequest {
 impl ProjectAssignmentClaimRequest {
     pub fn validate(&self) -> Result<()> {
         validate_name(&self.project, "params.project")?;
+        if self.expected_revision.is_some_and(|revision| revision < 0) {
+            return Err(Error::invalid_field(
+                "params.expected_revision",
+                "nonnegative revision",
+            ));
+        }
         if let Some(ProjectManagerIdentity::Local { agent, generation }) = &self.manager {
             parse_agent_id(agent)?;
             if *generation < 1 {

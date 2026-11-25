@@ -2126,8 +2126,11 @@ pub(crate) enum ProjectAssignmentCommand {
     /// Claim as the current Agent, or explicitly name an Agent as Owner.
     Claim {
         project: String,
-        #[arg(value_name = "AGENT", requires = "generation")]
+        #[arg(value_name = "AGENT", requires_all = ["generation", "revision"])]
         agent: Option<String>,
+        /// Current assignment revision, from project assignment get.
+        #[arg(long, value_parser = clap::value_parser!(i64).range(0..))]
+        revision: Option<i64>,
         #[arg(long, requires = "agent", value_parser = clap::value_parser!(i64).range(1..))]
         generation: Option<i64>,
     },

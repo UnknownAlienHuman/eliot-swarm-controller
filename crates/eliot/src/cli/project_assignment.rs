@@ -28,8 +28,10 @@ pub(super) async fn run(
             project,
             agent,
             generation,
+            revision,
         } => {
             let request = ProjectAssignmentClaimRequest {
+                expected_revision: revision,
                 id: mutation_id(id)?,
                 project,
                 manager: agent

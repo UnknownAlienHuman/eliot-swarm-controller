@@ -1,6 +1,6 @@
 use super::*;
 
-pub(super) const CURRENT_SCHEMA_VERSION: i64 = WITHHELD_FRESH_SESSION_VERSION;
+pub(super) const CURRENT_SCHEMA_VERSION: i64 = ORGANIZATION_KEY_INDEX_VERSION;
 const HARNESS_CHECK_SCHEMA_VERSION: i64 = 112;
 const WORK_TRUTH_VERSION: i64 = 113;
 const WORK_TRUTH_INTENT_VERSION: i64 = 114;
@@ -38,6 +38,7 @@ const FLUENT_READ_REVISIONS_VERSION: i64 = 145;
 const DESKTOP_USAGE_LOOKUP_VERSION: i64 = 146;
 const SWITCH_CHILD_ID_RESERVATIONS_VERSION: i64 = 147;
 const WITHHELD_FRESH_SESSION_VERSION: i64 = 148;
+const ORGANIZATION_KEY_INDEX_VERSION: i64 = 149;
 
 fn has_restart_continuation_brief_column(connection: &Connection) -> Result<bool> {
     connection
@@ -2765,6 +2766,12 @@ impl Store {
             self.migrate_sql(
                 "ALTER TABLE automatic_handoff_budgets ADD COLUMN withheld_fresh_session_at INTEGER;",
                 Some(WITHHELD_FRESH_SESSION_VERSION),
+            )?;
+        }
+        if current < ORGANIZATION_KEY_INDEX_VERSION {
+            self.migrate_sql(
+                &organization::registration_key_indexes(),
+                Some(ORGANIZATION_KEY_INDEX_VERSION),
             )?;
         }
         Ok(())

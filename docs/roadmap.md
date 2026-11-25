@@ -223,7 +223,9 @@ Checked layers record delivered increments, not full crash/load qualification.
   carry their group, so the desktop groups nothing itself. A task's menu attaches,
   detaches and tags under the link revision it read; a capacity refusal offers Queue
   it, and a lost Queue it reply resolves its intent before the draft returns.
-  Legacy path labels stay in the no-project bucket; history is not reinterpreted.
+  Headless legacy grouping uses retained registration, worktree and parent
+  evidence. Independent roots surface before a revision-checked Owner claim;
+  assignment leaves historical IDs and outcomes reachable.
 - [x] **6. Project overview.** Read scoped workspace Git status and retained
   turn usage coverage with project and fleet totals in one Store snapshot.
 

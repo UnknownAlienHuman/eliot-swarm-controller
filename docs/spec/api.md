@@ -577,8 +577,13 @@ unsupported. CLI callers use `swarm project assignment get|claim|launch|release`
 semantics as ordinary launch. The CLI exposes them as `--no-policy REASON` and
 `--goal-json JSON_OBJECT`. Only an Owner may override `check`, `check_cwd` or
 `escalation`; explicit safe fields and opt-out remain available to permitted launch
-principals. An explicit Owner claim supplies the Agent ID and generation. A scoped claim
-omits the manager to select the caller. The project action
+principals. An explicit Owner claim supplies the Agent ID, generation, and
+`expected_revision` from assignment readback. A stale revision yields
+`stale_assignment`. Claim and fresh manager launch refuse
+`legacy_project_writers` while another root or its workers retain independent
+control or unsettled custody. A successful claim links the selected Agent's ready
+managed worktree when it has an exact retained match. A scoped claim omits
+the manager to select the caller. The project action
 `project.assignment.claim` grants self-claim under the configured profile allowlist.
 For transfer, use `swarm project transfer <project> --revision <revision> begin|launch|commit|cancel`.
 The request and readback use [ProjectTransferRequest and ProjectTransferResult](../../crates/eliot-core/src/api/project_transfer.rs).
@@ -645,9 +650,10 @@ its `organization` field, so a listed row is counted in the group it reads
 in. Optional `query` applies the `agent.list` search haystack to member
 pages and every group's `member_total` alike, so header counts follow the
 search; registered groups still read back their headers with zero totals
-when nothing matches. A legacy Agent whose retained project label is a
-checkout path groups under the registration of that exact path, without
-rewriting the label; a path two registrations share stays unplaced. Only
+when nothing matches. A non-chat Agent groups by its retained registration,
+an exact checkout or managed-worktree common-directory match, or retained
+parent and root facts when local evidence is absent. Multiple matching
+registrations leave the row unplaced. Only
 trailing separators are normalized everywhere. On Windows the `\\?\`
 verbatim prefix is dropped, `\` and `/` compare equal and ASCII case is
 folded; on other platforms case and a literal backslash stay significant.
@@ -655,11 +661,11 @@ A registered group carries its header in the same read: the manager (with
 its managed worktree `branch`), the assignment, `needs_assignment`, and its
 exact team `totals` and project slot use (`capacity`), the numbers
 `project.overview` reports for it, so the desktop sidebar reads every header
-and total in one bounded read. Competing roots surface as an explicit
-ambiguity only beside an assigned manager: every other retained root competes
-with it (`conflicting_roots`, counted independently of the archived filter),
-and none is auto-reassigned. Without a manager the roots wait for assignment
-and the group reads `needs_assignment` alone. A registered group carries the
+and total in one bounded read. For a vacant assignment, independent roots
+with current control or retained custody are candidates. When several
+compete, the group has `needs_assignment` and lists their IDs in
+`conflicting_roots`, independently of the archived filter. For an assigned
+project, the list shows other retained roots. A registered group carries the
 open `project.transfer` intent as `transfer` while its manager drains. Chats keep their retained
 execution labels and group by their overlay link alone; a legacy chat that
 carries an execution project reads in the no-project bucket until attached.
@@ -3736,7 +3742,7 @@ swarm chat detach CHAT...
 swarm chat tag AGENT... [--tag TAG]...
 swarm provider holds [--after SCOPE] [--limit N]
 swarm provider clear-hold SCOPE --corrective-evidence credentials_updated|configuration_updated|owner_verified [--expected-probe-command ID]
-swarm project assignment claim PROJECT [AGENT] [--generation N]
+swarm project assignment claim PROJECT [AGENT --generation N --revision REVISION]
 swarm project assignment launch PROJECT --profile P [--adopt-worktree PATH] [--no-policy REASON] [--goal-json JSON_OBJECT]
 swarm plugin NAME | plugin-test ... | hook ... | mcp
 ```
