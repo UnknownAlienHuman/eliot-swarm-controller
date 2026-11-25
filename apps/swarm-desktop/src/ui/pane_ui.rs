@@ -965,13 +965,17 @@ impl DesktopApp {
                 super::page_ui::error_line(palette, format!("Git status not read: {error}")),
             ));
         }
-        if let Err(error) = &read.digest {
+        if let Err(error) = &read.digest
+            && changes.source != Source::Uncommitted
+        {
             items.push(KeyedView::new(
                 "digest-error",
                 super::page_ui::error_line(palette, format!("Review digest not read: {error}")),
             ));
         }
-        if let Some(digest) = digest {
+        // The digest reads the branch's patch against its base: it goes
+        // with Branch, not with the other sources' narrower scopes.
+        if let Some(digest) = digest.filter(|_| changes.source == Source::Branch) {
             items.push(KeyedView::new(
                 "digest",
                 self.digest_card(digest, context, palette),
@@ -986,7 +990,9 @@ impl DesktopApp {
                     Source::LastTurn if partial => {
                         "The last turn's edits did not name their files: Branch and Uncommitted list them."
                     }
-                    Source::LastTurn => "The last turn reported no file edits.",
+                    Source::LastTurn => {
+                        "The last turn reported no file edits. Files its commands changed show under Uncommitted and Branch."
+                    }
                     _ => "No changes yet.",
                 }),
             )),
@@ -1191,14 +1197,26 @@ impl DesktopApp {
             if !entries.is_empty() {
                 parts.push(KeyedView::new(
                     format!("paths:{group:?}"),
-                    m3::body(entries.join("\n"))
-                        .text_wrapping(TextWrapping::Wrap)
-                        .is_text_selection_enabled(true)
-                        .automation_name(format!(
-                            "{}: {}",
-                            group.words(entries.len()),
-                            entries.join(", ")
-                        )),
+                    m3::body(
+                        entries
+                            .iter()
+                            .map(|entry| {
+                                if entry == "." {
+                                    "Repository root"
+                                } else {
+                                    entry.as_str()
+                                }
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n"),
+                    )
+                    .text_wrapping(TextWrapping::Wrap)
+                    .is_text_selection_enabled(true)
+                    .automation_name(format!(
+                        "{}: {}",
+                        group.words(entries.len()),
+                        entries.join(", ")
+                    )),
                 ));
             }
         }
@@ -1591,19 +1609,19 @@ impl DesktopApp {
                     .iter()
                     .map(|process| {
                         let state = match process.state {
-                            eliot_core::ProcessState::Running => "Running".to_owned(),
+                            eliot_core::ProcessState::Running => "Running · seen".to_owned(),
                             eliot_core::ProcessState::Exited => match process.exit_code {
-                                Some(code) => format!("Exited · code {code}"),
-                                None => "Exited".to_owned(),
+                                Some(code) => format!("Exited · code {code} ·"),
+                                None => "Exited ·".to_owned(),
                             },
-                            eliot_core::ProcessState::Unknown => "State unknown".to_owned(),
+                            eliot_core::ProcessState::Unknown => "State unknown ·".to_owned(),
                         };
                         let age = monitor::elapsed_label(now.saturating_sub(process.updated_at));
                         KeyedView::new(
                             format!("{}:{}", process.identity.pid, process.identity.start_time),
                             super::page_ui::kv_text(
                                 &format!("{} · {}", process.role, process.identity.pid),
-                                format!("{state} · {age} ago"),
+                                format!("{state} {age} ago"),
                             ),
                         )
                     })
@@ -1616,7 +1634,9 @@ impl DesktopApp {
                             .keyed_children(rows),
                     ),
                 ));
-                if reply.next.is_some() {
+                // `next` names the last row even on the last page: a full
+                // page is what says more may follow.
+                if reply.processes.len() >= eliot_core::api::AgentProcessesRequest::new("").limit {
                     items.push(KeyedView::new(
                         "more",
                         super::page_ui::quiet("Partial: the first page of processes is shown."),
@@ -1837,6 +1857,7 @@ fn summary_line(
     let mut parts: Vec<KeyedView> = Vec::new();
     let files_words = match (source, files) {
         (_, None) => "Files not read".to_owned(),
+        (Source::LastTurn, Some(0)) => "No file edits reported in the last turn".to_owned(),
         (Source::LastTurn, Some(count)) => {
             format!(
                 "{} edited in the last turn",

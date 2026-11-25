@@ -1523,7 +1523,7 @@ impl Monitor {
             match tree {
                 Ok(page) => {
                     self.tree.rows = page.agents.iter().map(MonitorRow::from_list).collect();
-                    self.tree.truncated = page.next.is_some();
+                    self.tree.truncated = page.total > page.agents.len();
                     self.tree.error = None;
                     self.tree.read_at_ms = Some(snapshot.read_at_ms);
                 }

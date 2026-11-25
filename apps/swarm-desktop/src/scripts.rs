@@ -100,7 +100,7 @@ const EDITORS: &[&str] = &[
 
 /// Only the GUI environment needed by these editors. Provider credentials and
 /// Eliot identity are absent because the command starts from env_clear().
-pub(crate) const GUI_ENV: &[&str] = &[
+const GUI_ENV: &[&str] = &[
     "SystemRoot",
     "WINDIR",
     "PATH",

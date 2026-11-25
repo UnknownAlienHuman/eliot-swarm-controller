@@ -681,15 +681,30 @@ impl Component for Header {
                             .orientation(Orientation::Horizontal)
                             .spacing(tokens::spacing::SM)
                             .vertical_alignment(VerticalAlignment::Center)
-                            .children((
-                                input.pill.view(palette),
-                                goal,
-                                changes,
-                                agents,
-                                details,
-                                terminal,
-                                more,
-                            )),
+                            // Keyed by the open tab: a toggle whose pressed
+                            // state changes is a new control, so its colors
+                            // (tonal or outlined, on or off) are applied.
+                            .keyed_children(vec![
+                                KeyedView::new("pill", input.pill.view(palette)),
+                                KeyedView::new("goal", goal),
+                                KeyedView::new(
+                                    format!("changes:{}", input.open == Panel::Changes),
+                                    changes,
+                                ),
+                                KeyedView::new(
+                                    format!("agents:{}", input.open == Panel::Agents),
+                                    agents,
+                                ),
+                                KeyedView::new(
+                                    format!("details:{}", input.open == Panel::Details),
+                                    details,
+                                ),
+                                KeyedView::new(
+                                    format!("terminal:{}", input.open == Panel::Terminal),
+                                    terminal,
+                                ),
+                                KeyedView::new("more", more),
+                            ]),
                     )),
             );
         // The wave under the header while a turn runs (`.wave-bar`).

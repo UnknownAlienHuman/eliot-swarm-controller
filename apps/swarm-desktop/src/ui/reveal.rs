@@ -136,10 +136,12 @@ pub(super) fn open_with_default_app(path: &Path) -> Result<(), String> {
 
 /// Open `folder` in Windows Terminal (`wt.exe -d <folder>`): the app
 /// execution alias under `%LOCALAPPDATA%\Microsoft\WindowsApps`, by
-/// absolute path with explicit argv and no shell. The terminal gets only
-/// the GUI environment ([`crate::scripts::GUI_ENV`]): no provider
-/// credentials and no Eliot identity from this window, as Open in editor.
-/// Nothing is waited for. `Err` is the sentence to show the owner.
+/// absolute path with explicit argv and no shell. The terminal is the
+/// owner's: it keeps the owner's environment (Windows Terminal does not load
+/// its settings without it) except Swarm's own variables, so no Eliot
+/// identity or credential from this window reaches it; only `ELIOT_HOME`,
+/// which names the data directory, stays. Nothing is waited for. `Err` is
+/// the sentence to show the owner.
 pub(super) fn open_terminal(folder: &str) -> Result<(), String> {
     let Target::Folder(path) = target(folder)? else {
         return Err(format!("{} is not a folder.", nav::display_path(folder)));
@@ -168,7 +170,7 @@ pub(super) fn open_terminal(folder: &str) -> Result<(), String> {
         .map_err(|error| format!("Windows Terminal did not start: {error}"))
 }
 
-/// Windows Terminal's command with the GUI environment only.
+/// Windows Terminal's command without Swarm's variables (but `ELIOT_HOME`).
 #[expect(
     clippy::disallowed_types,
     reason = "This helper returns the Windows Terminal command Open in Windows Terminal starts."
@@ -179,10 +181,10 @@ fn terminal_command(wt: &Path) -> std::process::Command {
         reason = "This statement constructs the Windows Terminal process owned by this module."
     )]
     let mut command = std::process::Command::new(wt);
-    command.env_clear();
-    for name in crate::scripts::GUI_ENV {
-        if let Some(value) = std::env::var_os(name) {
-            command.env(name, value);
+    for (name, _) in std::env::vars_os() {
+        let upper = name.to_string_lossy().to_ascii_uppercase();
+        if upper.starts_with("ELIOT_") && upper != "ELIOT_HOME" {
+            command.env_remove(&name);
         }
     }
     command
