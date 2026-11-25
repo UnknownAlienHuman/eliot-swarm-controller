@@ -4979,7 +4979,7 @@ impl Router {
         )
         .await?;
         crate::adhoc::write_profile_command_snapshot(&mut profile, candidate)?;
-        crate::config::capture_native_store_inputs(
+        crate::config::capture_observation_store_inputs(
             &mut profile,
             self.inner.stand_store_root.as_deref(),
         )?;
@@ -7757,7 +7757,7 @@ async fn freeze_attach_profile(
     )
     .await?;
     crate::adhoc::write_profile_command_snapshot(&mut snapshot, candidate)?;
-    crate::config::capture_native_store_inputs(&mut snapshot, stand_store_root)?;
+    crate::config::capture_observation_store_inputs(&mut snapshot, stand_store_root)?;
     install_frozen_profile(request, &harness, snapshot, true)
 }
 

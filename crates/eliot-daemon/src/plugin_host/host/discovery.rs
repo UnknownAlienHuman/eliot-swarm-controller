@@ -385,6 +385,7 @@ impl PluginHost {
                 &profile,
                 &environment,
                 None,
+                false,
             )
             .await;
         let mut reader = match opened.result {
@@ -494,6 +495,7 @@ impl PluginHost {
                 &profile,
                 &environment,
                 None,
+                false,
             )
             .await;
         let mut reader = match opened.result {
@@ -671,6 +673,7 @@ impl PluginHost {
                 profile,
                 environment,
                 None,
+                false,
             )
             .await;
         let mut reader = match opened.result {
@@ -851,6 +854,7 @@ impl PluginHost {
                 &params.profile,
                 &params.target_environment,
                 None,
+                false,
             )
             .await;
         let mut reader = match opened.result {
@@ -959,6 +963,7 @@ impl PluginHost {
                 &profile,
                 &environment,
                 None,
+                true,
             )
             .await;
         let mut reader = match opened.result {

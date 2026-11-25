@@ -320,12 +320,35 @@ pub(crate) fn verify_stand_native_route(
     profile: &Value,
     environment: Option<&JsonMap<String, Value>>,
 ) -> core::Result<()> {
+    verify_stand_native_store(stand_home, harness, profile, environment, true)
+}
+
+/// Metadata observation never starts a turn. It still must use the verified
+/// private home and retained binding, even when no inference route is present.
+pub(crate) fn verify_stand_observation_store(
+    stand_home: Option<&Path>,
+    harness: &str,
+    profile: &Value,
+    environment: Option<&JsonMap<String, Value>>,
+) -> core::Result<()> {
+    verify_stand_native_store(stand_home, harness, profile, environment, false)
+}
+
+fn verify_stand_native_store(
+    stand_home: Option<&Path>,
+    harness: &str,
+    profile: &Value,
+    environment: Option<&JsonMap<String, Value>>,
+    require_proxy: bool,
+) -> core::Result<()> {
     let Some((root, native)) =
         stand_home.zip(core::api::HarnessCapabilities::of(harness).frozen_store_environment)
     else {
         return Ok(());
     };
-    require_stand_proxy(profile, native)?;
+    if require_proxy {
+        require_stand_proxy(profile, native)?;
+    }
     let home =
         canonical_stand_native_home(&root.join(native.private_directory), native.display_name)?;
     match std::fs::symlink_metadata(home.join(native.guard_file)) {
@@ -371,15 +394,33 @@ pub(crate) fn verify_stand_native_route(
     Err(core::Error::new("profile_error", native.binding_refusal))
 }
 
-/// Called only for a newly resolved launch, attach or metadata profile.
+/// Capture selectors for launch or a route-bound metadata operation.
 pub(crate) fn capture_native_store_inputs(
     profile: &mut Value,
     stand_home: Option<&Path>,
 ) -> core::Result<()> {
+    capture_store_inputs(profile, stand_home, true)
+}
+
+/// Capture selectors for an owner discovery or observe-only attach.
+pub(crate) fn capture_observation_store_inputs(
+    profile: &mut Value,
+    stand_home: Option<&Path>,
+) -> core::Result<()> {
+    capture_store_inputs(profile, stand_home, false)
+}
+
+fn capture_store_inputs(
+    profile: &mut Value,
+    stand_home: Option<&Path>,
+    require_proxy: bool,
+) -> core::Result<()> {
     let capabilities =
         core::api::HarnessCapabilities::of(profile["harness"].as_str().unwrap_or_default());
     let home = if let Some((root, native)) = stand_home.zip(capabilities.frozen_store_environment) {
-        require_stand_proxy(profile, native)?;
+        if require_proxy {
+            require_stand_proxy(profile, native)?;
+        }
         let home = root.join(native.private_directory);
         if let Err(error) = std::fs::create_dir(&home)
             && error.kind() != std::io::ErrorKind::AlreadyExists
