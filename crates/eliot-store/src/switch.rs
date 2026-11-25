@@ -1275,6 +1275,8 @@ impl Store {
                     transferred: &originals,
                     facts: Some(facts),
                     directive: directive.as_deref(),
+                    input_principal: None,
+                    restart: false,
                     now,
                 },
             )?

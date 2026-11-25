@@ -109,7 +109,9 @@ pub use presentation::{
     reason_words, swarm_note, swarm_note_with_trusted_review_labels,
 };
 pub use remote_call::{RemoteCallContext, RemoteIdentity};
-pub use restart::{RESTART_PRINCIPAL, format_restart_interrupted_turn_note_body};
+pub use restart::{
+    CONTINUE_FROM_STOP_ARG, RESTART_PRINCIPAL, format_restart_interrupted_turn_note_body,
+};
 pub use routing::{
     CapacityScope, MAX_AUTOMATIC_PROVIDER_PROBES, MAX_PROVIDER_RESET_HORIZON_MS,
     PROVIDER_LAUNCH_OVERRIDE_FIELDS, PROVIDER_MODEL_UNNAMED, PROVIDER_PROBE_LAUNCH_ARG,

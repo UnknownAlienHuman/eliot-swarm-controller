@@ -2153,7 +2153,10 @@ are excluded, and an Owner-applied Stop remains a fence. Eligible generations
 resume in batches of up to four commands within configured capacity. Roots
 resume before their children. Descendants wait for ancestors with interrupted
 work or undelivered input. A resumed generation with interrupted work opens with a
-framed Swarm note naming the interrupted turn; no prior input is replayed.
+framed Swarm continuation brief naming the interrupted turn. The brief uses the
+same bounded Git and Store evidence as a switch and retains the original task
+binding. The generated linked SEND is identified by its restart intent and
+cannot become a replacement task. No uncertain input is replayed.
 Resume uses the Agent's frozen profile and any inherited effective
 configuration from the retained generation. Goals and project assignments
 follow the Agent to its new generation. A Goal with unresolved prior work
@@ -2172,7 +2175,8 @@ worktrees remain fenced for Owner inspection.
 `swarm daemon update --interrupt-on-deadline` uses the ordinary Stop custody
 path for captured active turns after the wait expires. Under `continue`, an
 applied Stop with proven process exit and native source drain allows resume with
-the framed Swarm note after replacement or rollback, with interrupted parents before
+the same framed Swarm continuation brief after replacement or rollback. The Owner
+Resume binds the applied Stop and exact captured turn, with interrupted parents before
 their children. The old turn retains its observed outcome. `hold` keeps those
 generations stopped for the Owner.
 

@@ -27,6 +27,7 @@ use tokio::time::{Instant, sleep, timeout, timeout_at};
 
 const INTERRUPT_SETTLE_WAIT: Duration = Duration::from_secs(25);
 const RESUME_WAIT: Duration = Duration::from_secs(120);
+const CONTINUATION_BRIEF_SCHEMA: i64 = 139;
 
 fn print_update_value(value: &Value, json_output: bool) {
     print_value_or_human(value, json_output, || {
@@ -253,7 +254,12 @@ async fn run_update(
                     None
                 };
                 let (interruptions, resume_failed) = if recovered {
-                    Box::pin(resume_interrupted(&data_dir, &stopped)).await
+                    Box::pin(resume_interrupted(
+                        &data_dir,
+                        &stopped,
+                        previous.store_schema,
+                    ))
+                    .await
                 } else {
                     hold_interrupted(&stopped, "daemon admission unconfirmed")
                 };
@@ -346,7 +352,12 @@ async fn run_update(
         .await);
     }
     let backup_cleanup = discard_update_backup(&startup_path, backup.id).err();
-    let (interruptions, resume_failed) = Box::pin(resume_interrupted(&data_dir, &stopped)).await;
+    let (interruptions, resume_failed) = Box::pin(resume_interrupted(
+        &data_dir,
+        &stopped,
+        candidate.store_schema,
+    ))
+    .await;
 
     #[cfg(windows)]
     let (desktop, desktop_failed) = start_companion(&data_dir, desktop);
@@ -769,7 +780,11 @@ fn hold_interrupted(stopped: &[StoppedAgent], reason: &str) -> (Vec<Value>, bool
     )
 }
 
-async fn resume_interrupted(path: &Path, stopped: &[StoppedAgent]) -> (Vec<Value>, bool) {
+async fn resume_interrupted(
+    path: &Path,
+    stopped: &[StoppedAgent],
+    store_schema: i64,
+) -> (Vec<Value>, bool) {
     if stopped.is_empty() {
         return (Vec::new(), false);
     }
@@ -798,7 +813,12 @@ async fn resume_interrupted(path: &Path, stopped: &[StoppedAgent]) -> (Vec<Value
         {
             Err(Failure::new(1, "the interrupted parent did not resume"))
         } else {
-            match timeout_at(deadline, resume_stopped(path, candidate, deadline)).await {
+            match timeout_at(
+                deadline,
+                resume_stopped(path, candidate, store_schema, deadline),
+            )
+            .await
+            {
                 Ok(result) => result,
                 Err(_) => Err(Failure::timeout()),
             }
@@ -821,11 +841,12 @@ async fn resume_interrupted(path: &Path, stopped: &[StoppedAgent]) -> (Vec<Value
 async fn resume_stopped(
     path: &Path,
     candidate: &StoppedAgent,
+    store_schema: i64,
     deadline: Instant,
 ) -> Result<(), Failure> {
     let agent = &candidate.agent;
-    // The applied Stop proves custody closed. A pre-restart native stop
-    // carries a fresh continuation note for its captured turn.
+    // The daemon validates the applied Stop and renders the continuation
+    // from the retained task and exact stopped turn.
     let request = AgentGetRequest::new(&agent.id);
     let details: AgentGetResponse = eliot_daemon::client_call_typed(path, "agent.get", &request)
         .await
@@ -839,13 +860,17 @@ async fn resume_stopped(
             "the stopped generation changed before resume",
         ));
     }
-    let body = format!(
-        "The daemon update stopped {} while turn {} of generation {} was active. \
-         Read its retained outcome and reconcile the worktree (git status and git log on \
-         the task branch, plus the task card), then continue the task from the files as they are.",
-        agent.id, candidate.turn, agent.generation,
-    );
-    let args = json!({"text": eliot_core::swarm_note(&body, eliot_core::RESTART_PRINCIPAL)});
+    let args = if store_schema >= CONTINUATION_BRIEF_SCHEMA {
+        json!({(eliot_core::CONTINUE_FROM_STOP_ARG): candidate.stop_id})
+    } else {
+        // An older daemon recovered after cancellation or rollback only accepts text.
+        let body = eliot_core::format_restart_interrupted_turn_note_body(
+            &agent.id,
+            agent.generation,
+            Some(&candidate.turn),
+        );
+        json!({"text": eliot_core::swarm_note(&body, eliot_core::RESTART_PRINCIPAL)})
+    };
     let mut resume = submit_request(None, Some(agent.id.clone()), "resume", args)?;
     resume.expected_generation = Some(agent.generation);
     match submit_command(path, &resume).await {
@@ -908,7 +933,12 @@ async fn rollback(
         None
     };
     let (interruptions, _) = if pid.is_some() {
-        Box::pin(resume_interrupted(path, &agents_at_update.stopped)).await
+        Box::pin(resume_interrupted(
+            path,
+            &agents_at_update.stopped,
+            previous.store_schema,
+        ))
+        .await
     } else {
         hold_interrupted(&agents_at_update.stopped, "rollback unavailable")
     };

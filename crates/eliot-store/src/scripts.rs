@@ -147,6 +147,7 @@ impl Store {
                 CommandSubmission {
                     request: action,
                     event,
+                    continuation_text: None,
                 },
                 None,
                 now,

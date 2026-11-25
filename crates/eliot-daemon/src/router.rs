@@ -1363,20 +1363,35 @@ impl Router {
             .await;
             return None;
         }
+        let id = ulid::Ulid::new().to_string();
         let args = if candidate.interrupted {
-            let body = eliot_core::format_restart_interrupted_turn_note_body(
-                &candidate.agent,
-                candidate.generation,
-                candidate.turn_id.as_deref(),
-            );
-            json!({"text": eliot_core::swarm_note(&body, eliot_core::RESTART_PRINCIPAL)})
+            match self
+                .continuation_brief(
+                    &candidate.agent,
+                    candidate.generation,
+                    candidate.turn_id.as_deref(),
+                    &id,
+                )
+                .await
+            {
+                Ok(text) => json!({"text": text}),
+                Err(error) => {
+                    self.report_restart_resume_blocked(
+                        &candidate.agent,
+                        candidate.generation,
+                        error,
+                    )
+                    .await;
+                    return None;
+                }
+            }
         } else if let Some(text) = candidate.undelivered_send_text.as_deref() {
             json!({"text": text})
         } else {
             json!({})
         };
         let request = SubmitCommand {
-            id: ulid::Ulid::new().to_string(),
+            id,
             target: Some(candidate.agent.clone()),
             selector: None,
             verb: "resume".to_owned(),
@@ -1409,15 +1424,17 @@ impl Router {
             let mut store = self.inner.store.lock().await;
             match self.check_command_admission_mode("resume") {
                 Err(error) => Err(error),
-                Ok(()) => match store.submit_restart_resume(request, now_ms()) {
-                    Ok(admission) => {
-                        if !admission.events.is_empty() {
-                            self.publish_locked(&admission.events);
+                Ok(()) => {
+                    match store.submit_restart_resume(request, candidate.interrupted, now_ms()) {
+                        Ok(admission) => {
+                            if !admission.events.is_empty() {
+                                self.publish_locked(&admission.events);
+                            }
+                            Ok(admission)
                         }
-                        Ok(admission)
+                        Err(error) => Err(error),
                     }
-                    Err(error) => Err(error),
-                },
+                }
             }
         };
         match result {
@@ -1753,6 +1770,39 @@ impl Router {
                 self.check_command_admission_mode(&submission.request().verb)?;
                 self.reject_secret_command_args(submission.request())?;
                 Ok((submission, None))
+            } else if request.verb == "resume"
+                && request
+                    .args
+                    .get(eliot_core::CONTINUE_FROM_STOP_ARG)
+                    .is_some()
+            {
+                require_owner(principal)?;
+                self.check_command_admission_mode("resume")?;
+                self.reject_secret_command_args(&request)?;
+                let agent = request.target.as_deref().ok_or_else(|| {
+                    Error::new("invalid", "continuation Resume requires an Agent target")
+                })?;
+                let generation = request.expected_generation.ok_or_else(|| {
+                    Error::new(
+                        "invalid",
+                        "continuation Resume requires an exact generation",
+                    )
+                })?;
+                let stop = request.args[eliot_core::CONTINUE_FROM_STOP_ARG]
+                    .as_str()
+                    .ok_or_else(|| {
+                        Error::new("invalid", "continuation Resume requires a Stop command ID")
+                    })?;
+                let turn = self
+                    .inner
+                    .store
+                    .lock()
+                    .await
+                    .continuation_stop_turn(agent, generation, stop)?;
+                let text = self
+                    .continuation_brief(agent, generation, Some(&turn), &request.id)
+                    .await?;
+                Ok((CommandSubmission::resume_continuation(request, text)?, None))
             } else {
                 let PreparedSubmission { request, workspace } = self
                     .prepare_submission_after_authorization(request, principal, false, true)

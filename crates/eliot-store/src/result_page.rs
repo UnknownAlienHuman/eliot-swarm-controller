@@ -210,14 +210,27 @@ pub(super) fn record_generation_reason_tx(
 pub(super) fn record_restart_resume_intent_tx(
     tx: &Transaction<'_>,
     command_id: &str,
+    continuation_brief: bool,
 ) -> Result<()> {
     tx.execute(
-        "INSERT INTO restart_resume_intents(command_id) VALUES (?1)
+        "INSERT INTO restart_resume_intents(command_id,continuation_brief) VALUES (?1,?2)
          ON CONFLICT(command_id) DO NOTHING",
-        [command_id],
+        params![command_id, continuation_brief],
     )
     .map_err(sql_error)?;
     Ok(())
+}
+
+pub(super) fn is_restart_continuation_send(tx: &Connection, id: &str) -> Result<bool> {
+    tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM commands c JOIN commands p ON p.id=c.parent_command
+          LEFT JOIN restart_resume_intents r ON r.command_id=p.id
+          WHERE c.id=?1 AND c.link_kind='send' AND c.verb='send'
+            AND (r.continuation_brief OR json_type(p.args,'$.continue_from_stop')='text'))",
+        [id],
+        |row| row.get(0),
+    )
+    .map_err(sql_error)
 }
 
 /// Handoff may supply the first conversation of an already prepared Agent.

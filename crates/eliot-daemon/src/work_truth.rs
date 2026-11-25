@@ -1867,7 +1867,7 @@ pub(crate) async fn handoff_facts(
     task: Option<&str>,
     checkpoint: Option<&GitCheckpointView>,
     policy: &SecretPolicy,
-) -> Result<String> {
+) -> Result<(String, String)> {
     let git = GitProbe::new()?;
     let root = canonical_root(workspace)?;
     let status = fact(
@@ -1884,6 +1884,16 @@ pub(crate) async fn handoff_facts(
     )
     .await;
     let head = fact(&git, &root, &["rev-parse", "HEAD"], 128, policy).await;
+    let branch = status
+        .lines()
+        .next()
+        .and_then(|line| line.strip_prefix("## "))
+        .unwrap_or("(unavailable)");
+    let dirt = match (branch, status.lines().nth(1)) {
+        ("(unavailable)", _) => "unavailable",
+        (_, None) => "clean",
+        (_, Some(_)) => "dirty",
+    };
     let range = base.map_or_else(|| "HEAD".to_owned(), |base| format!("{base}..HEAD"));
     let log = fact(
         &git,
@@ -1973,8 +1983,12 @@ pub(crate) async fn handoff_facts(
             }
             lines
         });
-    Ok(format!(
-        "Worktree: {workspace}\nHEAD: {head}\nBase: {}\n{task}\n{snapshot}{not_captured}\n\nStatus (uncommitted files are listed here):\n{status}\n\nCommits since base (newest first):\n{log}\n\nDiff from base, including uncommitted tracked files:\n{stat}\n\nUncommitted patch of tracked files (new files are listed in the status):\n{patch}",
+    let summary = format!(
+        "Worktree: {workspace}\nCurrent Git branch: {branch}\nHEAD: {head}\nWorking tree: {dirt}\nBase: {}\n{task}\n{snapshot}\n\nRecent commits from the task base (newest first):\n{log}",
         base.unwrap_or("not recorded"),
-    ))
+    );
+    let detail = format!(
+        "{not_captured}\nStatus (uncommitted files are listed here):\n{status}\n\nDiff from base, including uncommitted tracked files:\n{stat}\n\nUncommitted patch of tracked files (new files are listed in the status):\n{patch}"
+    );
+    Ok((summary, detail))
 }

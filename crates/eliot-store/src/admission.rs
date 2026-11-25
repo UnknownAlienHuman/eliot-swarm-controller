@@ -1510,6 +1510,7 @@ fn admit_resume_tx(
     principal: &str,
     request: &SubmitCommand,
     payload_digest: &[u8],
+    continuation_text: Option<&str>,
     now: i64,
     events: &mut Vec<Event>,
 ) -> Result<Option<String>> {
@@ -1597,17 +1598,33 @@ fn admit_resume_tx(
             "resume requires a retained native_scope and native_ref",
         ));
     }
-    if request
-        .args
-        .as_object()
-        .is_some_and(|args| args.keys().any(|key| key != "text"))
+    if continuation_text.is_none()
+        && request
+            .args
+            .as_object()
+            .is_some_and(|args| args.keys().any(|key| key != "text"))
     {
         return Err(Error::new(
             "unsupported",
             "resume accepts only new linked input text; profile and subject are retained",
         ));
     }
-    let text = optional_string(&request.args, "text")?;
+    let (text, resume_args) = if let Some(text) = continuation_text {
+        if principal != "owner" || request.expected_generation != Some(agent.generation) {
+            return Err(Error::new(
+                "not_allowed",
+                "continuation Resume requires the Owner and exact generation",
+            ));
+        }
+        let stop = required_string(&request.args, core::CONTINUE_FROM_STOP_ARG)?;
+        handoff::continuation_stop_turn_tx(tx, &agent.id, agent.generation, &stop)?;
+        (
+            Some(text.to_owned()),
+            json!({(core::CONTINUE_FROM_STOP_ARG): stop}),
+        )
+    } else {
+        (optional_string(&request.args, "text")?, json!({}))
+    };
     if let Some(text) = &text {
         require_nonempty(text, "args.text")?;
         check_input(text)?;
@@ -1625,7 +1642,6 @@ fn admit_resume_tx(
         .generation
         .checked_add(1)
         .ok_or_else(|| Error::new("bad_state", "Agent generation cannot be incremented"))?;
-    let resume_args = json!({});
     events.push(admit_command(
         tx,
         &CommandInsert {
@@ -2239,6 +2255,7 @@ pub(super) fn submit_switch_launch_tx(
 pub(super) fn submit_restart_resume_tx(
     tx: &Transaction<'_>,
     request: SubmitCommand,
+    continuation_brief: bool,
     now: i64,
     limits: core::api::HierarchyLimits,
     policy: Option<&capacity::PolicyLoader>,
@@ -2257,7 +2274,7 @@ pub(super) fn submit_restart_resume_tx(
         false,
     )?;
     if admission.is_new {
-        super::result_page::record_restart_resume_intent_tx(tx, &command_id)?;
+        super::result_page::record_restart_resume_intent_tx(tx, &command_id, continuation_brief)?;
     }
     Ok(admission)
 }
@@ -2278,7 +2295,11 @@ fn submit_tx_mode(
     restart_resume: bool,
     linked_switch_launch: bool,
 ) -> Result<Admission> {
-    let CommandSubmission { mut request, event } = submission;
+    let CommandSubmission {
+        mut request,
+        event,
+        continuation_text,
+    } = submission;
     if linked_switch_launch && request.verb != "launch" {
         return Err(Error::new(
             "bad_state",
@@ -2474,17 +2495,25 @@ fn submit_tx_mode(
             )?;
             None
         }
-        "resume" => admit_resume_tx(tx, principal, &request, &payload_digest, now, &mut events)
-            .map_err(|error| {
-                if implicit_resume {
-                    implicit_resume_guidance(
-                        error,
-                        request.target.as_deref().unwrap_or("unknown Agent"),
-                    )
-                } else {
-                    error
-                }
-            })?,
+        "resume" => admit_resume_tx(
+            tx,
+            principal,
+            &request,
+            &payload_digest,
+            continuation_text.as_deref(),
+            now,
+            &mut events,
+        )
+        .map_err(|error| {
+            if implicit_resume {
+                implicit_resume_guidance(
+                    error,
+                    request.target.as_deref().unwrap_or("unknown Agent"),
+                )
+            } else {
+                error
+            }
+        })?,
         "configure" => {
             admit_configure_tx(tx, principal, &request, &payload_digest, now, &mut events)?;
             None

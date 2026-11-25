@@ -1187,9 +1187,44 @@ impl Store {
         Ok(value.flatten())
     }
 
-    /// Capture bounded original Owner input rows in Store admission order.
+    /// Recover the preceding task when an older daemon recorded its generated
+    /// restart note as a SEND task. The choice comes from the retained binding.
+    pub fn handoff_task_command(
+        &self,
+        agent: &str,
+        generation: i64,
+        requested: Option<&str>,
+    ) -> Result<Option<String>> {
+        let selected = self.work_task_command(agent, generation)?;
+        let command = requested
+            .filter(|id| !id.is_empty())
+            .or(selected.as_deref());
+        let Some(id) = command else {
+            return Ok(None);
+        };
+        if !result_page::is_restart_continuation_send(&self.connection, id)? {
+            return Ok(requested.map(str::to_owned));
+        }
+        self.connection
+            .query_row(
+                "SELECT t.task_command FROM git_work_tasks t
+                 LEFT JOIN commands c ON c.id=t.task_command
+                 LEFT JOIN commands p ON p.id=c.parent_command
+                 LEFT JOIN restart_resume_intents r ON r.command_id=c.parent_command
+                 WHERE t.agent=?1 AND t.generation=?2 AND t.task_command<>?3
+                   AND COALESCE(r.continuation_brief,0)=0
+                   AND json_type(p.args,'$.continue_from_stop') IS NOT 'text'
+                 ORDER BY t.updated_at DESC,t.rowid DESC LIMIT 1",
+                params![parse_agent_id(agent)?, generation, id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(sql_error)
+    }
+
+    /// Capture bounded Owner and manager inputs in Store admission order.
     /// The Git task record keeps them after command retention or another switch.
-    pub fn task_owner_corrections(
+    pub fn task_corrections(
         &self,
         agent: &str,
         generation: i64,
@@ -1206,10 +1241,15 @@ impl Store {
             .prepare(
                 "SELECT c.id, COUNT(*) OVER (), c.created_at, c.rowid FROM commands c
              LEFT JOIN commands parent ON parent.id = c.parent_command
-             WHERE c.target = ?1 AND c.generation = ?2 AND c.principal = 'owner'
+             WHERE c.target = ?1 AND c.generation = ?2
+               AND (c.principal='owner' OR (c.principal GLOB 'agent:a[0-9]*:*'
+                    AND substr(c.principal,1,length(?5))<>?5))
                AND c.id <> ?3 AND c.verb IN ('send', 'steer', 'inject')
                AND c.state <> 'rejected'
                AND c.link_kind IS NOT 'handoff' AND c.link_kind IS NOT 'rule_action'
+               AND json_type(parent.args,'$.continue_from_stop') IS NOT 'text'
+               AND NOT EXISTS (SELECT 1 FROM restart_resume_intents r
+                               WHERE r.command_id=c.parent_command AND r.continuation_brief)
                AND json_extract(c.cause, '$.rule') IS NULL
                AND json_extract(parent.cause, '$.rule') IS NULL
                AND json_type(c.args, '$.text') = 'text'
@@ -1223,7 +1263,13 @@ impl Store {
             .map_err(sql_error)?;
         let rows = statement
             .query_map(
-                params![parse_agent_id(agent)?, generation, task, LIMIT + 1],
+                params![
+                    parse_agent_id(agent)?,
+                    generation,
+                    task,
+                    LIMIT + 1,
+                    format!("agent:{agent}:"),
+                ],
                 |row| {
                     Ok((
                         row.get::<_, String>(0)?,
@@ -1341,6 +1387,10 @@ impl Store {
                    AND state IN ('dispatched','applied','unknown')
                    AND (link_kind IS NOT 'handoff' OR ordinal > 0)
                    AND principal NOT LIKE 'swarm_note:%'
+                   AND NOT EXISTS (SELECT 1 FROM commands p WHERE p.id=commands.parent_command
+                                   AND json_type(p.args,'$.continue_from_stop')='text')
+                   AND NOT EXISTS (SELECT 1 FROM restart_resume_intents r
+                                   WHERE r.command_id=commands.parent_command AND r.continuation_brief)
                    AND json_type(args, '$.text') = 'text'
                  ORDER BY created_at, rowid LIMIT 1",
                 [parse_agent_id(agent)?],
@@ -1363,6 +1413,7 @@ impl Store {
             || command.target.as_deref() != Some(agent)
             || command.principal.starts_with("swarm_note:")
             || handoff::is_brief_tx(&self.connection, id)?
+            || result_page::is_restart_continuation_send(&self.connection, id)?
             || !matches!(
                 command.state,
                 CommandState::Dispatched | CommandState::Applied | CommandState::Unknown

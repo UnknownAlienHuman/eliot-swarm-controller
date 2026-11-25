@@ -6,6 +6,7 @@
 /// `Swarm` sender in [`crate::swarm_note`], beside the background-wake
 /// principal.
 pub const RESTART_PRINCIPAL: &str = "swarm_note:daemon_restart";
+pub const CONTINUE_FROM_STOP_ARG: &str = "continue_from_stop";
 
 /// Format the body of the Swarm note delivered as the first input of a
 /// resume admitted for a restart-interrupted generation. `turn_id` names the
