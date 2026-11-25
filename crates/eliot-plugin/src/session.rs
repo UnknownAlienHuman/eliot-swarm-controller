@@ -1170,6 +1170,31 @@ pub struct StreamSource<'a> {
 }
 
 impl StreamSource<'_> {
+    /// Decide whether Stop can settle against this source.
+    pub fn needs_stop_settlement(&self, stopped: bool) -> Result<bool> {
+        if stopped {
+            return Ok(false);
+        }
+        if *self.writes_blocked {
+            return Err(Error::new(
+                "unknown",
+                format!("{} source acknowledgement is unresolved", self.harness),
+            ));
+        }
+        Ok(true)
+    }
+
+    /// Stop may finish only after the source's terminal event is committed.
+    pub async fn commit_session_end(&mut self, native_session: Option<&str>) -> Result<()> {
+        let native_id = format!(
+            "{}:{}:session.ended",
+            self.id_prefix,
+            native_session.unwrap_or("unresolved")
+        );
+        self.commit_event("session.ended", native_id, json!({}))
+            .await
+    }
+
     /// Latch the incomplete source. A definite batch rejection already has a
     /// host-owned gap, so only other errors can require a new adapter gap.
     pub async fn note_event_failure(&mut self, error: &Error, gap_reason: &str) -> bool {

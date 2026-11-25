@@ -5,7 +5,7 @@ use crate::{
     host::{contextual_error, native_scope},
     native::{
         NativeClient, NativeFrame, NativeLaunch, NativeProcess,
-        startup_retry::{StartupFailureEvidence, native_start_failed},
+        startup_retry::{native_start_failed, state_runtime_init_signature},
         store_policy::ensure_store_pin_supported,
         types::{
             NativeClientInfo, NativeDiscoveryConfigReadResponse, NativeDiscoverySourceKind,
@@ -30,7 +30,7 @@ use eliot_core::{
 use eliot_plugin::quota::projection::{usage_bound, window_facts};
 use eliot_plugin::{
     DiscoverParams, MAX_EVENT_BYTES,
-    retry::{Retry, RetryOperation, StartupAfterFailure},
+    retry::{StartupAttempt, StartupFailure, StartupFailureFact, start_read_only_native},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -1282,74 +1282,69 @@ async fn start_initialized_reader(
     diagnostic_secrets: &[String],
     deadline: Instant,
 ) -> Result<(NativeProcess, JoinHandle<()>, NativeInitializeResponse)> {
-    let mut retry = Retry::new(RetryOperation::NativeStartup);
-    loop {
-        if Instant::now() >= deadline {
-            // This refusal is before spawn; no native process or session exists.
-            return Err(native_start_failed());
-        }
-        let (mut native, drainer, native_frame_seen) =
-            spawn_reader(&launch, diagnostic_secrets, deadline).await?;
-        let client = native.client();
-        let mut initialize_response_received = false;
-        let mut initialize_request_failed = false;
-        let initialized = initialize_reader(
-            &client,
-            metadata_secrets,
-            deadline,
-            &mut initialize_response_received,
-            &mut initialize_request_failed,
-        )
-        .await;
-        let initialized = match initialized {
-            Ok(initialized) => initialized,
-            Err(initialize_error) => {
-                // Observe a natural exit before cleanup can terminate the process.
-                let natural_exit = wait_for_natural_startup_exit(&mut native, deadline).await;
-                finish_reader(&mut native, Some(drainer)).await?;
-                let stderr = client.stderr_snapshot();
-                let evidence = StartupFailureEvidence {
-                    initialize_request_failed,
-                    initialize_response_received,
-                    process_exited_unsuccessfully: natural_exit
-                        .is_some_and(|status| !status.success()),
-                    output_fully_drained: true,
-                    thread_or_session_request_sent: false,
-                    native_frame_seen: native_frame_seen.load(Ordering::Acquire),
-                    stderr: &stderr,
-                };
-                let no_effect = evidence.initialize_request_failed
-                    && !evidence.initialize_response_received
-                    && evidence.proves_no_thread_or_session_effect(true);
-                match retry
-                    .after_start_failure(evidence.retryable(), no_effect, deadline)
-                    .await
-                {
-                    StartupAfterFailure::Retry => continue,
-                    StartupAfterFailure::Failed => {
-                        return Err(client.diagnostic_error(native_start_failed()));
-                    }
-                    StartupAfterFailure::Unresolved => {
-                        return Err(client.diagnostic_error(initialize_error));
-                    }
-                }
-            }
-        };
+    start_read_only_native(deadline, native_start_failed, || {
+        initialize_reader_attempt(&launch, metadata_secrets, diagnostic_secrets, deadline)
+    })
+    .await
+}
 
-        // A received initialize response or initialized notification failure is
-        // never eligible for retry. No session or thread request has run yet.
-        if let Err(error) = notify_initialized(&client, deadline).await {
+async fn initialize_reader_attempt(
+    launch: &NativeLaunch,
+    metadata_secrets: &[String],
+    diagnostic_secrets: &[String],
+    deadline: Instant,
+) -> Result<StartupAttempt<(NativeProcess, JoinHandle<()>, NativeInitializeResponse)>> {
+    let (mut native, drainer, native_frame_seen) =
+        spawn_reader(launch, diagnostic_secrets, deadline).await?;
+    let client = native.client();
+    let mut initialize_response_received = false;
+    let mut initialize_request_failed = false;
+    let initialized = initialize_reader(
+        &client,
+        metadata_secrets,
+        deadline,
+        &mut initialize_response_received,
+        &mut initialize_request_failed,
+    )
+    .await;
+    let initialized = match initialized {
+        Ok(initialized) => initialized,
+        Err(error) => {
+            // Observe a natural exit before cleanup can terminate the process.
+            let natural_exit = wait_for_natural_startup_exit(&mut native, deadline).await;
             finish_reader(&mut native, Some(drainer)).await?;
-            if native_frame_seen.load(Ordering::Acquire) {
-                return Err(client.diagnostic_error(Error::new(
-                    "unknown",
-                    "Codex native startup emitted an unexpected native frame",
-                )));
-            }
-            return Err(client.diagnostic_error(error));
+            let stderr = client.stderr_snapshot();
+            return Ok(StartupAttempt::InitializationFailed(Box::new(
+                StartupFailure {
+                    fact: StartupFailureFact {
+                        initialize_request_failed,
+                        initialize_response_received,
+                        natural_failure_exit_observed: natural_exit
+                            .is_some_and(|status| !status.success()),
+                        output_complete: stderr.eof && !stderr.truncated && !stderr.read_error,
+                        unexpected_native_frame: native_frame_seen.load(Ordering::Acquire),
+                        local_state_initialization_failed: state_runtime_init_signature(
+                            &stderr.text,
+                        ),
+                    },
+                    error: client.diagnostic_error(error),
+                    pre_effect_error: client.diagnostic_error(native_start_failed()),
+                },
+            )));
         }
-        return Ok((native, drainer, initialized));
+    };
+
+    if let Err(error) = notify_initialized(&client, deadline).await {
+        finish_reader(&mut native, Some(drainer)).await?;
+        if native_frame_seen.load(Ordering::Acquire) {
+            return Err(client.diagnostic_error(Error::new(
+                "unknown",
+                "Codex native startup emitted an unexpected native frame",
+            )));
+        }
+        return Err(client.diagnostic_error(error));
     }
+    Ok(StartupAttempt::Ready((native, drainer, initialized)))
 }
 
 async fn spawn_reader(

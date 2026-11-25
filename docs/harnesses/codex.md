@@ -556,9 +556,9 @@ Codex 0.167.1's native `TurnError` requires `message` and may include
 schema has no dedicated provider-withholding code. The adapter falls back to the
 failed turn's exact error message after trimming outer whitespace. It applies the
 same classification to stream terminals, native turn readback and rollout history.
-The fallback matches this message.
-
-> You're approved for Daybreak Blue, but this response cannot be shown as this session was not authenticated with one of your authorized hardware keys. Please re-authenticate with your hardware key and try your request again.
+The adapter uses the
+[recorded Codex 0.167.1 TurnError message](../../plugins/codex/fixtures/withheld-turn-error-message-0.167.1.txt)
+to translate that case into the shared typed fact.
 
 A match sets `provider_response_withheld: true` and carries the shared typed
 `provider_response_withheld_fact` with optional absolute Unix-millisecond
@@ -642,10 +642,11 @@ initialization failure. The gated debug build's mean cycle was 15.5 seconds vers
 The lock has been removed. The underlying SQLite/OS error remains unknown; contention
 is a hypothesis, and Eliot cannot coordinate other Codex processes sharing the home.
 
-Each metadata process may retry initialization once after a short randomized backoff
-defined by [the startup retry helper](../../plugins/codex/src/native/startup_retry.rs),
-within the existing read deadline, only when its owned process independently exited
-unsuccessfully and complete stderr matches the state-runtime initialization signature.
+The adapter maps the native initialization error, exit and drained output into a
+startup failure fact. The [shared startup retry policy](../../crates/eliot-plugin/src/retry.rs)
+may start a fresh metadata reader once after a short randomized backoff, within
+the existing read deadline. The owned process must have independently exited
+unsuccessfully, and complete stderr must match the state-runtime initialization signature.
 The retry boundary owns spawn and initialization: only `initialize` may have been sent
 to the failed process; no successful initialization, configuration read, thread/session
 request or binding on that process may precede a retry. An earlier selection probe may

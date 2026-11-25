@@ -92,10 +92,69 @@ fn readiness_settle_delay(retries: u32) -> Duration {
         .min(READINESS_SETTLE_MAX)
 }
 
-pub enum StartupAfterFailure {
+enum StartupAfterFailure {
     Retry,
     Failed,
     Unresolved,
+}
+
+/// Evidence produced after the owned initialization attempt was reaped.
+pub struct StartupFailureFact {
+    pub initialize_request_failed: bool,
+    pub initialize_response_received: bool,
+    pub natural_failure_exit_observed: bool,
+    pub output_complete: bool,
+    pub unexpected_native_frame: bool,
+    pub local_state_initialization_failed: bool,
+}
+
+pub struct StartupFailure {
+    pub fact: StartupFailureFact,
+    pub error: eliot_core::Error,
+    pub pre_effect_error: eliot_core::Error,
+}
+
+pub enum StartupAttempt<T> {
+    Ready(T),
+    InitializationFailed(Box<StartupFailure>),
+}
+
+/// Retry one owned, read-only initialization before it issues any native
+/// session or thread request. Later failures go straight to the caller.
+pub async fn start_read_only_native<T, Attempt>(
+    deadline: Instant,
+    pre_spawn_refusal: impl Fn() -> eliot_core::Error,
+    mut attempt: impl FnMut() -> Attempt,
+) -> eliot_core::Result<T>
+where
+    Attempt: Future<Output = eliot_core::Result<StartupAttempt<T>>> + Send,
+{
+    let mut retry = Retry::new(RetryOperation::NativeStartup);
+    loop {
+        if Instant::now() >= deadline {
+            return Err(pre_spawn_refusal());
+        }
+        let failure = match attempt().await? {
+            StartupAttempt::Ready(ready) => return Ok(ready),
+            StartupAttempt::InitializationFailed(failure) => failure,
+        };
+        let fact = &failure.fact;
+        let no_effect = fact.initialize_request_failed
+            && !fact.initialize_response_received
+            && fact.output_complete
+            && !fact.unexpected_native_frame;
+        let eligible = no_effect
+            && fact.natural_failure_exit_observed
+            && fact.local_state_initialization_failed;
+        match retry
+            .after_start_failure(eligible, no_effect, deadline)
+            .await
+        {
+            StartupAfterFailure::Retry => {}
+            StartupAfterFailure::Failed => return Err(failure.pre_effect_error),
+            StartupAfterFailure::Unresolved => return Err(failure.error),
+        }
+    }
 }
 
 pub struct Retry {
@@ -125,7 +184,7 @@ impl Retry {
     /// Decide how to finish a failed initialization from native proof. If
     /// complete pre-effect evidence allowed a retry but the deadline cannot
     /// fit it, the attempted startup still failed before creating a session.
-    pub async fn after_start_failure(
+    async fn after_start_failure(
         &mut self,
         eligible: bool,
         proved_no_effect: bool,

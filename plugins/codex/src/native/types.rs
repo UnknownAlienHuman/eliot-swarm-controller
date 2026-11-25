@@ -14,7 +14,10 @@
 //! DTOs only: no I/O, no process spawning, no config access.
 //! L2.2 control verbs (steer/interrupt/deltas) return with a real caller.
 
-use eliot_core::{ProviderRestriction, ProviderRestrictionKind};
+use eliot_core::{
+    ProviderRestriction, ProviderRestrictionKind,
+    api::{ProviderResponseWithheldDetection, ProviderResponseWithheldFact},
+};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -514,12 +517,30 @@ pub struct NativeTurnError {
 /// a response for a session without an authorized hardware key. No structured
 /// `codexErrorInfo` variant is known for this hold, so this sentence is the
 /// fallback evidence on every terminal path (live, readback and history).
-const PROVIDER_RESPONSE_WITHHELD_MESSAGE: &str = "You're approved for Daybreak Blue, but this response cannot be shown as this session was not authenticated with one of your authorized hardware keys. Please re-authenticate with your hardware key and try your request again.";
+const PROVIDER_RESPONSE_WITHHELD_MESSAGE: &str =
+    include_str!("../../fixtures/withheld-turn-error-message-0.167.1.txt");
+pub(crate) const WITHHELD_LEGACY_EVIDENCE: &str = "text_fallback";
 
 /// Outer whitespace is benign; nested metadata and other output are not part
 /// of this signal.
-pub(crate) fn response_withheld_evidence_from_message(message: &str) -> Option<&'static str> {
-    (message.trim() == PROVIDER_RESPONSE_WITHHELD_MESSAGE).then_some("text_fallback")
+pub(crate) fn response_withheld_fact_from_message(
+    message: &str,
+) -> Option<ProviderResponseWithheldFact> {
+    (message.trim() == PROVIDER_RESPONSE_WITHHELD_MESSAGE.trim_end()).then(|| {
+        ProviderResponseWithheldFact::new(
+            ProviderResponseWithheldDetection::ExactNativeMessage,
+            None,
+        )
+    })
+}
+
+pub(crate) fn attach_response_withheld_fact(
+    data: &mut serde_json::Value,
+    fact: &ProviderResponseWithheldFact,
+) {
+    data["provider_response_withheld"] = serde_json::Value::Bool(true);
+    data["provider_response_withheld_evidence"] = serde_json::json!(WITHHELD_LEGACY_EVIDENCE);
+    data["provider_response_withheld_fact"] = serde_json::json!(fact);
 }
 
 pub(crate) fn history_missing_tool_output(message: &str) -> bool {
@@ -539,20 +560,8 @@ pub(crate) fn history_missing_tool_output(message: &str) -> bool {
 impl NativeTurnError {
     /// Match only the required `TurnError.message` value from Codex's native
     /// terminal envelope.
-    pub(crate) fn response_withheld_evidence(&self) -> Option<&'static str> {
-        response_withheld_evidence_from_message(&self.message)
-    }
-
-    pub(crate) fn response_withheld_fact(
-        &self,
-    ) -> Option<eliot_core::api::ProviderResponseWithheldFact> {
-        self.response_withheld_evidence()?;
-        // The verified Codex withholding protocol provides no reset field.
-        // Do not infer one from unrelated error metadata.
-        Some(eliot_core::api::ProviderResponseWithheldFact::new(
-            eliot_core::api::ProviderResponseWithheldDetection::ExactNativeMessage,
-            None,
-        ))
+    pub(crate) fn response_withheld_fact(&self) -> Option<ProviderResponseWithheldFact> {
+        response_withheld_fact_from_message(&self.message)
     }
 
     /// Installed codex-cli 0.167.1 CodexErrorInfo. HTTP status is forwarded

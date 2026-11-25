@@ -23,8 +23,10 @@ pub mod settle;
 pub mod skill;
 pub mod start_classification;
 mod stderr;
+pub mod stop_readback;
 pub mod sync;
 pub mod text_inference;
+pub mod turn_containment;
 pub mod turn_readback;
 pub mod usage;
 

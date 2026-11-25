@@ -123,6 +123,9 @@ is rejected, and an unmatched verb/choice rejects before any native
 write. The plugin writes `{outcome: {outcome: "selected", optionId}}`
 and commits `request.resolved`; only a proven no-write keeps the ask
 answerable, anything uncertain latches unknown without a rewrite.
+When an ask cannot be presented, shared settlement chooses the first one-time
+refusal, then the first standing refusal, then cancellation. The adapter
+maps the offered refusal kinds and encodes the ACP reply.
 Nothing is ever auto-approved: an unanswered ask keeps the turn busy
 (and the Agent waiting) until the owner, the manager, or a cancel
 resolves it. A validated permission ask associates the pending input
@@ -355,8 +358,9 @@ commandless native turn only when no prompt is outstanding. The adapter commits
 response; later ACP updates and `hook.before_model` facts use that local turn id.
 
 `Stop` carries `terminationReason` and optional `error`, outside the ACP frame
-order. The adapter sends a fenced read-only `session/list` and settles the turn
-only after that exact reply is consumed behind earlier ACP updates.
+order. The adapter sends a fenced read-only `session/list`. Shared readback
+binds the hook to the exact native turn, checks the ordered reply and
+reconciles an unresolved turn only with that evidence.
 `NO_TOOL_CALL`, `model_stop` and `max_steps_exceeded` complete normally; `ERROR`
 or a non-empty `error` fails; an unfamiliar reason remains `unknown`.
 `fullyIdle` and `continuationActive` do not predict another wake or terminal.

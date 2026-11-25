@@ -3225,7 +3225,9 @@ async fn read_owned_turn(
         status: Some(status.to_owned()),
         final_text,
         terminal,
-        provider_response_withheld_evidence: withheld_evidence.as_ref().map(|_| "text_fallback"),
+        provider_response_withheld_evidence: withheld_evidence
+            .as_ref()
+            .map(|_| crate::native::types::WITHHELD_LEGACY_EVIDENCE),
         provider_response_withheld_fact: withheld_evidence,
     }))
 }

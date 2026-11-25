@@ -28,7 +28,7 @@ use eliot_core::{
 };
 use eliot_plugin::{
     CommitSink, MAX_EVENT_BYTES, PeerClient,
-    event_actor::EventActor,
+    event_actor::{EventActor, StopDrain, StopRequest},
     event_buffer::EarlyEventBuffer,
     native_data::{UNCLASSIFIED_NATIVE_EVENT, unclassified},
     native_stdio::StreamState,
@@ -418,10 +418,8 @@ struct EventProcessor {
     buffer: EarlyEventBuffer<SseEnvelope>,
     gap_number: u64,
     accept_frames: bool,
-    planned_stop: bool,
     loss_reason: Option<&'static str>,
-    frames_drained: bool,
-    pending_end_stop: Option<oneshot::Sender<Result<()>>>,
+    stop_drain: StopDrain,
     close_frames: bool,
     writes_blocked: bool,
     gap_reported: bool,
@@ -768,10 +766,8 @@ impl EventProcessor {
             buffer: EarlyEventBuffer::new(),
             gap_number: 0,
             accept_frames: true,
-            planned_stop: false,
             loss_reason: None,
-            frames_drained: false,
-            pending_end_stop: None,
+            stop_drain: StopDrain::default(),
             close_frames: false,
             writes_blocked: false,
             gap_reported: false,
@@ -927,50 +923,24 @@ impl EventProcessor {
                 true
             }
             Control::BeginStop { reply } => {
-                self.planned_stop = true;
+                self.stop_drain.begin();
                 self.abort_context_hooks();
                 let _ = reply.send(Ok(()));
                 true
             }
             Control::EndStop { reply } => {
-                if self.frames_drained {
-                    let result = self.finish_stop().await;
-                    let _ = reply.send(result);
-                } else if self.pending_end_stop.is_some() {
-                    let _ = reply.send(Err(Error::new(
-                        "bad_state",
-                        "OpenCode stop is already waiting for native output drain",
-                    )));
-                } else {
-                    self.pending_end_stop = Some(reply);
-                }
+                self.request_stop_settlement(reply, false).await;
                 true
             }
             Control::DrainStop { reply } => {
-                self.planned_stop = true;
+                self.stop_drain.begin();
                 self.abort_context_hooks();
-                if self.frames_drained {
-                    let result = self.finish_stop().await;
-                    let _ = reply.send(result);
-                } else if self.pending_end_stop.is_some() {
-                    let _ = reply.send(Err(Error::new(
-                        "bad_state",
-                        "OpenCode stop is already waiting for native output drain",
-                    )));
-                } else {
-                    self.pending_end_stop = Some(reply);
-                    self.close_frames = true;
-                }
+                self.request_stop_settlement(reply, true).await;
                 true
             }
             Control::Close { reply } => {
                 self.abort_context_hooks();
-                if let Some(pending) = self.pending_end_stop.take() {
-                    let _ = pending.send(Err(Error::new(
-                        "unknown",
-                        "OpenCode native event queue closed before stop settlement",
-                    )));
-                }
+                self.stop_drain.fail_pending("OpenCode");
                 let _ = reply.send(());
                 false
             }
@@ -987,7 +957,7 @@ impl EventProcessor {
         }
         match current {
             StreamState::Closed => {
-                if !self.planned_stop {
+                if !self.stop_drain.is_planned() {
                     self.defer_gap("OpenCode event stream closed");
                 }
             }
@@ -1049,17 +1019,19 @@ impl EventProcessor {
                 }
             }
             None => {
-                self.frames_drained = true;
+                self.stop_drain.mark_drained();
                 self.accept_frames = false;
                 if !self.buffer.is_empty() {
                     self.buffer.clear();
                     self.defer_gap("OpenCode native events remained unassociated at stream end");
                 }
-                if !self.planned_stop && self.loss_reason.is_none() {
+                if !self.stop_drain.is_planned() && self.loss_reason.is_none() {
                     self.defer_gap("OpenCode native event reader closed");
                 }
                 self.report_gap_if_queue_empty(true).await;
-                self.finish_pending_end_stop().await;
+                if let Some(receipt) = self.stop_drain.take_ready() {
+                    receipt.finish(self.finish_stop().await);
+                }
             }
         }
     }
@@ -2199,7 +2171,7 @@ impl EventProcessor {
         if self.status.session_id.as_deref() != Some(deleted.session_id.as_str()) {
             return Ok(());
         }
-        if self.planned_stop || self.status.stopped {
+        if self.stop_drain.is_planned() || self.status.stopped {
             return Ok(());
         }
         self.record_gap("OpenCode native session ended outside Eliot stop")
@@ -2897,21 +2869,26 @@ impl EventProcessor {
         self.commit_event("turn.completed", native_id, data).await
     }
 
+    async fn request_stop_settlement(
+        &mut self,
+        reply: oneshot::Sender<Result<()>>,
+        seal_frames: bool,
+    ) {
+        match self.stop_drain.request(reply, "OpenCode") {
+            StopRequest::Ready(receipt) => receipt.finish(self.finish_stop().await),
+            StopRequest::Waiting if seal_frames => self.close_frames = true,
+            StopRequest::Waiting | StopRequest::Refused => {}
+        }
+    }
+
     async fn finish_stop(&mut self) -> Result<()> {
-        if self.status.stopped {
+        let stopped = self.status.stopped;
+        if !self.stream_source().needs_stop_settlement(stopped)? {
             return Ok(());
         }
-        if self.writes_blocked {
-            return Err(Error::new(
-                "unknown",
-                "OpenCode source acknowledgement is unresolved",
-            ));
-        }
-        let native_id = format!(
-            "opencode:{}:session.ended",
-            self.status.session_id.as_deref().unwrap_or("unresolved")
-        );
-        self.commit_event("session.ended", native_id, json!({}))
+        let session = self.status.session_id.clone();
+        self.stream_source()
+            .commit_session_end(session.as_deref())
             .await?;
         if let (Some(command_id), Some(turn_id)) = (
             self.status.active_command_id.clone(),
@@ -2944,16 +2921,6 @@ impl EventProcessor {
         self.seen_cancelled.clear();
         self.delivered_turn.clear();
         Ok(())
-    }
-
-    async fn finish_pending_end_stop(&mut self) {
-        if !self.frames_drained {
-            return;
-        }
-        if let Some(reply) = self.pending_end_stop.take() {
-            let result = self.finish_stop().await;
-            let _ = reply.send(result);
-        }
     }
 
     async fn commit_event(&mut self, kind: &str, native_id: String, data: Value) -> Result<()> {
@@ -4199,7 +4166,7 @@ async fn run(
             }
         }
         processor.expire_pending_hooks();
-        processor.status.native_drained = processor.frames_drained;
+        processor.status.native_drained = processor.stop_drain.is_drained();
         let _ = status_tx.send(processor.status.clone());
     }
     processor.abort_context_hooks();

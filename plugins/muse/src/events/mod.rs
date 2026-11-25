@@ -8,7 +8,7 @@ use eliot_core::{
 };
 use eliot_plugin::{
     CommitSink, MAX_EVENT_BYTES, PeerClient,
-    event_actor::EventActor,
+    event_actor::{EventActor, StopDrain, StopRequest},
     event_buffer::{BufferedRpcFrame as BufferedNativeFrame, EarlyEventBuffer},
     native_child::{ChildAction, binding_from_ack, is_admission_rejection, register_child},
     native_data::{UNCLASSIFIED_NATIVE_EVENT, unclassified},
@@ -18,6 +18,10 @@ use eliot_plugin::{
         attach_provider_restriction, event_id as shared_event_id, native_no_write,
         next_input_outcomes, rejected_control, request_event_id, request_reply_applied,
         unknown_control,
+    },
+    turn_containment::{
+        ModelDisposition, cancellation_deadline, model_disposition, model_terminal,
+        stop_after_cancel, wait_for_containment_stop,
     },
 };
 use serde::Serialize;
@@ -545,10 +549,8 @@ struct EventProcessor {
     pending_completion_usage: Option<(String, eliot_core::TurnUsage)>,
     gap_number: u64,
     accept_frames: bool,
-    planned_stop: bool,
     loss_reason: Option<String>,
-    frames_drained: bool,
-    pending_end_stop: Option<oneshot::Sender<Result<()>>>,
+    stop_drain: StopDrain,
     writes_blocked: bool,
     gap_reported: bool,
     /// The native transport itself was lost (queue overflow, unplanned close,
@@ -634,20 +636,7 @@ pub(crate) fn spawn(
 
 impl EventHandle {
     pub async fn wait_for_model_stop(&self) {
-        let mut status = self.actor.watch().clone();
-        loop {
-            let deadline = status.borrow_and_update().model_stop_at;
-            if let Some(deadline) = deadline {
-                match timeout_at(deadline, status.changed()).await {
-                    Err(_) if status.borrow().model_stop_at == Some(deadline) => return,
-                    Err(_) | Ok(Ok(())) => continue,
-                    Ok(Err(_)) => break,
-                }
-            } else if status.changed().await.is_err() {
-                break;
-            }
-        }
-        std::future::pending::<()>().await;
+        wait_for_containment_stop(self.actor.watch().clone(), |status| status.model_stop_at).await;
     }
 
     pub async fn view_readback(
@@ -879,10 +868,8 @@ impl EventProcessor {
             pending_completion_usage: None,
             gap_number: 0,
             accept_frames: true,
-            planned_stop: false,
             loss_reason: None,
-            frames_drained: false,
-            pending_end_stop: None,
+            stop_drain: StopDrain::default(),
             writes_blocked: false,
             gap_reported: false,
             transport_loss: false,
@@ -1034,21 +1021,13 @@ impl EventProcessor {
                 true
             }
             Control::BeginStop { reply } => {
-                self.planned_stop = true;
+                self.stop_drain.begin();
                 let _ = reply.send(Ok(()));
                 true
             }
             Control::EndStop { reply } => {
-                if self.frames_drained {
-                    let result = self.finish_stop().await;
-                    let _ = reply.send(result);
-                } else if self.pending_end_stop.is_some() {
-                    let _ = reply.send(Err(Error::new(
-                        "bad_state",
-                        "Muse stop is already waiting for native output drain",
-                    )));
-                } else {
-                    self.pending_end_stop = Some(reply);
+                if let StopRequest::Ready(receipt) = self.stop_drain.request(reply, "Muse") {
+                    receipt.finish(self.finish_stop().await);
                 }
                 true
             }
@@ -1068,12 +1047,7 @@ impl EventProcessor {
                 true
             }
             Control::Close { reply } => {
-                if let Some(pending) = self.pending_end_stop.take() {
-                    let _ = pending.send(Err(Error::new(
-                        "unknown",
-                        "Muse native event queue closed before stop settlement",
-                    )));
-                }
+                self.stop_drain.fail_pending("Muse");
                 let _ = reply.send(());
                 false
             }
@@ -1086,7 +1060,7 @@ impl EventProcessor {
         }
         match current {
             StreamState::Closed => {
-                if !self.planned_stop {
+                if !self.stop_drain.is_planned() {
                     self.defer_gap("Muse session host event stream closed");
                     self.transport_loss = true;
                 }
@@ -1237,7 +1211,7 @@ impl EventProcessor {
                 }
             }
             None => {
-                self.frames_drained = true;
+                self.stop_drain.mark_drained();
                 self.accept_frames = false;
                 if !self.buffer.is_empty() {
                     self.buffer.clear();
@@ -1246,15 +1220,17 @@ impl EventProcessor {
                 if !self.pending_requests.is_empty() {
                     self.defer_gap("Muse native requests remained unresolved at stream end");
                 }
-                if !self.planned_stop && self.loss_reason.is_none() {
+                if !self.stop_drain.is_planned() && self.loss_reason.is_none() {
                     self.defer_gap("Muse native event reader closed");
                 }
-                if !self.planned_stop {
+                if !self.stop_drain.is_planned() {
                     self.transport_loss = true;
                 }
                 self.settle_workflow_children().await;
                 self.report_gap_if_queue_empty(true).await;
-                self.finish_pending_end_stop().await;
+                if let Some(receipt) = self.stop_drain.take_ready() {
+                    receipt.finish(self.finish_stop().await);
+                }
             }
         }
         true
@@ -1642,9 +1618,9 @@ impl EventProcessor {
             .await?;
         self.messages = TurnMessages::default();
         if cancellation.is_some() {
-            let deadline = Instant::now() + Duration::from_secs(5);
-            let accepted = provider::cancel(&self.native, &session_id, &turn_id, deadline).await;
-            self.status.model_stop_at = Some(if accepted { deadline } else { Instant::now() });
+            let deadline = cancellation_deadline();
+            let proof = provider::cancel(&self.native, &session_id, &turn_id, deadline).await;
+            self.status.model_stop_at = Some(stop_after_cancel(deadline, proof));
             return Ok(());
         }
         self.apply_stashed_entries().await?;
@@ -3017,7 +2993,7 @@ impl EventProcessor {
                         )
                     })?;
                 if self.status.session_id.as_deref() == Some(notification.session_id.as_str())
-                    && !self.planned_stop
+                    && !self.stop_drain.is_planned()
                 {
                     return self
                         .record_gap("Muse session closed outside a planned stop")
@@ -3149,66 +3125,68 @@ impl EventProcessor {
             signal.record_id,
             "turn.model_observed",
         )?;
-        // Muse 1.4.25 fills an omitted response model with the requested
-        // selector. An exact echo carries no independent provider evidence.
-        let Some(actual) =
-            actual.filter(|actual| Some(*actual) != self.turn_model.expected.as_deref())
-        else {
-            self.status.provider_model_turn = None;
-            self.commit_event(
-                "turn.model_observed",
-                native_id,
-                json!({
-                    "turn_id": signal.turn_id,
-                    "model_unverified_reason": eliot_core::PROVIDER_MODEL_UNNAMED,
-                }),
-            )
-            .await?;
-            return self.flush_observed_messages(signal.turn_id).await;
-        };
+        let model = model_disposition(
+            self.turn_model
+                .expected
+                .as_deref()
+                .map(provider::observed_model),
+            actual.map(provider::observed_model),
+        );
         let policy = SecretPolicy::new(self.secrets.iter().cloned());
-        let model = policy.redact_bounded(actual, 256);
-        if let Some(expected) = self.turn_model.expected.as_deref()
-            && provider::canonical_model(expected) != provider::canonical_model(actual)
-        {
-            let mismatch = eliot_core::ProviderModelMismatch {
-                requested_model: policy.redact_bounded(expected, 256),
-                reported_model: model,
-                revision: self
-                    .model_hold_settings_path
-                    .as_deref()
-                    .and_then(crate::install::model_hold_revision_for_path),
-            };
-            self.status.model_mismatch = Some((signal.turn_id.to_owned(), mismatch.reason()));
-            self.status.provider_model_turn = None;
-            self.messages = TurnMessages::default();
-
-            // The hold and the cancellation are independent. Start the exact
-            // cancel immediately and persist the mismatch even if it fails.
-            let native = self.native.clone();
-            let deadline = Instant::now() + Duration::from_secs(5);
-            let (committed, accepted) = tokio::join!(
+        match model {
+            ModelDisposition::Unverified => {
+                self.status.provider_model_turn = None;
                 self.commit_event(
                     "turn.model_observed",
                     native_id,
                     json!({
-                        "turn_id": signal.turn_id, "model_mismatch": mismatch,
-                    })
-                ),
-                provider::cancel(&native, signal.session_id, signal.turn_id, deadline),
-            );
-            self.status.model_stop_at = Some(if accepted { deadline } else { Instant::now() });
-            return committed;
+                        "turn_id": signal.turn_id,
+                        "model_unverified_reason": eliot_core::PROVIDER_MODEL_UNNAMED,
+                    }),
+                )
+                .await?;
+            }
+            ModelDisposition::Verified(reported) => {
+                let model = policy.redact_bounded(reported, 256);
+                self.commit_event(
+                    "turn.model_observed",
+                    native_id,
+                    json!({ "turn_id": signal.turn_id, "model": model }),
+                )
+                .await?;
+                self.status.provider_model_turn = Some(signal.turn_id.to_owned());
+            }
+            ModelDisposition::Contain {
+                requested,
+                reported,
+            } => {
+                let mismatch = eliot_core::ProviderModelMismatch {
+                    requested_model: policy.redact_bounded(requested, 256),
+                    reported_model: policy.redact_bounded(reported, 256),
+                    revision: self
+                        .model_hold_settings_path
+                        .as_deref()
+                        .and_then(crate::install::model_hold_revision_for_path),
+                };
+                self.status.model_mismatch = Some((signal.turn_id.to_owned(), mismatch.reason()));
+                self.status.provider_model_turn = None;
+                self.messages = TurnMessages::default();
+
+                // The hold and the exact native cancellation are independent.
+                let native = self.native.clone();
+                let deadline = cancellation_deadline();
+                let (committed, proof) = tokio::join!(
+                    self.commit_event(
+                        "turn.model_observed",
+                        native_id,
+                        json!({ "turn_id": signal.turn_id, "model_mismatch": mismatch }),
+                    ),
+                    provider::cancel(&native, signal.session_id, signal.turn_id, deadline),
+                );
+                self.status.model_stop_at = Some(stop_after_cancel(deadline, proof));
+                return committed;
+            }
         }
-        self.commit_event(
-            "turn.model_observed",
-            native_id,
-            json!({
-                "turn_id": signal.turn_id, "model": model,
-            }),
-        )
-        .await?;
-        self.status.provider_model_turn = Some(signal.turn_id.to_owned());
         self.flush_observed_messages(signal.turn_id).await
     }
 
@@ -3623,33 +3601,30 @@ impl EventProcessor {
         }
         let model_verified =
             self.status.provider_model_turn.as_deref() == Some(notification.turn_id.as_str());
-        let model_error = if let Some((_, reason)) = self.status.model_mismatch.as_ref() {
-            Some(("model_mismatch", reason.clone()))
-        } else {
-            None
-        };
-        if model_error.is_none() {
+        let mismatch = self
+            .status
+            .model_mismatch
+            .as_ref()
+            .map(|(_, reason)| reason.clone());
+        let terminal = model_terminal(
+            turn_status(&notification.terminal).unwrap_or("other"),
+            turn_outcome(&notification.terminal).unwrap_or("unknown"),
+            mismatch.as_deref(),
+        );
+        if terminal.mismatch.is_none() {
             self.flush_observed_messages(&notification.turn_id).await?;
         }
-        let status_text = if model_error.is_some() {
-            "failed"
-        } else {
-            turn_status(&notification.terminal).unwrap_or("other")
-        };
+        let status_text = terminal.status;
         let command_id = self.status.active_command_id.clone();
         let provider_restriction = terminal_provider_restriction(&self.status, &notification);
         let secrets = SecretPolicy::new(self.secrets.iter().cloned());
         let mut data = json!({
             "turn_id": notification.turn_id,
             "status": status_text,
-            "outcome": if model_error.is_some() {
-                "failure"
-            } else {
-                turn_outcome(&notification.terminal).unwrap_or("unknown")
-            },
+            "outcome": terminal.outcome,
             "native_status": native_terminal(&notification.terminal).unwrap_or("other"),
         });
-        if model_error.is_none()
+        if terminal.mismatch.is_none()
             && !model_verified
             && notification.terminal == NativeTurnTerminal::Completed
         {
@@ -3699,13 +3674,13 @@ impl EventProcessor {
         }
         // The durable terminal record keeps the structured error message,
         // falling back to the terminal reason the readback used to drop.
-        let native_error = model_error
-            .as_ref()
-            .map(|(_, reason)| reason.clone())
+        let native_error = terminal
+            .mismatch
+            .map(str::to_owned)
             .or_else(|| turn_native_error(&notification, &notification.terminal, &secrets));
         attach_native_error(&mut data, native_error.as_deref(), &secrets);
-        if let Some((code, _)) = model_error {
-            data["native_error"]["code"] = json!(code);
+        if terminal.mismatch.is_some() {
+            data["native_error"]["code"] = json!("model_mismatch");
             eliot_plugin::session::attach_failure_origin(
                 &mut data,
                 "muse",
@@ -4125,20 +4100,13 @@ impl EventProcessor {
     }
 
     async fn finish_stop(&mut self) -> Result<()> {
-        if self.status.stopped {
+        let stopped = self.status.stopped;
+        if !self.stream_source().needs_stop_settlement(stopped)? {
             return Ok(());
         }
-        if self.writes_blocked {
-            return Err(Error::new(
-                "unknown",
-                "Muse source acknowledgement is unresolved",
-            ));
-        }
-        let native_id = format!(
-            "muse:{}:session.ended",
-            self.status.session_id.as_deref().unwrap_or("unresolved")
-        );
-        self.commit_event("session.ended", native_id, json!({}))
+        let session = self.status.session_id.clone();
+        self.stream_source()
+            .commit_session_end(session.as_deref())
             .await?;
         if let Some(turn_id) = self.status.active_turn_id.clone() {
             self.status.last_turn = Some(TurnFacts {
@@ -4158,16 +4126,6 @@ impl EventProcessor {
         self.turn_completion_usage = None;
         self.messages = TurnMessages::default();
         Ok(())
-    }
-
-    async fn finish_pending_end_stop(&mut self) {
-        if !self.frames_drained {
-            return;
-        }
-        if let Some(reply) = self.pending_end_stop.take() {
-            let result = self.finish_stop().await;
-            let _ = reply.send(result);
-        }
     }
 
     /// Fold one workflow-item revision: every `children[]` entry drives its
@@ -4794,7 +4752,7 @@ async fn run(
                 }
             }
         }
-        processor.status.native_drained = processor.frames_drained;
+        processor.status.native_drained = processor.stop_drain.is_drained();
         let _ = status_tx.send(processor.status.clone());
     }
 }

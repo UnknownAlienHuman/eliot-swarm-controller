@@ -13,7 +13,7 @@ use eliot_core::{
 };
 use eliot_plugin::{
     CommitSink, MAX_EVENT_BYTES, PeerClient,
-    event_actor::EventActor,
+    event_actor::{EventActor, StopDrain, StopRequest},
     event_buffer::EarlyEventBuffer,
     native_stdio::StreamState,
     protocol::{HookEvent, HookResponse},
@@ -417,9 +417,7 @@ struct EventProcessor {
     message_seq: u64,
     unclassified_sequence: u64,
     accept_frames: bool,
-    planned_stop: bool,
-    frames_drained: bool,
-    pending_end_stop: Option<oneshot::Sender<Result<()>>>,
+    stop_drain: StopDrain,
     writes_blocked: bool,
     gap_reported: bool,
     terminal_deadline: Option<Instant>,
@@ -737,7 +735,7 @@ async fn run(
 
 fn publish(processor: &EventProcessor, status: &watch::Sender<EventStatus>) {
     let mut current = processor.status.clone();
-    current.native_drained = processor.frames_drained;
+    current.native_drained = processor.stop_drain.is_drained();
     let _ = status.send_replace(current);
 }
 
@@ -832,24 +830,21 @@ async fn dispatch_control(
             publish(processor, status);
         }
         Control::BeginStop { reply } => {
-            processor.planned_stop = true;
+            processor.stop_drain.begin();
             processor.accept_frames = false;
             processor.cancel_all_hook_callbacks();
             publish(processor, status);
             let _ = reply.send(Ok(()));
         }
         Control::EndStop { reply } => {
-            if processor.frames_drained {
+            if let StopRequest::Ready(receipt) =
+                processor.stop_drain.request_with_conflict(reply, || {
+                    Error::new("unknown", "Claude stop settlement is already pending")
+                })
+            {
                 let result = processor.finish_stop().await;
                 publish(processor, status);
-                let _ = reply.send(result);
-            } else if processor.pending_end_stop.is_some() {
-                let _ = reply.send(Err(Error::new(
-                    "unknown",
-                    "Claude stop settlement is already pending",
-                )));
-            } else {
-                processor.pending_end_stop = Some(reply);
+                receipt.finish(result);
             }
         }
         Control::Close { reply } => {
@@ -916,9 +911,7 @@ impl EventProcessor {
             message_seq: 0,
             unclassified_sequence: 0,
             accept_frames: true,
-            planned_stop: false,
-            frames_drained: false,
-            pending_end_stop: None,
+            stop_drain: StopDrain::default(),
             writes_blocked: false,
             gap_reported: false,
             terminal_deadline: None,
@@ -1339,7 +1332,7 @@ impl EventProcessor {
                 && !names_input
                 && self.status.active_turn_id.is_none()
                 && self.status.ready
-                && !self.planned_stop
+                && !self.stop_drain.is_planned()
             {
                 self.start_native_turn(record).await?;
             }
@@ -2229,7 +2222,7 @@ impl EventProcessor {
     }
 
     async fn observe_hook_callback(&mut self, record: &Value) -> Result<()> {
-        if self.frames_drained || self.planned_stop || self.closed {
+        if self.stop_drain.is_drained() || self.stop_drain.is_planned() || self.closed {
             return Ok(());
         }
         let request_id = record
@@ -2733,8 +2726,8 @@ impl EventProcessor {
         if cancel.kind != "control_cancel_request" || cancel.request_id.trim().is_empty() {
             return;
         }
-        if !self.frames_drained
-            && !self.planned_stop
+        if !self.stop_drain.is_drained()
+            && !self.stop_drain.is_planned()
             && (self.status.active_turn_id.is_some() || self.pending_turn.is_some())
         {
             self.cancelled_hook_requests
@@ -3147,7 +3140,7 @@ impl EventProcessor {
         if args.contains_key("feedback") {
             return Err(rejected_control("Claude approval feedback is not allowed"));
         }
-        if self.frames_drained && !self.planned_stop {
+        if self.stop_drain.is_drained() && !self.stop_drain.is_planned() {
             return Err(unknown_control(
                 "Claude event stream was lost before the request reply; outcome is unresolved and will not be repeated",
             ));
@@ -3597,9 +3590,9 @@ impl EventProcessor {
     }
 
     async fn note_frames_drained(&mut self) {
-        self.frames_drained = true;
+        self.stop_drain.mark_drained();
         self.cancel_all_hook_callbacks();
-        if self.planned_stop || self.closed {
+        if self.stop_drain.is_planned() || self.closed {
             // A sticky record-local fault survives planned stop: flush its
             // gap before end-stop settlement instead of erasing it.
             self.report_pending_fault_gap().await;
@@ -3665,23 +3658,17 @@ impl EventProcessor {
     }
 
     async fn finish_stop(&mut self) -> Result<()> {
-        if self.status.stopped {
+        let stopped = self.status.stopped;
+        if !self.stream_source().needs_stop_settlement(stopped)? {
             return Ok(());
-        }
-        if self.writes_blocked {
-            return Err(Error::new(
-                "unknown",
-                "Claude source acknowledgement is unresolved",
-            ));
         }
         // The stopped session consumes no more asks: close every retained one
         // before `session.ended`.
         self.close_pending_requests(None).await?;
-        let native_id = format!(
-            "claude:{}:session.ended",
-            self.status.session_id.as_deref().unwrap_or("unresolved")
-        );
-        self.commit_event("session.ended", native_id, json!({}))
+        self.terminal_deadline = None;
+        let session = self.status.session_id.clone();
+        self.stream_source()
+            .commit_session_end(session.as_deref())
             .await?;
         if let Some(turn_id) = self.status.active_turn_id.clone() {
             self.status.last_turn = Some(TurnFacts {
@@ -3716,12 +3703,8 @@ impl EventProcessor {
     }
 
     async fn finish_pending_end_stop(&mut self) {
-        if !self.frames_drained {
-            return;
-        }
-        if let Some(reply) = self.pending_end_stop.take() {
-            let result = self.finish_stop().await;
-            let _ = reply.send(result);
+        if let Some(receipt) = self.stop_drain.take_ready() {
+            receipt.finish(self.finish_stop().await);
         }
     }
 
