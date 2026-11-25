@@ -1,13 +1,13 @@
 use crate::{
     git_monitor::GitProbe,
-    work_truth::{CheckpointManifest, SnapshotFile},
+    work_truth::{CheckpointManifest, MAX_CHECKPOINT_FILES, SnapshotFile},
 };
 use eliot_core::{
     Error, Result,
     api::{
         CheckpointFileMetadata, CheckpointGetCursor, CheckpointGetRequest, CheckpointGetResponse,
         CheckpointListCursor, CheckpointListEntry, CheckpointListRequest, CheckpointListResponse,
-        is_git_oid,
+        inference::sha256_hex, is_git_oid,
     },
 };
 use sha2::{Digest, Sha256};
@@ -22,6 +22,8 @@ const READ_TIME: Duration = Duration::from_secs(30);
 async fn retained_inventory(
     root: &Path,
     request: &CheckpointListRequest,
+    pending: Option<&str>,
+    deadline: Instant,
 ) -> Result<(Vec<CheckpointListEntry>, String)> {
     let prefix = format!(
         "refs/eliot/checkpoints/{}/g{}/",
@@ -34,10 +36,11 @@ async fn retained_inventory(
             &[
                 "for-each-ref",
                 &format!("--count={}", INVENTORY_LIMIT + 1),
+                "--sort=-refname",
                 "--format=%(refname) %(objectname)",
                 &prefix,
             ],
-            Instant::now() + READ_TIME,
+            deadline,
         )
         .await?;
     if output.code != 0 {
@@ -63,50 +66,59 @@ async fn retained_inventory(
                 "checkpoint inventory identity is malformed",
             ));
         }
-        refs.push(CheckpointListEntry {
-            checkpoint_ref: reference.to_owned(),
-            oid: oid.to_owned(),
-        });
+        if Some(reference) != pending {
+            refs.push(CheckpointListEntry {
+                checkpoint_ref: reference.to_owned(),
+                oid: oid.to_owned(),
+            });
+        }
     }
-    refs.sort_by(|a, b| b.checkpoint_ref.cmp(&a.checkpoint_ref));
-    let mut inventory = Vec::new();
+    let mut inventory = Sha256::new();
     for entry in &refs {
-        inventory.extend_from_slice(entry.checkpoint_ref.as_bytes());
-        inventory.push(b' ');
-        inventory.extend_from_slice(entry.oid.as_bytes());
-        inventory.push(b'\n');
+        inventory.update(entry.checkpoint_ref.as_bytes());
+        inventory.update(b" ");
+        inventory.update(entry.oid.as_bytes());
+        inventory.update(b"\n");
     }
-    let revision = format!("{:x}", Sha256::digest(&inventory));
+    let revision = inventory
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
     Ok((refs, revision))
 }
 
 pub(crate) async fn list(
-    root: &Path,
+    root: Option<&Path>,
     request: &CheckpointListRequest,
+    pending: Option<&str>,
 ) -> Result<CheckpointListResponse> {
-    let _lane = crate::work_truth_repo::write_lane().await;
-    let (refs, revision) = retained_inventory(root, request).await?;
-    if let Some(cursor) = &request.cursor {
+    let (refs, revision) = if let Some(root) = root {
+        let deadline = Instant::now() + READ_TIME;
+        let _lane = crate::work_truth_repo::read_lane(deadline).await?;
+        retained_inventory(root, request, pending, deadline).await?
+    } else {
+        (Vec::new(), sha256_hex(&[]))
+    };
+    let start = if let Some(cursor) = &request.cursor {
         if cursor.revision != revision {
             return Err(Error::new("stale_cursor", "checkpoint inventory changed"));
         }
-    }
-    let remaining: Vec<_> = if let Some(cursor) = &request.cursor {
         let index = refs
             .iter()
             .position(|e| e.checkpoint_ref == cursor.after)
             .ok_or_else(|| {
                 Error::new(
-                    "stale_cursor",
-                    "checkpoint cursor position is no longer retained",
+                    "invalid_cursor",
+                    "checkpoint cursor position does not exist",
                 )
             })?;
-        refs.into_iter().skip(index + 1).collect()
+        index + 1
     } else {
-        refs
+        0
     };
-    let has_more = remaining.len() > request.limit;
-    let entries: Vec<_> = remaining.into_iter().take(request.limit).collect();
+    let has_more = refs.len() - start > request.limit;
+    let entries: Vec<_> = refs.into_iter().skip(start).take(request.limit).collect();
     let next = has_more.then(|| CheckpointListCursor {
         agent: request.agent.clone(),
         generation: request.generation,
@@ -130,21 +142,20 @@ pub(crate) async fn get(
     root: &Path,
     request: &CheckpointGetRequest,
 ) -> Result<CheckpointGetResponse> {
-    let _lane = crate::work_truth_repo::write_lane().await;
+    let deadline = Instant::now() + READ_TIME;
+    let _lane = crate::work_truth_repo::read_lane(deadline).await?;
     let git = GitProbe::new()?;
     let actual = crate::work_truth::checkpoint_reference(root, &request.checkpoint_ref).await?;
-    if actual.as_deref() != Some(request.oid.as_str()) {
+    let actual =
+        actual.ok_or_else(|| Error::new("not_found", "checkpoint ref is no longer retained"))?;
+    if actual != request.oid {
         return Err(Error::new(
-            "source_integrity",
+            "stale_revision",
             "checkpoint ref no longer names the listed object",
         ));
     }
     let tree = git
-        .workspace_command(
-            root,
-            &["ls-tree", "-z", &request.oid],
-            Instant::now() + READ_TIME,
-        )
+        .workspace_command(root, &["ls-tree", "-z", &request.oid], deadline)
         .await?;
     if tree.code != 0 {
         return Err(Error::new(
@@ -165,7 +176,7 @@ pub(crate) async fn get(
         .filter(|oid| is_git_oid(oid))
         .ok_or_else(|| Error::new("unavailable", "checkpoint manifest object is invalid"))?;
     let size = git
-        .workspace_command(root, &["cat-file", "-s", blob], Instant::now() + READ_TIME)
+        .workspace_command(root, &["cat-file", "-s", blob], deadline)
         .await?;
     let bytes: usize = std::str::from_utf8(&size.stdout)
         .ok()
@@ -177,18 +188,14 @@ pub(crate) async fn get(
                 "checkpoint manifest exceeds its metadata limit",
             )
         })?;
-    let bytes = git
-        .workspace_blob(root, blob, bytes, Instant::now() + READ_TIME)
-        .await?;
+    let bytes = git.workspace_blob(root, blob, bytes, deadline).await?;
     let manifest: CheckpointManifest = serde_json::from_slice(&bytes)
         .map_err(|_| Error::new("unavailable", "checkpoint manifest is unreadable"))?;
     if manifest.version != 1
         || manifest.agent != request.agent
         || manifest.generation != request.generation
         || !is_git_oid(&manifest.head)
-        || manifest.staged.len() > 512
-        || manifest.worktree.len() > 512
-        || manifest.staged.len() + manifest.worktree.len() > 1024
+        || manifest.staged.len().max(manifest.worktree.len()) > MAX_CHECKPOINT_FILES
     {
         return Err(Error::new(
             "source_integrity",
@@ -228,6 +235,9 @@ pub(crate) async fn get(
     let mut page_staged = Vec::new();
     let mut page_worktree = Vec::new();
     let mut count = 0;
+    // The envelope contains two refs (at most 512 bytes each), two OIDs,
+    // the Agent binding and delimiters. Leave ample room for all of it.
+    let mut encoded_bytes = 4096;
     for (index, item) in staged
         .iter()
         .chain(worktree.iter())
@@ -235,45 +245,18 @@ pub(crate) async fn get(
         .skip(after)
         .take(request.limit)
     {
+        let encoded = serde_json::to_vec(item)
+            .map_err(|_| Error::new("internal", "checkpoint metadata cannot be encoded"))?;
+        encoded_bytes += encoded.len() + 1;
+        if encoded_bytes > PAGE_BYTES {
+            break;
+        }
         if index < staged.len() {
             page_staged.push(item.clone());
         } else {
             page_worktree.push(item.clone());
         }
         count += 1;
-        let next_after = after + count;
-        let next = (next_after < total).then(|| CheckpointGetCursor {
-            checkpoint_ref: request.checkpoint_ref.clone(),
-            oid: request.oid.clone(),
-            after: next_after,
-        });
-        let response = CheckpointGetResponse {
-            agent: request.agent.clone(),
-            generation: request.generation,
-            checkpoint_ref: request.checkpoint_ref.clone(),
-            oid: request.oid.clone(),
-            head: manifest.head.clone(),
-            staged: page_staged.clone(),
-            worktree: page_worktree.clone(),
-            next,
-        };
-        let encoded = serde_json::to_vec(&response)
-            .map_err(|_| Error::new("internal", "checkpoint metadata cannot be encoded"))?;
-        if encoded.len() > PAGE_BYTES {
-            if count == 1 {
-                return Err(Error::new(
-                    "unavailable",
-                    "checkpoint metadata entry exceeds the response byte limit",
-                ));
-            }
-            if index < staged.len() {
-                page_staged.pop();
-            } else {
-                page_worktree.pop();
-            }
-            count -= 1;
-            break;
-        }
     }
     if count == 0 && after < total {
         return Err(Error::new(

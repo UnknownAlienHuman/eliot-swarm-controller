@@ -871,6 +871,8 @@ defer collection. The capture and its wait for the write lane have a 90-second b
 `checkpoint.list` pages the retained ref inventory for one exact Agent
 generation, newest first. Its cursor binds the inventory revision and the
 last ref on the previous page. A changed inventory requires a fresh list.
+The read excludes unpublished or unsettled checkpoint intents and refuses
+an inventory beyond its fixed read bound instead of showing a partial history.
 `checkpoint.get` uses the exact ref and object ID from the list to page its
 staged and worktree manifest metadata. It returns no captured file bodies.
 Both methods use the scoped [Agent result read](api.md#command-turn-and-result-reads) authority: Owner, self

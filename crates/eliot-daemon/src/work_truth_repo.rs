@@ -20,6 +20,17 @@ pub(crate) async fn write_lane() -> tokio::sync::MutexGuard<'static, ()> {
     WRITE_LANE.lock().await
 }
 
+pub(crate) async fn read_lane(deadline: Instant) -> Result<tokio::sync::MutexGuard<'static, ()>> {
+    tokio::time::timeout_at(deadline, write_lane())
+        .await
+        .map_err(|_| {
+            Error::new(
+                "repository_busy",
+                "work-truth repository write lane is busy",
+            )
+        })
+}
+
 fn repository_path(data_root: &Path) -> Result<PathBuf> {
     std::fs::canonicalize(data_root)
         .map(|root| root.join(REPOSITORY_NAME))
@@ -58,7 +69,22 @@ async fn is_bare(git: &GitProbe, repository: &Path) -> Result<bool> {
 /// Resolve a previously created repository even when its source worktree
 /// disappeared. Recovery must never initialize a missing repository.
 pub(crate) async fn existing(data_root: &Path) -> Result<PathBuf> {
+    find(data_root).await?.ok_or_else(|| {
+        Error::new(
+            "source_integrity",
+            "private work-truth repository path changed",
+        )
+    })
+}
+
+/// Read-only lookup that distinguishes a fresh Store from a damaged repository.
+pub(crate) async fn find(data_root: &Path) -> Result<Option<PathBuf>> {
     let repository = repository_path(data_root)?;
+    if fs::symlink_metadata(&repository)
+        .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+    {
+        return Ok(None);
+    }
     require_plain_path(&repository)?;
     if !is_bare(&GitProbe::new()?, &repository).await? {
         return Err(Error::new(
@@ -66,7 +92,7 @@ pub(crate) async fn existing(data_root: &Path) -> Result<PathBuf> {
             "private checkpoint repository is missing",
         ));
     }
-    Ok(repository)
+    Ok(Some(repository))
 }
 
 /// Resolve the one daemon-owned bare repository and ensure it is outside both

@@ -1,6 +1,6 @@
 //! Bounded reads of allow-listed sections from pinned Git task commits.
 use super::*;
-use eliot_core::api::{TASK_RECORD_TEXT_PAGE_BYTES, TaskGetRequest};
+use eliot_core::api::{TASK_RECORD_TEXT_PAGE_BYTES, TaskGetRequest, inference::sha256_hex};
 
 const MAX_TASK_SECTION_BYTES: usize = 1024 * 1024;
 
@@ -14,8 +14,8 @@ pub(crate) async fn read_task_record_section(
     let offset = request.offset.unwrap_or(0);
     let git = GitProbe::new()?;
     let root = crate::work_truth_repo::existing(data_root).await?;
-    let _read_lane = crate::work_truth_repo::write_lane().await;
     let deadline = Instant::now() + GIT_TIME;
+    let _read_lane = crate::work_truth_repo::read_lane(deadline).await?;
     let commit = task_commit(&git, &root, task_ref, deadline)
         .await
         .ok_or_else(|| Error::new("unavailable", "bound Git task record is unreadable"))?;
@@ -77,7 +77,7 @@ pub(crate) async fn read_task_record_section(
             "rendered task section exceeds the read limit",
         ));
     }
-    let digest = format!("{:x}", Sha256::digest(text.as_bytes()));
+    let digest = sha256_hex(text.as_bytes());
     if request
         .content_digest
         .as_ref()

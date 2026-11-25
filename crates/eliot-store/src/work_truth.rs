@@ -1027,6 +1027,24 @@ impl Store {
             .map_err(sql_error)
     }
 
+    pub fn uncommitted_checkpoint_ref(
+        &self,
+        agent: &str,
+        generation: i64,
+    ) -> Result<Option<String>> {
+        self.ensure_committed_reads()?;
+        self.connection
+            .query_row(
+                "SELECT json_extract(input, '$.checkpoint_ref') FROM git_checkpoint_intents
+             WHERE agent=?1 AND generation=?2",
+                params![parse_agent_id(agent)?, generation],
+                |row| row.get(0),
+            )
+            .optional()
+            .map(Option::flatten)
+            .map_err(sql_error)
+    }
+
     /// Old or terminal generations eligible for bounded private-ref cleanup.
     pub fn checkpoint_retention_generations(
         &self,

@@ -7,15 +7,12 @@ impl Router {
         request.validate()?;
         let response = {
             let store = self.inner.store.lock().await;
-            hierarchy::authorize_agent_read(
+            hierarchy::authorize_retained_work_read(
                 &store,
                 principal,
                 &request.agent,
-                Some(request.generation),
+                request.generation,
             )?;
-            store
-                .get_agent(&request.agent)?
-                .ok_or_else(|| Error::new("not_found", "Agent not found"))?;
             let page = store.task_record_list(&request)?;
             TaskListResponse {
                 agent: request.agent.clone(),
@@ -35,15 +32,12 @@ impl Router {
         let offset = request.offset.unwrap_or(0);
         let (task_ref, store_revision) = {
             let store = self.inner.store.lock().await;
-            hierarchy::authorize_agent_read(
+            hierarchy::authorize_retained_work_read(
                 &store,
                 principal,
                 &request.agent,
-                Some(request.generation),
+                request.generation,
             )?;
-            store
-                .get_agent(&request.agent)?
-                .ok_or_else(|| Error::new("not_found", "Agent not found"))?;
             let (task_ref, store_revision) = store
                 .task_record_binding(&request.agent, request.generation, &request.task_command)?
                 .ok_or_else(|| Error::new("not_found", "task record not found"))?;
@@ -60,15 +54,12 @@ impl Router {
             .await?;
         {
             let store = self.inner.store.lock().await;
-            hierarchy::authorize_agent_read(
+            hierarchy::authorize_retained_work_read(
                 &store,
                 principal,
                 &request.agent,
-                Some(request.generation),
+                request.generation,
             )?;
-            let _agent = store
-                .get_agent(&request.agent)?
-                .ok_or_else(|| Error::new("not_found", "Agent not found"))?;
             let current = store.task_record_binding(
                 &request.agent,
                 request.generation,

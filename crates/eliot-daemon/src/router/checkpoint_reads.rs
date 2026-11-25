@@ -10,31 +10,25 @@ impl Router {
         let request: CheckpointListRequest =
             eliot_core::api::discovery::decode_params(params.clone())?;
         request.validate()?;
+        let pending = self
+            .checkpoint_read_binding(principal, &request.agent, request.generation)
+            .await?;
+        let root = crate::work_truth_repo::find(&self.inner.data_root).await?;
+        let response = crate::work_truth::checkpoint_reads::list(
+            root.as_deref(),
+            &request,
+            pending.as_deref(),
+        )
+        .await?;
+        if pending
+            != self
+                .checkpoint_read_binding(principal, &request.agent, request.generation)
+                .await?
         {
-            let store = self.inner.store.lock().await;
-            hierarchy::authorize_agent_read(
-                &store,
-                principal,
-                &request.agent,
-                Some(request.generation),
-            )?;
-            if store.get_agent(&request.agent)?.is_none() {
-                return Err(Error::new("not_found", "checkpoint Agent is missing"));
-            }
-        }
-        let root = crate::work_truth_repo::existing(&self.inner.data_root).await?;
-        let response = crate::work_truth::checkpoint_reads::list(&root, &request).await?;
-        {
-            let store = self.inner.store.lock().await;
-            hierarchy::authorize_agent_read(
-                &store,
-                principal,
-                &request.agent,
-                Some(request.generation),
-            )?;
-            if store.get_agent(&request.agent)?.is_none() {
-                return Err(Error::new("not_found", "checkpoint Agent is missing"));
-            }
+            return Err(Error::new(
+                "stale_cursor",
+                "checkpoint inventory changed during the read",
+            ));
         }
         serde_json::to_value(response)
             .map_err(|_| Error::new("internal", "checkpoint list response cannot be encoded"))
@@ -48,33 +42,40 @@ impl Router {
         let request: CheckpointGetRequest =
             eliot_core::api::discovery::decode_params(params.clone())?;
         request.validate()?;
-        {
-            let store = self.inner.store.lock().await;
-            hierarchy::authorize_agent_read(
-                &store,
-                principal,
-                &request.agent,
-                Some(request.generation),
-            )?;
-            if store.get_agent(&request.agent)?.is_none() {
-                return Err(Error::new("not_found", "checkpoint Agent is missing"));
-            }
+        let pending = self
+            .checkpoint_read_binding(principal, &request.agent, request.generation)
+            .await?;
+        if pending.as_deref() == Some(request.checkpoint_ref.as_str()) {
+            return Err(Error::new(
+                "repository_busy",
+                "checkpoint publication is still settling",
+            ));
         }
-        let root = crate::work_truth_repo::existing(&self.inner.data_root).await?;
+        let root = crate::work_truth_repo::find(&self.inner.data_root)
+            .await?
+            .ok_or_else(|| Error::new("not_found", "checkpoint ref is no longer retained"))?;
         let response = crate::work_truth::checkpoint_reads::get(&root, &request).await?;
-        {
-            let store = self.inner.store.lock().await;
-            hierarchy::authorize_agent_read(
-                &store,
-                principal,
-                &request.agent,
-                Some(request.generation),
-            )?;
-            if store.get_agent(&request.agent)?.is_none() {
-                return Err(Error::new("not_found", "checkpoint Agent is missing"));
-            }
+        let pending = self
+            .checkpoint_read_binding(principal, &request.agent, request.generation)
+            .await?;
+        if pending.as_deref() == Some(request.checkpoint_ref.as_str()) {
+            return Err(Error::new(
+                "repository_busy",
+                "checkpoint publication is still settling",
+            ));
         }
         serde_json::to_value(response)
             .map_err(|_| Error::new("internal", "checkpoint response cannot be encoded"))
+    }
+
+    async fn checkpoint_read_binding(
+        &self,
+        principal: &Principal,
+        agent: &str,
+        generation: i64,
+    ) -> Result<Option<String>> {
+        let store = self.inner.store.lock().await;
+        hierarchy::authorize_retained_work_read(&store, principal, agent, generation)?;
+        store.uncommitted_checkpoint_ref(agent, generation)
     }
 }
