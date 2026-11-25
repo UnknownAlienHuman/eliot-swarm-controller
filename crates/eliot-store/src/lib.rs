@@ -252,6 +252,8 @@ mod admission;
 mod attention_lookup;
 pub use attention_lookup::AttentionVersionReader;
 mod attribution;
+mod child_cleanup;
+pub use child_cleanup::{ChildCleanupJob, ChildCleanupOutcome, ChildCleanupState};
 mod command_children;
 mod config_overlay;
 mod context;

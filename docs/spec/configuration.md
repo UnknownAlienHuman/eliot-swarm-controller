@@ -814,11 +814,18 @@ auto_cleanup_after = "7d"
 ```
 
 `max_event_backlog` is a positive signed 64-bit integer. It defaults to `100000`; zero,
-negative, wrong-type and unknown automation values are invalid. Automatic cleanup
-is written as enabled when Swarm creates a new configuration. An existing
-configuration that omits the key runs plan-only sweeps. Explicit `true` applies
-eligible cleanup after the first complete plan-only sweep of each daemon startup.
-Set `auto_cleanup = false` to disable automatic planning and apply.
+negative, wrong-type and unknown automation values are invalid.
+
+- Omitted `automation.auto_cleanup` enables guarded cleanup after the direct
+  manager's graceful Stop of a completed child. The age-based sweep previews
+  eligible artifacts.
+- `automation.auto_cleanup = true` also applies age-based cleanup after the
+  first complete preview of each daemon startup. New configuration files
+  contain this value.
+- `automation.auto_cleanup = false` disables both automatic cleanup paths.
+
+Child completion cleanup uses the worktree removal quiet period. The age-based
+sweep leaves direct-child worktree retirement to the guarded completion path.
 `auto_cleanup_after` defaults to seven days and accepts a positive duration
 such as `"14d"`. Every automatic apply uses the
 [cleanup retention policy](coordination.md#registered-artifacts-and-cleanup-k69) through

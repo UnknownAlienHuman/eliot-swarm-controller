@@ -1,6 +1,6 @@
 use super::*;
 
-pub(super) const CURRENT_SCHEMA_VERSION: i64 = BROKEN_NATIVE_SESSION_VERSION;
+pub(super) const CURRENT_SCHEMA_VERSION: i64 = CHILD_CLEANUP_VERSION;
 const HARNESS_CHECK_SCHEMA_VERSION: i64 = 112;
 const WORK_TRUTH_VERSION: i64 = 113;
 const WORK_TRUTH_INTENT_VERSION: i64 = 114;
@@ -26,6 +26,7 @@ const AUTH_LOGIN_UNKNOWN_VERSION: i64 = 133;
 const ATTENTION_ENDPOINTS_CUSTODY_VERSION: i64 = 134;
 const PROJECT_OVERVIEW_GIT_VERSION: i64 = 135;
 const BROKEN_NATIVE_SESSION_VERSION: i64 = 136;
+const CHILD_CLEANUP_VERSION: i64 = 137;
 
 impl Store {
     pub const SCHEMA_VERSION: i64 = CURRENT_SCHEMA_VERSION;
@@ -210,6 +211,34 @@ impl Store {
                 [BROKEN_NATIVE_SESSION_VERSION],
             )
             .map_err(sql_error)?;
+            tx.commit().map_err(sql_error)?;
+        }
+        if current < CHILD_CLEANUP_VERSION {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            tx.execute_batch(
+                "CREATE TABLE child_cleanup (
+                     child INTEGER NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+                     child_generation INTEGER NOT NULL CHECK(child_generation > 0),
+                     parent INTEGER NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+                     parent_generation INTEGER NOT NULL CHECK(parent_generation > 0),
+                     stop_id TEXT NOT NULL,
+                     not_before INTEGER NOT NULL CHECK(not_before >= 0),
+                     state TEXT NOT NULL CHECK(state IN ('pending','kept','removed')),
+                     reason TEXT NOT NULL,
+                     detail TEXT,
+                     plan_id TEXT, apply_id TEXT, notice_id TEXT,
+                     notice_delivered INTEGER NOT NULL DEFAULT 0 CHECK(notice_delivered IN (0,1)),
+                     PRIMARY KEY(child, child_generation),
+                     CHECK((plan_id IS NULL AND apply_id IS NULL AND notice_id IS NULL)
+                        OR (plan_id IS NOT NULL AND apply_id IS NOT NULL AND notice_id IS NOT NULL))
+                 ) WITHOUT ROWID;
+                 CREATE INDEX child_cleanup_due ON child_cleanup(not_before, child, child_generation)
+                     WHERE state = 'pending' OR (state = 'kept' AND notice_delivered = 0);
+                 INSERT INTO schema_migrations(version) VALUES (137);"
+            ).map_err(sql_error)?;
             tx.commit().map_err(sql_error)?;
         }
         Ok(())

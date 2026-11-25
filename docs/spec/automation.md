@@ -716,9 +716,11 @@ applied stop also cleans that Agent's build, temp and managed-worktree
 artifacts inline in the stop worker: same authority check, same quiescence
 gate and guarded deletion, with retained receipts, and no second executor.
 The daemon's periodic automatic cleanup uses the same guarded paged planner.
-An omitted `automation.auto_cleanup` is plan-only; explicit `true` applies only
-after one complete plan-only sweep per daemon startup, and explicit `false`
-turns the automatic planner off. It sends one Owner `notify` after a complete
+Omitting `automation.auto_cleanup` enables guarded child completion cleanup and
+previews age-based cleanup. Setting `automation.auto_cleanup = true` also enables
+age-based removal after the first complete preview of each daemon startup.
+Setting `automation.auto_cleanup = false` pauses both paths. The age-based sweep
+sends one Owner `notify` after a complete
 sweep, with the planned would-remove and kept totals and the configured
 enablement; pages do not each send a notice.
 `enabled = false` (default true) pauses the assignment at timer admission before
