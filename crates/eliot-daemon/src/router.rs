@@ -7107,10 +7107,6 @@ impl Router {
 
     async fn expire_restart_lease(&self, id: &str, mut expires: tokio::time::Instant) {
         loop {
-            #[expect(
-                clippy::disallowed_methods,
-                reason = "This expiry belongs to one bounded update lease."
-            )]
             tokio::time::sleep_until(expires).await;
             let mut store = self.inner.store.lock().await;
             let mut current = self.inner.restart_lease.lock_recover();
