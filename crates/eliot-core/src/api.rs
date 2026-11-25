@@ -130,9 +130,10 @@ pub use git::{
 pub use git_integrate::{
     DEFAULT_GIT_INTEGRATE_TIMEOUT_MS, FrozenGitIntegrate, GitIntegrateBranchPin,
     GitIntegrateCaller, GitIntegrateCheckClassification, GitIntegrateCheckFailure,
-    GitIntegrateDefinitionArgs, GitIntegrateOutcome, GitIntegrateRefUpdate, GitIntegrateStatus,
-    GitIntegrateTargetPin, MAX_GIT_INTEGRATE_BRANCHES, MAX_GIT_INTEGRATE_CHECK_TAIL_BYTES,
-    MAX_GIT_INTEGRATE_CONFLICT_PATHS, validate_integration_branch,
+    GitIntegrateDefinitionArgs, GitIntegrateOutcome, GitIntegrateRefUpdate, GitIntegrateSettlement,
+    GitIntegrateStatus, GitIntegrateTargetPin, MAX_GIT_INTEGRATE_BRANCHES,
+    MAX_GIT_INTEGRATE_CHECK_TAIL_BYTES, MAX_GIT_INTEGRATE_CONFLICT_PATHS,
+    validate_integration_branch,
 };
 pub use goals::{
     AssignmentGoal, CHECK_SPAWN_RETRYABLE, DEFAULT_GOAL_CHECK_TIMEOUT_MS, GOAL_CHECK_HISTORY_LIMIT,

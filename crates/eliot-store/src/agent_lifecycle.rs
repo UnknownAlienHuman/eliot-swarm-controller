@@ -18,12 +18,49 @@ macro_rules! delete_db {
     };
 }
 
-const AGENT_DELETE_RECEIPT_KEY: &str = "__eliot_agent_delete";
-
+#[derive(serde::Deserialize)]
+#[serde(from = "StoredAgentDeleteReceipt")]
 enum AgentDeleteReceipt {
     Pending,
-    Completed(Value),
+    Completed(AgentTreeResponse),
     Refused(Error),
+}
+
+#[derive(serde::Deserialize)]
+#[serde(untagged)]
+enum StoredAgentDeleteReceipt {
+    Staged {
+        #[serde(rename = "__eliot_agent_delete")]
+        stage: AgentDeleteStage,
+    },
+    Completed(AgentTreeResponse),
+}
+
+#[derive(serde::Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+enum AgentDeleteStage {
+    Pending,
+    Refused { error: AgentDeleteError },
+}
+
+#[derive(serde::Deserialize)]
+struct AgentDeleteError {
+    code: String,
+    message: String,
+}
+
+impl From<StoredAgentDeleteReceipt> for AgentDeleteReceipt {
+    fn from(receipt: StoredAgentDeleteReceipt) -> Self {
+        match receipt {
+            StoredAgentDeleteReceipt::Completed(result) => Self::Completed(result),
+            StoredAgentDeleteReceipt::Staged {
+                stage: AgentDeleteStage::Pending,
+            } => Self::Pending,
+            StoredAgentDeleteReceipt::Staged {
+                stage: AgentDeleteStage::Refused { error },
+            } => Self::Refused(Error::new(error.code, error.message)),
+        }
+    }
 }
 
 fn agent_delete_payload(agent: &str) -> Value {
@@ -46,42 +83,8 @@ fn agent_delete_error_value(error: &Error) -> Value {
     })
 }
 
-fn parse_agent_delete_receipt(value: Value) -> Result<AgentDeleteReceipt> {
-    let Some(receipt) = value.get(AGENT_DELETE_RECEIPT_KEY) else {
-        return Ok(AgentDeleteReceipt::Completed(value));
-    };
-    match receipt.get("state").and_then(Value::as_str) {
-        Some("pending") => Ok(AgentDeleteReceipt::Pending),
-        Some("refused") => {
-            let error = receipt.get("error").ok_or_else(|| {
-                Error::new("source_integrity", "retained Agent delete error is absent")
-            })?;
-            let code = error.get("code").and_then(Value::as_str).ok_or_else(|| {
-                Error::new(
-                    "source_integrity",
-                    "retained Agent delete error code is invalid",
-                )
-            })?;
-            let message = error
-                .get("message")
-                .and_then(Value::as_str)
-                .ok_or_else(|| {
-                    Error::new(
-                        "source_integrity",
-                        "retained Agent delete error message is invalid",
-                    )
-                })?;
-            Ok(AgentDeleteReceipt::Refused(Error::new(code, message)))
-        }
-        _ => Err(Error::new(
-            "source_integrity",
-            "retained Agent delete receipt is invalid",
-        )),
-    }
-}
-
-fn agent_delete_replay_result(value: Value) -> Result<Value> {
-    match parse_agent_delete_receipt(value)? {
+fn agent_delete_replay_result(receipt: AgentDeleteReceipt) -> Result<AgentTreeResponse> {
+    match receipt {
         AgentDeleteReceipt::Pending => Err(Error::new(
             "unknown",
             "Agent deletion has an unsettled external cleanup receipt",
@@ -96,19 +99,7 @@ fn agent_delete_receipt_tx(
     id: &str,
     digest: &[u8],
 ) -> Result<Option<AgentDeleteReceipt>> {
-    if let Some((principal, method, old_digest, result)) = write_binding(tx, id)? {
-        if principal != "owner" || method != "agent.delete" || old_digest.as_slice() != digest {
-            return Err(Error::new(
-                "id_conflict",
-                "cleanup write id has another binding",
-            ));
-        }
-        return parse_agent_delete_receipt(decode_json(&result)?).map(Some);
-    }
-    if command_binding(tx, id)?.is_some() || digest_id_bound(tx, id)? {
-        return Err(Error::new("id_conflict", "cleanup id is already in use"));
-    }
-    Ok(None)
+    super::cleanup::replay_cleanup_write(tx, "owner", id, "agent.delete", digest)
 }
 
 fn current_agent_tree_tx(
@@ -369,7 +360,7 @@ impl Store {
         id: &str,
         agent: &str,
         now: i64,
-    ) -> Result<(Option<Value>, Vec<Agent>)> {
+    ) -> Result<(Option<AgentTreeResponse>, Vec<Agent>)> {
         self.ensure_committed_reads()?;
         let payload = agent_delete_payload(agent);
         if let Some(result) = self.cleanup_replay("owner", id, "agent.delete", &payload)? {
@@ -384,14 +375,8 @@ impl Store {
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(sql_error)?;
             if let Some(receipt) = agent_delete_receipt_tx(&tx, id, &digest)? {
-                return match receipt {
-                    AgentDeleteReceipt::Pending => Err(Error::new(
-                        "unknown",
-                        "Agent deletion has an unsettled external cleanup receipt",
-                    )),
-                    AgentDeleteReceipt::Completed(result) => Ok((Some(result), Vec::new())),
-                    AgentDeleteReceipt::Refused(error) => Err(error),
-                };
+                return agent_delete_replay_result(receipt)
+                    .map(|result| (Some(result), Vec::new()));
             }
             validate_id_age(id, now)?;
             let root = parse_agent_id(agent)?;
@@ -422,7 +407,7 @@ impl Store {
         self.ensure_committed_reads()?;
         let payload = agent_delete_payload(agent);
         if let Some(result) = self.cleanup_replay("owner", id, "agent.delete", &payload)? {
-            return match parse_agent_delete_receipt(result)? {
+            return match result {
                 AgentDeleteReceipt::Pending => Err(Error::new(
                     "unknown",
                     "Agent deletion already has an unsettled external cleanup receipt",
@@ -494,11 +479,11 @@ impl Store {
         agent: &str,
         expected: &[Agent],
         now: i64,
-    ) -> Result<Value> {
+    ) -> Result<AgentTreeResponse> {
         self.ensure_committed_reads()?;
         let payload = agent_delete_payload(agent);
         if let Some(result) = self.cleanup_replay("owner", id, "agent.delete", &payload)? {
-            match parse_agent_delete_receipt(result)? {
+            match result {
                 AgentDeleteReceipt::Pending => {}
                 AgentDeleteReceipt::Completed(result) => return Ok(result),
                 AgentDeleteReceipt::Refused(error) => return Err(error),
@@ -523,7 +508,7 @@ impl Store {
         expected: &[Agent],
         now: i64,
         payload: &Value,
-    ) -> Result<Value> {
+    ) -> Result<AgentTreeResponse> {
         let digest = canonical::digest(payload)?;
         let tx = self
             .connection
@@ -544,13 +529,12 @@ impl Store {
         let (members, current) = current_agent_tree_tx(&tx, root, None, false)?;
         verify_agent_delete_snapshot(expected, &current)?;
         delete_tree_tx(&tx, &members, now)?;
-        let result = serde_json::to_value(AgentTreeResponse {
+        let result = AgentTreeResponse {
             agent: agent.to_owned(),
             affected: members.len(),
             archived: None,
             deleted: true,
-        })
-        .map_err(|_| Error::new("internal", "Agent tree result encoding failed"))?;
+        };
         let changed = tx
             .execute(
                 "UPDATE writes SET result=?1
@@ -596,7 +580,7 @@ impl Store {
                 "Agent deletion has no cleanup reservation to fail",
             ));
         };
-        match parse_agent_delete_receipt(result)? {
+        match result {
             AgentDeleteReceipt::Pending if error.code == "unknown" => return Ok(()),
             AgentDeleteReceipt::Pending => {}
             AgentDeleteReceipt::Completed(_) | AgentDeleteReceipt::Refused(_) => return Ok(()),
@@ -690,118 +674,61 @@ impl Store {
         ))
     }
 
-    pub fn change_agent_tree(
+    pub fn archive_agent_tree(
         &mut self,
         id: &str,
         agent: &str,
-        archived: Option<bool>,
+        archived: bool,
         now: i64,
-    ) -> Result<Value> {
-        let method = if archived.is_some() {
-            "agent.archive"
-        } else {
-            "agent.delete"
-        };
+    ) -> Result<AgentTreeResponse> {
+        const METHOD: &str = "agent.archive";
         self.ensure_committed_reads()?;
         let payload = json!({"agent":agent,"archived":archived});
-        if let Some(result) = self.cleanup_replay("owner", id, method, &payload)? {
-            return if archived.is_none() {
-                agent_delete_replay_result(result)
-            } else {
-                Ok(result)
-            };
+        if let Some(result) = self.cleanup_replay("owner", id, METHOD, &payload)? {
+            return Ok(result);
         }
         self.ensure_writer_healthy()?;
-        let result = self.change_agent_tree_inner(id, agent, archived, now);
-        if archived.is_some() {
-            self.fault_on_persistence_error(&result);
-        } else if result.is_err() && !self.connection.is_autocommit() {
-            // A failed automatic rollback leaves the writer connection unsafe to reuse.
-            self.write_faulted.set(true);
-            return Err(Error::new(
-                "unknown",
-                "Agent deletion rollback could not be verified",
-            ));
-        }
-        result
-    }
-    fn change_agent_tree_inner(
-        &mut self,
-        id: &str,
-        agent: &str,
-        archived: Option<bool>,
-        now: i64,
-    ) -> Result<Value> {
-        validate_ulid(id)?;
-        let root = parse_agent_id(agent)?;
-        let method = if archived.is_some() {
-            "agent.archive"
-        } else {
-            "agent.delete"
-        };
-        let payload = json!({"agent":agent,"archived":archived});
-        let digest = canonical::digest(&payload)?;
-        let tx = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(sql_error)?;
-        if command_binding(&tx, id)?.is_some() {
-            return Err(Error::new("id_conflict", "id belongs to a command"));
-        }
-        crate::ensure_no_digest_id(&tx, id, "id is already used by a completion digest")?;
-        if let Some((principal, old_method, old_digest, result)) = write_binding(&tx, id)? {
-            if principal != "owner" || old_method != method || old_digest != digest {
-                return Err(Error::new("id_conflict", "id belongs to another mutation"));
+        let result = (|| {
+            validate_ulid(id)?;
+            let root = parse_agent_id(agent)?;
+            let digest = canonical::digest(&payload)?;
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            if let Some(result) =
+                super::cleanup::replay_cleanup_write(&tx, "owner", id, METHOD, &digest)?
+            {
+                return Ok(result);
             }
-            let result = decode_json(&result)?;
-            return if archived.is_none() {
-                agent_delete_replay_result(result)
-            } else {
-                Ok(result)
-            };
-        }
-        validate_id_age(id, now)?;
-        let (members, _) = current_agent_tree_tx(&tx, root, archived, false)?;
-        if let Some(value) = archived {
+            validate_id_age(id, now)?;
+            let (members, _) = current_agent_tree_tx(&tx, root, Some(archived), false)?;
             for num in &members {
                 db!(tx.execute(
                     "UPDATE agents SET archived=?1,updated_at=?2 WHERE id=?3",
-                    params![value, now, num]
+                    params![archived, now, num],
                 ));
             }
-        } else {
-            delete_tree_tx(&tx, &members, now)?;
-        }
-        let result = serde_json::to_value(AgentTreeResponse {
-            agent: agent.to_owned(),
-            affected: members.len(),
-            archived,
-            deleted: archived.is_none(),
-        })
-        .map_err(|_| Error::new("internal", "Agent tree result encoding failed"))?;
-        let result_json = encode_json(&result)?;
-        let receipt = insert_write_tx(&tx, id, "owner", method, &digest, &result_json, now);
-        if archived.is_some() {
-            db!(receipt);
+            let result = AgentTreeResponse {
+                agent: agent.to_owned(),
+                affected: members.len(),
+                archived: Some(archived),
+                deleted: false,
+            };
+            db!(insert_write_tx(
+                &tx,
+                id,
+                "owner",
+                METHOD,
+                &digest,
+                &encode_json(&result)?,
+                now
+            ));
             commit_transaction(tx, &self.write_faulted)?;
-        } else {
-            delete_db!(receipt);
-            if let Err(error) = commit_sql(&tx) {
-                // An open transaction can still roll back. A constraint refusal
-                // also proves SQLite did not commit, including a commit-hook veto.
-                if tx.is_autocommit()
-                    && error.sqlite_error_code() != Some(rusqlite::ErrorCode::ConstraintViolation)
-                {
-                    self.write_faulted.set(true);
-                    return Err(Error::new(
-                        "unknown",
-                        "Agent deletion commit outcome is unknown",
-                    ));
-                }
-                return Err(delete_sql_error(error));
-            }
-        }
-        Ok(result)
+            Ok(result)
+        })();
+        self.fault_on_persistence_error(&result);
+        result
     }
 }
 

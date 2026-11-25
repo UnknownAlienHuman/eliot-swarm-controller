@@ -65,12 +65,6 @@ impl GitIntegrateDefinitionArgs {
     }
 }
 
-#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct GitIntegrateBranchPin {
-    pub branch: String,
-    pub oid: String,
-}
-
 impl GitIntegrateBranchPin {
     pub fn validate(&self) -> Result<()> {
         branch(&self.branch, "branch")?;
@@ -195,95 +189,121 @@ pub enum GitIntegrateCheckClassification {
     IsolationUnknown,
 }
 
-#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct GitIntegrateCheckFailure {
-    pub exit_code: i32,
-    pub tail: String,
-    pub classification: GitIntegrateCheckClassification,
-    pub failed_branches: Vec<String>,
-    pub unknown_branches: Vec<String>,
-}
+// Keep settlement admission and retained readback on one field layout.
+macro_rules! integration_outcomes {
+    ($(#[$policy:meta])?) => {
+        #[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+        $(#[$policy])?
+        pub struct GitIntegrateBranchPin {
+            pub branch: String,
+            pub oid: String,
+        }
 
-#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct GitIntegrateRefUpdate {
-    pub branch: String,
-    pub oid: String,
-}
+        #[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+        $(#[$policy])?
+        pub struct GitIntegrateCheckFailure {
+            pub exit_code: i32,
+            pub tail: String,
+            pub classification: GitIntegrateCheckClassification,
+            pub failed_branches: Vec<String>,
+            pub unknown_branches: Vec<String>,
+        }
 
-#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct GitIntegrateOutcome {
-    pub status: GitIntegrateStatus,
-    pub base_oid: String,
-    pub branches: Vec<GitIntegrateBranchPin>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub integration_oid: Option<String>,
-    #[serde(default)]
-    pub conflict_paths: Vec<String>,
-    #[serde(default)]
-    pub conflict_paths_truncated: bool,
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub cleanup_pending: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub check_failure: Option<GitIntegrateCheckFailure>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub fast_forward: Option<GitIntegrateRefUpdate>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub failure_code: Option<String>,
-}
+        #[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+        $(#[$policy])?
+        pub struct GitIntegrateRefUpdate {
+            pub branch: String,
+            pub oid: String,
+        }
 
-impl GitIntegrateOutcome {
-    pub fn validate_for(&self, frozen: &FrozenGitIntegrate) -> Result<()> {
-        frozen.validate()?;
-        oid(&self.base_oid, "base_oid")?;
-        if self.base_oid != frozen.base_oid || self.branches != frozen.branches {
-            return Err(invalid(
-                "git.integrate result differs from frozen input pins",
-            ));
+        #[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+        $(#[$policy])?
+        pub struct GitIntegrateOutcome {
+            pub status: GitIntegrateStatus,
+            pub base_oid: String,
+            pub branches: Vec<GitIntegrateBranchPin>,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            pub integration_oid: Option<String>,
+            #[serde(default)]
+            pub conflict_paths: Vec<String>,
+            #[serde(default)]
+            pub conflict_paths_truncated: bool,
+            #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+            pub cleanup_pending: bool,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            pub check_failure: Option<GitIntegrateCheckFailure>,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            pub fast_forward: Option<GitIntegrateRefUpdate>,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            pub failure_code: Option<String>,
         }
-        if let Some(value) = &self.integration_oid {
-            oid(value, "integration_oid")?;
-        }
-        if self.conflict_paths.len() > MAX_GIT_INTEGRATE_CONFLICT_PATHS
-            || self
-                .conflict_paths
-                .iter()
-                .any(|path| path.is_empty() || path.len() > 4_096)
-        {
-            return Err(invalid("git.integrate conflict paths exceed their bound"));
-        }
-        if let Some(check) = &self.check_failure
-            && (check.tail.len() > MAX_GIT_INTEGRATE_CHECK_TAIL_BYTES
-                || check.failed_branches.len() > MAX_GIT_INTEGRATE_BRANCHES
-                || check.unknown_branches.len() > MAX_GIT_INTEGRATE_BRANCHES
-                || check
-                    .failed_branches
-                    .iter()
-                    .chain(&check.unknown_branches)
-                    .any(|name| !frozen.branches.iter().any(|pin| &pin.branch == name)))
-        {
-            return Err(invalid("git.integrate check attribution exceeds its bound"));
-        }
-        if let Some(update) = &self.fast_forward {
-            branch(&update.branch, "fast_forward.branch")?;
-            oid(&update.oid, "fast_forward.oid")?;
-            if frozen
-                .fast_forward
-                .as_ref()
-                .map(|target| target.branch.as_str())
-                != Some(update.branch.as_str())
-                || self.integration_oid.as_deref() != Some(update.oid.as_str())
-            {
-                return Err(invalid("git.integrate ref update differs from the result"));
+
+        impl GitIntegrateOutcome {
+            pub fn validate_for(&self, frozen: &FrozenGitIntegrate) -> Result<()> {
+                frozen.validate()?;
+                oid(&self.base_oid, "base_oid")?;
+                if self.base_oid != frozen.base_oid
+                    || !self.branches.iter().map(|pin| (&pin.branch, &pin.oid))
+                        .eq(frozen.branches.iter().map(|pin| (&pin.branch, &pin.oid))) {
+                    return Err(invalid(
+                        "git.integrate result differs from frozen input pins",
+                    ));
+                }
+                if let Some(value) = &self.integration_oid {
+                    oid(value, "integration_oid")?;
+                }
+                if self.conflict_paths.len() > MAX_GIT_INTEGRATE_CONFLICT_PATHS
+                    || self
+                        .conflict_paths
+                        .iter()
+                        .any(|path| path.is_empty() || path.len() > 4_096)
+                {
+                    return Err(invalid("git.integrate conflict paths exceed their bound"));
+                }
+                if let Some(check) = &self.check_failure
+                    && (check.tail.len() > MAX_GIT_INTEGRATE_CHECK_TAIL_BYTES
+                        || check.failed_branches.len() > MAX_GIT_INTEGRATE_BRANCHES
+                        || check.unknown_branches.len() > MAX_GIT_INTEGRATE_BRANCHES
+                        || check
+                            .failed_branches
+                            .iter()
+                            .chain(&check.unknown_branches)
+                            .any(|name| !frozen.branches.iter().any(|pin| &pin.branch == name)))
+                {
+                    return Err(invalid("git.integrate check attribution exceeds its bound"));
+                }
+                if let Some(update) = &self.fast_forward {
+                    branch(&update.branch, "fast_forward.branch")?;
+                    oid(&update.oid, "fast_forward.oid")?;
+                    if frozen
+                        .fast_forward
+                        .as_ref()
+                        .map(|target| target.branch.as_str())
+                        != Some(update.branch.as_str())
+                        || self.integration_oid.as_deref() != Some(update.oid.as_str())
+                    {
+                        return Err(invalid("git.integrate ref update differs from the result"));
+                    }
+                }
+                if self.failure_code.as_ref().is_some_and(|code| {
+                    code.is_empty() || code.len() > 128 || code.chars().any(char::is_control)
+                }) {
+                    return Err(invalid("git.integrate failure code is invalid"));
+                }
+                Ok(())
             }
         }
-        if self.failure_code.as_ref().is_some_and(|code| {
-            code.is_empty() || code.len() > 128 || code.chars().any(char::is_control)
-        }) {
-            return Err(invalid("git.integrate failure code is invalid"));
-        }
-        Ok(())
-    }
+    };
 }
+
+integration_outcomes!();
+
+mod settlement {
+    use super::*;
+    integration_outcomes!(#[serde(deny_unknown_fields)]);
+}
+
+pub use settlement::GitIntegrateOutcome as GitIntegrateSettlement;
 
 fn validate_timeout(value: i64) -> Result<()> {
     if !(1_000..=DEFAULT_GIT_INTEGRATE_TIMEOUT_MS).contains(&value) {

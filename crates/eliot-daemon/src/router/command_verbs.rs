@@ -82,10 +82,12 @@ impl Router {
             self.secret_policy_snapshot(),
         )
         .await;
-        let mut outcome = serde_json::to_value(execution.outcome)
-            .unwrap_or_else(|_| json!({"code":"git_integrate_result_encode_failed"}));
-        self.redact_native_value(&mut outcome);
-        self.settle(id, execution.state, Some(outcome)).await;
+        self.settle(
+            id,
+            execution.state,
+            super::SettlementPayload::Git(Box::new(execution.outcome)),
+        )
+        .await;
         self.signal_progress();
     }
 

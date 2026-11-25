@@ -186,16 +186,12 @@ struct RuleFiringKey<'a> {
 
 #[derive(serde::Serialize)]
 struct RuleCommandAccepted<'a> {
-    #[serde(flatten)]
-    firing: &'a Value,
     command_id: &'a str,
     children: &'a [String],
 }
 
 #[derive(serde::Serialize)]
 struct RuleFired<'a> {
-    #[serde(flatten)]
-    firing: &'a Value,
     parent_command: &'a str,
     child_command: &'a str,
 }
@@ -240,21 +236,30 @@ impl<'a> RuleFiringKey<'a> {
     }
 
     fn command_event_data(&self, children: &[String]) -> Result<Value> {
-        serde_json::to_value(RuleCommandAccepted {
-            firing: &self.args,
+        self.with_firing_fields(RuleCommandAccepted {
             command_id: &self.parent_id,
             children,
         })
-        .map_err(|_| Error::new("internal", "rule command event cannot encode"))
     }
 
     fn fired_data(&self, child_id: &str) -> Result<Value> {
-        serde_json::to_value(RuleFired {
-            firing: &self.args,
+        self.with_firing_fields(RuleFired {
             parent_command: &self.parent_id,
             child_command: child_id,
         })
-        .map_err(|_| Error::new("internal", "rule firing event cannot encode"))
+    }
+
+    fn with_firing_fields(&self, fields: impl serde::Serialize) -> Result<Value> {
+        let mut args =
+            self.args.as_object().cloned().ok_or_else(|| {
+                Error::new("source_integrity", "rule firing args must be an object")
+            })?;
+        let fields = serde_json::to_value(fields)
+            .map_err(|_| Error::new("internal", "rule firing event cannot encode"))?;
+        if let Value::Object(fields) = fields {
+            args.extend(fields);
+        }
+        Ok(Value::Object(args))
     }
 
     fn rejected_data(&self, rejection: &Error) -> Value {

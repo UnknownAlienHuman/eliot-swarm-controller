@@ -17,7 +17,7 @@ impl Router {
             now_ms(),
         )?;
         if let Some(replay) = replay {
-            return Ok(replay);
+            return encoded(replay);
         }
         let plan = self.plan_agent_deletion(&agents).await?;
         let mut store = self.inner.store.lock().await;
@@ -41,7 +41,7 @@ impl Router {
         // After reserving the write, settle the operation even if the client
         // disconnects. The durable receipts fence effects across daemon exit.
         let router = self.clone();
-        tokio::spawn(async move {
+        let outcome = tokio::spawn(async move {
             let result = async {
                 if let Some(mut response) = started? {
                     router
@@ -80,7 +80,8 @@ impl Router {
             result
         })
         .await
-        .map_err(|_| Error::new("unknown", "Agent deletion did not report a settlement"))?
+        .map_err(|_| Error::new("unknown", "Agent deletion did not report a settlement"))??;
+        encoded(outcome)
     }
 
     async fn plan_agent_deletion(&self, agents: &[Agent]) -> Result<CleanupPlan> {

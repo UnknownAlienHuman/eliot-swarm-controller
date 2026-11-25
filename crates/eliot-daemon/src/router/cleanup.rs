@@ -1281,9 +1281,9 @@ impl Router {
         let store = self.inner.store.lock().await;
         // Replay precedes filesystem reads, including after successful cleanup.
         if let Some(value) =
-            store.cleanup_replay(&name, &request.id, "artifact.register", params)?
+            store.cleanup_replay::<ArtifactView>(&name, &request.id, "artifact.register", params)?
         {
-            return Ok(value);
+            return encoded(value);
         }
         let Principal::Agent { id, generation } = principal else {
             return Err(Error::new("not_allowed", "only Agents register artifacts"));

@@ -28,6 +28,38 @@ pub struct CleanupInventoryPage {
     pub next_seq: Option<i64>,
 }
 
+pub enum CleanupJobReceipt {
+    Apply(CleanupApplyResponse),
+    Bulk(CleanupJobStatus),
+}
+
+fn read_cleanup_receipt<T: DeserializeOwned>(json: &str) -> Result<T> {
+    serde_json::from_str(json)
+        .map_err(|_| Error::new("source_integrity", "invalid cleanup receipt"))
+}
+
+pub(super) fn replay_cleanup_write<T: DeserializeOwned>(
+    conn: &Connection,
+    principal: &str,
+    id: &str,
+    method: &str,
+    digest: &[u8],
+) -> Result<Option<T>> {
+    if let Some((p, m, d, result)) = write_binding(conn, id)? {
+        if p != principal || m != method || d != digest {
+            return Err(Error::new(
+                "id_conflict",
+                "cleanup write id has another binding",
+            ));
+        }
+        return read_cleanup_receipt(&result).map(Some);
+    }
+    if command_binding(conn, id)?.is_some() || digest_id_bound(conn, id)? {
+        return Err(Error::new("id_conflict", "cleanup id is already in use"));
+    }
+    Ok(None)
+}
+
 /// An apply can read back its exact workspace command even after a crash
 /// between native removal and cleanup receipt settlement.
 pub fn cleanup_worktree_command_id(apply_id: &str, artifact_id: &str) -> Result<String> {
@@ -798,45 +830,23 @@ impl Store {
         Ok(false)
     }
 
-    pub fn cleanup_replay(
+    pub fn cleanup_replay<T: DeserializeOwned>(
         &self,
         principal: &str,
         id: &str,
         method: &str,
         payload: &Value,
-    ) -> Result<Option<Value>> {
-        self.cleanup_replay_json(principal, id, method, payload)?
-            .as_deref()
-            .map(decode_json)
-            .transpose()
+    ) -> Result<Option<T>> {
+        replay_cleanup_write(
+            &self.connection,
+            principal,
+            id,
+            method,
+            &canonical::digest(payload)?,
+        )
     }
 
-    pub fn cleanup_replay_json(
-        &self,
-        principal: &str,
-        id: &str,
-        method: &str,
-        payload: &Value,
-    ) -> Result<Option<String>> {
-        let digest = canonical::digest(payload)?;
-        if let Some((p, m, d, result)) = write_binding(&self.connection, id)? {
-            if p != principal || m != method || d != digest {
-                return Err(Error::new(
-                    "id_conflict",
-                    "cleanup write id has another binding",
-                ));
-            }
-            return Ok(Some(result));
-        }
-        if command_binding(&self.connection, id)?.is_some()
-            || digest_id_bound(&self.connection, id)?
-        {
-            return Err(Error::new("id_conflict", "cleanup id is already in use"));
-        }
-        Ok(None)
-    }
-
-    pub fn cleanup_job_receipt(&self, principal: &str, id: &str) -> Result<(String, String)> {
+    pub fn cleanup_job_receipt(&self, principal: &str, id: &str) -> Result<CleanupJobReceipt> {
         self.ensure_committed_reads()?;
         let Some((author, method, _, result)) = write_binding(&self.connection, id)? else {
             return Err(Error::new("not_found", "cleanup receipt absent"));
@@ -850,7 +860,11 @@ impl Store {
                 "cleanup receipt belongs to another principal",
             ));
         }
-        Ok((method, result))
+        if method == "cleanup.apply" {
+            read_cleanup_receipt(&result).map(CleanupJobReceipt::Apply)
+        } else {
+            read_cleanup_receipt(&result).map(CleanupJobReceipt::Bulk)
+        }
     }
 
     /// Use the authority of one reserved cleanup item without changing its
@@ -953,8 +967,7 @@ impl Store {
         if let Some(value) =
             self.cleanup_replay(principal, &request.id, "artifact.register", &payload)?
         {
-            return serde_json::from_value(value)
-                .map_err(|_| Error::new("source_integrity", "invalid retained artifact"));
+            return Ok(value);
         }
         validate_id_age(&request.id, now)?;
         if let Some(expires_at) = request.expires_at
@@ -1177,11 +1190,12 @@ impl Store {
         // been reclaimed from the ledger while its receipt is retained, and
         // the retry must still read back the retained response instead of
         // `not_found` for the missing plan row.
-        if let Some(value) =
-            self.cleanup_replay_json(principal, &request.id, "cleanup.apply", &payload)?
-        {
-            let mut response: CleanupApplyResponse = serde_json::from_str(&value)
-                .map_err(|_| Error::new("source_integrity", "invalid cleanup receipt"))?;
+        if let Some(mut response) = self.cleanup_replay::<CleanupApplyResponse>(
+            principal,
+            &request.id,
+            "cleanup.apply",
+            &payload,
+        )? {
             let plan = match self.cleanup_plan(principal, &request.plan_id) {
                 Ok(plan) => plan,
                 Err(error) if error.code == "not_found" => CleanupPlan {
