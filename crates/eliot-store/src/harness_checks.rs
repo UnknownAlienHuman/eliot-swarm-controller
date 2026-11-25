@@ -148,6 +148,7 @@ impl Store {
         after: Option<&str>,
         limit: usize,
     ) -> Result<(Vec<eliot_core::Agent>, Option<String>, bool)> {
+        self.ensure_committed_reads()?;
         super::validate_limit(limit)?;
         let after_num = after.map(core::parse_agent_id).transpose()?.unwrap_or(0);
         let mut statement = self
@@ -159,6 +160,7 @@ impl Store {
                  WHERE id > ?1 AND chat = 1 AND observe_only = 0
                    AND project = '' AND parent IS NULL
                    AND json_extract(profile_snapshot, '$._harness_check.harness') = harness
+                   AND json_type(profile_snapshot, '$._harness_check.version') = 'text'
                  ORDER BY id LIMIT ?2"
             ))
             .map_err(sql_error)?;

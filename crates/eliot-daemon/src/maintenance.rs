@@ -76,13 +76,14 @@ async fn run_harness_check_maintenance(
         tokio::time::interval(Duration::from_secs(eliot_core::HARNESS_CHECK_TICK_SECS));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut check_tasks = tokio::task::JoinSet::new();
+    let mut cleanup_scan = crate::router::HarnessCheckCleanupScan::default();
     loop {
         tokio::select! {
             _ = ticker.tick() => {
                 let available = eliot_core::HARNESS_CHECK_BATCH_LIMIT
                     .saturating_sub(check_tasks.len());
                 let inventory = crate::adhoc::CheckInventory::refresh(&policy).await;
-                match router.maintain_harness_checks(available, &inventory).await {
+                match router.maintain_harness_checks(available, &inventory, &mut cleanup_scan).await {
                     Ok((started, orphans)) => {
                         for agent_id in orphans {
                             let orphan_router = router.clone();
