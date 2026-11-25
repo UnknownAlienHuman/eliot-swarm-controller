@@ -277,7 +277,8 @@ impl Store {
                    command_id TEXT PRIMARY KEY NOT NULL REFERENCES commands(id) ON DELETE CASCADE,
                    restart_id TEXT NOT NULL,
                    native_scope TEXT NOT NULL,
-                   native_ref TEXT NOT NULL
+                   native_ref TEXT NOT NULL,
+                   sealed INTEGER NOT NULL DEFAULT 0 CHECK (sealed IN (0, 1))
                  );",
             )
             .map_err(sql_error)?;
@@ -287,6 +288,16 @@ impl Store {
             )
             .map_err(sql_error)?;
             tx.commit().map_err(sql_error)?;
+        }
+        // An earlier private build recorded 138 before it tracked the seal.
+        if !self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('restart_deferred_sends') WHERE name='sealed')",
+            [], |row| row.get::<_, bool>(0),
+        ).map_err(sql_error)? {
+            self.connection.execute_batch(
+                "ALTER TABLE restart_deferred_sends ADD COLUMN sealed INTEGER NOT NULL
+                    DEFAULT 0 CHECK (sealed IN (0, 1));",
+            ).map_err(sql_error)?;
         }
         if current < RESTART_CONTINUATION_BRIEF_VERSION {
             let tx = self

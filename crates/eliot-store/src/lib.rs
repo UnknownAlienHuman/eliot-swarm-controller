@@ -1274,6 +1274,10 @@ impl Store {
             if has_restart_work_on(&tx, lossless)? {
                 return Err(Error::new("restart_busy", "admitted work is still running"));
             }
+            if lossless {
+                let prepare_id = required_string(semantic_payload, "restart_id")?;
+                restart_queue::seal(&tx, &prepare_id)?;
+            }
             for (agent, generation) in native_sources {
                 let agent_num = parse_agent_id(agent)?;
                 let current = load_agent_by_num(&tx, agent_num)?
@@ -3032,6 +3036,7 @@ impl Store {
         drop(dispatched_statement);
 
         let mut events = Vec::new();
+        restart_queue::recover_unsealed(&tx, now, &mut events)?;
         recover_workspaces(&tx, now, &mut events)?;
         Self::recover_lost_native_children_tx(&tx, now, &mut events)?;
         for (command_id, target, generation, verb, encoded_outcome) in dispatched_commands {

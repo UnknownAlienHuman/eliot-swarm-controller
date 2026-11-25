@@ -7129,7 +7129,13 @@ impl Router {
                 continue;
             }
             let unpark_error = if lease.lossless {
-                store.cancel_parked_restart(id).err()
+                match store.expire_parked_restart(id, now_ms()) {
+                    Ok(change) => {
+                        self.publish_locked(&change.events);
+                        change.value
+                    }
+                    Err(error) => Some(error),
+                }
             } else {
                 None
             };

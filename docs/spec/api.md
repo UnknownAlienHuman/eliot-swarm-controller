@@ -3220,8 +3220,12 @@ carries a wait budget of 1–1800 seconds (default 60). Bound restart attempts r
 the short 120-second inactivity lease within an absolute ceiling of the wait
 budget plus 60 seconds. While still quiescing, expiry or confirmed cancellation releases the parked
 rows to the old daemon and reopens admission. If unparking fails on expiry,
-the daemon still reopens admission and reports the underlying cancellation
-error in its log. At its deadline the CLI cancels by
+the daemon reopens admission and reports the cancellation error in its log.
+A writable Store rejects the affected queued SENDs with
+`restart_preparation_abandoned` and `native_dispatched: false`.
+Startup also settles SENDs parked by an unsealed preparation this way, before
+ordinary admission opens. The restart transaction marks its preparation sealed
+so those parked SENDs can continue through the matching Resume path. At its deadline the CLI cancels by
 default. The CLI prints the preparation ID; the Owner can cancel immediately
 with Ctrl-C (Ctrl-Break also works on Windows) or with
 `swarm daemon update --cancel PREPARE_ID` on the same data directory.

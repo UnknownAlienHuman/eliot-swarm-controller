@@ -32,13 +32,125 @@ pub(super) fn park(tx: &Transaction<'_>, restart_id: &str) -> Result<()> {
     Ok(())
 }
 
+/// Mark the exact preparation in the transaction that seals its restart.
+pub(super) fn seal(tx: &Transaction<'_>, restart_id: &str) -> Result<()> {
+    tx.execute(
+        "UPDATE restart_deferred_sends SET sealed=1 WHERE restart_id=?1",
+        [restart_id],
+    )
+    .map_err(sql_error)?;
+    Ok(())
+}
+
 impl Store {
-    pub fn cancel_parked_restart(&mut self, restart_id: &str) -> Result<()> {
+    pub fn expire_parked_restart(
+        &mut self,
+        restart_id: &str,
+        now: i64,
+    ) -> Result<Change<Option<Error>>> {
         self.ensure_writer_healthy()?;
-        let result = unpark(&self.connection, restart_id);
+        let result = self.expire_parked_restart_inner(restart_id, now);
         self.fault_on_persistence_error(&result);
         result
     }
+
+    fn expire_parked_restart_inner(
+        &mut self,
+        restart_id: &str,
+        now: i64,
+    ) -> Result<Change<Option<Error>>> {
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sql_error)?;
+        let error = unpark(&tx, restart_id).err();
+        let mut events = Vec::new();
+        if error.is_some() {
+            // A DELETE refusal can leave the writer usable. Give these inputs
+            // a durable terminal outcome even if the marker cannot be removed.
+            settle_unsealed(&tx, Some(restart_id), now, &mut events)?;
+        }
+        commit_transaction(tx, &self.write_faulted)?;
+        Ok(Change {
+            value: error,
+            events,
+        })
+    }
+}
+
+pub(super) fn recover_unsealed(
+    tx: &Transaction<'_>,
+    now: i64,
+    events: &mut Vec<Event>,
+) -> Result<()> {
+    settle_unsealed(tx, None, now, events)?;
+    tx.execute(
+        "DELETE FROM restart_deferred_sends
+         WHERE sealed=0 OR command_id IN (
+           SELECT id FROM commands WHERE id=restart_deferred_sends.command_id
+             AND state NOT IN ('accepted','queued')
+         )",
+        [],
+    )
+    .map_err(sql_error)?;
+    Ok(())
+}
+
+fn settle_unsealed(
+    tx: &Transaction<'_>,
+    restart_id: Option<&str>,
+    now: i64,
+    events: &mut Vec<Event>,
+) -> Result<()> {
+    let mut statement = tx
+        .prepare_cached(
+            "SELECT c.id, c.target, c.generation
+             FROM restart_deferred_sends d JOIN commands c ON c.id=d.command_id
+             WHERE d.sealed=0 AND (?1 IS NULL OR d.restart_id=?1)
+               AND c.verb='send' AND c.state IN ('accepted','queued') AND c.turn_id IS NULL",
+        )
+        .map_err(sql_error)?;
+    let sends = statement
+        .query_map([restart_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get(1)?, row.get(2)?))
+        })
+        .map_err(sql_error)?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(sql_error)?;
+    for (id, target, generation) in sends {
+        events.push(reject_parked(
+            tx,
+            &id,
+            target,
+            generation,
+            "restart_preparation_abandoned",
+            "The update preparation ended before sealing. This queued input was never dispatched.",
+            now,
+        )?);
+    }
+    Ok(())
+}
+
+fn reject_parked(
+    tx: &Transaction<'_>,
+    id: &str,
+    target: Option<i64>,
+    generation: Option<i64>,
+    code: &str,
+    message: &str,
+    now: i64,
+) -> Result<Event> {
+    let outcome = json!({"code":code,"message":message,"native_dispatched":false});
+    update_command_state(tx, id, CommandState::Rejected, Some(&outcome), None, now)?;
+    insert_daemon_command_event(
+        tx,
+        now,
+        "command.rejected",
+        target,
+        generation,
+        id,
+        json!({"command_id":id,"state":"rejected","outcome":outcome}),
+    )
 }
 
 pub(super) fn unpark(connection: &Connection, restart_id: &str) -> Result<()> {
@@ -54,7 +166,9 @@ pub(super) fn unpark(connection: &Connection, restart_id: &str) -> Result<()> {
 pub(super) fn is_parked(connection: &Connection, id: &str) -> Result<bool> {
     connection
         .query_row(
-            "SELECT EXISTS(SELECT 1 FROM restart_deferred_sends WHERE command_id=?1)",
+            "SELECT EXISTS(SELECT 1 FROM restart_deferred_sends d
+             JOIN commands c ON c.id=d.command_id
+             WHERE c.id=?1 AND c.state IN ('accepted','queued'))",
             [id],
             |row| row.get(0),
         )
@@ -176,22 +290,24 @@ pub(super) fn release_after_resume(
                 "The resumed session cannot accept queued input. The input was never dispatched.",
             )
         };
-        let outcome = json!({
-            "code": code,
-            "message": message,
-            "native_dispatched": false
-        });
-        update_command_state(tx, &id, CommandState::Rejected, Some(&outcome), None, now)?;
-        events.push(insert_daemon_command_event(
+        events.push(reject_parked(
             tx,
-            now,
-            "command.rejected",
+            &id,
             Some(agent),
             Some(original_generation),
-            &id,
-            json!({"command_id": id, "state": "rejected", "outcome": outcome}),
+            code,
+            message,
+            now,
         )?);
         clear_parked(tx, &id)?;
     }
+    tx.execute(
+        "DELETE FROM restart_deferred_sends WHERE command_id IN (
+           SELECT id FROM commands WHERE target=?1 AND generation<?2
+             AND state NOT IN ('accepted','queued')
+         )",
+        params![agent, generation],
+    )
+    .map_err(sql_error)?;
     Ok(())
 }

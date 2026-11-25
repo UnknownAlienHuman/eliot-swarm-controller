@@ -270,7 +270,7 @@ impl Store {
             && state == CommandState::Applied
             && let (Some(agent), Some(generation)) = (target, generation)
         {
-            super::restart_queue::release_after_resume(&tx, agent, generation, now, &mut events)?;
+            super::restart_queue::release_after_resume(tx, agent, generation, now, &mut events)?;
         }
 
         if record.command.verb == "send" && state != CommandState::Applied {
