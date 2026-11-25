@@ -197,7 +197,7 @@ impl DesktopApp {
                     .and_then(|profile| profile.permissions.as_deref());
                 let label = match self.launch.profile() {
                     Some(_) => launch_ui::access_label(permissions),
-                    None => "Access from the preset".to_owned(),
+                    None => "Preset access".to_owned(),
                 };
                 let full = permissions.and_then(SandboxPermissions::parse)
                     == Some(SandboxPermissions::DangerFullAccess);

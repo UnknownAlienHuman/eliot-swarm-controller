@@ -1042,17 +1042,12 @@ fn agents_row(agents: &AgentsEntry, context: &mut ViewContext<Sidebar>) -> Keyed
             .on_click(context.message(Message::Shell(ShellMsg::PlaceOpened(
                 super::page_ui::Place::Agents,
             ))))
-            .content(controls::sidebar_row(
-                controls::icon(controls::glyph::HUB),
+            // The nav row rule: "Agents" keeps its width and the fleet's
+            // line trims at the right.
+            .content(controls::nav_content(
+                controls::glyph::HUB,
                 "Agents",
-                open,
-                0.0,
-                false,
-                None,
-                View::from(
-                    controls::trailing(agents.line.clone())
-                        .text_trimming(TextTrimming::CharacterEllipsis),
-                ),
+                &agents.line,
             ))
             .tooltip(agents.summary.clone()),
     )

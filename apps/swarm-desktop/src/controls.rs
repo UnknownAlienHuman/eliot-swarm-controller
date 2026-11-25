@@ -550,14 +550,28 @@ pub fn row_content(
 }
 
 /// A nav row's content: its icon, its label and a trailing caption
-/// ("Ctrl+N").
+/// ("Ctrl+N", "1 working · 1 needs attention"). The label is the row's
+/// name and keeps its width; the caption takes the star cell at the right
+/// and is the text that trims when the row runs out of room.
 pub fn nav_content(glyph: &str, label: &str, hint: &str) -> View {
-    row_content(
-        Some(glyph),
-        label,
-        "",
-        (!hint.is_empty()).then(|| secondary(hint.to_owned()).into()),
-    )
+    if hint.is_empty() {
+        return row_content(Some(glyph), label, "", None);
+    }
+    Grid::new()
+        .columns([GridLength::Auto, GridLength::Auto, GridLength::STAR])
+        .column_spacing(spacing::ROW)
+        .children((
+            icon(glyph),
+            text(label.to_owned(), style::BODY)
+                .grid_column(1)
+                .vertical_alignment(VerticalAlignment::Center),
+            secondary(hint.to_owned())
+                .grid_column(2)
+                .horizontal_alignment(HorizontalAlignment::Right)
+                .vertical_alignment(VerticalAlignment::Center)
+                .text_trimming(TextTrimming::CharacterEllipsis),
+        ))
+        .into()
 }
 
 /// A chip: a default button (`.content(chip_content(..))` last, then a

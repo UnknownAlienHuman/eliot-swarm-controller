@@ -880,7 +880,8 @@ impl Component for Composer {
             .column_spacing(tokens::spacing::CHIP_GAP)
             .keyed_children(crate::views::slots([
                 Some(
-                    controls::icon_button()
+                    controls::bar_button(false)
+                        .style(ButtonStyle::Subtle)
                         .automation_name("Attach files")
                         .on_click(context.message(Message::Launch(LaunchMsg::AttachRequested)))
                         .content(controls::icon(controls::glyph::NEW_TASK))
