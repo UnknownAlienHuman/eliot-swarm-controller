@@ -223,7 +223,10 @@ traverses the inventory on the daemon, with `all` as the default scope. It appli
 safe local candidates using the same attempt reservations and live rechecks. It handles
 ordinary artifacts and native sessions before their worktrees or chat directories,
 including across pages. Project registrations use current revision and
-path checks for each batch. One explicit cleanup apply runs at a time. Read progress
+path checks for each batch. One explicit or periodic/terminal-cache apply runs
+at a time. The daemon reserves the apply slot under the Store lock and keeps
+it until the effect outcome is recorded. A prepared restart can wait for an
+admitted apply, while its final seal refuses until that slot clears. Read progress
 with `cleanup.status {id}` or repeat the original call with the same id and filters.
 The tally includes pages, page errors by reason, inventory issue count, applied,
 skipped by reason, failed, unknown, pending, and confirmed bytes reclaimed.
