@@ -291,21 +291,25 @@ fn native_lifecycle_receipt(
                     AND json_type(e.data,'$.native_scope')='text' AND json_extract(e.data,'$.native_scope')<>''
                     AND (json_extract(e.data,'$.command_id')=?3 OR (
                       json_extract(e.data,'$.command_id') IS NULL
-                      AND EXISTS (SELECT 1 FROM events previous INDEXED BY events_agent
-                        WHERE previous.agent=?1 AND previous.generation=?2-1
-                          AND previous.kind='session.ready' AND previous.source='stream'
-                          AND previous.native_id IS NOT NULL AND previous.seq<e.seq
-                          AND json_extract(previous.data,'$.native_ref')=json_extract(e.data,'$.native_ref')
-                          AND json_extract(previous.data,'$.native_scope')=json_extract(e.data,'$.native_scope'))
+                      AND EXISTS (SELECT 1 FROM agents bound
+                        WHERE bound.id=?1 AND bound.generation=?2
+                          AND bound.native_ref=json_extract(e.data,'$.native_ref')
+                          AND bound.native_scope=json_extract(e.data,'$.native_scope'))
                     ))
+                    AND e.ts<=?4
                     AND NOT EXISTS (SELECT 1 FROM commands prior
                       WHERE prior.target=?1 AND prior.generation=?2
                         AND prior.verb IN ('launch','resume') AND prior.id<>?3)
                     AND EXISTS (SELECT 1 FROM events d INDEXED BY events_agent WHERE d.agent=?1 AND d.generation=?2
                       AND d.source='daemon' AND d.kind='command.dispatched' AND d.seq<e.seq
-                      AND json_extract(d.data,'$.command_id')=?3)
+                      AND d.ts<=e.ts AND json_extract(d.data,'$.command_id')=?3
+                      AND NOT EXISTS (SELECT 1 FROM events finished INDEXED BY events_agent
+                        WHERE finished.agent=?1 AND finished.generation=?2 AND finished.source='daemon'
+                          AND finished.kind IN ('command.unknown','command.failed','command.rejected')
+                          AND finished.seq>d.seq AND finished.seq<e.seq
+                          AND json_extract(finished.data,'$.command_id')=?3))
                  ORDER BY e.seq LIMIT 1",
-                params![target,generation,id], |r| r.get::<_, i64>(0),
+                params![target,generation,id,record.command.updated_at], |r| r.get::<_, i64>(0),
             ).optional().map_err(sql_error)?;
             Ok(ready.map(|seq| {
                 (
