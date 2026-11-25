@@ -299,7 +299,7 @@ impl Store {
                     &command,
                     agent_num,
                     generation,
-                    "project_check_superseded",
+                    ("project_check_superseded", None),
                     now,
                     &mut events,
                 )?;
@@ -410,7 +410,7 @@ impl Store {
                     &record,
                     agent_num,
                     generation,
-                    "task_card_superseded",
+                    ("task_card_superseded", None),
                     now,
                     &mut events,
                 )?;
@@ -893,7 +893,7 @@ pub(super) fn claim_next_input_tx(
                     &record,
                     agent_num,
                     agent.generation,
-                    "expired",
+                    ("expired", None),
                     now,
                     events,
                 )?;
@@ -905,7 +905,7 @@ pub(super) fn claim_next_input_tx(
                     &record,
                     agent_num,
                     agent.generation,
-                    "frame_too_large",
+                    ("frame_too_large", None),
                     now,
                     events,
                 )?;
@@ -926,7 +926,7 @@ pub(super) fn claim_next_input_tx(
                         &record,
                         agent_num,
                         agent.generation,
-                        "frame_too_large",
+                        ("frame_too_large", None),
                         now,
                         events,
                     )?;
@@ -1156,7 +1156,7 @@ impl Store {
                         &record,
                         agent_num,
                         generation,
-                        "expired",
+                        ("expired", None),
                         now,
                         &mut events,
                     )?;
@@ -1202,7 +1202,7 @@ impl Store {
                         &record,
                         agent_num,
                         generation,
-                        "frame_too_large",
+                        ("frame_too_large", None),
                         now,
                         &mut events,
                     )?;
@@ -2467,24 +2467,19 @@ fn reject_unauthorized_context(
 ) -> Result<bool> {
     match check_context_authority(tx, record, agent) {
         Ok(()) => Ok(false),
-        Err(error)
-            if matches!(
-                error.code.as_str(),
-                "stale_assignment" | "not_allowed" | "stale_generation"
-            ) =>
-        {
+        Err(error) if matches!(error.code.as_str(), "internal" | "busy") => Err(error),
+        Err(error) => {
             reject_pending_context(
                 tx,
                 record,
                 agent_num,
                 agent.generation,
-                &error.code,
+                (&error.code, Some(&error.message)),
                 now,
                 events,
             )?;
             Ok(true)
         }
-        Err(error) => Err(error),
     }
 }
 
@@ -2493,11 +2488,14 @@ fn reject_pending_context(
     record: &CommandRecord,
     agent_num: i64,
     generation: i64,
-    code: &str,
+    (code, reason): (&str, Option<&str>),
     now: i64,
     events: &mut Vec<Event>,
 ) -> Result<()> {
     let mut outcome = json!({"code": code, "delivery": "cancelled"});
+    if let Some(reason) = reason {
+        outcome["reason"] = json!(reason);
+    }
     if record
         .command
         .outcome
