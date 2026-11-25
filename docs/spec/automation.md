@@ -1266,6 +1266,18 @@ The Router and Store admit `git.fetch`, `git.integrate`, and check-bound
 `git.publish` through the ordinary command path. `git.fetch` is available to Owner and
 registered-project event or timer rules.
 
+### Local base movement notices
+
+Swarm delivers a committed `git.upstream_moved` fact to the live manager bound
+to the observed workspace and generation. The mail identifies the observed
+topic branch, local upstream ref and old and new OIDs. It uses the existing
+context-note cursor, deterministic mail identity and wake admission. A repeated
+sample of the same tip produces no new notice.
+
+The [Owner settings](configuration.md#daemon-and-automation-settings) control
+delivery and waking. The notice reports locally visible refs. Fetching, merge
+verification and any rebase use their existing Owner-controlled paths.
+
 ### Local branch integration
 
 `git.integrate` takes a literal registered repository, base branch and ordered local

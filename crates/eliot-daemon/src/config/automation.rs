@@ -37,9 +37,27 @@ pub(crate) struct AutomationConfig {
     #[serde(default = "default_auto_cleanup_after")]
     pub(crate) auto_cleanup_after: String,
     #[serde(default)]
+    pub(crate) git_base_notices: GitBaseNoticeConfig,
+    #[serde(default)]
     pub(crate) run: RunGrantConfig,
     #[serde(default)]
     pub(crate) assignments: BTreeMap<String, AssignmentConfig>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub(crate) struct GitBaseNoticeConfig {
+    pub(crate) enabled: bool,
+    pub(crate) wake: bool,
+}
+
+impl Default for GitBaseNoticeConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            wake: true,
+        }
+    }
 }
 
 /// Settings-owned identity and bounds for a routing-aware backlog assignment.
@@ -74,6 +92,7 @@ impl Default for AutomationConfig {
             max_event_backlog: default_max_event_backlog(),
             auto_cleanup: None,
             auto_cleanup_after: default_auto_cleanup_after(),
+            git_base_notices: GitBaseNoticeConfig::default(),
             run: RunGrantConfig::default(),
             assignments: BTreeMap::new(),
         }

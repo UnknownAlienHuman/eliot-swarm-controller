@@ -1,8 +1,12 @@
 use super::{MODE_OPEN, Principal, Router, insertion_facts::InsertionFact};
 use crate::common::now_ms;
-use eliot_core::{CommandState, ContextWaitRequest, Error, Event, Result, api::HandoffResponse};
+use eliot_core::{
+    CommandState, ContextWaitRequest, Error, Event, GitUpstreamMoved, Result,
+    api::{HandoffResponse, MailMode, MailSendRequest, SWARM_MAIL_SENDER},
+};
 use eliot_store::Store;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::sync::atomic::Ordering;
 use tokio::sync::{broadcast, watch};
 
@@ -88,6 +92,9 @@ impl Router {
         if self.inner.mode.load(Ordering::SeqCst) != MODE_OPEN {
             return Ok(());
         }
+        if event.kind == "git.upstream_moved" && event.source == "git" {
+            return self.deliver_git_base_notice(event).await;
+        }
         self.note_native_auth_hold(event).await?;
         self.reconcile_launch_refusal(event).await?;
         if matches!(
@@ -162,6 +169,75 @@ impl Router {
                 )?,
             }
         }
+        Ok(())
+    }
+
+    async fn deliver_git_base_notice(&self, event: &Event) -> Result<()> {
+        let (Some(agent), Some(generation)) = (event.agent.as_deref(), event.generation) else {
+            return Ok(());
+        };
+        let moved: GitUpstreamMoved = serde_json::from_value(event.data.clone())
+            .map_err(|_| Error::new("source_integrity", "invalid retained Git ref movement"))?;
+        let Some(upstream_branch) = moved.upstream.branch() else {
+            return Err(Error::new(
+                "source_integrity",
+                "invalid retained Git upstream tip",
+            ));
+        };
+        if !eliot_core::api::is_git_oid(&moved.previous_oid)
+            || moved.branch.len() > 256
+            || !eliot_core::api::valid_diff_path(&moved.branch)
+        {
+            return Err(Error::new(
+                "source_integrity",
+                "invalid retained Git ref movement",
+            ));
+        }
+        let mut store = self.inner.store.lock().await;
+        let config = self.inner.monitoring.git_base_notice_config();
+        if !config.enabled
+            || self.inner.mode.load(Ordering::SeqCst) != MODE_OPEN
+            || !store.get_agent(agent)?.is_some_and(|current| {
+                current.generation == generation
+                    && current.receives_git_base_notices()
+                    && current.workspace.as_deref().is_some_and(|path| {
+                        eliot_core::workspace_path_key(path)
+                            == eliot_core::workspace_path_key(&moved.workspace)
+                    })
+            })
+        {
+            return Ok(());
+        }
+        let digest = Sha256::digest(format!(
+            "git-base-notice:{}:{agent}:{generation}",
+            event.seq
+        ));
+        let mut entropy = [0; 16];
+        entropy[6..].copy_from_slice(&digest[..10]);
+        let id = ulid::Ulid::from_parts(
+            u64::try_from(event.ts).unwrap_or(0),
+            u128::from_be_bytes(entropy),
+        );
+        let text = format!(
+            "Your checkout was on {} when the locally observed origin/{} moved from {} to {}. Inspect the new base before deciding whether to rebase.",
+            moved.branch, upstream_branch, moved.previous_oid, moved.upstream.oid
+        );
+        let request = MailSendRequest {
+            id: id.to_string(),
+            to: vec![agent.to_owned()],
+            mode: MailMode::Queue,
+            wake: config.wake,
+            text: eliot_core::swarm_note(
+                &self.secret_policy_snapshot().redact_text(&text),
+                SWARM_MAIL_SENDER,
+            ),
+            thread: Some("git-base".to_owned()),
+            reply_to_delivery: None,
+        };
+        request.validate()?;
+        let change = self.mail_send_locked(&mut store, SWARM_MAIL_SENDER, &request, false)?;
+        drop(store);
+        self.mail_send_finish(&request, change).await?;
         Ok(())
     }
 

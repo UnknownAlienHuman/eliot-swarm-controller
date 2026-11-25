@@ -149,7 +149,10 @@ impl Router {
                             "settings changed before the pause applied",
                         ));
                     }
-                    Self::apply_assignment_pauses_locked(&mut store, config)
+                    let notices = config.git_base_notices;
+                    let changed = Self::apply_assignment_pauses_locked(&mut store, config)?;
+                    self.set_git_base_notice_config(notices);
+                    Ok(changed)
                 })
                 .map_err(|_| {
                     Error::new(

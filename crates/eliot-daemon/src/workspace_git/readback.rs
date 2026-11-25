@@ -83,6 +83,33 @@ impl DiffCheckout {
                 value.starts_with("refs/heads/") && eliot_core::api::valid_diff_path(value)
             })
             .ok_or_else(no_head)?;
+        self.reference_oid(reference)
+    }
+
+    pub(crate) fn origin_default(&self) -> Result<eliot_core::GitUpstreamTip> {
+        let (dir, name) =
+            Directory::open(&self.common_dir.path)?.descend("refs/remotes/origin/HEAD")?;
+        let head = line(&read_diff_metadata(dir.file(&name)?, 4096)?)?;
+        let reference = head
+            .strip_prefix("ref: ")
+            .filter(|value| {
+                value.starts_with("refs/remotes/origin/")
+                    && value.len() <= 256
+                    && eliot_core::api::valid_diff_path(value)
+            })
+            .ok_or_else(|| problem("unavailable", "cannot resolve the local origin default"))?;
+        let tip = eliot_core::GitUpstreamTip {
+            reference: reference.to_owned(),
+            oid: self.reference_oid(reference)?,
+        };
+        tip.branch()
+            .is_some()
+            .then_some(tip)
+            .ok_or_else(|| problem("unavailable", "invalid local origin default"))
+    }
+
+    fn reference_oid(&self, reference: &str) -> Result<String> {
+        let no_head = || problem("unavailable", "cannot resolve the checkout Git ref");
         let loose = self.common_dir.path.join(reference);
         let oid = match fs::symlink_metadata(&loose) {
             Ok(_) => {

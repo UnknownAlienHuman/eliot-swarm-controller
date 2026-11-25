@@ -26,7 +26,8 @@ pub(crate) mod recovery;
 pub(crate) mod settings;
 
 pub(crate) use automation::{
-    AutomationConfig, RunGrantConfig, load_automation_config, load_automation_config_snapshot,
+    AutomationConfig, GitBaseNoticeConfig, RunGrantConfig, load_automation_config,
+    load_automation_config_snapshot,
 };
 use projects::{ProjectEntry, project_registrations_in};
 pub(crate) use projects::{

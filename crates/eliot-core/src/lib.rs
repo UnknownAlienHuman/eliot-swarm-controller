@@ -387,7 +387,34 @@ pub struct GitSnapshot {
     #[serde(default)]
     pub base_complete: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream: Option<GitUpstreamTip>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub work: Option<GitWorkProbe>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitUpstreamTip {
+    pub reference: String,
+    pub oid: String,
+}
+
+impl GitUpstreamTip {
+    pub fn branch(&self) -> Option<&str> {
+        let branch = self.reference.strip_prefix("refs/remotes/origin/")?;
+        (branch != "HEAD"
+            && self.reference.len() <= 256
+            && api::valid_diff_path(branch)
+            && api::is_git_oid(&self.oid))
+        .then_some(branch)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitUpstreamMoved {
+    pub workspace: String,
+    pub branch: String,
+    pub upstream: GitUpstreamTip,
+    pub previous_oid: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -609,6 +636,18 @@ pub struct Agent {
 }
 
 impl Agent {
+    pub fn receives_git_base_notices(&self) -> bool {
+        !self.chat
+            && !self.observe_only
+            && !self.archived
+            && self.parent.is_none()
+            && matches!(self.control, AgentControl::Tree | AgentControl::Project)
+            && matches!(
+                self.state,
+                AgentState::Idle | AgentState::Busy | AgentState::Waiting
+            )
+    }
+
     /// Retain the exact turn selector separately from provider model evidence.
     pub fn set_admitted_model(&mut self, model: Option<String>) {
         if let Some(Value::Object(effective)) = self.effective.as_mut() {

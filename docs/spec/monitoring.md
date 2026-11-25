@@ -682,6 +682,12 @@ silently disabling the configured HTTPS/SSH transport itself.
   `diff --no-ext-diff --no-textconv` against frozen `base_oid` when available;
 - remote refs change only after explicit safe fetch or optional validated read-only
   `ls-remote` poll;
+- for controlled root managers on a topic branch, the sampler also reads the
+  locally recorded `origin/HEAD` and its tip through the pinned Git directory.
+  It uses bounded loose or packed refs and starts no additional Git process.
+  First observation or a changed checkout, branch, or upstream ref establishes
+  a baseline. A changed tip on the same binding records `git.upstream_moved`.
+  The fact describes a local ref movement and carries no GitHub merge assertion.
 - slow status backs off and reports source health;
 - monitor never writes index, refs or objects.
 - an unchanged probe writes no Store rows: with no relevant native hints, Git events or

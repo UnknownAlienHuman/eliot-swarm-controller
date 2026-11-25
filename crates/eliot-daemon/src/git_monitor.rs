@@ -371,6 +371,7 @@ impl GitProbe {
             base_oid: base_oid.map(str::to_owned),
             committed_paths,
             base_complete,
+            upstream: None,
             work: Some(work),
         })
     }

@@ -405,6 +405,7 @@ struct GitView {
     data: Value,
     changed: bool,
     undelivered: Vec<GitCommit>,
+    upstream_moved: Option<core::GitUpstreamMoved>,
 }
 
 /// Code-progress snapshot read by automatic attention without launching Git.
@@ -837,14 +838,18 @@ fn git_changed_data(
     base_complete: bool,
     view_digest: &str,
 ) -> Value {
-    json!({
+    let mut data = json!({
         "workspace": snapshot.workspace, "head": snapshot.head, "branch": snapshot.branch,
         "dirty": dirty, "complete": complete,
         "dirty_digest": snapshot.work.as_ref().and_then(|work| work.dirty_digest.as_deref()),
         "history_complete": snapshot.history_complete, "history_gap": snapshot.history_gap,
         "base_oid": snapshot.base_oid, "committed_paths": committed_paths, "base_complete": base_complete,
         "view_digest": view_digest,
-    })
+    });
+    if let Some(upstream) = &snapshot.upstream {
+        data["upstream"] = json!(upstream);
+    }
+    data
 }
 
 /// Bound one commit's persisted representation before commit: truncate its
@@ -988,6 +993,27 @@ fn compute_git_view(
             }
         }
     }
+    let upstream_moved = previous.as_ref().and_then(|previous| {
+        let upstream = snapshot.upstream.as_ref()?;
+        let branch = snapshot.branch.as_ref()?;
+        let old: core::GitUpstreamTip =
+            serde_json::from_value(previous["upstream"].clone()).ok()?;
+        if old.reference != upstream.reference
+            || old.oid == upstream.oid
+            || old.branch().is_none()
+            || previous["branch"].as_str() != Some(branch)
+            || previous["workspace"].as_str() != Some(snapshot.workspace.as_str())
+            || snapshot.head.as_deref() == Some(upstream.oid.as_str())
+        {
+            return None;
+        }
+        Some(core::GitUpstreamMoved {
+            workspace: snapshot.workspace.clone(),
+            branch: branch.clone(),
+            upstream: upstream.clone(),
+            previous_oid: old.oid,
+        })
+    });
     let changed = match previous {
         Some(previous) => canonical::digest(&previous)? != canonical::digest(&data)?,
         None => true,
@@ -996,6 +1022,7 @@ fn compute_git_view(
         data,
         changed,
         undelivered,
+        upstream_moved,
     })
 }
 
@@ -1017,6 +1044,21 @@ fn persist_git_observation_events(
             "git.changed",
             "git",
             view.data,
+        )?);
+    }
+    if let Some(moved) = view.upstream_moved
+        && load_agent_by_num(tx, agent_num)?.is_some_and(|agent| {
+            agent.generation == generation && agent.receives_git_base_notices()
+        })
+    {
+        events.push(insert_git_event(
+            tx,
+            agent_num,
+            generation,
+            snapshot.observed_at,
+            "git.upstream_moved",
+            "git",
+            json!(moved),
         )?);
     }
     if snapshot.complete {
@@ -1120,6 +1162,19 @@ fn git_path_key(workspace: &str, path: &str) -> String {
 
 fn validate_git_snapshot(snapshot: &GitSnapshot) -> Result<()> {
     require_nonempty(&snapshot.workspace, "Git workspace")?;
+    if let Some(upstream) = &snapshot.upstream
+        && (upstream.branch().is_none()
+            || snapshot.branch.as_deref().is_none_or(|branch| {
+                branch.len() > 256
+                    || !core::api::valid_diff_path(branch)
+                    || upstream.branch() == Some(branch)
+            }))
+    {
+        return Err(Error::new(
+            "invalid",
+            "Git upstream observation has an invalid branch or tip",
+        ));
+    }
     if snapshot.dirty.len() > MAX_PAGE_ENTRIES
         || snapshot.commits.len() > MAX_PAGE_ENTRIES
         || snapshot.clean_paths.len() > MAX_PAGE_ENTRIES
