@@ -27,7 +27,7 @@ use eliot_plugin::{
         AgentModelCatalogue, AgentModelsParams, ModelListParams, ModelListPart,
         NativeArchiveParams, stream_sources,
     },
-    retry::{Retry, RetryOperation},
+    retry::{Readiness, RetryOperation, poll_idempotent, settle_readiness},
     session::{
         ModelSelection, ResumeSubject, TargetEnvironment, attach_reply_diagnostics, begin_stop,
         decode, ensure_dedicated_reader, ensure_reader_harness, initialize_fields_valid,
@@ -3977,16 +3977,6 @@ fn policy_from_snapshot(profile: &serde_json::Map<String, Value>) -> Result<McpP
     Ok(policy)
 }
 
-/// How long the effective MCP readback waits for the installed inventory
-/// to settle on the Agent-scoped server. MCP servers connect
-/// asynchronously after session create (observed up to ~10s on the
-/// installed 2.2.7 server); a single instant query almost always races
-/// them and reports an empty surface. Polling is bounded well under one
-/// RPC budget so neither the create nor the resume path can stall on it.
-/// The backoff is the shared readiness-settle policy (50 ms doubling to
-/// 1 s, clamped to this cap).
-const MCP_SETTLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
-
 /// Polled Agent-scoped MCP readback for the effective record:
 /// `GET /api/mcp` (`mcp.list`) after the session exists, re-polled until
 /// the Agent-scoped server reports `connected` (or a terminal
@@ -4005,35 +3995,22 @@ async fn observe_mcp_servers(
     http: &OpenCodeHttp,
     deadline: Instant,
 ) -> (Value, bool, Option<Vec<McpServerReadback>>) {
-    let cap = (Instant::now() + MCP_SETTLE_TIMEOUT).min(deadline);
-    let mut retry = Retry::new(RetryOperation::ReadinessSettle);
-    let mut last: Option<Vec<McpServerReadback>> = None;
-    loop {
+    let observation = settle_readiness(deadline, async |cap| {
         let read_timing = crate::native::startup::Step::new("mcp_inventory_read");
         let readback = http.list_mcp_servers(cap).await;
         drop(read_timing);
-        if let Ok(servers) = readback {
-            match mcp_settle(&servers) {
-                McpSettle::Connected => return (mcp_names(&servers), true, Some(servers)),
-                // A terminal non-connected status settles the observation
-                // early: without a restart the entry cannot become serving.
-                McpSettle::Terminal => return (mcp_names(&servers), false, Some(servers)),
-                McpSettle::KeepPolling => {
-                    last = Some(servers);
-                }
-            }
+        let Ok(servers) = readback else {
+            return Readiness::Unavailable;
+        };
+        match mcp_settle(&servers) {
+            McpSettle::Connected => Readiness::Settled((servers, true)),
+            McpSettle::Terminal => Readiness::Settled((servers, false)),
+            McpSettle::KeepPolling => Readiness::Pending((servers, false)),
         }
-        if Instant::now() >= cap {
-            break;
-        }
-        // Hot MCP startup should not pay a whole second after the first
-        // pending observation. The shared readiness-settle backoff waits
-        // from 50 ms up to 1 s, clamping both the native reads and the
-        // sleeps to the same settle/start deadline.
-        retry.wait_settle(cap).await;
-    }
-    match last {
-        Some(servers) => (mcp_names(&servers), false, Some(servers)),
+    })
+    .await;
+    match observation {
+        Some((servers, connected)) => (mcp_names(&servers), connected, Some(servers)),
         None => (Value::Null, false, None),
     }
 }
@@ -4813,27 +4790,24 @@ async fn bind_context_hooks(
     session_id: &str,
     deadline: Instant,
 ) -> bool {
-    let mut retry =
-        eliot_plugin::retry::Retry::new(eliot_plugin::retry::RetryOperation::SessionBinding);
-    loop {
+    use std::ops::ControlFlow;
+
+    poll_idempotent(RetryOperation::SessionBinding, deadline, async || {
         if Instant::now() >= deadline {
-            return false;
+            return ControlFlow::Break(false);
         }
         match http.eliot_context_bind(session_id, deadline).await {
             Ok(output) => {
-                return crate::context_hooks::bind_verified(&output, session_id);
+                ControlFlow::Break(crate::context_hooks::bind_verified(&output, session_id))
             }
-            Err(HttpOutcome::Rejected { .. }) => return false,
+            Err(HttpOutcome::Rejected { .. }) => ControlFlow::Break(false),
             Err(HttpOutcome::Unknown { .. } | HttpOutcome::NotDispatched { .. }) => {
-                if !retry
-                    .wait(eliot_plugin::retry::RetryFact::Idempotent, Some(deadline))
-                    .await
-                {
-                    return false;
-                }
+                ControlFlow::Continue(())
             }
         }
-    }
+    })
+    .await
+    .unwrap_or(false)
 }
 
 /// The first slash separates `providerID`; the full remaining id stays intact.
