@@ -20,7 +20,7 @@ use windows_sys::{
             WinTrust::{
                 WINTRUST_ACTION_GENERIC_VERIFY_V2, WINTRUST_DATA, WINTRUST_DATA_0,
                 WINTRUST_FILE_INFO, WTD_CACHE_ONLY_URL_RETRIEVAL, WTD_CHOICE_FILE,
-                WTD_STATEACTION_CLOSE, WTD_STATEACTION_VERIFY, WTD_UI_NONE,
+                WTD_REVOKE_WHOLECHAIN, WTD_STATEACTION_CLOSE, WTD_STATEACTION_VERIFY, WTD_UI_NONE,
                 WTHelperGetProvCertFromChain, WTHelperGetProvSignerFromChain,
                 WTHelperProvDataFromStateData, WinVerifyTrust,
             },
@@ -30,7 +30,8 @@ use windows_sys::{
 };
 
 /// Verify the open file using Windows Authenticode and match its verified leaf
-/// signer's exact subject attributes. Uses local trust data and shows no UI.
+/// signer's exact subject attributes. Checks revocation across the whole chain
+/// using cached data only, without network retrieval or UI.
 pub fn authenticode_signer_matches(
     file: &File,
     path: &Path,
@@ -47,6 +48,7 @@ pub fn authenticode_signer_matches(
     let mut trust = WINTRUST_DATA {
         cbStruct: size_of::<WINTRUST_DATA>() as u32,
         dwUIChoice: WTD_UI_NONE,
+        fdwRevocationChecks: WTD_REVOKE_WHOLECHAIN,
         dwUnionChoice: WTD_CHOICE_FILE,
         Anonymous: WINTRUST_DATA_0 {
             pFile: &raw mut subject,

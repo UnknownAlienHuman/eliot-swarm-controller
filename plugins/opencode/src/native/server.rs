@@ -13,7 +13,7 @@
 //!
 //! Store layout: the generated `opencode.jsonc` is per generation (under the
 //! plugin instance directory), but the session store (`XDG_DATA_HOME`) is
-//! per Agent â€” `opencode-{agent_id}` next to the instance directories â€” so
+//! per Agent — `opencode-{agent_id}` next to the instance directories — so
 //! a resumed generation serves the exact retained native session instead of
 //! an empty store. Generations of one Agent never run concurrently (the old
 //! one is terminal before resume), so one server owns the store at a time;

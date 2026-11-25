@@ -1,5 +1,5 @@
 use crate::{Error, Result, RoutingDecision};
-use serde::Serialize;
+use serde::{Serialize, de::DeserializeOwned};
 use serde_json::{Map, Value};
 
 /// Launch selectors shared by the CLI, Router and Store. The original
@@ -78,10 +78,10 @@ impl LaunchCommandArgs {
     /// Project the selectors without changing the retained envelope. Some
     /// validators distinguish omission, null and a malformed value, and
     /// check the original key at the boundary that owns that decision.
-    pub fn read(args: &Value) -> Self {
+    pub fn read(args: &Value) -> Result<Self> {
         let text = |key| args.get(key).and_then(Value::as_str).map(str::to_owned);
         let flag = |key| args.get(key).and_then(Value::as_bool);
-        Self {
+        Ok(Self {
             workspace: text("workspace"),
             project: text("project"),
             registered_project: text("registered_project"),
@@ -103,16 +103,32 @@ impl LaunchCommandArgs {
             chat: flag("chat"),
             owner_override: flag("owner_override"),
             switch_blank_scope: flag(super::SWITCH_BLANK_SCOPE_ARG),
-            goal: args.get("goal").and_then(Value::as_object).cloned(),
-            profile_choice: args
-                .get("profile_choice")
-                .cloned()
-                .and_then(|value| serde_json::from_value(value).ok()),
-            sources: args
-                .get("sources")
-                .cloned()
-                .and_then(|value| serde_json::from_value(value).ok())
+            goal: optional_field(args, "goal", Value::is_object, "a Goal object")?,
+            profile_choice: optional_field(
+                args,
+                "profile_choice",
+                Value::is_object,
+                "a routing decision object",
+            )?,
+            sources: optional_field(args, "sources", Value::is_array, "an array of path strings")?
                 .unwrap_or_default(),
-        }
+        })
     }
+}
+
+fn optional_field<T: DeserializeOwned>(
+    args: &Value,
+    key: &str,
+    shape: fn(&Value) -> bool,
+    expected: &str,
+) -> Result<Option<T>> {
+    args.get(key)
+        .map(|value| {
+            let invalid = || Error::invalid_field(format!("args.{key}"), expected);
+            if !shape(value) {
+                return Err(invalid());
+            }
+            T::deserialize(value).map_err(|_| invalid())
+        })
+        .transpose()
 }

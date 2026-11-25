@@ -842,7 +842,7 @@ fn admit_launch_tx(
         hierarchy::check_child_fanout(tx, parent, limits)?;
     }
     use eliot_core::api::LaunchCommandArgs;
-    let launch = LaunchCommandArgs::read(&request.args);
+    let launch = LaunchCommandArgs::read(&request.args)?;
     let chat = launch.chat.unwrap_or(false);
     let provider_probe_scope = launch.provider_probe.as_deref();
     let provider_probe = provider_probe_scope.is_some();
@@ -1099,11 +1099,7 @@ fn admit_launch_tx(
             params![path.to_string_lossy(), agent_num]
         ));
     }
-    if request.args.get("profile_choice").is_some() {
-        let choice = launch
-            .profile_choice
-            .as_ref()
-            .ok_or_else(|| Error::new("invalid", "invalid routing decision"))?;
+    if let Some(choice) = &launch.profile_choice {
         if choice.profile.as_deref() != Some(profile.as_str()) {
             return Err(Error::new(
                 "invalid",

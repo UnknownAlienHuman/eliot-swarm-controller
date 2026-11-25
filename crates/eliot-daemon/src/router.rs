@@ -3630,7 +3630,7 @@ impl Router {
             self.freeze_project_command_guards(request).await?;
             return retained_preparation(&request.args);
         }
-        let launch = LaunchCommandArgs::read(&request.args);
+        let launch = LaunchCommandArgs::read(&request.args)?;
         let profile = LaunchCommandArgs::required_text(launch.profile.as_deref(), "profile")?;
         self.refresh_model_hold(profile, &request.args["profile_snapshot"])
             .await;
@@ -3897,7 +3897,7 @@ impl Router {
             return Ok(true);
         }
 
-        let launch = LaunchCommandArgs::read(&request.args);
+        let launch = LaunchCommandArgs::read(&request.args)?;
 
         // Ad-hoc Owner launch: freeze a profile-equivalent snapshot from
         // built-in per-harness defaults plus flags. Agent principals keep
@@ -8433,7 +8433,7 @@ fn normalize_launch(request: &mut SubmitCommand, principal: &Principal) -> Resul
     }
     reject_launch_derived_keys(&request.args)?;
     project_checks::validate_launch_inputs(&request.args, matches!(principal, Principal::Owner))?;
-    let launch = LaunchCommandArgs::read(&request.args);
+    let launch = LaunchCommandArgs::read(&request.args)?;
     if request.args.get("role").is_some() {
         let role = launch
             .role

@@ -23,7 +23,7 @@ use eliot_plugin::install::{
 use eliot_plugin::session::split_provider_model;
 use eliot_plugin::sync::LockExt;
 use serde_json::{Value, json};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 pub(crate) const ADHOC_PROFILE_PREFIX: &str = "adhoc-";
 
@@ -1159,10 +1159,11 @@ fn probe_version_uncached(
         &[("method", "--version")],
         None,
     );
+    let cwd = version_probe_directory(Path::new(program))?;
     let bytes = native_capture(
         program,
         &["--version"],
-        Path::new(program).parent(),
+        Some(&cwd),
         deadline.min(Instant::now() + VERSION_PROBE_TIMEOUT),
     )?
     .filter(|capture| capture.status.success() && capture.stdout_complete)
@@ -1175,6 +1176,23 @@ fn probe_version_uncached(
             && (identity.is_none() || parse_cli_version(text).is_some()))
         .then(|| text.to_owned())
     }))
+}
+
+fn version_probe_directory(program: &Path) -> core::Result<PathBuf> {
+    if let Some(directory) = program.parent().filter(|directory| directory.is_absolute()) {
+        return Ok(directory.to_owned());
+    }
+    #[cfg(windows)]
+    let directory = std::env::var_os("SystemRoot")
+        .map(PathBuf::from)
+        .filter(|root| root.is_absolute())
+        .map(|root| root.join("System32"))
+        .ok_or_else(|| {
+            core::Error::new("platform_io", "Windows system directory is unavailable")
+        })?;
+    #[cfg(not(windows))]
+    let directory = PathBuf::from("/");
+    Ok(directory)
 }
 
 /// Bridge synchronous installation/profile resolution to the same bounded

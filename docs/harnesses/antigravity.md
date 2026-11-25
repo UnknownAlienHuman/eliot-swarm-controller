@@ -602,8 +602,9 @@ naming the IDE path with guidance to install `agy`: the IDE executable does
 not implement the native ACP/model CLI and is never launched for discovery.
 Install discovery requires the `agy` filename and reads the executable's Go
 build-info record. On Windows it requires a PE console image and a valid
-Authenticode signature from Google LLC, verified with Windows trust data
-without network retrieval. A Windows build may omit its Go module record.
+Authenticode signature from Google LLC. Windows checks revocation across the
+whole chain using cached data without network retrieval. A Windows build may
+omit its Go module record.
 When a module record exists, the main module must match on every platform.
 Other platforms require that module record. After verifying the file,
 discovery reads bounded `--version` metadata from the executable's directory.

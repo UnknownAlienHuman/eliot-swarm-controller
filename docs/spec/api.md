@@ -1445,7 +1445,7 @@ policy. `args.no_policy` is a nonblank reason of at most 256 bytes without contr
 or invisible format characters. It skips both the policy Goal and the fast check and
 records `project.policy.opted_out` with the reason. Private chats have no registered
 execution project or policy. A same-project switch retains the opt-out reason.
-The same arguments reach direct and queued launch admission. Executable check
+Ordinary launch arguments reach direct and queued admission. Executable check
 overrides and escalation require Owner authority. A queued intent has no Agent or command until
 admitted. Exact retry
 returns the current intent. When admission succeeds, the receipt gives the
@@ -1463,9 +1463,9 @@ receives `capacity_unavailable` for that request alone, before creating a
 command, Agent, or reservation. Expiry while still waiting also gives a
 definite capacity refusal. An admission decision already in progress settles
 before the RPC replies. Use `--queue` for a durable intent and retry a lost
-reply with the same ID. An Owner can explicitly use
-`--owner-override` to bypass fair ordering while still checking every
-admission limit.
+reply with the same ID. An Owner can use `--owner-override` on a direct
+launch to bypass fair ordering while still checking every admission limit.
+`launch.enqueue` rejects `owner_override`.
 
 A manager uses `swarm project budget PROJECT --revision REV` with `--max-live`,
 `--priority`, `--pause` or `--resume` to apply an Owner-granted change to its current
