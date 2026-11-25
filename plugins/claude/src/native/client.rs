@@ -64,14 +64,14 @@ pub(crate) struct ClaudeProcess {
 
 impl ClaudeProcess {
     pub async fn spawn(launch: NativeLaunch, policy: SecretPolicy) -> Result<Self> {
-        // JSON-RPC: keep nonblocking routing; a pending reply must never
-        // wait behind a saturated emit queue.
+        // Claude stream-json has no shared JSON-RPC reply channel, so applying
+        // backpressure preserves ordered records without blocking reply routing.
         let (transport, pending, frame_rx, stream_rx) = spawn_pumped(
             launch,
             policy.clone(),
             LABELS,
             ID_PREFIX,
-            PumpMode::LossyOverflow,
+            PumpMode::LosslessBackpressure,
             OVERSIZED_KNOWN_METHODS,
             classify_claude_frame,
             None,

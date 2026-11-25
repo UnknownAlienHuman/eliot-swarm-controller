@@ -6,7 +6,7 @@ use self::hooks::{
 };
 
 use eliot_core::{
-    ContextItem, ContextOutcome, Error, InjectPoint, Result, SecretPolicy, TurnUsage,
+    ContextItem, ContextOutcome, Error, InjectPoint, NativeEvent, Result, SecretPolicy, TurnUsage,
     limits::{MAX_COMMAND_ID_BYTES, MAX_TOOL_COMMAND_BYTES, NATIVE_TERMINAL_DEADLINE_REASON},
     requests::{ApprovalChoice, ApprovalDecision, ApprovalRequest},
 };
@@ -1864,6 +1864,7 @@ impl EventProcessor {
             return Ok(());
         };
         let command_id = self.status.active_command_id.clone();
+        let mut events = Vec::new();
         for tool_use in assistant_tool_uses(record) {
             self.tool_names
                 .entry(tool_use.id.clone())
@@ -1896,15 +1897,21 @@ impl EventProcessor {
                     Value::String(policy.redact_bounded(&redacted, MAX_TOOL_COMMAND_BYTES));
             }
             if serde_json::to_vec(&data).map_or(true, |bytes| bytes.len() > MAX_EVENT_BYTES) {
+                self.commit_tool_facts(events).await?;
                 return self
                     .record_gap("Claude tool start exceeded the persisted-event bound")
                     .await;
             }
             let session_id = self.status.session_id.as_deref().unwrap_or_default();
             let native_id = format!("claude:{session_id}:{turn_id}:tool.started:{}", tool_use.id);
-            self.commit_event("tool.started", native_id, data).await?;
+            events.push(NativeEvent {
+                kind: "tool.started".to_owned(),
+                native_id,
+                data,
+                ts: None,
+            });
         }
-        Ok(())
+        self.commit_tool_facts(events).await
     }
 
     /// Commit `tool.completed` for the main-thread `tool_result` blocks of
@@ -1948,6 +1955,7 @@ impl EventProcessor {
         }
         let command_id = self.status.active_command_id.clone();
         let mut unknown = false;
+        let mut events = Vec::new();
         for result in results {
             let Some(tool) = self.tool_names.get(&result.tool_use_id).cloned() else {
                 unknown = true;
@@ -1975,6 +1983,7 @@ impl EventProcessor {
                 );
             }
             if serde_json::to_vec(&data).map_or(true, |bytes| bytes.len() > MAX_EVENT_BYTES) {
+                self.commit_tool_facts(events).await?;
                 return self
                     .record_gap("Claude tool completion exceeded the persisted-event bound")
                     .await;
@@ -1984,11 +1993,32 @@ impl EventProcessor {
                 "claude:{session_id}:{turn_id}:tool.completed:{}",
                 result.tool_use_id
             );
-            self.commit_event("tool.completed", native_id, data).await?;
+            events.push(NativeEvent {
+                kind: "tool.completed".to_owned(),
+                native_id,
+                data,
+                ts: None,
+            });
         }
+        self.commit_tool_facts(events).await?;
         if unknown {
             self.record_tool_coverage_gap("Claude tool result did not match a known tool use")
                 .await?;
+        }
+        Ok(())
+    }
+
+    async fn commit_tool_facts(&mut self, events: Vec<NativeEvent>) -> Result<()> {
+        if !events.is_empty() {
+            if let Err(error) = self.stream_source().commit_tool_events(events).await {
+                if error.failure_where.as_deref() != Some("plugin.events.put") {
+                    self.stream_source()
+                        .note_event_failure(&error, "Claude tool event batch was not confirmed")
+                        .await;
+                }
+                return Err(error);
+            }
+            self.refresh_terminal_deadline();
         }
         Ok(())
     }

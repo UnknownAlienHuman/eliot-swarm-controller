@@ -411,7 +411,9 @@ impl CommitSink {
             })?;
         let value = match self.client.call_prepared(prepared, deadline, permit).await {
             Ok(value) => value,
-            Err(error) if is_definite_batch_rejection(&error.code) => return Err(error),
+            Err(error) if is_definite_batch_rejection(&error.code) => {
+                return Err(error.with_where("plugin.events.put"));
+            }
             Err(_) => return Err(self.lost_ack()),
         };
         let ack: BatchAck = serde_json::from_value(value).map_err(|_| self.lost_ack())?;

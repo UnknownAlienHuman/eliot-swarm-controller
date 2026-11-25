@@ -18,14 +18,21 @@ use crate::common::{now_ms, secure_eq};
 use crate::git_monitor::GitProbe;
 use crate::monitor::Monitoring;
 
+use eliot_core::limits::{
+    MAX_TOOL_BATCHES_PER_GROUP, MAX_TOOL_EVENTS_PER_BATCH, MAX_TOOL_GROUP_BYTES,
+};
 use eliot_core::{Error, PermissionRefusal, Result, SecretPolicy, SourceBatch, SourceGap};
 use eliot_plugin::protocol::{
     HookEvent, HookResponse, SessionUsageSampleAck, SessionUsageSampleRequest,
 };
 use eliot_plugin::sync::LockExt;
-use eliot_store::family_for_kind;
+use eliot_store::{BatchCommit, ReadyToolBatch, family_for_kind};
 use serde_json::{Value, json};
 
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, Weak};
+use std::time::Duration;
+use tokio::sync::{Mutex as AsyncMutex, oneshot};
 use tokio::time::{Instant, timeout_at};
 use ulid::Ulid;
 
@@ -34,6 +41,153 @@ struct BatchIntake<'a> {
     monitoring: &'a Monitoring,
     policy: &'a CommandGuardPolicy,
     credentials: &'a [String],
+}
+
+#[derive(Default)]
+pub(super) struct ReadyToolBatches {
+    queue: Mutex<Vec<QueuedToolBatch>>,
+    streams: Mutex<HashMap<AgentKey, Weak<AsyncMutex<()>>>>,
+}
+
+struct QueuedToolBatch {
+    ticket: Arc<()>,
+    batch: ReadyToolBatch,
+    queued: Instant,
+    deadline: Instant,
+    reply: oneshot::Sender<ToolBatchOutcome>,
+}
+
+enum ToolBatchOutcome {
+    Direct(SourceBatch),
+    Committed {
+        result: Result<BatchCommit>,
+        wait: Duration,
+        held: Duration,
+        batches: usize,
+        group_bytes: usize,
+    },
+    RestartCutoff(String),
+    Unsettled(Error),
+}
+
+impl ReadyToolBatches {
+    /// Keep one FIFO admission lock shared by any overlapping connections for
+    /// this controlled stream. A connection holds it through commit or gap.
+    fn stream_order(&self, key: &AgentKey) -> Arc<AsyncMutex<()>> {
+        let mut streams = self.streams.lock_recover();
+        if let Some(order) = streams.get(key).and_then(Weak::upgrade) {
+            return order;
+        }
+        streams.retain(|_, order| order.strong_count() > 0);
+        let order = Arc::new(AsyncMutex::new(()));
+        streams.insert(key.clone(), Arc::downgrade(&order));
+        order
+    }
+
+    /// A caller that acquires the existing Store lock serves the bounded
+    /// ready queue. Other callers join through their own result channels.
+    /// A full queue uses the original single-batch path.
+    async fn try_submit(
+        &self,
+        host: &HostState,
+        store: &StoreHandle,
+        bus: &Bus,
+        batch: ReadyToolBatch,
+        until: Instant,
+    ) -> ToolBatchOutcome {
+        let (reply, mut received) = oneshot::channel();
+        let ticket = Arc::new(());
+        {
+            let mut queue = self.queue.lock_recover();
+            queue.retain(|job| !job.reply.is_closed());
+            let queued_bytes: usize = queue.iter().map(|job| job.batch.encoded_bytes()).sum();
+            if queue.len() >= MAX_TOOL_BATCHES_PER_GROUP
+                || batch.encoded_bytes() > MAX_TOOL_GROUP_BYTES - queued_bytes
+            {
+                return ToolBatchOutcome::Direct(batch.into_batch());
+            }
+            queue.push(QueuedToolBatch {
+                ticket: Arc::clone(&ticket),
+                batch,
+                queued: Instant::now(),
+                deadline: until,
+                reply,
+            });
+        }
+        match timeout_at(until, async {
+            tokio::select! {
+                biased;
+                result = &mut received => result,
+                mut writer = store.lock() => {
+                    let queued = std::mem::take(&mut *self.queue.lock_recover());
+                    let acquired = Instant::now();
+                    let mut batches = Vec::with_capacity(queued.len());
+                    let mut replies = Vec::with_capacity(queued.len());
+                    let cutoff = host.planned_restart_cutoff.lock_recover().clone();
+                    for job in queued {
+                        if let Some(cutoff) = &cutoff {
+                            let _ = job.reply.send(ToolBatchOutcome::RestartCutoff(cutoff.clone()));
+                        } else if job.deadline <= acquired {
+                            let _ = job.reply.send(ToolBatchOutcome::Unsettled(Error::new(
+                                "busy",
+                                "Store lock deadline elapsed for events.put",
+                            )));
+                        } else if !job.reply.is_closed() {
+                            batches.push(job.batch);
+                            replies.push((job.queued, job.reply));
+                        }
+                    }
+                    if !batches.is_empty() {
+                        let count = batches.len();
+                        let group_bytes = batches.iter().map(ReadyToolBatch::encoded_bytes).sum();
+                        let results = if count == 1 {
+                            vec![writer.put_batch(batches.pop().expect("one ready batch").into_batch(), now_ms())]
+                        } else {
+                            writer.put_tool_batch_group(batches, now_ms())
+                        };
+                        for commit in results.iter().filter_map(|result| result.as_ref().ok()) {
+                            bus.publish(&commit.events);
+                        }
+                        let held = acquired.elapsed();
+                        for ((queued_at, reply), result) in replies.into_iter().zip(results) {
+                            let _ = reply.send(ToolBatchOutcome::Committed {
+                                result,
+                                wait: acquired - queued_at,
+                                held,
+                                batches: count,
+                                group_bytes,
+                            });
+                        }
+                    }
+                    drop(writer);
+                    received.await
+                }
+            }
+        })
+        .await
+        {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => ToolBatchOutcome::Unsettled(Error::new(
+                "unknown",
+                "tool group acknowledgement was not delivered",
+            )),
+            Err(_) => {
+                let mut queue = self.queue.lock_recover();
+                if let Some(index) = queue.iter().position(|job| Arc::ptr_eq(&job.ticket, &ticket)) {
+                    queue.remove(index);
+                    ToolBatchOutcome::Unsettled(Error::new(
+                        "busy",
+                        "Store lock deadline elapsed for events.put",
+                    ))
+                } else {
+                    ToolBatchOutcome::Unsettled(Error::new(
+                        "unknown",
+                        "tool group acknowledgement deadline elapsed after dequeue",
+                    ))
+                }
+            }
+        }
+    }
 }
 
 pub(super) async fn serve_plugin_requests(mut connection: PluginConnection, source: EventSource) {
@@ -56,6 +210,9 @@ pub(super) async fn serve_plugin_requests(mut connection: PluginConnection, sour
         observation: observation.as_ref(),
     };
     let client = connection.client();
+    let stream_order = state
+        .upgrade()
+        .map(|host| host.tool_batches.stream_order(&key));
     while let Some(request) = connection.next_request().await {
         let request_id = request.id.clone();
         let method = request.method.clone();
@@ -67,6 +224,7 @@ pub(super) async fn serve_plugin_requests(mut connection: PluginConnection, sour
             _ => reply_deadline,
         };
         let mut rejected_batch = None;
+        let mut stream_guard = None;
         let result = if !matches!(
             method.as_str(),
             "events.put"
@@ -183,6 +341,29 @@ pub(super) async fn serve_plugin_requests(mut connection: PluginConnection, sour
                         }
                     }
                     "events.put" => {
+                        if let Some(order) = &stream_order
+                            && params["source"].as_str() == Some("stream")
+                            && params["agent_id"].as_str() == Some(&agent_id)
+                            && params["generation"].as_i64() == Some(generation)
+                        {
+                            match timeout_at(request_deadline, order.lock()).await {
+                                Ok(guard) => stream_guard = Some(guard),
+                                Err(_) => {
+                                    // Coverage is unresolved while the earlier batch owns the
+                                    // stream. Retirement settles the missing suffix in order.
+                                    let result = Err(late_batch_error(
+                                        &state,
+                                        &agent_id,
+                                        generation,
+                                        "stream_order",
+                                    ));
+                                    let _ =
+                                        client.respond(request_id, result, reply_deadline).await;
+                                    let _ = client.close_input(Instant::now() + RPC_GRACE).await;
+                                    break;
+                                }
+                            }
+                        }
                         let result = put_events(
                             &store,
                             &bus,
@@ -397,15 +578,25 @@ pub(super) async fn serve_plugin_requests(mut connection: PluginConnection, sour
                 }
             }
         };
+        let result = if let Some(gap) = rejected_batch
+            && !persist_rejected_batch_gap(&store, &bus, binding, gap, reply_deadline).await
+        {
+            Err(late_batch_error(
+                &state,
+                &agent_id,
+                generation,
+                "rejected_gap",
+            ))
+        } else {
+            result
+        };
+        drop(stream_guard);
         let result = result.map_err(|error| redact_native_error(error, &source_credentials));
         let unsettled = matches!(
             method.as_str(),
             "events.put" | "source.gap" | "source.handoff" | "source.health"
         ) && result.as_ref().is_err_and(|error| error.code == "unknown");
         let replied = client.respond(request_id, result, reply_deadline).await;
-        if let Some(gap) = rejected_batch {
-            persist_rejected_batch_gap(&store, &bus, binding, gap).await;
-        }
         // On a broken reply path, the runtime actor owns source retirement and
         // generation loss. A reader that already reached EOF may still have
         // terminal facts queued, so drain them before the actor settles loss.
@@ -662,47 +853,43 @@ async fn put_events(
         .events
         .iter()
         .any(|event| event.kind == "session.usage");
+    let native_events = batch.events.len() as u64;
     if let Some(cutoff) = planned_restart_cutoff(intake.host) {
         record_planned_restart_cutoff(credentials, &gap, &batch_id, &event_kinds, &cutoff);
         return Err(planned_restart_cutoff_error(&cutoff));
     }
-    let queued = Instant::now();
-    let result = match timeout_at(until, store.lock()).await {
-        Ok(mut store) => {
-            let acquired = Instant::now();
-            if let Some(cutoff) = planned_restart_cutoff(intake.host) {
-                drop(store);
-                record_planned_restart_cutoff(credentials, &gap, &batch_id, &event_kinds, &cutoff);
-                return Err(planned_restart_cutoff_error(&cutoff));
+    let ready_group = if !is_child
+        && subject.is_none()
+        && batch.source == "stream"
+        && (1..=MAX_TOOL_EVENTS_PER_BATCH).contains(&batch.events.len())
+        && batch
+            .events
+            .iter()
+            .all(|event| matches!(event.kind.as_str(), "tool.started" | "tool.completed"))
+        && let Some(host) = intake.host.upgrade()
+    {
+        match ReadyToolBatch::new(batch) {
+            Ok(batch) => {
+                host.tool_batches
+                    .try_submit(&host, store, bus, batch, until)
+                    .await
             }
-            let now = now_ms();
-            let result = if is_child {
-                store.put_native_child_batch(binding.agent_id, binding.generation, batch, now)
-            } else if let Some(subject) = subject {
-                store.put_observed_batch(batch, subject, now)
-            } else {
-                store.put_batch_with_completion_capture(
-                    batch,
-                    completion_worktree,
-                    project_check,
-                    now,
-                )
-            };
-            if let Ok(commit) = &result {
-                bus.publish(&commit.events);
+            Err(error) => {
+                *rejected = rejection_gap(gap, &error.code, credentials);
+                return Err(error);
             }
-            let latest_usage = if result.is_ok() && contains_session_usage {
-                store
-                    .get_session_usage(&gap.agent_id, gap.generation)
-                    .unwrap_or(None)
-            } else {
-                None
-            };
-            let held = acquired.elapsed();
-            drop(store);
-            if let Some(usage) = latest_usage {
-                monitoring.record_session_usage(&gap.agent_id, gap.generation, usage);
-            }
+        }
+    } else {
+        ToolBatchOutcome::Direct(batch)
+    };
+    let result = match ready_group {
+        ToolBatchOutcome::Committed {
+            result,
+            wait,
+            held,
+            batches,
+            group_bytes,
+        } => {
             if crate::logging::is_debug()
                 && let Ok(commit) = &result
             {
@@ -711,23 +898,105 @@ async fn put_events(
                     "store.source_batch",
                     &[("agent", &gap.agent_id), ("source", &gap.source)],
                     &[
-                        ("lock_wait_us", (acquired - queued).as_micros() as u64),
+                        ("lock_wait_us", wait.as_micros() as u64),
                         ("lock_hold_us", held.as_micros() as u64),
                         ("events", commit.events.len() as u64),
+                        ("native_events", native_events),
+                        ("commit_batches", batches as u64),
+                        ("commit_batch_bytes", group_bytes as u64),
                     ],
                 );
             }
             result
         }
-        Err(_) => {
-            if let Some(cutoff) = planned_restart_cutoff(intake.host) {
-                record_planned_restart_cutoff(credentials, &gap, &batch_id, &event_kinds, &cutoff);
-                return Err(planned_restart_cutoff_error(&cutoff));
+        ToolBatchOutcome::RestartCutoff(cutoff) => {
+            record_planned_restart_cutoff(credentials, &gap, &batch_id, &event_kinds, &cutoff);
+            return Err(planned_restart_cutoff_error(&cutoff));
+        }
+        ToolBatchOutcome::Unsettled(error) => Err(error),
+        ToolBatchOutcome::Direct(batch) => {
+            let queued = Instant::now();
+            match timeout_at(until, store.lock()).await {
+                Ok(mut store) => {
+                    let acquired = Instant::now();
+                    if let Some(cutoff) = planned_restart_cutoff(intake.host) {
+                        drop(store);
+                        record_planned_restart_cutoff(
+                            credentials,
+                            &gap,
+                            &batch_id,
+                            &event_kinds,
+                            &cutoff,
+                        );
+                        return Err(planned_restart_cutoff_error(&cutoff));
+                    }
+                    let now = now_ms();
+                    let result = if is_child {
+                        store.put_native_child_batch(
+                            binding.agent_id,
+                            binding.generation,
+                            batch,
+                            now,
+                        )
+                    } else if let Some(subject) = subject {
+                        store.put_observed_batch(batch, subject, now)
+                    } else {
+                        store.put_batch_with_completion_capture(
+                            batch,
+                            completion_worktree,
+                            project_check,
+                            now,
+                        )
+                    };
+                    if let Ok(commit) = &result {
+                        bus.publish(&commit.events);
+                    }
+                    let latest_usage = if result.is_ok() && contains_session_usage {
+                        store
+                            .get_session_usage(&gap.agent_id, gap.generation)
+                            .unwrap_or(None)
+                    } else {
+                        None
+                    };
+                    let held = acquired.elapsed();
+                    drop(store);
+                    if let Some(usage) = latest_usage {
+                        monitoring.record_session_usage(&gap.agent_id, gap.generation, usage);
+                    }
+                    if crate::logging::is_debug()
+                        && let Ok(commit) = &result
+                    {
+                        crate::logging::record_debug(
+                            &SecretPolicy::new(credentials),
+                            "store.source_batch",
+                            &[("agent", &gap.agent_id), ("source", &gap.source)],
+                            &[
+                                ("lock_wait_us", (acquired - queued).as_micros() as u64),
+                                ("lock_hold_us", held.as_micros() as u64),
+                                ("events", commit.events.len() as u64),
+                                ("native_events", native_events),
+                            ],
+                        );
+                    }
+                    result
+                }
+                Err(_) => {
+                    if let Some(cutoff) = planned_restart_cutoff(intake.host) {
+                        record_planned_restart_cutoff(
+                            credentials,
+                            &gap,
+                            &batch_id,
+                            &event_kinds,
+                            &cutoff,
+                        );
+                        return Err(planned_restart_cutoff_error(&cutoff));
+                    }
+                    Err(Error::new(
+                        "busy",
+                        "Store lock deadline elapsed for events.put",
+                    ))
+                }
             }
-            Err(Error::new(
-                "busy",
-                "Store lock deadline elapsed for events.put",
-            ))
         }
     };
     match result {
@@ -962,16 +1231,16 @@ async fn persist_rejected_batch_gap(
     bus: &Bus,
     binding: source_handoff::SourceBinding<'_>,
     gap: SourceGap,
-) {
+    until: Instant,
+) -> bool {
     let Ok(subject) = binding.expected_subject() else {
-        return;
+        return false;
     };
-    let until = deadline();
     // The gap is a host write. Retry it once after a proven no-write so
     // contention that outlasts the batch and first gap attempt can still settle.
     for attempt in 0..2 {
         let Ok(mut store) = timeout_at(until, store.lock()).await else {
-            return;
+            return false;
         };
         match store.record_rejected_batch_gap(
             gap.clone(),
@@ -981,10 +1250,11 @@ async fn persist_rejected_batch_gap(
         ) {
             Ok(change) => {
                 bus.publish(&change.events);
-                return;
+                return true;
             }
             Err(error) if error.code == "busy" && attempt == 0 => {}
-            Err(_) => return,
+            Err(_) => return false,
         }
     }
+    false
 }

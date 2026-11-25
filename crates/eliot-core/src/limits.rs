@@ -12,6 +12,13 @@ pub const MAX_NATIVE_INBOUND_FRAME_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_TEXT_BYTES: usize = 512 * 1024;
 /// Persisted event data and final text.
 pub const MAX_EVENT_BYTES: usize = 64 * 1024;
+/// Encoded native source batch before the RPC and credential envelope.
+pub const MAX_SOURCE_BATCH_BYTES: usize = 900 * 1024;
+/// Tool facts per source batch eligible for a shared writer transaction.
+pub const MAX_TOOL_EVENTS_PER_BATCH: usize = 16;
+/// Source batches and total encoded payload per shared writer transaction.
+pub const MAX_TOOL_BATCHES_PER_GROUP: usize = 8;
+pub const MAX_TOOL_GROUP_BYTES: usize = 1024 * 1024;
 pub const MAX_UNCLASSIFIED_NATIVE_FACTS_PER_SESSION: i64 = 64;
 
 /// Maximum silence on an associated native turn before its outcome is unknown.

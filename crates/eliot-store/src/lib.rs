@@ -286,7 +286,7 @@ mod resolution;
 mod retention;
 mod schema;
 mod source_batches;
-pub use source_batches::CompletionWorktreeCapture;
+pub use source_batches::{CompletionWorktreeCapture, ReadyToolBatch};
 mod source_handoff;
 mod source_install;
 mod switch;
