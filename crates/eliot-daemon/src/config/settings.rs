@@ -1033,7 +1033,7 @@ pub(crate) fn prepare_candidate(
     let candidate = splice_sections(
         original,
         &blocks,
-        &replacements(sections, policy, has_desktop_section(original))?,
+        &replacements(sections, policy, original)?,
     );
     if candidate.len() > MAX_CONFIG_BYTES {
         return Err(core::Error::new(
@@ -1269,10 +1269,29 @@ pub(super) fn commit_candidate_locked(
 fn replacements(
     sections: &BTreeMap<SettingsSection, JsonValue>,
     policy: &SecretPolicy,
-    desktop_present: bool,
+    original: &str,
 ) -> core::Result<BTreeMap<String, String>> {
+    let desktop_present = has_desktop_section(original);
     let mut result = BTreeMap::new();
     for (section, value) in sections {
+        let merged_rules = if *section == SettingsSection::OwnerRules
+            && let Some(patch) = value.as_object()
+        {
+            let previous = section_json(original, "owner_rules").unwrap_or_default();
+            // The repair action still clears a malformed section with an empty object.
+            let mut rules = if patch.is_empty()
+                && serde_json::from_value::<OwnerRulesConfig>(previous.clone()).is_err()
+            {
+                JsonMap::new()
+            } else {
+                previous.as_object().cloned().unwrap_or_default()
+            };
+            rules.extend(patch.clone());
+            Some(JsonValue::Object(rules))
+        } else {
+            None
+        };
+        let value = merged_rules.as_ref().unwrap_or(value);
         if *section == SettingsSection::OwnerRules
             && let Some(text) = value.get("text").and_then(JsonValue::as_str)
         {

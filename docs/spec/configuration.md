@@ -378,6 +378,8 @@ explicit authority from the Owner for the task. Set
 Nonblank custom text supplies the complete shared instruction.
 `settings.read` shows the configured settings and their revision.
 A launch freezes the revision and SHA-256 of the effective text before native dispatch.
+The built-in rule stays frozen for that Agent until it is relaunched, even if
+`default_commit_only` later changes.
 Queued launches use the rules available when they start. A resume reuses the
 retained digest, and a legacy Agent can capture the current setting when explicitly
 reopened. The built-in rule remains available for Agents that froze it before an
@@ -386,6 +388,12 @@ from settings. If the custom text changes before delivery or native reopen, the
 operation reports that the retained rules are unavailable. Settings saves reject values detected by the secret policy, redaction
 markers, and common credential forms such as bearer tokens and private keys. The
 same validation applies to text read for delivery.
+
+`settings.read` includes `default_commit_only` in the `owner_rules` section only
+when it is explicitly configured, preserving the distinction between an unset
+value and explicit `true` or `false`. `settings.save` updates the keys supplied
+in `owner_rules` and keeps the rest. Clearing `text` preserves an explicit
+`default_commit_only` value.
 
 The Agent's Store record contains delivery metadata. `agent.get` and
 `swarm show` expose revision, digest, delivery method, status and delivered flag.
@@ -1882,7 +1890,7 @@ with `swarm settings save request.json` (add `--dry-run` to validate only):
 }
 ```
 
-Each named section is a complete replacement; leave unmodified sections out of the
+Each named section is a complete replacement except `owner_rules`, which merges supplied keys. Leave unmodified sections out of the
 request. The desktop Settings screen uses the same read/save contract and follows the
 stale-revision rule of [unified settings](#unified-settings).
 Desktop profile creation and duplication omit `cmd`. The Owner can add or remove
@@ -1928,8 +1936,8 @@ a section with an empty object when the daemon verifies a failure in that
 section itself. The revision remains the hash of the complete `config.toml`,
 including while another section is invalid.
 
-`settings.save` keeps the complete-section replacement and revision-CAS contract. The
-daemon validates the changed section and its dependencies with the same strict parser
+`settings.save` checks the source revision before replacing selected sections or merging
+Owner rules keys. The daemon validates the changed section and its dependencies with the same strict parser
 and validators used for launch configuration. Parsed table headers identify source
 blocks, so bracket-like text inside a value does not affect which bytes are replaced.
 Profile blocks that cannot be separated safely are withheld with `not_allowed` and
