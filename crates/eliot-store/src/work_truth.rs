@@ -1,6 +1,7 @@
 //! Where an Agent's work is recorded in Git. The daemon writes the Git objects;
 //! Store keeps the latest fact per generation and the event history.
 use super::*;
+mod task_records;
 
 pub enum HandoffTaskBinding {
     Keep,

@@ -868,6 +868,16 @@ Retention sweeps old refs of terminal Agents using the event-retention window an
 collects unreachable objects in the private Git write lane. Unsettled checkpoint intents
 defer collection. The capture and its wait for the write lane have a 90-second budget.
 
+`checkpoint.list` pages the retained ref inventory for one exact Agent
+generation, newest first. Its cursor binds the inventory revision and the
+last ref on the previous page. A changed inventory requires a fresh list.
+`checkpoint.get` uses the exact ref and object ID from the list to page its
+staged and worktree manifest metadata. It returns no captured file bodies.
+Both methods use the scoped [Agent result read](api.md#command-turn-and-result-reads) authority: Owner, self
+in the authenticated generation, or a manager for an Agent in controlled
+scope. A retained ref alone does not make a checkpoint eligible for restore.
+See the [checkpoint DTOs](../../crates/eliot-core/src/api/checkpoint.rs).
+
 Before writing an object, the daemon scans every candidate path and the exact bytes for
 both layers. It writes those bytes with Git filters and encoding conversion disabled.
 Credential paths (including `.env`, private-key files and authentication directories),
@@ -943,6 +953,15 @@ record. Switch and Resume inherit the selected SEND identity and its Git ref in 
 Store transactions; the task and its task card remain available after command
 retention. Agents sharing a branch can hold different task records. The daemon keeps
 these refs outside the project repository, including for mirror pushes.
+
+`task.list` pages retained Store bindings for one exact Agent generation in
+command ID order. Its cursor is bound to the binding revision. `task.get`
+resolves the exact command through that binding and reads one allowlisted
+text section of the current pinned Git snapshot. Continue with the returned
+Git revision, redacted-section digest and next UTF-8 offset. A changed
+revision or digest requires restarting the read. Neither method accepts an
+arbitrary Git ref or filesystem path. They use the same read authority as
+`checkpoint.list`. See the [task DTOs](../../crates/eliot-core/src/api/task_record.rs).
 
 **Signals.** A turn-end note, or a note during a turn older than ten minutes, reminds the
 Agent to commit. That long turn also takes a checkpoint, at most once per ten minutes.

@@ -1,8 +1,11 @@
 use super::{
     args::{CheckpointArgs, CheckpointCommand},
-    support::{Failure, mutation_id, print_value_or_human},
+    support::{Failure, mutation_id, print_value, print_value_or_human, read_and_print},
 };
-use eliot_core::api::{CheckpointRestoreRequest, CheckpointRestoreResponse};
+use eliot_core::api::{
+    CheckpointGetRequest, CheckpointGetResponse, CheckpointListRequest, CheckpointListResponse,
+    CheckpointRestoreRequest, CheckpointRestoreResponse,
+};
 use std::path::PathBuf;
 
 pub(crate) async fn run(
@@ -12,6 +15,64 @@ pub(crate) async fn run(
     supplied_id: Option<String>,
 ) -> Result<u8, Failure> {
     match args.command {
+        CheckpointCommand::List {
+            agent,
+            generation,
+            limit,
+            cursor,
+        } => {
+            let cursor = cursor
+                .as_deref()
+                .map(serde_json::from_str)
+                .transpose()
+                .map_err(|_| {
+                    Failure::new(2, "--cursor must be the JSON object returned as next")
+                })?;
+            let request = CheckpointListRequest {
+                agent,
+                generation,
+                limit,
+                cursor,
+            };
+            read_and_print!(
+                &data_dir,
+                json_output,
+                "checkpoint.list",
+                request,
+                CheckpointListResponse
+            )
+        }
+        CheckpointCommand::Get {
+            agent,
+            generation,
+            checkpoint_ref,
+            oid,
+            limit,
+            cursor,
+        } => {
+            let cursor = cursor
+                .as_deref()
+                .map(serde_json::from_str)
+                .transpose()
+                .map_err(|_| {
+                    Failure::new(2, "--cursor must be the JSON object returned as next")
+                })?;
+            let request = CheckpointGetRequest {
+                agent,
+                generation,
+                checkpoint_ref,
+                oid,
+                limit,
+                cursor,
+            };
+            read_and_print!(
+                &data_dir,
+                json_output,
+                "checkpoint.get",
+                request,
+                CheckpointGetResponse
+            )
+        }
         CheckpointCommand::Restore {
             agent,
             generation,

@@ -1,6 +1,6 @@
 use super::*;
 
-pub(super) const CURRENT_SCHEMA_VERSION: i64 = AGENT_RESULT_READS_VERSION;
+pub(super) const CURRENT_SCHEMA_VERSION: i64 = FLUENT_READ_REVISIONS_VERSION;
 const HARNESS_CHECK_SCHEMA_VERSION: i64 = 112;
 const WORK_TRUTH_VERSION: i64 = 113;
 const WORK_TRUTH_INTENT_VERSION: i64 = 114;
@@ -34,6 +34,7 @@ const SOURCE_REPLAY_COMPARISON_VERSION: i64 = 141;
 const CHILD_DIGEST_ASSIGNMENT_VERSION: i64 = 142;
 const OWNER_PROJECTION_LOOKUP_VERSION: i64 = 143;
 const AGENT_RESULT_READS_VERSION: i64 = 144;
+const FLUENT_READ_REVISIONS_VERSION: i64 = 145;
 
 fn has_restart_continuation_brief_column(connection: &Connection) -> Result<bool> {
     connection
@@ -310,6 +311,12 @@ impl Store {
                      PRIMARY KEY(child,generation)
                  ) WITHOUT ROWID;",
                 Some(AGENT_RESULT_READS_VERSION),
+            )?;
+        }
+        if current < FLUENT_READ_REVISIONS_VERSION {
+            self.migrate_sql(
+                include_str!("../migrations/fluent_read_revisions.sql"),
+                Some(FLUENT_READ_REVISIONS_VERSION),
             )?;
         }
         Ok(())

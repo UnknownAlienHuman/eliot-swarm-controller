@@ -14,7 +14,7 @@ use eliot_core::{
     AgentState, Error, Event, Result,
     api::{
         MailAckRequest, MailDelivery, MailInboxRequest, MailReadRequest, MailSendRequest,
-        MailSendResponse, VarGetRequest, VarSetRequest, VarSetResponse,
+        MailSendResponse, VarGetRequest, VarListRequest, VarSetRequest, VarSetResponse,
     },
 };
 use eliot_plugin::sync::LockExt;
@@ -358,6 +358,23 @@ impl Router {
             }
         }
         owned.take();
+    }
+
+    pub(super) async fn var_list(&self, params: &Value, principal: &Principal) -> Result<Value> {
+        let request: VarListRequest = decode_coordination_request(
+            params,
+            &self.inner.secrets,
+            "var.list",
+            VarListRequest::validate,
+        )?;
+        let page = self
+            .inner
+            .store
+            .lock()
+            .await
+            .var_list(&principal_name(principal), &request)?;
+        serde_json::to_value(page)
+            .map_err(|_| Error::new("internal", "variable list could not be encoded"))
     }
 
     pub(super) async fn var_get(&self, params: &Value, principal: &Principal) -> Result<Value> {

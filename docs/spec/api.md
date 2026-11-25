@@ -541,7 +541,8 @@ command id frozen at claim. The settled event's persisted `kind` is exactly
 | `events.bounds/read/subscribe` | journal bounds, persisted replay and bounded live delivery |
 | `agent.discover` | owner-only native metadata discovery, without creating Agents |
 | `agent.history` | owner-only bounded history of an exact observed subject |
-| `mail.send/inbox/read/ack`, `var.set/get` | addressed queued mail with separate acknowledgement, shared variables with CAS |
+| `mail.send/inbox/read/ack`, `var.set/get/list` | addressed queued mail with separate acknowledgement, shared variables with CAS and one-scope key paging |
+| `task.list/get`, `checkpoint.list/get` | scoped, revision-bound reads of retained Git work records |
 | `swarm.reparent` | Owner-only atomic subtree or all-children manager change; generation-bound, no native effect |
 | `who`, `claim.set/list/release` | current-worker file areas plus advisory claims with deferred conflict details |
 
@@ -3064,6 +3065,15 @@ and otherwise long-polls for the matching `var.changed`; an absent row reads as
 version 0, so a nonzero baseline on an absent row returns `not_found` at once.
 The CLI is `swarm var get [--scope S] [--after-version N] [--wait SECS] KEY`.
 
+`var.list` uses the same read scopes as `var.get`. It pages keys, current
+versions, writers and write times in one resolved scope in key order. The
+Owner names the scope; an Agent may omit it for its own project or name
+`global`. Values and notes are read separately with `var.get`. See the
+[list DTOs](../../crates/eliot-core/src/api/coordination.rs) for bounds. Pass
+the returned `next` as `cursor` with the same scope. A write in that scope
+invalidates older cursors with `stale_cursor`; writes elsewhere do not.
+The CLI is `swarm var list [--scope S] [--limit N] [--cursor JSON]`.
+
 The CLI supplies exactly one value source: inline `VALUE` or `--value-file
 PATH`, mutually exclusive. The file is read as bounded UTF-8 (at most 16 KiB)
 and its contents become the value; with `--as-json` the contents must parse
@@ -3597,6 +3607,10 @@ swarm settings save FILE [--dry-run]
 swarm settings claude-cmd PROFILE (--cmd PATH|--latest)
 swarm worktree remove AGENT [--generation N]
 swarm checkpoint restore --agent A --generation N --checkpoint-ref REF --workspace PATH
+swarm checkpoint list --agent A --generation N [--limit N] [--cursor JSON]
+swarm checkpoint get --agent A --generation N --checkpoint-ref REF --oid OID [--limit N] [--cursor JSON]
+swarm task list --agent A --generation N [--limit N] [--cursor CURSOR]
+swarm task get --agent A --generation N --task-command ID [--section NAME] [--revision OID --content-digest SHA256 --offset N]
 swarm ls | show A | watch [A|SELECTOR] [--after SEQ] | top
 swarm usage [A] [--generation N] [--project P] [--root A]
 swarm heavy [A] [--generation N] [--window-secs N]
@@ -3629,7 +3643,7 @@ swarm why CMD|AGENT|AGENT:TURN
 swarm events [--after SEQ] [--limit N]
 swarm msg send --to RECIPIENT... TEXT | msg show DELIVERY [AGENT] | msg ack [AGENT] --delivery DELIVERY...
 swarm inbox [AGENT] [--wait SECS] | inbox decide ITEM CHOICE | inbox snooze ITEM | inbox apply (--kind KIND [--yes] | --item REF...)
-swarm var set KEY [VALUE | --value-file PATH] [--as-json] [...] | var get ... | who [--project P] [--history]
+swarm var set KEY [VALUE | --value-file PATH] [--as-json] [...] | var get ... | var list ... | who [--project P] [--history]
 swarm claim set GLOB [AGENT] [--note TEXT] [--ttl-secs N] | claim list [AGENT] [--project P] | claim release GLOB [AGENT]
 swarm project list | show ID
 swarm rule list [--project PROJECT] [--after ID] [--limit N]

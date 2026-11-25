@@ -28,12 +28,14 @@ use std::{
 };
 use tokio::time::Instant;
 
+pub(crate) mod checkpoint_reads;
 mod restore;
 pub(crate) use restore::{
     CheckpointRestoreWriter, observe_restore_writer, restore_checkpoint, restore_writer_closed,
     stop_restore_writer,
 };
 mod task_inputs;
+pub(crate) mod task_record_reads;
 pub(crate) use task_inputs::{read_handoff_task, record_task_inputs};
 
 const GIT_TIME: Duration = Duration::from_secs(30);

@@ -33,6 +33,7 @@ pub const MAX_VAR_KEY_BYTES: usize = 256;
 pub const MAX_VAR_NOTE_BYTES: usize = 1024;
 /// Variable scopes encode as `global` or `project:<name>`.
 pub const MAX_VAR_SCOPE_BYTES: usize = 1024;
+pub const MAX_VAR_LIST_ROWS: usize = 100;
 /// A routed recipient receives at most one generic notice per minute through
 /// the shared mail/claim notice gate.
 pub const MAIL_NOTICE_COOLDOWN_MS: i64 = 60 * 1000;
@@ -810,6 +811,106 @@ pub struct VarGetResponse {
     pub set_by: String,
     pub note: Option<String>,
     pub set_at: i64,
+}
+
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VarListRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1, max = MAX_VAR_LIST_ROWS))]
+    pub limit: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<VarListCursor>,
+}
+
+impl VarListRequest {
+    pub fn validate(&self) -> Result<()> {
+        if let Some(scope) = &self.scope {
+            parse_var_scope(scope)?;
+        }
+        if !(1..=MAX_VAR_LIST_ROWS).contains(&self.page_size()) {
+            return Err(Error::invalid_field(
+                "params.limit",
+                "an integer from 1 to 100",
+            ));
+        }
+        if let Some(cursor) = &self.cursor {
+            if cursor.revision < 0 || cursor.scope.len() > MAX_VAR_SCOPE_BYTES {
+                return Err(Error::new(
+                    "invalid_cursor",
+                    "variable list cursor is malformed",
+                ));
+            }
+            validate_var_key(&cursor.after).map_err(|_| {
+                Error::new("invalid_cursor", "variable list cursor key is malformed")
+            })?;
+        }
+        Ok(())
+    }
+
+    pub fn page_size(&self) -> usize {
+        self.limit.unwrap_or(50)
+    }
+
+    pub fn validate_response(&self, page: &VarListResponse) -> Result<()> {
+        let prefix_matches = self.scope.as_ref().is_none_or(|scope| scope == &page.scope)
+            && self.cursor.as_ref().is_none_or(|cursor| {
+                cursor.scope == page.scope
+                    && cursor.revision == page.revision
+                    && page
+                        .entries
+                        .first()
+                        .is_none_or(|entry| entry.key > cursor.after)
+            });
+        let entries_valid = page.entries.len() <= self.page_size()
+            && page
+                .entries
+                .iter()
+                .all(|entry| entry.version > 0 && validate_var_key(&entry.key).is_ok())
+            && page
+                .entries
+                .windows(2)
+                .all(|pair| pair[0].key < pair[1].key);
+        let next_valid = page.next.as_ref().is_none_or(|next| {
+            next.scope == page.scope
+                && next.revision == page.revision
+                && page.entries.len() == self.page_size()
+                && page
+                    .entries
+                    .last()
+                    .is_some_and(|entry| entry.key == next.after)
+        });
+        if page.revision < 0 || !prefix_matches || !entries_valid || !next_valid {
+            return Err(unproven());
+        }
+        Ok(())
+    }
+}
+
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VarListCursor {
+    pub scope: String,
+    pub revision: i64,
+    pub after: String,
+}
+
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VarListEntry {
+    pub key: String,
+    pub version: i64,
+    pub set_by: String,
+    pub set_at: i64,
+}
+
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VarListResponse {
+    pub scope: String,
+    pub revision: i64,
+    pub entries: Vec<VarListEntry>,
+    pub next: Option<VarListCursor>,
 }
 
 fn validate_write_id(id: &str) -> Result<()> {
