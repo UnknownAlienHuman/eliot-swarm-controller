@@ -242,12 +242,7 @@ impl Router {
                 launch.args["goal"] = json!(goal);
             }
             super::project_checks::freeze_launch_goal(self, &mut launch, principal).await?;
-            if contains_known_secret(&launch.args, &self.inner.secrets) {
-                return Err(Error::new(
-                    "secret_in_payload",
-                    "manager launch contains a known credential",
-                ));
-            }
+            self.reject_secret_command_args(&launch)?;
             Ok((launch, preparation))
         }
         .await;

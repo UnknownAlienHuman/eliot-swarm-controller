@@ -597,6 +597,26 @@ that accept Owner text must reject exact run-local literals before admission.
 The Store sanitizes command outcomes and event text before encoding and
 refuses credential-bearing event keys and bindings.
 
+Owner-text caller checks for the Store command writer
+
+- [Direct submission](../../crates/eliot-daemon/src/router.rs) checks exact
+  literals in keys and values, including Owner SEND, steer, inject, run,
+  launch and coordination command arguments. The direct launch path checks
+  again after freezing the request.
+- [Queued launch](../../crates/eliot-daemon/src/router/launch_queue.rs) checks
+  the original intent arguments. [Assignment launch and staged transfer
+  launch](../../crates/eliot-daemon/src/router/project_assignment.rs) check
+  the prepared launch, including any resolved Goal inputs.
+- [Handoff](../../crates/eliot-daemon/src/router/handoff.rs) and
+  [Switch](../../crates/eliot-daemon/src/router/switch.rs) check the submitted
+  or prepared command arguments. Their generated briefs also use the scoped
+  policy during preparation.
+- [Rule catch-up and timer run](../../crates/eliot-daemon/src/router/rules.rs)
+  check the incoming keys and values. [Coordination
+  requests](../../crates/eliot-daemon/src/router/coordination.rs) do the same
+  for their own typed write paths. Goal definitions are stored by their
+  [Goal API](../../crates/eliot-daemon/src/router/goals.rs).
+
 A source permits at most one unacknowledged batch. Keep later input in a bounded spool.
 
 For a planned daemon restart, while holding the Store writer lock, the daemon
