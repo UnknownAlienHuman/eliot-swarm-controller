@@ -26,8 +26,9 @@ use eliot_core::{
         MAIL_NOTICE_COOLDOWN_MS, MailAckRequest, MailAckResponse, MailDefinitionArgs,
         MailDeliveredEvent, MailDelivery, MailDeliverySummary, MailInboxRequest, MailInboxResponse,
         MailLimits, MailMode, MailReadRequest, MailSendRequest, MailSendResponse,
-        SWARM_MAIL_SENDER, VarDefinitionArgs, VarGetRequest, VarGetResponse, VarScope,
-        VarSetRequest, VarSetResponse, digest_thread, parse_var_scope,
+        SWARM_MAIL_SENDER, VarDefinitionArgs, VarGetRequest, VarGetResponse, VarListCursor,
+        VarListEntry, VarListRequest, VarListResponse, VarScope, VarSetRequest, VarSetResponse,
+        digest_thread, parse_var_scope,
     },
     fence_untrusted_text, parse_agent_id,
 };
@@ -789,6 +790,90 @@ impl Store {
         };
         request.validate_response(&response)?;
         Ok(response)
+    }
+
+    pub fn var_list(&self, principal: &str, request: &VarListRequest) -> Result<VarListResponse> {
+        request.validate()?;
+        self.ensure_committed_reads()?;
+        let tx = self.connection.unchecked_transaction().map_err(sql_error)?;
+        let scope = self
+            .resolve_var_scope(principal, request.scope.as_deref(), false)?
+            .encoded();
+        let revision = tx
+            .query_row(
+                "SELECT COALESCE((SELECT revision FROM var_scope_revisions WHERE scope=?1), 0)",
+                [&scope],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(sql_error)?;
+        let after = if let Some(cursor) = &request.cursor {
+            if cursor.scope != scope {
+                return Err(Error::new(
+                    "invalid_cursor",
+                    "variable list cursor has a different scope",
+                ));
+            }
+            if cursor.revision != revision {
+                return Err(Error::new(
+                    "stale_cursor",
+                    "variables in this scope changed; restart the list",
+                ));
+            }
+            let exists = tx
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM vars WHERE scope=?1 AND key=?2)",
+                    params![scope, cursor.after],
+                    |row| row.get::<_, bool>(0),
+                )
+                .map_err(sql_error)?;
+            if !exists {
+                return Err(Error::new(
+                    "invalid_cursor",
+                    "variable list cursor key does not exist",
+                ));
+            }
+            cursor.after.as_str()
+        } else {
+            ""
+        };
+        let limit = request.page_size();
+        let mut entries = {
+            let mut statement = tx
+                .prepare_cached(
+                    "SELECT key,version,set_by,set_at FROM vars
+                 WHERE scope=?1 AND key>?2 ORDER BY key LIMIT ?3",
+                )
+                .map_err(sql_error)?;
+            statement
+                .query_map(params![scope, after, (limit + 1) as i64], |r| {
+                    Ok(VarListEntry {
+                        key: r.get(0)?,
+                        version: r.get(1)?,
+                        set_by: r.get(2)?,
+                        set_at: r.get(3)?,
+                    })
+                })
+                .map_err(sql_error)?
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(sql_error)?
+        };
+        let next = if entries.len() > limit {
+            entries.truncate(limit);
+            entries.last().map(|entry| VarListCursor {
+                scope: scope.clone(),
+                revision,
+                after: entry.key.clone(),
+            })
+        } else {
+            None
+        };
+        tx.commit().map_err(sql_error)?;
+        Ok(VarListResponse {
+            scope,
+            revision,
+            entries,
+            next,
+        })
     }
 
     fn prepare_var_set(&self, principal: &str, request: &VarSetRequest) -> Result<PreparedVarSet> {
@@ -1931,6 +2016,11 @@ impl Store {
             Some(id) => insert_daemon_event_for_command(tx, id, input)?,
             None => insert_daemon_event_input(tx, input)?,
         };
+        db!(tx.execute(
+            "INSERT INTO var_scope_revisions(scope,revision) VALUES(?1,?2)
+             ON CONFLICT(scope) DO UPDATE SET revision=excluded.revision",
+            params![encoded_scope, event.seq],
+        ));
         Ok((response, event))
     }
 

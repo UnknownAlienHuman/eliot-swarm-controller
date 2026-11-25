@@ -5,6 +5,7 @@ mod auth;
 mod auth_login;
 mod background_wake;
 mod catalog;
+mod checkpoint_reads;
 mod checkpoint_restore;
 mod child_run;
 mod cleanup;
@@ -28,6 +29,7 @@ mod instructions;
 pub(crate) mod launch_queue;
 mod launch_refusal;
 mod launch_result;
+mod task_records;
 pub(crate) use launch_result::RULE_WORKTREE_GUARD_ARG;
 mod loss_recovery;
 mod organization;
@@ -893,6 +895,10 @@ impl Router {
             "agent.git" => self.agent_git(&params, &principal).await,
             "agent.diff" => Box::pin(self.agent_diff(&params, &principal)).await,
             "checkpoint.restore" => self.checkpoint_restore(&params, &principal).await,
+            "checkpoint.list" => self.checkpoint_list(&params, &principal).await,
+            "checkpoint.get" => self.checkpoint_get(&params, &principal).await,
+            "task.list" => self.task_list(&params, &principal).await,
+            "task.get" => self.task_get(&params, &principal).await,
             "agent.patch_digest" => self.agent_patch_digest(&params, &principal).await,
             "agent.edits" => self.agent_edits(&params, &principal).await,
             "turn.get" => self.turn_get(&params, &principal).await,
@@ -974,6 +980,7 @@ impl Router {
             "mail.ack" => self.mail_ack(&params, &principal).await,
             "var.set" => self.var_set(&params, &principal).await,
             "var.get" => self.var_get(&params, &principal).await,
+            "var.list" => self.var_list(&params, &principal).await,
             "who" => self.who(&params, &principal).await,
             "claim.set" => self.claim_set(&params, &principal).await,
             "claim.list" => self.claim_list(&params, &principal).await,

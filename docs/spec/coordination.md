@@ -883,6 +883,9 @@ takes an optional `after_version` baseline; `wait_ms` (clamped to 30,000)
 requires it. The read returns at once when the version already differs, and
 otherwise long-polls for the matching version bump; an absent row reads as
 version 0.
+`var.list` reads one authorized scope under the same read rules as `var.get`.
+It returns key and version metadata. A cursor is bound to its scope and the
+scope revision, which advances in the same Store transaction as `var.changed`.
 Concurrent queued writes use bounded [Store commit grouping](core.md#storage);
 each request still has its own CAS result and retained idempotency binding.
 

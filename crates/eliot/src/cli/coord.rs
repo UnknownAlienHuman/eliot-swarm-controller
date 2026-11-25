@@ -4,7 +4,7 @@ use super::args::{
     CmdChildrenArgs, CmdCommand, CmdResolveArgs, CmdSettleStoppedArgs, CmdShowArgs, InboxArgs,
     MsgAckArgs, MsgArgs, MsgCommand, MsgSendArgs, MsgShowArgs, OptionalAgent, OwnerInboxArgs,
     OwnerInboxCommand, PageArgs, TurnArgs, TurnCommand, TurnResolveArgs, VarArgs, VarCommand,
-    VarGetArgs, VarSetArgs, WhoArgs,
+    VarGetArgs, VarListArgs, VarSetArgs, WhoArgs,
 };
 use super::reads::resolve_agent_target;
 use super::support::read_and_print;
@@ -23,8 +23,8 @@ use eliot_core::api::{
     MailSendResponse, OwnerBulkDecideRequest, OwnerBulkDecideResponse, OwnerDecideRequest,
     OwnerDecideResponse, OwnerInboxItemRef, OwnerInboxKind, OwnerInboxRequest, OwnerInboxResponse,
     SettleStoppedRequest, SettleStoppedResponse, TurnResolveRequest, TurnResolveResponse,
-    TurnResolveStatus, VarGetRequest, VarGetResponse, VarSetRequest, VarSetResponse, WhoRequest,
-    WhoResponse,
+    TurnResolveStatus, VarGetRequest, VarGetResponse, VarListRequest, VarListResponse,
+    VarSetRequest, VarSetResponse, WhoRequest, WhoResponse,
 };
 use serde_json::Value;
 use std::{
@@ -990,6 +990,25 @@ pub(crate) async fn run_var(
                 .map_err(|_| Failure::new(4, "var.set response is invalid"))?;
             print_value(&value, json_output);
             Ok(0)
+        }
+        VarCommand::List(VarListArgs {
+            scope,
+            limit,
+            cursor,
+        }) => {
+            let cursor = cursor
+                .as_deref()
+                .map(serde_json::from_str)
+                .transpose()
+                .map_err(|_| {
+                    Failure::new(2, "--cursor must be the JSON object returned as next")
+                })?;
+            let request = VarListRequest {
+                scope,
+                limit,
+                cursor,
+            };
+            read_and_print!(&data_dir, json_output, "var.list", request, VarListResponse)
         }
         VarCommand::Get(VarGetArgs {
             key,

@@ -1,6 +1,7 @@
 //! Where an Agent's work is recorded in Git. The daemon writes the Git objects;
 //! Store keeps the latest fact per generation and the event history.
 use super::*;
+mod task_records;
 
 pub enum HandoffTaskBinding {
     Keep,
@@ -1023,6 +1024,24 @@ impl Store {
                 [],
                 |row| row.get(0),
             )
+            .map_err(sql_error)
+    }
+
+    pub fn uncommitted_checkpoint_ref(
+        &self,
+        agent: &str,
+        generation: i64,
+    ) -> Result<Option<String>> {
+        self.ensure_committed_reads()?;
+        self.connection
+            .query_row(
+                "SELECT json_extract(input, '$.checkpoint_ref') FROM git_checkpoint_intents
+             WHERE agent=?1 AND generation=?2",
+                params![parse_agent_id(agent)?, generation],
+                |row| row.get(0),
+            )
+            .optional()
+            .map(Option::flatten)
             .map_err(sql_error)
     }
 

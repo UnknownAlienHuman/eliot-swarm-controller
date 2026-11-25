@@ -51,6 +51,10 @@ const METHODS: &[Method] = &[
     method!("auth.desktop.claim", eliot_core::api::auth_login::AuthDesktopClaimRequest, eliot_core::api::auth_login::AuthDesktopClaimResponse, true, true, "Claim one exact vendor sign-in attempt from the interactive desktop.", {"harness":EXAMPLE_HARNESS,"revision":EXAMPLE_ID}),
     method!("auth.desktop.report", eliot_core::api::auth_login::AuthDesktopReportRequest, eliot_core::api::auth_login::AuthDesktopReportResponse, true, true, "Report only vendor sign-in status or exact console lifecycle from the interactive desktop.", {"harness":EXAMPLE_HARNESS,"revision":EXAMPLE_ID,"state":"signed_in"}),
     method!("owner.inbox.aged", OwnerInboxRequest, OwnerInboxResponse, true, false, "Page Owner decisions waiting more than 24 hours.", {"limit":20}),
+    method!("checkpoint.list", CheckpointListRequest, CheckpointListResponse, false, false, "Page retained Git checkpoints for one Agent generation.", {"agent":"a1","generation":1,"limit":10}),
+    method!("checkpoint.get", CheckpointGetRequest, CheckpointGetResponse, false, false, "Read bounded metadata for one retained checkpoint at its exact Git object ID.", {"agent":"a1","generation":1,"checkpoint_ref":"refs/eliot/checkpoints/a1/g1/0000000000000001-01ARZ3NDEKTSV4RRFFQ69G5FAV","oid":"0000000000000000000000000000000000000001"}),
+    method!("task.list", TaskListRequest, TaskListResponse, false, false, "Page retained Store task bindings for one Agent generation.", {"agent":"a1","generation":1,"limit":10}),
+    method!("task.get", TaskGetRequest, TaskGetResponse, false, false, "Read a bounded section of an exact retained Git task record.", {"agent":"a1","generation":1,"task_command":EXAMPLE_ID,"section":"task.md"}),
     method!(
         "owner.inbox",
         OwnerInboxRequest,
@@ -375,6 +379,7 @@ const METHODS: &[Method] = &[
     method!("mail.ack", MailAckRequest, MailAckResponse, false, true, "Acknowledge 1..100 exact delivery ids in your mailbox.", {"id":EXAMPLE_ID,"deliveries":["previous-write/a1"]}),
     method!("var.set", VarSetRequest, VarSetResponse, false, true, "Set a shared variable, optionally using compare-and-swap.", {"id":EXAMPLE_ID,"key":"progress","value":"working","expect_version":0}),
     method!("var.get", VarGetRequest, VarGetResponse, false, false, "Read a shared variable or wait for a version after after_version; absent keys are version 0.", {"key":"progress"}),
+    method!("var.list", VarListRequest, VarListResponse, false, false, "Page shared-variable keys and versions in one readable scope.", {"scope":"global","limit":10}),
     method!(
         "who",
         WhoRequest,
@@ -658,11 +663,16 @@ impl Router {
             "owner.inbox.aged" => &["swarm inbox --aged"],
             "auth.login" => &["swarm auth login"],
             "checkpoint.restore" => &["swarm checkpoint restore"],
+            "checkpoint.list" => &["swarm checkpoint list"],
+            "checkpoint.get" => &["swarm checkpoint get"],
+            "task.list" => &["swarm task list"],
+            "task.get" => &["swarm task get"],
             "owner.decide.bulk" => &["swarm inbox apply"],
             "mail.read" => &["swarm msg show"],
             "mail.ack" => &["swarm msg ack"],
             "var.set" => &["swarm var set"],
             "var.get" => &["swarm var get"],
+            "var.list" => &["swarm var list"],
             "swarm.wait" => &["swarm wait"],
             "swarm.digest" => &["swarm digest"],
             "swarm.reparent" => &["swarm reparent"],
@@ -1036,7 +1046,7 @@ fn method_scopes(name: &str, principal: &Principal, identity: &IdentityResponse)
         .allowed_scopes
         .iter()
         .filter(|scope| match name {
-            "var.get" => scope.as_str() == "global" || scope.starts_with("project:"),
+            "var.get" | "var.list" => scope.as_str() == "global" || scope.starts_with("project:"),
             "var.set" => {
                 scope.starts_with("project:")
                     || (scope.as_str() == "global" && matches!(principal, Principal::Owner))
@@ -1093,6 +1103,9 @@ fn method_limits(name: &str) -> &'static str {
         }
         "var.set" | "var.get" => {
             "Scopes: global or project:<name>; Owner must specify scope, Agent omission selects its actual project. Only Owner writes global; Agents can read global. Key: 256 bytes; value: 16384 encoded JSON bytes; note: 1024 bytes. CAS uses expect_version; an absent key has version zero."
+        }
+        "var.list" => {
+            "One readable global or project scope. Page up to 100 keys with versions and writers, without values. Restart pagination after a scope revision change."
         }
         "agent.discover" | "agent.history" => {
             "Metadata/history only; native support and view availability are capability-dependent. History views are subject, turns or items. No Agent is created; hook callbacks are private plugin traffic."

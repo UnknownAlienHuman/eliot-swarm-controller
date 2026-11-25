@@ -21,6 +21,7 @@ mod settings;
 mod stand;
 mod store;
 pub(crate) mod support;
+mod task;
 mod update;
 
 use self::args::{AuthCommand, CliCommand, LsArgs, PageArgs, StandAction};
@@ -173,6 +174,7 @@ pub(crate) async fn dispatch(
         CliCommand::Heavy(args) => reads::run_heavy(args, data_dir, json_output).await,
         CliCommand::Git(args) => git::run(args.command, &data_dir, json_output, id).await,
         CliCommand::Checkpoint(args) => checkpoint::run(args, data_dir, json_output, id).await,
+        CliCommand::Task(args) => task::run(args, data_dir, json_output).await,
         CliCommand::GitStatus(args) => reads::run_git_status(args, data_dir, json_output).await,
         CliCommand::PatchDigest(args) => reads::run_patch_digest(args, data_dir, json_output).await,
         CliCommand::Diff(args) => reads::run_diff(args, data_dir, json_output).await,

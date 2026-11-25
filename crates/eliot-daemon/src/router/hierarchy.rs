@@ -561,6 +561,33 @@ pub(super) fn authorize_agent_read(
     }
 }
 
+pub(super) fn authorize_retained_work_read(
+    store: &Store,
+    principal: &Principal,
+    id: &str,
+    generation: i64,
+) -> Result<()> {
+    authorize_agent_read(store, principal, id, Some(generation))?;
+    let target = store
+        .get_agent(id)?
+        .ok_or_else(|| Error::new("not_found", "Agent not found"))?;
+    if let Principal::Agent {
+        id: caller,
+        generation: expected,
+    } = principal
+    {
+        let current = if caller == id {
+            Some(target.generation)
+        } else {
+            store.get_agent(caller)?.map(|agent| agent.generation)
+        };
+        if current != Some(*expected) {
+            return Err(Error::new("stale_generation", "caller generation changed"));
+        }
+    }
+    Ok(())
+}
+
 impl Router {
     pub(super) async fn swarm_reparent(
         &self,

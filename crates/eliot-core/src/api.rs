@@ -57,6 +57,8 @@ mod rule_edit;
 mod rules;
 mod script_edit;
 mod scripts;
+mod task_record;
+pub use task_record::*;
 mod string_list;
 mod swarm_usage;
 mod switch;
@@ -115,14 +117,15 @@ pub use coordination::{
     LIVENESS_MAIL_THREAD_PREFIX, MAIL_NOTICE_COOLDOWN_MS, MAX_CLAIM_GLOB_BYTES,
     MAX_CLAIM_NOTE_BYTES, MAX_CLAIM_TTL_SECS, MAX_CLAIMS_PER_AGENT, MAX_MAIL_ACK_IDS,
     MAX_MAIL_INBOX_ROWS, MAX_MAIL_RECIPIENTS, MAX_MAIL_TEXT_BYTES, MAX_MAIL_THREAD_BYTES,
-    MAX_VAR_KEY_BYTES, MAX_VAR_NOTE_BYTES, MAX_VAR_SCOPE_BYTES, MAX_VAR_VALUE_BYTES, MAX_WHO_PATHS,
-    MAX_WHO_WORKERS, MailAckRequest, MailAckResponse, MailDefinitionArgs, MailDeliveredEvent,
-    MailDelivery, MailDeliverySummary, MailInboxRequest, MailInboxResponse, MailLimits, MailMode,
-    MailReadRequest, MailSendRequest, MailSendResponse, SWARM_MAIL_SENDER, VarDefinitionArgs,
-    VarGetRequest, VarGetResponse, VarScope, VarSetRequest, VarSetResponse, WhoRequest,
-    WhoResponse, WhoSharedWorkspace, WhoWorker, advisory_claim_matches, claim_glob_matches,
-    claim_glob_matches_normalized, claim_globs_overlap, claim_globs_overlap_normalized,
-    normalize_claim_glob, parse_var_scope,
+    MAX_VAR_KEY_BYTES, MAX_VAR_LIST_ROWS, MAX_VAR_NOTE_BYTES, MAX_VAR_SCOPE_BYTES,
+    MAX_VAR_VALUE_BYTES, MAX_WHO_PATHS, MAX_WHO_WORKERS, MailAckRequest, MailAckResponse,
+    MailDefinitionArgs, MailDeliveredEvent, MailDelivery, MailDeliverySummary, MailInboxRequest,
+    MailInboxResponse, MailLimits, MailMode, MailReadRequest, MailSendRequest, MailSendResponse,
+    SWARM_MAIL_SENDER, VarDefinitionArgs, VarGetRequest, VarGetResponse, VarListCursor,
+    VarListEntry, VarListRequest, VarListResponse, VarScope, VarSetRequest, VarSetResponse,
+    WhoRequest, WhoResponse, WhoSharedWorkspace, WhoWorker, advisory_claim_matches,
+    claim_glob_matches, claim_glob_matches_normalized, claim_globs_overlap,
+    claim_globs_overlap_normalized, normalize_claim_glob, parse_var_scope,
 };
 pub use digests::{
     DIGEST_THREAD_PREFIX, SwarmDigestRequest, SwarmDigestResponse, digest_mode_completed,

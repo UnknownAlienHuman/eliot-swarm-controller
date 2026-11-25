@@ -156,6 +156,8 @@ pub(crate) enum CliCommand {
     Git(GitArgs),
     /// Restore a retained private work-truth checkpoint.
     Checkpoint(CheckpointArgs),
+    /// Read retained Git task records.
+    Task(TaskArgs),
     /// Read the current Git snapshot for an Agent's workspace.
     GitStatus(GitStatusArgs),
     /// Digest an Agent's patch for review: files, packages, new
@@ -805,8 +807,74 @@ pub(crate) struct CheckpointArgs {
     pub(crate) command: CheckpointCommand,
 }
 
+#[derive(Args)]
+pub(crate) struct TaskArgs {
+    #[command(subcommand)]
+    pub(crate) command: TaskCommand,
+}
+
+#[derive(Subcommand)]
+pub(crate) enum TaskCommand {
+    /// Page retained task bindings for one Agent generation.
+    List {
+        #[arg(long)]
+        agent: String,
+        #[arg(long)]
+        generation: i64,
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+        #[arg(long)]
+        cursor: Option<String>,
+    },
+    /// Read a UTF-8 page of one retained task section.
+    Get {
+        #[arg(long)]
+        agent: String,
+        #[arg(long)]
+        generation: i64,
+        #[arg(long)]
+        task_command: String,
+        #[arg(long, default_value = "task.md")]
+        section: String,
+        #[arg(long)]
+        revision: Option<String>,
+        #[arg(long)]
+        content_digest: Option<String>,
+        #[arg(long)]
+        offset: Option<usize>,
+    },
+}
+
 #[derive(Subcommand)]
 pub(crate) enum CheckpointCommand {
+    /// Page the retained Git checkpoints for an Agent generation.
+    List {
+        #[arg(long)]
+        agent: String,
+        #[arg(long)]
+        generation: i64,
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+        /// JSON cursor returned as next by the preceding page.
+        #[arg(long)]
+        cursor: Option<String>,
+    },
+    /// Read metadata for one retained checkpoint at its exact Git object ID.
+    Get {
+        #[arg(long)]
+        agent: String,
+        #[arg(long)]
+        generation: i64,
+        #[arg(long)]
+        checkpoint_ref: String,
+        #[arg(long)]
+        oid: String,
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+        /// JSON cursor returned as next by the preceding page.
+        #[arg(long)]
+        cursor: Option<String>,
+    },
     /// Restore staged and unstaged layers into a clean worktree at the captured HEAD.
     Restore {
         #[arg(long, value_name = "AGENT")]
@@ -1580,6 +1648,19 @@ pub(crate) enum VarCommand {
     Set(VarSetArgs),
     /// Read one variable value with its version and writer.
     Get(VarGetArgs),
+    /// Page variable keys and their versions within a readable scope.
+    List(VarListArgs),
+}
+
+#[derive(Args)]
+pub(crate) struct VarListArgs {
+    #[arg(long, value_name = "SCOPE")]
+    pub(crate) scope: Option<String>,
+    #[arg(long, value_name = "N")]
+    pub(crate) limit: Option<usize>,
+    /// JSON cursor returned as next by the preceding page.
+    #[arg(long, value_name = "JSON")]
+    pub(crate) cursor: Option<String>,
 }
 
 #[derive(Args)]
