@@ -972,6 +972,9 @@ impl EventProcessor {
     async fn handle_frame(&mut self, frame: Option<SseFrame>) {
         match frame {
             Some(SseFrame::Event(envelope)) => {
+                if envelope.event_type == "session.created" {
+                    drop(crate::native::startup::Step::new("session_created_event"));
+                }
                 if self.should_buffer(&envelope.event_type) {
                     self.buffer.push(envelope, &mut self.loss_reason);
                 } else {

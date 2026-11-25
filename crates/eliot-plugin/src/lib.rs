@@ -44,5 +44,5 @@ pub use protocol::{
 };
 pub use stderr::{
     StderrCapture, StderrSnapshot, StderrView, harness_diagnostic, spawn_plugin_stderr,
-    spawn_stderr, spawn_stderr_prefix,
+    spawn_stderr, spawn_stderr_prefix, spawn_stderr_with_line_signal,
 };

@@ -33,7 +33,7 @@ use eliot_plugin::{
     StderrCapture,
     retry::{NATIVE_READINESS_BUDGET, RetryOperation, poll_idempotent},
     session::paths_equal,
-    skill, spawn_stderr,
+    skill, spawn_stderr, spawn_stderr_with_line_signal,
 };
 #[expect(
     clippy::disallowed_types,
@@ -680,7 +680,12 @@ impl OwnedServer {
         // Both pipes drain continuously with the shared redacting tail;
         // stdout carries the `server listening` line and MCP spawn notes.
         let capture = std::sync::Arc::new(capture);
-        let stdout = spawn_stderr(stdout, capture.clone());
+        let stdout = spawn_stderr_with_line_signal(
+            stdout,
+            capture.clone(),
+            format!("server listening on http://127.0.0.1:{port}"),
+            || drop(super::startup::Step::new("server_listening")),
+        );
         let stderr = spawn_stderr(stderr, capture.clone());
 
         let mut server = Self {
@@ -752,6 +757,7 @@ impl OwnedServer {
                     "native serve process exited during startup",
                 )));
             }
+            let _timing = super::startup::Step::new("serve_config_probe");
             match self.http.get_config(deadline).await {
                 Ok(documents) if serves_our_config(&self.config_dir, &documents) => {
                     ControlFlow::Break(Ok(()))
