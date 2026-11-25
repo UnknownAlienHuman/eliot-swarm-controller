@@ -179,6 +179,7 @@ async fn wait_for_stop_exit_proof(
 
 pub(crate) type SecretSet = Arc<Mutex<HashSet<String>>>;
 pub(crate) type AgentCredentials = Arc<Mutex<HashMap<(String, i64), String>>>;
+
 pub(crate) type UnknownCommands = Arc<Mutex<HashSet<String>>>;
 
 type StoreHandle = Arc<AsyncMutex<eliot_store::Store>>;
@@ -187,6 +188,7 @@ pub(crate) struct PluginHostOptions {
     data_root: PathBuf,
     owner_token: String,
     stand_codex_home: Option<PathBuf>,
+    agent_mcp_url: Option<String>,
 }
 
 impl PluginHostOptions {
@@ -194,11 +196,13 @@ impl PluginHostOptions {
         data_root: PathBuf,
         owner_token: String,
         stand_codex_home: Option<PathBuf>,
+        agent_mcp_url: Option<String>,
     ) -> Self {
         Self {
             data_root,
             owner_token,
             stand_codex_home,
+            agent_mcp_url,
         }
     }
 }
@@ -356,6 +360,7 @@ struct HostState {
     acl_notices: Arc<crate::acl_notice::AclNotices>,
     data_root: PathBuf,
     stand_codex_home: Option<PathBuf>,
+    agent_mcp_url: Option<String>,
     owner_token: String,
     store: StoreHandle,
     bus: Bus,
@@ -486,12 +491,14 @@ impl PluginHost {
             data_root,
             owner_token,
             stand_codex_home,
+            agent_mcp_url,
         } = options;
         Self {
             state: Arc::new(HostState {
                 acl_notices,
                 data_root,
                 stand_codex_home,
+                agent_mcp_url,
                 owner_token,
                 store,
                 bus,

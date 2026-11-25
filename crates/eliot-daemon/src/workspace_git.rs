@@ -24,6 +24,8 @@ use tokio::time::{Instant, sleep_until, timeout_at};
 
 pub(crate) mod containment;
 mod readback;
+#[cfg(any(windows, target_os = "linux"))]
+pub(crate) use readback::linked_watch_admin;
 
 const READ_TIME: Duration = Duration::from_secs(15);
 const UNTRACKED_ARGS: &[&str] = &["ls-files", "--others", "--exclude-standard", "-z"];

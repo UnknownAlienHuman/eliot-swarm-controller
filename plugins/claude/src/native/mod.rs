@@ -6,4 +6,4 @@ pub(crate) mod types;
 
 pub(crate) use auth::{auth_status, require_auth};
 pub(crate) use client::{ClaudeClient, ClaudeFrame, ClaudeProcess};
-pub(crate) use mcp_config::ClaudeMcpConfigFile;
+pub(crate) use mcp_config::{ClaudeMcpConfigFile, MCP_TOKEN_ENV};

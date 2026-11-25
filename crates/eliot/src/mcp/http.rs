@@ -38,12 +38,13 @@ use axum::{
 };
 use eliot_plugin::protocol::McpHttpReady;
 use rmcp::transport::streamable_http_server::{
-    StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
+    StreamableHttpServerConfig, StreamableHttpService,
+    session::{local::LocalSessionManager, never::NeverSessionManager},
 };
 use tokio_util::sync::CancellationToken;
 
-use super::EliotMcpHandler;
 use super::origin_auth::{OriginAuth, SessionLifetime, VerifiedRequest};
+use super::{AgentHttpIdentity, EliotMcpHandler};
 
 /// MCP route served locally; the owner-managed tunnel maps the public URL
 /// onto it. Single route by design: no arbitrary routes. Also the required
@@ -53,6 +54,7 @@ const MCP_HTTP_PATH: &str = "/mcp";
 const HTTPS_DEFAULT_PORT: u16 = 443;
 
 type HttpMcpService = StreamableHttpService<EliotMcpHandler, LocalSessionManager>;
+type AgentHttpService = StreamableHttpService<EliotMcpHandler, NeverSessionManager>;
 
 #[derive(Clone)]
 struct HttpState {
@@ -115,6 +117,7 @@ pub async fn run_http(
                 data_dir: data_dir.clone(),
                 notify_owner_events: true,
                 require_agent: false,
+                agent_http: false,
                 shutdown: factory_shutdown.clone(),
                 notify_spawned: Arc::new(AtomicBool::new(false)),
                 session_lifetime: Arc::new(SessionLifetime::default()),
@@ -148,6 +151,151 @@ pub async fn run_http(
         .await
         .map_err(|error| format!("mcp http serve failed: {error}"))?;
     Ok(())
+}
+
+/// Shared loopback-only Agent MCP bridge owned by the foreground daemon.
+/// Requests carry exact Agent credentials and are checked by the daemon API
+/// on every HTTP POST. The listener itself holds no credential registry.
+pub struct AgentMcpBridge {
+    listener: tokio::net::TcpListener,
+    data_dir: PathBuf,
+    address: String,
+}
+
+impl AgentMcpBridge {
+    pub async fn bind(data_dir: PathBuf) -> Result<Self, String> {
+        let listener =
+            tokio::net::TcpListener::bind(SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 0)))
+                .await
+                .map_err(|error| format!("Agent MCP bridge bind failed: {error}"))?;
+        let address = listener
+            .local_addr()
+            .map_err(|error| format!("Agent MCP bridge address unavailable: {error}"))?
+            .to_string();
+        Ok(Self {
+            listener,
+            data_dir,
+            address,
+        })
+    }
+
+    pub fn url(&self) -> String {
+        format!("http://{}/mcp", self.address)
+    }
+
+    pub async fn serve(self) -> Result<(), String> {
+        let sessions = Arc::new(NeverSessionManager::default());
+        let cancel = CancellationToken::new();
+        let factory_shutdown = cancel.clone();
+        let factory_data = self.data_dir.clone();
+        #[allow(
+            deprecated,
+            reason = "The shared handler retains the rmcp 3.9 logging field for Owner sessions."
+        )]
+        let service = StreamableHttpService::new(
+            move || {
+                Ok(EliotMcpHandler {
+                    data_dir: factory_data.clone(),
+                    notify_owner_events: false,
+                    require_agent: true,
+                    agent_http: true,
+                    shutdown: factory_shutdown.clone(),
+                    notify_spawned: Arc::new(AtomicBool::new(false)),
+                    session_lifetime: Arc::new(SessionLifetime::default()),
+                    log_level: Arc::new(RwLock::new(LoggingLevel::Info)),
+                })
+            },
+            sessions,
+            StreamableHttpServerConfig::default()
+                .with_max_request_body_bytes(eliot_daemon::MAX_RPC_FRAME_BYTES)
+                .with_legacy_session_mode(false)
+                .with_stateless_protocol_metadata_required(false)
+                .with_allowed_hosts(vec![self.address.clone()])
+                .with_allowed_origins(vec![format!("http://{}", self.address)])
+                .with_cancellation_token(cancel),
+        );
+        let state = AgentHttpState {
+            service,
+            data_dir: self.data_dir,
+        };
+        let app = Router::new()
+            .route(MCP_HTTP_PATH, post(serve_agent_mcp))
+            .with_state(state);
+        axum::serve(self.listener, app)
+            .await
+            .map_err(|error| format!("Agent MCP bridge stopped: {error}"))
+    }
+}
+
+#[derive(Clone)]
+struct AgentHttpState {
+    service: AgentHttpService,
+    data_dir: PathBuf,
+}
+
+async fn serve_agent_mcp(
+    State(state): State<AgentHttpState>,
+    mut request: Request<axum::body::Body>,
+) -> Response<axum::body::Body> {
+    use axum::http::header::HeaderName;
+    let Some(identity) = agent_http_identity(request.headers()) else {
+        return rejected(axum::http::StatusCode::UNAUTHORIZED);
+    };
+    if eliot_daemon::verify_explicit_agent_identity(
+        &state.data_dir,
+        &identity.agent_id,
+        identity.generation,
+        &identity.token,
+    )
+    .await
+    .is_err()
+    {
+        return rejected(axum::http::StatusCode::UNAUTHORIZED);
+    }
+    request
+        .headers_mut()
+        .remove(HeaderName::from_static("x-eliot-agent-id"));
+    request
+        .headers_mut()
+        .remove(HeaderName::from_static("x-eliot-agent-generation"));
+    request
+        .headers_mut()
+        .remove(axum::http::header::AUTHORIZATION);
+    request.extensions_mut().insert(identity);
+    use tower_service::Service as _;
+    let mut service = state.service;
+    if std::future::poll_fn(|cx| {
+        <AgentHttpService as tower_service::Service<Request<axum::body::Body>>>::poll_ready(
+            &mut service,
+            cx,
+        )
+    })
+    .await
+    .is_err()
+    {
+        return internal_error();
+    }
+    match service.call(request).await {
+        Ok(response) => response.map(axum::body::Body::new),
+        Err(error) => match error {},
+    }
+}
+
+fn agent_http_identity(headers: &axum::http::HeaderMap) -> Option<AgentHttpIdentity> {
+    let read = |name: &str| headers.get(name)?.to_str().ok();
+    let agent_id = read("x-eliot-agent-id").filter(|value| !value.trim().is_empty())?;
+    let generation = read("x-eliot-agent-generation")?
+        .parse::<i64>()
+        .ok()
+        .filter(|value| *value > 0)?;
+    let token = read(axum::http::header::AUTHORIZATION.as_str())?
+        .strip_prefix("Bearer ")
+        .filter(|value| !value.is_empty() && !value.chars().any(char::is_whitespace))?;
+    Some(AgentHttpIdentity {
+        agent_id: agent_id.to_owned(),
+        generation,
+        token: token.to_owned(),
+    })
 }
 
 /// Public host/origin derived from `--public-url`, in SDK allowlist form.

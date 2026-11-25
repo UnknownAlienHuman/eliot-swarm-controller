@@ -34,6 +34,8 @@ use tokio::{
 
 const SAMPLE_INTERVAL: Duration = Duration::from_secs(2);
 const SAMPLE_TTL_MS: i64 = 4_000;
+const QUIET_GIT_RECONCILE: Duration = Duration::from_secs(300);
+const QUIET_GIT_TTL_MS: i64 = 306_000;
 const PAGE_LIMIT: usize = 1_000;
 /// Maximum Git bindings snapshotted under one Store mutex acquisition.
 /// Each binding costs a handful of small reads plus one bounded hint page
@@ -194,6 +196,14 @@ impl Default for WatchSlot {
 }
 
 impl WatchSlot {
+    fn healthy(&self) -> bool {
+        self.active
+            && self
+                .watcher
+                .as_ref()
+                .is_some_and(|watcher| !watcher.is_degraded())
+    }
+
     fn view(&self) -> FilesystemInvalidationView {
         let state = match (self.active, self.watcher.as_ref()) {
             (false, _) => FilesystemInvalidationState::Inactive,
@@ -227,6 +237,8 @@ struct GitCache {
     last_attempt: Option<Instant>,
     next_attempt: Instant,
     backoff: Duration,
+    watched: bool,
+    observed_bindings: HashSet<Key>,
 }
 
 impl Default for GitCache {
@@ -237,6 +249,8 @@ impl Default for GitCache {
             last_attempt: None,
             next_attempt: Instant::now(),
             backoff: SAMPLE_INTERVAL,
+            watched: false,
+            observed_bindings: HashSet::new(),
         }
     }
 }
@@ -253,6 +267,8 @@ struct GitBindingInput {
 struct GitGroup {
     baseline: Option<GitBaseline>,
     base_oid: Option<String>,
+    common_dir: Option<String>,
+    quiet: bool,
     inputs: Vec<GitBindingInput>,
     edited_paths: Vec<String>,
     paths_complete: bool,
@@ -1130,10 +1146,18 @@ impl Monitoring {
             .as_ref()
             .map(|target| target.cache.lock_recover().clone())
             .unwrap_or_default();
-        let invalidation = target
-            .as_ref()
-            .map(|target| target.watch.lock_recover().view())
-            .unwrap_or_else(FilesystemInvalidationView::inactive);
+        let (invalidation, quiet_watch) = target.as_ref().map_or_else(
+            || (FilesystemInvalidationView::inactive(), false),
+            |target| {
+                let watch = target.watch.lock_recover();
+                let quiet = watch.healthy()
+                    && watch
+                        .watcher
+                        .as_ref()
+                        .is_some_and(|watcher| !watcher.is_dirty());
+                (watch.view(), quiet)
+            },
+        );
         let unavailable = self.inner.git_unavailable.lock_recover().clone();
         let (baseline, edits, source) = {
             let store = self.inner.store.lock().await;
@@ -1153,16 +1177,21 @@ impl Monitoring {
         let now = now_ms();
         let age = sampled_at.and_then(|at| age_ms(now, at));
         let clock_regressed = sampled_at.is_some_and(|at| at > now);
+        let ttl_ms = if quiet_watch && cache.watched {
+            QUIET_GIT_TTL_MS
+        } else {
+            SAMPLE_TTL_MS
+        };
         let stale = unavailable.is_some()
             || cache.error.is_some()
             || clock_regressed
-            || age.is_some_and(|age| age > SAMPLE_TTL_MS);
+            || age.is_some_and(|age| age > ttl_ms);
         let value = GitView::Data(Box::new(GitObservation {
             available: snapshot.is_some() && !stale,
             workspace: workspace.to_owned(),
             observed_at: sampled_at,
             age_ms: age,
-            ttl_ms: SAMPLE_TTL_MS,
+            ttl_ms,
             clock_regressed,
             retry_after_ms: cache
                 .next_attempt
@@ -1349,11 +1378,12 @@ impl Monitoring {
                     std::collections::hash_map::Entry::Vacant(entry) => {
                         let (edited_paths, paths_complete) =
                             store.git_edit_paths(workspace, PAGE_LIMIT)?;
+                        let retained = store.get_workspace_by_path(workspace)?;
                         entry.insert(GitGroup {
                             baseline: store.git_baseline(workspace)?,
-                            base_oid: store
-                                .get_workspace_by_path(workspace)?
-                                .map(|row| row.base_oid),
+                            base_oid: retained.as_ref().map(|row| row.base_oid.clone()),
+                            common_dir: retained.map(|row| row.repo_common_dir),
+                            quiet: true,
                             inputs: Vec::new(),
                             edited_paths,
                             paths_complete,
@@ -1363,6 +1393,7 @@ impl Monitoring {
                 };
                 let cursor = store.git_cursor(&key.0, key.1)?;
                 let page = store.git_hint_page(&key.0, key.1, cursor, PAGE_LIMIT)?;
+                group.quiet &= current.state == eliot_core::AgentState::Idle && !historical;
                 group.inputs.push(GitBindingInput {
                     key: key.clone(),
                     terminal: historical || current.is_terminal(),
@@ -1488,8 +1519,13 @@ impl Monitoring {
         drop(retired);
     }
 
-    fn update_watcher(target: &GitWorkspace, workspace: &str, live: bool) -> bool {
-        let (dirty, registration, retired) = {
+    fn update_watcher(
+        target: &GitWorkspace,
+        workspace: &str,
+        common_dir: Option<&str>,
+        live: bool,
+    ) -> (bool, bool) {
+        let (dirty, healthy, registration, retired) = {
             let mut slot = target.watch.lock_recover();
             slot.active = live;
             let mut retired = None;
@@ -1530,24 +1566,28 @@ impl Monitoring {
             if !live || retry {
                 retired = slot.watcher.take().or(retired);
             }
-            (dirty, registration, retired)
+            (dirty, slot.healthy(), registration, retired)
         };
         drop(retired);
         if let Some(sender) = registration {
             let workspace = workspace.to_owned();
+            let common_dir = common_dir.map(str::to_owned);
             // Registration may block in recursive filesystem I/O. Its detached
             // thread never holds Tokio shutdown, Store, cache, or watcher locks.
             if std::thread::Builder::new()
                 .name("eliot-fs-watch".to_owned())
                 .spawn(move || {
-                    let _ = sender.send(WorkspaceInvalidation::watch(&workspace));
+                    let _ = sender.send(WorkspaceInvalidation::watch(
+                        &workspace,
+                        common_dir.as_deref(),
+                    ));
                 })
                 .is_err()
             {
                 target.watch.lock_recover().pending = None;
             }
         }
-        dirty
+        (dirty, healthy)
     }
 
     async fn sample_git(&self, final_flush: bool) {
@@ -1574,21 +1614,30 @@ impl Monitoring {
                 .entry(workspace.clone())
                 .or_insert_with(|| Arc::new(GitWorkspace::default()))
                 .clone();
-            let dirty =
-                Self::update_watcher(&target, &workspace, live_workspaces.contains(&workspace));
-            let (due, earliest) = {
+            let (dirty, healthy) = Self::update_watcher(
+                &target,
+                &workspace,
+                group.common_dir.as_deref(),
+                live_workspaces.contains(&workspace),
+            );
+            let (due, earliest, quiet) = {
                 let mut cache = target.cache.lock_recover();
-                if dirty {
-                    let earliest = cache
-                        .last_attempt
-                        .map(|at| at + SAMPLE_INTERVAL)
-                        .unwrap_or_else(Instant::now);
-                    cache.next_attempt = cache.next_attempt.min(earliest);
+                let earliest = cache.last_attempt.map(|at| at + SAMPLE_INTERVAL);
+                if dirty && cache.error.is_none() {
+                    // Keep this invalidation if the two-second floor defers this pass.
+                    cache.watched = false;
                 }
-                (
-                    cache.next_attempt,
-                    cache.last_attempt.map(|at| at + SAMPLE_INTERVAL),
-                )
+                let quiet = healthy
+                    && group.quiet
+                    && cache.watched
+                    && cache.error.is_none()
+                    && cache
+                        .last_attempt
+                        .is_some_and(|at| at.elapsed() < QUIET_GIT_RECONCILE)
+                    && group.inputs.iter().all(|input| {
+                        input.page.events.is_empty() && cache.observed_bindings.contains(&input.key)
+                    });
+                (cache.next_attempt, earliest, quiet)
             };
             // A binding's final read (terminal generation, native stream
             // closed) is what closes its Git source. Like the shutdown flush
@@ -1600,7 +1649,7 @@ impl Monitoring {
                     .inputs
                     .iter()
                     .any(|input| input.terminal && input.native_closed);
-            if (!final_read && Instant::now() < due)
+            if (!final_read && (quiet || Instant::now() < due))
                 || (!final_flush && earliest.is_some_and(|earliest| Instant::now() < earliest))
             {
                 continue;
@@ -1610,7 +1659,11 @@ impl Monitoring {
                 sleep_until(earliest).await;
             }
             let started = Instant::now();
-            target.cache.lock_recover().last_attempt = Some(started);
+            {
+                let mut cache = target.cache.lock_recover();
+                cache.last_attempt = Some(started);
+                cache.watched = false;
+            }
             let result = async {
                 let (edited_paths, paths_complete) = self
                     .git_probe_paths(&workspace, &group, final_flush)
@@ -1646,6 +1699,7 @@ impl Monitoring {
             match result {
                 Ok(snapshot) => {
                     let mut failed = None;
+                    let mut observed_bindings = HashSet::new();
                     for input in group.inputs {
                         let final_binding = (input.terminal || final_flush) && input.native_closed;
                         let key = input.key.clone();
@@ -1657,6 +1711,8 @@ impl Monitoring {
                             if failed.as_deref() != Some("secret_in_payload") {
                                 failed = Some(error.code);
                             }
+                        } else if !final_binding {
+                            observed_bindings.insert(key);
                         }
                     }
                     let cache_check = serde_json::to_value(&snapshot)
@@ -1669,6 +1725,12 @@ impl Monitoring {
                         failed = Some(error.code);
                     }
                     let mut cache = target.cache.lock_recover();
+                    cache.watched = healthy
+                        && !slow
+                        && failed.is_none()
+                        && snapshot.complete
+                        && snapshot.history_complete;
+                    cache.observed_bindings = observed_bindings;
                     cache.backoff = if slow || failed.is_some() {
                         cache.backoff.saturating_mul(2).min(GIT_MAX_BACKOFF)
                     } else {

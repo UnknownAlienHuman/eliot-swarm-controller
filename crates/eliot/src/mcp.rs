@@ -33,6 +33,7 @@ mod bounded_io;
 mod http;
 mod origin_auth;
 
+pub use http::AgentMcpBridge;
 pub use http::run_http;
 
 use std::path::{Path, PathBuf};
@@ -95,6 +96,7 @@ pub async fn run_stdio(data_dir: PathBuf, require_agent: bool) -> Result<(), Str
         data_dir,
         notify_owner_events: false,
         require_agent,
+        agent_http: false,
         shutdown: CancellationToken::new(),
         notify_spawned: Arc::new(AtomicBool::new(false)),
         session_lifetime: Arc::new(origin_auth::SessionLifetime::default()),
@@ -117,8 +119,10 @@ pub async fn run_stdio(data_dir: PathBuf, require_agent: bool) -> Result<(), Str
 #[derive(Clone)]
 struct EliotMcpHandler {
     data_dir: PathBuf,
-    /// Stdio-only policy; HTTP sessions always use their separately verified remote identity.
+    /// Advertise the Agent-scoped tool and prohibit Owner fallback.
     require_agent: bool,
+    /// Agent HTTP uses request-bound identity, never the process environment.
+    agent_http: bool,
     /// True only for HTTP sessions: advertise `logging` and spawn the one
     /// owner-event delivery task on initialize. Stdio stays `false`.
     notify_owner_events: bool,
@@ -239,6 +243,10 @@ impl ServerHandler for EliotMcpHandler {
         let remote = verified_remote(&context.extensions, Some(request_id.clone()));
         let http = self.notify_owner_events;
         let require_agent = self.require_agent;
+        let agent_http = self.agent_http;
+        let agent_identity = agent_http
+            .then(|| context_agent_http_identity(&context))
+            .flatten();
         async move {
             if http && remote.is_none() {
                 return Err(McpError::invalid_request(
@@ -281,13 +289,34 @@ impl ServerHandler for EliotMcpHandler {
                 }
                 None if require_agent => {
                     let call_id = ulid::Ulid::new().to_string();
-                    eliot_daemon::client_call_with_agent_mcp_tool(
-                        Path::new(&data_dir),
-                        &parsed.method,
-                        params,
-                        &call_id,
-                    )
-                    .await
+                    if agent_http {
+                        match agent_identity.as_ref() {
+                            Some(identity) => {
+                                eliot_daemon::client_call_with_explicit_agent_mcp_tool(
+                                    Path::new(&data_dir),
+                                    &parsed.method,
+                                    params,
+                                    &call_id,
+                                    &identity.agent_id,
+                                    identity.generation,
+                                    &identity.token,
+                                )
+                                .await
+                            }
+                            None => Err(eliot_core::Error::new(
+                                "not_allowed",
+                                "Agent MCP request identity is missing",
+                            )),
+                        }
+                    } else {
+                        eliot_daemon::client_call_with_agent_mcp_tool(
+                            Path::new(&data_dir),
+                            &parsed.method,
+                            params,
+                            &call_id,
+                        )
+                        .await
+                    }
                 }
                 None => {
                     eliot_daemon::client_call(Path::new(&data_dir), &parsed.method, params).await
@@ -307,6 +336,22 @@ impl ServerHandler for EliotMcpHandler {
             }
         }
     }
+}
+
+#[derive(Clone)]
+struct AgentHttpIdentity {
+    agent_id: String,
+    generation: i64,
+    token: String,
+}
+
+fn context_agent_http_identity(context: &RequestContext<RoleServer>) -> Option<AgentHttpIdentity> {
+    context
+        .extensions
+        .get::<axum::http::request::Parts>()?
+        .extensions
+        .get::<AgentHttpIdentity>()
+        .cloned()
 }
 
 /// Mint one fresh ULID into `params` when a mutation call omits `id`

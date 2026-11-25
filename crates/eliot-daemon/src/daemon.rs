@@ -228,14 +228,32 @@ fn compact_store_with_preflight(
 /// Open the private local daemon, recover durable state without replaying any
 /// external effects, and serve concurrent local RPC connections.
 pub async fn run(path: PathBuf) -> Result<()> {
-    run_with_update(path, None).await
+    run_with_update(path, None, None).await
+}
+
+/// Run the daemon with the process-local Agent MCP bridge endpoint supplied by
+/// the foreground CLI. The endpoint is runtime-only and never persisted.
+pub async fn run_with_agent_mcp_url(path: PathBuf, url: String) -> Result<()> {
+    run_with_update(path, None, Some(url)).await
 }
 
 pub async fn run_for_update(path: PathBuf, attempt: &str) -> Result<()> {
-    run_with_update(path, Some(attempt)).await
+    run_with_update(path, Some(attempt), None).await
 }
 
-async fn run_with_update(path: PathBuf, attempt: Option<&str>) -> Result<()> {
+pub async fn run_for_update_with_agent_mcp_url(
+    path: PathBuf,
+    attempt: &str,
+    url: String,
+) -> Result<()> {
+    run_with_update(path, Some(attempt), Some(url)).await
+}
+
+async fn run_with_update(
+    path: PathBuf,
+    attempt: Option<&str>,
+    agent_mcp_url: Option<String>,
+) -> Result<()> {
     eliot_core::api::HarnessCapabilities::require_registered()?;
 
     // Daemon-private files carry explicit current-user-only creation modes
@@ -338,6 +356,7 @@ async fn run_with_update(path: PathBuf, attempt: Option<&str>) -> Result<()> {
         attempt,
         daemon_config,
         removed,
+        agent_mcp_url,
     )
     .await;
     logging::record(
@@ -360,8 +379,9 @@ async fn run_owned(
     attempt: Option<&str>,
     daemon_config: crate::config::DaemonConfig,
     removed: Vec<crate::platform::ForeignDataDirAce>,
+    agent_mcp_url: Option<String>,
 ) -> Result<()> {
-    let runtime = initialize_runtime(data_dir, policy, daemon_config).await?;
+    let runtime = initialize_runtime(data_dir, policy, daemon_config, agent_mcp_url).await?;
     runtime
         .router
         .report_acl_repairs(&runtime.policy, removed)
@@ -419,6 +439,7 @@ async fn initialize_runtime(
     data_dir: &DataDir,
     policy: Arc<SecretPolicy>,
     daemon_config: crate::config::DaemonConfig,
+    agent_mcp_url: Option<String>,
 ) -> Result<DaemonRuntime> {
     let store_path = data_dir.path().join("eliot.db");
     crate::platform::data_dir::validate_store_files(data_dir.path())?;
@@ -509,8 +530,8 @@ async fn initialize_runtime(
         std::sync::Arc::clone(&store),
         bus.clone(),
         mail_config,
-        daemon_config.attention,
-        daemon_config.background_wake_max_wait_secs * 1_000,
+        &daemon_config,
+        agent_mcp_url,
     )?;
 
     crate::bootstrap::ensure_hot_start(data_dir.path(), &store, &policy).await?;
@@ -1613,6 +1634,60 @@ pub async fn client_call_with_agent_mcp_tool(
     }
     let identity = required_agent_identity_for(path)?;
     client_call_with_identity_measured(path, method, params, identity, None, Some(call_id)).await
+}
+
+/// Agent MCP HTTP request carrying its exact per-request authority. This
+/// accepts no Owner fallback and leaves live generation/token verification to
+/// the same authenticated local Router path used by Agent stdio calls.
+pub async fn client_call_with_explicit_agent_mcp_tool(
+    path: &Path,
+    method: &str,
+    params: Value,
+    call_id: &str,
+    agent_id: &str,
+    generation: i64,
+    token: &str,
+) -> Result<Value> {
+    validate_client_call(method, &params)?;
+    if Ulid::from_string(call_id).is_err()
+        || agent_id.trim().is_empty()
+        || generation <= 0
+        || token.is_empty()
+    {
+        return Err(Error::new(
+            "not_allowed",
+            "invalid Agent MCP request identity",
+        ));
+    }
+    let identity = ClientIdentity::Agent {
+        id: agent_id.to_owned(),
+        generation,
+        token: token.to_owned(),
+    };
+    client_call_with_identity_measured(path, method, params, identity, None, Some(call_id)).await
+}
+
+/// Verify an exact Agent HTTP request credential against the live daemon.
+pub async fn verify_explicit_agent_identity(
+    path: &Path,
+    agent_id: &str,
+    generation: i64,
+    token: &str,
+) -> Result<()> {
+    if agent_id.trim().is_empty() || generation <= 0 || token.is_empty() {
+        return Err(Error::new(
+            "not_allowed",
+            "invalid Agent MCP request identity",
+        ));
+    }
+    let identity = ClientIdentity::Agent {
+        id: agent_id.to_owned(),
+        generation,
+        token: token.to_owned(),
+    };
+    client_call_with_identity(path, "api.identity", json!({}), identity)
+        .await
+        .map(|_| ())
 }
 
 fn required_agent_identity_for(target: &Path) -> Result<ClientIdentity> {

@@ -244,6 +244,7 @@ struct StartPlan {
     data_root: PathBuf,
     swarm_binary: PathBuf,
     mcp_environment: Vec<(OsString, OsString)>,
+    agent_mcp_url: Option<String>,
     program: OsString,
     environment: Vec<(OsString, OsString)>,
     secrets: Vec<String>,
@@ -797,12 +798,17 @@ impl ClaudePlugin {
             None => new_uuid(),
         };
         let resume_ref = resume_subject.map(|subject| subject.native_ref);
+        let agent_mcp_url = params.agent_mcp_url.clone().filter(|_| {
+            !proxy_configured(&environment)
+                && crate::owner_scan::agent_http_allowed(&workspace, config_dir.as_deref())
+        });
         Ok(StartPlan {
             workspace,
             instance_dir,
             data_root,
             swarm_binary,
             mcp_environment: mcp_environment.variables,
+            agent_mcp_url,
             program,
             environment,
             secrets,
@@ -1960,11 +1966,24 @@ async fn launch_session(
             phase: StartPhase::Auth,
             error: Box::new(error),
         })?;
+    let token = eliot_plugin::native_cli::unique_environment_value(
+        &plan.mcp_environment,
+        "ELIOT_AGENT_TOKEN",
+    )
+    .filter(|token| !token.is_empty())
+    .ok_or_else(|| PhaseFailure {
+        phase: StartPhase::McpConfig,
+        error: Box::new(Error::new(
+            "not_allowed",
+            "Claude Agent MCP credential is missing",
+        )),
+    })?;
     let mcp_config = ClaudeMcpConfigFile::create(
         &plan.instance_dir,
         &plan.swarm_binary,
         &plan.data_root,
         &plan.mcp_environment,
+        plan.agent_mcp_url.as_deref(),
     )
     .map_err(|error| PhaseFailure {
         phase: StartPhase::McpConfig,
@@ -2058,11 +2077,13 @@ async fn launch_session(
     }
     argv.push(OsString::from("--plugin-dir"));
     argv.push(OsString::from(skill_root));
+    let mut environment = plan.environment.clone();
+    environment.push((crate::native::MCP_TOKEN_ENV.into(), token.to_owned()));
     let launch = NativeLaunch {
         program: plan.program.clone(),
         args: argv,
         cwd: plan.workspace.clone(),
-        environment: plan.environment.clone(),
+        environment,
     };
     let mut native = ClaudeProcess::spawn(launch, SecretPolicy::new(plan.secrets.iter().cloned()))
         .await
@@ -2313,6 +2334,16 @@ fn mcp_argv(policy: McpPolicy, config_path: &std::ffi::OsStr) -> Vec<OsString> {
     argv.push(OsString::from("--mcp-config"));
     argv.push(config_path.to_owned());
     argv
+}
+
+fn proxy_configured(environment: &[(OsString, OsString)]) -> bool {
+    ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"]
+        .into_iter()
+        .any(|name| {
+            environment.iter().any(|(key, value)| {
+                key.to_string_lossy().eq_ignore_ascii_case(name) && !value.is_empty()
+            })
+        })
 }
 
 /// Per-session native-subagent mapping for the installed Claude Code CLI

@@ -92,10 +92,22 @@ pub(crate) async fn run_daemon(
             super::autostart::uninstall(&data_dir, json_output, dry_run).await
         }
         None if foreground => {
+            let bridge = mcp::AgentMcpBridge::bind(data_dir.clone())
+                .await
+                .map_err(Failure::new_from_message)?;
+            let url = bridge.url();
+            let server = tokio::spawn(bridge.serve());
             let result = match args.upgrade_attempt.as_deref() {
-                Some(attempt) => eliot_daemon::operator::run_for_update(data_dir, attempt).await,
-                None => eliot_daemon::run(data_dir).await,
+                Some(attempt) => {
+                    eliot_daemon::operator::run_for_update_with_agent_mcp_url(
+                        data_dir, attempt, url,
+                    )
+                    .await
+                }
+                None => eliot_daemon::run_with_agent_mcp_url(data_dir, url).await,
             };
+            server.abort();
+            let _ = server.await;
             result.map_err(Failure::for_read)?;
             Ok(0)
         }

@@ -424,8 +424,8 @@ impl Router {
         store: StoreHandle,
         bus: Bus,
         mail: crate::config::MailConfig,
-        attention: crate::config::AttentionConfig,
-        background_wake_max_wait_ms: i64,
+        config: &crate::config::DaemonConfig,
+        agent_mcp_url: Option<String>,
     ) -> Result<Self> {
         let stand_codex_home = crate::config::stand_codex_home(&data_root)?;
         let secrets: SecretSet = Arc::new(Mutex::new(HashSet::from([owner_token.clone()])));
@@ -452,6 +452,7 @@ impl Router {
                 data_root.clone(),
                 owner_token.clone(),
                 stand_codex_home.clone(),
+                agent_mcp_url,
             ),
             Arc::clone(&store),
             bus.clone(),
@@ -474,9 +475,9 @@ impl Router {
                 integration_cleanup: AsyncMutex::new(()),
                 bus,
                 mail,
-                attention,
+                attention: config.attention,
                 attention_threshold_cache: Mutex::default(),
-                background_wake_max_wait_ms,
+                background_wake_max_wait_ms: config.background_wake_max_wait_secs * 1_000,
                 started_at_ms: now_ms(),
                 owner_token,
                 secrets,
