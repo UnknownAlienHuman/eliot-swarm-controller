@@ -560,6 +560,7 @@ impl ClaudePlugin {
             "agent.start" => self.start(&request.params, client).await,
             "agent.command" => self.command(request).await,
             "agent.snapshot" => self.snapshot(&request.params).await,
+            "native.turn_evidence" => crate::history::read(&request.params).await,
             "agent.stop" => self.stop(&request.params).await,
             "shutdown" => self.shutdown().await,
             _ => Err(Error::new(
@@ -2404,7 +2405,7 @@ fn new_uuid() -> String {
 /// metadata must never collide with it: the daemon rejects secret-bearing
 /// immutable metadata, which used to wedge the launch unknown on its very
 /// first batch. Same FNV-1a shape as the Codex home scope.
-fn claude_scope(config_dir: Option<&str>) -> String {
+pub(crate) fn claude_scope(config_dir: Option<&str>) -> String {
     match config_dir.filter(|dir| !dir.trim().is_empty()) {
         Some(dir) => {
             let canonical = std::fs::canonicalize(dir).unwrap_or_else(|_| PathBuf::from(dir));

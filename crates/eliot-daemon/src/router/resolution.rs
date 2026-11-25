@@ -16,6 +16,7 @@ use eliot_core::{
         TurnResolveRequest,
     },
 };
+use eliot_store::HistoricalTurnCursor;
 use eliot_store::TurnInactiveProof;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
@@ -87,6 +88,82 @@ fn turn_inactive_proof(
 }
 
 impl Router {
+    pub(crate) async fn reconcile_historical_turn_evidence(
+        &self,
+        after: Option<&HistoricalTurnCursor>,
+    ) -> Result<Option<HistoricalTurnCursor>> {
+        use eliot_core::api::harness::TurnHistoryReadback;
+        use std::sync::atomic::Ordering;
+        if self.inner.mode.load(Ordering::SeqCst) != super::MODE_OPEN {
+            return Ok(None);
+        }
+        let (turns, next) = self
+            .inner
+            .store
+            .lock()
+            .await
+            .historical_unknown_turns(after)?;
+        for turn in turns {
+            let reader =
+                eliot_core::api::HarnessCapabilities::of(&turn.agent.harness).turn_history_readback;
+            let status = if let Some((_, status)) = turn.retained_terminal {
+                Some(status)
+            } else if reader == Some(TurnHistoryReadback::HistoryFile) {
+                self.inner
+                    .plugin_host
+                    .historical_turn_evidence(&turn)
+                    .await
+                    .ok()
+                    .flatten()
+            } else if reader == Some(TurnHistoryReadback::OwnedSnapshot)
+                && turn.agent.generation == turn.generation
+                && turn.agent.native_scope.as_deref() == Some(turn.native_scope.as_str())
+                && turn.agent.native_ref.as_deref() == Some(turn.native_ref.as_str())
+                && let Some(command) = turn.command_id.as_deref()
+            {
+                // The owned reader binds the exact inbox input through the
+                // adapter's shared turn readback. A retired reader proves nothing.
+                self.inner
+                    .plugin_host
+                    .snapshot_turn(&turn.agent, command, &turn.turn_id)
+                    .await
+                    .ok()
+                    .filter(|snapshot| {
+                        snapshot["command_id"].as_str() == Some(command)
+                            && snapshot["last_turn"]["command_id"].as_str() == Some(command)
+                            && snapshot["native_ref"].as_str() == Some(turn.native_ref.as_str())
+                            && turn_inactive_proof(
+                                snapshot,
+                                &turn.agent.id,
+                                turn.generation,
+                                &turn.turn_id,
+                            )
+                            .is_some()
+                    })
+                    .and_then(|snapshot| {
+                        eliot_core::api::TurnResolveStatus::parse(
+                            snapshot["last_turn"]["status"].as_str()?,
+                        )
+                        .ok()
+                    })
+            } else {
+                None
+            };
+            if let Some(status) = status {
+                let mut store = self.inner.store.lock().await;
+                if self.inner.mode.load(Ordering::SeqCst) != super::MODE_OPEN {
+                    return Ok(None);
+                }
+                let events = store.settle_historical_turn(&turn, status, now_ms())?;
+                self.publish_locked(&events);
+                if !events.is_empty() {
+                    self.signal_progress();
+                }
+            }
+        }
+        Ok(next)
+    }
+
     pub(crate) async fn reconcile_retained_command_evidence(
         &self,
         after: Option<&str>,

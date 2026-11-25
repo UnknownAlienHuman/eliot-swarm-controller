@@ -4,6 +4,9 @@ use std::collections::HashSet;
 
 use eliot_core::{Error, Result};
 
+mod files;
+pub use files::{find_exact_history, is_native_uuid, read_history_records};
+
 const MAX_TURN_HISTORY_PAGES: usize = 4;
 
 /// The adapter maps native messages and preserves the server's page order.

@@ -60,9 +60,46 @@ pub(crate) async fn run(
             reactions_enabled
         ),
         run_harness_check_maintenance(router.clone(), Arc::clone(&policy), shutdown.clone()),
+        run_historical_turn_reconciliation(router.clone(), Arc::clone(&policy), shutdown.clone()),
         run_missing_worktree_reconciliation(router, policy, shutdown),
     )?;
     Ok(())
+}
+
+/// Give each bounded readback page its own worker rather than making it
+/// delay command or workspace reconciliation.
+async fn run_historical_turn_reconciliation(
+    router: crate::router::Router,
+    policy: Arc<SecretPolicy>,
+    mut shutdown: watch::Receiver<bool>,
+) -> Result<()> {
+    let mut after = None;
+    loop {
+        if *shutdown.borrow() {
+            return Ok(());
+        }
+        match router
+            .reconcile_historical_turn_evidence(after.as_ref())
+            .await
+        {
+            Ok(next) => after = next,
+            Err(error) => logging::record(
+                &policy,
+                "daemon.turn_history_reconciliation_failed",
+                &[],
+                Some(&error),
+            ),
+        }
+        let delay = if after.is_some() {
+            Duration::from_secs(5)
+        } else {
+            Duration::from_secs(300)
+        };
+        tokio::select! {
+            _ = tokio::time::sleep_until(tokio::time::Instant::now() + delay) => {}
+            _ = shutdown.changed() => return Ok(()),
+        }
+    }
 }
 
 /// Maintain post-update checks and retry cleanup before admitting new work.
