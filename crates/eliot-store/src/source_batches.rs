@@ -28,6 +28,8 @@ impl PreparedSourceBatch {
             return Err(secret_in_batch_binding());
         }
         let mut refused = Vec::new();
+        let warning_batch =
+            batch.events.len() == 1 && batch.source == "stream" && batch.cursor.is_none();
         for (index, event) in batch.events.iter_mut().enumerate() {
             let id = policy.contains_native_secret(&event.native_id);
             let kind = policy.contains_native_secret(&event.kind);
@@ -48,23 +50,18 @@ impl PreparedSourceBatch {
                 refused.push(index);
                 continue;
             }
-            if event.kind == core::NATIVE_WARNING_EVENT
-                && let Some(occurrence) = event
-                    .native_id
-                    .strip_prefix(core::NATIVE_WARNING_OCCURRENCE_PREFIX)
+            if event
+                .native_id
+                .starts_with(core::NATIVE_WARNING_CONTENT_PREFIX)
+                && !(warning_batch
+                    && event.kind == core::NATIVE_WARNING_EVENT
+                    && core::NativeWarning::has_stable_id_shape(&event.native_id)
+                    && batch.batch_id == format!("{}:batch", event.native_id))
             {
-                if ulid::Ulid::from_string(occurrence).is_err()
-                    || batch.batch_id != format!("{}:batch", event.native_id)
-                {
-                    return Err(Error::new(
-                        "source_integrity",
-                        "unkeyed warning must bind its exact occurrence batch",
-                    ));
-                }
-                // A warning without a native notification ID is identified by
-                // Store's deduplicated batch and position, not its producer's
-                // lifetime counter. Normalize before computing replay digests.
-                event.native_id = format!("warning-batch:{}:{index}", batch.batch_id);
+                return Err(Error::new(
+                    "source_integrity",
+                    "native warning identity requires its exact singleton stream batch",
+                ));
             }
             if protected_data_has_secret(&event.data, &policy, false) {
                 return Err(secret_in_batch_binding());
@@ -1165,6 +1162,70 @@ impl Store {
         let source = load_source_state(tx, agent_num, batch.generation, &batch.source)?
             .ok_or_else(|| Error::new("source_integrity", "source has no committed state"))?;
 
+        if !observed
+            && batch.source == "stream"
+            && batch.events.len() == 1
+            && batch.events[0].kind == core::NATIVE_WARNING_EVENT
+            && core::NativeWarning::has_stable_id_shape(&batch.events[0].native_id)
+            && source.state == "open"
+            && !projection.is_terminal()
+        {
+            let event = &batch.events[0];
+            let owner: Option<String> = tx
+                .query_row(
+                    "SELECT source FROM source_owners
+                     WHERE agent=?1 AND generation=?2 AND family='session'",
+                    params![agent_num, batch.generation],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(sql_error)?;
+            if owner.as_deref() != Some(batch.source.as_str()) {
+                return Err(Error::new(
+                    "source_integrity",
+                    "warning source does not own its family",
+                ));
+            }
+            core::NativeWarning::validate_data(&event.data, projection.native_ref.as_deref())?;
+            let retained: Option<(i64, String)> = tx
+                .query_row(
+                    "SELECT seq, data FROM events
+                     WHERE agent=?1 AND generation<=?2 AND source='stream' AND kind=?3 AND native_id=?4
+                     ORDER BY seq DESC LIMIT 1",
+                    params![agent_num, batch.generation, core::NATIVE_WARNING_EVENT, event.native_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()
+                .map_err(sql_error)?;
+            if let Some((seq, data)) = retained {
+                let retained: core::NativeWarning = serde_json::from_value(decode_json(&data)?)
+                    .map_err(|_| Error::new("source_integrity", "retained warning is invalid"))?;
+                let incoming: core::NativeWarning = serde_json::from_value(event.data.clone())
+                    .map_err(|_| Error::new("source_integrity", "warning data is invalid"))?;
+                if retained
+                    .validate_for_thread(projection.native_ref.as_deref())
+                    .is_err()
+                    || !retained.matches_retained_diagnostic(&incoming)
+                {
+                    return Err(Error::new(
+                        "source_integrity",
+                        "warning identity collides with different retained content",
+                    ));
+                }
+                return Ok(BatchCommit {
+                    ack: BatchAck {
+                        first_seq: seq,
+                        last_seq: seq,
+                        cursor: None,
+                        dropped_unclassified: 0,
+                        refused_native_fields: refused,
+                        permission_refusal: None,
+                        native_wake_cancel: None,
+                    },
+                    events: Vec::new(),
+                });
+            }
+        }
         if source.last_batch_id.as_deref() == Some(batch.batch_id.as_str()) {
             if source.cursor == batch.cursor
                 && (source.last_batch_digest.as_deref() == Some(batch_digest.as_slice())

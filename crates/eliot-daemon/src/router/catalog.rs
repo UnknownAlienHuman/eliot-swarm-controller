@@ -1038,6 +1038,7 @@ impl Router {
         observation: &eliot_core::api::harness::QuotaObservation,
         projection: eliot_core::api::harness::QuotaWindowProjection,
     ) {
+        // Sparse values cannot safely decorate an incomplete/non-object full read.
         let Some(details) = details.as_object_mut() else {
             return;
         };

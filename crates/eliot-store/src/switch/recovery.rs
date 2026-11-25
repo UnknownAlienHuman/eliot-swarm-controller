@@ -34,6 +34,8 @@ impl Store {
                 .connection
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(sql_error)?;
+            // A rejected switch cannot dispatch again. Release its unused child IDs
+            // on every boot; any materialized child still owns its ID in commands.
             tx.execute(
                 "DELETE FROM switch_child_id_reservations
                  WHERE EXISTS (

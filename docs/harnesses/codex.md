@@ -808,7 +808,17 @@ the installed 0.167.1 schema. It produces a typed `session.native_warning`
 diagnostic only when `threadId` matches the exact owned thread. The adapter
 records a running count per bounded code and redacts the message before
 truncating it. The schema has no code field, so uncoded notifications use
-`warning`. The diagnostic remains thread-scoped and visible in retained events
+`warning`. Identity uses the exact thread, accepted native code before the
+bounded display `other` bucket, and the full redacted message before the 1,024
+byte display truncation. Its deterministic content digest excludes the
+process-local count; persisted warning fields and credentials are unchanged.
+A matching retained warning on the same Agent's `stream` is acknowledged by
+its original sequence without a second event, including across generations
+when the same native thread is reattached. The lookback ends when the warning
+row is pruned by the configured event-retention window; a later identical
+notice can then be admitted again. Other
+Agents, threads and sources remain separate. Legacy warning IDs keep their
+existing behavior. The diagnostic remains thread-scoped and visible in retained events
 after the turn ends. Missing or mismatched thread bindings increment
 `unbound_warnings_dropped` in the native snapshot; malformed notification or
 startup-status payloads increment `malformed_warnings_dropped`. Both discard

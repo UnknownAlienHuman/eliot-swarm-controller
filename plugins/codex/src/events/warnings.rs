@@ -1,6 +1,5 @@
 use eliot_core::{
-    Error, MAX_NATIVE_WARNING_BYTES, NATIVE_WARNING_OCCURRENCE_PREFIX, NativeWarning, Result,
-    SecretPolicy, is_native_discriminator,
+    Error, MAX_NATIVE_WARNING_BYTES, NativeWarning, Result, SecretPolicy, is_native_discriminator,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -122,27 +121,27 @@ impl Warnings {
         if source_message.is_empty() {
             return Ok(None);
         }
-        let mut code = code;
-        if !self.counts.contains_key(code) && self.counts.len() >= MAX_WARNING_CODES - 1 {
-            code = "other";
-        }
-        let count = self.counts.entry(code.to_owned()).or_default();
-        *count = count.saturating_add(1);
         let mut message = policy.redact_text(source_message);
         let truncated = message.len() > MAX_NATIVE_WARNING_BYTES;
+        let id = NativeWarning::stable_id_for_fields(thread, code, &message, truncated)?;
+        let published_code =
+            if !self.counts.contains_key(code) && self.counts.len() >= MAX_WARNING_CODES - 1 {
+                "other"
+            } else {
+                code
+            };
+        let count = self.counts.entry(published_code.to_owned()).or_default();
+        *count = count.saturating_add(1);
         if truncated {
             message.truncate(message.floor_char_boundary(MAX_NATIVE_WARNING_BYTES));
         }
         let warning = NativeWarning {
             thread_id: thread.to_owned(),
-            code: code.to_owned(),
+            code: published_code.to_owned(),
             count: *count,
             message,
             truncated,
         };
-        // This occurrence key is for retrying the exact transport batch.
-        // Store assigns the diagnostic's published identity.
-        let id = format!("{NATIVE_WARNING_OCCURRENCE_PREFIX}{}", ulid::Ulid::new());
         let data = serde_json::to_value(warning)
             .map_err(|_| Error::new("internal", "Codex warning could not be encoded"))?;
         Ok(Some((id, data)))

@@ -1186,11 +1186,21 @@ code inventory and the redacted, UTF-8-bounded message. A missing or mismatched
 thread binding increments `unbound_warnings_dropped` in the native snapshot and
 retains no warning text. Malformed warning and startup-status payloads increment
 `malformed_warnings_dropped` and retain no payload text. Codex supplies no native
-identity for these notifications. The adapter names the transport occurrence
-and Store assigns a stable diagnostic ID from its exact batch and position.
-Identical warnings in distinct batches remain separate facts. The stream does
-not replay uncertain writes. The diagnostic supplies no lifecycle,
-progress, quota or settlement evidence. MCP startup status emits the same typed diagnostic only
+identity for these notifications. The adapter assigns a content ID from the
+exact thread and a deterministic digest of the full redacted native code and
+message before display aggregation or truncation; the local count is excluded
+and no extra fields enter the persisted warning. Store accepts the neutral
+`native-warning-content:` marker only for a typed singleton stream warning on
+the current thread. A matching retained row for the same Agent and
+`stream` source returns its original one-event sequence as the acknowledgement without
+republishing, including when the same thread is reattached in a later
+generation. Count changes and the `other` display bucket do not alter identity.
+Legacy warning IDs keep their existing receipt behavior. Deduplication lasts
+only while the matching warning row is retained under the configured event-retention
+window; pruning that row permits a later identical warning to be admitted again. Different Agents, native threads,
+or sources do not share this lookback. The stream does not replay uncertain
+writes. The diagnostic supplies no lifecycle, progress, quota or settlement
+evidence. MCP startup status emits the same typed diagnostic only
 for `status: failed` on the exact owned thread; starting, ready and cancelled
 updates remain silent. Its bounded message preserves the startup error or typed
 failure reason. An unbound startup failure is counted as dropped without retaining

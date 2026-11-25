@@ -1071,7 +1071,7 @@ impl Store {
             .pop())
     }
 
-    /// Read the newest bounded sparse updates since a confirmed read, oldest first.
+    /// Read the complete sparse update sequence since a confirmed read, oldest first.
     pub fn quota_observations_after(
         &self,
         harness: &str,
@@ -1101,7 +1101,7 @@ impl Store {
         self.ensure_committed_reads()?;
         const MAX_ROLLING_UPDATES: i64 = 64;
         let limit = if read_bound.is_some() {
-            MAX_ROLLING_UPDATES
+            MAX_ROLLING_UPDATES + 1
         } else {
             1
         };
@@ -1140,6 +1140,11 @@ impl Store {
             .map_err(sql_error)?
             .collect::<rusqlite::Result<Vec<_>>>()
             .map_err(sql_error)?;
+        if rows.len() > MAX_ROLLING_UPDATES as usize {
+            // The on-demand result is still usable. Never apply an incomplete
+            // range of sparse updates that may miss the first value in a pair.
+            return Ok(Vec::new());
+        }
         rows.into_iter()
             .rev()
             .map(|data| {
