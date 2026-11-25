@@ -203,7 +203,7 @@ impl Router {
                 request,
                 &Principal::Owner,
                 false,
-                false,
+                super::SubmissionScope::Verify,
                 routing::LaunchRouting {
                     harness_check_candidate: Some(candidate),
                     ..Default::default()

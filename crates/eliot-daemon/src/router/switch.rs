@@ -548,7 +548,7 @@ impl Router {
                     launch,
                     &Principal::Owner,
                     false,
-                    false,
+                    super::SubmissionScope::Verify,
                     routing::LaunchRouting {
                         owner_automation,
                         provider_source: (provider_failure.is_some()

@@ -346,6 +346,12 @@ pub(crate) struct PreparedSubmission {
     pub(crate) workspace: Option<WorkspacePreparationInput>,
 }
 
+enum SubmissionScope {
+    Verify,
+    Verified,
+    DirectRpc,
+}
+
 use eliot_core::api::discovery::{ProjectGetRequest, ProjectListRequest};
 
 /// One locked snapshot of a frozen wait set: per-entry results plus the
@@ -617,6 +623,7 @@ impl Router {
             remote: remote.as_ref(),
             owner_process: owner_process.as_ref(),
             owner_automation: false,
+            direct_command_rpc: method == "command.submit",
             ..SubmissionContext::default()
         };
         let result = self
@@ -1856,7 +1863,18 @@ impl Router {
                 Ok((CommandSubmission::resume_continuation(request, text)?, None))
             } else {
                 let PreparedSubmission { request, workspace } = self
-                    .prepare_submission_after_authorization(request, principal, false, true)
+                    .prepare_submission_with_routing(
+                        request,
+                        principal,
+                        false,
+                        if context.direct_command_rpc {
+                            SubmissionScope::DirectRpc
+                        } else {
+                            SubmissionScope::Verified
+                        },
+                        routing::LaunchRouting::default(),
+                        false,
+                    )
                     .await?;
                 Ok((request.into(), workspace))
             }
@@ -1959,11 +1977,28 @@ impl Router {
             return Ok(admission);
         }
         owner_inbox::check_binding(store)?;
-        self.check_command_admission_mode(&request.verb)?;
+        // The direct RPC exemption must survive asynchronous preparation.
+        // The writer keeps the selected lease fixed through admission.
+        let restart_id = context
+            .direct_command_rpc
+            .then(|| self.restart_send_preparation(&request.verb))
+            .flatten();
+        if restart_id.is_none() {
+            self.check_command_admission_mode(&request.verb)?;
+        }
         if request.verb == "answer" {
             validate_answer_request(store, request)?;
         }
-        store.submit_with_context(principal, submission, workspace, context, now_ms())
+        store.submit_with_context(
+            principal,
+            submission,
+            workspace,
+            SubmissionContext {
+                restart_send: restart_id.as_deref(),
+                ..context
+            },
+            now_ms(),
+        )
     }
 
     fn check_command_admission_mode(&self, verb: &str) -> Result<()> {
@@ -1999,6 +2034,18 @@ impl Router {
                 .lock_recover()
                 .as_ref()
                 .is_some_and(|lease| lease.lossless)
+    }
+
+    fn restart_send_preparation(&self, verb: &str) -> Option<String> {
+        if verb != "send" || self.inner.mode.load(Ordering::SeqCst) != MODE_QUIESCE {
+            return None;
+        }
+        self.inner
+            .restart_lease
+            .lock_recover()
+            .as_ref()
+            .filter(|lease| lease.lossless)
+            .map(|lease| lease.id.clone())
     }
 
     async fn replay_command_submission(
@@ -2810,7 +2857,7 @@ impl Router {
                 request,
                 &Principal::Owner,
                 false,
-                false,
+                SubmissionScope::Verify,
                 routing::LaunchRouting {
                     owner_automation: true,
                     ..Default::default()
@@ -3250,7 +3297,11 @@ impl Router {
             request,
             principal,
             project_authority_preverified,
-            submission_scope_preverified,
+            if submission_scope_preverified {
+                SubmissionScope::Verified
+            } else {
+                SubmissionScope::Verify
+            },
             routing::LaunchRouting::default(),
             false,
         )
@@ -3262,7 +3313,7 @@ impl Router {
         mut request: SubmitCommand,
         principal: &Principal,
         project_authority_preverified: bool,
-        submission_scope_preverified: bool,
+        submission_scope: SubmissionScope,
         routing: routing::LaunchRouting<'_>,
         defer_launch_goal: bool,
     ) -> Result<PreparedSubmission> {
@@ -3286,7 +3337,7 @@ impl Router {
                 "only an explicit send may probe a provider hold",
             ));
         }
-        if !submission_scope_preverified {
+        if matches!(submission_scope, SubmissionScope::Verify) {
             self.authorize_submission_scope(&mut request, principal)
                 .await?;
         }
@@ -3294,7 +3345,12 @@ impl Router {
             self.verify_native_control_target(&request).await?;
         }
         self.check_safe_point_steer_target(&request).await?;
-        self.check_command_admission_mode(&request.verb)?;
+        if !(matches!(submission_scope, SubmissionScope::DirectRpc)
+            && request.verb == "send"
+            && self.lossless_quiescing())
+        {
+            self.check_command_admission_mode(&request.verb)?;
+        }
         if request.verb == "detach" {
             self.hydrate_detach_generation(&mut request).await?;
         }

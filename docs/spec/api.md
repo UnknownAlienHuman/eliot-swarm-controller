@@ -3287,11 +3287,15 @@ is removed before the admission fence. A failed check leaves the old daemon in
 service. The running daemon uses the planned-restart
 `daemon.shutdown` modes. `prepare_restart` records a bounded admission
 fence and parks admitted, never-dispatched direct SENDs for controlled
-sessions. The command must target the current generation without an explicit
+sessions. During a lossless fence, authorized direct SENDs to a live
+controlled session are admitted and parked in the same Store transaction.
+The command must target the current generation without an explicit
 generation or turn constraint. Linked and selector inputs retain their own
-admission rules. Prepare acquires the mutation barrier before recording the fence. New work
-and non-command RPC mutations are refused during the fence. Stop and native
-request-resolution controls remain available so admitted turns can progress.
+admission rules. Prepare acquires the mutation barrier before recording the
+fence. Parked SENDs cannot dispatch while the fence is held. Automation and
+switch-generated SENDs remain refused during quiesce. Other new
+work and non-command RPC mutations are refused during the fence. Stop and
+native request-resolution controls remain available so admitted turns can progress.
 The CLI reports active turn IDs, Agent generations and elapsed age to stderr.
 The writer waits for every controlled turn, start and already-dispatched
 command to settle, plus daemon-owned workers. Queued commands on stopped or

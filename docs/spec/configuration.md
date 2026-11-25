@@ -2200,13 +2200,12 @@ streams disconnected.
 ### Agent restart policy
 
 `[daemon].on_restart` takes `"continue"` (default) or `"hold"` and applies
-at daemon startup. Continue has one automatic continuation rule: resume a
-retained generation only when work was interrupted or input was still waiting
-at restart. The restart event captures undelivered direct sends and unread
-wake-enabled mail. Mail arriving later does not reopen an idle Agent.
-An idle Agent without interrupted work or waiting input stays closed until a direct `send`,
-which uses normal resume admission and links that new input. Archived Agents
-are excluded, and an Owner-applied Stop remains a fence. Eligible generations
+at daemon startup. Continue automatically reopens eligible retained
+generations with exact custody closure when an idle session was clean, work
+was interrupted or input was still waiting at restart. A clean idle session
+reopens without input. The restart event captures undelivered direct sends
+and unread wake-enabled mail. Archived Agents are excluded, and an
+Owner-applied Stop remains a fence. Eligible generations
 resume in batches of up to four commands within configured capacity. Roots
 resume before their children. Descendants wait for ancestors with interrupted
 work or undelivered input. A resumed generation with interrupted work opens with a
@@ -2216,8 +2215,11 @@ binding. The generated linked SEND is identified by its restart intent and
 cannot become a replacement task. No uncertain input is replayed.
 Resume uses the Agent's frozen profile and any inherited effective
 configuration from the retained generation. Goals and project assignments
-follow the Agent to its new generation. A Goal with unresolved prior work
-remains paused until that work is settled. Hold leaves those sessions for
+follow the Agent to its new generation. An unknown Goal round from an older
+generation does not block a clean idle session from reopening when checker
+closure is recorded for that exact round, including proof that the checker
+never spawned. Older markers without this evidence stay fenced. The round key remains burned and the Goal remains
+paused until its unresolved work is settled. Hold leaves those sessions for
 explicit resume. Previously admitted commands still follow durable command
 recovery. Interrupted turns and uncertain effects stay `unknown` under either
 policy: they are named, never replayed.

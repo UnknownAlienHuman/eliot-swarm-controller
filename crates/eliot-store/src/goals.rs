@@ -229,6 +229,7 @@ pub struct GoalRoundCommit {
     /// unchanged (no Agent event during the check); idle commits pin the
     /// key itself instead.
     pub claim_seq: i64,
+    pub check_custody: GoalCheckCustody,
     pub check: Option<GoalCheckResult>,
     /// Successful command timing and frozen check identity, recorded atomically.
     pub check_history: Option<GoalCheckHistoryEntry>,
@@ -249,6 +250,20 @@ pub struct GoalRoundCommit {
     /// Exact registered project and unchanged checked worktree fingerprint.
     pub project_check: Option<(String, String)>,
     pub continuation: Option<GoalContinuation>,
+}
+
+/// A released checker may have only bounded process-group evidence.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GoalCheckCustody {
+    Unconfirmed,
+    Quiescent,
+    Exact,
+}
+
+impl GoalCheckCustody {
+    pub fn is_quiescent(self) -> bool {
+        self != Self::Unconfirmed
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -445,7 +460,7 @@ fn abandon_goal_marker_tx(
     record: &GoalRoundRecord,
     custody_closed: bool,
     now: i64,
-) -> Result<()> {
+) -> Result<bool> {
     let agent = parse_agent_id(&record.request.agent)?;
     let mode = record.request.mode.as_str();
     if custody_closed
@@ -471,9 +486,9 @@ fn abandon_goal_marker_tx(
                 record.holder
             ],
         ));
-        return Ok(());
+        return Ok(false);
     }
-    db!(tx.execute(
+    let burned = db!(tx.execute(
         "UPDATE goal_markers SET state = 'unknown', updated_at = ?1, custody_closed = ?2
          WHERE agent = ?3 AND mode = ?4 AND generation = ?5 AND revision = ?6
            AND round_key = ?7 AND round_key_kind = ?8 AND state = 'running' AND holder = ?9",
@@ -489,7 +504,7 @@ fn abandon_goal_marker_tx(
             record.holder
         ],
     ));
-    Ok(())
+    Ok(burned == 1)
 }
 
 fn unknown_goal_round_error() -> Error {
@@ -1710,56 +1725,13 @@ impl Store {
         result?.transpose()
     }
 
-    /// Burn the marker and retain the original sanitized error atomically.
-    /// If persistence itself fails, the reservation stays unresolved; it
-    /// never authorizes a rerun, and a new holder reads it as unknown.
-    pub fn goal_abandon_round(
-        &mut self,
-        principal: &str,
-        request: &GoalRoundRequest,
-        error: &Error,
-        check_timeout_ms: Option<i64>,
-        retry_timeout_ms: Option<i64>,
-        now: i64,
-    ) -> Result<Change<Error>> {
-        self.goal_finish_round_error(
-            principal,
-            request,
-            error,
-            check_timeout_ms,
-            retry_timeout_ms,
-            now,
-            true,
-        )
-    }
-
-    /// Retain the request error without releasing process single-flight.
-    /// A failed request and an unproven process-family closure are independent.
-    pub fn goal_hold_round_error(
-        &mut self,
-        principal: &str,
-        request: &GoalRoundRequest,
-        error: &Error,
-        check_timeout_ms: Option<i64>,
-        retry_timeout_ms: Option<i64>,
-        now: i64,
-    ) -> Result<Change<Error>> {
-        self.goal_finish_round_error(
-            principal,
-            request,
-            error,
-            check_timeout_ms,
-            retry_timeout_ms,
-            now,
-            false,
-        )
-    }
-
+    /// Keep the original error and release single-flight only on quiescence.
+    /// The durable closure bit requires stronger, exact custody evidence.
     #[allow(
         clippy::too_many_arguments,
         reason = "The failure settlement carries the exact request, observed deadlines, and ownership state"
     )]
-    fn goal_finish_round_error(
+    pub fn goal_finish_round_error(
         &mut self,
         principal: &str,
         request: &GoalRoundRequest,
@@ -1767,7 +1739,7 @@ impl Store {
         check_timeout_ms: Option<i64>,
         retry_timeout_ms: Option<i64>,
         now: i64,
-        release_marker: bool,
+        custody: GoalCheckCustody,
     ) -> Result<Change<Error>> {
         self.ensure_writer_healthy()?;
         let result = (|| {
@@ -1783,12 +1755,27 @@ impl Store {
                 &goal_round_digest(request)?,
             )?
             .ok_or_else(|| Error::new("unknown", "goal round reservation is no longer retained"))?;
-            if release_marker && record.holder == self.goal_holder {
+            let mut events = Vec::new();
+            if custody.is_quiescent() && record.holder == self.goal_holder {
                 // A later proven closure may release the marker without
                 // replacing an already retained original request error.
-                abandon_goal_marker_tx(&tx, &record, true, now)?;
+                let exact = custody == GoalCheckCustody::Exact;
+                if abandon_goal_marker_tx(&tx, &record, exact, now)? && exact {
+                    events.push(insert_daemon_event(
+                        &tx,
+                        now,
+                        "goal.check_custody_closed",
+                        "goal",
+                        Some(parse_agent_id(&request.agent)?),
+                        Some(record.generation),
+                        json!({
+                            "mode": record.request.mode,
+                            "revision": record.revision,
+                            "round_key": record.key.text(),
+                        }),
+                    )?);
+                }
             }
-            let mut events = Vec::new();
             let retained = if matches!(record.outcome, StoredGoalRoundOutcome::Running)
                 && record.holder == self.goal_holder
             {

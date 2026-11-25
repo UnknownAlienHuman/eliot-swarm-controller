@@ -52,6 +52,9 @@ const RESTART_LINKED_LAUNCH_INPUT_VALID: &str = "EXISTS (
 
 // Both facts must come from the retained restart event, not a later Store read.
 fn restart_resume_eligibility() -> String {
+    // A burned Goal round with closed checker custody from an older
+    // generation still fences the Goal in advance_resume_tx. It cannot
+    // execute work in the clean idle session being reopened here.
     format!(
         r#"
     a.observe_only = 0 AND a.archived = 0
@@ -105,7 +108,21 @@ fn restart_resume_eligibility() -> String {
     )
     AND NOT EXISTS (
         SELECT 1 FROM goal_markers g
-        WHERE g.agent = a.id AND g.state IN ('running', 'unknown')
+        WHERE g.agent = a.id
+          AND (g.state = 'running'
+               OR (g.state = 'unknown' AND NOT (
+                   ({clean_idle_session}) IS TRUE
+                   AND g.generation < a.generation AND g.custody_closed = 1
+                   AND EXISTS (
+                       SELECT 1 FROM events checker
+                       WHERE checker.agent = g.agent AND checker.generation = g.generation
+                         AND checker.kind = 'goal.check_custody_closed' AND checker.ts = g.updated_at
+                         AND json_extract(checker.data, '$.mode') = g.mode
+                         AND json_extract(checker.data, '$.revision') = g.revision
+                         AND json_extract(checker.data, '$.round_key') =
+                             (g.round_key_kind || ':' || g.round_key)
+                   )
+               )))
     )
 "#,
         interrupted_work = RESTART_INTERRUPTED_WORK,
