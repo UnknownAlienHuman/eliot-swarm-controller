@@ -102,8 +102,13 @@ and JSON decode durations. Timings do not enter method DTOs, retained writes or
 acknowledgements; absent timing metadata means unmeasured, never zero backend time.
 On Windows a busy connect waits for pipe availability within the original call
 deadline instead of a fixed polling sleep. Availability never reserves a pipe:
-only the connect may repeat, before any request bytes are sent. Send/response
-failures retain their ordinary `unknown` outcome and never trigger a new call.
+only the connect may repeat, before any request bytes are sent. EOF, a broken
+pipe or confirmed exit of the daemon process bound to the endpoint settles
+each outstanding local RPC promptly. Reads report `unavailable` at
+`client.ipc`. After any possible write of a mutation, the same loss reports
+`unknown` at `client.ipc`, even when the transport failure itself is definite.
+It never sends the request again or changes the admitted command's Store
+outcome. Inspect the original command by its retained ID.
 
 Background `daemon` startup reports `starting`, then waits up to 30 s for
 `daemon.status` readiness and reports `ready` with the resolved data

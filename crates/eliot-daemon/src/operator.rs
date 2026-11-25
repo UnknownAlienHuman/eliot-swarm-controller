@@ -402,6 +402,31 @@ pub fn daemon_alive(info: &DaemonInfo) -> Result<bool> {
     }
 }
 
+/// A positive exit of the process published with this endpoint is independent
+/// of pipe readiness. Most RPCs finish before the first process check.
+pub(crate) async fn wait_for_daemon_exit(info: &DaemonInfo) {
+    #[cfg(windows)]
+    if let Ok(birth) = birth_time(info, "windows-creation-filetime:") {
+        crate::platform::windows::wait_recorded_process_exit(info.pid, birth).await;
+        return;
+    }
+    #[cfg(target_os = "linux")]
+    loop {
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "Bound the exact-peer check for an outstanding local RPC."
+        )]
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        match daemon_alive(info) {
+            Ok(false) => return,
+            Ok(true) => {}
+            Err(_) => break,
+        }
+    }
+    let _ = info;
+    std::future::pending::<()>().await;
+}
+
 pub fn running_binary(info: &DaemonInfo) -> Result<PathBuf> {
     #[cfg(windows)]
     return crate::platform::windows::recorded_process_image(

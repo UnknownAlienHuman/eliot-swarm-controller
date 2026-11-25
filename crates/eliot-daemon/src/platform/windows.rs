@@ -1409,6 +1409,32 @@ pub(crate) fn recorded_process_alive(pid: u32, start_time: u64) -> Result<bool> 
     }
 }
 
+pub(crate) async fn wait_recorded_process_exit(pid: u32, start_time: u64) {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "Short RPCs need no process handle."
+    )]
+    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    let process = match verified_process(pid, start_time, 0) {
+        Ok(process) => process,
+        Err(_) if matches!(recorded_process_alive(pid, start_time), Ok(false)) => return,
+        Err(_) => return std::future::pending().await,
+    };
+    loop {
+        // SAFETY: the verified query handle pins the exact birth identity.
+        match unsafe { WaitForSingleObject(process.0, 0) } {
+            WAIT_OBJECT_0 => return,
+            WAIT_TIMEOUT => {}
+            _ => return std::future::pending().await,
+        }
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "Check a pinned process handle without blocking a Tokio thread."
+        )]
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+}
+
 pub(crate) fn process_start_time(pid: u32) -> Result<u64> {
     let (sample, _) = read_job_process(None, pid, "", "", "", 0)?;
     if sample.record.state == ProcessState::Exited {
