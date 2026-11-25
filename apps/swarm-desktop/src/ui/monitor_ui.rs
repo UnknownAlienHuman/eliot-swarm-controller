@@ -565,12 +565,15 @@ impl DesktopApp {
                             .is_ok(),
                         None => false,
                     };
-                    if !waited && !feed::backoff(wait, &cancelled) {
+                    // Inside the runtime: `pause`, never `backoff` (it
+                    // starts its own runtime).
+                    if !waited && !feed::pause(wait, &cancelled).await {
                         return None;
                     }
-                    paused(&cancelled);
-                    if cancelled() {
-                        return None;
+                    while crate::window_place::hidden() {
+                        if !feed::pause(monitor::HIDDEN_CHECK_MS, &cancelled).await {
+                            return None;
+                        }
                     }
                 }
                 // The tip before this read: the next wait starts there, so
