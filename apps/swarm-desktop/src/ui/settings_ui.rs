@@ -1338,7 +1338,7 @@ impl DesktopApp {
                     let read = model::policy_fields(&s.base(Section::Projects), &id);
                     PolicyDraft::new(id, read)
                 });
-                self.read_policy_usage(context);
+                self.poll_projects(context);
             }
             SettingsMsg::PolicyEdited(edit) => {
                 if let Some(policy) = s.policy.as_mut() {

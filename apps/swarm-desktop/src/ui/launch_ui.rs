@@ -501,25 +501,27 @@ impl DesktopApp {
         }))
     }
 
-    /// The project popover's rows: `(checkout, name, path)`, filtered;
-    /// "No project (chat)" first.
-    pub(super) fn project_rows(&self) -> Vec<(String, String, String)> {
+    /// The project popover's rows: `(checkout, name, path or why it
+    /// waits, paused)`, filtered; "No project (chat)" first.
+    pub(super) fn project_rows(&self) -> Vec<(String, String, String, bool)> {
         let query = self.launch.project_query.trim().to_lowercase();
         let chat = "no project (chat)";
-        let mut rows: Vec<(String, String, String)> = Vec::new();
+        let mut rows: Vec<(String, String, String, bool)> = Vec::new();
         if query.is_empty() || chat.contains(&query) {
             rows.push((
                 CHAT_PROJECT.to_owned(),
                 "No project (chat)".to_owned(),
                 "A chat in its own private folder".to_owned(),
+                false,
             ));
         }
         // Each project, then its subprojects ("app" < "app › x"), as the
         // sidebar lists them. The list comes from daemon registrations and
-        // verified checkouts, and an absent checkout cannot start a task.
+        // verified checkouts, and an absent checkout cannot start a task;
+        // a linked worktree waits while its Git metadata refreshes.
         let checkouts = self.checkouts();
         let mut seen = HashSet::new();
-        let mut projects: Vec<(String, String, String)> = checkouts
+        let mut projects: Vec<(String, String, String, bool)> = checkouts
             .iter()
             .filter(|checkout| !checkout.missing && seen.insert(nav::path_key(&checkout.path)))
             .map(|checkout| (checkout, self.place_title_in(&checkout.path, &checkouts)))
@@ -529,10 +531,16 @@ impl DesktopApp {
                     || checkout.path.to_lowercase().contains(&query)
             })
             .map(|(checkout, label)| {
+                let paused = checkout.paused();
                 (
                     checkout.path.clone(),
                     label,
-                    nav::display_path(&checkout.path).to_owned(),
+                    if paused {
+                        GIT_REFRESHING.to_owned()
+                    } else {
+                        nav::display_path(&checkout.path).to_owned()
+                    },
+                    paused,
                 )
             })
             .collect();
@@ -542,6 +550,7 @@ impl DesktopApp {
             OTHER_FOLDER.to_owned(),
             "Other folder…".to_owned(),
             "Type a folder path".to_owned(),
+            false,
         ));
         rows
     }
@@ -758,7 +767,7 @@ impl DesktopApp {
                     self.launch.workspace.clear();
                     self.launch.profiles.clear();
                     self.nav.selection.project = None;
-                } else {
+                } else if self.can_launch_here(&checkout) {
                     self.pick_project(&checkout);
                 }
             }

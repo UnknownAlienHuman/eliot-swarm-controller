@@ -1669,6 +1669,14 @@ impl DesktopApp {
                 ))
                 .into()
         };
+        // The title names the project by its origin: the last known while
+        // its Git metadata refreshes, and it says so.
+        let refreshing = (!self.launch.chat && self.git_refreshing_at(&self.launch.workspace))
+            .then(|| {
+                controls::secondary(GIT_REFRESHING)
+                    .horizontal_alignment(HorizontalAlignment::Center)
+                    .into()
+            });
         ScrollViewer::new()
             .grid_row(1)
             .vertical_scroll_bar_visibility(ScrollBarVisibility::Auto)
@@ -1683,6 +1691,7 @@ impl DesktopApp {
                         .spacing(tokens::spacing::HOME_GROUP_GAP)
                         .keyed_children(crate::views::slots([
                             Some(title),
+                            refreshing,
                             alert,
                             Some(composer),
                             Some(

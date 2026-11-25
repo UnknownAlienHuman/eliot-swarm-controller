@@ -769,7 +769,7 @@ impl DesktopApp {
         let rows: Vec<KeyedView> = self
             .project_rows()
             .into_iter()
-            .map(|(checkout, name, path)| {
+            .map(|(checkout, name, path, paused)| {
                 let highlighted = highlight == Some(checkout.as_str());
                 let selected = if self.launch.chat {
                     checkout == CHAT_PROJECT
@@ -783,7 +783,7 @@ impl DesktopApp {
                     _ => controls::glyph::FOLDER,
                 };
                 KeyedView::new(
-                    format!("{checkout}:{highlighted}:{selected}"),
+                    format!("{checkout}:{highlighted}:{selected}:{paused}"),
                     Border::new()
                         .corner_radius(tokens::radius::CONTROL)
                         .background(if highlighted {
@@ -793,7 +793,12 @@ impl DesktopApp {
                         })
                         .content(
                             controls::row(false)
-                                .automation_name(format!("{name}, {path}"))
+                                .is_enabled(!paused)
+                                .automation_name(if paused {
+                                    format!("{name}, {GIT_PAUSED}")
+                                } else {
+                                    format!("{name}, {path}")
+                                })
                                 .on_click(context.message(Message::Launch(
                                     LaunchMsg::ProjectChosen(checkout.clone()),
                                 )))

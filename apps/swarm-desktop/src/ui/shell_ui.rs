@@ -124,9 +124,10 @@ pub(super) enum ShellMsg {
     /// The new data directory runs: whether it was remembered.
     RootRemembered(PathBuf, Result<(), String>),
     ProjectsLoaded(Fallible<Vec<UiProject>>),
-    /// A `project.list` read for the open policy editor's counter: only
-    /// each project's `policy_usage` is taken from it.
-    PolicyUsageLoaded(Fallible<Vec<UiProject>>),
+    /// The sidebar refresh's `project.list` ([`DesktopApp::poll_projects`]):
+    /// each listed project's `policy_usage` and Git state are taken from
+    /// it; the list, its order and the selection stay.
+    ProjectsPolled(Fallible<Vec<UiProject>>),
     /// The sidebar's grouping readback (`chat.organization` groups with
     /// their headers and totals, and the `organization.changed` rows since
     /// the cursor). A failed read keeps the last server grouping with a
@@ -235,10 +236,9 @@ pub(super) enum ShellMsg {
     ExpandToggled(String, bool),
     /// Tree epoch, manager id and its direct-children page.
     BranchLoaded(u64, String, Fallible<AgentPage>),
-    /// The preferences and window size written to `[desktop]` (or not).
+    /// The preferences written to `[desktop]` (or not).
     PreferencesSaved(
         crate::settings::Preferences,
-        Option<(u32, u32)>,
         MutationResult<eliot_core::api::SettingsSaveResponse>,
     ),
     AlertDismissed,
@@ -261,7 +261,7 @@ impl ShellMsg {
             Self::AttentionReports(_, read) => read.is_err(),
             Self::OrganizationLoaded(read) => read.stale,
             Self::QueueLoaded(read) => !read.errors.is_empty(),
-            Self::PolicyUsageLoaded(read) => read.is_err(),
+            Self::ProjectsPolled(read) => read.is_err(),
             Self::Inbox(InboxMsg::Status(read)) => read.is_err(),
             Self::Inbox(InboxMsg::Loaded(_, read)) => read.is_err(),
             _ => false,
@@ -548,7 +548,8 @@ impl DesktopApp {
                 }
             }
             ShellMsg::ProjectsLoaded(projects) => match projects {
-                Ok(projects) => {
+                Ok(mut projects) => {
+                    keep_last_known(&mut projects, &self.nav.projects);
                     self.nav.projects = projects;
                     let workspace = self.launch.workspace.clone();
                     if let Some(project) = self
@@ -570,18 +571,39 @@ impl DesktopApp {
                 }
                 Err(error) => self.alert(format!("Projects not read: {error}")),
             },
-            ShellMsg::PolicyUsageLoaded(read) => {
-                // A failed read keeps the counter shown; the next poll reads again.
-                for fresh in read.into_iter().flatten() {
-                    if let Some(project) = self
+            ShellMsg::ProjectsPolled(read) => {
+                // A failed read keeps what is shown; the next poll reads
+                // again. A row still refreshing keeps its last known Git
+                // data; one whose marker cleared takes the new metadata.
+                let Ok(mut read) = read else {
+                    return;
+                };
+                keep_last_known(&mut read, &self.nav.projects);
+                let mut git_changed = false;
+                for fresh in read {
+                    let Some(project) = self
                         .nav
                         .projects
                         .iter_mut()
                         .find(|project| project.id == fresh.id)
-                        .filter(|project| project.policy_usage != fresh.policy_usage)
-                    {
+                    else {
+                        continue;
+                    };
+                    if project.policy_usage != fresh.policy_usage {
                         project.policy_usage = fresh.policy_usage;
                     }
+                    if project.git_refreshing != fresh.git_refreshing
+                        || project.origin != fresh.origin
+                        || project.git_checkouts != fresh.git_checkouts
+                    {
+                        project.git_refreshing = fresh.git_refreshing;
+                        project.origin = fresh.origin;
+                        project.git_checkouts = fresh.git_checkouts;
+                        git_changed = true;
+                    }
+                }
+                if git_changed {
+                    self.refresh_search();
                 }
             }
             ShellMsg::AgentsLoaded(list_epoch, append, page) => {
@@ -968,20 +990,20 @@ impl DesktopApp {
                 self.save_preferences(context);
             }
             ShellMsg::StartupChosen(_) => {}
-            ShellMsg::PreferencesSaved(saved, window, result) => {
+            ShellMsg::PreferencesSaved(saved, result) => {
                 self.prefs_saving = false;
                 if let Err(error) = &result {
                     self.alert(format!("Preferences not saved: {error}"));
                 }
-                // A choice made on the page reports there; window-size
-                // and composer writes stay quiet.
+                // A choice made on the page reports there; composer
+                // writes stay quiet.
                 if self.main == Main::Settings || result.is_err() {
                     self.settings
                         .notes
                         .insert(self.settings_page, settings_ui::Note::of(false, &result));
                 }
                 // A newer change arrived while this one was written.
-                if saved != self.prefs || window != self.size_note.size() {
+                if saved != self.prefs {
                     self.save_preferences(context);
                 } else if self.settings.loaded && result.is_ok() {
                     // The revision moved: the page's drafts save against it.
@@ -1214,8 +1236,9 @@ impl DesktopApp {
                     self.load_organization(context);
                     self.load_queue(context);
                 }
-                // An open launch policy's counter follows new launches.
-                self.read_policy_usage(context);
+                // Refreshing Git metadata and an open launch policy's
+                // counter follow the daemon.
+                self.poll_projects(context);
                 // The navigation's inbox counts on every poll; the items
                 // only while the Inbox shows them.
                 self.read_inbox_counts(context);
@@ -1605,11 +1628,24 @@ impl DesktopApp {
             .collect()
     }
 
+    /// The checkout at `path` belongs to a project whose Git metadata is
+    /// refreshing.
+    pub(super) fn git_refreshing_at(&self, path: &str) -> bool {
+        let key = nav::path_key(path);
+        !path.trim().is_empty()
+            && self
+                .checkouts()
+                .iter()
+                .any(|checkout| checkout.refreshing && nav::path_key(&checkout.path) == key)
+    }
+
+    /// A task can start in `path`: a listed checkout that is not missing
+    /// and not paused while its Git metadata refreshes.
     pub(super) fn can_launch_here(&self, path: &str) -> bool {
         let key = nav::path_key(path);
-        self.checkouts()
-            .iter()
-            .any(|checkout| !checkout.missing && nav::path_key(&checkout.path) == key)
+        self.checkouts().iter().any(|checkout| {
+            !checkout.missing && !checkout.paused() && nav::path_key(&checkout.path) == key
+        })
     }
 
     /// The listed, fetched or found Agent with this id.
@@ -1910,14 +1946,13 @@ impl DesktopApp {
             return;
         };
         self.prefs_saving = true;
-        let (preferences, window) = (self.prefs.clone(), self.size_note.size());
+        let preferences = self.prefs.clone();
         let _task = context.spawn_background(move |_| {
             let saved = client::block_on(config_client::save_preferences(
                 &data_dir,
                 preferences.clone(),
-                window,
             ));
-            Message::Shell(ShellMsg::PreferencesSaved(preferences, window, saved))
+            Message::Shell(ShellMsg::PreferencesSaved(preferences, saved))
         });
     }
 
@@ -1925,7 +1960,7 @@ impl DesktopApp {
     /// closes goes to.
     pub(super) fn note_data_dir(&self) {
         if let Ok(data_dir) = self.data_dir.clone() {
-            self.size_note.set_data_dir(data_dir);
+            self.close_note.set_data_dir(data_dir);
         }
     }
 
@@ -2263,20 +2298,28 @@ impl DesktopApp {
         });
     }
 
-    /// Read the projects' launch policy use while a policy editor shows it
-    /// (Settings › Projects with a project open).
-    pub(super) fn read_policy_usage(&mut self, context: &ComponentContext<Self>) {
-        if self.main != Main::Settings
-            || self.settings_page != Page::Projects
-            || self.settings.policy.is_none()
-        {
+    /// Read the projects again while a row's Git metadata refreshes (until
+    /// its marker clears) or a launch policy editor shows the use counter
+    /// (Settings › Projects with a project open). In the sidebar refresh
+    /// it is that refresh's one `project.list`, and the next refresh waits
+    /// for its reply.
+    pub(super) fn poll_projects(&mut self, context: &ComponentContext<Self>) {
+        let refreshing = self
+            .nav
+            .projects
+            .iter()
+            .any(|project| project.git_refreshing);
+        let policy = self.main == Main::Settings
+            && self.settings_page == Page::Projects
+            && self.settings.policy.is_some();
+        if !refreshing && !policy {
             return;
         }
         let Ok(data_dir) = self.data_dir.clone() else {
             return;
         };
         self.spawn_read(context, move || {
-            ShellMsg::PolicyUsageLoaded(load_projects_blocking(&data_dir))
+            ShellMsg::ProjectsPolled(load_projects_blocking(&data_dir))
         });
     }
 
@@ -2377,7 +2420,6 @@ impl DesktopApp {
             over: !self.pane_docked(),
             wide: self.pane.wide,
             widths: split_ui::PanelWidths::of(self.prefs.panels),
-            note: self.size_note.clone(),
             on_layout: context.callback(|layout| Message::Shell(ShellMsg::Layout(layout))),
             on_widths: context.callback(|widths| Message::Shell(ShellMsg::PanelsResized(widths))),
             on_overlay_closed: context.callback(|_: bool| Message::Shell(ShellMsg::OverlayClosed)),

@@ -696,11 +696,11 @@ pub fn cloud_template() -> Value {
     )
 }
 
-/// The `[desktop]` section with the given preferences; other fields kept.
+/// The `[desktop]` section with the given preferences; other fields kept
+/// (`window` changes only in the close write).
 pub fn desktop_section(
     current: Option<&Value>,
     preferences: &crate::settings::Preferences,
-    window: Option<(u32, u32)>,
 ) -> Value {
     use crate::settings::{MAX_COLLAPSED, MAX_COLLAPSED_KEY, MAX_FAVORITES, MAX_RECENTS};
     let mut desktop = current.cloned().unwrap_or_else(|| json!({}));
@@ -769,13 +769,6 @@ pub fn desktop_section(
         None => {
             map.remove("panels");
         }
-    }
-    // The size replaces only width and height: the saved place and
-    // maximized state stay until the close write replaces them.
-    if let Some((width, height)) = window {
-        let saved = object(map.entry("window".to_owned()).or_insert_with(|| json!({})));
-        saved.insert("width".to_owned(), json!(width));
-        saved.insert("height".to_owned(), json!(height));
     }
     desktop
 }

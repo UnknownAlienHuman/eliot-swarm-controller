@@ -26,20 +26,19 @@ use eliot_core::api::{
     RuleListResponse, ScriptListRequest, ScriptListResponse, ScriptReadRequest, ScriptReadResponse,
     ScriptSaveRequest, ScriptSaveResponse, SettingsReadResponse, SettingsSaveRequest,
     SettingsSaveResponse, TimerRunRequest, WorkspaceListRequest, WorkspaceListResponse,
-    discovery::ProjectListRequest,
+    discovery::ProjectListViewRequest,
 };
 use eliot_core::{Command, Error, Result, RoutingDecision};
 use serde_json::Value;
 
 use crate::settings::{self, Preferences};
 
-/// Write the `[desktop]` preferences and window size.
+/// Write the `[desktop]` preferences (the window persists at close).
 pub async fn save_preferences(
     data_dir: &Path,
     preferences: Preferences,
-    window: Option<(u32, u32)>,
 ) -> Result<SettingsSaveResponse> {
-    settings::save_preferences(data_dir, preferences, window).await
+    settings::save_preferences(data_dir, preferences).await
 }
 
 /// Every settings section, its revision and history; imports the legacy
@@ -83,13 +82,17 @@ pub async fn remove_projects(data_dir: &Path, ids: &[String]) -> Result<Settings
 
 /// Project registrations for the launch picker. `project.list` returns a bare
 /// array (not an object), so it cannot pass the typed object boundary; the
-/// rows get the same field validation instead.
+/// rows get the same field validation instead. The desktop opts in to
+/// `include_git_state`: a row whose Git observation is pending comes back
+/// at once with `git_refreshing` and no Git data, instead of waiting for a
+/// live Git read.
 pub async fn list_projects(data_dir: &Path) -> Result<Vec<ProjectRegistrationView>> {
-    let params = ProjectListRequest {};
-    params.validate()?;
-    let value =
-        eliot_daemon::client_call(data_dir, "project.list", Value::Object(Default::default()))
-            .await?;
+    let params = ProjectListViewRequest {
+        include_git_state: true,
+    };
+    let params = serde_json::to_value(&params)
+        .map_err(|_| Error::new("internal", "project.list request could not be encoded"))?;
+    let value = eliot_daemon::client_call(data_dir, "project.list", params).await?;
     let registrations: Vec<ProjectRegistrationView> =
         serde_json::from_value(value).map_err(|error| {
             crate::client::invalid_reply("project.list", &format!("its fields: {error}"))

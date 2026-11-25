@@ -640,13 +640,11 @@ pub async fn save(
 pub async fn save_preferences(
     data_dir: &Path,
     preferences: Preferences,
-    window: Option<(u32, u32)>,
 ) -> eliot_core::Result<SettingsSaveResponse> {
     let read = read(data_dir).await?;
     let desktop = crate::settings_model::desktop_section(
         read.sections.get(&SettingsSection::Desktop),
         &preferences,
-        window,
     );
     let request = SettingsSaveRequest {
         expected_revision: read.revision,
@@ -672,7 +670,6 @@ pub fn window_close_request(
     let mut desktop = crate::settings_model::desktop_section(
         read.sections.get(&SettingsSection::Desktop),
         &preferences,
-        None,
     );
     if let Some(map) = desktop.as_object_mut() {
         map.insert("window".to_owned(), serde_json::json!(window));

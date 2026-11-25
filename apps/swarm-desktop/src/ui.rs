@@ -101,6 +101,11 @@ use crate::views::{self, RenderCache, RenderedItem, RowCallbacks};
 const AGENT_PAGE: usize = 100;
 /// Harnesses an Owner ad-hoc launch accepts (the daemon validates again).
 const ADHOC_HARNESSES: [&str; 5] = ["codex", "claude", "muse", "opencode", "antigravity"];
+/// Where a project's Git data shows while `project.list` marks it
+/// `git_refreshing`.
+const GIT_REFRESHING: &str = "Refreshing Git metadata…";
+/// Why an action that needs current checkouts waits meanwhile.
+const GIT_PAUSED: &str = "Paused while Git metadata refreshes";
 
 /// UI copy of one project registration. Its name is derived, never the
 /// registration ID ([`DesktopApp::place_title`]).
@@ -112,9 +117,15 @@ struct UiProject {
     /// The Git common directory registered with the checkout: its
     /// repository, which the sidebar groups by.
     common_dir: String,
-    /// The repository's name from its `origin` remote (`project.list`).
+    /// The repository's name from its `origin` remote (`project.list`);
+    /// while `git_refreshing`, the last one read (display only).
     origin: Option<String>,
+    /// The verified checkouts; while `git_refreshing`, the last ones read,
+    /// whose existence is unknown ([`nav::Checkout::paused`]).
     git_checkouts: Vec<eliot_core::api::ProjectCheckoutView>,
+    /// Git monitoring has no current observation (`project.list`'s
+    /// `git_refreshing`): the Git data above is the last known.
+    git_refreshing: bool,
     /// The registered folder is gone.
     missing: bool,
     /// Launch policy use in the last 24 hours (`project.list`).
@@ -287,7 +298,7 @@ struct DesktopInput {
     window: Option<crate::settings::WindowPlacement>,
     /// `[desktop] panels`, read with `window`.
     panels: Option<crate::settings::Panels>,
-    size_note: SizeNote,
+    close_note: CloseNote,
 }
 
 impl PartialEq for DesktopInput {
@@ -296,57 +307,28 @@ impl PartialEq for DesktopInput {
     }
 }
 
-/// The window's size note: the last normal client size with the data
-/// directory it belongs to, for the one `[desktop]` write after the window
-/// closes. [`split_ui`]'s size observer writes the size; the window names
-/// the data directory. Shared with [`run`], which outlives the component.
+/// The data directory the one `[desktop]` write after the window closes
+/// goes to: the window names it once it is known. The size and place come
+/// from the closing window's placement ([`crate::window_place`]). Shared
+/// with [`run`], which outlives the component.
 #[derive(Clone, Default)]
-struct SizeNote(Arc<Mutex<Sizes>>);
+struct CloseNote(Arc<Mutex<Option<PathBuf>>>);
 
-#[derive(Default)]
-struct Sizes {
-    data_dir: Option<PathBuf>,
-    /// The normal (not maximized) client size, once at least 640 x 480;
-    /// the saved size until then.
-    size: Option<(u32, u32)>,
-}
-
-impl PartialEq for SizeNote {
+impl PartialEq for CloseNote {
     fn eq(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.0, &other.0)
     }
 }
 
-impl SizeNote {
-    fn new(size: Option<(u32, u32)>) -> Self {
-        Self(Arc::new(Mutex::new(Sizes {
-            size,
-            ..Sizes::default()
-        })))
-    }
-
-    fn with<T>(&self, read: impl FnOnce(&mut Sizes) -> T) -> Option<T> {
-        self.0.lock().ok().map(|mut sizes| read(&mut sizes))
-    }
-
+impl CloseNote {
     fn set_data_dir(&self, data_dir: PathBuf) {
-        self.with(|sizes| sizes.data_dir = Some(data_dir));
-    }
-
-    /// A size observation: the client size when normal.
-    fn observe(&self, normal: Option<(u32, u32)>) {
-        if normal.is_some() {
-            self.with(|sizes| sizes.size = normal);
+        if let Ok(mut note) = self.0.lock() {
+            *note = Some(data_dir);
         }
     }
 
-    fn size(&self) -> Option<(u32, u32)> {
-        self.with(|sizes| sizes.size).flatten()
-    }
-
-    fn load(&self) -> Option<(PathBuf, (u32, u32))> {
-        self.with(|sizes| sizes.data_dir.clone().zip(sizes.size))
-            .flatten()
+    fn data_dir(&self) -> Option<PathBuf> {
+        self.0.lock().ok().and_then(|note| note.clone())
     }
 }
 
@@ -376,8 +358,8 @@ struct DesktopApp {
     /// The saved window size the first frame declares (constant: a later
     /// declaration would resize the window after it is shown).
     preferred_window: Option<(u32, u32)>,
-    /// The window's sizes (see [`SizeNote`]).
-    size_note: SizeNote,
+    /// Where the window's close write goes (see [`CloseNote`]).
+    close_note: CloseNote,
     /// The size class and docking result the size observer last posted.
     layout: split_ui::Layout,
     /// `[desktop]` was read.
@@ -477,10 +459,27 @@ fn load_projects_blocking(data_dir: &Path) -> Fallible<Vec<UiProject>> {
                 origin: registration.origin,
                 id: registration.id,
                 git_checkouts: registration.checkouts,
+                git_refreshing: registration.git_refreshing,
                 policy_usage: registration.policy_usage,
             })
             .collect())
     })
+}
+
+/// A project read over the shown projects: a refreshing row carries no Git
+/// data, so it keeps the origin and checkouts last read for the same
+/// registration (display only) until its marker clears.
+fn keep_last_known(fresh: &mut [UiProject], shown: &[UiProject]) {
+    for project in fresh.iter_mut().filter(|project| project.git_refreshing) {
+        if let Some(last) = shown.iter().find(|last| {
+            last.id == project.id
+                && last.workspace == project.workspace
+                && last.common_dir == project.common_dir
+        }) {
+            project.origin.clone_from(&last.origin);
+            project.git_checkouts.clone_from(&last.git_checkouts);
+        }
+    }
 }
 
 /// The sidebar's grouping readback on a worker: every `chat.organization`
@@ -603,6 +602,7 @@ fn project_checkouts(projects: &[UiProject]) -> Vec<nav::Checkout> {
                     main: Some(git.main),
                     origin: project.origin.clone(),
                     missing: false,
+                    refreshing: project.git_refreshing,
                 });
             }
         }
@@ -615,6 +615,7 @@ fn project_checkouts(projects: &[UiProject]) -> Vec<nav::Checkout> {
             let mut row = nav::Checkout::new(&project.workspace, &project.common_dir);
             row.origin = project.origin.clone();
             row.missing = project.missing;
+            row.refreshing = project.git_refreshing;
             rows.push(row);
         }
     }
@@ -913,7 +914,7 @@ impl Component for DesktopApp {
             prefs_rev: 0,
             startup_done: false,
             focus_held: None,
-            size_note: input.size_note.clone(),
+            close_note: input.close_note.clone(),
             preferred_window: input.window.map(|window| (window.width, window.height)),
             // The first frame's guess from the saved size and panel widths,
             // until the size observer posts.
@@ -1116,14 +1117,14 @@ pub fn run(workspace: Option<PathBuf>) -> Result<(), String> {
         .map(|data_dir| crate::settings::saved_desktop(&data_dir))
         .unwrap_or_default();
     let window = saved.window;
-    let size_note = SizeNote::new(window.map(|window| (window.width, window.height)));
+    let close_note = CloseNote::default();
     // On this thread, which creates the window (Reactor runs WinUI here).
     let placement = crate::window_place::install(window);
     let result = App::run_component::<DesktopApp>(DesktopInput {
         workspace,
         window,
         panels: saved.panels,
-        size_note: size_note.clone(),
+        close_note: close_note.clone(),
     })
     .map_err(|error| error.to_string());
     let closed = match placement {
@@ -1133,8 +1134,15 @@ pub fn run(workspace: Option<PathBuf>) -> Result<(), String> {
             None
         }
     };
-    if let Some((data_dir, (width, height))) = size_note.load() {
-        // Without a read placement the saved place stays as it was.
+    // Without a read placement the saved place stays as it was, and so
+    // does the saved size without a normal size in bounds.
+    let size = closed
+        .map(|closed| (closed.width, closed.height))
+        .filter(|&(width, height)| {
+            eliot_daemon::desktop_window_in_bounds(width, height, None, None)
+        })
+        .or(window.map(|saved| (saved.width, saved.height)));
+    if let (Some(data_dir), Some((width, height))) = (close_note.data_dir(), size) {
         let placement = crate::settings::WindowPlacement {
             width,
             height,

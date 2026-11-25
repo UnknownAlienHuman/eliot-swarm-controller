@@ -279,6 +279,9 @@ pub struct Checkout {
     pub origin: Option<String>,
     /// A registered checkout whose folder is gone.
     pub missing: bool,
+    /// Its project's Git metadata is refreshing: the Git facts above are
+    /// the last known.
+    pub refreshing: bool,
 }
 
 impl Checkout {
@@ -288,6 +291,13 @@ impl Checkout {
             common_dir: common_dir.into(),
             ..Self::default()
         }
+    }
+
+    /// A linked worktree known only from the last Git read while its
+    /// project's Git metadata refreshes: whether it still exists is
+    /// unknown, so a start there waits. A registered checkout stays usable.
+    pub fn paused(&self) -> bool {
+        self.refreshing && self.registration_ids.is_empty()
     }
 }
 
