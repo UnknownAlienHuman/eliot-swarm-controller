@@ -1048,6 +1048,12 @@ fn admit_launch_tx(
             "invalid project policy opt-out reason",
         ));
     }
+    if policy_opt_out_reason.is_some() && principal != "owner" {
+        return Err(Error::new(
+            "not_allowed",
+            "only the Owner can grant a project policy opt-out",
+        ));
+    }
     if policy_applied && policy_opt_out_reason.is_some() {
         return Err(Error::new(
             "invalid",
