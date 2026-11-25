@@ -403,6 +403,38 @@ impl WorkspaceManager {
         result
     }
 
+    pub(crate) async fn reconcile_no_write_removal(
+        &self,
+        command: &CoreCommand,
+        preparation: &WorkspacePreparation,
+    ) -> Result<bool> {
+        let result = async {
+            let slot = self.register_slot(preparation).await?;
+            let _operation = slot.operation.lock().await;
+            let _gate = slot.gate.clone().lock_owned().await;
+            if slot.active.lock_recover().is_some()
+                || slot.removal_write_guard.lock_recover().is_some()
+            {
+                return Ok(false);
+            }
+            let expected_tip = command.args["expected_tip"].as_str();
+            let Some(proof) = WorkspaceGit::new()?
+                .reconcile_unwritten_removal(preparation, expected_tip)
+                .await?
+            else {
+                return Ok(false);
+            };
+            let mut store = self.inner.store.lock().await;
+            let change =
+                store.reconcile_no_write_removal(preparation, &command.id, proof, now_ms())?;
+            self.publish(&change.events);
+            Ok(change.value)
+        }
+        .await;
+        self.retire_slots(&preparation.agent).await;
+        result
+    }
+
     async fn cleanup_unstarted_launch_workspace(
         &self,
         slot: &Arc<Slot>,
@@ -1747,7 +1779,9 @@ impl WorkspaceManager {
                         })?;
                     if preparation.outcome.as_ref().is_some_and(|outcome| {
                         outcome["result"]["code"] == "identity_changed"
-                            || eliot_store::Store::is_legacy_missing_branch_removal(outcome, id)
+                            // The existing paced reconciliation records the
+                            // no-write proof with the original command.
+                            || eliot_store::Store::is_no_write_unknown_removal(outcome, id)
                     }) {
                         return Ok(None);
                     }

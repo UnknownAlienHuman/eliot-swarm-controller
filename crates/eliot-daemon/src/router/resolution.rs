@@ -87,6 +87,22 @@ fn turn_inactive_proof(
 }
 
 impl Router {
+    pub(crate) async fn reconcile_retained_command_evidence(
+        &self,
+        after: Option<&str>,
+    ) -> Result<Option<String>> {
+        let mut store = self.inner.store.lock().await;
+        if self.inner.mode.load(std::sync::atomic::Ordering::SeqCst) != super::MODE_OPEN {
+            return Ok(None);
+        }
+        let change = store.reconcile_retained_command_evidence(after, now_ms())?;
+        self.publish_locked(&change.events);
+        if !change.events.is_empty() {
+            self.signal_progress();
+        }
+        Ok(change.value)
+    }
+
     pub(super) async fn failed_custody_resolve(
         &self,
         params: &Value,

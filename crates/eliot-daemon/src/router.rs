@@ -6755,6 +6755,14 @@ impl Router {
             eliot_core::api::discovery::decode_params(params.clone())?;
         request.validate()?;
         let policy = self.secret_policy_snapshot();
+        if let Err(error) = self.reconcile_retained_command_evidence(None).await {
+            crate::logging::record(
+                &policy,
+                "daemon.command_evidence_reconciliation_failed",
+                &[],
+                Some(&error),
+            );
+        }
         let report = crate::maintenance::run_now(
             &self.inner.store,
             &self.inner.data_root,

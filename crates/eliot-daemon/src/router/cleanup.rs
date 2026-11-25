@@ -2026,6 +2026,32 @@ impl Router {
         };
         for workspace in workspaces {
             *after = Some(workspace.agent.clone());
+            if workspace.phase == WorkspacePhase::Unknown {
+                let command = match workspace.outcome.as_ref() {
+                    Some(marker)
+                        if let Some(id) = marker["command_id"].as_str()
+                            && eliot_store::Store::is_no_write_unknown_removal(marker, id) =>
+                    {
+                        self.inner.store.lock().await.get_command(id)?
+                    }
+                    _ => None,
+                };
+                if let Some(command) = command.filter(|command| {
+                    command.verb == "worktree.remove"
+                        && command.state == CommandState::Unknown
+                        && command.outcome.as_ref().is_some_and(|outcome| {
+                            eliot_store::Store::is_no_write_unknown_removal(outcome, &command.id)
+                        })
+                }) && self
+                    .inner
+                    .workspaces
+                    .reconcile_no_write_removal(&command, &workspace)
+                    .await?
+                {
+                    self.signal_progress();
+                }
+                continue;
+            }
             if workspace.phase != WorkspacePhase::Ready
                 || !matches!(
                     crate::workspace_git::observe_worktree_absence(Path::new(

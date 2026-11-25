@@ -140,6 +140,7 @@ pub(crate) enum RemovalBranch<'a> {
     Retained,
     At(&'a str),
     Absent,
+    Observed(Option<&'a str>),
 }
 
 struct Subject {
@@ -1538,6 +1539,41 @@ impl WorkspaceGit {
         Ok(outcome)
     }
 
+    /// Read back the exact outcome of a removal for which the ledger proves
+    /// no Git write was dispatched. A stale registration supplies no proof.
+    pub(crate) async fn reconcile_unwritten_removal(
+        &self,
+        preparation: &WorkspacePreparation,
+        expected_tip: Option<&str>,
+    ) -> Result<Option<eliot_store::RemovalEvidence>> {
+        let deadline = Instant::now() + READ_TIME + ABSENCE_GRACE;
+        let path = Path::new(&preparation.worktree_path);
+        if let Some(parent) = observe_worktree_absence(path)? {
+            confirm_worktree_absence_after_grace(path, &parent, deadline).await?;
+            let outcome = self
+                .inspect_removed(preparation, RemovalBranch::Observed(expected_tip))
+                .await?;
+            confirm_worktree_absence(path, &parent)?;
+            return Ok(Some(eliot_store::RemovalEvidence::Absent(outcome)));
+        }
+        let repository = self
+            .repository(&preparation.worktree_path, deadline)
+            .await?;
+        verify_source_common_dir(&repository, preparation)?;
+        let entries = self.entries(&repository.root, deadline).await?;
+        let mut matches = entries
+            .iter()
+            .filter(|entry| git_path_matches(&entry.path, path));
+        let branch = branch_ref(&preparation.requested_branch);
+        let intact = matches.next().is_some_and(|entry| {
+            !entry.incomplete
+                && !entry.prunable
+                && entry.head.is_some()
+                && entry.branch.as_deref() == Some(branch.as_str())
+        }) && matches.next().is_none();
+        Ok(intact.then_some(eliot_store::RemovalEvidence::Present))
+    }
+
     async fn inspect_removed(
         &self,
         preparation: &WorkspacePreparation,
@@ -1571,6 +1607,9 @@ impl WorkspaceGit {
             RemovalBranch::Retained => branch_tip.is_some(),
             RemovalBranch::At(tip) => branch_tip.as_deref() == Some(tip),
             RemovalBranch::Absent => branch_tip.is_none(),
+            RemovalBranch::Observed(expected) => branch_tip
+                .as_deref()
+                .is_none_or(|tip| expected.is_none_or(|expected| expected == tip)),
         };
         if !branch_matches {
             return Err(problem(
@@ -1585,8 +1624,12 @@ impl WorkspaceGit {
             worktree_path: path_text(&target)?,
             branch: preparation.requested_branch.clone(),
             branch_retained: branch_tip.is_some(),
-            directory_absent_before_remove: matches!(branch, RemovalBranch::Absent),
-            branch_absent_before_remove: matches!(branch, RemovalBranch::Absent),
+            directory_absent_before_remove: matches!(
+                branch,
+                RemovalBranch::Absent | RemovalBranch::Observed(_)
+            ),
+            branch_absent_before_remove: branch_tip.is_none()
+                && matches!(branch, RemovalBranch::Absent | RemovalBranch::Observed(_)),
         })
     }
 

@@ -465,7 +465,8 @@ fn project_unknown_commands(
                     CASE c.verb
                         WHEN 'compact' THEN json_extract(c.outcome,'$.message')
                         WHEN 'worktree.remove' THEN json_extract(c.outcome,'$.result.message')
-                    END,1,1024) END
+                    END,1,1024) END,
+                CASE WHEN c.verb='worktree.remove' AND c.state='unknown' THEN c.outcome END
          FROM commands c WHERE c.state IN ('accepted','queued','dispatched','unknown')
            AND NOT EXISTS (SELECT 1 FROM agents check_agent WHERE check_agent.id=c.target
                  AND json_type(check_agent.profile_snapshot, '$._harness_check') IS NOT NULL)", "c.id=?1", bindings)?;
@@ -488,6 +489,7 @@ fn project_unknown_commands(
                 r.get::<_, bool>(13)?,
                 r.get::<_, bool>(14)?,
                 r.get::<_, Option<String>>(15)?,
+                r.get::<_, Option<String>>(16)?,
             ))
         })
         .map_err(sql_error)?;
@@ -509,6 +511,7 @@ fn project_unknown_commands(
             source_open,
             owner_handoff_send,
             detail,
+            removal_outcome,
         ) = row.map_err(sql_error)?;
         let state = match raw_state.as_str() {
             "accepted" => eliot_core::CommandState::Accepted,
@@ -573,6 +576,16 @@ fn project_unknown_commands(
         let mut choices = Vec::new();
         let workspace_launch = verb == "launch" && stage.as_deref() == Some("workspace");
         let start_command = matches!(verb.as_str(), "launch" | "resume");
+        let removal_outcome = removal_outcome
+            .as_deref()
+            .map(crate::decode_json)
+            .transpose()?;
+        let removal_no_write = removal_outcome
+            .as_ref()
+            .is_some_and(|outcome| crate::Store::is_no_write_unknown_removal(outcome, &id));
+        let legacy_absence = removal_outcome
+            .as_ref()
+            .is_some_and(|outcome| crate::Store::is_legacy_missing_branch_removal(outcome, &id));
         let mut recommended = None;
         if method == "command.submit" {
             let stop_applied_proven = match (verb.as_str(), target, generation) {
@@ -592,7 +605,7 @@ fn project_unknown_commands(
                 );
                 recommended = Some(applied.clone());
                 choices.push(applied);
-            } else if !start_command {
+            } else if !start_command && (verb != "worktree.remove" || legacy_absence) {
                 for resolution in ["applied", "failed"] {
                     choices.push(action(
                         resolution,
@@ -630,6 +643,60 @@ fn project_unknown_commands(
             choices,
         );
         projected.detail = detail;
+        if reason == "stop_exit_and_reader_drain_proven" {
+            projected.instructions = Some(
+                "Owned processes exited and the reader drained for this Stop. Reconciliation can complete it as applied. Use `swarm cmd settle-stopped` to review the retained proof."
+                    .to_owned(),
+            );
+        } else if method == "command.submit" {
+            let check = match verb.as_str() {
+                "worktree.remove" if legacy_absence => Some((
+                    "Check the exact path, Git registration and branch in the source repository. The guarded completion action requires all three to be absent. Assert failure only if the checkout and registration both remain.",
+                    true,
+                )),
+                "worktree.remove" if removal_no_write => Some((
+                    "The retained marker proves Git never ran. Check the exact checkout and its registration with `git worktree list --porcelain` in the source repository. If both remain, the removal failed. If both are absent, check the recorded branch and let the guarded absence readback complete it.",
+                    false,
+                )),
+                "worktree.remove" => Some((
+                    "Git may have run. Compare the recorded checkout path on disk with `git worktree list --porcelain` in the source repository. If both are absent, leave the outcome for guarded completion readback. Assert failure only when the checkout and registration both remain and the evidence rules out a removal effect. Leave inconsistent or unreadable results unknown.",
+                    false,
+                )),
+                "resume" => Some((
+                    "Check the exact native session and attempt for a refusal. A newer generation alone cannot establish the previous result.",
+                    false,
+                )),
+                "stop" => Some((
+                    "Check exact-generation process exit and native reader drain. For proven exit use `swarm cmd settle-stopped` to review that evidence.",
+                    false,
+                )),
+                "attention.emit" => Some((
+                    "Check whether the Store committed this exact attention event or rejected its subject before insertion.",
+                    true,
+                )),
+                "inject" => Some((
+                    "Check the original consumer and application point for a matching committed context receipt.",
+                    true,
+                )),
+                "send" => Some((
+                    "Check the original native session for an input or turn receipt tied to this command ID.",
+                    true,
+                )),
+                _ => None,
+            };
+            if let Some((check, allow_completed)) = check {
+                let id = &projected.subject;
+                let mut instructions = format!(
+                    "{check} For a verified failure, run `swarm cmd resolve {id} --status failed --reason \"<verified evidence>\"`."
+                );
+                if allow_completed {
+                    instructions.push_str(&format!(
+                        " For a verified effect, run `swarm cmd resolve {id} --status completed --reason \"<verified evidence>\"`."
+                    ));
+                }
+                projected.instructions = Some(instructions);
+            }
+        }
         if let (Some(agent), Some(generation)) = (target, generation) {
             let queued = queued_sends_blocked_by(db, agent, generation, &projected.subject)?;
             if !queued.is_empty() {

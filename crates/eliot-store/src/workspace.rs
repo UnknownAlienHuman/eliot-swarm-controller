@@ -1470,6 +1470,81 @@ pub(super) fn resolve_legacy_removal_tx(
     Ok(marker)
 }
 
+pub(crate) fn reconcile_no_write_removal_tx(
+    tx: &Transaction<'_>,
+    proof: &WorkspacePreparation,
+    id: &str,
+    readback: crate::RemovalEvidence,
+    now: i64,
+    events: &mut Vec<Event>,
+) -> Result<Option<(CommandRecord, CommandState, Value)>> {
+    let agent_num = parse_agent_id(&proof.agent)?;
+    let Some(record) = load_command_record(tx, id)? else {
+        return Ok(None);
+    };
+    let eligible = |marker: &Value| Store::is_no_write_unknown_removal(marker, id);
+    if record.state != CommandState::Unknown
+        || record.command.verb != "worktree.remove"
+        || record.command.method != "command.submit"
+        || record.target != Some(agent_num)
+        || record.command.generation != Some(proof.target_generation)
+        || proof.phase != WorkspacePhase::Unknown
+        || !proof.outcome.as_ref().is_some_and(eligible)
+        || !record.command.outcome.as_ref().is_some_and(eligible)
+        || load_workspace(tx, agent_num)?.as_ref() != Some(proof)
+        || !load_agent_by_num(tx, agent_num)?.is_some_and(|agent| {
+            agent.generation == proof.target_generation
+                && agent.is_terminal()
+                && !agent.observe_only
+                && agent.active_turn.is_none()
+        })
+        || workspace_has_borrowers(tx, &proof.agent, &proof.worktree_path)?
+        || repo_git_write_blocked_tx(tx, id, &proof.repo_common_dir)?
+    {
+        return Ok(None);
+    }
+    let mut workspace = proof.clone();
+    let (state, outcome) = match readback {
+        crate::RemovalEvidence::Present => {
+            let previous = proof
+                .outcome
+                .as_ref()
+                .and_then(|marker| marker["previous_phase"].as_str());
+            workspace.phase = match previous {
+                Some("ready") => WorkspacePhase::Ready,
+                Some("failed") => WorkspacePhase::Failed,
+                _ => return Ok(None),
+            };
+            (
+                CommandState::Failed,
+                WorkspaceRemovalOutcome::Failed {
+                    code: "workspace_git_not_dispatched".to_owned(),
+                    message: "The checkout is present and no removal write was dispatched."
+                        .to_owned(),
+                    failure_where: Some("workspace.remove.readback".to_owned()),
+                },
+            )
+        }
+        crate::RemovalEvidence::Absent(
+            outcome @ WorkspaceRemovalOutcome::Removed {
+                directory_absent_before_remove: true,
+                ..
+            },
+        ) => {
+            apply_removed_workspace(tx, &mut workspace, &outcome)?;
+            (CommandState::Applied, outcome)
+        }
+        crate::RemovalEvidence::Absent(_) => return Ok(None),
+    };
+    let marker = removal_marker(tx, agent_num, proof, id, &outcome)?;
+    workspace.outcome = Some(marker.clone());
+    workspace.updated_at = now;
+    persist_workspace(tx, proof, &workspace)?;
+    events.push(workspace_event(tx, &workspace, now)?);
+    close_finished_workspace_process_source(tx, agent_num, proof.target_generation, now, events)?;
+    Ok(Some((record, state, marker)))
+}
+
 pub(super) fn admit_workspace_preparation(
     tx: &Transaction<'_>,
     request: &SubmitCommand,

@@ -2159,6 +2159,23 @@ event; no `command.applied`/`command.failed` receipt is emitted.
 Future turn-result metadata retains the planned `command_ids` field; `usage` is
 connected and stays null on owner-resolved turns without native usage.
 
+The existing reconciliation pass can settle an `unknown` command from exact
+retained evidence. The command and `command.resolved` record
+`resolution_source=retained_evidence` and the evidence kind. Native readiness
+must bind the exact Resume generation and dispatch. A newer generation alone
+supplies no outcome. The retained archived-session refusal must name the same
+native subject, with process exit and reader drain proven. SEND and INJECT
+require their own committed receipt. A Stop can use exact-generation owned
+exit and reader drain. A retained stale attention-subject rejection proves
+failure before event insertion. No effect is replayed.
+
+A Worktree removal with an exact no-write marker can fail after verifying
+that its checkout and registration remain, or complete after verifying
+that both are absent and checking the recorded branch. The Store rechecks
+the command and workspace binding in the settlement transaction. Unsupported
+evidence leaves the item unknown. The Owner inbox names the receipt or
+readback to check and the exact resolution command.
+
 `turn.resolve {id, agent, generation, turn_id, status: completed|failed|interrupted,
 reason}` requires the turn to be stored `unknown`; running and terminal turns
 are refused with `bad_state`. It further requires a stored terminal
