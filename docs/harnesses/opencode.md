@@ -167,7 +167,13 @@ the installed schema requires `error`, but its absence still commits
 exact turn and generation with the native part `id` as the item id. A
 tool input string `command` on `called` (the shell tool) is added to
 `tool.started` as `command`, secret-redacted and bounded (plugin
-protocol). A structured nonzero shell exit retains a bounded redacted
+protocol). The adapter preserves the native timestamps and shell kind for
+`bash` and `shell` calls. A local shell terminal with a completed status and zero exit
+reports `shell_execution_cwd` from its absolute `workdir` or the verified
+native session directory when `workdir` is omitted. Background and
+interrupted shell results provide no checkout evidence. The shared
+[workspace gate](../spec/monitoring.md) verifies Git attribution.
+A structured nonzero shell exit retains a bounded redacted
 output excerpt and truncation flag for repeated-failure diagnosis.
 `session.tool.input.delta`, `input.ended` and `progress` stay unmapped
 streaming detail. A terminal with no observed start is one tool-family

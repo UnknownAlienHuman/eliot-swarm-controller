@@ -14,6 +14,7 @@
 
 use std::{
     collections::{HashMap, HashSet, VecDeque},
+    path::Path,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -182,6 +183,7 @@ const REPLY_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
 struct ToolPart {
     name: Option<String>,
     write_path: Option<String>,
+    shell_cwd: Option<String>,
     started: bool,
     completed: bool,
 }
@@ -2372,6 +2374,28 @@ impl EventProcessor {
             "item_id": called.id,
             "tool": tool,
         });
+        let shell_cwd = if matches!(tool.as_str(), "bash" | "shell") {
+            data["tool_kind"] = json!("shell");
+            if let Some(at) = envelope.created {
+                data["native_at_ms"] = json!(at);
+            }
+            let input = envelope.data["input"].as_object();
+            input
+                .and_then(|input| {
+                    input
+                        .get("workdir")
+                        .map_or_else(|| Some(self.http.directory()), Value::as_str)
+                })
+                .filter(|cwd| {
+                    cwd.len() <= 4096
+                        && Path::new(cwd).is_absolute()
+                        && !cwd.chars().any(char::is_control)
+                        && !SecretPolicy::new(self.secrets.iter().cloned()).contains_text(cwd)
+                })
+                .map(str::to_owned)
+        } else {
+            None
+        };
         if let Some(command) = envelope
             .data
             .get("input")
@@ -2400,6 +2424,7 @@ impl EventProcessor {
         )?;
         self.commit_event("tool.started", native_id, data).await?;
         if let Some(part) = self.tool_parts.get_mut(&called.id) {
+            part.shell_cwd = shell_cwd;
             part.started = true;
         }
         Ok(())
@@ -2481,6 +2506,7 @@ impl EventProcessor {
         }
         let tool = part.name.clone().unwrap_or_else(|| "tool".to_owned());
         let write_path = part.write_path.take();
+        let shell_cwd = part.shell_cwd.take();
         let secrets = SecretPolicy::new(self.secrets.iter().cloned());
         let mut data = json!({
             "command_id": command_id,
@@ -2489,6 +2515,26 @@ impl EventProcessor {
             "tool": tool,
             "status": if failed { "error" } else { "completed" },
         });
+        if matches!(tool.as_str(), "bash" | "shell") {
+            data["tool_kind"] = json!("shell");
+            if let Some(at) = envelope.created {
+                data["native_at_ms"] = json!(at);
+            }
+            let metadata = &envelope.data["metadata"];
+            if !failed
+                && envelope.data["executed"] != true
+                && metadata["status"].as_str() == Some("completed")
+                && metadata["exit"].as_i64() == Some(0)
+                && metadata["signal"].is_null()
+                && metadata["timeout"] != true
+                && metadata["killed"] != true
+                && metadata["interrupted"] != true
+                && let Some(cwd) = shell_cwd
+            {
+                data["shell_execution_cwd"] = json!(cwd);
+                data["exit_code"] = json!(0);
+            }
+        }
         attach_native_error(&mut data, native_error.as_deref(), &secrets);
         if output_truncated && let Some(native_error) = data.get_mut("native_error") {
             native_error["truncated"] = json!(true);

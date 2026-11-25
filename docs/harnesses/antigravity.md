@@ -205,6 +205,13 @@ gaps leave the output unattributed. A confirmed coverage gap preserves stream
 health and permits the next send on the same live ACP session. An unresolved
 gap acknowledgement fences the stream.
 
+Restart branch attribution requires an exact shell command, working directory
+and a successful terminal result tied to the same native invocation and time
+window. The retained ACP tool facts establish call identity and lifecycle
+status. Their titles and file hints leave the shell command, working directory
+and invocation timestamps unverified, so the shared workspace gate refuses
+unattributed branch changes.
+
 **Interrupt** is the ACP `session/cancel` notification scoped to the exact
 active Eliot turn (turn id required, stale turns reject). The command
 proves dispatch, then waits (bounded) for the fenced reply's actual

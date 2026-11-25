@@ -276,8 +276,6 @@ pub use lifecycle::{PreparedRuleCoordination, RuleCoordinationDispatch, UserEven
 pub struct NativeBranchSwitchCandidate {
     pub agent: String,
     pub generation: i64,
-    pub branch: String,
-    pub workspace: String,
     pub start_seq: i64,
     pub terminal_seq: i64,
     pub started_at_ms: i64,
@@ -2788,57 +2786,114 @@ impl Store {
         })
     }
 
-    /// Bounded lookup of native branch switches tied to one checkout.
-    /// The event pair must share Agent, generation, native item and turn.
+    /// Read one checkout's native evidence near its observed reflog transition.
+    /// The owner is scoped to the preceding generation. Other Agents must be
+    /// bound to the same worktree, with a turn overlapping the transition.
     pub fn native_branch_switch_candidates(
         &self,
+        agent: &str,
+        generation: i64,
         workspace: &str,
-        branch: Option<&str>,
-        generation: Option<i64>,
+        branch: &str,
+        observed_at_ms: i64,
     ) -> Result<Vec<NativeBranchSwitchCandidate>> {
+        let agent_num = parse_agent_id(agent)?;
+        let window_start = observed_at_ms.saturating_sub(1_000);
+        let window_end = observed_at_ms.saturating_add(1_000);
+        // A pending resume can still carry the preceding generation. Anchor
+        // the range to the applied start that actually preceded the checkout.
+        let start_ms: Option<i64> = self
+            .connection
+            .query_row(
+                "SELECT created_at FROM commands
+                 WHERE target = ?1 AND generation = ?2 AND state = 'applied'
+                   AND verb IN ('launch', 'resume') AND created_at <= ?3
+                 ORDER BY created_at DESC, id DESC LIMIT 1",
+                params![agent_num, generation, window_end],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(sql_error)?;
+        let start_ms = start_ms.ok_or_else(|| {
+            Error::new(
+                "workspace_branch_unattributed",
+                "the preceding generation's applied start is no longer retained",
+            )
+        })?;
         let display_workspace = core::display_path(workspace);
         let verbatim_workspace = core::verbatim_path(std::path::Path::new(workspace))
             .to_string_lossy()
             .into_owned();
-        let start_path = if cfg!(windows) {
-            "lower(json_extract(s.data, '$.cwd')) IN (lower(?1), lower(?2), lower(?3))"
-        } else {
-            "json_extract(s.data, '$.cwd') IN (?1, ?2, ?3)"
+        let workspace_filter = |column: &str| {
+            if cfg!(windows) {
+                format!(
+                    "lower(replace({column}, char(92), '/')) IN (
+                        lower(replace(?6, char(92), '/')), lower(replace(?7, char(92), '/')),
+                        lower(replace(?8, char(92), '/')))"
+                )
+            } else {
+                format!("{column} IN (?6, ?7, ?8)")
+            }
         };
-        let terminal_path = if cfg!(windows) {
-            "lower(json_extract(c.data, '$.git_branch_switch.cwd')) IN (lower(?1), lower(?2), lower(?3))"
-        } else {
-            "json_extract(c.data, '$.git_branch_switch.cwd') IN (?1, ?2, ?3)"
-        };
+        let bound_workspace_filter = workspace_filter("a.workspace");
+        let legacy_workspace_filter =
+            workspace_filter("json_extract(c.data, '$.git_branch_switch.cwd')");
+        // These predicates match the existing partial indexes. Seek starts by
+        // generation and time, then seek the matching terminal in that turn.
+        let index_kinds = "'turn.started', 'turn.completed', 'message.completed',
+                           'tool.started', 'tool.completed', 'request.opened',
+                           'request.resolved', 'request.closed'";
         let mut statement = self
             .connection
-            .prepare(
-                &format!("SELECT c.agent, c.generation, c.seq, s.seq, s.ts, s.data, c.data
-                 FROM events c JOIN events s
-                   ON s.agent = c.agent AND s.generation = c.generation AND s.seq < c.seq
-                  AND s.source = 'stream' AND s.kind = 'tool.started'
-                  AND json_extract(s.data, '$.item_id') = json_extract(c.data, '$.git_branch_switch.item_id')
-                  AND json_extract(s.data, '$.turn_id') = json_extract(c.data, '$.git_branch_switch.turn_id')
-                  AND {start_path}
-                  AND json_extract(s.data, '$.tool') = 'commandExecution'
-                 WHERE c.source = 'stream' AND c.kind = 'tool.completed'
-                   AND c.generation IS NOT NULL
-                   AND (?5 IS NULL OR c.generation = ?5)
+            .prepare(&format!(
+                "WITH scoped_turns AS (
+                     SELECT t.agent, t.generation, t.turn_id, t.started_at
+                     FROM turns t INDEXED BY turns_agent_result_order
+                     WHERE t.agent = ?1 AND t.generation = ?2
+                       AND t.started_at <= ?5 AND (t.completed_at IS NULL OR t.completed_at >= ?4)
+                     UNION ALL
+                     SELECT t.agent, t.generation, t.turn_id, t.started_at
+                     FROM agents a CROSS JOIN turns t INDEXED BY turns_agent_result_order
+                     WHERE a.id <> ?1 AND {bound_workspace_filter} AND t.agent = a.id
+                       AND t.started_at <= ?5 AND (t.completed_at IS NULL OR t.completed_at >= ?4)
+                 )
+                 SELECT c.agent, c.generation, c.seq, s.seq, s.ts, s.data, c.data
+                 FROM scoped_turns t
+                 CROSS JOIN events s INDEXED BY events_native_progress_time
+                 CROSS JOIN events c INDEXED BY attention_native_turn_activity
+                 WHERE s.agent = t.agent AND s.generation = t.generation
+                   AND s.ts BETWEEN CASE WHEN t.agent = ?1 THEN MAX(t.started_at, ?3)
+                                         ELSE t.started_at END AND ?5
+                   AND s.kind = 'tool.started' AND s.source = 'stream' AND s.native_id IS NOT NULL
+                   AND s.source NOT IN ('daemon', 'os', 'git', 'workspace_process')
+                   AND s.kind IN ({index_kinds})
+                   AND json_extract(s.data, '$.turn_id') = t.turn_id
+                   AND c.agent = t.agent AND c.generation = t.generation AND c.seq > s.seq
+                   AND json_extract(c.data, '$.turn_id') = json_extract(s.data, '$.turn_id')
+                   AND json_extract(c.data, '$.item_id') = json_extract(s.data, '$.item_id')
+                   AND c.kind = 'tool.completed' AND c.source = 'stream' AND c.native_id IS NOT NULL
+                   AND c.source NOT IN ('daemon', 'os', 'git', 'workspace_process')
+                   AND c.kind IN ({index_kinds})
                    AND json_extract(c.data, '$.status') = 'completed'
-                   AND json_extract(c.data, '$.exit_code') = 0
-                   AND {terminal_path}
-                   AND (?4 IS NULL OR json_extract(c.data, '$.git_branch_switch.branch') = ?4)
-                 ORDER BY c.seq DESC LIMIT 65")
-            )
+                   AND (({legacy_workspace_filter}
+                         AND json_extract(c.data, '$.git_branch_switch.branch') IS NOT NULL)
+                        OR (json_extract(c.data, '$.tool_kind') = 'shell'
+                            AND json_extract(s.data, '$.tool_kind') = 'shell'
+                            AND json_type(c.data, '$.shell_execution_cwd') = 'text'))
+                 ORDER BY c.seq DESC"
+            ))
             .map_err(sql_error)?;
         let rows = statement
             .query_map(
                 params![
+                    agent_num,
+                    generation,
+                    start_ms,
+                    window_start,
+                    window_end,
                     workspace,
                     display_workspace,
-                    verbatim_workspace,
-                    branch,
-                    generation
+                    verbatim_workspace
                 ],
                 |row| {
                     Ok((
@@ -2869,42 +2924,30 @@ impl Store {
             let terminal: Value = serde_json::from_str(&terminal_data).map_err(|_| {
                 Error::new("source_integrity", "invalid native tool terminal event")
             })?;
-            let fact = &terminal["git_branch_switch"];
-            let (
-                Some(item_id),
-                Some(turn_id),
-                Some(branch_value),
-                Some(workspace_value),
-                Some(completed_at),
-            ) = (
-                fact["item_id"].as_str(),
-                fact["turn_id"].as_str(),
-                fact["branch"].as_str(),
-                fact["cwd"].as_str(),
-                fact["native_at_ms"].as_i64(),
-            )
+            let Some(checkout) = workspace::native_branch_checkout(&start, &terminal, start_ts)
             else {
                 continue;
             };
-            if start["item_id"].as_str() != Some(item_id)
-                || start["turn_id"].as_str() != Some(turn_id)
-                || !start["cwd"].as_str().is_some_and(|cwd| {
-                    core::workspace_path_key(cwd) == core::workspace_path_key(workspace_value)
-                })
-                || branch.is_some_and(|branch| branch_value != branch)
-                || core::workspace_path_key(workspace_value) != core::workspace_path_key(workspace)
+            if checkout.branch != branch
+                || core::workspace_path_key(&checkout.cwd) != core::workspace_path_key(workspace)
+                || checkout.started_at_ms > window_end
+                || checkout.completed_at_ms < window_start
             {
                 continue;
+            }
+            if candidates.len() == 64 {
+                return Err(Error::new(
+                    "workspace_branch_unattributed",
+                    "native checkout evidence reached its read bound",
+                ));
             }
             candidates.push(NativeBranchSwitchCandidate {
                 agent: format!("a{agent_num}"),
                 generation,
-                branch: branch_value.to_owned(),
-                workspace: workspace_value.to_owned(),
                 start_seq,
                 terminal_seq,
-                started_at_ms: start["native_at_ms"].as_i64().unwrap_or(start_ts),
-                completed_at_ms: completed_at,
+                started_at_ms: checkout.started_at_ms,
+                completed_at_ms: checkout.completed_at_ms,
             });
         }
         Ok(candidates)
