@@ -431,7 +431,9 @@ pub fn toggle_icon_button(on: bool) -> Button {
 /// A command in a bar (the conversation header, the composer row): a
 /// stock button at the control height with its own padding, so every
 /// command in one bar has the same height whatever its content (a label,
-/// an icon and a label, or the "…" icon). `accent` for the one main action.
+/// an icon and a label, or the "…" icon). `accent` for the one main action,
+/// and for the ▾ beside it (the composer's Add as a note, Home's Start task
+/// options).
 pub fn bar_button(accent: bool) -> Button {
     let button = Button::new()
         .min_height(height::CONTROL)
@@ -479,13 +481,6 @@ pub fn command_content(glyph: &str, label: &str, pending: bool) -> View {
             text(label.to_owned(), style::BUTTON).vertical_alignment(VerticalAlignment::Center),
         ))
         .into()
-}
-
-/// The ▾ beside a main action (the composer's Add as a note, Home's Start
-/// task options): the action's own style (`accent` beside an accent
-/// action) at the bar's height.
-pub fn send_menu_button(accent: bool) -> Button {
-    bar_button(accent)
 }
 
 /// The New task button: the sidebar's main action, an accent button.

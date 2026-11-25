@@ -694,10 +694,21 @@ fn part_view(
                 .keyed_children(crate::views::slots([Some(row.into()), detail]))
                 .into()
         }
-        // The end of a turn without an answer ("Stopped by you after 3m")
-        // is a service line; other notices keep their label.
+        // The end of a turn without an answer is a service line: the
+        // owner's stop says only that ("Stopped by you after 3m"); any other
+        // end keeps its outcome in view ("Assistant · result not confirmed
+        // · …"), with a warning unless the turn succeeded.
         PartKind::Notice if part.key.contains("/final:") => {
-            service_line(&part.plain, crate::controls::glyph::STOP_CIRCLE)
+            if part.label == crate::chat::STOPPED_BY_YOU_LABEL {
+                service_line(&part.plain, crate::controls::glyph::STOP_CIRCLE)
+            } else {
+                let glyph = if part.label == crate::chat::ANSWER_LABEL {
+                    crate::controls::glyph::INFO
+                } else {
+                    crate::controls::glyph::WARNING
+                };
+                service_line(&format!("{} · {}", part.label, part.plain), glyph)
+            }
         }
         PartKind::Notice => crate::controls::secondary(format!("{} · {}", part.label, part.plain))
             .text_wrapping(TextWrapping::Wrap)

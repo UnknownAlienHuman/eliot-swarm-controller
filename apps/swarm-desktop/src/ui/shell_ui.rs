@@ -320,9 +320,10 @@ pub(super) struct ShellState {
     /// `project.list` reads in flight ([`DesktopApp::load_projects`] and
     /// [`DesktopApp::poll_projects`]): a poll waits while any is.
     pub(super) project_reads: u32,
-    /// A `project.list` read failed and no read has succeeded since: the
-    /// failing streak's alert is shown once, not on every poll.
-    pub(super) projects_failing: bool,
+    /// The alert of the failing `project.list` streak: a poll repeats no
+    /// alert while the error stays the same; a new error alerts, and a read
+    /// that succeeds clears it.
+    pub(super) projects_error: Option<String>,
     pub(super) selection: Selection,
     pub(super) projects: Vec<UiProject>,
     /// The sidebar's projects as the daemon groups and counts them.
@@ -551,7 +552,7 @@ impl DesktopApp {
                 self.nav.project_reads = self.nav.project_reads.saturating_sub(1);
                 match projects {
                     Ok(mut projects) => {
-                        self.nav.projects_failing = false;
+                        self.nav.projects_error = None;
                         keep_last_known(&mut projects, &self.nav.projects);
                         self.nav.projects = projects;
                         let workspace = self.launch.workspace.clone();
@@ -588,7 +589,7 @@ impl DesktopApp {
                         return;
                     }
                 };
-                self.nav.projects_failing = false;
+                self.nav.projects_error = None;
                 keep_last_known(&mut read, &self.nav.projects);
                 let mut git_changed = false;
                 for fresh in read {
@@ -2355,13 +2356,13 @@ impl DesktopApp {
         });
     }
 
-    /// A `project.list` read failed: the alert opens the failing streak and
-    /// later failures of the same streak leave it as it is; the next read
-    /// that succeeds ends the streak.
+    /// A `project.list` read failed: it alerts unless the same error is
+    /// already the streak's alert ([`ShellState::projects_error`]).
     fn projects_failed(&mut self, error: &str) {
-        if !self.nav.projects_failing {
-            self.nav.projects_failing = true;
-            self.alert(format!("Projects not read: {error}"));
+        let text = format!("Projects not read: {error}");
+        if self.nav.projects_error.as_deref() != Some(text.as_str()) {
+            self.nav.projects_error = Some(text.clone());
+            self.alert(text);
         }
     }
 

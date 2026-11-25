@@ -752,6 +752,13 @@ impl Invalidation {
     }
 }
 
+/// The label of a turn's answer, and of its end notice when the turn
+/// succeeded without public final text.
+pub const ANSWER_LABEL: &str = "Assistant";
+
+/// The label of the end notice of a turn the owner stopped.
+pub const STOPPED_BY_YOU_LABEL: &str = "Assistant · stopped by you";
+
 /// Kind of one keyed part inside a turn item.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PartKind {
@@ -1756,11 +1763,11 @@ impl Conversation {
         let final_key = format!("final:{}", turn.key.id);
         let label = match &turn.status {
             TurnStatus::Completed(Some(TurnOutcome::Success)) | TurnStatus::Completed(None) => {
-                "Assistant".to_owned()
+                ANSWER_LABEL.to_owned()
             }
             TurnStatus::Completed(Some(TurnOutcome::Failure)) => "Assistant · failed".to_owned(),
             TurnStatus::Completed(Some(TurnOutcome::Interrupted)) if turn.stopped_by_owner => {
-                "Assistant · stopped by you".to_owned()
+                STOPPED_BY_YOU_LABEL.to_owned()
             }
             TurnStatus::Completed(Some(TurnOutcome::Interrupted)) => {
                 "Assistant · interrupted".to_owned()

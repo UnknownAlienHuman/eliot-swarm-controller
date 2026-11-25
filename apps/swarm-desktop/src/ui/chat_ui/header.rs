@@ -294,7 +294,7 @@ impl DesktopApp {
                 Panel::Closed
             },
             menu,
-            compact: self.layout.class == split_ui::SizeClass::Wide && self.pane_docked(),
+            compact: self.narrow_main(),
             running,
             send: context.forward(),
         })

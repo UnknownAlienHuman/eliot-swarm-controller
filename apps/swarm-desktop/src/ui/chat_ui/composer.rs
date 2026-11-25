@@ -116,6 +116,9 @@ impl DesktopApp {
             };
         // The command this composer sent is still being confirmed: its
         // action shows the pending ring (§9.4) until the reply settles it.
+        // A retry reuses the original action's key (`retry_pending`), and a
+        // retried input is sent again as a launch or a send, so both are
+        // covered here.
         let pending = self.in_flight_key.as_deref().is_some_and(|key| {
             let mut fields = key.split(':');
             match (fields.next(), agent.as_deref()) {
@@ -1139,7 +1142,7 @@ fn composer_actions(
                 }
             ) && !draft_blank);
             Some(
-                controls::send_menu_button(accent)
+                controls::bar_button(accent)
                     .is_enabled(ready)
                     .automation_name("More send options: Add as a note")
                     .content(controls::icon(controls::glyph::CHEVRON_DOWN))
@@ -1269,7 +1272,7 @@ fn start_split(
                     "Start task",
                     pending,
                 )),
-            controls::send_menu_button(true)
+            controls::bar_button(true)
                 .is_enabled(ready)
                 .automation_name("More start options")
                 .content(controls::icon(controls::glyph::CHEVRON_DOWN))
