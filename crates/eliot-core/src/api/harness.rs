@@ -54,6 +54,13 @@ pub enum NativeArchiveBinding {
     Workspace,
 }
 
+/// A readback capable of proving one exact native turn's terminal outcome.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TurnHistoryReadback {
+    HistoryFile,
+    OwnedSnapshot,
+}
+
 /// Inclusive native access bounds from a frozen profile. Levels are read-only
 /// (0), requires approval (1), automatic approval (2) and full access (3).
 pub type NativeAccessBounds = (u8, u8);
@@ -474,6 +481,7 @@ pub struct HarnessCapabilities {
     pub route_client_key_env_selector: Option<RouteClientKeyEnvSelector>,
     /// Failed turns backfill `native_error_message` / `effective_model` on readback.
     pub backfill_failed_turn_readback: bool,
+    pub turn_history_readback: Option<TurnHistoryReadback>,
     /// Supports `source.gap` view-projection recovery on active turns.
     pub view_projection_recovery: Option<ViewProjectionRecovery>,
     pub oversized_frame_prefixes: &'static [&'static str],

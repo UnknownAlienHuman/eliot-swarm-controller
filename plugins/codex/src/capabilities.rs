@@ -160,6 +160,7 @@ pub fn declaration() -> HarnessCapabilities {
         resume_previous_turn: true,
         reconcile_unfinished_tools: true,
         native_archive: Some(eliot_core::api::harness::NativeArchiveBinding::FrozenStore),
+        turn_history_readback: Some(eliot_core::api::harness::TurnHistoryReadback::HistoryFile),
         agent_identity_env: true,
         launch_default_policy: LaunchDefaultPolicy::NativeMarkedDefault,
         guard_refusal_point: Some(InjectPoint::ActiveTurn),

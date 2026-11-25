@@ -1,6 +1,9 @@
 use super::native_events::{persist_effects, verified_native_event_cause_tx};
 use super::*;
 
+mod historical;
+pub use historical::{HistoricalTurn, HistoricalTurnCursor};
+
 #[derive(Debug, PartialEq, Eq)]
 pub struct ActiveTurnRecovery {
     /// The bound send; `None` for a self-started native turn with no send,

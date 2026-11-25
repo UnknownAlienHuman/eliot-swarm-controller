@@ -113,6 +113,7 @@ pub fn declaration() -> HarnessCapabilities {
         project_instruction_read: crate::instructions::PROJECT_READ,
         user_instruction_files: crate::instructions::USER_FILES,
         native_archive: Some(eliot_core::api::harness::NativeArchiveBinding::Workspace),
+        turn_history_readback: Some(eliot_core::api::harness::TurnHistoryReadback::OwnedSnapshot),
         resume_config: true,
         manifest_extra_verbs: &["models"],
         compact: true,

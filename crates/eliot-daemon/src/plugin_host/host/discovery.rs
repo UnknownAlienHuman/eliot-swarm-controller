@@ -9,8 +9,8 @@ use eliot_core::{
     api::{DiscoverPage, HarnessCapabilities, harness::NativeArchiveBinding, is_supported_harness},
 };
 use eliot_plugin::protocol::{
-    ModelCatalogue, ModelListParams, ModelListPart, NativeArchiveParams, ProfileStoreParams,
-    ProfileStoreResult,
+    ModelCatalogue, ModelListParams, ModelListPart, NativeArchiveParams, NativeTurnEvidenceRequest,
+    ProfileStoreParams, ProfileStoreResult,
 };
 use eliot_plugin::sync::LockExt;
 use serde_json::{Value, json};
@@ -64,6 +64,95 @@ struct MetadataRead<T> {
 }
 
 impl PluginHost {
+    pub(crate) async fn historical_turn_evidence(
+        &self,
+        turn: &eliot_store::HistoricalTurn,
+    ) -> Result<Option<eliot_core::api::TurnResolveStatus>> {
+        let request = NativeTurnEvidenceRequest {
+            native_scope: turn.native_scope.clone(),
+            native_ref: turn.native_ref.clone(),
+            turn_id: turn.turn_id.clone(),
+            target_environment: history_environment(&turn.profile),
+            profile: turn.profile.clone(),
+        };
+        let (id, stop, done) = self.register_metadata_reader()?;
+        let host = self.clone();
+        let (reply, response) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let completion = host.read_historical_turn(request, stop).await;
+            host.finish_metadata_reader(&id, done, completion.cleanup);
+            let _ = reply.send(completion.result);
+        });
+        response
+            .await
+            .map_err(|_| Error::new("unavailable", "Native history reader stopped"))?
+    }
+
+    async fn read_historical_turn(
+        &self,
+        request: NativeTurnEvidenceRequest,
+        mut stop: watch::Receiver<Option<Instant>>,
+    ) -> MetadataRead<Option<eliot_core::api::TurnResolveStatus>> {
+        let method = "native.turn_evidence";
+        if stop.borrow().is_some() {
+            return MetadataRead {
+                result: Ok(None),
+                cleanup: ReaderCleanup::Confirmed,
+            };
+        }
+        let harness = request.profile["harness"].as_str().unwrap_or_default();
+        let opened = self
+            .open_reader_with_cleanup(
+                &AgentKey {
+                    id: "turn-evidence".to_owned(),
+                    generation: 0,
+                },
+                harness,
+                &request.profile,
+                &request.target_environment,
+                None,
+            )
+            .await;
+        let mut reader = match opened.result {
+            Ok(reader) => reader,
+            Err(error) => return failed_metadata_open(error, opened.cleanup_confirmed, method),
+        };
+        let until = Instant::now() + READER_DEADLINE;
+        let read = async {
+            reader.initialize(harness, until).await?;
+            let payload = serde_json::to_value(&request)
+                .map_err(|_| Error::new("invalid", "Could not encode turn history binding"))?;
+            let reply = reader.client.call(method, payload, until).await?;
+            reject_reserved_metadata(&reply, &reader.metadata_secrets, method)?;
+            if reply["native_scope"].as_str() != Some(request.native_scope.as_str())
+                || reply["native_ref"].as_str() != Some(request.native_ref.as_str())
+                || reply["turn_id"].as_str() != Some(request.turn_id.as_str())
+            {
+                return Err(Error::new(
+                    "source_integrity",
+                    "Native history reply changed its binding",
+                ));
+            }
+            let outcome = reply.get("outcome").ok_or_else(|| {
+                Error::new("source_integrity", "Native history omitted its outcome")
+            })?;
+            serde_json::from_value(outcome.clone())
+                .map_err(|_| Error::new("source_integrity", "Native history outcome is malformed"))
+        };
+        let result = tokio::select! {
+            result = tokio::time::timeout_at(until, read) =>
+                result.unwrap_or_else(|_| Err(Error::new("unavailable", "Native history reader exceeded its deadline"))),
+            _ = stop.changed() => Err(Error::new("cancelled", "Native history reader was cancelled")),
+        };
+        let closure = reader
+            .close_until(self, None, metadata_reader_close_deadline(&stop))
+            .await;
+        MetadataRead {
+            result: require_reader_cleanup(result, closure.closed, method),
+            cleanup: cleanup_state(closure.closed),
+        }
+    }
+
     pub(crate) fn close_discovery_admission(&self) {
         // Shares the registration lock, so shutdown cannot miss a reader that
         // passed the Router check immediately before its admission mode changed.
@@ -1100,6 +1189,42 @@ fn require_reader_cleanup<T>(
             format!("{operation} reader cleanup is unconfirmed"),
         ))
     }
+}
+
+/// A historical read needs store selectors, never an inference credential or
+/// a current provider route. The adapter rechecks the retained scope against
+/// the resolved directories before it opens any history file.
+fn history_environment(profile: &Value) -> Value {
+    let native = HarnessCapabilities::of(profile["harness"].as_str().unwrap_or_default())
+        .profile
+        .environment;
+    let names = ["HOME", "USERPROFILE"]
+        .into_iter()
+        .chain(native.store_paths.iter().copied())
+        .chain(native.legacy_captured_paths.iter().copied())
+        .chain(native.credential_directory);
+    let mut environment = serde_json::Map::new();
+    for name in names {
+        let captured = profile["native_route_home"]
+            .get(name)
+            .or_else(|| profile["pass_env_values"].get(name));
+        let admitted = matches!(name, "HOME" | "USERPROFILE")
+            || profile["pass_env"].as_array().is_some_and(|names| {
+                names
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .any(|key| key == name || cfg!(windows) && key.eq_ignore_ascii_case(name))
+            });
+        let path = match captured {
+            Some(value) => value.as_str().map(str::to_owned),
+            None if admitted => std::env::var(name).ok(),
+            None => None,
+        };
+        if let Some(path) = path.filter(|path| std::path::Path::new(path).is_absolute()) {
+            environment.insert(name.to_owned(), Value::String(path));
+        }
+    }
+    Value::Object(environment)
 }
 
 fn cleanup_state(cleanup_confirmed: bool) -> ReaderCleanup {

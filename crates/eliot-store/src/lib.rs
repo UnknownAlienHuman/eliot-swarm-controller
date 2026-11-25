@@ -70,7 +70,7 @@ pub use rules::{
     TimerDefinitionInput, TimerSlotAdmission, TimerSlotCommit,
 };
 pub use scripts::ScriptRunAdmission;
-pub use turn_recovery::{ActiveTurnRecovery, RecoveredTurn};
+pub use turn_recovery::{ActiveTurnRecovery, HistoricalTurn, HistoricalTurnCursor, RecoveredTurn};
 pub use usage::ResolvedUsageScope;
 pub use workspace::StandWorkspaceRecord;
 

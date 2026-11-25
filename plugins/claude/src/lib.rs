@@ -2,6 +2,7 @@
 
 pub mod capabilities;
 mod events;
+mod history;
 mod host;
 pub mod inference;
 pub mod install;

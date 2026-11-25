@@ -3,6 +3,7 @@
 pub mod capabilities;
 mod discovery;
 mod events;
+mod history;
 mod host;
 pub mod install;
 mod instructions;

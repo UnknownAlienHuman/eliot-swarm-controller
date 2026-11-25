@@ -251,6 +251,17 @@ pub struct NativeArchiveParams {
     pub workspace: Option<String>,
 }
 
+/// Read the terminal outcome for one native turn, with no vendor write.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeTurnEvidenceRequest {
+    pub native_scope: String,
+    pub native_ref: String,
+    pub turn_id: String,
+    pub profile: Value,
+    pub target_environment: Value,
+}
+
 /// One catalogue phase per owned reader lifetime. OpenCode's native CLI uses
 /// separate commands for ids and metadata. The host closes each family before
 /// starting the next phase. Other harnesses use the default complete inventory.

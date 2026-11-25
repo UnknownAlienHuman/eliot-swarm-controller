@@ -291,6 +291,16 @@ A SEND dispatched before stop can supply the stop's exact turn binding.
 Force stop skips the cooperative interrupt window and uses the same process and
 source proof requirement.
 
+Reconciliation checks bounded pages of unknown turns against their recorded
+generation, native scope and exact turn binding. A retained native terminal,
+an exact terminal in the bound Codex rollout, or an explicit Claude interrupt
+linked by native message ancestry can supply the outcome. OpenCode uses the
+owned reader's exact input-bound terminal history while that reader is available.
+Evidence readback leaves vendor files, command states, and current Agent
+custody untouched. The Store rechecks the binding and records `turn.resolved`
+with native provenance only while the exact turn is still unknown. Missing,
+ambiguous, or unavailable evidence leaves the turn unknown.
+
 Diagnosis of a stopped, failed or lost Agent names retained unknown commands and
 turns across all generations, including history outside the recent-turn page.
 It points to `swarm cmd resolve` or `swarm turn resolve` for an exact Owner

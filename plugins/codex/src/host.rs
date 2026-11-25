@@ -607,6 +607,7 @@ impl CodexPlugin {
             "model.list" => self.model_list(&request.params).await,
             "quota.read" => self.quota_read(&request.params).await,
             "native.archive" => self.native_archive(&request.params).await,
+            "native.turn_evidence" => crate::history::read(&request.params).await,
             "agent.attach" => self.attach(&request.params).await,
             "agent.detach" => self.detach(&request.params).await,
             "agent.start" => Box::pin(self.start(&request.params, client)).await,
