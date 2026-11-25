@@ -194,7 +194,7 @@ impl DesktopApp {
             .as_ref()
             .map_or_else(String::new, |registration| registration.checkout.clone());
         self.close_popover();
-        if self.panel == Panel::Details {
+        if self.panel != Panel::Closed {
             self.close_panel();
         }
         if self.project.key != key {

@@ -586,6 +586,7 @@ impl DesktopApp {
                         self.sync_open_agent();
                         self.ensure_catalog(context);
                         self.read_conversation_extras(context);
+                        self.pane_detail_landed(context);
                         let cursor = snapshot.coverage.cursor;
                         let mut generation_changed = false;
                         if let Some(convo) = self.chat.convo.as_mut() {
@@ -709,6 +710,7 @@ impl DesktopApp {
                             self.sync_open_agent();
                             self.ensure_catalog(context);
                             self.read_conversation_extras(context);
+                            self.pane_detail_landed(context);
                         }
                         if let Some(convo) = self.chat.convo.as_mut() {
                             if let Some(results) = reread.results.as_ref() {
@@ -1689,13 +1691,11 @@ impl DesktopApp {
             let page = Border::new()
                 .grid_row(1)
                 .background(palette.surface())
-                .corner_radius(
-                    if self.panel != Panel::Closed && self.main == Main::Project {
-                        CornerRadius::new(radius, 0.0, 0.0, radius)
-                    } else {
-                        CornerRadius::uniform(radius)
-                    },
-                )
+                .corner_radius(if self.panel_shown() && self.main == Main::Project {
+                    CornerRadius::new(radius, 0.0, 0.0, radius)
+                } else {
+                    CornerRadius::uniform(radius)
+                })
                 .content(content);
             return Grid::new()
                 .rows([

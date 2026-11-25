@@ -248,6 +248,15 @@ pub mod layout {
     pub const SIDEBAR_PADDING: f64 = 12.0;
     /// The right pane (Changes, Agents, Details, Terminal).
     pub const PANEL_WIDTH: f64 = crate::brand::SIZE_PANE;
+    /// The right pane at its Wide width (the brand book: `size-reading`).
+    pub const PANEL_WIDE_WIDTH: f64 = crate::brand::SIZE_READING;
+    /// Below this window width the right pane lies over the main area
+    /// instead of beside it (skeleton, regions).
+    pub const PANEL_OVERLAY_BELOW: f64 = crate::brand::SIZE_PANE_OVERLAY;
+    /// The Filter files field of the Changes tab.
+    pub const FILTER_WIDTH: f64 = crate::brand::SIZE_FILTER_FIELD;
+    /// The open tab's indicator under its label.
+    pub const TAB_INDICATOR: f64 = crate::brand::SIZE_TAB_INDICATOR;
     /// The narrowest the task area gets beside the full sidebar; a smaller
     /// window folds the sidebar to its rail.
     pub const MAIN_MIN_WIDTH: f64 = 480.0;

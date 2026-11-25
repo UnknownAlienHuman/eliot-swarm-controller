@@ -27,7 +27,6 @@ pub(super) enum MonitorMsg {
     ChildrenToggled(String),
     /// Show or hide Recently stopped.
     StoppedToggled,
-    TechnicalToggled,
     /// A pane tab or the header's details button: select that tab, never
     /// close the pane.
     PanelChosen(Panel),
@@ -80,7 +79,6 @@ pub(super) struct MonitorState {
     pub(super) stopped_open: bool,
     /// What the list is narrowed to (a group, a project, or both).
     pub(super) filter: Filter,
-    pub(super) technical_open: bool,
     /// The event cursor the next scheduled read waits from.
     pub(super) event_cursor: Option<i64>,
     /// Read the selected Agent's usage and diagnosis at the next read.
@@ -257,30 +255,7 @@ impl DesktopApp {
                             .rows
                             .iter()
                             .find(|row| row.id == id)
-                            .map(|row| UiAgent {
-                                id: row.id.clone(),
-                                generation: row.generation,
-                                harness: row.harness.clone(),
-                                state: row.state,
-                                status_line: row.status_line.clone(),
-                                project_id: row.project.clone(),
-                                project_scope: row.project_scope.clone(),
-                                repo_common_dir: None,
-                                workspace: None,
-                                parent: row.parent.clone(),
-                                updated_at: 0,
-                                title: row.title.clone(),
-                                native_child: row.activity.is_some(),
-                                tokens: row.tokens,
-                                chat: row.chat,
-                                archived: false,
-                                pending: false,
-                                organization: None,
-                                tags: Vec::new(),
-                                organization_revision: None,
-                                model: row.model.clone(),
-                                work: row.work.clone().map(Box::new),
-                            })
+                            .map(row_agent)
                     });
                 if let Some(agent) = agent {
                     self.shell_update(ShellMsg::AgentOpened(agent.clone()), context);
@@ -321,9 +296,6 @@ impl DesktopApp {
                 if seq == self.monitor.liveness_seq {
                     self.monitor.liveness = Some(*read);
                 }
-            }
-            MonitorMsg::TechnicalToggled => {
-                self.monitor.technical_open = !self.monitor.technical_open
             }
             MonitorMsg::AutonomyToggled => {
                 let autonomy = &mut self.monitor.autonomy;
@@ -379,8 +351,9 @@ impl DesktopApp {
     }
 
     /// Select a pane tab. Details shows the open task's Agent, else the one
-    /// chosen in the Monitor (without either it stays where it is); only
-    /// [`Self::close_panel`] closes the pane.
+    /// chosen in the Monitor (without either it stays where it is); the
+    /// other tabs show the open task. Only [`Self::close_panel`] closes the
+    /// pane.
     pub(super) fn choose_panel(&mut self, panel: Panel, context: &ComponentContext<Self>) {
         match panel {
             Panel::Details => {
@@ -388,6 +361,7 @@ impl DesktopApp {
                     self.show_details(&agent, context);
                 }
             }
+            Panel::Changes | Panel::Agents | Panel::Terminal => self.open_tab(panel, context),
             Panel::Closed => {}
         }
     }
@@ -405,20 +379,22 @@ impl DesktopApp {
         if changed {
             self.monitor.selected = Some(agent.to_owned());
             self.monitor.data.detail_errors.clear();
-            self.monitor.technical_open = false;
             self.monitor.detail_due = true;
         }
-        let was_closed = !self.monitor_panel();
+        // Another tab ran the chain with its own reads: read Details now.
+        let was_closed = !self.monitor_panel() || self.panel != Panel::Details;
         self.panel = Panel::Details;
         if was_closed || changed {
             self.start_monitor(context);
         }
     }
 
-    /// Whether the pane shown runs the Monitor's refresh chain (the
-    /// Monitor or the details; the Inbox reads with the sidebar's poll).
+    /// Whether what shows runs the Monitor's refresh chain: the Agents
+    /// page, or the pane's Details or Agents tab (the Inbox reads with the
+    /// sidebar's poll; Changes and Terminal read on their own).
     pub(super) fn monitor_panel(&self) -> bool {
-        self.main == Main::Agents || self.panel == Panel::Details
+        self.main == Main::Agents
+            || (self.panel_shown() && matches!(self.panel, Panel::Details | Panel::Agents))
     }
 
     /// After every update: neither the Agents page nor Details shows any
@@ -500,11 +476,16 @@ impl DesktopApp {
         // only while its Details show; its usage and diagnosis only when
         // the selection or its generation changed.
         let fleet = self.main == Main::Agents;
+        let shown = self.panel_shown();
         let selected = self
             .monitor
             .selected
             .clone()
-            .filter(|_| self.panel == Panel::Details);
+            .filter(|_| shown && self.panel == Panel::Details);
+        // The task's tree only while the Agents tab shows.
+        let tree = self
+            .tree_root()
+            .filter(|_| shown && self.panel == Panel::Agents);
         let cached = self.monitor.data.detail.as_ref().map(|detail| {
             (
                 detail.read.agent.agent.id.clone(),
@@ -525,7 +506,13 @@ impl DesktopApp {
                     cached_id != id || current.is_some_and(|current| current != *generation)
                 })
             });
-        let filter = monitor::fleet_filter(if fleet { None } else { selected.as_deref() });
+        let filter = match &tree {
+            Some(root) if self.monitor.data.tree.root.as_ref() == Some(root) => {
+                monitor::tree_filter(self.monitor.data.tree.agents())
+            }
+            Some(root) => monitor::tree_filter(vec![root.clone()]),
+            None => monitor::fleet_filter(if fleet { None } else { selected.as_deref() }),
+        };
         let plan = monitor::RefreshPlan {
             fleet,
             selected,
@@ -537,6 +524,7 @@ impl DesktopApp {
             } else {
                 Vec::new()
             },
+            tree,
         };
         let cursor = self.monitor.event_cursor;
         let refresh_gate = self.monitor.refresh_gate.clone();
@@ -618,34 +606,6 @@ impl DesktopApp {
         }));
     }
 
-    /// The Details pane's head: its title and the close button.
-    pub(super) fn panel_header(
-        &self,
-        title: &str,
-        context: &mut ViewContext<Self>,
-        palette: Palette,
-    ) -> View {
-        Grid::new()
-            .height(tokens::height::CONTROL)
-            .columns([GridLength::STAR, GridLength::Auto])
-            .margin(Thickness::new(
-                tokens::spacing::ROW + tokens::spacing::XS,
-                tokens::spacing::INSET,
-                tokens::spacing::ROW + tokens::spacing::XS,
-                0.0,
-            ))
-            .children((
-                m3::section_title(title.to_owned()).vertical_alignment(VerticalAlignment::Center),
-                m3::icon_button(palette)
-                    .grid_column(1)
-                    .automation_name("Close panel")
-                    .on_click(
-                        context.message(Message::Shell(ShellMsg::PanelToggled(Panel::Closed))),
-                    )
-                    .content(m3::icon(m3::glyph::CLOSE)),
-            ))
-    }
-
     /// A monitor row's project as the sidebar names it: its section key
     /// ([`nav::project_key`]) and the owner's display name for that
     /// project, else the sidebar's name ([`nav::project_of`]); a chat
@@ -673,7 +633,7 @@ impl DesktopApp {
         clippy::too_many_arguments,
         reason = "The operation's distinct inputs remain explicit at its established call boundary."
     )]
-    fn monitor_entries(
+    pub(super) fn monitor_entries(
         &self,
         row: &MonitorRow,
         depth: usize,
@@ -1116,24 +1076,22 @@ impl DesktopApp {
         page_ui::page("Agents", self.page_width(tokens::page::WIDTH), items)
     }
 
-    /// The open Agent's details: its settings and coverage, resources and
-    /// usage. Ids and readback text live here, not in the conversation.
-    /// Moving it under another task is a menu action
-    /// ([`super::move_ui`]), not a section here.
+    /// Details (skeleton 5.5, `Finished.dc.html`): the open Agent in
+    /// collapsible sections (Summary, Task, Goal, Work, Mail, What went
+    /// wrong, Activity & resources, Context, Heavy work, Technical). Ids and
+    /// readback text live here, not in the conversation. Moving it under
+    /// another task is a menu action ([`super::move_ui`]).
     pub(super) fn details_view(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
         let Some(id) = self.monitor.selected.clone() else {
             return View::empty();
         };
-        let mut sections: Vec<KeyedView> = Vec::new();
+        let mut items: Vec<KeyedView> = Vec::new();
         let mut technical = vec![format!("ID {id}")];
         let data = &self.monitor.data;
+        let now = crate::handoff::now_ms();
 
-        // The Agent: identity and settings (from the open conversation's
-        // detail when it is this Agent, else the monitor's read). Effort
-        // words read short; `spoken` holds the same settings lines in full
-        // words and where they start, for the section's accessible name.
-        let mut agent_lines: Vec<String> = Vec::new();
-        let mut spoken: Option<(usize, Vec<String>)> = None;
+        // The Agent: from the open conversation's detail when it is this
+        // Agent, else the monitor's read.
         let detail = self
             .chat
             .detail
@@ -1158,8 +1116,8 @@ impl DesktopApp {
             .into_iter()
             .chain(resources_at)
             .min();
-        if let Some(status) = monitor::read_status(read_at, crate::handoff::now_ms()) {
-            sections.push(KeyedView::new(
+        if let Some(status) = monitor::read_status(read_at, now) {
+            items.push(KeyedView::new(
                 "refresh",
                 m3::secondary(status).text_wrapping(TextWrapping::Wrap),
             ));
@@ -1171,16 +1129,22 @@ impl DesktopApp {
             .map(String::as_str)
             .collect();
         if !errors.is_empty() {
-            sections.push(KeyedView::new(
+            items.push(KeyedView::new(
                 "read-errors",
                 m3::secondary(format!("Some reads failed: {}", errors.join(" · ")))
                     .foreground(palette.attention())
                     .text_wrapping(TextWrapping::Wrap),
             ));
         }
-        // No cached read and no error yet: the first read is still due. This
-        // ignores routine refreshes, so a placeholder never flips each cycle.
+        // No cached read and no error yet: the first read is still due.
         let pending = data.detail_errors.is_empty();
+
+        // Summary: state, harness, model and effort, access and preset, who
+        // chose the model, the generation, when it started, its parent.
+        // Effort words read short; `spoken` holds the same lines in full
+        // words where they start, for the accessible name.
+        let mut agent_lines: Vec<String> = Vec::new();
+        let mut spoken: Option<(usize, Vec<String>)> = None;
         match (detail, read) {
             (Some(detail), _) => {
                 let harness = crate::picker::harness_label(&detail.harness);
@@ -1201,9 +1165,6 @@ impl DesktopApp {
                 }
                 if detail.active_turn.is_some() {
                     agent_lines.push("Working on a turn".to_owned());
-                }
-                if read.is_none() {
-                    technical.push(format!("Generation {}", detail.generation));
                 }
             }
             (None, Some(read)) => {
@@ -1233,50 +1194,168 @@ impl DesktopApp {
                 *line = said;
             }
         }
-        sections.push(KeyedView::new(
-            "agent",
-            spoken_section(palette, "Summary", &agent_lines, &agent_spoken),
-        ));
-        if let Some(lines) = detail
-            .and_then(|detail| detail.project_instructions.clone())
-            .or_else(|| read.and_then(|read| monitor_view::project_instruction_lines(&read.agent)))
-        {
-            sections.push(KeyedView::new(
-                "project-instructions",
-                section(palette, "Project instructions", &lines),
+        let body = m3::body(agent_lines.join("\n"))
+            .text_wrapping(TextWrapping::Wrap)
+            .is_text_selection_enabled(true);
+        let body = if agent_spoken == agent_lines {
+            body
+        } else {
+            body.automation_name(agent_spoken.join("\n"))
+        };
+        let mut summary: Vec<KeyedView> = vec![KeyedView::new("lines", body)];
+        // How the profile was chosen: the routing decision frozen at
+        // admission; the skipped candidates go to Technical.
+        let choice = match (detail, read) {
+            (Some(detail), _) => Some((detail.routing.clone(), detail.settings.profile.clone())),
+            (None, Some(read)) => Some((
+                read.agent.agent.profile_choice.clone(),
+                read.agent.agent.profile.clone(),
+            )),
+            (None, None) => None,
+        };
+        if let Some((decision, profile)) = choice {
+            let chosen = match decision {
+                Some(decision) => {
+                    let (headline, skipped) = crate::settings_model::decision_lines(&decision);
+                    technical.extend(skipped);
+                    headline.replacen("Routing picks", "Routing picked", 1)
+                }
+                None if profile.starts_with("adhoc-") => {
+                    "You chose its app and model when you started it.".to_owned()
+                }
+                None => format!("You started it on the preset {profile}."),
+            };
+            summary.push(KeyedView::new(
+                "chosen",
+                page_ui::kv_text("Chosen by", chosen),
             ));
         }
+        if let Some(generation) = generation {
+            summary.push(KeyedView::new(
+                "generation",
+                page_ui::kv_text("Generation", generation.to_string()),
+            ));
+        }
+        let created = detail
+            .map(|detail| detail.created_at)
+            .or_else(|| read.map(|read| read.agent.agent.created_at))
+            .filter(|at| *at > 0);
+        if let Some(created) = created.and_then(monitor::last_read_label) {
+            summary.push(KeyedView::new(
+                "started",
+                page_ui::kv_text("Started", created.replacen("Last read ", "", 1)),
+            ));
+        }
+        let parent = detail
+            .and_then(|detail| detail.parent.clone())
+            .or_else(|| read.and_then(|read| read.agent.agent.parent.clone()));
+        if let Some(parent) = parent {
+            summary.push(KeyedView::new(
+                "parent",
+                page_ui::kv_text("Parent", self.agent_title(&parent)),
+            ));
+        }
+        items.push(KeyedView::new(
+            "summary",
+            self.details_section("summary", "Summary", summary, context, palette),
+        ));
 
-        // Whether it writes code: the Git-aware work summary of this
-        // generation (`agent.get`, else the Monitor's row), and an open
-        // `no_code_progress` report in the attention tone.
+        // Task: what the task record would hold, where the desktop can read
+        // it (branch, base, preset, goal); the record itself is a daemon
+        // read the desktop does not have yet.
+        let goal = self
+            .chat
+            .goal
+            .as_ref()
+            .filter(|(agent, _)| *agent == id)
+            .map(|(_, goal)| goal.as_ref());
+        let mut task: Vec<KeyedView> = Vec::new();
+        if let Some(branch) = detail.and_then(|detail| detail.branch.clone()) {
+            task.push(KeyedView::new("branch", page_ui::kv_text("Branch", branch)));
+        }
+        if let Some(base) = detail.and_then(|detail| detail.base_ref.clone()) {
+            task.push(KeyedView::new("base", page_ui::kv_text("Base", base)));
+        }
+        if let Some(detail) = detail {
+            task.push(KeyedView::new(
+                "profile",
+                page_ui::kv_text("Profile", detail.settings.profile.clone()),
+            ));
+        }
+        if let Some(goal) = goal.flatten() {
+            task.push(KeyedView::new(
+                "goal",
+                page_ui::kv_text("Goal", goal.definition.text.clone()),
+            ));
+            if !goal.definition.check.is_empty() {
+                task.push(KeyedView::new(
+                    "check",
+                    page_ui::kv_text("Check", goal.definition.check.join(" ")),
+                ));
+            }
+        }
+        task.push(KeyedView::new(
+            "record",
+            m3::secondary(
+                "The task's text, card and journal live in its record in Git; the desktop cannot read that record yet.",
+            )
+            .text_wrapping(TextWrapping::Wrap),
+        ));
+        items.push(KeyedView::new(
+            "task",
+            self.details_section("task", "Task", task, context, palette),
+        ));
+
+        // Goal: its state, rounds and turns of the budget, cost, the check
+        // and its last result, cadence and scope, with the controls the
+        // daemon has.
+        let mut goal_rows: Vec<KeyedView> = Vec::new();
+        match goal {
+            None => goal_rows.push(KeyedView::new("reading", m3::secondary("Reading…"))),
+            Some(None) => {
+                goal_rows.push(KeyedView::new("none", m3::secondary("No goal.")));
+                goal_rows.push(KeyedView::new(
+                    "set",
+                    Border::new()
+                        .horizontal_alignment(HorizontalAlignment::Left)
+                        .content(
+                            m3::text_button(palette)
+                                .is_enabled(false)
+                                .automation_name(
+                                    "Set goal: setting a goal is not in the desktop yet",
+                                )
+                                .content(m3::label("Set goal…")),
+                        )
+                        .tooltip(
+                            "Setting a goal is not in the desktop yet: swarm goal set does it",
+                        ),
+                ));
+            }
+            Some(Some(goal)) => {
+                goal_rows.extend(goal_lines(goal, now));
+                goal_rows.extend(self.goal_actions(goal, context, palette));
+            }
+        }
+        items.push(KeyedView::new(
+            "goal",
+            self.details_section("goal", "Goal", goal_rows, context, palette),
+        ));
+
+        // Work: the worktree (opens in Explorer) and its project's
+        // checkout, the branch and its commits, the Git-aware work summary
+        // of this generation (an open `no_code_progress` report in the
+        // attention tone), and the last checkpoint.
         let row = data
             .row(&id)
             .filter(|row| generation.is_none_or(|generation| row.generation == generation));
         let work = read
             .and_then(|read| read.agent.work.as_ref())
-            .or_else(|| row.and_then(|row| row.work.as_ref()));
+            .or_else(|| row.and_then(|row| row.work.as_ref()))
+            .or_else(|| self.find_agent(&id).and_then(|agent| agent.work.as_deref()));
         let no_code = row
             .filter(|row| row.state != eliot_core::AgentState::Stopped)
             .and_then(|row| data.incident(row))
             .filter(|incident| incident.no_code());
-        if work.is_some() || no_code.is_some() {
-            let now = crate::handoff::now_ms();
-            sections.push(KeyedView::new(
-                "work",
-                work_section(
-                    palette,
-                    no_code.map(|incident| incident.words(now)),
-                    &work.map_or_else(Vec::new, |work| monitor::work_detail_lines(work, now)),
-                ),
-            ));
-        }
-
-        // Where it works: its project's checkout and, on a worktree, that
-        // worktree; each row opens in Explorer.
-        // `project` on the wire is the registration ID, not a path: the
-        // project folder is that registration's checkout, else the
-        // Agent's own workspace.
         let (project_id, workspace) = match (detail, read) {
             (Some(detail), _) => (Some(detail.project.clone()), detail.workspace.clone()),
             (None, Some(read)) => (
@@ -1296,85 +1375,168 @@ impl DesktopApp {
             .and_then(|id| self.nav.projects.iter().find(|project| project.id == id))
             .map(|project| project.workspace.clone())
             .or_else(|| workspace.clone());
-        let mut folders: Vec<KeyedView> = Vec::new();
+        let mut work_rows: Vec<KeyedView> = Vec::new();
         if let Some(project) = project.filter(|project| !project.is_empty()) {
-            folders.push(KeyedView::new(
-                "project",
-                self.path_row(context, palette, "Project folder", "", &project),
-            ));
-            if let Some(worktree) =
-                workspace.filter(|workspace| nav::path_key(workspace) != nav::path_key(&project))
+            if let Some(worktree) = workspace
+                .clone()
+                .filter(|workspace| nav::path_key(workspace) != nav::path_key(&project))
             {
-                folders.push(KeyedView::new(
+                work_rows.push(KeyedView::new(
                     "worktree",
                     self.path_row(context, palette, "Worktree", "", &worktree),
                 ));
             }
-        }
-        if !folders.is_empty() {
-            sections.push(KeyedView::new(
-                "folders",
-                m3::card_high(palette).content(
-                    StackPanel::new().spacing(tokens::spacing::XS).children((
-                        m3::section_title("Folders"),
-                        StackPanel::new().keyed_children(folders),
-                    )),
-                ),
+            work_rows.push(KeyedView::new(
+                "project",
+                self.path_row(context, palette, "Project folder", "", &project),
             ));
         }
+        if let Some(branch) = detail.and_then(|detail| detail.branch.clone()) {
+            let ahead =
+                work.and_then(|work| work.commits_ahead)
+                    .map_or_else(String::new, |ahead| {
+                        format!(
+                            " · {} ahead",
+                            eliot_core::count_words(ahead, "commit", "commits")
+                        )
+                    });
+            work_rows.push(KeyedView::new(
+                "branch",
+                page_ui::kv_text("Branch", format!("{branch}{ahead}")),
+            ));
+        }
+        if let Some(incident) = no_code {
+            work_rows.push(KeyedView::new(
+                "no-code",
+                m3::body(incident.words(now))
+                    .foreground(palette.attention())
+                    .text_wrapping(TextWrapping::Wrap)
+                    .is_text_selection_enabled(true),
+            ));
+        }
+        if let Some(work) = work {
+            let lines = monitor::work_detail_lines(work, now);
+            if !lines.is_empty() {
+                work_rows.push(KeyedView::new(
+                    "summary",
+                    m3::body(lines.join("\n"))
+                        .text_wrapping(TextWrapping::Wrap)
+                        .is_text_selection_enabled(true),
+                ));
+            }
+        }
+        work_rows.push(KeyedView::new(
+            "checkpoint",
+            Border::new()
+                .content(page_ui::kv_text("Checkpoint", "\u{2014}"))
+                .tooltip("The daemon keeps checkpoints but the desktop cannot read them yet"),
+        ));
+        items.push(KeyedView::new(
+            "work",
+            self.details_section("work", "Work", work_rows, context, palette),
+        ));
 
-        // The failure diagnosis summary: why and where the Agent last
-        // failed, from the same monitor read as the identity above. The
-        // full causal chain lives behind `swarm why`.
+        // Mail: this Agent's unread mail, read-only (reading marks nothing).
+        let mut mail: Vec<KeyedView> = Vec::new();
+        match read.map(|read| &read.mail) {
+            None => mail.push(KeyedView::new("reading", m3::secondary("Reading…"))),
+            Some(Err(error)) if error.is_empty() => {
+                mail.push(KeyedView::new("reading", m3::secondary("Reading…")));
+            }
+            Some(Err(error)) => mail.push(KeyedView::new(
+                "error",
+                page_ui::error_line(palette, format!("Mail not read: {error}")),
+            )),
+            Some(Ok(inbox)) if inbox.deliveries.is_empty() => {
+                mail.push(KeyedView::new("none", m3::secondary("No unread mail.")));
+            }
+            Some(Ok(inbox)) => {
+                for delivery in &inbox.deliveries {
+                    let sender = match delivery.sender.as_str() {
+                        "owner" => "You".to_owned(),
+                        sender if sender.starts_with('a') => self.agent_title(sender),
+                        sender => sender.to_owned(),
+                    };
+                    let thread = delivery
+                        .thread
+                        .as_deref()
+                        .map_or_else(String::new, |thread| format!(" · {thread}"));
+                    let age = monitor::elapsed_label(now.saturating_sub(delivery.admitted_at));
+                    mail.push(KeyedView::new(
+                        delivery.delivery_id.clone(),
+                        StackPanel::new()
+                            .spacing(tokens::spacing::ROW_GAP)
+                            .children((
+                                m3::text(
+                                    format!("{sender}{thread} · {age} ago"),
+                                    tokens::text::LABEL,
+                                )
+                                .foreground(palette.muted()),
+                                m3::body(delivery.text.clone())
+                                    .text_wrapping(TextWrapping::Wrap)
+                                    .max_lines(4)
+                                    .is_text_selection_enabled(true),
+                            )),
+                    ));
+                }
+                if inbox.next.is_some() && inbox.deliveries.len() >= monitor::MAIL_ROWS {
+                    mail.push(KeyedView::new(
+                        "more",
+                        m3::secondary(format!("The first {} are shown.", monitor::MAIL_ROWS)),
+                    ));
+                }
+            }
+        }
+        items.push(KeyedView::new(
+            "mail",
+            self.details_section("mail", "Mail", mail, context, palette),
+        ));
+
+        // What went wrong: why and where the Agent last failed, in one line
+        // (the full chain lives behind `swarm why`).
         if let Some(line) = read
             .and_then(|read| read.diagnosis.as_ref().ok())
             .and_then(monitor::diagnosis_line)
         {
-            sections.push(KeyedView::new(
+            items.push(KeyedView::new(
                 "diagnosis",
-                section(palette, "What went wrong", &[line]),
+                self.details_section(
+                    "wrong",
+                    "What went wrong",
+                    vec![
+                        KeyedView::new(
+                            "line",
+                            m3::body(line.clone())
+                                .text_wrapping(TextWrapping::Wrap)
+                                .is_text_selection_enabled(true),
+                        ),
+                        KeyedView::new(
+                            "copy",
+                            m3::text_button(palette)
+                                .horizontal_alignment(HorizontalAlignment::Left)
+                                .automation_name("Copy diagnosis")
+                                .on_click(context.message(Message::Pane(
+                                    super::pane_ui::PaneMsg::Copy("the diagnosis".to_owned(), line),
+                                )))
+                                .content(m3::icon_label(m3::glyph::COPY, "Copy diagnosis")),
+                        ),
+                    ],
+                    context,
+                    palette,
+                ),
             ));
         }
 
-        // How the profile was chosen: the routing decision frozen at
-        // admission, with every skipped candidate.
-        let choice = match (detail, read) {
-            (Some(detail), _) => Some((detail.routing.clone(), detail.settings.profile.clone())),
-            (None, Some(read)) => Some((
-                read.agent.agent.profile_choice.clone(),
-                read.agent.agent.profile.clone(),
-            )),
-            (None, None) => None,
-        };
-        if let Some((decision, profile)) = choice {
-            let lines = match decision {
-                Some(decision) => {
-                    let (headline, skipped) = crate::settings_model::decision_lines(&decision);
-                    std::iter::once(headline.replacen("Routing picks", "Routing picked", 1))
-                        .chain(skipped)
-                        .collect()
-                }
-                None if profile.starts_with("adhoc-") => {
-                    vec!["You chose its app and model when you started it.".to_owned()]
-                }
-                None => vec![format!("You started it on the preset {profile}.")],
-            };
-            technical.extend(lines);
-        }
-
-        // The conversation's retained coverage and the feed.
-        // Only what is unusual about the conversation: older turns not
-        // loaded, pruned activity, a feed that is not live.
+        // The conversation's retained coverage and the feed: only what is
+        // unusual (older turns not loaded, pruned activity, a feed that is
+        // not live).
         if let Some(convo) = self.chat.convo.as_ref().filter(|convo| convo.agent() == id) {
-            let mut lines = convo.coverage().notes(convo.inputs_unavailable());
+            technical.extend(convo.coverage().notes(convo.inputs_unavailable()));
             if !matches!(
                 self.chat.live,
                 LiveStatus::Live | LiveStatus::Idle | LiveStatus::Loading
             ) {
-                lines.push(format!("Live updates: {}", self.chat.live.label()));
-            }
-            if !lines.is_empty() {
-                technical.extend(lines);
+                technical.push(format!("Live updates: {}", self.chat.live.label()));
             }
         }
 
@@ -1386,82 +1548,274 @@ impl DesktopApp {
         } else {
             monitor_view::resource_views(data, &id, palette)
         };
-        sections.push(KeyedView::new(
+        items.push(KeyedView::new(
             "resources",
-            m3::card_high(palette).content(
-                StackPanel::new().spacing(tokens::spacing::SM).children((
-                    m3::section_title("Activity & resources"),
+            self.details_section(
+                "resources",
+                "Activity & resources",
+                vec![KeyedView::new(
+                    "views",
                     StackPanel::new()
                         .spacing(tokens::spacing::MD)
                         .keyed_children(resources),
-                )),
+                )],
+                context,
+                palette,
             ),
         ));
 
+        // Context: the fill and the session's tokens, then what Swarm
+        // loads (project instructions and the owner rules' delivery).
+        let mut context_rows: Vec<KeyedView> = Vec::new();
+        if let Some((used, window)) = detail.and_then(|detail| detail.context) {
+            let percent = 100.0 * used as f64 / window as f64;
+            context_rows.push(KeyedView::new(
+                "used",
+                page_ui::kv_text(
+                    "Used",
+                    format!(
+                        "{} of {} tokens",
+                        monitor::group(used),
+                        monitor::group(window)
+                    ),
+                ),
+            ));
+            context_rows.push(KeyedView::new("meter", m3::meter(palette, percent, false)));
+        }
         let usage = match read {
             Some(read) => monitor_view::usage_lines(read),
             None if pending => vec!["Reading…".to_owned()],
             None => vec!["Usage unavailable.".to_owned()],
         };
-        sections.push(KeyedView::new("usage", section(palette, "Usage", &usage)));
-
-        if let Some(read) = read {
-            technical.push(format!("Generation {}", read.agent.agent.generation));
-            technical.extend(monitor_view::observe_lines(read));
+        context_rows.push(KeyedView::new(
+            "usage",
+            m3::body(usage.join("\n"))
+                .text_wrapping(TextWrapping::Wrap)
+                .is_text_selection_enabled(true),
+        ));
+        if let Some(growth) = read.and_then(|read| read.agent.session_growth.as_ref()) {
+            context_rows.push(KeyedView::new(
+                "growth",
+                m3::body(format!(
+                    "The session grows fast: {}",
+                    growth
+                        .message
+                        .as_deref()
+                        .unwrap_or("its size crossed the warning threshold")
+                ))
+                .foreground(palette.attention())
+                .text_wrapping(TextWrapping::Wrap),
+            ));
         }
-        let technical_body = if self.monitor.technical_open {
-            section(palette, "Session", &technical)
-        } else {
-            View::empty()
-        };
-        sections.push(KeyedView::new(
-            "technical",
-            StackPanel::new().spacing(tokens::spacing::XS).children((
-                m3::row(palette, false)
-                    .automation_name(format!(
-                        "Technical details ({})",
-                        if self.monitor.technical_open {
-                            "expanded"
+        if let Some(rules) = read.and_then(|read| read.agent.owner_rules_delivery.as_ref()) {
+            context_rows.push(KeyedView::new(
+                "rules",
+                page_ui::kv_text(
+                    "Owner rules",
+                    format!(
+                        "{} · revision {}",
+                        if rules.delivered {
+                            "delivered"
                         } else {
-                            "collapsed"
-                        }
-                    ))
-                    .on_click(context.message(Message::Monitor(MonitorMsg::TechnicalToggled)))
-                    .content(m3::row_content(
-                        Some(if self.monitor.technical_open {
-                            m3::glyph::CHEVRON_DOWN
-                        } else {
-                            m3::glyph::CHEVRON_RIGHT
-                        }),
-                        "Technical details",
-                        "",
-                        View::empty(),
-                    )),
-                technical_body,
-            )),
+                            "not delivered"
+                        },
+                        rules.revision
+                    ),
+                ),
+            ));
+        }
+        if let Some(lines) = detail
+            .and_then(|detail| detail.project_instructions.clone())
+            .or_else(|| read.and_then(|read| monitor_view::project_instruction_lines(&read.agent)))
+        {
+            context_rows.push(KeyedView::new(
+                "instructions-head",
+                m3::text("Project instructions", tokens::text::LABEL).foreground(palette.muted()),
+            ));
+            context_rows.push(KeyedView::new(
+                "instructions",
+                m3::body(lines.join("\n"))
+                    .text_wrapping(TextWrapping::Wrap)
+                    .is_text_selection_enabled(true),
+            ));
+        }
+        items.push(KeyedView::new(
+            "context",
+            self.details_section("context", "Context", context_rows, context, palette),
         ));
 
-        Grid::new()
-            .rows([GridLength::Auto, GridLength::STAR])
-            .children((
-                self.panel_header("Details", context, palette),
-                ScrollViewer::new()
-                    .grid_row(1)
-                    .vertical_scroll_bar_visibility(ScrollBarVisibility::Auto)
-                    .automation_name("Agent details")
-                    .content(
-                        StackPanel::new()
-                            .spacing(tokens::spacing::ROW)
-                            .margin(Thickness::new(
-                                tokens::spacing::ROW,
-                                tokens::spacing::ROW,
-                                tokens::spacing::ROW,
-                                tokens::spacing::INSET,
-                            ))
-                            .keyed_children(sections),
+        // Heavy work: only when heavy episodes were recorded.
+        let heavy: Vec<String> = read
+            .map(monitor_view::observe_lines)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|line| line.starts_with("Heavy work"))
+            .collect();
+        if !heavy.is_empty() {
+            items.push(KeyedView::new(
+                "heavy",
+                self.details_section(
+                    "heavy",
+                    "Heavy work",
+                    vec![KeyedView::new(
+                        "lines",
+                        m3::body(heavy.join("\n"))
+                            .text_wrapping(TextWrapping::Wrap)
+                            .is_text_selection_enabled(true),
+                    )],
+                    context,
+                    palette,
+                ),
+            ));
+        }
+
+        // Technical: ids, the generation, routing's skipped candidates,
+        // coverage notes, with Copy.
+        match (read, detail) {
+            (Some(read), _) => {
+                technical.push(format!("Generation {}", read.agent.agent.generation));
+                if let Some(native) = &read.agent.agent.native_ref {
+                    technical.push(format!("Native session {native}"));
+                }
+                technical.push(format!("Profile {}", read.agent.agent.profile));
+            }
+            (None, Some(detail)) => {
+                technical.push(format!("Generation {}", detail.generation));
+                technical.push(format!("Profile {}", detail.settings.profile));
+            }
+            (None, None) => {}
+        }
+        let text = technical.join("\n");
+        items.push(KeyedView::new(
+            "technical",
+            self.details_section(
+                "technical",
+                "Technical",
+                vec![
+                    KeyedView::new(
+                        "lines",
+                        m3::body(text.clone())
+                            .text_wrapping(TextWrapping::Wrap)
+                            .is_text_selection_enabled(true),
                     ),
-            ))
+                    KeyedView::new(
+                        "copy",
+                        m3::text_button(palette)
+                            .horizontal_alignment(HorizontalAlignment::Left)
+                            .automation_name("Copy technical details")
+                            .on_click(context.message(Message::Pane(
+                                super::pane_ui::PaneMsg::Copy(
+                                    "the technical details".to_owned(),
+                                    text,
+                                ),
+                            )))
+                            .content(m3::icon_label(m3::glyph::COPY, "Copy")),
+                    ),
+                ],
+                context,
+                palette,
+            ),
+        ));
+
+        self.pane_body("Agent details", items)
     }
+}
+
+/// The Goal section's facts: its state, rounds and turns against the
+/// budget, the turns without progress, cost, the check and its last
+/// result, cadence and scope; facts it does not have are left out.
+fn goal_lines(goal: &eliot_core::api::GoalView, now: i64) -> Vec<KeyedView> {
+    use eliot_core::api::GoalStatus;
+    let definition = &goal.definition;
+    let counters = &goal.counters;
+    let state = match goal.status {
+        GoalStatus::Active => "Active".to_owned(),
+        GoalStatus::Paused => match goal.paused_reason.as_deref() {
+            Some(reason) => format!("Paused · {reason}"),
+            None => "Paused".to_owned(),
+        },
+        GoalStatus::Blocked => match goal.blocked_reason.as_deref() {
+            Some(reason) => format!("Blocked · {}", eliot_core::reason_words(reason)),
+            None => "Blocked".to_owned(),
+        },
+        GoalStatus::Completed => "Met".to_owned(),
+        GoalStatus::Cleared => "Cleared".to_owned(),
+    };
+    let mut rows = vec![KeyedView::new("state", page_ui::kv_text("State", state))];
+    rows.push(KeyedView::new(
+        "rounds",
+        page_ui::kv_text(
+            "Rounds",
+            match definition.max_rounds {
+                Some(max) => format!("{} of {max}", counters.rounds),
+                None => counters.rounds.to_string(),
+            },
+        ),
+    ));
+    let turns = counters.turns_used;
+    rows.push(KeyedView::new(
+        "turns",
+        page_ui::kv_text(
+            "Turns",
+            match definition.max_turns {
+                Some(max) => format!("{turns} of {max}"),
+                None => turns.to_string(),
+            },
+        ),
+    ));
+    if let Some(max) = definition.max_without_progress {
+        rows.push(KeyedView::new(
+            "progress",
+            page_ui::kv_text(
+                "Same result",
+                format!("{} of {max} rounds", counters.consecutive_same_output),
+            ),
+        ));
+    }
+    if !definition.check.is_empty() {
+        rows.push(KeyedView::new(
+            "check",
+            page_ui::kv_text("Check", definition.check.join(" ")),
+        ));
+    }
+    if let Some(code) = counters.last_exit_code {
+        let at = counters.last_check_at.map_or_else(String::new, |at| {
+            format!(" · {} ago", monitor::elapsed_label(now.saturating_sub(at)))
+        });
+        rows.push(KeyedView::new(
+            "last",
+            page_ui::kv_text(
+                "Last result",
+                if code == 0 {
+                    format!("Passed{at}")
+                } else {
+                    format!("Failed · exit {code}{at}")
+                },
+            ),
+        ));
+    }
+    if goal.cost_status != "none" && !goal.cost_status.is_empty() {
+        rows.push(KeyedView::new(
+            "cost",
+            page_ui::kv_text("Cost", goal.cost_status.replace('_', " ")),
+        ));
+    }
+    if let Some(cadence) = definition.cadence_ms {
+        rows.push(KeyedView::new(
+            "cadence",
+            page_ui::kv_text(
+                "Cadence",
+                format!("every {}", monitor::elapsed_label(cadence)),
+            ),
+        ));
+    }
+    if !definition.scope.is_empty() {
+        rows.push(KeyedView::new(
+            "scope",
+            page_ui::kv_text("Scope", definition.scope.join(", ")),
+        ));
+    }
+    rows
 }
 
 /// An Agent state code in words.
@@ -1478,52 +1832,31 @@ fn state_label(state: eliot_core::AgentState) -> &'static str {
     }
 }
 
-/// A details section: a container-corner card, its title and its lines
-/// in body text.
-fn section(palette: Palette, title: &str, lines: &[String]) -> View {
-    spoken_section(palette, title, lines, lines)
-}
-
-/// The Code work card: an open `no_code_progress` report in the attention
-/// tone ("Working without writing code for 14m"), then the work summary.
-fn work_section(palette: Palette, attention: Option<String>, lines: &[String]) -> View {
-    let attention: View = match attention {
-        Some(text) => m3::body(text)
-            .foreground(palette.attention())
-            .text_wrapping(TextWrapping::Wrap)
-            .is_text_selection_enabled(true)
-            .into(),
-        None => View::empty(),
-    };
-    let body: View = if lines.is_empty() {
-        View::empty()
-    } else {
-        m3::body(lines.join("\n"))
-            .text_wrapping(TextWrapping::Wrap)
-            .is_text_selection_enabled(true)
-            .into()
-    };
-    m3::card_high(palette).content(StackPanel::new().spacing(tokens::spacing::SM).children((
-        m3::section_title("Code work"),
-        attention,
-        body,
-    )))
-}
-
-/// [`section`] whose lines a screen reader hears as `spoken` (the efforts
-/// in full words where the text shows them short).
-fn spoken_section(palette: Palette, title: &str, lines: &[String], spoken: &[String]) -> View {
-    let body = m3::body(lines.join("\n"))
-        .text_wrapping(TextWrapping::Wrap)
-        .is_text_selection_enabled(true);
-    let body = if spoken == lines {
-        body
-    } else {
-        body.automation_name(spoken.join("\n"))
-    };
-    m3::card_high(palette).content(
-        StackPanel::new()
-            .spacing(tokens::spacing::SM)
-            .children((m3::section_title(title), body)),
-    )
+/// A monitor row as the menus, dialogs and conversation take it (the
+/// sidebar's row when it is not listed there).
+pub(super) fn row_agent(row: &MonitorRow) -> UiAgent {
+    UiAgent {
+        id: row.id.clone(),
+        generation: row.generation,
+        harness: row.harness.clone(),
+        state: row.state,
+        status_line: row.status_line.clone(),
+        project_id: row.project.clone(),
+        project_scope: row.project_scope.clone(),
+        repo_common_dir: None,
+        workspace: None,
+        parent: row.parent.clone(),
+        updated_at: 0,
+        title: row.title.clone(),
+        native_child: row.activity.is_some(),
+        tokens: row.tokens,
+        chat: row.chat,
+        archived: false,
+        pending: false,
+        organization: None,
+        tags: Vec::new(),
+        organization_revision: None,
+        model: row.model.clone(),
+        work: row.work.clone().map(Box::new),
+    }
 }

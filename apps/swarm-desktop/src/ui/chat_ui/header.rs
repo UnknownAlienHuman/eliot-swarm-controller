@@ -293,7 +293,11 @@ impl DesktopApp {
             goal,
             changes,
             workers,
-            details_open: self.panel == Panel::Details,
+            open: if self.panel_shown() {
+                self.panel
+            } else {
+                Panel::Closed
+            },
             menu,
             running,
             send: context.forward(),
@@ -482,7 +486,8 @@ pub(super) struct HeaderInput {
     changes: Option<(u64, u64)>,
     /// The task's workers.
     workers: usize,
-    details_open: bool,
+    /// The right pane's open tab (`Closed`: no pane).
+    open: Panel,
     /// The "…" entries; `None` while the detail is read (the button is
     /// shown, not active).
     menu: Option<Vec<MenuItem>>,
@@ -556,99 +561,95 @@ impl Component for Header {
                 )),
             None => View::empty(),
         };
-        // Changes and Agents open tabs of the right pane that this build
-        // does not have yet; Terminal has no terminal yet. Each says so.
-        let changes: View = {
-            let counts: View = match input.changes {
-                Some((add, del)) => m3::diff_counts(add, del, false),
-                None => View::empty(),
-            };
-            Border::new()
-                .content(
-                    m3::outlined_small(palette)
-                        .is_enabled(false)
-                        .automation_name("Changes: the Changes tab is not in this build yet")
-                        .content(
-                            StackPanel::new()
-                                .orientation(Orientation::Horizontal)
-                                .spacing(tokens::spacing::SM)
-                                .margin(Thickness::xy(
-                                    tokens::spacing::INSET - tokens::spacing::ROW,
-                                    0.0,
-                                ))
-                                .children((
-                                    m3::text("Changes", tokens::text::BUTTON)
-                                        .vertical_alignment(VerticalAlignment::Center),
-                                    counts,
-                                )),
-                        ),
-                )
-                .tooltip("The Changes tab is not in this build yet")
-        };
-        let agents: View = if input.workers > 0 {
-            Border::new()
-                .content(
-                    m3::outlined_small(palette)
-                        .is_enabled(false)
-                        .automation_name(format!(
-                            "Agents {}: the Agents tab is not in this build yet",
-                            input.workers
-                        ))
-                        .content(
-                            StackPanel::new()
-                                .orientation(Orientation::Horizontal)
-                                .spacing(tokens::spacing::SM)
-                                .margin(Thickness::xy(
-                                    tokens::spacing::INSET - tokens::spacing::ROW,
-                                    0.0,
-                                ))
-                                .children((
-                                    m3::small_icon(m3::glyph::HUB),
-                                    m3::text(
-                                        format!("Agents {}", input.workers),
-                                        tokens::text::BUTTON,
-                                    )
-                                    .vertical_alignment(VerticalAlignment::Center),
-                                )),
-                        ),
-                )
-                .tooltip("The Agents tab is not in this build yet")
-        } else {
-            Border::new()
-                .content(
-                    m3::icon_button(palette)
-                        .is_enabled(false)
-                        .automation_name("Agents: the Agents tab is not in this build yet")
-                        .content(m3::icon(m3::glyph::HUB)),
-                )
-                .tooltip("The Agents tab is not in this build yet")
-        };
-        let details = m3::icon_button(palette)
-            .resource_overrides(palette.toggle(input.details_open))
-            .automation_name(if input.details_open {
-                "Details (open)"
-            } else {
-                "Details"
-            })
-            .on_click(if input.details_open {
+        // The pane toggles (component 3): pressed = that tab of the right
+        // pane is open; the pressed one closes the pane. Changes and
+        // "Agents N" are labelled buttons (tonal when pressed), Agents
+        // without workers, Details and Terminal icon buttons.
+        let toggle = |panel: Panel| -> Callback<()> {
+            if input.open == panel {
                 context.message(Message::Shell(ShellMsg::PanelToggled(Panel::Closed)))
             } else {
-                context.message(Message::Monitor(MonitorMsg::PanelChosen(Panel::Details)))
-            })
-            .content(m3::icon(&if input.details_open {
-                m3::glyph::filled(m3::glyph::INFO)
+                context.message(Message::Shell(ShellMsg::PanelToggled(panel)))
+            }
+        };
+        let named = |panel: Panel, words: &str| -> String {
+            if input.open == panel {
+                format!("{words} (open)")
             } else {
-                m3::glyph::INFO.to_owned()
-            }))
-            .tooltip("Details");
-        let terminal: View = Border::new()
-            .content(
-                m3::icon_button(palette)
-                    .is_enabled(false)
-                    .automation_name("Terminal: no terminal in this build yet")
-                    .content(m3::icon(m3::glyph::TERMINAL)),
-            )
-            .tooltip("No terminal in this build yet");
+                words.to_owned()
+            }
+        };
+        let labelled = |pressed: bool| {
+            if pressed {
+                m3::tonal(palette)
+            } else {
+                m3::outlined_small(palette)
+            }
+        };
+        let changes: View = {
+            let pressed = input.open == Panel::Changes;
+            let counts: View = match input.changes {
+                Some((add, del)) => m3::diff_counts(add, del, pressed),
+                None => View::empty(),
+            };
+            labelled(pressed)
+                .automation_name(named(Panel::Changes, "Changes"))
+                .on_click(toggle(Panel::Changes))
+                .content(
+                    StackPanel::new()
+                        .orientation(Orientation::Horizontal)
+                        .spacing(tokens::spacing::SM)
+                        .margin(Thickness::xy(
+                            tokens::spacing::INSET - tokens::spacing::ROW,
+                            0.0,
+                        ))
+                        .children((
+                            m3::text("Changes", tokens::text::BUTTON)
+                                .vertical_alignment(VerticalAlignment::Center),
+                            counts,
+                        )),
+                )
+                .tooltip("Changes")
+        };
+        let icon_toggle = |panel: Panel, glyph: &str, words: &str| -> View {
+            let pressed = input.open == panel;
+            m3::icon_button(palette)
+                .resource_overrides(palette.toggle(pressed))
+                .automation_name(named(panel, words))
+                .on_click(toggle(panel))
+                .content(m3::icon(&if pressed {
+                    m3::glyph::filled(glyph)
+                } else {
+                    glyph.to_owned()
+                }))
+                .tooltip(words.to_owned())
+        };
+        let agents: View = if input.workers > 0 {
+            let pressed = input.open == Panel::Agents;
+            let words = format!("Agents {}", input.workers);
+            labelled(pressed)
+                .automation_name(named(Panel::Agents, &words))
+                .on_click(toggle(Panel::Agents))
+                .content(
+                    StackPanel::new()
+                        .orientation(Orientation::Horizontal)
+                        .spacing(tokens::spacing::SM)
+                        .margin(Thickness::xy(
+                            tokens::spacing::INSET - tokens::spacing::ROW,
+                            0.0,
+                        ))
+                        .children((
+                            m3::small_icon(m3::glyph::HUB),
+                            m3::text(words.clone(), tokens::text::BUTTON)
+                                .vertical_alignment(VerticalAlignment::Center),
+                        )),
+                )
+                .tooltip("Agents")
+        } else {
+            icon_toggle(Panel::Agents, m3::glyph::HUB, "Agents")
+        };
+        let details = icon_toggle(Panel::Details, m3::glyph::INFO, "Details");
+        let terminal = icon_toggle(Panel::Terminal, m3::glyph::TERMINAL, "Terminal (Ctrl+J)");
         let bar = Border::new()
             .height(tokens::height::HEADER)
             .background(palette.surface())

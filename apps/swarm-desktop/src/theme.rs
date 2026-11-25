@@ -590,6 +590,20 @@ pub mod winui {
             })
         }
 
+        /// A tab of the right pane (`.tab`): no fill, its label in
+        /// `on-surface-variant`, the open tab's in `primary-text` (its
+        /// 3-DIP `primary` indicator is drawn under it).
+        pub fn tab(self, selected: bool) -> ResourceOverrides {
+            self.with(|r| {
+                Family::new(None, if selected { r.primary_text } else { r.variant }).overrides(r)
+            })
+        }
+
+        /// The right pane's ground (`.pane-r`: `surface-container-low`).
+        pub fn pane(self) -> Brush {
+            self.role(|r| r.composer, ThemeBrush::SolidBackground)
+        }
+
         /// An outlined labelled button (`.btn.out`: Changes +/−, Deny):
         /// the outline in `outline-variant`, the content on-surface-variant.
         pub fn outlined_plain(self) -> ResourceOverrides {

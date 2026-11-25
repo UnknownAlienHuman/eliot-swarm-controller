@@ -41,8 +41,8 @@ use windows_sys::Win32::System::Threading::{GetCurrentProcessId, GetCurrentThrea
 use windows_sys::Win32::UI::HiDpi::GetDpiForWindow;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     GetActiveWindow, GetKeyState, VK_APPS, VK_B, VK_BROWSER_BACK, VK_BROWSER_FORWARD, VK_CONTROL,
-    VK_DOWN, VK_ESCAPE, VK_F, VK_F10, VK_K, VK_LEFT, VK_M, VK_N, VK_OEM_COMMA, VK_RETURN, VK_RIGHT,
-    VK_SHIFT, VK_TAB, VK_UP,
+    VK_DOWN, VK_ESCAPE, VK_F, VK_F10, VK_J, VK_K, VK_LEFT, VK_M, VK_N, VK_OEM_COMMA, VK_RETURN,
+    VK_RIGHT, VK_SHIFT, VK_TAB, VK_UP,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CWPSTRUCT, CallNextHookEx, GetCursorPos, GetForegroundWindow, GetWindowThreadProcessId,
@@ -80,6 +80,8 @@ pub enum Shortcut {
     Settings,
     /// Ctrl+B: hide or show the sidebar.
     Sidebar,
+    /// Ctrl+J: open or close the right pane's Terminal tab.
+    Terminal,
     /// Alt+←, the keyboard's Back key or the mouse's back button.
     Back,
     /// Alt+→, the keyboard's Forward key or the mouse's forward button.
@@ -322,6 +324,7 @@ fn chord(key: u16, ctrl: bool, shift: bool, alt: bool) -> Option<Shortcut> {
         VK_M => Some(Shortcut::ModelPicker),
         VK_OEM_COMMA => Some(Shortcut::Settings),
         VK_B => Some(Shortcut::Sidebar),
+        VK_J => Some(Shortcut::Terminal),
         _ => None,
     }
 }
