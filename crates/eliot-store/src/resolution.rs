@@ -331,22 +331,6 @@ impl Store {
 
     /// `preparation` binds the daemon's Git absence readback to the exact
     /// workspace snapshot. The manager holds its effect gates through commit.
-    pub fn resolve_command_with_absent_workspace(
-        &mut self,
-        principal: &str,
-        request: &CommandResolveRequest,
-        preparation: &WorkspacePreparation,
-        now: i64,
-    ) -> Result<Change<CommandResolveResponse>> {
-        self.resolve_command_with_workspace_launch_cleanup(
-            principal,
-            request,
-            preparation,
-            &WorkspaceLaunchCleanup::Removed,
-            now,
-        )
-    }
-
     pub fn resolve_command_with_workspace_launch_cleanup(
         &mut self,
         principal: &str,

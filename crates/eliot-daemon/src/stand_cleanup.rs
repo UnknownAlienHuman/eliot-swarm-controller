@@ -154,11 +154,6 @@ impl StandExternalCleanupReport {
             || !self.unusable_records.is_empty()
     }
 
-    pub fn has_unknown(&self) -> bool {
-        self.worktrees.iter().any(|item| item.outcome == "unknown")
-            || self.branches.iter().any(|item| item.outcome == "unknown")
-    }
-
     pub fn first_blocker_reason(&self) -> (&'static str, &str) {
         if let Some(reason) = self
             .worktrees
