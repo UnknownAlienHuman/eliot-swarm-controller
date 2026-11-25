@@ -83,7 +83,31 @@ pub(crate) fn init(data: &DataDir, lock: &DaemonLock) -> Result<DaemonLog> {
         ));
     }
     *current = Some(LogFile::open(data, lock)?);
+    eliot_store::observe_context_digest_warnings(record_context_digest_warning);
     Ok(DaemonLog { _owner: () })
+}
+
+fn record_context_digest_warning(
+    command: &str,
+    agent: Option<&str>,
+    turn: Option<&str>,
+    error: &Error,
+) {
+    // A retained context item uses its inject command ID. The digest error
+    // describes encoding or bounds, and the sink receives no request payload.
+    write_record(
+        &SecretPolicy::default(),
+        "context.legacy_digest_rebuild",
+        &[
+            ("context_id", command),
+            ("command_id", command),
+            ("agent_id", agent.unwrap_or_default()),
+            ("turn_id", turn.unwrap_or_default()),
+        ],
+        None,
+        Some(Map::from_iter([("level".to_owned(), json!("warn"))])),
+        Some(error),
+    );
 }
 
 impl Drop for DaemonLog {
@@ -385,6 +409,7 @@ fn encode_record(
                 | "generation"
                 | "command"
                 | "command_id"
+                | "context_id"
                 | "turn_id"
                 | "request_id"
                 | "restore_id"

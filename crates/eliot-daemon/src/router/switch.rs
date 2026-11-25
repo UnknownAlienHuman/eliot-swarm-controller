@@ -62,7 +62,7 @@ impl Router {
         match store.fail_switch_preparation(id, error, &policy, now_ms()) {
             Ok(change) => {
                 self.publish_locked(&change.events);
-                if !change.events.is_empty() && change.value.state == CommandState::Rejected {
+                if change.value.state == CommandState::Rejected && !change.events.is_empty() {
                     log_refusal(&policy, id, &error.code, &error.message);
                 }
             }
@@ -713,16 +713,7 @@ impl Router {
         let admission = match prepared {
             Ok(admission) => admission,
             Err(error) => {
-                let policy = self.secret_policy_snapshot();
-                let mut store = self.inner.store.lock().await;
-                if let Ok(change) = store.fail_switch_preparation(id, &error, &policy, now_ms()) {
-                    self.publish_locked(&change.events);
-                    if !change.events.is_empty() && change.value.state == CommandState::Rejected {
-                        log_refusal(&policy, id, &error.code, &error.message);
-                    }
-                }
-                self.signal_progress();
-                self.signal_launch_arbitration();
+                self.reject_switch_input(id, &error).await;
                 return;
             }
         };
