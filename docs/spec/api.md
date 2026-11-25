@@ -2183,10 +2183,11 @@ A session whose plugin declares `steer_delivery: "turn_safe_point"` (Claude) tak
 at a hook. Its admission also requires `args.text` alone, a live runtime with that hook support, a healthy native stream and no in-flight
 stop, and the `#888` Swarm-note frame must fit the 1 MiB hook response. Store rechecks the
 dispatch gates, including rule-action order, and claims pending Claude steers in FIFO order
-on the soonest `PreToolUse` or `PostToolUse` callback (`hook.event`) for that exact turn
+on the soonest `PreToolUse`, `PostToolUse` or `PostToolUseFailure` callback
+(`hook.event`) for that exact turn
 using the `#888` Swarm note frame (preserving Owner and manager sender identity). A steer
 that cannot be rendered is rejected alone, and the rest of the hook batch is delivered.
-The steer stays bound to its exact turn: if the turn ends without another tool call, it
+The steer stays bound to its exact turn: if the turn ends before another safe point, it
 settles `rejected` (`captured_turn_ended`) and never moves to a later turn, so the sender
 sees the rejection and can resend with `send`. It settles `unknown` only if a claimed hook
 write outcome is unconfirmed, without replaying or moving to `next_input`.

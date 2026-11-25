@@ -519,7 +519,8 @@ channel. The connection credential binds the Agent generation; the plugin cannot
 or override that identity in the callback. The shared wire DTOs are named `HookEvent`
 and `HookResponse`; their field catalog belongs in the [protocol DTO module](../../crates/eliot-plugin/src/protocol.rs),
 while this spec owns their semantics. A callback reports
-`before_tool` (Claude Code `PreToolUse`), `after_tool` (Claude Code `PostToolUse`), or `before_model` (OpenCode `context` hook and
+`before_tool` (Claude Code `PreToolUse`), `after_tool` (Claude Code `PostToolUse` or
+`PostToolUseFailure`), or `before_model` (OpenCode `context` hook and
 Antigravity `PreInvocation`), its exact `turn_id`, and an opaque `consumer_id`; the response
 carries `context[]` as shared Core `ContextItem` values.
 
@@ -1279,16 +1280,18 @@ bind exact generation/request/deadline. Timeout uses the safe native default; la
 approval is discarded, not queued. Hooks do not duplicate the authoritative stream.
 
 Claude Code delivers `turn_safe_point` context and exact-turn `steer` commands through
-`PreToolUse.additionalContext` and `PostToolUse.additionalContext`. Store frames each
-claimed item using the shared Swarm note format (preserving Owner and manager sender
+the `additionalContext` response to `PreToolUse`, `PostToolUse` or
+`PostToolUseFailure`. The two after-tool hooks share one claim slot per native
+tool invocation. Store frames each claimed item using the shared Swarm note
+format (preserving Owner and manager sender
 identity) and supplies it to the soonest `before_tool` or `after_tool` `hook.event`
 callback for that exact turn. The adapter writes the supplied text on the selected
-callback and reports `claude.PreToolUse.additionalContext` or
-`claude.PostToolUse.additionalContext` on the committed `hook.before_tool` /
-`hook.after_tool` receipt. Existing approval callbacks retain permission decisions.
+callback and reports `claude.<native hook name>.additionalContext` on the committed
+`hook.before_tool` / `hook.after_tool` receipt. Existing approval callbacks retain
+permission decisions.
 
-Both Claude tool hooks have a three-second native timeout and matching adapter deadlines.
-Empty responses contribute to `empty_after_tool_hooks` on the turn terminal.
+Claude tool hooks have a three-second native timeout and matching adapter deadlines.
+Empty after-tool responses contribute to `empty_after_tool_hooks` on the turn terminal.
 Only a context delivery emits a `hook.after_tool` receipt. A successful file write
 with an empty selection emits a `tool.file.edited` fact. OpenCode and Antigravity
 also emit this fact for successful native edits with an attributable edit path.

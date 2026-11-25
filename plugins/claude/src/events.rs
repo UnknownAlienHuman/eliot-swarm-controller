@@ -243,31 +243,32 @@ enum HookConsumerState {
     Finished,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy)]
 enum HookPoint {
     BeforeTool,
-    AfterTool,
+    AfterTool { succeeded: bool },
 }
 
 impl HookPoint {
     fn native_event_name(self) -> &'static str {
         match self {
             Self::BeforeTool => "PreToolUse",
-            Self::AfterTool => "PostToolUse",
+            Self::AfterTool { succeeded: true } => "PostToolUse",
+            Self::AfterTool { succeeded: false } => "PostToolUseFailure",
         }
     }
 
     fn event_kind(self) -> &'static str {
         match self {
             Self::BeforeTool => "hook.before_tool",
-            Self::AfterTool => "hook.after_tool",
+            Self::AfterTool { .. } => "hook.after_tool",
         }
     }
 
     fn event_name(self) -> &'static str {
         match self {
             Self::BeforeTool => "before_tool",
-            Self::AfterTool => "after_tool",
+            Self::AfterTool { .. } => "after_tool",
         }
     }
 }
@@ -288,14 +289,14 @@ impl ToolUseBinding {
     fn hook_state(&self, hook: HookPoint) -> HookConsumerState {
         match hook {
             HookPoint::BeforeTool => self.before_hook_state,
-            HookPoint::AfterTool => self.after_hook_state,
+            HookPoint::AfterTool { .. } => self.after_hook_state,
         }
     }
 
     fn is_active_consumer(&self, hook: HookPoint, consumer_id: &str) -> bool {
         let active = match hook {
             HookPoint::BeforeTool => self.before_consumer_id.as_deref(),
-            HookPoint::AfterTool => self.after_consumer_id.as_deref(),
+            HookPoint::AfterTool { .. } => self.after_consumer_id.as_deref(),
         };
         active == Some(consumer_id)
     }
@@ -306,7 +307,7 @@ impl ToolUseBinding {
                 self.before_hook_state = HookConsumerState::InFlight;
                 self.before_consumer_id = Some(consumer_id);
             }
-            HookPoint::AfterTool => {
+            HookPoint::AfterTool { .. } => {
                 self.after_hook_state = HookConsumerState::InFlight;
                 self.after_consumer_id = Some(consumer_id);
             }
@@ -322,7 +323,7 @@ impl ToolUseBinding {
                 self.before_hook_state = HookConsumerState::Finished;
                 self.before_consumer_id = None;
             }
-            HookPoint::AfterTool => {
+            HookPoint::AfterTool { .. } => {
                 self.after_hook_state = HookConsumerState::Finished;
                 self.after_consumer_id = None;
             }
@@ -334,7 +335,9 @@ impl ToolUseBinding {
             HookPoint::BeforeTool if self.before_hook_state == HookConsumerState::Available => {
                 self.before_hook_state = HookConsumerState::Finished;
             }
-            HookPoint::AfterTool if self.after_hook_state == HookConsumerState::Available => {
+            HookPoint::AfterTool { .. }
+                if self.after_hook_state == HookConsumerState::Available =>
+            {
                 self.after_hook_state = HookConsumerState::Finished;
             }
             _ => {}
@@ -2265,7 +2268,8 @@ impl EventProcessor {
         };
         let hook = match body.input.get("hook_event_name").and_then(Value::as_str) {
             Some("PreToolUse") => HookPoint::BeforeTool,
-            Some("PostToolUse") => HookPoint::AfterTool,
+            Some("PostToolUse") => HookPoint::AfterTool { succeeded: true },
+            Some("PostToolUseFailure") => HookPoint::AfterTool { succeeded: false },
             _ => return self.write_hook_pass(&native, request_id, deadline).await,
         };
         if body.subtype != "hook_callback"
@@ -2349,7 +2353,7 @@ impl EventProcessor {
             &tool_use_id,
             &self.workspace,
             &policy,
-            hook == HookPoint::AfterTool,
+            matches!(hook, HookPoint::AfterTool { succeeded: true }),
         );
         let event = HookEvent {
             hook: hook.event_name().to_owned(),
@@ -2378,9 +2382,10 @@ impl EventProcessor {
             // The start callback corroborates the completion-time shell cwd.
             match hook {
                 HookPoint::BeforeTool => binding.shell_cwd = shell_cwd.map(str::to_owned),
-                HookPoint::AfterTool => {
-                    binding.shell_cwd_confirmed =
-                        shell_cwd.is_some() && binding.shell_cwd.as_deref() == shell_cwd;
+                HookPoint::AfterTool { succeeded } => {
+                    binding.shell_cwd_confirmed = succeeded
+                        && shell_cwd.is_some()
+                        && binding.shell_cwd.as_deref() == shell_cwd;
                 }
             }
             binding.start_hook(hook, consumer_id.clone());
@@ -2669,7 +2674,7 @@ impl EventProcessor {
         consumer_id: String,
         tool: &HookToolFacts,
     ) -> Result<()> {
-        let kind = if hook == HookPoint::AfterTool {
+        let kind = if matches!(hook, HookPoint::AfterTool { .. }) {
             self.empty_after_tool_hooks = self.empty_after_tool_hooks.saturating_add(1);
             if !tool.has_edit() {
                 return Ok(());
