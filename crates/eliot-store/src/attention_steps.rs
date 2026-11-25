@@ -426,7 +426,7 @@ impl Store {
         let mut statement = self
             .connection
             .prepare(
-                "SELECT generation, ts, data FROM events INDEXED BY events_kind
+                "SELECT generation, ts, data FROM events INDEXED BY events_monitoring_agent
                  WHERE agent = ?1 AND generation IS NOT NULL AND kind = ?2
                    AND kind IN ('session.growth', 'x.user.agent.attention_step')
                    AND (?3 IS NULL OR json_extract(data, '$.turn_id') = ?3)

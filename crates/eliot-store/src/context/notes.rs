@@ -40,10 +40,10 @@ pub(crate) fn read_counters(
                 sum(outcome.delivered), sum(outcome.moved), sum(outcome.cancelled),
                     sum(CASE WHEN outcome.delivered AND (
                         (c.principal = 'swarm_note:no_check_before_end' AND EXISTS (
-                            SELECT 1 FROM events AS checked INDEXED BY events_agent
+                            SELECT 1 FROM events AS checked INDEXED BY autonomy_activity_events_window
                             WHERE checked.agent = c.target AND checked.generation = c.generation
                             AND checked.ts > c.updated_at AND checked.ts <= ?2
-                            AND checked.kind IN ('goal.round', 'project.check.finished')
+                            AND (checked.kind = 'goal.round' OR checked.kind = 'project.check.finished')
                             AND json_type(checked.data, '$.exit_code') = 'integer'
                         )) OR (c.principal = 'swarm_note:outside_scope' AND EXISTS (
                             SELECT 1 FROM events AS restored INDEXED BY events_agent

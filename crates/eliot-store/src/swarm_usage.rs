@@ -299,11 +299,12 @@ impl Store {
                            WHEN e.kind = 'tool.completed'
                             AND json_extract(e.data, '$.status') = 'refused'
                             AND EXISTS (
-                                SELECT 1 FROM events AS started
+                                SELECT 1 FROM events AS started INDEXED BY usage_daemon_tool_pairs
                                 WHERE started.agent = e.agent
                                   AND started.generation = e.generation
                                   AND started.source = 'daemon'
                                   AND started.kind = 'tool.started'
+                                  AND started.kind IN ('tool.started', 'tool.completed')
                                   AND json_extract(started.data, '$.origin') = ?2
                                   AND json_extract(started.data, '$.tool') = ?3
                                   AND json_extract(started.data, '$.call_id') =
@@ -313,8 +314,7 @@ impl Store {
                             )
                            THEN json_extract(e.data, '$.call_id') END) AS refusals,
                        MAX(e.seq) AS latest
-                FROM events AS e INDEXED BY events_agent
-                JOIN wanted AS w
+                FROM wanted AS w CROSS JOIN events AS e INDEXED BY usage_daemon_tool_pairs
                   ON w.agent = e.agent AND w.generation = e.generation
                 WHERE e.source = 'daemon'
                   AND e.kind IN ('tool.started', 'tool.completed')

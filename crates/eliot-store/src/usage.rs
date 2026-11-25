@@ -736,7 +736,7 @@ impl Store {
                 Ok(())
             })?;
         }
-        self.accumulate_usage_context(&wanted, &agent_ids, &mut role_usage)?;
+        self.accumulate_usage_context(pairs, &mut role_usage)?;
         let sessions = self.summarize_sessions(&wanted)?;
         let (swarm_mcp, swarm_mcp_truncated) = self.swarm_mcp_turn_usage(pairs)?;
         let by_role = role_usage.finish();
@@ -1245,43 +1245,52 @@ fn normalize_baseline_source(source: Option<&str>) -> String {
 impl Store {
     fn accumulate_usage_context(
         &self,
-        wanted: &std::collections::HashSet<(i64, i64)>,
-        agents: &BTreeSet<i64>,
+        pairs: &[(i64, i64)],
         role_usage: &mut RoleUsage,
     ) -> Result<()> {
-        if agents.is_empty() {
+        if pairs.is_empty() {
             return Ok(());
         }
-        let placeholders = agents.iter().map(|_| "?").collect::<Vec<_>>().join(",");
         let manager = manager_at_sql("e.agent", "e.ts");
         let sql = format!(
-            "SELECT e.agent, e.generation, e.data, {manager}
-             FROM events e
-             WHERE e.kind = 'session.usage' AND e.agent IN ({placeholders})
+            "WITH wanted AS (
+                 SELECT DISTINCT json_extract(value, '$[0]') AS agent,
+                                 json_extract(value, '$[1]') AS generation FROM json_each(?1)
+             )
+             SELECT json_type(e.data, '$.usage'), json_extract(e.data, '$.usage'), {manager}
+             FROM wanted w CROSS JOIN events e INDEXED BY usage_context_pairs
+               ON e.agent = w.agent AND e.generation = w.generation
+             WHERE e.kind = 'session.usage'
              ORDER BY e.seq"
         );
-        let mut statement = self.connection.prepare(&sql).map_err(sql_error)?;
+        let mut statement = self.connection.prepare_cached(&sql).map_err(sql_error)?;
         let rows = statement
-            .query_map(params_from_iter(agents.iter()), |row| {
+            .query_map([encode_json(&pairs)?], |row| {
+                let kind: Option<String> = row.get(0)?;
                 Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, i64>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, bool>(3)?,
+                    if matches!(kind.as_deref(), Some("object" | "array")) {
+                        Some(row.get::<_, String>(1)?)
+                    } else {
+                        None
+                    },
+                    kind.is_some(),
+                    row.get::<_, bool>(2)?,
                 ))
             })
             .map_err(sql_error)?;
         for row in rows {
-            let (agent, generation, data, manager) = row.map_err(sql_error)?;
-            if !wanted.contains(&(agent, generation)) {
-                continue;
-            }
-            let event: serde_json::Value = serde_json::from_str(&data)
-                .map_err(|_| Error::new("internal", "retained session usage event is malformed"))?;
-            let mut usage: SessionUsage =
-                serde_json::from_value(event.get("usage").cloned().ok_or_else(|| {
-                    Error::new("internal", "retained session usage event has no usage")
-                })?)
+            let (raw, present, manager) = row.map_err(sql_error)?;
+            let raw = raw.ok_or_else(|| {
+                Error::new(
+                    "internal",
+                    if present {
+                        "retained session usage data is malformed"
+                    } else {
+                        "retained session usage event has no usage"
+                    },
+                )
+            })?;
+            let mut usage: SessionUsage = serde_json::from_str(&raw)
                 .map_err(|_| Error::new("internal", "retained session usage data is malformed"))?;
             usage.validate()?;
             usage.retain_valid_context();
