@@ -299,6 +299,7 @@ struct RouterInner {
     launch_arbitration: watch::Sender<u64>,
     direct_launches: Mutex<launch_queue::DirectLaunches>,
     usage_summary_cache: Mutex<UsageSummaryCache>,
+    recent_patch_reads: patch_digest::PatchReadCache,
 }
 
 const USAGE_SUMMARY_CACHE_CAPACITY: usize = 8;
@@ -657,6 +658,7 @@ impl Router {
                 launch_arbitration,
                 direct_launches: Mutex::new(launch_queue::DirectLaunches::default()),
                 usage_summary_cache: Mutex::new(UsageSummaryCache::default()),
+                recent_patch_reads: Default::default(),
             }),
         })
     }
