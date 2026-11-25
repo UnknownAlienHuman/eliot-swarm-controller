@@ -370,14 +370,20 @@ prints the same typed readback. Missing fields from older Store rows remain abse
 
 ## Shared owner rules
 
-`[owner_rules].text` in the unified settings file is the single shared owner-rule
-source. `settings.read` exposes the unified settings-file revision beside that text.
-A launch freezes the revision and SHA-256 of the text before native dispatch.
+`[owner_rules].text` in the unified settings file supplies custom shared Owner
+rules. When it is blank or absent, the built-in rule asks Agents to commit
+locally for delivery and leave pushing, opening pull requests and merging to
+explicit authority from the Owner for the task. Set
+`[owner_rules].default_commit_only = false` to opt out for future snapshots.
+Nonblank custom text supplies the complete shared instruction.
+`settings.read` shows the configured settings and their revision.
+A launch freezes the revision and SHA-256 of the effective text before native dispatch.
 Queued launches use the rules available when they start. A resume reuses the
 retained digest, and a legacy Agent can capture the current setting when explicitly
-reopened. Delivery resolves that digest from settings. If the text changes before
-delivery or native reopen, the operation reports that the retained rules are
-unavailable. Settings saves reject values detected by the secret policy, redaction
+reopened. The built-in rule remains available for Agents that froze it before an
+opt-out or a custom rules change. Delivery resolves custom text by its digest
+from settings. If the custom text changes before delivery or native reopen, the
+operation reports that the retained rules are unavailable. Settings saves reject values detected by the secret policy, redaction
 markers, and common credential forms such as bearer tokens and private keys. The
 same validation applies to text read for delivery.
 

@@ -1104,19 +1104,32 @@ pub(crate) fn current_revision(data_root: &Path) -> core::Result<Option<String>>
         .map(profiles_edit::revision_of))
 }
 
-/// Read the current owner rules and the exact unified-settings revision they came from.
-pub(crate) fn owner_rules_snapshot(data_root: &Path) -> core::Result<Option<(String, String)>> {
-    let Some(source) = read_config_source(data_root)? else {
-        return Ok(None);
-    };
+// Keep the bytes available for Agents that froze this rule on launch. Custom
+// Owner text replaces the default without changing existing custom digests.
+const DEFAULT_COMMIT_ONLY_RULE: &str = "Commit locally for delivery. Push branches, open pull requests, or merge only when the Owner explicitly authorizes that action for this task.";
+
+fn read_owner_rules_config(data_root: &Path) -> core::Result<(String, OwnerRulesConfig)> {
+    let source = read_config_source(data_root)?.unwrap_or_default();
     let revision = profiles_edit::revision_of(&source);
-    let config = super::parse_config(&source)?;
-    let text = config.owner_rules.text;
-    if text.trim().is_empty() {
-        Ok(None)
-    } else {
-        Ok(Some((revision, text)))
+    Ok((revision, super::parse_config(&source)?.owner_rules))
+}
+
+/// Compare only text the Owner configured with their native user files.
+pub(crate) fn configured_owner_rules_text(data_root: &Path) -> core::Result<Option<String>> {
+    let (_, rules) = read_owner_rules_config(data_root)?;
+    Ok((!rules.text.trim().is_empty()).then_some(rules.text))
+}
+
+/// Read the effective instruction and its unified-settings revision.
+pub(crate) fn owner_rules_snapshot(data_root: &Path) -> core::Result<Option<(String, String)>> {
+    let (revision, rules) = read_owner_rules_config(data_root)?;
+    if !rules.text.trim().is_empty() {
+        return Ok(Some((revision, rules.text)));
     }
+    Ok(rules
+        .default_commit_only
+        .unwrap_or(true)
+        .then(|| (revision, DEFAULT_COMMIT_ONLY_RULE.to_owned())))
 }
 
 static CREDENTIAL_PATTERN: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
@@ -1168,6 +1181,10 @@ pub(crate) fn owner_rules_for_delivery(
     digest: &str,
     policy: &SecretPolicy,
 ) -> core::Result<String> {
+    if eliot_core::api::inference::sha256_hex(DEFAULT_COMMIT_ONLY_RULE.as_bytes()) == digest {
+        validate_owner_rules_text(DEFAULT_COMMIT_ONLY_RULE, policy)?;
+        return Ok(DEFAULT_COMMIT_ONLY_RULE.to_owned());
+    }
     if let Some((_, text)) = owner_rules_snapshot(data_root)?
         && eliot_core::api::inference::sha256_hex(text.as_bytes()) == digest
     {
