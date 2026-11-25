@@ -1143,6 +1143,29 @@ does not claim a full external workflow.
 Contain owned children before tools run; use absolute deadlines. Drain buffered native
 output before declaring loss. Plugin replacement never rebinds an uncertain old call.
 Persisted facts backpressure; ephemeral telemetry may drop with visible lag.
+
+### Live assistant preview
+
+Controlled Claude and Codex adapters translate native assistant text deltas into
+the authenticated `turn.preview.put` RPC. Each chunk carries the exact Agent,
+generation, turn and native message ID, a zero-based message sequence and UTF-8
+text. Claude uses `--include-partial-messages` and the main session's text blocks.
+Codex uses `item/agentMessage/delta` from the bound thread. The shared sender has
+a bounded, best-effort queue. Dropped chunks cannot delay or determine durable
+settlement. The host accepts a contiguous prefix from sequence zero and never
+joins text across a gap or across messages. An empty chunk marks the message
+truncated. Preview frames do not extend the terminal deadline.
+
+The host binds chunks to a committed live turn of the authenticated plugin.
+At most 64 live turns hold the latest message's preview, with 32 KiB of input
+per turn and 2 KiB per chunk. The host uses the same source credentials as
+committed messages, redacts accumulated text across chunk boundaries,
+and withholds dangling literal-secret prefixes and up to 128 bytes of an
+unfinished word. It coalesces updates at 100 ms and drops the preview on turn end or
+generation change. Preview bytes have no Store rows, sequence numbers, or replay.
+The existing message-completion path still commits only the completed message.
+Its optional `data.message_id` correlates the native message with its preview.
+
 Claude's native stdout queue holds 64 frames. Its event processor waits for
 each Store acknowledgement before moving on. Native queue overflow faults the
 stream. The adapter reports a source gap for the lost coverage. Coverage

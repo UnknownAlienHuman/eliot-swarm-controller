@@ -2013,6 +2013,7 @@ async fn launch_session(
         OsString::from("--output-format"),
         OsString::from("stream-json"),
         OsString::from("--verbose"),
+        OsString::from("--include-partial-messages"),
         OsString::from("--permission-prompt-tool"),
         OsString::from("stdio"),
     ];

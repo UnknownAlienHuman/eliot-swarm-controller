@@ -46,6 +46,7 @@ const OVERSIZED_KNOWN_METHODS: &[&str] = &[];
 /// One non-response stream record for the event task.
 pub(crate) enum ClaudeFrame {
     Record(Value),
+    Preview { record: Value, gap: bool },
 }
 
 #[derive(Clone)]
@@ -413,6 +414,12 @@ fn classify_claude_frame(value: Value) -> PumpAction<ClaudeFrame> {
             key: response.response.request_id,
             result,
         };
+    }
+    if kind == "stream_event" {
+        return PumpAction::BestEffort(Box::new(move |gap| ClaudeFrame::Preview {
+            record: value,
+            gap,
+        }));
     }
     PumpAction::Emit(ClaudeFrame::Record(value))
 }

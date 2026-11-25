@@ -916,6 +916,9 @@ pub struct PendingGuard {
 pub enum PumpAction<Frame> {
     /// A protocol frame for the event task (subject to the queue bound).
     Emit(Frame),
+    /// A disposable frame. The builder receives whether an earlier
+    /// disposable frame was dropped before this one.
+    BestEffort(Box<dyn FnOnce(bool) -> Frame + Send>),
     /// A correlated reply for one pending call.
     Route { key: String, result: Result<Value> },
     /// The stream is unusable from here on; the pump gaps and fails pending.
@@ -2115,6 +2118,7 @@ where
         ),
     );
     let mut overflowed = false;
+    let mut best_effort_gap = false;
     let mut exit_deadline = process_exit
         .borrow()
         .as_ref()
@@ -2289,6 +2293,13 @@ where
                         }
                     }
                 }
+            }
+            PumpAction::BestEffort(frame) => {
+                // Reserve half the native queue for exact lifecycle facts.
+                // Preview pressure must never fence the native stream.
+                best_effort_gap = overflowed
+                    || frames.capacity() <= frames.max_capacity() / 2
+                    || frames.try_send(frame(best_effort_gap)).is_err();
             }
             PumpAction::Route { key, result } => {
                 pending.route(&key, result, line.len());

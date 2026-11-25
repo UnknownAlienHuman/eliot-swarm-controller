@@ -27,6 +27,7 @@ pub mod stop_readback;
 pub mod sync;
 pub mod text_inference;
 pub mod turn_containment;
+pub mod turn_preview;
 pub mod turn_readback;
 pub mod usage;
 

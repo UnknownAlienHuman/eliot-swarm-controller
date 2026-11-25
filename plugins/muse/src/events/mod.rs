@@ -1161,6 +1161,7 @@ impl EventProcessor {
 
     async fn handle_frame(&mut self, frame: Option<NativeFrame>) -> bool {
         match frame {
+            Some(NativeFrame::BestEffortNotification { .. }) => {}
             Some(NativeFrame::Request { id, method, params }) => {
                 if !self.status.ready || self.status.active_turn_id.is_none() {
                     self.buffer.push(

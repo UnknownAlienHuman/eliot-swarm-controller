@@ -513,6 +513,7 @@ command id frozen at claim. The settled event's persisted `kind` is exactly
 | `workspace.list` | owner-only page of the managed worktrees Swarm created |
 | `command.submit/get` | implemented immutable admission and command readback |
 | `turn.get` | implemented running/completed/unknown turn read |
+| `turn.preview.watch` | long-poll the bounded in-memory assistant preview for one exact live turn |
 | `swarm.wait` | bounded wait over a frozen child command/turn set with all/any, timeout and honest per-entry outcomes |
 | `swarm.digest` | durable digest over a frozen child set delivering one coalesced parent mailbox result with the standard mail wake |
 | `command.resolve`, `turn.resolve` | constrained Owner resolution of unknown outcomes, interrupted switch checkout release, and asserted application of a failed handoff brief |
@@ -2995,6 +2996,20 @@ unsupported until that native path exists: revoke control and become observe-onl
 exact success without killing the shared/adopted service. It does not settle an unknown
 input. Controlled resume reopens the same native subject as a new generation and never
 resends previous input.
+
+## Live turn preview
+
+`turn.preview.watch {agent,generation,turn_id,revision?}` uses the Agent read
+scope of `turn.get`. Supply the visible turn's exact binding and the last
+returned non-null revision. The first call returns the current state. A long
+poll waits up to 20 seconds. On timeout it returns the same revision with
+`preview:null,ended:false`. The daemon limits concurrent calls to 32 overall
+and four per principal. Excess calls return `busy`. A changed revision
+replaces the preview with `{message_id,text,truncated}`, or clears it if
+`preview` is null. A turn that is no longer active returns `ended:true` with
+a null preview. Discard the preview on terminal notification or selection change.
+Previews are best effort. The committed transcript remains the source for
+complete messages and pagination.
 
 ## Event replay
 
