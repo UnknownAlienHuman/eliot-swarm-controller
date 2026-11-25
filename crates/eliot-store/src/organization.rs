@@ -214,8 +214,8 @@ fn checkout_key_sql(column: &str) -> String {
 /// worktree lookups use the existing unique-path index and owner primary key.
 pub(super) fn registration_key_indexes() -> String {
     format!(
-        "CREATE INDEX organization_registration_checkout ON project_registrations({});
-         CREATE INDEX organization_registration_common ON project_registrations({});",
+        "CREATE INDEX IF NOT EXISTS organization_registration_checkout ON project_registrations({});
+         CREATE INDEX IF NOT EXISTS organization_registration_common ON project_registrations({});",
         checkout_key_sql("checkout"),
         checkout_key_sql("repo_common_dir"),
     )
