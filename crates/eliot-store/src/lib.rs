@@ -2366,12 +2366,20 @@ impl Store {
         generation: i64,
         turn_id: &str,
     ) -> Result<Option<Event>> {
-        let record = self.connection.query_row(
-            "SELECT seq, ts, kind, agent, generation, source, native_id, data, subject, cause FROM events
+        let record = self
+            .connection
+            .query_row(
+                "SELECT seq, ts, kind, agent, generation, source, native_id, data, subject, cause
+             FROM events INDEXED BY owner_inbox_turn_events
              WHERE agent = ?1 AND generation = ?2 AND kind IN ('turn.completed', 'turn.unknown')
-               AND json_extract(data, '$.turn_id') = ?3 ORDER BY seq DESC LIMIT 1",
-            params![parse_agent_id(agent)?, generation, turn_id], event_record_from_row,
-        ).optional().map_err(sql_error)?;
+               AND json_type(data, '$.turn_id') = 'text'
+               AND CAST(json_extract(data, '$.turn_id') AS TEXT) = ?3
+             ORDER BY seq DESC LIMIT 1",
+                params![parse_agent_id(agent)?, generation, turn_id],
+                event_record_from_row,
+            )
+            .optional()
+            .map_err(sql_error)?;
         record.map(event_from_record).transpose()
     }
 
@@ -2666,11 +2674,13 @@ impl Store {
             .connection
             .prepare(
                 "SELECT seq, ts, kind, agent, generation, source, native_id, data, subject, cause
-                 FROM events
-                 WHERE agent = ?1 AND generation = ?2
-                   AND (kind IN ('agent.lost', 'agent.failed')
-                        OR (kind = 'agent.stopped'
-                            AND json_extract(data, '$.reason') = 'owned_exit_before_restart'))
+                 FROM events INDEXED BY autonomy_fleet_agent_state_event
+                 WHERE agent = ?1 AND generation = ?2 AND kind IN ('agent.failed', 'agent.lost')
+                 UNION ALL
+                 SELECT seq, ts, kind, agent, generation, source, native_id, data, subject, cause
+                 FROM events INDEXED BY events_kind
+                 WHERE agent = ?1 AND generation = ?2 AND kind = 'agent.stopped'
+                   AND json_extract(data, '$.reason') = 'owned_exit_before_restart'
                  ORDER BY seq DESC LIMIT ?3",
             )
             .map_err(sql_error)?;

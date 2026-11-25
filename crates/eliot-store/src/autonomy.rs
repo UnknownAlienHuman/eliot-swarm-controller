@@ -6,8 +6,7 @@ mod shell;
 
 use super::{Result, Store, sql_error};
 use eliot_core::api::AutonomyResponse;
-use rusqlite::{Connection, OpenFlags, OptionalExtension};
-use std::{path::Path, time::Duration};
+use rusqlite::{Connection, OptionalExtension};
 
 pub(super) const PROVIDER_HOLD_AGE_INDEX: &str =
     "CREATE INDEX IF NOT EXISTS autonomy_fleet_provider_hold_age
@@ -15,22 +14,15 @@ pub(super) const PROVIDER_HOLD_AGE_INDEX: &str =
 pub(super) const INDEXES: &[&str] = &[activity::INDEXES, fleet::INDEXES, PROVIDER_HOLD_AGE_INDEX];
 
 impl Store {
-    pub fn read_autonomy(
-        path: &Path,
+    pub fn autonomy_from_snapshot(
+        &self,
         since: i64,
         until: i64,
         confirmed: &super::StuckStates,
     ) -> Result<AutonomyResponse> {
-        #[cfg(windows)]
-        let path = &eliot_core::verbatim_path(path);
-        let mut connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
-            .map_err(sql_error)?;
-        connection
-            .busy_timeout(Duration::from_secs(1))
-            .map_err(sql_error)?;
-        let tx = connection.transaction().map_err(sql_error)?;
-        let activity = activity::read(&tx, since, until)?;
-        let fleet = fleet::read(&tx, since, until, confirmed)?;
+        let connection = &self.connection;
+        let activity = activity::read(connection, since, until)?;
+        let fleet = fleet::read(connection, since, until, confirmed)?;
         let mut report = AutonomyResponse {
             since_ms: since,
             until_ms: until,
@@ -44,7 +36,7 @@ impl Store {
             executor_swarm: activity.executor_swarm,
             work_in_git: activity.work_in_git,
         };
-        if event_window_pruned(&tx, since)? {
+        if event_window_pruned(connection, since)? {
             let reason = "the event retention boundary overlaps the requested window";
             report.checks.limit_coverage(reason);
             report.waits.limit_coverage(reason);
@@ -52,7 +44,6 @@ impl Store {
             report.executor_swarm.limit_coverage(reason);
             report.work_in_git.limit_coverage(reason);
         }
-        tx.commit().map_err(sql_error)?;
         Ok(report)
     }
 }
