@@ -1725,15 +1725,17 @@ pub struct ProjectRegistrationView {
     #[serde(default)]
     pub policy_usage: ProjectPolicyUsageView,
     /// The repository's name from its `origin` remote URL (the last path
-    /// segment without `.git`), read live from Git by `project.list` and
+    /// segment without `.git`), observed by Git monitoring for `project.list` and
     /// `project.get`. Read-only: never stored or settable, never the URL
     /// itself (which may embed credentials); absent without an `origin`
     /// remote or when Git cannot read it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origin: Option<String>,
-    /// Live checkout identities verified against this registration's common directory.
+    /// Checkout identities verified against this registration's common directory.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub checkouts: Vec<ProjectCheckoutView>,
+    #[serde(default, skip_serializing_if = "ProjectGitReadbackState::is_current")]
+    pub git_readback_state: ProjectGitReadbackState,
 }
 
 #[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1743,6 +1745,23 @@ pub struct ProjectCheckoutView {
     pub main: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub branch: Option<String>,
+}
+
+/// Whether the registration has a current, verified Git observation.
+#[derive(
+    schemars::JsonSchema, Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum ProjectGitReadbackState {
+    #[default]
+    Current,
+    Refreshing,
+}
+
+impl ProjectGitReadbackState {
+    pub fn is_current(&self) -> bool {
+        *self == Self::Current
+    }
 }
 
 /// A bare repository name as [`ProjectRegistrationView::origin`] carries
@@ -1850,6 +1869,14 @@ impl ProjectRegistrationView {
     /// Pure readback grammar. Store/daemon own canonical repository identity and
     /// the authority checks for the explicit profile/action allowsets.
     pub fn validate(&self) -> Result<()> {
+        if !self.git_readback_state.is_current()
+            && (self.origin.is_some() || !self.checkouts.is_empty())
+        {
+            return Err(Error::new(
+                "invalid",
+                "refreshing project readback carries Git data",
+            ));
+        }
         text(&self.id)?;
         text(&self.checkout)?;
         text(&self.repo_common_dir)?;
