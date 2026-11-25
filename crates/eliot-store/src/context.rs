@@ -1792,12 +1792,12 @@ pub(super) fn allows_next_input_fallback(
         if let Some(expires) = args.expires_at_ms {
             semantic_args["expires_at_ms"] = json!(expires);
         }
-        if legacy_request_digest_matches(&request, &semantic_args, &digest)? {
+        if legacy_request_digest_matches(&request, &semantic_args, &digest) {
             return Ok(true);
         }
         if args.expires_at_ms.is_none() {
             semantic_args["expires_at_ms"] = Value::Null;
-            if legacy_request_digest_matches(&request, &semantic_args, &digest)? {
+            if legacy_request_digest_matches(&request, &semantic_args, &digest) {
                 return Ok(true);
             }
         }
@@ -1805,16 +1805,11 @@ pub(super) fn allows_next_input_fallback(
     Ok(false)
 }
 
-fn legacy_request_digest_matches(
-    request: &SubmitCommand,
-    args: &Value,
-    digest: &[u8],
-) -> Result<bool> {
-    match admission::command_semantic_payload(request, args.clone()) {
-        Ok(payload) => Ok(canonical::digest(&payload)? == digest),
-        Err(error) if error.code == "frame_too_large" => Ok(false),
-        Err(error) => Err(error),
-    }
+fn legacy_request_digest_matches(request: &SubmitCommand, args: &Value, digest: &[u8]) -> bool {
+    // Failure to reconstruct a legacy digest cannot authorize a move or block settlement.
+    admission::command_semantic_payload(request, args.clone())
+        .and_then(|payload| canonical::digest(&payload))
+        .is_ok_and(|candidate| candidate == digest)
 }
 
 pub(super) fn turn_accepts_context_tx(

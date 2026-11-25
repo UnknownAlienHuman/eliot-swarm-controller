@@ -62,8 +62,15 @@ impl Router {
         match store.fail_switch_preparation(id, error, &policy, now_ms()) {
             Ok(change) => {
                 self.publish_locked(&change.events);
-                if !change.events.is_empty() && change.value.state == CommandState::Rejected {
-                    log_refusal(&policy, id, &error.code, &error.message);
+                if change.value.state == CommandState::Rejected {
+                    let outcome = change.value.outcome.as_ref();
+                    let code = outcome
+                        .and_then(|value| value["error"].as_str())
+                        .unwrap_or("rejected");
+                    let reason = outcome
+                        .and_then(|value| value["error_reason"].as_str())
+                        .unwrap_or("switch was already rejected");
+                    log_refusal(&policy, id, code, reason);
                 }
             }
             Err(error) => crate::logging::record(
@@ -713,16 +720,7 @@ impl Router {
         let admission = match prepared {
             Ok(admission) => admission,
             Err(error) => {
-                let policy = self.secret_policy_snapshot();
-                let mut store = self.inner.store.lock().await;
-                if let Ok(change) = store.fail_switch_preparation(id, &error, &policy, now_ms()) {
-                    self.publish_locked(&change.events);
-                    if !change.events.is_empty() && change.value.state == CommandState::Rejected {
-                        log_refusal(&policy, id, &error.code, &error.message);
-                    }
-                }
-                self.signal_progress();
-                self.signal_launch_arbitration();
+                self.reject_switch_input(id, &error).await;
                 return;
             }
         };
