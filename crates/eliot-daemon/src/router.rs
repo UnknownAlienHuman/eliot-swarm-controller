@@ -258,6 +258,9 @@ struct RouterInner {
     plugin_crashes: Mutex<PluginCrashStatus>,
     previous_crash: Mutex<Option<CrashMarker>>,
     worker_tasks: Mutex<Vec<WorkerTaskStatus>>,
+    /// Worker names already reported as unregistered. In-memory only, so a
+    /// restart logs each missing registration once more.
+    worker_registration_missing_logged: Mutex<HashSet<String>>,
     automatic_cleanup: Mutex<cleanup::AutomaticCleanupState>,
     cleanup_worker: Mutex<Option<String>>,
     mode: AtomicU8,
@@ -638,6 +641,7 @@ impl Router {
                         })
                         .collect(),
                 ),
+                worker_registration_missing_logged: Mutex::new(HashSet::new()),
                 automatic_cleanup: Mutex::new(cleanup::AutomaticCleanupState::default()),
                 cleanup_worker: Mutex::new(None),
                 mode: AtomicU8::new(MODE_OPEN),
@@ -1776,6 +1780,14 @@ impl Router {
     }
 
     fn log_worker_registration_missing(&self, name: &str) {
+        if !self
+            .inner
+            .worker_registration_missing_logged
+            .lock_recover()
+            .insert(name.to_owned())
+        {
+            return;
+        }
         crate::logging::record(
             &self.secret_policy_snapshot(),
             "daemon.worker_status_unregistered",
