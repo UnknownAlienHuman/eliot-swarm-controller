@@ -574,7 +574,10 @@ impl Store {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(sql_error)?;
         let deleted = db!(tx.execute(
-            &format!("DELETE FROM completion_digests WHERE id IN ({PRUNE_DIGEST_SELECT})"),
+            &format!(
+                "DELETE FROM completion_digests WHERE id IN ({})",
+                prune_digest_select()
+            ),
             params![cutoff, MAX_PAGE_ENTRIES as i64],
         ));
         commit_transaction(tx, &self.write_faulted)?;
@@ -598,33 +601,33 @@ impl Store {
         // cannot make this pass scan an arbitrarily long prefix.
         let candidates = {
             let mut statement = tx
-                .prepare(&format!(
-                    "SELECT rowid, updated_at FROM processes
-                     INDEXED BY processes_exited_child_updated
-                     WHERE {EXITED_CHILD} AND updated_at < ?1
-                       AND (updated_at, rowid) > (?2, ?3)
-                     ORDER BY updated_at, rowid LIMIT ?4"
-                ))
+                .prepare(&process_retention_candidates(true))
                 .map_err(sql_error)?;
             statement
                 .query_map(
                     params![cutoff, after_time, after_row, RETENTION_BATCH_ENTRIES],
-                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, bool>(2)?,
+                        ))
+                    },
                 )
                 .map_err(sql_error)?
                 .collect::<rusqlite::Result<Vec<_>>>()
                 .map_err(sql_error)?
         };
         let examined = candidates.len() as i64;
-        let rowids: Vec<i64> = candidates.iter().map(|&(rowid, _)| rowid).collect();
+        let rowids: Vec<i64> = candidates
+            .iter()
+            .filter_map(|&(id, _, eligible)| eligible.then_some(id))
+            .collect();
         let deleted = if rowids.is_empty() {
             0
         } else {
             db!(tx.execute(
-                &format!(
-                    "DELETE FROM processes WHERE rowid IN (SELECT value FROM json_each(?1))
-                   AND {PROCESS_WITHOUT_RESERVATION}"
-                ),
+                "DELETE FROM processes WHERE rowid IN (SELECT value FROM json_each(?1))",
                 [encode_json(&rowids)?],
             ))
         };
@@ -633,7 +636,7 @@ impl Store {
         self.retention_processes_cursor = candidates
             .last()
             .filter(|_| more)
-            .map(|&(rowid, time)| (time, rowid));
+            .map(|&(rowid, time, _)| (time, rowid));
         Ok((deleted as i64, examined, more))
     }
 
@@ -649,7 +652,10 @@ impl Store {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(sql_error)?;
         let deleted = db!(tx.execute(
-            &format!("DELETE FROM messages WHERE delivery_id IN ({PRUNE_MAIL_SELECT})"),
+            &format!(
+                "DELETE FROM messages WHERE delivery_id IN ({})",
+                prune_acknowledged_mail_select()
+            ),
             params![cutoff, MAX_PAGE_ENTRIES as i64],
         ));
         let advisory_limit = MAX_PAGE_ENTRIES.saturating_sub(deleted);
@@ -657,45 +663,33 @@ impl Store {
         let mut advisory_deleted = 0;
         if advisory_limit > 0 {
             let (after_time, after_id) = advisory_cursor.unwrap_or((i64::MIN, i64::MIN));
-            let candidates: Vec<(i64, i64)> = {
+            let candidates: Vec<(i64, i64, bool)> = {
                 let mut statement = tx
-                    .prepare(&format!(
-                        "SELECT admitted_at, id FROM messages
-                         INDEXED BY messages_prune_legacy_advisory_unread
-                         WHERE read_at IS NULL
-                           AND {LEGACY_ATTENTION_ADVISORY_MAIL_PREDICATE}
-                           AND admitted_at <= ?1
-                           AND (admitted_at, id) > (?2, ?3)
-                         ORDER BY admitted_at, id LIMIT ?4"
-                    ))
+                    .prepare(&legacy_advisory_retention_candidates(true))
                     .map_err(sql_error)?;
                 statement
                     .query_map(
                         params![cutoff, after_time, after_id, advisory_limit as i64],
-                        |row| Ok((row.get(0)?, row.get(1)?)),
+                        |row| Ok((row.get(1)?, row.get(0)?, row.get(2)?)),
                     )
                     .map_err(sql_error)?
                     .collect::<rusqlite::Result<Vec<_>>>()
                     .map_err(sql_error)?
             };
-            let candidate_ids: Vec<i64> = candidates.iter().map(|&(_, id)| id).collect();
+            let candidate_ids: Vec<i64> = candidates
+                .iter()
+                .filter_map(|&(_, id, eligible)| eligible.then_some(id))
+                .collect();
             if !candidate_ids.is_empty() {
                 advisory_deleted = db!(tx.execute(
-                    &format!(
-                        "DELETE FROM messages
-                         WHERE id IN (SELECT CAST(value AS INTEGER) FROM json_each(?1))
-                           AND read_at IS NULL
-                           AND {LEGACY_ATTENTION_ADVISORY_MAIL_PREDICATE}
-                           AND admitted_at <= ?2
-                           AND {ADVISORY_TERMINAL_RECIPIENT}"
-                    ),
-                    params![encode_json(&candidate_ids)?, cutoff],
+                    "DELETE FROM messages WHERE id IN (SELECT value FROM json_each(?1))",
+                    [encode_json(&candidate_ids)?],
                 ));
             }
             advisory_cursor = candidates
                 .last()
                 .filter(|_| candidates.len() == advisory_limit)
-                .copied();
+                .map(|&(time, id, _)| (time, id));
         }
         // A spent attention wake lives only as long as mail on its thread:
         // once every message on the thread is gone, the bound can go. A new
@@ -703,8 +697,9 @@ impl Store {
         db!(tx.execute(
             &format!(
                 "DELETE FROM attention_wakes WHERE rowid IN (
-                 SELECT w.rowid FROM attention_wakes w WHERE {ORPHAN_ATTENTION_WAKE} LIMIT 512
-             )"
+                 {} LIMIT 512
+             )",
+                orphan_attention_wake_select("messages")
             ),
             [],
         ));
@@ -727,11 +722,8 @@ fn read_passive_checkpoint(connection: &Connection) -> Result<(i64, i64, bool)> 
     ))
 }
 
-/// The prune batch `prune_mail` deletes: acknowledged rows only, oldest ack
-/// first. Shared with the plan test so the asserted plan cannot drift from
-/// the executed query.
-const PRUNE_DIGEST_SELECT: &str = "SELECT id FROM completion_digests
-    WHERE delivered_at IS NOT NULL AND delivered_at <= ?1 ORDER BY delivered_at,id LIMIT ?2";
+const DIGEST_DELIVERED: &str = "delivered_at IS NOT NULL";
+const PROCESS_AGE: &str = "updated_at < ?1";
 const EXITED_CHILD: &str = "state = 'exited' AND role = 'child'";
 const PROCESS_WITHOUT_RESERVATION: &str = "NOT EXISTS (
     SELECT 1 FROM agents
@@ -741,12 +733,62 @@ const PROCESS_WITHOUT_RESERVATION: &str = "NOT EXISTS (
 const ADVISORY_TERMINAL_RECIPIENT: &str = "EXISTS (
     SELECT 1 FROM agents a WHERE a.id = messages.recipient AND a.state IN ('stopped','failed','lost')
 )";
-const ORPHAN_ATTENTION_WAKE: &str =
-    "NOT EXISTS (SELECT 1 FROM messages m WHERE m.thread = w.thread)";
+const MAIL_ACKNOWLEDGED: &str = "read_at IS NOT NULL";
+const MAIL_UNREAD: &str = "read_at IS NULL";
+const ACK_AGE: &str = "read_at <= ?1";
+const ACK_UNPINNED: &str = "inline_ack_pending = 0";
+const UNREAD_AGE: &str = "admitted_at <= ?1";
 
-const PRUNE_MAIL_SELECT: &str = "SELECT delivery_id FROM messages
-             WHERE read_at IS NOT NULL AND read_at <= ?1 AND inline_ack_pending = 0
-             ORDER BY read_at, delivery_id LIMIT ?2";
+fn prune_digest_select() -> String {
+    format!(
+        "SELECT id FROM completion_digests
+        WHERE {DIGEST_DELIVERED} AND delivered_at <= ?1 ORDER BY delivered_at,id LIMIT ?2"
+    )
+}
+
+fn prune_acknowledged_mail_select() -> String {
+    format!(
+        "SELECT delivery_id FROM messages
+        WHERE {MAIL_ACKNOWLEDGED} AND {ACK_AGE} AND {ACK_UNPINNED}
+        ORDER BY read_at, delivery_id LIMIT ?2"
+    )
+}
+
+fn orphan_attention_wake_select(messages: &str) -> String {
+    format!(
+        "SELECT w.rowid FROM attention_wakes w
+        WHERE NOT EXISTS (SELECT 1 FROM {messages} m WHERE m.thread = w.thread)"
+    )
+}
+
+/// Bound the cursor scan before custody checks. The preview reads the same
+/// classified candidates without the per-pass bound.
+fn process_retention_candidates(bounded: bool) -> String {
+    let window = if bounded {
+        "AND (updated_at, rowid) > (?2, ?3) ORDER BY updated_at, rowid LIMIT ?4"
+    } else {
+        ""
+    };
+    format!(
+        "SELECT rowid, updated_at, {PROCESS_WITHOUT_RESERVATION} AS eligible
+        FROM processes INDEXED BY processes_exited_child_updated
+        WHERE {EXITED_CHILD} AND {PROCESS_AGE} {window}"
+    )
+}
+
+fn legacy_advisory_retention_candidates(bounded: bool) -> String {
+    let window = if bounded {
+        "AND (admitted_at, id) > (?2, ?3) ORDER BY admitted_at, id LIMIT ?4"
+    } else {
+        ""
+    };
+    format!(
+        "SELECT id, admitted_at, {ADVISORY_TERMINAL_RECIPIENT} AS eligible, delivery_id
+        FROM messages INDEXED BY messages_prune_legacy_advisory_unread
+        WHERE {MAIL_UNREAD} AND {LEGACY_ATTENTION_ADVISORY_MAIL_PREDICATE}
+          AND {UNREAD_AGE} {window}"
+    )
+}
 
 fn bounded_command_set(connection: &Connection, root: &str) -> Result<Option<Vec<SubtreeMember>>> {
     match subtree_members_tx(connection, root) {
@@ -1098,26 +1140,36 @@ fn prune_writes_tx(tx: &Transaction<'_>, cutoff: i64) -> Result<i64> {
     // exact retries read back as retained (plan present) or history-gap
     // (receipt pruned after reclaim).
     Ok(db!(tx.execute(
-        &format!("DELETE FROM writes WHERE id IN ({PRUNE_WRITE_SELECT})"),
-        params![
-            cutoff,
-            RETENTION_BATCH_ENTRIES,
-            super::goals::goal_round_running_outcome_json()?,
-        ],
+        &format!(
+            "DELETE FROM writes WHERE id IN ({})",
+            prune_write_select("cleanup_plans")
+        ),
+        rusqlite::named_params! {
+            ":write_cutoff": cutoff,
+            ":write_limit": RETENTION_BATCH_ENTRIES,
+            ":running_goal": super::goals::goal_round_running_outcome_json()?,
+        },
     )) as i64)
 }
 
-const PRUNE_WRITE_SELECT: &str = "SELECT id FROM writes WHERE created_at <= ?1
-               AND method NOT LIKE 'inference.%'
+const WRITE_AGE: &str = "created_at <= :write_cutoff";
+const WRITE_INCLUDED: &str = "method NOT LIKE 'inference.%'";
+
+fn prune_write_select(plans: &str) -> String {
+    format!(
+        "SELECT id FROM writes WHERE {WRITE_AGE}
+               AND {WRITE_INCLUDED}
                AND NOT EXISTS (SELECT 1 FROM launch_intents q WHERE q.id = writes.id)
                AND NOT EXISTS (SELECT 1 FROM checkpoint_restore_intents r WHERE r.id = writes.id)
                AND NOT (method = 'goal.round'
-                        AND json_extract(result, '$.outcome') IS json_extract(?3, '$'))
+                        AND json_extract(result, '$.outcome') IS json_extract(:running_goal, '$'))
                AND NOT (method = 'cleanup.apply' AND EXISTS(
-                   SELECT 1 FROM cleanup_plans p WHERE p.apply_id=writes.id
+                   SELECT 1 FROM {plans} p WHERE p.apply_id=writes.id
                ))
                AND NOT (method = 'cleanup.apply_all' AND (
                    json_extract(result, '$.state') IS 'running'
-                   OR COALESCE(json_extract(result, '$.finished_at'), created_at) > ?1
+                   OR COALESCE(json_extract(result, '$.finished_at'), created_at) > :write_cutoff
                ))
-             ORDER BY created_at, id LIMIT ?2";
+             ORDER BY created_at, id LIMIT :write_limit"
+    )
+}

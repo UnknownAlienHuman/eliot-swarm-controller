@@ -1,9 +1,11 @@
 //! Read-only forecast with each protection evaluated at the snapshot boundary.
 use super::*;
 use crate::cleanup::{
-    ARTIFACT_TOMBSTONE_SELECT, SETTLED_CLEANUP_PLAN_SELECT, STALE_CLEANUP_PLAN_SELECT,
+    CLEANUP_PLAN_AGE, REMOVED_ARTIFACT, artifact_tombstone_select, cleanup_metadata_cutoff,
+    settled_cleanup_plan_select, stale_cleanup_plan_select,
 };
 use eliot_core::api::{RetentionPreviewRequest, RetentionPreviewResponse, RetentionPreviewRow};
+use rusqlite::named_params;
 use std::collections::HashSet;
 
 const NONE: &str = "SELECT NULL WHERE 0";
@@ -33,12 +35,14 @@ impl Store {
             processes(db, cutoffs.processes)?,
             commands(db, cutoffs.commands)?,
         ];
-        let plan_cutoff = now.saturating_sub(RETRY_WINDOW_MS + RETRY_CLOCK_SKEW_MS + 1);
+        let plan_cutoff = cleanup_metadata_cutoff(now);
         let expiring_plans = format!(
-            "SELECT * FROM ({SETTLED_CLEANUP_PLAN_SELECT}) UNION ALL SELECT * FROM ({STALE_CLEANUP_PLAN_SELECT})"
+            "SELECT * FROM ({}) UNION ALL SELECT * FROM ({})",
+            settled_cleanup_plan_select(),
+            stale_cleanup_plan_select(),
         );
         let kept_plans =
-            format!("SELECT body FROM cleanup_plans WHERE id NOT IN ({expiring_plans})");
+            format!("(SELECT body,apply_id FROM cleanup_plans WHERE id NOT IN ({expiring_plans}))");
 
         let mut plan_row = summary(
             db,
@@ -46,26 +50,25 @@ impl Store {
             "cleanup ledger",
             "SELECT id,json_extract(body,'$.created_at') FROM cleanup_plans",
             &expiring_plans,
-            params![plan_cutoff, ALL_ROWS],
+            named_params! {":plan_cutoff": plan_cutoff, ":plan_limit": ALL_ROWS},
         )?;
         let held = count(
             db,
-            "SELECT COUNT(*) FROM cleanup_plans WHERE json_extract(body,'$.created_at')<=?1",
-            [plan_cutoff],
+            &format!("SELECT COUNT(*) FROM cleanup_plans p WHERE {CLEANUP_PLAN_AGE}"),
+            named_params! {":plan_cutoff": plan_cutoff},
         )? - plan_row.would_delete;
         protect(&mut plan_row, "live_or_uncertain_receipt", held);
         rows.push(plan_row);
 
-        let artifacts = ARTIFACT_TOMBSTONE_SELECT
-            .replace("FROM cleanup_plans p,", &format!("FROM ({kept_plans}) p,"))
-            .replace("LIMIT ?1", "LIMIT ?2");
         let mut tombstones = summary(
             db,
             "artifacts",
             "removed tombstones",
-            "SELECT id,json_extract(body,'$.created_at') FROM artifacts WHERE json_extract(body,'$.state')='removed'",
-            &artifacts,
-            params![plan_cutoff, ALL_ROWS],
+            &format!(
+                "SELECT id,json_extract(body,'$.created_at') FROM artifacts a WHERE {REMOVED_ARTIFACT}"
+            ),
+            &artifact_tombstone_select(&kept_plans),
+            named_params! {":plan_cutoff": plan_cutoff, ":plan_limit": ALL_ROWS, ":tombstone_limit": ALL_ROWS},
         )?;
         let kept = tombstones.kept;
         protect(&mut tombstones, "custody_or_ledger_anchor", kept);
@@ -74,37 +77,31 @@ impl Store {
         let write_ledger = "SELECT id,created_at FROM writes";
         let digest_ledger = "SELECT id,created_at FROM completion_digests";
         if let Some(cutoff) = cutoffs.commands {
-            // Use a distinct slot for the virtual cleanup plan age. The
-            // shared SELECT reserves 1/2/3 for cutoff/page/running outcome.
-            let writes = PRUNE_WRITE_SELECT.replace(
-                "FROM cleanup_plans p WHERE",
-                &format!(
-                    "FROM (SELECT apply_id FROM cleanup_plans WHERE id NOT IN ({})) p WHERE",
-                    expiring_plans.replace("?1", "?4")
-                ),
-            );
             let mut write_row = summary(
                 db,
                 "writes",
                 "mutation receipts",
                 write_ledger,
-                &writes,
-                params![
-                    cutoff,
-                    ALL_ROWS,
-                    crate::goals::goal_round_running_outcome_json()?,
-                    plan_cutoff
-                ],
+                &prune_write_select(&kept_plans),
+                named_params! {
+                    ":write_cutoff": cutoff,
+                    ":write_limit": ALL_ROWS,
+                    ":running_goal": crate::goals::goal_round_running_outcome_json()?,
+                    ":plan_cutoff": plan_cutoff,
+                    ":plan_limit": ALL_ROWS,
+                },
             )?;
             let old = count(
                 db,
-                "SELECT COUNT(*) FROM writes WHERE created_at<=?1",
-                [cutoff],
+                &format!("SELECT COUNT(*) FROM writes WHERE {WRITE_AGE}"),
+                named_params! {":write_cutoff": cutoff},
             )?;
             let separate = count(
                 db,
-                "SELECT COUNT(*) FROM writes WHERE created_at<=?1 AND method LIKE 'inference.%'",
-                [cutoff],
+                &format!(
+                    "SELECT COUNT(*) FROM writes WHERE {WRITE_AGE} AND NOT ({WRITE_INCLUDED})"
+                ),
+                named_params! {":write_cutoff": cutoff},
             )?;
             let kept = old - write_row.would_delete - separate;
             protect(&mut write_row, "live_receipt", kept);
@@ -128,7 +125,7 @@ impl Store {
                 "completion_digests",
                 "completion digests",
                 digest_ledger,
-                PRUNE_DIGEST_SELECT,
+                &prune_digest_select(),
                 params![cutoff, ALL_ROWS],
             )?;
             protect(
@@ -136,7 +133,9 @@ impl Store {
                 "pending_delivery",
                 count(
                     db,
-                    "SELECT COUNT(*) FROM completion_digests WHERE delivered_at IS NULL AND created_at<=?1",
+                    &format!(
+                        "SELECT COUNT(*) FROM completion_digests WHERE NOT ({DIGEST_DELIVERED}) AND created_at<=?1"
+                    ),
                     [cutoff],
                 )?,
             );
@@ -201,6 +200,7 @@ fn row(
 
 // Both queries expose only an identity and its retained clock. The selected
 // IDs are the Store's deletion SELECTs with their batch limits lifted.
+// Materialize them once so a forced sweep index never runs once per ledger row.
 fn summary(
     db: &Connection,
     table: &str,
@@ -211,7 +211,7 @@ fn summary(
 ) -> Result<RetentionPreviewRow> {
     db.query_row(
         &format!(
-            "WITH retained(id,ts) AS ({ledger}), selected(id) AS ({selected})
+            "WITH retained(id,ts) AS ({ledger}), selected(id) AS MATERIALIZED ({selected})
          SELECT count(selected.id),count(*)-count(selected.id),
                 min(CASE WHEN selected.id IS NULL THEN retained.ts END)
          FROM retained LEFT JOIN selected ON selected.id=retained.id"
@@ -301,27 +301,26 @@ fn processes(db: &Connection, cutoff: Option<i64>) -> Result<RetentionPreviewRow
     let Some(cutoff) = cutoff else {
         return summary(db, "processes", "process ledger", ledger, NONE, []);
     };
+    let candidates = process_retention_candidates(false);
     let mut result = summary(
         db,
         "processes",
         "process ledger",
         ledger,
-        &format!(
-            "SELECT rowid FROM processes WHERE {EXITED_CHILD} AND updated_at<?1 AND {PROCESS_WITHOUT_RESERVATION}"
-        ),
+        &format!("SELECT rowid FROM ({candidates}) WHERE eligible"),
         [cutoff],
     )?;
     let age = count(
         db,
-        "SELECT count(*) FROM processes WHERE updated_at<?1",
+        &format!("SELECT count(*) FROM processes WHERE {PROCESS_AGE}"),
         [cutoff],
     )?;
-    let outside = count(
+    let custody = count(
         db,
-        &format!("SELECT count(*) FROM processes WHERE updated_at<?1 AND NOT ({EXITED_CHILD})"),
+        &format!("SELECT count(*) FROM ({candidates}) WHERE NOT eligible"),
         [cutoff],
     )?;
-    let custody = age - outside - result.would_delete;
+    let outside = age - custody - result.would_delete;
     protect(&mut result, "owned_or_nonexited_evidence", outside);
     protect(&mut result, "custody", custody);
     Ok(result)
@@ -388,12 +387,13 @@ fn commands(db: &Connection, cutoff: Option<i64>) -> Result<RetentionPreviewRow>
 }
 
 fn mail(db: &Connection, cutoff: Option<i64>, rows: &mut Vec<RetentionPreviewRow>) -> Result<()> {
-    let acknowledged = "SELECT delivery_id,admitted_at FROM messages WHERE read_at IS NOT NULL";
+    let acknowledged =
+        format!("SELECT delivery_id,admitted_at FROM messages WHERE {MAIL_ACKNOWLEDGED}");
     let advisory = format!(
-        "SELECT delivery_id,admitted_at FROM messages WHERE read_at IS NULL AND {LEGACY_ATTENTION_ADVISORY_MAIL_PREDICATE}"
+        "SELECT delivery_id,admitted_at FROM messages WHERE {MAIL_UNREAD} AND {LEGACY_ATTENTION_ADVISORY_MAIL_PREDICATE}"
     );
     let unread = format!(
-        "SELECT delivery_id,admitted_at FROM messages WHERE read_at IS NULL AND NOT ({LEGACY_ATTENTION_ADVISORY_MAIL_PREDICATE})"
+        "SELECT delivery_id,admitted_at FROM messages WHERE {MAIL_UNREAD} AND NOT ({LEGACY_ATTENTION_ADVISORY_MAIL_PREDICATE})"
     );
     let wake_ledger = "SELECT rowid,woken_at FROM attention_wakes";
     let Some(cutoff) = cutoff else {
@@ -401,7 +401,7 @@ fn mail(db: &Connection, cutoff: Option<i64>, rows: &mut Vec<RetentionPreviewRow
             db,
             "messages",
             "acknowledged",
-            acknowledged,
+            &acknowledged,
             NONE,
             [],
         )?);
@@ -431,14 +431,15 @@ fn mail(db: &Connection, cutoff: Option<i64>, rows: &mut Vec<RetentionPreviewRow
         )?);
         return Ok(());
     };
-    let legacy_selected=format!("SELECT delivery_id FROM messages WHERE read_at IS NULL
-        AND {LEGACY_ATTENTION_ADVISORY_MAIL_PREDICATE} AND admitted_at<=?1 AND {ADVISORY_TERMINAL_RECIPIENT}");
+    let legacy_candidates = legacy_advisory_retention_candidates(false);
+    let legacy_selected = format!("SELECT delivery_id FROM ({legacy_candidates}) WHERE eligible");
+    let ack_selected = prune_acknowledged_mail_select();
     let mut ack = summary(
         db,
         "messages",
         "acknowledged",
-        acknowledged,
-        PRUNE_MAIL_SELECT,
+        &acknowledged,
+        &ack_selected,
         params![cutoff, ALL_ROWS],
     )?;
     protect(
@@ -446,7 +447,9 @@ fn mail(db: &Connection, cutoff: Option<i64>, rows: &mut Vec<RetentionPreviewRow
         "inline_ack",
         count(
             db,
-            "SELECT count(*) FROM messages WHERE read_at<=?1 AND inline_ack_pending<>0",
+            &format!(
+                "SELECT count(*) FROM messages WHERE {MAIL_ACKNOWLEDGED} AND {ACK_AGE} AND NOT ({ACK_UNPINNED})"
+            ),
             [cutoff],
         )?,
     );
@@ -461,9 +464,9 @@ fn mail(db: &Connection, cutoff: Option<i64>, rows: &mut Vec<RetentionPreviewRow
     )?;
     let held = count(
         db,
-        &format!("SELECT count(*) FROM ({advisory}) a WHERE a.admitted_at<=?1"),
+        &format!("SELECT count(*) FROM ({legacy_candidates}) WHERE NOT eligible"),
         [cutoff],
-    )? - legacy.would_delete;
+    )?;
     protect(&mut legacy, "live_recipient", held);
     rows.push(legacy);
     let mut ordinary = summary(db, "messages", "ordinary unread", &unread, NONE, [])?;
@@ -472,7 +475,7 @@ fn mail(db: &Connection, cutoff: Option<i64>, rows: &mut Vec<RetentionPreviewRow
         "unread",
         count(
             db,
-            &format!("SELECT count(*) FROM ({unread}) a WHERE a.admitted_at<=?1"),
+            &format!("SELECT count(*) FROM ({unread}) a WHERE {UNREAD_AGE}"),
             [cutoff],
         )?,
     );
@@ -480,16 +483,15 @@ fn mail(db: &Connection, cutoff: Option<i64>, rows: &mut Vec<RetentionPreviewRow
 
     let remaining = format!(
         "(SELECT thread FROM messages WHERE delivery_id NOT IN (
-        SELECT * FROM ({PRUNE_MAIL_SELECT}) UNION ALL {legacy_selected}
+        SELECT * FROM ({ack_selected}) UNION ALL {legacy_selected}
     ))"
     );
-    let wakes = ORPHAN_ATTENTION_WAKE.replace("FROM messages m", &format!("FROM {remaining} m"));
     rows.push(summary(
         db,
         "attention_wakes",
         "thread wake ledger",
         wake_ledger,
-        &format!("SELECT w.rowid FROM attention_wakes w WHERE {wakes}"),
+        &orphan_attention_wake_select(&remaining),
         params![cutoff, ALL_ROWS],
     )?);
     Ok(())

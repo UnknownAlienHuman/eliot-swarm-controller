@@ -2,6 +2,7 @@
 use super::coordination::{Sender, parse_sender, retain_write_tx};
 use super::*;
 use eliot_core::api::*;
+use rusqlite::named_params;
 
 /// Retained cleanup plans. A full ledger self-heals on retain (see
 /// `prune_reclaimable_cleanup_plans_tx`) before it refuses admission.
@@ -19,30 +20,50 @@ const ACTIVE_ARTIFACT_LIMIT: i64 = 4_096;
 const DAEMON_CUSTODY_LIMIT_PER_GENERATION: i64 = 512;
 const ARTIFACT_TOMBSTONE_BATCH: i64 = 128;
 
-pub(super) const ARTIFACT_TOMBSTONE_SELECT: &str = "WITH refs AS MATERIALIZED (
+pub(super) const REMOVED_ARTIFACT: &str = "json_extract(a.body, '$.state') = 'removed'";
+pub(super) const CLEANUP_PLAN_AGE: &str = "json_extract(p.body, '$.created_at') <= :plan_cutoff";
+
+pub(super) fn artifact_tombstone_select(plans: &str) -> String {
+    format!(
+        "WITH refs AS MATERIALIZED (
                  SELECT DISTINCT json_extract(i.value, '$.artifact.id') AS id
-                 FROM cleanup_plans p, json_each(p.body, '$.items') i
+                 FROM {plans} p, json_each(p.body, '$.items') i
              )
              SELECT a.id FROM artifacts a
                  WHERE a.seq < (SELECT MAX(seq) FROM artifacts)
-                   AND json_extract(a.body, '$.state') = 'removed'
+                   AND {REMOVED_ARTIFACT}
                    AND json_extract(a.body, '$.kind') <> 'native_session'
                    AND NOT EXISTS (SELECT 1 FROM refs WHERE refs.id = a.id)
-                 ORDER BY a.seq LIMIT ?1";
-pub(super) const SETTLED_CLEANUP_PLAN_SELECT: &str =
-    "SELECT p.id FROM cleanup_plans p JOIN writes w ON w.id = p.apply_id
+                 ORDER BY a.seq LIMIT :tombstone_limit"
+    )
+}
+
+pub(super) fn settled_cleanup_plan_select() -> String {
+    format!(
+        "SELECT p.id FROM cleanup_plans p JOIN writes w ON w.id = p.apply_id
              WHERE w.method = 'cleanup.apply'
-               AND json_extract(p.body, '$.created_at') <= ?1
+               AND {CLEANUP_PLAN_AGE}
                AND json_extract(w.result, '$.state') IS NOT 'running'
                AND json_type(w.result, '$.items') = 'array'
                AND NOT EXISTS (
                    SELECT 1 FROM json_each(w.result, '$.items') r
                    WHERE json_extract(r.value, '$.outcome') = 'unknown'
                )
-             ORDER BY p.id LIMIT ?2";
-pub(super) const STALE_CLEANUP_PLAN_SELECT: &str = "SELECT p.id FROM cleanup_plans p
-    WHERE p.apply_id IS NULL AND json_extract(p.body, '$.created_at') <= ?1
-    ORDER BY p.id LIMIT ?2";
+             ORDER BY p.id LIMIT :plan_limit"
+    )
+}
+
+pub(super) fn stale_cleanup_plan_select() -> String {
+    format!(
+        "SELECT p.id FROM cleanup_plans p
+        WHERE p.apply_id IS NULL AND {CLEANUP_PLAN_AGE}
+        ORDER BY p.id LIMIT :plan_limit"
+    )
+}
+
+pub(super) fn cleanup_metadata_cutoff(now: i64) -> i64 {
+    now.saturating_sub(RETRY_WINDOW_MS + RETRY_CLOCK_SKEW_MS + 1)
+}
 
 pub struct CleanupInventoryPage {
     pub artifacts: Vec<ArtifactView>,
@@ -106,15 +127,18 @@ impl Store {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(sql_error)?;
-        let cutoff = now.saturating_sub(RETRY_WINDOW_MS + RETRY_CLOCK_SKEW_MS + 1);
+        let cutoff = cleanup_metadata_cutoff(now);
         let plans = prune_settled_cleanup_plans_tx(&tx, cutoff)?
             + prune_stale_cleanup_plans_tx(&tx, cutoff)?;
         // The maximum sequence anchors later insertion and inventory cursors,
         // and native-session tombstones fence resuming the archived subject.
         let artifacts = tx
             .execute(
-                &format!("DELETE FROM artifacts WHERE id IN ({ARTIFACT_TOMBSTONE_SELECT})"),
-                [ARTIFACT_TOMBSTONE_BATCH],
+                &format!(
+                    "DELETE FROM artifacts WHERE id IN ({})",
+                    artifact_tombstone_select("cleanup_plans")
+                ),
+                named_params! { ":tombstone_limit": ARTIFACT_TOMBSTONE_BATCH },
             )
             .map_err(sql_error)? as i64;
         commit_transaction(tx, &self.write_faulted)?;
@@ -1723,8 +1747,11 @@ fn prune_reclaimable_cleanup_plans_tx(tx: &Transaction<'_>, now: i64) -> Result<
 
 fn prune_settled_cleanup_plans_tx(tx: &Transaction<'_>, cutoff: i64) -> Result<i64> {
     tx.execute(
-        &format!("DELETE FROM cleanup_plans WHERE id IN ({SETTLED_CLEANUP_PLAN_SELECT})"),
-        params![cutoff, CLEANUP_PLAN_RECLAIM_BATCH],
+        &format!(
+            "DELETE FROM cleanup_plans WHERE id IN ({})",
+            settled_cleanup_plan_select()
+        ),
+        named_params! { ":plan_cutoff": cutoff, ":plan_limit": CLEANUP_PLAN_RECLAIM_BATCH },
     )
     .map(|rows| rows as i64)
     .map_err(sql_error)
@@ -1732,8 +1759,11 @@ fn prune_settled_cleanup_plans_tx(tx: &Transaction<'_>, cutoff: i64) -> Result<i
 
 fn prune_stale_cleanup_plans_tx(tx: &Transaction<'_>, cutoff: i64) -> Result<i64> {
     tx.execute(
-        &format!("DELETE FROM cleanup_plans WHERE id IN ({STALE_CLEANUP_PLAN_SELECT})"),
-        params![cutoff, CLEANUP_PLAN_RECLAIM_BATCH],
+        &format!(
+            "DELETE FROM cleanup_plans WHERE id IN ({})",
+            stale_cleanup_plan_select()
+        ),
+        named_params! { ":plan_cutoff": cutoff, ":plan_limit": CLEANUP_PLAN_RECLAIM_BATCH },
     )
     .map(|rows| rows as i64)
     .map_err(sql_error)
