@@ -344,6 +344,12 @@ pub(super) fn validate_launch_inputs(args: &Value, owner: bool) -> Result<()> {
             "private chats have no project policy to opt out of",
         ));
     }
+    if args.get("no_policy").is_some() && !owner {
+        return Err(Error::new(
+            "not_allowed",
+            "only the Owner can grant a project policy opt-out",
+        ));
+    }
     if !owner
         && args
             .get("goal")

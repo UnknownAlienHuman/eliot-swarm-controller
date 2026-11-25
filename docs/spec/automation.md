@@ -182,11 +182,21 @@ engine.
 The Owner's explicit Goal fields replace defaults individually. Agent and
 project-rule launches can tighten policy by lowering limits or the check deadline,
 adding check-input globs, or adding a scope that intersects the project scope.
-They can opt out explicitly with a nonblank `no_policy` reason. Executable check
-overrides and escalation require Owner authority. Opting out skips the policy Goal
-and the fast project check. A separately supplied Goal continues under the caller's
-existing authority. Store records `project.policy.opted_out`, and Agent and project
-readback show the reason.
+Only the Owner can grant a project policy opt-out with a nonblank `no_policy`
+reason. This includes Owner-authorized global rule and timer actions; a project rule
+or Agent cannot grant itself an exception. An opted-out reason frozen on an Agent
+may continue through a same-project switch, and retained retries preserve the
+original admission. An Owner-configured rule's opted-out launch event retains that
+rule's cause; project rules do not inherit Owner authority. Exact same-ID retries
+replay the original caller-bound admission, while a queued Owner intent keeps its
+Owner principal and frozen request until arbitration. A historical queued intent
+whose principal is an Agent and whose request contains `no_policy` is refused when
+it reaches new admission; it is never promoted to Owner authority. Already-admitted
+commands keep their committed launch snapshot and are not retroactively rewritten.
+Executable check overrides and escalation require Owner authority. Opting out skips
+the policy Goal and the fast project check. A separately supplied Goal continues
+under the caller's existing authority. Store records `project.policy.opted_out`,
+and Agent and project readback show the reason.
 
 The fast path uses the Agent's resolved launch Goal check, including any Owner argv,
 working-directory and deadline overrides. Setting `policy.check.at_turn_end = true`
