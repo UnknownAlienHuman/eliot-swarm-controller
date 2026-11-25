@@ -281,7 +281,24 @@ impl Router {
             facts,
         };
         response.validate()?;
-        encode_child_run(response)
+        let (child, generation, turn) = (
+            response.agent.clone(),
+            response.generation,
+            response.turn_id.clone(),
+        );
+        let full_result = matches!(
+            response.status,
+            ChildRunStatus::Succeeded | ChildRunStatus::Failed
+        ) && !response.truncated
+            && response.final_text.is_some();
+        let encoded = encode_child_run(response)?;
+        if full_result
+            && let (Some(child), Some(generation), Some(turn)) = (child, generation, turn)
+        {
+            self.note_child_result_read(principal, &child, generation, &turn)
+                .await;
+        }
+        Ok(encoded)
     }
 
     async fn child_run_completion_wake(

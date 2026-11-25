@@ -1208,7 +1208,9 @@ Agent at a time. It checks aged handoff sources with a retained successor,
 ended children whose direct manager received their latest result, and quiet
 observed sessions whose custody has closed. A successful direct-parent
 `agent.result` readback of the latest completed turn records its exact child
-generation, parent, and turn. This receipt also gates handed-off children.
+generation, parent, and turn. A terminal `child.run` response with the full,
+untruncated final text records the same receipt. This receipt also gates
+handed-off children.
 Unread completion digests and unread latest results anywhere below an Agent
 keep it visible. A working child or attached observer
 keeps its custody and stays visible. Retirement starts and stops no sessions.
