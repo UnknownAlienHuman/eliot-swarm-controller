@@ -57,14 +57,20 @@ fn daemon_choice(
     choices: &'static [(&'static str, &'static str)],
     name: &str,
 ) -> View {
+    // The first entry is the daemon's default: what an absent key means.
+    // An absent key selects it, so the list shows the stored state and
+    // choosing it again leaves the key absent.
     let current = model::daemon_text(daemon, pointer);
-    let index = choices
-        .iter()
-        .position(|(value, _)| *value == current)
-        .unwrap_or(0);
-    let labels: Vec<String> = choices
-        .iter()
-        .map(|(_, label)| (*label).to_owned())
+    let index = if current.is_empty() {
+        0
+    } else {
+        choices
+            .iter()
+            .position(|(value, _)| *value == current)
+            .map_or(0, |index| index + 1)
+    };
+    let labels: Vec<String> = std::iter::once(format!("Default ({})", choices[0].1))
+        .chain(choices.iter().map(|(_, label)| (*label).to_owned()))
         .collect();
     Grid::new().keyed_children(vec![KeyedView::new(
         format!("{pointer}:{index}"),
@@ -76,12 +82,14 @@ fn daemon_choice(
             // A selection WinUI reports for the list it was given is the
             // value shown: the edit then changes nothing.
             .on_selection_changed(context.callback(move |index: Option<usize>| {
-                Message::Settings(SettingsMsg::DaemonEdit(
-                    match index.and_then(|index| choices.get(index)) {
+                Message::Settings(SettingsMsg::DaemonEdit(match index {
+                    Some(0) => DaemonEdit::Text(pointer, String::new()),
+                    Some(index) => match choices.get(index - 1) {
                         Some((value, _)) => DaemonEdit::Choice(pointer, value),
                         None => DaemonEdit::Unchanged,
                     },
-                ))
+                    None => DaemonEdit::Unchanged,
+                }))
             })),
     )])
 }
@@ -289,8 +297,9 @@ fn value_words(value: Option<&Value>, unit: Unit) -> String {
         (Unit::WindowSeconds | Unit::Seconds, Some(value)) => format!("{value} s"),
         (Unit::Days | Unit::WindowSeconds, None) => "forever".to_owned(),
         (Unit::Seconds, None) => "the default".to_owned(),
-        (Unit::Choice(choices), value) => {
-            let value = value.and_then(Value::as_str).unwrap_or(choices[0].0);
+        (Unit::Choice(choices), None) => format!("Default ({})", choices[0].1),
+        (Unit::Choice(choices), Some(value)) => {
+            let value = value.as_str().unwrap_or_default();
             choices
                 .iter()
                 .find(|(key, _)| *key == value)

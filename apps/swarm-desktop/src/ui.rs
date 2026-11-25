@@ -1010,6 +1010,7 @@ impl Component for DesktopApp {
             Message::Reveal(item, path) => self.reveal_path(item, path),
         }
         self.record_location();
+        self.sync_monitor();
         self.sync_dialog(context);
     }
 

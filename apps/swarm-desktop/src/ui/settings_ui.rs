@@ -548,6 +548,9 @@ pub(super) struct SettingsState {
     pub(super) owner_rules: Value,
     /// The daemon page whose Save waits for its confirmation.
     pub(super) daemon_confirm: Option<Page>,
+    /// The `[daemon]` draft the owner confirmed and that has not been sent
+    /// yet: only this exact content saves.
+    daemon_confirmed: Option<Value>,
     /// Advanced: every section as pretty JSON, and its read form.
     all: String,
     all_base: String,
@@ -1180,11 +1183,6 @@ impl DesktopApp {
             SettingsMsg::RemoveInvalidSections(sections) => {
                 self.remove_invalid_sections(sections, context);
             }
-            SettingsMsg::Save(page, dry_run)
-                if !dry_run && matches!(page, Page::Attention | Page::Daemon | Page::Retention) =>
-            {
-                s.daemon_confirm = Some(page);
-            }
             SettingsMsg::Save(page, dry_run) => self.save_page(page, dry_run, context),
             SettingsMsg::AutoSave(page, seq) => {
                 if self.settings.rested(page, seq) {
@@ -1500,6 +1498,8 @@ impl DesktopApp {
                 if let Some(page) = s.daemon_confirm.take()
                     && save
                 {
+                    // Exactly this draft may go (now or, queued, later).
+                    s.daemon_confirmed = Some(s.daemon.clone());
                     self.save_page(page, false, context);
                 }
             }
@@ -1764,11 +1764,27 @@ impl DesktopApp {
         if !self.settings.loaded {
             return;
         }
+        // The daemon's pages save only the draft the owner confirmed: a
+        // save of anything else (a later edit, a queued save whose draft
+        // moved since) asks again.
+        let daemon_page = matches!(page, Page::Attention | Page::Daemon | Page::Retention);
+        if daemon_page
+            && !dry_run
+            && self.settings.daemon_confirmed.as_ref() != Some(&self.settings.daemon)
+        {
+            self.settings.daemon_confirmed = None;
+            self.settings.daemon_confirm = Some(page);
+            return;
+        }
         if self.settings.busy() || self.prefs_saving {
             if !dry_run && !self.settings.queued.contains(&page) {
                 self.settings.queued.push(page);
             }
             return;
+        }
+        if daemon_page && !dry_run {
+            // Sent now: a later edit needs its own confirmation.
+            self.settings.daemon_confirmed = None;
         }
         if !dry_run && self.settings.refuse_if_changed(page) {
             self.reprime_fields(context);

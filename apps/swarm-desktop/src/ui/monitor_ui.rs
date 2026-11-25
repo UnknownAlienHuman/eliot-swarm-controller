@@ -421,6 +421,19 @@ impl DesktopApp {
         self.main == Main::Agents || self.panel == Panel::Details
     }
 
+    /// After every update: neither the Agents page nor Details shows any
+    /// more, so the running read (a wait or a read) is cancelled now
+    /// rather than at its next result.
+    pub(super) fn sync_monitor(&mut self) {
+        if !self.monitor_panel()
+            && let Some(task) = self.monitor.task.take()
+        {
+            task.cancel();
+            self.monitor.epoch += 1;
+            self.monitor.refreshing = false;
+        }
+    }
+
     /// Close the panel: no refresh, no render work.
     pub(super) fn close_panel(&mut self) {
         self.panel = Panel::Closed;
@@ -559,10 +572,19 @@ impl DesktopApp {
                     // Wait from the tip read before the last read: an event
                     // committed since wakes it at once. Without a cursor, or
                     // when the wait fails, the quiet period passes instead.
+                    // Cancellable: leaving the page drops the long-poll.
                     let waited = match cursor {
-                        Some(after) => client::events_wait(&data_dir, after, &filter, wait)
+                        Some(after) => {
+                            match feed::cancellable(
+                                client::events_wait(&data_dir, after, &filter, wait),
+                                &cancelled,
+                            )
                             .await
-                            .is_ok(),
+                            {
+                                None => return None,
+                                Some(reply) => reply.is_ok(),
+                            }
+                        }
                         None => false,
                     };
                     // Inside the runtime: `pause`, never `backoff` (it
@@ -575,6 +597,9 @@ impl DesktopApp {
                             return None;
                         }
                     }
+                }
+                if cancelled() {
+                    return None;
                 }
                 // The tip before this read: the next wait starts there, so
                 // nothing committed during the read is missed.
