@@ -18,6 +18,9 @@
 //! inactive. The stored active turn alone is never proof.
 //! Observe-only Agents have no resolvable commands or turns.
 
+mod evidence;
+pub use evidence::RemovalEvidence;
+
 use super::{
     Change, CommandRecord, Error, MAX_EVENT_BYTES, Result, Store, canonical, command_binding,
     command_state_name, commit_transaction, decode_json, encode_json, insert_daemon_command_event,

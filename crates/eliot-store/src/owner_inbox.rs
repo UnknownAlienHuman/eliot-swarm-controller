@@ -630,6 +630,47 @@ fn project_unknown_commands(
             choices,
         );
         projected.detail = detail;
+        if method == "command.submit" {
+            let check = match verb.as_str() {
+                "worktree.remove" => Some((
+                    "Verify the checkout directory, Git worktree registration, and branch against the retained removal record.",
+                    false,
+                )),
+                "resume" => Some((
+                    "Check the exact native session and attempt for a refusal. A newer generation alone cannot establish the previous result.",
+                    false,
+                )),
+                "stop" => Some((
+                    "Check exact-generation process exit and native reader drain. For proven exit use `swarm cmd settle-stopped` to review that evidence.",
+                    false,
+                )),
+                "attention.emit" => Some((
+                    "Check whether the Store committed this exact attention event or rejected its subject before insertion.",
+                    true,
+                )),
+                "inject" => Some((
+                    "Check the original consumer and application point for a matching committed context receipt.",
+                    true,
+                )),
+                "send" => Some((
+                    "Check the original native session for an input or turn receipt tied to this command ID.",
+                    true,
+                )),
+                _ => None,
+            };
+            if let Some((check, allow_completed)) = check {
+                let id = &projected.subject;
+                let mut instructions = format!(
+                    "{check} For a verified failure, run `swarm cmd resolve {id} --status failed --reason \"<verified evidence>\"`."
+                );
+                if allow_completed {
+                    instructions.push_str(&format!(
+                        " For a verified effect, run `swarm cmd resolve {id} --status completed --reason \"<verified evidence>\"`."
+                    ));
+                }
+                projected.instructions = Some(instructions);
+            }
+        }
         if let (Some(agent), Some(generation)) = (target, generation) {
             let queued = queued_sends_blocked_by(db, agent, generation, &projected.subject)?;
             if !queued.is_empty() {

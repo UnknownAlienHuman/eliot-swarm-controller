@@ -6763,6 +6763,7 @@ impl Router {
         let request: MaintenanceRunRequest =
             eliot_core::api::discovery::decode_params(params.clone())?;
         request.validate()?;
+        self.reconcile_retained_command_evidence(None).await?;
         let policy = self.secret_policy_snapshot();
         let report = crate::maintenance::run_now(
             &self.inner.store,

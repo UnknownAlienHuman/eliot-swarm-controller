@@ -58,7 +58,9 @@ pub use handoff::{
     TaskInputs, TaskInstruction, TaskOmissionObservation,
 };
 pub use projects::ProjectRegistrationInput;
-pub use resolution::{ConfigureReadback, TurnInactiveProof, WorkspaceLaunchCleanup};
+pub use resolution::{
+    ConfigureReadback, RemovalEvidence, TurnInactiveProof, WorkspaceLaunchCleanup,
+};
 pub use retention::{RetentionReport, RetentionSpaceStatus, StoreCompactionReport};
 pub use rules::{
     RuleCatchUpAction, RuleCatchUpActionOutcome, RuleCatchUpAdmission, RuleCursorOutcome,

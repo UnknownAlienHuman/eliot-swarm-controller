@@ -167,9 +167,16 @@ async fn run_missing_worktree_reconciliation(
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut after = None;
     let mut in_flight = None;
+    let mut evidence_after: Option<String> = None;
     loop {
         tokio::select! {
             _ = ticker.tick() => {
+                match router.reconcile_retained_command_evidence(evidence_after.as_deref()).await {
+                    Ok(next) => evidence_after = next,
+                    Err(error) => logging::record(
+                        &policy, "daemon.command_evidence_reconciliation_failed", &[], Some(&error),
+                    ),
+                }
                 if let Err(error) = router.reconcile_missing_worktrees(&mut after, &mut in_flight).await {
                     logging::record(&policy, "daemon.missing_worktree_reconciliation_failed", &[], Some(&error));
                 }
