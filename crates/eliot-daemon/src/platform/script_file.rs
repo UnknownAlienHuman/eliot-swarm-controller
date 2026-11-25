@@ -666,18 +666,13 @@ fn cleanup_name(name: &str) -> Result<()> {
 }
 
 pub(crate) fn protected_cleanup_name(name: &str) -> bool {
-    [
-        ".git",
-        ".codex",
-        ".claude",
-        ".config",
-        ".ssh",
-        ".muse",
-        ".opencode",
-        ".antigravity",
-    ]
-    .iter()
-    .any(|reserved| name.eq_ignore_ascii_case(reserved))
+    [".git", ".config", ".ssh"]
+        .into_iter()
+        .chain(
+            crate::config::profile_environments()
+                .flat_map(|native| native.protected_cleanup_names.iter().copied()),
+        )
+        .any(|reserved| name.eq_ignore_ascii_case(reserved))
 }
 
 #[cfg(windows)]

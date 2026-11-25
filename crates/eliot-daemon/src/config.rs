@@ -6,7 +6,7 @@
 //! errors. Project and automation helpers share this module's parser and
 //! validation path; profile freezing and resolution stay here.
 //!
-//! Snapshots retain admitted environment names. Codex retains its native-store execution inputs. Private
+//! Snapshots retain admitted environment names and declared native-store execution inputs. Private
 //! route selectors are bound by digest and resolved only in the process environment.
 use crate::harness_capabilities::ProfileCapabilities;
 use core::api::harness::NativeRoute;
@@ -49,53 +49,44 @@ const MAX_ENV_NAME_LEN: usize = 256;
 const MAX_PASS_ENV_ENTRIES: usize = 64;
 const MAX_CHILD_PROFILES: usize = 64;
 
-/// Codex dispatch already retains these execution inputs verbatim. Other
-/// store and provider selectors are verified against an opaque route identity.
-pub(crate) const CODEX_STORE_SELECTORS: &[&str] = &["CODEX_HOME", "CODEX_SQLITE_HOME"];
-const PRIVATE_STORE_SELECTORS: &[&str] = &[
-    "CLAUDE_CONFIG_DIR",
-    "XDG_CONFIG_HOME",
-    "XDG_DATA_HOME",
-    "XDG_STATE_HOME",
-    "XDG_CACHE_HOME",
-    "OPENCODE_CONFIG",
-    "OPENCODE_CONFIG_DIR",
-    "APPDATA",
-];
-const PRIVATE_PROVIDER_SELECTORS: &[&str] = &[
-    "ANTHROPIC_BASE_URL",
-    "ANTHROPIC_AWS_BASE_URL",
-    "ANTHROPIC_BEDROCK_BASE_URL",
-    "ANTHROPIC_BEDROCK_MANTLE_BASE_URL",
-    "ANTHROPIC_FOUNDRY_BASE_URL",
-    "ANTHROPIC_FOUNDRY_RESOURCE",
-    "ANTHROPIC_VERTEX_BASE_URL",
-    "ANTHROPIC_VERTEX_PROJECT_ID",
-];
-/// The provider-mode subset of the core external-route markers, in their
-/// declared order so the frozen route identity digest is unchanged.
-const CLAUDE_PROVIDER_MODES: &[&str] = &[
-    core::api::CLAUDE_EXTERNAL_ROUTE_MARKERS[3],
-    core::api::CLAUDE_EXTERNAL_ROUTE_MARKERS[4],
-    core::api::CLAUDE_EXTERNAL_ROUTE_MARKERS[5],
-    core::api::CLAUDE_EXTERNAL_ROUTE_MARKERS[6],
-    core::api::CLAUDE_EXTERNAL_ROUTE_MARKERS[7],
-    core::api::CLAUDE_EXTERNAL_ROUTE_MARKERS[8],
-];
-const CLAUDE_ROUTE_CREDENTIALS: &[&str] = &[
-    "ANTHROPIC_API_KEY",
-    "ANTHROPIC_AUTH_TOKEN",
-    "CLAUDE_CODE_OAUTH_TOKEN",
-];
-const CLAUDE_MODEL_SELECTORS: &[&str] = &[
-    "ANTHROPIC_MODEL",
-    "ANTHROPIC_DEFAULT_MODEL",
-    "ANTHROPIC_DEFAULT_FABLE_MODEL",
-    "ANTHROPIC_DEFAULT_HAIKU_MODEL",
-    "ANTHROPIC_DEFAULT_OPUS_MODEL",
-    "ANTHROPIC_DEFAULT_SONNET_MODEL",
-    "ANTHROPIC_CUSTOM_MODEL_OPTION",
-];
+pub(crate) fn profile_environments() -> impl Iterator<Item = core::api::harness::ProfileEnvironment>
+{
+    core::api::HarnessCapabilities::declarations()
+        .iter()
+        .map(|(_, caps)| caps.profile.environment)
+}
+
+pub(crate) fn frozen_store_environments()
+-> impl Iterator<Item = core::api::harness::FrozenStoreEnvironment> {
+    core::api::HarnessCapabilities::declarations()
+        .iter()
+        .filter_map(|(_, caps)| caps.frozen_store_environment)
+}
+
+pub(crate) fn frozen_store_selectors() -> impl Iterator<Item = &'static str> {
+    frozen_store_environments().flat_map(|store| store.selectors.iter().copied())
+}
+
+fn native_store_selectors() -> impl Iterator<Item = &'static str> {
+    frozen_store_selectors()
+        .chain(profile_environments().flat_map(|profile| profile.store_paths.iter().copied()))
+        .chain(["APPDATA"])
+}
+
+fn provider_selectors() -> impl Iterator<Item = &'static str> {
+    profile_environments().flat_map(|profile| {
+        profile
+            .route_values
+            .iter()
+            .chain(profile.binary_modes)
+            .copied()
+    })
+}
+
+fn credential_presence_selectors() -> impl Iterator<Item = &'static str> {
+    profile_environments().flat_map(|profile| profile.credential_presence.iter().copied())
+}
+
 pub(crate) const ROUTE_HOME_SELECTORS: &[&str] = if cfg!(windows) {
     &["HOME", "USERPROFILE", "LOCALAPPDATA"]
 } else {
@@ -111,35 +102,29 @@ fn env_name_matches(name: &str, selector: &str) -> bool {
 }
 
 pub(crate) fn native_store_selector(name: &str) -> Option<&'static str> {
-    CODEX_STORE_SELECTORS
-        .iter()
-        .chain(PRIVATE_STORE_SELECTORS)
-        .copied()
-        .find(|selector| env_name_matches(name, selector))
+    native_store_selectors().find(|selector| env_name_matches(name, selector))
 }
 
 pub(crate) fn private_route_selector(name: &str) -> bool {
     native_store_selector(name).is_some()
-        || PRIVATE_PROVIDER_SELECTORS
-            .iter()
-            .chain(CLAUDE_PROVIDER_MODES)
-            .any(|selector| env_name_matches(name, selector))
+        || provider_selectors().any(|selector| env_name_matches(name, selector))
 }
 
-/// Claude can echo a model pin as native metadata. An explicitly bound API
-/// key still contributes a credential, even when it uses a model pin's name.
-pub(crate) fn claude_model_selector(profile: &Value, name: &str) -> bool {
-    profile_capabilities(profile).model_pin_selectors
-        && CLAUDE_MODEL_SELECTORS
-            .iter()
-            .any(|selector| env_name_matches(name, selector))
+/// An explicitly bound API key always contributes a credential.
+pub(crate) fn native_model_selector(profile: &Value, name: &str) -> bool {
+    profile_capabilities(profile)
+        .environment
+        .model_pins
+        .iter()
+        .any(|selector| env_name_matches(name, selector))
         && !api_key_name_matches(profile, name)
 }
 
-pub(crate) fn claude_provider_mode_flag(profile: &Value, name: &str, value: &Value) -> bool {
-    profile_capabilities(profile).model_pin_selectors
-        && matches!(value.as_str(), Some("0" | "1" | "false" | "true"))
-        && CLAUDE_PROVIDER_MODES
+pub(crate) fn native_provider_mode_flag(profile: &Value, name: &str, value: &Value) -> bool {
+    matches!(value.as_str(), Some("0" | "1" | "false" | "true"))
+        && profile_capabilities(profile)
+            .environment
+            .binary_modes
             .iter()
             .any(|selector| env_name_matches(name, selector))
         && !api_key_name_matches(profile, name)
@@ -168,20 +153,19 @@ pub(crate) fn native_route_selectors(
         .and_then(Value::as_array)
         .map_or(&[][..], Vec::as_slice);
     let mut selectors = serde_json::Map::new();
-    for &selector in ROUTE_HOME_SELECTORS
+    for selector in ROUTE_HOME_SELECTORS
         .iter()
-        .chain(CODEX_STORE_SELECTORS)
-        .chain(PRIVATE_STORE_SELECTORS)
-        .chain(PRIVATE_PROVIDER_SELECTORS)
-        .chain(CLAUDE_PROVIDER_MODES)
-        .chain(CLAUDE_ROUTE_CREDENTIALS)
+        .copied()
+        .chain(native_store_selectors())
+        .chain(provider_selectors())
+        .chain(credential_presence_selectors())
     {
         let admitted = admitted_selector(names, selector);
         if let Some(name) =
             admitted.or_else(|| ROUTE_HOME_SELECTORS.contains(&selector).then_some(selector))
         {
             let value = lookup(name)?;
-            let value = if CLAUDE_ROUTE_CREDENTIALS.contains(&selector) {
+            let value = if credential_presence_selectors().any(|name| name == selector) {
                 value.map(|value| Value::Bool(!value.is_empty()))
             } else {
                 value.map(Value::String)
@@ -270,7 +254,7 @@ pub(crate) fn metadata_route_scope_known(
 ) -> bool {
     let capabilities = profile_capabilities(profile);
     if capabilities.route_selectors_resolved
-        && !claude_route_selectors_resolved(profile, environment)
+        && !required_route_selectors_resolved(profile, environment)
     {
         return false;
     }
@@ -290,7 +274,7 @@ pub(crate) fn metadata_route_scope_known(
         })
 }
 
-fn claude_route_selectors_resolved(
+fn required_route_selectors_resolved(
     profile: &Value,
     environment: &serde_json::Map<String, Value>,
 ) -> bool {
@@ -308,9 +292,9 @@ fn claude_route_selectors_resolved(
         })
 }
 
-pub(crate) fn stand_codex_home(data_root: &Path) -> core::Result<Option<PathBuf>> {
+pub(crate) fn stand_store_root(data_root: &Path) -> core::Result<Option<PathBuf>> {
     match std::fs::symlink_metadata(data_root.join(crate::stand_cleanup::STAND_MARKER)) {
-        Ok(_) => Ok(Some(data_root.join("codex-home"))),
+        Ok(_) => Ok(Some(data_root.to_owned())),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(core::Error::new(
             "platform_io",
@@ -319,45 +303,51 @@ pub(crate) fn stand_codex_home(data_root: &Path) -> core::Result<Option<PathBuf>
     }
 }
 
-fn require_stand_codex_proxy(profile: &Value) -> core::Result<()> {
+fn require_stand_proxy(
+    profile: &Value,
+    native: core::api::harness::FrozenStoreEnvironment,
+) -> core::Result<()> {
     if !profile["route_binding"].is_object() {
         return Err(core::Error::new(
-            "stand_codex_login_unsupported",
-            "Codex ChatGPT/OAuth login is unavailable in a private stand; select a named Codex profile with an adopted Responses proxy",
+            native.direct_login_refusal.0,
+            native.direct_login_refusal.1,
         ));
     }
     Ok(())
 }
 
 /// Compare the actual environment and any retained native store before the plugin
-/// can start Codex. A retained binding can repin the home after environment setup.
-pub(crate) fn verify_stand_codex_route(
+/// starts. A retained binding can repin the home after environment setup.
+pub(crate) fn verify_stand_native_route(
     stand_home: Option<&Path>,
     harness: &str,
     profile: &Value,
     environment: Option<&JsonMap<String, Value>>,
 ) -> core::Result<()> {
-    if !core::api::HarnessCapabilities::of(harness).requires_frozen_store_inputs {
-        return Ok(());
-    }
-    let Some(home) = stand_home else {
+    let Some((root, native)) =
+        stand_home.zip(core::api::HarnessCapabilities::of(harness).frozen_store_environment)
+    else {
         return Ok(());
     };
-    require_stand_codex_proxy(profile)?;
-    let home = canonical_stand_codex_home(home)?;
-    match std::fs::symlink_metadata(home.join("config.toml")) {
+    require_stand_proxy(profile, native)?;
+    let home =
+        canonical_stand_native_home(&root.join(native.private_directory), native.display_name)?;
+    match std::fs::symlink_metadata(home.join(native.guard_file)) {
         Ok(metadata) if metadata.is_file() && !crate::platform::is_reparse_point(&metadata) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Ok(_) => {
             return Err(core::Error::new(
                 "not_allowed",
-                "stand Codex config.toml must be a regular file without links",
+                format!(
+                    "stand {} {} must be a regular file without links",
+                    native.display_name, native.guard_file
+                ),
             ));
         }
         Err(error) => {
             return Err(core::Error::new(
                 "platform_io",
-                format!("inspect stand Codex config: {error}"),
+                format!("inspect stand {} config: {error}", native.display_name),
             ));
         }
     }
@@ -371,7 +361,7 @@ pub(crate) fn verify_stand_codex_route(
         })
     };
     if profile["stand_native_store"] == true
-        && CODEX_STORE_SELECTORS.iter().all(|&name| {
+        && native.selectors.iter().all(|&name| {
             environment
                 .and_then(|env| env.get(name))
                 .is_some_and(matches_home)
@@ -382,10 +372,7 @@ pub(crate) fn verify_stand_codex_route(
     {
         return Ok(());
     }
-    Err(core::Error::new(
-        "profile_error",
-        "Codex on a private stand requires its stand-owned home and SQLite root; launch a fresh Agent if the retained store is outside the stand",
-    ))
+    Err(core::Error::new("profile_error", native.binding_refusal))
 }
 
 /// Called only for a newly resolved launch, attach or metadata profile.
@@ -393,28 +380,28 @@ pub(crate) fn capture_native_store_inputs(
     profile: &mut Value,
     stand_home: Option<&Path>,
 ) -> core::Result<()> {
-    let home = if let Some(home) = stand_home.filter(|_| {
-        core::api::HarnessCapabilities::of(profile["harness"].as_str().unwrap_or_default())
-            .requires_frozen_store_inputs
-    }) {
-        require_stand_codex_proxy(profile)?;
-        if let Err(error) = std::fs::create_dir(home)
+    let capabilities =
+        core::api::HarnessCapabilities::of(profile["harness"].as_str().unwrap_or_default());
+    let home = if let Some((root, native)) = stand_home.zip(capabilities.frozen_store_environment) {
+        require_stand_proxy(profile, native)?;
+        let home = root.join(native.private_directory);
+        if let Err(error) = std::fs::create_dir(&home)
             && error.kind() != std::io::ErrorKind::AlreadyExists
         {
             return Err(core::Error::new(
                 "platform_io",
-                format!("create stand Codex home: {error}"),
+                format!("create stand {} home: {error}", native.display_name),
             ));
         }
         let names = profile["pass_env"].as_array_mut().ok_or_else(|| {
             core::Error::new("invalid", "resolved profile pass_env must be an array")
         })?;
-        for &selector in CODEX_STORE_SELECTORS {
+        for &selector in native.selectors {
             if admitted_selector(names, selector).is_none() {
                 names.push(Value::from(selector));
             }
         }
-        Some(canonical_stand_codex_home(home)?)
+        Some(canonical_stand_native_home(&home, native.display_name)?)
     } else {
         None
     };
@@ -424,9 +411,14 @@ pub(crate) fn capture_native_store_inputs(
         .and_then(Value::as_array)
         .ok_or_else(|| core::Error::new("invalid", "resolved profile pass_env must be an array"))?;
     let mut values = serde_json::Map::new();
-    for &selector in CODEX_STORE_SELECTORS {
+    for selector in frozen_store_selectors() {
         let selected = home
             .as_ref()
+            .filter(|_| {
+                capabilities
+                    .frozen_store_environment
+                    .is_some_and(|native| native.selectors.contains(&selector))
+            })
             .map(|path| core::display_path(&path.to_string_lossy()).into())
             .or_else(|| admitted_selector(names, selector).and_then(std::env::var_os));
         let value = selected
@@ -446,9 +438,12 @@ pub(crate) fn capture_native_store_inputs(
         .filter(|name| !managed_native_update_environment_name(name))
         .filter(|name| {
             (!private_route_selector(name)
-                || (profile_capabilities(profile).config_dir_credential
-                    && env_name_matches(name, "CLAUDE_CONFIG_DIR")))
-                && !claude_model_selector(profile, name)
+                || capabilities
+                    .profile
+                    .environment
+                    .credential_directory
+                    .is_some_and(|selector| env_name_matches(name, selector)))
+                && !native_model_selector(profile, name)
         })
         .chain(profile["api_key_env"].as_str())
         .filter_map(std::env::var_os)
@@ -465,7 +460,7 @@ pub(crate) fn capture_native_store_inputs(
     if snapshot.get("harness").and_then(Value::as_str).is_some() {
         let selectors = native_route_selectors(&snapshot, |name| {
             if let Some(selector) = native_store_selector(name)
-                && CODEX_STORE_SELECTORS.contains(&selector)
+                && frozen_store_selectors().any(|name| name == selector)
             {
                 return Ok(snapshot["pass_env_values"][selector]
                     .as_str()
@@ -507,10 +502,13 @@ pub(crate) fn capture_native_store_inputs(
     Ok(())
 }
 
-fn canonical_stand_codex_home(path: &Path) -> core::Result<PathBuf> {
+fn canonical_stand_native_home(path: &Path, display_name: &str) -> core::Result<PathBuf> {
     crate::stand_cleanup::check_directory_chain(path)?;
     path.canonicalize().map_err(|error| {
-        core::Error::new("platform_io", format!("resolve stand Codex home: {error}"))
+        core::Error::new(
+            "platform_io",
+            format!("resolve stand {display_name} home: {error}"),
+        )
     })
 }
 
@@ -3230,8 +3228,9 @@ pub(crate) fn reserved_eliot_environment_name(name: &str) -> bool {
 /// Updater controls are managed outside profiles. In particular, an old
 /// pass_env entry must never suppress the installed vendor's updates.
 pub(crate) fn managed_native_update_environment_name(name: &str) -> bool {
-    name.eq_ignore_ascii_case("MUSE_NO_AUTO_UPDATE")
-        || name.eq_ignore_ascii_case("MUSE_UPDATE_INTERVAL_SECONDS")
+    profile_environments()
+        .flat_map(|profile| profile.managed_update.iter().copied())
+        .any(|selector| name.eq_ignore_ascii_case(selector))
 }
 
 fn validate_pass_env(

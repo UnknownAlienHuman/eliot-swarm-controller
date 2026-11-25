@@ -97,22 +97,12 @@ impl Router {
     pub(super) fn harness_auth_applies(&self, harness: &str, snapshot: &Value) -> bool {
         let env = &snapshot["pass_env_values"];
         let profile = HarnessCapabilities::of(harness).profile;
-        let selectors = [
-            "CLAUDE_CONFIG_DIR",
-            "CODEX_HOME",
-            "CODEX_SQLITE_HOME",
-            "XDG_CONFIG_HOME",
-            "XDG_DATA_HOME",
-            "MUSE_AUTH_PATH",
-            "META_API_KEY",
-            "OPENCODE_CONFIG_CONTENT",
-        ];
         super::catalog::external_quota_route(harness, snapshot, env).is_none()
             && env.as_object().is_none_or(|values| {
                 !values.iter().any(|(name, value)| {
                     !value.is_null()
-                        && selectors
-                            .iter()
+                        && crate::config::profile_environments()
+                            .flat_map(|profile| profile.auth_scope.iter())
                             .chain(profile.route_scope_secret_names)
                             .any(|key| name.eq_ignore_ascii_case(key))
                 })

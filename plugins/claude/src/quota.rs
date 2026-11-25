@@ -1,6 +1,7 @@
 //! OpenCodex 2.84.0 vendor-probes-oauth.ts: pattern only, no copied source.
+use crate::capabilities::EXTERNAL_ROUTE_MARKERS;
+use eliot_core::Result;
 use eliot_core::api::harness::QuotaEvidence;
-use eliot_core::{Result, api::CLAUDE_EXTERNAL_ROUTE_MARKERS};
 use eliot_plugin::quota as q;
 use serde_json::Value;
 use std::{ffi::OsStr, path::Path};
@@ -33,7 +34,7 @@ fn require_native_oauth_settings(settings: &Value) -> Result<()> {
 }
 
 pub(crate) fn uses_external_route(environment: &Value) -> bool {
-    q::has_nonempty_env_marker(environment, CLAUDE_EXTERNAL_ROUTE_MARKERS)
+    q::has_nonempty_env_marker(environment, EXTERNAL_ROUTE_MARKERS)
 }
 
 fn subscription_status(status: &Value) -> bool {

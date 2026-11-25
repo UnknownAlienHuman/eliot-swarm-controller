@@ -187,7 +187,7 @@ type StoreHandle = Arc<AsyncMutex<eliot_store::Store>>;
 pub(crate) struct PluginHostOptions {
     data_root: PathBuf,
     owner_token: String,
-    stand_codex_home: Option<PathBuf>,
+    stand_store_root: Option<PathBuf>,
     agent_mcp_url: Option<String>,
 }
 
@@ -195,13 +195,13 @@ impl PluginHostOptions {
     pub(crate) fn new(
         data_root: PathBuf,
         owner_token: String,
-        stand_codex_home: Option<PathBuf>,
+        stand_store_root: Option<PathBuf>,
         agent_mcp_url: Option<String>,
     ) -> Self {
         Self {
             data_root,
             owner_token,
-            stand_codex_home,
+            stand_store_root,
             agent_mcp_url,
         }
     }
@@ -359,7 +359,7 @@ impl PendingCommand {
 struct HostState {
     acl_notices: Arc<crate::acl_notice::AclNotices>,
     data_root: PathBuf,
-    stand_codex_home: Option<PathBuf>,
+    stand_store_root: Option<PathBuf>,
     agent_mcp_url: Option<String>,
     owner_token: String,
     store: StoreHandle,
@@ -491,14 +491,14 @@ impl PluginHost {
         let PluginHostOptions {
             data_root,
             owner_token,
-            stand_codex_home,
+            stand_store_root,
             agent_mcp_url,
         } = options;
         Self {
             state: Arc::new(HostState {
                 acl_notices,
                 data_root,
-                stand_codex_home,
+                stand_store_root,
                 agent_mcp_url,
                 owner_token,
                 store,
@@ -715,7 +715,7 @@ impl PluginHost {
             .transpose()?;
         let (mut target_environment, mcp_environment) = build_target_environment(
             &self.state.data_root,
-            self.state.stand_codex_home.as_deref(),
+            self.state.stand_store_root.as_deref(),
             &agent,
             &agent_token,
         )?;
@@ -2080,11 +2080,15 @@ impl PluginHost {
             .stderr(Stdio::piped());
         // The install launcher reads this interval outside the profile's
         // credential-bearing pass_env. A malformed value uses its default.
-        if let Ok(interval) = std::env::var("MUSE_UPDATE_INTERVAL_SECONDS")
-            && interval.bytes().all(|byte| byte.is_ascii_digit())
-            && interval.parse::<i64>().is_ok()
+        for setting in
+            crate::config::profile_environments().filter_map(|profile| profile.forwarded_update)
         {
-            command.env("MUSE_UPDATE_INTERVAL_SECONDS", interval);
+            if let Ok(interval) = std::env::var(setting)
+                && interval.bytes().all(|byte| byte.is_ascii_digit())
+                && interval.parse::<i64>().is_ok()
+            {
+                command.env(setting, interval);
+            }
         }
         // Debug-only owner fault hook: the plugin entry point panics when
         // `ELIOT_DEBUG_PLUGIN_PANIC=1`. The child environment is rebuilt from
@@ -3596,17 +3600,16 @@ fn metadata_secret_snapshot(
         // Exclude contributions by NAME, never subtract a matching secret value.
         names.retain(|name| {
             name.as_str().is_none_or(|name| {
-                !crate::config::CODEX_STORE_SELECTORS
-                    .iter()
-                    .any(|selector| crate::config::native_store_selector(name) == Some(*selector))
-                    && !crate::config::claude_model_selector(profile, name)
+                !crate::config::frozen_store_selectors()
+                    .any(|selector| crate::config::native_store_selector(name) == Some(selector))
+                    && !crate::config::native_model_selector(profile, name)
                     && !environment
                         .as_object()
                         .into_iter()
                         .flatten()
                         .any(|(key, value)| {
                             (key == name || (cfg!(windows) && key.eq_ignore_ascii_case(name)))
-                                && crate::config::claude_provider_mode_flag(profile, name, value)
+                                && crate::config::native_provider_mode_flag(profile, name, value)
                         })
             })
         });
@@ -3644,32 +3647,24 @@ fn metadata_route_with(
 }
 
 fn captured_store_inputs_valid(values: &Map<String, Value>) -> bool {
+    let frozen = crate::config::frozen_store_selectors;
+    let legacy = || {
+        crate::config::profile_environments()
+            .flat_map(|profile| profile.legacy_captured_paths.iter().copied())
+    };
+    let has_exact_key = |selector| {
+        values
+            .keys()
+            .filter(|name| crate::config::native_store_selector(name) == Some(selector))
+            .count()
+            == 1
+    };
     values
         .values()
         .all(|value| value.is_null() || value.is_string())
-        && (values.len() == 2 || values.len() == 5)
-        && values
-            .keys()
-            .all(|name| crate::config::native_store_selector(name).is_some())
-        && ["CODEX_HOME", "CODEX_SQLITE_HOME"]
-            .into_iter()
-            .all(|selector| {
-                values
-                    .keys()
-                    .filter(|name| crate::config::native_store_selector(name) == Some(selector))
-                    .count()
-                    == 1
-            })
-        && (values.len() == 2
-            || ["CLAUDE_CONFIG_DIR", "XDG_CONFIG_HOME", "XDG_DATA_HOME"]
-                .into_iter()
-                .all(|selector| {
-                    values
-                        .keys()
-                        .filter(|name| crate::config::native_store_selector(name) == Some(selector))
-                        .count()
-                        == 1
-                }))
+        && frozen().all(has_exact_key)
+        && (values.len() == frozen().count()
+            || (values.len() == frozen().count() + legacy().count() && legacy().all(has_exact_key)))
 }
 
 fn build_process_environment_with(
@@ -3694,7 +3689,8 @@ fn prepare_process_environment(
         .transpose()?;
     if captured.is_none()
         && HarnessCapabilities::of(profile["harness"].as_str().unwrap_or_default())
-            .requires_frozen_store_inputs
+            .frozen_store_environment
+            .is_some()
     {
         return Err(Error::new(
             "invalid",
@@ -3869,7 +3865,7 @@ fn data_root_only_mcp_environment(environment: &Value) -> Result<Value> {
 
 fn build_target_environment(
     data_root: &Path,
-    stand_codex_home: Option<&Path>,
+    stand_store_root: Option<&Path>,
     agent: &Agent,
     agent_token: &str,
 ) -> Result<(Value, Value)> {
@@ -3994,8 +3990,8 @@ fn build_target_environment(
         .into_string()
         .map_err(|_| Error::new("invalid", "managed target PATH is not valid Unicode"))?;
     insert_environment(&mut environment, "PATH", path_value);
-    crate::config::verify_stand_codex_route(
-        stand_codex_home,
+    crate::config::verify_stand_native_route(
+        stand_store_root,
         &agent.harness,
         &agent.profile_snapshot,
         Some(&environment),
@@ -4337,7 +4333,7 @@ async fn settle_drained_source_exit(
             let events = store.record_owned_reader_drained(&key.id, key.generation, now_ms())?;
             state.bus.publish(&events);
             drop(store);
-            if native_children::is_codex_producer(&state.store, &key.id).await? {
+            if native_children::has_native_child_grant(&state.store, &key.id).await? {
                 native_children::mark_children_unavailable(
                     &state.store,
                     &state.bus,
@@ -4371,7 +4367,7 @@ async fn settle_drained_source_exit(
             )?
         };
         state.bus.publish(&events);
-        if native_children::is_codex_producer(&state.store, &key.id).await? {
+        if native_children::has_native_child_grant(&state.store, &key.id).await? {
             native_children::mark_children_unavailable(
                 &state.store,
                 &state.bus,

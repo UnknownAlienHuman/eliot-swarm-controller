@@ -201,8 +201,9 @@ impl PluginHost {
         profile: Value,
         workspace: &str,
     ) -> Result<ProfileStoreResult> {
-        if !HarnessCapabilities::of(profile["harness"].as_str().unwrap_or_default())
-            .requires_frozen_store_inputs
+        if HarnessCapabilities::of(profile["harness"].as_str().unwrap_or_default())
+            .frozen_store_environment
+            .is_none()
         {
             return Err(Error::new(
                 "unsupported",

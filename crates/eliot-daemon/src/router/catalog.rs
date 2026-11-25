@@ -155,7 +155,7 @@ impl Router {
             let mut snapshot = self.resolve_profile_cached(name)?;
             crate::config::capture_native_store_inputs(
                 &mut snapshot,
-                self.inner.stand_codex_home.as_deref(),
+                self.inner.stand_store_root.as_deref(),
             )?;
             if snapshot.get("harness").and_then(Value::as_str) != Some(harness) {
                 return Err(Error::new(
@@ -214,7 +214,7 @@ impl Router {
         crate::config::stamp_cloud_mcp_hostname(&mut snapshot, &self.inner.data_root);
         crate::config::capture_native_store_inputs(
             &mut snapshot,
-            self.inner.stand_codex_home.as_deref(),
+            self.inner.stand_store_root.as_deref(),
         )?;
         Ok((Some(snapshot), "adhoc".to_owned(), discovered))
     }
@@ -1131,7 +1131,7 @@ impl Router {
         let router = self.clone();
         crate::adhoc::blocking_discovery(deadline, move || {
             let root = &router.inner.data_root;
-            let stand_codex_home = router.inner.stand_codex_home.as_deref();
+            let stand_store_root = router.inner.stand_store_root.as_deref();
             let auth_revision = router.inner.catalog_cache.lock_recover().auth_revision;
             let settings_revision = crate::config::settings::current_revision(root)?;
             let installations = SUPPORTED_HARNESSES
@@ -1156,7 +1156,7 @@ impl Router {
                         )
                         .ok()
                     })
-                    .and_then(|snapshot| catalog_source_scope("adhoc", snapshot, stand_codex_home));
+                    .and_then(|snapshot| catalog_source_scope("adhoc", snapshot, stand_store_root));
                 adhoc.push(scope);
                 if HarnessCapabilities::of(harness).models_preview_auth_integrations {
                     previews.extend(
@@ -1171,7 +1171,7 @@ impl Router {
                                     )
                                 });
                                 let scope = snapshot.and_then(|snapshot| {
-                                    catalog_source_scope(&name, snapshot, stand_codex_home)
+                                    catalog_source_scope(&name, snapshot, stand_store_root)
                                 });
                                 PreviewSource {
                                     name,
@@ -1591,9 +1591,9 @@ fn apply_source_age(
 fn catalog_source_scope(
     label: &str,
     mut snapshot: Value,
-    stand_codex_home: Option<&std::path::Path>,
+    stand_store_root: Option<&std::path::Path>,
 ) -> Option<ModelSourceIdentity> {
-    crate::config::capture_native_store_inputs(&mut snapshot, stand_codex_home).ok()?;
+    crate::config::capture_native_store_inputs(&mut snapshot, stand_store_root).ok()?;
     let route = crate::router::plugin_host::metadata_route(&snapshot).ok()?;
     model_source_identity(
         label,
@@ -1905,7 +1905,7 @@ pub(crate) fn canonical_cache_identity(
         .as_object()
         .into_iter()
         .flatten()
-        .filter(|(name, _)| crate::config::claude_model_selector(snapshot, name))
+        .filter(|(name, _)| crate::config::native_model_selector(snapshot, name))
         .collect::<std::collections::BTreeMap<_, _>>();
     let route = json!({
         "label": profile_label,

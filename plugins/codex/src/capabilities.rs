@@ -90,6 +90,14 @@ pub fn declaration() -> HarnessCapabilities {
             ],
         },
         profile: ProfileCapabilities {
+            environment: eliot_core::api::harness::ProfileEnvironment {
+                auth_scope: CODEX_PROXY_SELECTOR_ENV_NAMES,
+                cleanup_roots: CODEX_PROXY_SELECTOR_ENV_NAMES,
+                protected_env: CODEX_PROXY_SELECTOR_ENV_NAMES,
+                protected_home_paths: &[".codex"],
+                protected_cleanup_names: &[".codex"],
+                ..Default::default()
+            },
             script_wrapper_cmd: true,
             project_doc_max_bytes: true,
             native_subagents_policy: Some(NativeSubagentsPolicy::deny_by_default()),
@@ -129,7 +137,21 @@ pub fn declaration() -> HarnessCapabilities {
         project_instruction_read: crate::instructions::PROJECT_READ,
         user_instruction_files: crate::instructions::USER_FILES,
         requires_pass_env: true,
-        requires_frozen_store_inputs: true,
+        frozen_store_environment: Some(eliot_core::api::harness::FrozenStoreEnvironment {
+            display_name: "Codex",
+            selectors: CODEX_PROXY_SELECTOR_ENV_NAMES,
+            account_identity_keys: &[
+                ("codex_home", "CODEX_HOME"),
+                ("codex_sqlite_home", "CODEX_SQLITE_HOME"),
+            ],
+            private_directory: "codex-home",
+            guard_file: "config.toml",
+            direct_login_refusal: (
+                "stand_codex_login_unsupported",
+                "Codex ChatGPT/OAuth login is unavailable in a private stand; select a named Codex profile with an adopted Responses proxy",
+            ),
+            binding_refusal: "Codex on a private stand requires its stand-owned home and SQLite root; launch a fresh Agent if the retained store is outside the stand",
+        }),
         native_discovery: true,
         resume_previous_turn: true,
         reconcile_unfinished_tools: true,

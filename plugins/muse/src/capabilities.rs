@@ -36,6 +36,15 @@ pub fn declaration() -> HarnessCapabilities {
         }),
         native_route: NativeRoute::FixedCredential("ambient"),
         profile: ProfileCapabilities {
+            environment: eliot_core::api::harness::ProfileEnvironment {
+                auth_scope: &["MUSE_AUTH_PATH", "META_API_KEY"],
+                managed_update: &["MUSE_NO_AUTO_UPDATE", "MUSE_UPDATE_INTERVAL_SECONDS"],
+                forwarded_update: Some("MUSE_UPDATE_INTERVAL_SECONDS"),
+                protected_env: &["MUSE_CONFIG_DIR"],
+                protected_home_paths: &[".muse"],
+                protected_cleanup_names: &[".muse"],
+                ..Default::default()
+            },
             approval_field: Some("approval"),
             native_subagents_policy: Some(NativeSubagentsPolicy::allow_by_default()),
             ..ProfileCapabilities::default()

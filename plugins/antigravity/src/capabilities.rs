@@ -26,6 +26,11 @@ pub fn declaration() -> HarnessCapabilities {
         native_auth: None,
         native_route: NativeRoute::FixedCredential("antigravity-cli-keyring"),
         profile: ProfileCapabilities {
+            environment: eliot_core::api::harness::ProfileEnvironment {
+                protected_home_paths: &[".gemini", ".antigravity", ".agy"],
+                protected_cleanup_names: &[".antigravity"],
+                ..Default::default()
+            },
             command_refusal: Some(|cmd| {
                 (!eliot_plugin::install::cli_identity_matches(cmd, crate::install::CLI_STEM)).then_some(
                 "must name the native `agy` CLI, not the Antigravity IDE executable (which does not implement the ACP/model CLI and is never launched); install the `agy` CLI and put it on PATH",

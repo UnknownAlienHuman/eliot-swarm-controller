@@ -33,11 +33,45 @@ pub fn declaration() -> HarnessCapabilities {
         }),
         native_route: NativeRoute::FixedCredential("claude-cli-oauth"),
         profile: ProfileCapabilities {
+            environment: eliot_core::api::harness::ProfileEnvironment {
+                store_paths: &["CLAUDE_CONFIG_DIR"],
+                legacy_captured_paths: &["CLAUDE_CONFIG_DIR"],
+                route_values: &[
+                    "ANTHROPIC_BASE_URL",
+                    "ANTHROPIC_AWS_BASE_URL",
+                    "ANTHROPIC_BEDROCK_BASE_URL",
+                    "ANTHROPIC_BEDROCK_MANTLE_BASE_URL",
+                    "ANTHROPIC_FOUNDRY_BASE_URL",
+                    "ANTHROPIC_FOUNDRY_RESOURCE",
+                    "ANTHROPIC_VERTEX_BASE_URL",
+                    "ANTHROPIC_VERTEX_PROJECT_ID",
+                ],
+                binary_modes: &EXTERNAL_ROUTE_MARKERS[3..],
+                credential_presence: &[
+                    "ANTHROPIC_API_KEY",
+                    "ANTHROPIC_AUTH_TOKEN",
+                    "CLAUDE_CODE_OAUTH_TOKEN",
+                ],
+                model_pins: &[
+                    "ANTHROPIC_MODEL",
+                    "ANTHROPIC_DEFAULT_MODEL",
+                    "ANTHROPIC_DEFAULT_FABLE_MODEL",
+                    "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+                    "ANTHROPIC_DEFAULT_OPUS_MODEL",
+                    "ANTHROPIC_DEFAULT_SONNET_MODEL",
+                    "ANTHROPIC_CUSTOM_MODEL_OPTION",
+                ],
+                credential_directory: Some("CLAUDE_CONFIG_DIR"),
+                auth_scope: &["CLAUDE_CONFIG_DIR"],
+                cleanup_roots: &["CLAUDE_CONFIG_DIR"],
+                protected_env: &["CLAUDE_CONFIG_DIR"],
+                protected_home_paths: &[".claude"],
+                protected_cleanup_names: &[".claude"],
+                ..Default::default()
+            },
             approval_field: Some("permission_mode"),
-            model_pin_selectors: true,
             route_selectors_resolved: true,
             route_scope_secret_names: &["CLAUDE_CODE_OAUTH_TOKEN"],
-            config_dir_credential: true,
             latest_cmd: true,
             command_refusal: Some(eliot_plugin::capabilities::absolute_native_command_refusal),
             native_subagents_policy: Some(NativeSubagentsPolicy::deny_by_default()),
@@ -160,3 +194,18 @@ fn legacy_result_outcome(status: Option<&str>) -> eliot_core::TurnOutcome {
         _ => TurnOutcome::Unknown,
     }
 }
+
+/// Environment markers that select an external Claude route. The daemon
+/// refuses them from the frozen environment and the Claude quota reader
+/// refuses them from native `settings.json`; both share this one list.
+pub(crate) const EXTERNAL_ROUTE_MARKERS: &[&str] = &[
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "ANTHROPIC_BASE_URL",
+    "CLAUDE_CODE_USE_ANTHROPIC_AWS",
+    "CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD",
+    "CLAUDE_CODE_USE_BEDROCK",
+    "CLAUDE_CODE_USE_VERTEX",
+    "CLAUDE_CODE_USE_FOUNDRY",
+    "CLAUDE_CODE_USE_MANTLE",
+];

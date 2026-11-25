@@ -35,6 +35,25 @@ pub fn declaration() -> HarnessCapabilities {
         }),
         native_route: NativeRoute::AuthIntegration,
         profile: ProfileCapabilities {
+            environment: eliot_core::api::harness::ProfileEnvironment {
+                store_paths: &[
+                    "XDG_CONFIG_HOME",
+                    "XDG_DATA_HOME",
+                    "XDG_STATE_HOME",
+                    "XDG_CACHE_HOME",
+                    "OPENCODE_CONFIG",
+                    "OPENCODE_CONFIG_DIR",
+                ],
+                legacy_captured_paths: &["XDG_CONFIG_HOME", "XDG_DATA_HOME"],
+                auth_scope: &[
+                    "XDG_CONFIG_HOME",
+                    "XDG_DATA_HOME",
+                    "OPENCODE_CONFIG_CONTENT",
+                ],
+                protected_env: &["OPENCODE_CONFIG_DIR", "XDG_CONFIG_HOME", "XDG_DATA_HOME"],
+                protected_cleanup_names: &[".opencode"],
+                ..Default::default()
+            },
             route_scope_secret_names: &["OPENCODE_CONFIG_CONTENT"],
             local_provider: true,
             native_subagents_policy: Some(NativeSubagentsPolicy::deny_by_default()),
