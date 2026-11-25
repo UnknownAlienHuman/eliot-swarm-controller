@@ -1103,7 +1103,6 @@ impl Router {
                     && !self.run_workers_active()
                     && self.inner.cleanup_worker.lock_recover().is_none())
             }
-            MODE_DRAIN => Ok(false),
             _ => Ok(false),
         }
     }

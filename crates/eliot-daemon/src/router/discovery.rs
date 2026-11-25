@@ -402,7 +402,7 @@ static MUTATION_ID_METHODS: OnceLock<Vec<&'static str>> = OnceLock::new();
 /// caller-retained `id`. Derived from this module's descriptors (mutation
 /// flag plus an `id` property in the request schema); MCP id minting follows
 /// this list so the two can never drift.
-pub fn mutation_id_methods() -> &'static [&'static str] {
+fn mutation_id_methods() -> &'static [&'static str] {
     MUTATION_ID_METHODS.get_or_init(|| {
         METHODS
             .iter()

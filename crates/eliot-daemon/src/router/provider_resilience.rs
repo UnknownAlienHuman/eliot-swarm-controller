@@ -641,7 +641,6 @@ impl Router {
                     "succeeded" | "failed" | "interrupted" => return Ok(Some(command)),
                     // A turn with an unknown source/outcome is not cleanup
                     // authority, even if the command itself is Applied.
-                    "unknown" => return Ok(None),
                     _ => return Ok(None),
                 }
             } else if command.state.is_terminal() {

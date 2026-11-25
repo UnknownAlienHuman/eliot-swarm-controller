@@ -556,7 +556,7 @@ fn persist_selected_root_at(path: &Path, pointer_dir: &Path) -> Result<()> {
 }
 
 /// Resolve the durable root selection, if the user has made one.
-pub fn resolve_selected_root() -> Result<Option<PathBuf>> {
+fn resolve_selected_root() -> Result<Option<PathBuf>> {
     resolve_selected_root_at(&selected_root_pointer_dir()?)
 }
 

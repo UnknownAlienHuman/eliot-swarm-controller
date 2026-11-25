@@ -8,7 +8,6 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 pub use crate::config::profiles_edit::profile_draft_blocks;
-pub use crate::daemon::run_for_update;
 pub use crate::daemon::run_for_update_with_agent_mcp_url;
 pub use crate::harness_capabilities::native_subagents_policy;
 pub use crate::platform::data_dir::{DaemonInfo, DaemonLock, OperatorLock};

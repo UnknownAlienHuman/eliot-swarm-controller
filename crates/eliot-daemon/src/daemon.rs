@@ -237,10 +237,6 @@ pub async fn run_with_agent_mcp_url(path: PathBuf, url: String) -> Result<()> {
     run_with_update(path, None, Some(url)).await
 }
 
-pub async fn run_for_update(path: PathBuf, attempt: &str) -> Result<()> {
-    run_with_update(path, Some(attempt), None).await
-}
-
 pub async fn run_for_update_with_agent_mcp_url(
     path: PathBuf,
     attempt: &str,
@@ -1605,21 +1601,6 @@ pub fn require_agent_identity(target: &Path) -> Result<()> {
     required_agent_identity_for(target).map(|_| ())
 }
 
-/// Make one local JSON-RPC call using only a complete inherited Agent identity
-/// scoped to `path`. Owner and Run contexts are rejected before any Owner
-/// credential lookup, as is an Agent identity issued by another data
-/// directory: this path never sends a foreign token and never falls back to
-/// Owner authority.
-pub async fn client_call_with_agent_identity(
-    path: &Path,
-    method: &str,
-    params: Value,
-) -> Result<Value> {
-    validate_client_call(method, &params)?;
-    let identity = required_agent_identity_for(path)?;
-    client_call_with_identity(path, method, params, identity).await
-}
-
 /// Make one Agent-authenticated daemon RPC from the shared Swarm MCP tool boundary.
 /// The call id is private provenance metadata; RPC params remain unchanged.
 pub async fn client_call_with_agent_mcp_tool(
@@ -2800,7 +2781,7 @@ fn validated_config_startup_diagnostic(evidence: &str) -> Option<String> {
 }
 
 /// Newest `daemon.failed` record in the bounded log tail, if any.
-pub fn last_daemon_failure(data_dir: &Path) -> Option<DaemonStartupFailure> {
+fn last_daemon_failure(data_dir: &Path) -> Option<DaemonStartupFailure> {
     read_log_failures(data_dir).into_iter().next_back()
 }
 
@@ -2921,7 +2902,7 @@ fn read_log_failures(data_dir: &Path) -> Vec<DaemonStartupFailure> {
 
 /// Bounded connect hint for an unreachable daemon. Names only lock/log
 /// presence and the last sanitized `daemon.failed` code; never secrets.
-pub fn daemon_connect_hint(data_dir: &Path) -> String {
+fn daemon_connect_hint(data_dir: &Path) -> String {
     let metadata = data_dir.join("daemon.json");
     let lock = data_dir.join("daemon.lock");
     let log = data_dir.join("logs").join("daemon.log");

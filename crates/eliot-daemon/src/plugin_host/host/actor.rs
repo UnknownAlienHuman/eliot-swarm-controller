@@ -79,9 +79,7 @@ pub(super) fn arbitrate_reader_close(root_exited: bool, reader_ok: bool) -> (&'s
 /// keeps #702's drain-before-reap order: the leader stays unreaped while the
 /// owned group drains, and only the bounded reap clears the birth-checked
 /// identity. Both the spontaneous-exit arm and the reader-EOF arbitration run
-/// this path, so EOF can never mask an observed root exit. This runs only
-/// from terminal arms where no stop was planned, matching the old
-/// `!planned_exit` guard at the call sites.
+/// this path only when no stop was planned, so EOF cannot mask root exit.
 #[allow(
     clippy::too_many_arguments,
     reason = "The operation's distinct inputs remain explicit at its established call boundary."
@@ -248,7 +246,7 @@ pub(super) async fn run_agent_inner(
     } = actor;
     let mut pending_steers: FuturesUnordered<PendingSteerFuture> = FuturesUnordered::new();
     let mut pending_snapshots: FuturesUnordered<PendingSnapshotFuture> = FuturesUnordered::new();
-    let planned_exit = drive_agent_dispatch(AgentDispatch {
+    drive_agent_dispatch(AgentDispatch {
         state: &state,
         monitoring: &monitoring,
         key: &key,
@@ -268,7 +266,6 @@ pub(super) async fn run_agent_inner(
         &state,
         &key,
         &plugin_credential,
-        planned_exit,
         &mut pending_steers,
         pending_snapshots,
         &client,
@@ -511,10 +508,10 @@ fn startup_loss_origin(error: &Error) -> Option<FailureOrigin> {
 
 /// Typed process/source/control message handling: supervise the plugin child,
 /// source stream, and queued commands, stops, snapshots, and daemon force
-/// until the loop exits, then report whether the exit was planned. Every
+/// until the loop exits. Every
 /// handle is borrowed from the actor frame; `child` is taken only where the
 /// inline code dropped it.
-async fn drive_agent_dispatch(dispatch: AgentDispatch<'_>) -> bool {
+async fn drive_agent_dispatch(dispatch: AgentDispatch<'_>) {
     let AgentDispatch {
         state,
         monitoring,
@@ -530,7 +527,6 @@ async fn drive_agent_dispatch(dispatch: AgentDispatch<'_>) -> bool {
         pending_snapshots,
         pending_failure,
     } = dispatch;
-    let mut planned_exit = false;
     // while_let_loop does not apply: the child borrow must end before
     // take() on break paths, which a while-let condition cannot express.
     #[allow(
@@ -573,7 +569,6 @@ async fn drive_agent_dispatch(dispatch: AgentDispatch<'_>) -> bool {
                 if source_settled && control_gone {
                     mark_lost_state(state, key, gap_reason).await;
                 }
-                planned_exit = true;
                 break;
             }
             completion = pending_snapshots.next(), if !pending_snapshots.is_empty() => {
@@ -822,7 +817,6 @@ async fn drive_agent_dispatch(dispatch: AgentDispatch<'_>) -> bool {
                         if let Some(state) = state.upgrade() {
                             fence_runtime_generation(&state, key);
                         }
-                        planned_exit = true;
                         let source_error = source_exit.err();
                         // A failed teardown step is provisional. The observer may
                         // already have committed exit, and source settlement can
@@ -881,7 +875,6 @@ async fn drive_agent_dispatch(dispatch: AgentDispatch<'_>) -> bool {
                             // Preserve the generation projection and its custody reservation.
                             // Boot recovery proves the prior generation's exit before
                             // it decides whether this session can continue.
-                            planned_exit = true;
                             let _ = reply.send(Ok(()));
                             break;
                         }
@@ -894,7 +887,6 @@ async fn drive_agent_dispatch(dispatch: AgentDispatch<'_>) -> bool {
                             if let Some(state) = state.upgrade() {
                                 fence_runtime_generation(&state, key);
                             }
-                            planned_exit = true;
                             let _ = reply.send(Err(Error::new(
                                 "unknown",
                                 format!(
@@ -912,12 +904,10 @@ async fn drive_agent_dispatch(dispatch: AgentDispatch<'_>) -> bool {
                             if let Some(state) = state.upgrade() {
                                 fence_runtime_generation(&state, key);
                             }
-                            planned_exit = true;
                             let _ = reply.send(Err(error));
                             break;
                         }
                         mark_lost_state(state, key, "daemon_force_exit_without_session_terminal").await;
-                        planned_exit = true;
                         let _ = reply.send(Ok(()));
                         break;
                     }
@@ -925,7 +915,6 @@ async fn drive_agent_dispatch(dispatch: AgentDispatch<'_>) -> bool {
             }
         }
     }
-    planned_exit
 }
 
 /// Final family settlement: drop pending snapshot reads, clean up the actor,
@@ -940,7 +929,6 @@ async fn settle_agent_actor(
     state: &Weak<super::HostState>,
     key: &super::AgentKey,
     plugin_credential: &str,
-    planned_exit: bool,
     pending_steers: &mut FuturesUnordered<PendingSteerFuture>,
     pending_snapshots: FuturesUnordered<PendingSnapshotFuture>,
     client: &PluginClient,
@@ -952,7 +940,7 @@ async fn settle_agent_actor(
     // These read-only futures are actor-owned. Dropping them cancels every
     // pending snapshot RPC before actor cleanup; they cannot outlive the child.
     drop(pending_snapshots);
-    cleanup_actor(state, key, plugin_credential, planned_exit).await;
+    cleanup_actor(state, key, plugin_credential);
     if !pending_steers.is_empty() {
         // Stop/force/source custody above owns teardown. Only then wait for the
         // transport to close and settle the retained correlated responses.
