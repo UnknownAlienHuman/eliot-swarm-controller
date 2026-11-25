@@ -3091,7 +3091,7 @@ impl EventProcessor {
                 .record_gap("Muse agentMessage omitted its item id")
                 .await;
         }
-        let text = SecretPolicy::new(self.secrets.iter().cloned()).redact_text(text);
+        let text = SecretPolicy::new(self.secrets.iter().cloned()).redact_native_text(text);
         let mut data = json!({
             "turn_id": turn_id,
             "text": text,

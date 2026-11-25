@@ -103,7 +103,9 @@ pub(super) async fn recover_active_turn(
                 match readback(agent, &command_id, &current, &snapshot) {
                     Readback::Running => return Ok(false),
                     Readback::Terminal(mut terminal) => {
-                        router.secret_policy_snapshot().redact_values(&mut terminal);
+                        router
+                            .secret_policy_snapshot()
+                            .redact_native_values(&mut terminal);
                         return settle(router, agent, &current, RecoveredTurn::Terminal(terminal))
                             .await;
                     }

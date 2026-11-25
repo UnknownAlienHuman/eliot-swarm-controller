@@ -379,7 +379,7 @@ fn write_record(
 }
 
 fn bounded_text(policy: &SecretPolicy, text: &str, limit: usize) -> String {
-    let safe = policy.redact_text(text);
+    let safe = policy.redact_native_text(text);
     let mut end = safe.len().min(limit);
     while !safe.is_char_boundary(end) {
         end -= 1;
@@ -486,7 +486,9 @@ fn encode_record(
     if let Some(detail) = detail
         && !detail.is_empty()
     {
-        value["detail"] = Value::Object(detail);
+        let mut detail = Value::Object(detail);
+        policy.redact_native_values(&mut detail);
+        value["detail"] = detail;
     }
     if let Some(error) = error {
         value["cause"] = json!(bounded_text(policy, &error.message, 1024));
@@ -511,7 +513,7 @@ fn encode_record(
         }
         let mut diagnostics = (*error.diagnostics).clone();
         for diagnostic in &mut diagnostics {
-            diagnostic.snapshot.text = policy.redact_text(&diagnostic.snapshot.text);
+            diagnostic.snapshot.text = policy.redact_native_text(&diagnostic.snapshot.text);
         }
         let remaining = RECORD_BYTES.saturating_sub(serde_json::to_vec(&value).ok()?.len() + 32);
         bound_stderr_diagnostics(&mut diagnostics, remaining.min(MAX_STDERR_DIAGNOSTIC_BYTES));

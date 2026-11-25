@@ -563,8 +563,24 @@ become `events.put` records.
 ### Commit acknowledgement
 
 Normalize one native record into one atomic batch. Each event carries stable native id,
-kind/family, timestamp, exact correlations and bounded data. The daemon computes
-canonical event/batch digests, excluding transport ids/timing; cursor is compared too.
+kind/family, timestamp, exact correlations and bounded data. The host applies
+the shared [native redaction policy](../../crates/eliot-core/src/secrets.rs) to
+semantic values before the Store computes canonical event and batch digests.
+Recognized provider and GitHub keys, JWTs, Bearer values, query credential values
+and high-entropy values in named secret fields become
+`[REDACTED:<kind>:<original byte length>]`. The digest sees the marker and
+surrounding text. Ordinary Git SHAs and ULIDs remain intact. A credential in
+an immutable correlation or object key rejects the batch with
+`secret_in_payload`. Bounded adapter views apply the same shared policy before
+truncation. Native outcome and recovery text and daemon diagnostics also use
+this policy.
+
+Redaction is stable on repeated application, so same-ID replay of normalized
+content reproduces the digest. Digests exclude transport IDs and timing. The
+Store also compares the cursor. Historical rows and replay receipts keep
+their original contents. A legacy replay whose normalization now changes its
+digest returns the existing source-integrity refusal.
+
 A source permits at most one unacknowledged batch. Keep later input in a bounded spool.
 
 For a planned daemon restart, while holding the Store writer lock, the daemon
@@ -692,7 +708,7 @@ its own background task; `tool.background_ended` (`turn_id`, `item_id`) reports 
 task ended and may commit after that turn. A command tool's `tool.started` may carry `command`, the command text the
 harness reports (Codex: its parsed `commandActions[].command`, one per line, else the raw
 `command`; Claude: the `tool_use` `input.command`; OpenCode: the
-`session.tool.called` tool input string `command`, the shell tool), redacted with the secret policy and
+`session.tool.called` tool input string `command`, the shell tool), redacted with the shared native policy and
 bounded to [`MAX_TOOL_COMMAND_BYTES`](../../crates/eliot-core/src/limits.rs); command
 output is never persisted, except the bounded, redacted tail of a failed Codex
 `commandExecution` (`error_tail`): the whole native output is redacted, then the
@@ -759,8 +775,8 @@ The private authenticated `source.state` readback includes paired nullable
 first handoff, and all current generation owner/mechanism rows.
 `SourceHandoff::prepare(&mut self, policy:&SecretPolicy)->CoreResult<()>` is the shared,
 idempotent normalization step. It rejects known secrets in immutable fields before
-mutation and redacts only `gap.reason`; the canonical digest includes the full prepared
-request, including the redacted reason. The host uses the same prepare path.
+mutation and redacts the semantic `gap.reason`; the canonical digest includes the full
+prepared request, including the redacted reason. The host uses the same prepare path.
 A reader with an uncertain handoff reply stops publishing on that source. It may
 publish successor facts only after a validated acknowledgement. The public Agent
 `source_states` projection omits the digest and ACK. No source epoch or open-id layer.

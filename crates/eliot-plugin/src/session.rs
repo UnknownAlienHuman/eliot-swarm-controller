@@ -1049,7 +1049,7 @@ pub fn attach_native_error(data: &mut Value, message: Option<&str>, policy: &Sec
     let budget = MAX_EVENT_BYTES
         .saturating_sub(encoded.len().saturating_add(r#","native_error":"#.len()))
         .min(4 * 1024);
-    let mut message = policy.redact_text(message);
+    let mut message = policy.redact_native_text(message);
     let mut truncated = false;
     loop {
         let diagnostic = json!({"message": &message, "truncated": truncated});
@@ -1081,7 +1081,7 @@ pub fn attach_final_text(data: &mut Value, final_text: &str) {
     };
     fields.insert(
         "final_text".to_owned(),
-        Value::String(final_text.to_owned()),
+        Value::String(SecretPolicy::default().redact_native_text(final_text)),
     );
     // Adapters can also retain the attached reply for a private snapshot.
     // Its smaller public event budget is applied when the Store writes it.

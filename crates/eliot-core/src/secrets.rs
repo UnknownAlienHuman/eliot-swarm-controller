@@ -1,5 +1,7 @@
 //! Immutable literal-secret policy shared by admission, transports and logging.
 
+mod credentials;
+
 use serde_json::Value;
 
 const MARKER: &[u8] = b"[REDACTED]";
@@ -45,6 +47,69 @@ impl SecretPolicy {
         let mut safe = self.redact_text(text);
         safe.truncate(safe.floor_char_boundary(max_bytes));
         safe
+    }
+
+    /// Check exact credentials and recognizable shapes without altering an identity.
+    pub fn contains_native_secret(&self, text: &str) -> bool {
+        self.contains_text(text) || credentials::contains(text)
+    }
+
+    /// Redact complete native text before truncating, logging or hashing it.
+    pub fn redact_native_text(&self, text: &str) -> String {
+        let safe = credentials::redact(text);
+        if self.contains_text(&safe) {
+            self.redact_text(&safe)
+        } else {
+            safe.into_owned()
+        }
+    }
+
+    /// Redact native text before applying the caller's byte limit.
+    pub fn redact_native_bounded(&self, text: &str, max_bytes: usize) -> String {
+        let mut safe = self.redact_native_text(text);
+        safe.truncate(safe.floor_char_boundary(max_bytes));
+        safe
+    }
+
+    /// Redact native string values, with context from explicit secret fields.
+    /// Object keys remain intact for the caller's metadata validation.
+    pub fn redact_native_values(&self, value: &mut Value) -> bool {
+        self.redact_native_field(value, None)
+    }
+
+    fn redact_native_field(&self, value: &mut Value, field: Option<&str>) -> bool {
+        match value {
+            Value::String(text) => {
+                let safe = credentials::redact_field(text, field);
+                let safe = if self.contains_text(&safe) {
+                    self.redact_text(&safe)
+                } else if let std::borrow::Cow::Owned(safe) = safe {
+                    safe
+                } else {
+                    return false;
+                };
+                if *text == safe {
+                    return false;
+                }
+                *text = safe;
+                true
+            }
+            Value::Array(values) => {
+                let mut changed = false;
+                for value in values {
+                    changed |= self.redact_native_field(value, field);
+                }
+                changed
+            }
+            Value::Object(values) => {
+                let mut changed = false;
+                for (key, value) in values {
+                    changed |= self.redact_native_field(value, Some(key));
+                }
+                changed
+            }
+            _ => false,
+        }
     }
 
     /// Inspect both string keys and string values; other JSON scalars stay typed.

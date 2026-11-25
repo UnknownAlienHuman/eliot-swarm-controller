@@ -2797,10 +2797,21 @@ fn safe_cause_code(code: &str) -> String {
 }
 
 fn redact_source_batch(batch: &mut SourceBatch, credentials: &[String]) -> Result<()> {
+    fn contains_secret(value: &Value, policy: &SecretPolicy) -> bool {
+        match value {
+            Value::String(text) => policy.contains_native_secret(text),
+            Value::Object(values) => values.iter().any(|(key, value)| {
+                policy.contains_native_secret(key) || contains_secret(value, policy)
+            }),
+            Value::Array(values) => values.iter().any(|value| contains_secret(value, policy)),
+            _ => false,
+        }
+    }
+
     fn protected_data(value: &Value, policy: &SecretPolicy) -> bool {
         match value {
             Value::Object(values) => values.iter().any(|(key, value)| {
-                policy.contains_text(key)
+                policy.contains_native_secret(key)
                     || (matches!(
                         key.as_str(),
                         "agent_id"
@@ -2810,7 +2821,7 @@ fn redact_source_batch(batch: &mut SourceBatch, credentials: &[String]) -> Resul
                             | "item_id"
                             | "native_scope"
                             | "native_ref"
-                    ) && policy.contains_value(value))
+                    ) && contains_secret(value, policy))
                     || protected_data(value, policy)
             }),
             Value::Array(values) => values.iter().any(|value| protected_data(value, policy)),
@@ -2823,24 +2834,24 @@ fn redact_source_batch(batch: &mut SourceBatch, credentials: &[String]) -> Resul
     // and object keys must never be rewritten into a different durable payload.
     if [&batch.batch_id, &batch.agent_id, &batch.source]
         .into_iter()
-        .any(|value| policy.contains_text(value))
+        .any(|value| policy.contains_native_secret(value))
         || batch
             .cursor
             .as_deref()
-            .is_some_and(|value| policy.contains_text(value))
+            .is_some_and(|value| policy.contains_native_secret(value))
         || batch.events.iter().any(|event| {
-            policy.contains_text(&event.native_id)
-                || policy.contains_text(&event.kind)
+            policy.contains_native_secret(&event.native_id)
+                || policy.contains_native_secret(&event.kind)
                 || protected_data(&event.data, &policy)
         })
     {
         return Err(Error::new(
             "secret_in_payload",
-            "native source payload contains a known secret in immutable metadata",
+            "native source payload contains a credential in immutable metadata",
         ));
     }
     for event in &mut batch.events {
-        if policy.redact_values(&mut event.data) {
+        if policy.redact_native_values(&mut event.data) {
             let Some(data) = event.data.as_object_mut() else {
                 return Err(Error::new(
                     "invalid",
@@ -2980,18 +2991,18 @@ fn redact_source_gap(gap: &mut SourceGap, credentials: &[String]) -> Result<()> 
     if [&gap.gap_id, &gap.agent_id, &gap.source]
         .into_iter()
         .chain(gap.families.iter())
-        .any(|value| policy.contains_text(value))
+        .any(|value| policy.contains_native_secret(value))
         || [&gap.from, &gap.to]
             .into_iter()
             .flatten()
-            .any(|value| policy.contains_text(value))
+            .any(|value| policy.contains_native_secret(value))
     {
         return Err(Error::new(
             "secret_in_payload",
-            "native source payload contains a known secret in immutable metadata",
+            "native source payload contains a credential in immutable metadata",
         ));
     }
-    gap.reason = policy.redact_text(&gap.reason);
+    gap.reason = policy.redact_native_text(&gap.reason);
     Ok(())
 }
 
@@ -3044,7 +3055,7 @@ fn redact_native_error(error: Error, credentials: &[String]) -> Error {
     // The boundary behind every persisted outcome, event and log record:
     // redacted message, origin evidence and stderr tails, normalized
     // `where`, every bound re-applied.
-    error.sanitized(&SecretPolicy::new(credentials))
+    crate::redaction::redact_native_error(error, &SecretPolicy::new(credentials))
 }
 
 fn diagnose_error(error: Error, stderr: &StderrView, credentials: &[String]) -> Error {

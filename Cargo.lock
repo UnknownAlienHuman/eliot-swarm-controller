@@ -537,6 +537,7 @@ name = "eliot-core"
 version = "0.2.0-dev"
 dependencies = [
  "globset",
+ "regex",
  "schemars",
  "serde",
  "serde_json",

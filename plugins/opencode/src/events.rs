@@ -2404,7 +2404,7 @@ impl EventProcessor {
             .filter(|command| !command.trim().is_empty())
         {
             let policy = SecretPolicy::new(self.secrets.iter().cloned());
-            let redacted = policy.redact_text(command);
+            let redacted = policy.redact_native_text(command);
             data["command_truncated"] = json!(redacted.len() > MAX_TOOL_COMMAND_BYTES);
             data["command"] =
                 Value::String(policy.redact_bounded(&redacted, MAX_TOOL_COMMAND_BYTES));
@@ -2842,7 +2842,7 @@ impl EventProcessor {
             let data = json!({
                 "command_id": command_id,
                 "turn_id": turn_id,
-                "text": secrets.redact_text(text),
+                "text": secrets.redact_native_text(text),
             });
             let native_id = event_id(
                 &terminal.session_id,
@@ -3750,7 +3750,7 @@ fn terminal_turn_data(
         );
     }
     if let Some(text) = readback.and_then(|readback| readback.final_text.as_deref()) {
-        attach_final_text(&mut data, &secrets.redact_text(text));
+        attach_final_text(&mut data, &secrets.redact_native_text(text));
     }
     data
 }

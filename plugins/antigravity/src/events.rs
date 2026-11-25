@@ -930,7 +930,7 @@ impl State {
             }
             self.finish_assistant_text();
             let final_text = if self.text_unavailable.is_none() {
-                self.policy.redact_text(&self.text_accum)
+                self.policy.redact_native_text(&self.text_accum)
             } else {
                 String::new()
             };
@@ -1021,7 +1021,7 @@ impl State {
         self.close_pending_requests(Some(&stop.turn_id)).await?;
         self.close_open_tools_at_terminal(status == "completed")
             .await?;
-        let text = self.policy.redact_text(&self.text_accum);
+        let text = self.policy.redact_native_text(&self.text_accum);
         let missing_text = self.text_unavailable;
         let outcome = match status {
             "completed" => "success",
@@ -2493,7 +2493,9 @@ impl State {
                 diff_paths: ToolDiffPaths::default(),
             });
         if !title.is_empty() {
-            known.title = self.policy.redact_bounded(title, MAX_TOOL_TITLE_BYTES);
+            known.title = self
+                .policy
+                .redact_native_bounded(title, MAX_TOOL_TITLE_BYTES);
         }
         if let Some(status) = status {
             let next = ToolStatus::parse(status);
@@ -2751,7 +2753,7 @@ impl State {
         // a terminal response cannot establish their native outcome.
         self.close_open_tools_at_terminal(status == "completed")
             .await?;
-        let text = self.policy.redact_text(&self.text_accum);
+        let text = self.policy.redact_native_text(&self.text_accum);
         let missing_text = self.text_unavailable;
         let mut data = json!({"turn_id": turn,
             "status": status, "outcome": outcome, "native_status": native_status});

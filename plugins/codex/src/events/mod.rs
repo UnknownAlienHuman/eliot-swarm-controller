@@ -1662,7 +1662,7 @@ impl EventProcessor {
                     if let Some(command) = command_text(&notification.item) {
                         data["command"] = Value::String(
                             SecretPolicy::new(self.secrets.iter().cloned())
-                                .redact_bounded(&command, MAX_TOOL_COMMAND_BYTES),
+                                .redact_native_bounded(&command, MAX_TOOL_COMMAND_BYTES),
                         );
                     }
                     if item_type == "commandExecution"
@@ -1778,7 +1778,7 @@ impl EventProcessor {
             .get("text")
             .and_then(Value::as_str)
             .ok_or_else(|| Error::new("native_protocol", "Codex agentMessage omitted its text"))?;
-        let text = SecretPolicy::new(self.secrets.iter().cloned()).redact_text(text);
+        let text = SecretPolicy::new(self.secrets.iter().cloned()).redact_native_text(text);
         let mut data = json!({
             "command_id": self.status.active_command_id.as_deref().unwrap_or_default(),
             "turn_id": turn_id,
@@ -2858,7 +2858,7 @@ fn unclassified_native_item(item: &Value) -> Option<(&'static str, &str, bool)> 
 /// the lines that actually fail, not its first banner. `None` when nothing
 /// usable remains.
 fn failed_output_tail(output: &str, secrets: &[String]) -> Option<String> {
-    let safe = SecretPolicy::new(secrets.iter().cloned()).redact_text(output);
+    let safe = SecretPolicy::new(secrets.iter().cloned()).redact_native_text(output);
     let max = MAX_TOOL_ERROR_TAIL_BYTES;
     let tail = if safe.len() <= max {
         safe.as_str()
