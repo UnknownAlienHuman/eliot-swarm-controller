@@ -517,8 +517,7 @@ pub struct NativeTurnError {
 /// a response for a session without an authorized hardware key. No structured
 /// `codexErrorInfo` variant is known for this hold, so this sentence is the
 /// fallback evidence on every terminal path (live, readback and history).
-const PROVIDER_RESPONSE_WITHHELD_MESSAGE: &str =
-    include_str!("../../fixtures/withheld-turn-error-message-0.167.1.txt");
+const PROVIDER_RESPONSE_WITHHELD_MESSAGE: &str = "You're approved for Daybreak Blue, but this response cannot be shown as this session was not authenticated with one of your authorized hardware keys. Please re-authenticate with your hardware key and try your request again.";
 pub(crate) const WITHHELD_LEGACY_EVIDENCE: &str = "text_fallback";
 
 /// Outer whitespace is benign; nested metadata and other output are not part
@@ -526,7 +525,7 @@ pub(crate) const WITHHELD_LEGACY_EVIDENCE: &str = "text_fallback";
 pub(crate) fn response_withheld_fact_from_message(
     message: &str,
 ) -> Option<ProviderResponseWithheldFact> {
-    (message.trim() == PROVIDER_RESPONSE_WITHHELD_MESSAGE.trim_end()).then(|| {
+    (message.trim() == PROVIDER_RESPONSE_WITHHELD_MESSAGE).then(|| {
         ProviderResponseWithheldFact::new(
             ProviderResponseWithheldDetection::ExactNativeMessage,
             None,

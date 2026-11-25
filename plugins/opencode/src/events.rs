@@ -2874,7 +2874,11 @@ impl EventProcessor {
         reply: oneshot::Sender<Result<()>>,
         seal_frames: bool,
     ) {
-        match self.stop_drain.request(reply, "OpenCode") {
+        match self.stop_drain.request(
+            reply,
+            "bad_state",
+            "OpenCode stop is already waiting for native output drain",
+        ) {
             StopRequest::Ready(receipt) => receipt.finish(self.finish_stop().await),
             StopRequest::Waiting if seal_frames => self.close_frames = true,
             StopRequest::Waiting | StopRequest::Refused => {}

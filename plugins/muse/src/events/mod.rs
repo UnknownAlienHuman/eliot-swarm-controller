@@ -1026,7 +1026,11 @@ impl EventProcessor {
                 true
             }
             Control::EndStop { reply } => {
-                if let StopRequest::Ready(receipt) = self.stop_drain.request(reply, "Muse") {
+                if let StopRequest::Ready(receipt) = self.stop_drain.request(
+                    reply,
+                    "bad_state",
+                    "Muse stop is already waiting for native output drain",
+                ) {
                     receipt.finish(self.finish_stop().await);
                 }
                 true

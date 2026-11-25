@@ -837,11 +837,11 @@ async fn dispatch_control(
             let _ = reply.send(Ok(()));
         }
         Control::EndStop { reply } => {
-            if let StopRequest::Ready(receipt) =
-                processor.stop_drain.request_with_conflict(reply, || {
-                    Error::new("unknown", "Claude stop settlement is already pending")
-                })
-            {
+            if let StopRequest::Ready(receipt) = processor.stop_drain.request(
+                reply,
+                "unknown",
+                "Claude stop settlement is already pending",
+            ) {
                 let result = processor.finish_stop().await;
                 publish(processor, status);
                 receipt.finish(result);

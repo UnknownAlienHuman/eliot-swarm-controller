@@ -45,25 +45,17 @@ impl StopDrain {
         self.drained = true;
     }
 
-    pub fn request(&mut self, reply: oneshot::Sender<Result<()>>, harness: &str) -> StopRequest {
-        self.request_with_conflict(reply, || {
-            Error::new(
-                "bad_state",
-                format!("{harness} stop is already waiting for native output drain"),
-            )
-        })
-    }
-
-    pub fn request_with_conflict(
+    pub fn request(
         &mut self,
         reply: oneshot::Sender<Result<()>>,
-        duplicate: impl FnOnce() -> Error,
+        conflict_code: &str,
+        conflict_message: &str,
     ) -> StopRequest {
         let receipt = StopReceipt(reply);
         if self.drained {
             StopRequest::Ready(receipt)
         } else if self.pending.is_some() {
-            receipt.finish(Err(duplicate()));
+            receipt.finish(Err(Error::new(conflict_code, conflict_message)));
             StopRequest::Refused
         } else {
             self.pending = Some(receipt);
