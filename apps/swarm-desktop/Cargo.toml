@@ -79,10 +79,6 @@ windows-sys = { workspace = true, features = [
     # for its AppWindowTitleBar colors.
     "Win32_System_LibraryLoader",
     "Win32_System_Memory",
-    # The transcript's scroll-to-end through UI Automation (`scroll_end`):
-    # the VARIANT of its property condition.
-    "Win32_System_Ole",
-    "Win32_System_Variant",
     "Win32_UI_Shell",
     # Whether an inherited standard handle is usable (GetFileType, `startup`).
     "Win32_Storage_FileSystem",

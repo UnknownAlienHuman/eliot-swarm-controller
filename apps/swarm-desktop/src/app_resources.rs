@@ -923,9 +923,6 @@ pub fn styles_xaml(animations: bool) -> String {
         radius: container,
         morph: false,
     });
-    // The transcript is the app's only ScrollView: anchored at its far
-    // (bottom) edge, WinUI keeps it at the end while it is there and the
-    // content grows, so a conversation opens at its newest turn.
     format!(
         "{XAML_ROOT}\
          <FontFamily x:Key=\"ContentControlThemeFontFamily\">{family}</FontFamily>\
@@ -1012,9 +1009,6 @@ pub fn styles_xaml(animations: bool) -> String {
            {font}\
            <Setter Property=\"CornerRadius\" Value=\"{dialog}\"/>\
            <Setter Property=\"Background\" Value=\"Transparent\"/>\
-         </Style>\
-         <Style TargetType=\"ScrollView\">\
-           <Setter Property=\"VerticalAnchorRatio\" Value=\"1\"/>\
          </Style>\
          <Style TargetType=\"MenuFlyoutItem\">\
            {font}\

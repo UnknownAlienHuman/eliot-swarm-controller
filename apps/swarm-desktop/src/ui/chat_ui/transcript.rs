@@ -3,25 +3,16 @@ use super::*;
 impl DesktopApp {
     /// Hand typing to the composer once the conversation is drawn; after a
     /// send (`scroll`), first scroll the transcript to its end
-    /// (`crate::scroll_end`) in case it was read further up. An opened
-    /// conversation needs no scroll: the transcript is anchored at its end.
+    /// (`ElementRef::request_scroll_to`) in case it was read further up. An
+    /// opened conversation needs no scroll: the transcript is anchored at
+    /// its end.
     pub(super) fn follow_latest(&self, scroll: bool, context: &ComponentContext<Self>) {
         let epoch = self.chat.epoch;
         let _task = context.spawn_background(move |cancel| {
             let cancelled = || cancel.is_cancelled();
             // False: the conversation was left while waiting.
-            if !feed::backoff(FOLLOW_DELAY_MS, &cancelled) || !scroll {
-                return Message::Chat(ChatMsg::FollowLatest(epoch, Ok(())));
-            }
-            let outcome = match crate::app_resources::own_window() {
-                None => Err("the window was not found".to_owned()),
-                Some(window) => match crate::scroll_end::scroll_to_end(window, TRANSCRIPT_ID) {
-                    Ok(Some(_)) => Ok(()),
-                    Ok(None) => Err("the transcript was not realized".to_owned()),
-                    Err(error) => Err(error),
-                },
-            };
-            Message::Chat(ChatMsg::FollowLatest(epoch, outcome))
+            let drawn = feed::backoff(FOLLOW_DELAY_MS, &cancelled);
+            Message::Chat(ChatMsg::FollowLatest(epoch, drawn && scroll))
         });
     }
 
@@ -146,6 +137,7 @@ impl DesktopApp {
             load_older,
             empty,
             automation_id: TRANSCRIPT_ID,
+            scroll: self.chat.transcript_ref.clone(),
         })
     }
 }

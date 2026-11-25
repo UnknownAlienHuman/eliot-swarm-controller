@@ -12,33 +12,17 @@
 //! retarget an in-flight submission. Results carry the selection epoch and
 //! are dropped when the conversation they were read for is no longer shown.
 //!
-//! Reactor 0.100.0 integration gaps, stated rather than papered over:
-//! `ScrollViewer` exposes no offset, `ViewChanged`, `ChangeView` or anchor
-//! ratio, so the transcript cannot detect "at the bottom" or auto-follow.
-//! A "N new" jump button cannot know it is already at the bottom, so there
-//! is none (k98: it stayed shown at the bottom); opening a conversation or
-//! sending scrolls the transcript to its end through UI Automation's scroll
-//! pattern ([`crate::scroll_end`]). There is no
-//! font-family property (code is not monospace), no
-//! clipboard (see [`crate::clipboard`]) and no key events on `TextBox`: Enter
-//! sends through the window's thread keyboard hook, which marks the line
-//! break that Enter without Shift typed into the composer
+//! Reactor integration (windows-rs default branch; `Cargo.lock` records the
+//! commit), gaps stated rather than papered over: the transcript
+//! `ScrollView` is anchored at its end (`vertical_anchor_ratio`), so reading
+//! further up keeps the position, and opening a conversation or sending
+//! scrolls it to the end through its `ElementRef` (`request_scroll_to`).
+//! A "N new" jump button is not built (k98). Code blocks are monospace
+//! (`TextBlock::font_family`). There is no clipboard (see
+//! [`crate::clipboard`]), no IME composition event and no key events on
+//! `TextBox`: Enter sends through the window's thread keyboard hook, which
+//! marks the line break that Enter without Shift typed into the composer
 //! ([`crate::shortcuts::take_plain_enter`]); Shift+Enter keeps it.
-//!
-//! Checked against windows-rs master `f37e2f9046cf9710fe00285436c4d22ad6053d72`
-//! (2026-11-14, unreleased `windows-reactor` 0.101.0, MIT OR Apache-2.0):
-//! it adds `TextBlock::font_family`, `Border::on_preview_key_down` /
-//! `on_key_up` / `on_character_received` (a `RoutedCallback<KeyEventInfo>`
-//! whose `bool` sets `Handled`), and `ElementRef::request_notification`.
-//! It still has no `ScrollViewer`/`ScrollView` view-changed event, offset,
-//! extent or viewport readback, `ChangeView`/`ScrollTo`/`StartBringIntoView`
-//! or `VerticalAnchorRatio`, no `ElementRef` for scroll viewers, no `TextBox`
-//! key events, no Shift `AcceleratorModifiers` variant and no IME
-//! composition events. It is not pinned: conditional bottom-follow stays
-//! impossible there, and a Git pin makes every lockfile resolution
-//! (including both uncached CI jobs) fetch the 1.48 GB windows-rs
-//! repository. Monospace code waits for a published release that carries
-//! `font_family`.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -991,6 +975,7 @@ impl Component for DesktopApp {
                 items: Rc::new(Vec::new()),
                 expanded: HashSet::new(),
                 composer_ref: ElementRef::new(),
+                transcript_ref: ElementRef::new(),
                 pending_local: None,
                 waiting_label: None,
                 inputs_checking: false,

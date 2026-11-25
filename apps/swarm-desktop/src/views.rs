@@ -1007,6 +1007,8 @@ pub struct TranscriptInput {
     /// The line shown without turns ("Loading…", "No messages yet.").
     pub empty: Option<&'static str>,
     pub automation_id: &'static str,
+    /// The ScrollView's reference, for the scroll to the end after a send.
+    pub scroll: ElementRef<ScrollView>,
 }
 
 /// A conversation that was left: drawn as it was (hidden, so its parts
@@ -1173,11 +1175,13 @@ impl Component for Transcript {
                     .keyed_children(turn_views(&left.input, left.gone)),
             )
         }));
-        // The app's one ScrollView: its implicit style anchors it at the
-        // far (bottom) edge (`app_resources::styles_xaml`), so it opens at
-        // the newest turn and stays there while earlier turns are built or
-        // new activity arrives, with no scroll after the first frame.
+        // Anchored at the far (bottom) edge, it opens at the newest turn and
+        // stays there while earlier turns are built or new activity
+        // arrives, with no scroll after the first frame; read further up,
+        // the anchor keeps the reading position.
         ScrollView::new()
+            .element_ref(&input.scroll)
+            .vertical_anchor_ratio(1.0)
             .grid_row(1)
             .vertical_scroll_bar_visibility(ScrollingScrollBarVisibility::Auto)
             .automation_name("Conversation")

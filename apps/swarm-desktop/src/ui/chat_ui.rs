@@ -37,8 +37,11 @@ pub(super) enum ChatMsg {
     RereadLoaded(u64, Result<Box<Reread>, (eliot_core::Error, Invalidation)>),
     RereadRetry(u64),
     LoadOlderRequested,
-    /// The newest turn was scrolled into view, or why not (epoch).
-    FollowLatest(u64, Result<(), String>),
+    /// The conversation is drawn (epoch); scroll its transcript to the
+    /// end first when true.
+    FollowLatest(u64, bool),
+    /// The transcript's scroll to its end finished, or why not (epoch).
+    ScrolledToEnd(u64, Result<(), String>),
     ToolsToggled(String, bool),
     CopyPart(String),
     CopyCode(String, usize),
@@ -180,7 +183,7 @@ fn command_reason(outcome: Option<&serde_json::Value>) -> String {
 /// before a send scrolls the transcript to its end: the next render has
 /// realized the newest turn by then (ms).
 const FOLLOW_DELAY_MS: u64 = 60;
-/// The transcript viewer's automation id, which `crate::scroll_end` finds.
+/// The transcript viewer's automation id.
 const TRANSCRIPT_ID: &str = "ConversationTranscript";
 
 /// Admission refusals of a steer after which the text goes as the next
@@ -411,6 +414,8 @@ pub(super) struct ChatState {
     pub(super) expanded: HashSet<String>,
     /// The composer, focused again after input is admitted, a launch and New.
     pub(super) composer_ref: ElementRef<TextBox>,
+    /// The transcript's ScrollView, scrolled to its end after a send.
+    pub(super) transcript_ref: ElementRef<ScrollView>,
     pub(super) pending_local: Option<(String, String, String)>,
     /// What the new Agent's first message waits for ("Starting Codex…"),
     /// carried from the launch to its conversation.
@@ -751,19 +756,40 @@ impl DesktopApp {
                 self.set_status("Loading older retained history…");
                 self.start_snapshot(context);
             }
-            ChatMsg::FollowLatest(epoch, outcome) => {
+            ChatMsg::FollowLatest(epoch, scroll) => {
                 if epoch != self.chat.epoch {
                     return;
                 }
-                if let Err(error) = outcome {
-                    self.set_status(format!(
-                        "The latest turn was not scrolled into view: {error}"
-                    ));
+                if scroll {
+                    // WinUI clamps the offset to the end of the content.
+                    let done = context.callback(move |outcome| {
+                        Message::Chat(ChatMsg::ScrolledToEnd(epoch, outcome))
+                    });
+                    let requested = self.chat.transcript_ref.request_scroll_to(
+                        0.0,
+                        f64::MAX,
+                        false,
+                        move |outcome: Result<ScrollViewMetrics, IntegrationError>| {
+                            done.call(outcome.map(|_| ()).map_err(|error| format!("{error:?}")));
+                        },
+                    );
+                    if !requested {
+                        self.set_status(
+                            "The latest turn was not scrolled into view: the transcript was not realized",
+                        );
+                    }
                 }
                 // Typing goes on in the composer; focus would leave the
                 // search box and close its list.
                 if !self.chat.opened_from_search {
                     self.take_focus(FocusTarget::Composer);
+                }
+            }
+            ChatMsg::ScrolledToEnd(epoch, outcome) => {
+                if let (true, Err(error)) = (epoch == self.chat.epoch, outcome) {
+                    self.set_status(format!(
+                        "The latest turn was not scrolled into view: {error}"
+                    ));
                 }
             }
             ChatMsg::ToolsToggled(key, expanded) => {
