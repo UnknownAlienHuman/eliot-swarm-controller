@@ -621,6 +621,21 @@ impl EventProcessor {
             }
             return;
         }
+        if method == "mcpServer/startupStatus/updated"
+            && params.get("status").and_then(Value::as_str) != Some("failed")
+        {
+            return;
+        }
+        let warning_without_child_binding =
+            method == "warning" || method == "mcpServer/startupStatus/updated";
+        if warning_without_child_binding
+            && !self.child_states.contains_key(&child_thread)
+            && !self.child_pending.contains_key(&child_thread)
+        {
+            self.warnings.record_unbound_dropped();
+            self.status.unbound_warnings_dropped = self.warnings.unbound_dropped();
+            return;
+        }
         if self
             .child_states
             .get(&child_thread)
@@ -1194,7 +1209,34 @@ impl EventProcessor {
                     .child_states
                     .get_mut(child_thread)
                     .ok_or_else(|| Error::new("bad_state", "Codex child state missing"))?;
-                if let Some((id, data)) = state.warnings.observe(child_thread, params, &policy)? {
+                if let Some((id, data)) =
+                    state
+                        .warnings
+                        .observe(Some(child_thread), params, &policy)?
+                {
+                    state
+                        .commit_event(
+                            &mut self.sink,
+                            &self.host,
+                            &self.credential,
+                            NATIVE_WARNING_EVENT,
+                            id,
+                            data,
+                        )
+                        .await?;
+                }
+            }
+            "mcpServer/startupStatus/updated" => {
+                let policy = SecretPolicy::new(self.secrets.iter().cloned());
+                let state = self
+                    .child_states
+                    .get_mut(child_thread)
+                    .ok_or_else(|| Error::new("bad_state", "Codex child state missing"))?;
+                if let Some((id, data)) =
+                    state
+                        .warnings
+                        .observe_startup_status(Some(child_thread), params, &policy)?
+                {
                     state
                         .commit_event(
                             &mut self.sink,

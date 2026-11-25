@@ -92,6 +92,10 @@ impl Warnings {
         self.unbound_dropped
     }
 
+    pub(super) fn record_unbound_dropped(&mut self) {
+        self.unbound_dropped = self.unbound_dropped.saturating_add(1);
+    }
+
     fn observe_fields(
         &mut self,
         bound_thread: Option<&str>,
@@ -102,7 +106,7 @@ impl Warnings {
     ) -> Result<Option<(String, Value)>> {
         let Some(thread) = bound_thread.filter(|thread| Some(*thread) == notification_thread)
         else {
-            self.unbound_dropped = self.unbound_dropped.saturating_add(1);
+            self.record_unbound_dropped();
             return Ok(None);
         };
         if source_message.is_empty() {

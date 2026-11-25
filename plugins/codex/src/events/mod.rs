@@ -708,8 +708,13 @@ impl EventProcessor {
         if method == "thread/tokenUsage/updated" {
             return !self.status.ready;
         }
-        if matches!(method, "warning" | "mcpServer/startupStatus/updated") {
+        if method == "warning" {
             return !self.status.ready && params.get("threadId").is_some_and(Value::is_string);
+        }
+        if method == "mcpServer/startupStatus/updated" {
+            return !self.status.ready
+                && params.get("status").and_then(Value::as_str) == Some("failed")
+                && params.get("threadId").is_some_and(Value::is_string);
         }
         if self.compaction_notification_matches(method, params) {
             return false;
@@ -2400,6 +2405,7 @@ fn known_notification(method: &str) -> bool {
             | "thread/started"
             | "thread/tokenUsage/updated"
             | "error"
+            | "mcpServer/startupStatus/updated"
             | "turn/diff/updated"
             | "turn/plan/updated"
             | "item/mcpToolCall/progress"
