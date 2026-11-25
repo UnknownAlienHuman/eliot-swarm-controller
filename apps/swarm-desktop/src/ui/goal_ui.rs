@@ -503,6 +503,11 @@ impl DesktopApp {
                 format!("{} Not read again: {error}", status_words(goal))
             }
         };
+        // The goal as the last read confirmed it: after a failed read the
+        // fields show the last known values greyed, and no control acts on
+        // them until a read succeeds.
+        let stale = read_error.is_some();
+        let confirmed = goal.filter(|_| !stale);
         let number = |header: &str, value: Option<f64>, message: fn(Option<f64>) -> GoalMsg| {
             NumberBox::new()
                 .header(controls::secondary(header))
@@ -510,6 +515,7 @@ impl DesktopApp {
                 .minimum(1.0)
                 .maximum(MAX_LIMIT)
                 .value(value)
+                .is_enabled(!stale)
                 .horizontal_alignment(HorizontalAlignment::Stretch)
                 .on_value_changed(context.callback(move |value| Message::Goal(message(value))))
         };
@@ -541,6 +547,7 @@ impl DesktopApp {
                         .element_ref(&self.dialog.field)
                         .header(controls::secondary("Goal"))
                         .automation_name("Goal")
+                        .is_enabled(!stale)
                         .text(draft.text.clone())
                         .placeholder_text("What is done when the goal is met")
                         .accepts_return(true)
@@ -559,6 +566,7 @@ impl DesktopApp {
                             controls::field()
                                 .header(controls::secondary("Check command"))
                                 .automation_name("Check command")
+                                .is_enabled(!stale)
                                 .text(draft.check.clone())
                                 .placeholder_text("cargo test")
                                 .on_text_changed(crate::views::text_edits(
@@ -591,7 +599,7 @@ impl DesktopApp {
         let footer = Grid::new().keyed_children(vec![if open.confirm_clear {
             KeyedView::new("ask", self.goal_clear_footer(context))
         } else {
-            KeyedView::new("controls", self.goal_footer(open, goal, busy, context))
+            KeyedView::new("controls", self.goal_footer(open, confirmed, busy, context))
         }]);
         let heading = match current {
             Some(_) => format!("Goal for “{}”", open.title),

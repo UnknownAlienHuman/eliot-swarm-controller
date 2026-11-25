@@ -50,8 +50,11 @@ impl Availability {
     }
 
     /// A row the catalogue does not list (Claude's CLI default, a typed or
-    /// remembered id): a hold read for the harness's own account scope
-    /// covers it too; quota is per model, so it is never Ready.
+    /// remembered id). `models.catalog` reads holds for every profile-less
+    /// row of a harness from one scope, that harness's ad-hoc profile
+    /// (`profile:<adhoc>`), which a profile-less launch also uses, so a
+    /// hold on any such row covers this one. Quota is per model: never
+    /// Ready.
     fn unlisted(reply: Option<&ModelsCatalogResponse>, harness: &str) -> Self {
         let held = reply.is_some_and(|reply| {
             reply.models.iter().any(|model| {
