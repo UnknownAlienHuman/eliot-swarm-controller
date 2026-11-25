@@ -2006,6 +2006,7 @@ fn stop_agent_tx(
         )?;
     }
     if agent.state == AgentState::Stopped {
+        super::child_cleanup::record_manager_stop_tx(tx, agent_num, &stop, now)?;
         return super::goals::pause_for_stop_tx(tx, agent_num, generation, now, events);
     }
     if agent.state == AgentState::Failed {

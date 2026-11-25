@@ -317,7 +317,8 @@ and new keep reasons. Repeated keep reasons are omitted from later events.
 
 The direct manager ends a completed child with a graceful Stop while it has
 no active turn. Store records that applied Stop and both generations in the
-transaction that changes the child to stopped. Reading a result or receiving
+Stop settlement transaction. This includes native exit observed before
+settlement when the Stop was dispatched against the live child. Reading a result or receiving
 a completion digest leaves an idle child available for follow-up. Owner stops,
 forced stops, and unsolicited exits leave child worktrees for explicit cleanup.
 

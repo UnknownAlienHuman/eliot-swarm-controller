@@ -42,7 +42,8 @@ const CHILD_CLEANUP_SELECT: &str = "SELECT 'a' || child, child_generation, 'a' |
     parent_generation, not_before, state, reason, detail,
     plan_id, apply_id, notice_id, notice_delivered FROM child_cleanup";
 
-/// Admit retirement only from the command that actually settled the child stopped.
+/// Admit retirement from the applied manager Stop that targeted a live child.
+/// The native stream can record session.ended before the command settles.
 pub(super) fn record_manager_stop_tx(
     tx: &Transaction<'_>,
     child: i64,
@@ -65,6 +66,10 @@ pub(super) fn record_manager_stop_tx(
            AND ch.origin = 'eliot' AND w.phase <> 'removed'
            AND EXISTS (SELECT 1 FROM turns t WHERE t.agent = ch.id
                        AND t.generation = ch.generation AND t.state = 'completed')
+           AND EXISTS (SELECT 1 FROM events e WHERE e.agent = ch.id
+                       AND e.generation = ch.generation AND e.kind = 'command.dispatched'
+                       AND json_extract(e.data, '$.command_id') = ?3
+                       AND json_extract(e.data, '$.live_at_dispatch') = 1)
            AND ?4 = ('agent:a' || p.id || ':' || p.generation)",
         params![
             child,
@@ -122,6 +127,25 @@ pub(super) fn require_automatic_removal_tx(
         return Err(Error::new(
             "owner_hold",
             "the child or its manager is archived",
+        ));
+    }
+    let another_stopper: bool = tx
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM commands
+             WHERE target = ?1 AND generation = ?2 AND verb = 'stop'
+               AND principal <> ?3 AND state IN ('dispatched', 'applied', 'unknown'))",
+            params![
+                child_num,
+                child.generation,
+                format!("agent:a{parent}:{parent_generation}")
+            ],
+            |row| row.get(0),
+        )
+        .map_err(sql_error)?;
+    if another_stopper {
+        return Err(Error::new(
+            "owner_hold",
+            "another principal's Stop is recorded for the child generation",
         ));
     }
     let artifact: Option<(String, String, Option<i64>)> = tx
