@@ -678,15 +678,9 @@ fn normalize_live_event(
             // the sole (fallback) evidence for a provider hold on this path.
             if !aborted
                 && let Some(evidence) =
-                    crate::native::types::response_withheld_evidence_from_message(message)
+                    crate::native::types::response_withheld_fact_from_message(message)
             {
-                data["provider_response_withheld"] = Value::Bool(true);
-                data["provider_response_withheld_evidence"] = json!(evidence);
-                data["provider_response_withheld_fact"] =
-                    json!(eliot_core::api::ProviderResponseWithheldFact::new(
-                        eliot_core::api::ProviderResponseWithheldDetection::ExactNativeMessage,
-                        None,
-                    ));
+                crate::native::types::attach_response_withheld_fact(&mut data, &evidence);
             }
             true
         }
@@ -1405,7 +1399,7 @@ fn project_line(
                     .payload
                     .pointer("/error/message")
                     .and_then(Value::as_str)
-                    .and_then(crate::native::types::response_withheld_evidence_from_message);
+                    .and_then(crate::native::types::response_withheld_fact_from_message);
                 let mut entry = json!({
                     "turn_id": turn_id,
                     "status": if line.payload.get("error").is_some_and(|error| !error.is_null()) {"failed"} else {"completed"},
@@ -1415,13 +1409,7 @@ fn project_line(
                     "ordinal": line.ordinal,
                 });
                 if let Some(evidence) = withheld_evidence {
-                    entry["provider_response_withheld"] = Value::Bool(true);
-                    entry["provider_response_withheld_evidence"] = json!(evidence);
-                    entry["provider_response_withheld_fact"] =
-                        json!(eliot_core::api::ProviderResponseWithheldFact::new(
-                            eliot_core::api::ProviderResponseWithheldDetection::ExactNativeMessage,
-                            None,
-                        ));
+                    crate::native::types::attach_response_withheld_fact(&mut entry, &evidence);
                 }
                 entries.push(entry);
             }

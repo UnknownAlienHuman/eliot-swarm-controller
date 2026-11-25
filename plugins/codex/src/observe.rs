@@ -914,9 +914,7 @@ impl ObserverSession {
             if turn.status == "failed"
                 && let Some(evidence) = turn.error.and_then(|error| error.response_withheld_fact())
             {
-                value["provider_response_withheld"] = json!(true);
-                value["provider_response_withheld_evidence"] = json!("text_fallback");
-                value["provider_response_withheld_fact"] = json!(evidence);
+                crate::native::types::attach_response_withheld_fact(&mut value, &evidence);
             }
             entries.push(value);
         }

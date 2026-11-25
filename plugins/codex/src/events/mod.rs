@@ -2050,12 +2050,6 @@ impl EventProcessor {
         } else {
             None
         };
-        let withheld_evidence = notification
-            .turn
-            .error
-            .as_ref()
-            .and_then(NativeTurnError::response_withheld_evidence)
-            .filter(|_| withheld_fact.is_some());
         let provider_response_withheld = withheld_fact.is_some();
         let secrets = SecretPolicy::new(self.secrets.iter().cloned());
         let mut data = json!({
@@ -2089,10 +2083,8 @@ impl EventProcessor {
             eliot_plugin::session::attach_failure_origin(
                 &mut data, "codex", origin, evidence, &secrets,
             );
-            if let Some(evidence) = withheld_evidence {
-                data["provider_response_withheld"] = Value::Bool(true);
-                data["provider_response_withheld_evidence"] = json!(evidence);
-                data["provider_response_withheld_fact"] = json!(&withheld_fact);
+            if let Some(fact) = &withheld_fact {
+                crate::native::types::attach_response_withheld_fact(&mut data, fact);
             }
         }
         if !provider_response_withheld
@@ -2173,7 +2165,9 @@ impl EventProcessor {
             status: Some(status_text),
             final_text: self.final_text.take(),
             terminal: true,
-            provider_response_withheld_evidence: withheld_evidence,
+            provider_response_withheld_evidence: withheld_fact
+                .as_ref()
+                .map(|_| crate::native::types::WITHHELD_LEGACY_EVIDENCE),
             provider_response_withheld_fact: withheld_fact,
         });
         self.status.active_turn_id = None;
