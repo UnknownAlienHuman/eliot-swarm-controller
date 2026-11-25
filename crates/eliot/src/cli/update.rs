@@ -1505,8 +1505,13 @@ fn prepare_update_release(source: &Path) -> Result<(PathBuf, String), Failure> {
 }
 
 fn remove_incomplete_release(path: &Path) -> std::io::Result<()> {
+    #[cfg(windows)]
     if let Ok(metadata) = std::fs::metadata(path) {
         let mut permissions = metadata.permissions();
+        #[expect(
+            clippy::permissions_set_readonly_false,
+            reason = "Windows must clear the read-only attribute before deleting the failed image"
+        )]
         permissions.set_readonly(false);
         std::fs::set_permissions(path, permissions)?;
     }
