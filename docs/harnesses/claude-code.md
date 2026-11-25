@@ -156,6 +156,12 @@ spawn has its own classification. Eliot does not write the user config.
 [Claude Code MCP scopes](https://code.claude.com/docs/en/mcp#mcp-installation-scopes)
 and [managed MCP policy](https://code.claude.com/docs/en/managed-mcp).
 
+Managed MCP release qualification requires a native tool call and the retained
+daemon result. For a project variable, verify the value, version, and
+generation-bound Agent writer in the Store. A turn using a supplied canonical
+method establishes that call path. Unassisted tool and method discovery
+requires its own evidence.
+
 Requested vs observed: `requested` carries `mcp_policy` and `mcp_allow`;
 `effective` carries `mcp_policy` and the server set. The `initialize`
 control reply exposes no MCP inventory record, so the effective set stays

@@ -519,6 +519,15 @@ the connected product. Keep results in the PR/CI, not a permanent audit/readines
       custody and promptless continuation in parent-first order (#836).
 - [x] Private stand creation imports named profiles and supports offline Store
       snapshots. Registered teardown forces owned shutdown when drain fails (#837).
+- [x] Bound native Codex SQLite initialization failure to one proven pre-effect
+      retry (#384, #456). Windows recheck on 2026-11-24 using Codex 0.167.1 and
+      four concurrent lanes completed 32 exact attach, native history and detach
+      cycles each on historical C2BB9062 and active 11DFDFD5. Neither batch
+      surfaced an initialization failure. The underlying native cause and
+      recovered internal retries remain unverified.
+- [x] Roll forward Claude managed MCP registration (#384, #385). A private
+      11DFDFD5 run on Claude Code 2.1.330 and Haiku 5.5 wrote a version-1 project
+      variable through MCP with the Agent as the Store-recorded writer.
 - [x] Unrunnable Goal checks settle with a typed reason and retained round events
       expose check outcomes (#802).
 - [x] Daemon logs attribute errors and count command storms. `swarm status` and
@@ -571,8 +580,11 @@ the connected product. Keep results in the PR/CI, not a permanent audit/readines
       `CLAUDE_CONFIG_DIR` credential mount; readiness commits, never unknown.
       Muse/Antigravity Linux binaries install and run, but their authenticated
       turns are not qualified here. Custody stays honestly degraded (see Docker README).
-- [ ] Retention/WAL/backpressure and representative load. The 10,000-Agent,
-      2,000-events/s owner run is a release capacity check, not a prerequisite to L2.
+- [ ] Retention/WAL/backpressure and representative load. The 10,000-Agent
+      release check requires 9,992 settled native histories and eight
+      simultaneously active native tasks. Report sustained committed ingress
+      against 2,000 events/s separately from retained replay and client work.
+      Store-only write probes and replay throughput leave this check open.
 
 Fix the root cause and keep focused regressions. No runtime readiness claim until the
 relevant real path is exercised. A missing optional harness does not block qualification

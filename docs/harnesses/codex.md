@@ -662,6 +662,10 @@ from the warm store retained 400 `unknown/history_gap` outcomes and 400 applied 
 these are absent-subject results, not successful attachment. Neither sample surfaced a
 SQLite-init failure. Successful internal retries are not exposed by the settled readback,
 so these observations do not prove that the retry branch ran or identify the SQLite cause.
+Compare releases by settled attach, exact native history and detach results for
+the same verified subjects and reader concurrency. Count absent subjects,
+unknown outcomes and startup failures separately. A failure-free warm-home
+sample leaves the rare initialization trigger unproven.
 
 The installed stable and experimental schemas expose no passive subscription operation.
 `thread/read`, `thread/turns/list` and `thread/items/list` are separate bounded historical
