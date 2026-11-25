@@ -1407,6 +1407,22 @@ pub(crate) struct StoreArgs {
 pub(crate) enum StoreCommand {
     /// Rebuild the Store and enable incremental vacuum after a disk-space preflight.
     Compact,
+    /// Estimate retention effects from a read-only Store snapshot.
+    RetentionPreview(RetentionPreviewArgs),
+}
+
+#[derive(Args)]
+pub(crate) struct RetentionPreviewArgs {
+    #[arg(long, conflicts_with = "events_seconds", value_parser = clap::value_parser!(i64).range(1..))]
+    pub(crate) events_days: Option<i64>,
+    #[arg(long, value_parser = clap::value_parser!(i64).range(1..))]
+    pub(crate) events_seconds: Option<i64>,
+    #[arg(long, value_parser = clap::value_parser!(i64).range(1..))]
+    pub(crate) processes_seconds: Option<i64>,
+    #[arg(long, value_parser = clap::value_parser!(i64).range(1..))]
+    pub(crate) commands_days: Option<i64>,
+    #[arg(long, value_parser = clap::value_parser!(i64).range(1..))]
+    pub(crate) mail_days: Option<i64>,
 }
 
 #[derive(Args)]

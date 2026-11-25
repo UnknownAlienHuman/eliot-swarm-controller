@@ -19,6 +19,31 @@ const ACTIVE_ARTIFACT_LIMIT: i64 = 4_096;
 const DAEMON_CUSTODY_LIMIT_PER_GENERATION: i64 = 512;
 const ARTIFACT_TOMBSTONE_BATCH: i64 = 128;
 
+pub(super) const ARTIFACT_TOMBSTONE_SELECT: &str = "WITH refs AS MATERIALIZED (
+                 SELECT DISTINCT json_extract(i.value, '$.artifact.id') AS id
+                 FROM cleanup_plans p, json_each(p.body, '$.items') i
+             )
+             SELECT a.id FROM artifacts a
+                 WHERE a.seq < (SELECT MAX(seq) FROM artifacts)
+                   AND json_extract(a.body, '$.state') = 'removed'
+                   AND json_extract(a.body, '$.kind') <> 'native_session'
+                   AND NOT EXISTS (SELECT 1 FROM refs WHERE refs.id = a.id)
+                 ORDER BY a.seq LIMIT ?1";
+pub(super) const SETTLED_CLEANUP_PLAN_SELECT: &str =
+    "SELECT p.id FROM cleanup_plans p JOIN writes w ON w.id = p.apply_id
+             WHERE w.method = 'cleanup.apply'
+               AND json_extract(p.body, '$.created_at') <= ?1
+               AND json_extract(w.result, '$.state') IS NOT 'running'
+               AND json_type(w.result, '$.items') = 'array'
+               AND NOT EXISTS (
+                   SELECT 1 FROM json_each(w.result, '$.items') r
+                   WHERE json_extract(r.value, '$.outcome') = 'unknown'
+               )
+             ORDER BY p.id LIMIT ?2";
+pub(super) const STALE_CLEANUP_PLAN_SELECT: &str = "SELECT p.id FROM cleanup_plans p
+    WHERE p.apply_id IS NULL AND json_extract(p.body, '$.created_at') <= ?1
+    ORDER BY p.id LIMIT ?2";
+
 pub struct CleanupInventoryPage {
     pub artifacts: Vec<ArtifactView>,
     pub inventory_issues: Vec<CleanupInventoryIssue>,
@@ -88,18 +113,7 @@ impl Store {
         // and native-session tombstones fence resuming the archived subject.
         let artifacts = tx
             .execute(
-                "WITH refs AS MATERIALIZED (
-                 SELECT DISTINCT json_extract(i.value, '$.artifact.id') AS id
-                 FROM cleanup_plans p, json_each(p.body, '$.items') i
-             )
-             DELETE FROM artifacts WHERE id IN (
-                 SELECT a.id FROM artifacts a
-                 WHERE a.seq < (SELECT MAX(seq) FROM artifacts)
-                   AND json_extract(a.body, '$.state') = 'removed'
-                   AND json_extract(a.body, '$.kind') <> 'native_session'
-                   AND NOT EXISTS (SELECT 1 FROM refs WHERE refs.id = a.id)
-                 ORDER BY a.seq LIMIT ?1
-             )",
+                &format!("DELETE FROM artifacts WHERE id IN ({ARTIFACT_TOMBSTONE_SELECT})"),
                 [ARTIFACT_TOMBSTONE_BATCH],
             )
             .map_err(sql_error)? as i64;
@@ -1709,18 +1723,7 @@ fn prune_reclaimable_cleanup_plans_tx(tx: &Transaction<'_>, now: i64) -> Result<
 
 fn prune_settled_cleanup_plans_tx(tx: &Transaction<'_>, cutoff: i64) -> Result<i64> {
     tx.execute(
-        "DELETE FROM cleanup_plans WHERE id IN (
-             SELECT p.id FROM cleanup_plans p JOIN writes w ON w.id = p.apply_id
-             WHERE w.method = 'cleanup.apply'
-               AND json_extract(p.body, '$.created_at') <= ?1
-               AND json_extract(w.result, '$.state') IS NOT 'running'
-               AND json_type(w.result, '$.items') = 'array'
-               AND NOT EXISTS (
-                   SELECT 1 FROM json_each(w.result, '$.items') r
-                   WHERE json_extract(r.value, '$.outcome') = 'unknown'
-               )
-             ORDER BY p.id LIMIT ?2
-         )",
+        &format!("DELETE FROM cleanup_plans WHERE id IN ({SETTLED_CLEANUP_PLAN_SELECT})"),
         params![cutoff, CLEANUP_PLAN_RECLAIM_BATCH],
     )
     .map(|rows| rows as i64)
@@ -1729,12 +1732,7 @@ fn prune_settled_cleanup_plans_tx(tx: &Transaction<'_>, cutoff: i64) -> Result<i
 
 fn prune_stale_cleanup_plans_tx(tx: &Transaction<'_>, cutoff: i64) -> Result<i64> {
     tx.execute(
-        "DELETE FROM cleanup_plans WHERE id IN (
-                 SELECT p.id FROM cleanup_plans p
-                 WHERE p.apply_id IS NULL
-                   AND json_extract(p.body, '$.created_at') <= ?1
-                 ORDER BY p.id LIMIT ?2
-             )",
+        &format!("DELETE FROM cleanup_plans WHERE id IN ({STALE_CLEANUP_PLAN_SELECT})"),
         params![cutoff, CLEANUP_PLAN_RECLAIM_BATCH],
     )
     .map(|rows| rows as i64)

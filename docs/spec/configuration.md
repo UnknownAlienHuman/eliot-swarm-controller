@@ -908,6 +908,13 @@ This owner-only local command takes the private DataDir lock, refuses to
 operate while a daemon holds it, and does not start a daemon. Before SQLite
 runs `VACUUM`, it reports the estimated required and available bytes and
 requires free space of about twice the combined current `eliot.db` and WAL size.
+Preview proposed windows with `swarm store retention-preview --events-days 30
+--processes-seconds 86400 --commands-days 90 --mail-days 90 --json`. Use
+`--events-seconds` instead of `--events-days` for a sub-day event window.
+A read-only Store stand accepts the same command. The arguments apply only
+to that snapshot forecast. The operation starts no daemon and saves no
+configuration.
+
 `compact_on_start` remains opt-in and defaults to `false`; when enabled, startup
 uses the same preflight before the daemon serves requests. Routine retention
 does not run compaction in the live request path.

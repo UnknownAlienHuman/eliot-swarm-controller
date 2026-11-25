@@ -69,10 +69,17 @@ pub(crate) fn read_only_stand(
                 reads::print_agent_table(&result, false, 0, false);
             }
         }
+        CliCommand::Store(
+            args @ args::StoreArgs {
+                command: args::StoreCommand::RetentionPreview(_),
+            },
+        ) => {
+            return store::run_store(args, data_dir.to_owned(), json_output);
+        }
         _ => {
             return Err(Failure::new(
                 3,
-                "read-only Store stands support status and ls",
+                "read-only Store stands support status, ls, and store retention-preview",
             ));
         }
     }

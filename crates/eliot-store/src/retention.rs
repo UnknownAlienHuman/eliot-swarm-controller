@@ -13,6 +13,8 @@
 
 use super::*;
 
+mod preview;
+
 const MS_PER_SECOND: i64 = 1_000;
 const MS_PER_DAY: i64 = 24 * 60 * 60 * MS_PER_SECOND;
 /// Event retention amortizes commit overhead over one bounded sequence range.
@@ -132,11 +134,86 @@ struct SubtreeMember {
     depth: i64,
     state: String,
     created_at: i64,
-    turn_bound: bool,
+    turn_state: Option<String>,
     workspace_ref: bool,
     probe_ref: bool,
     goal_ref: bool,
     config_ref: bool,
+}
+
+struct RetentionCutoffs {
+    events: Option<i64>,
+    processes: Option<i64>,
+    commands: Option<i64>,
+    mail: Option<i64>,
+}
+
+fn retention_cutoffs(
+    events_seconds: Option<i64>,
+    processes_seconds: Option<i64>,
+    commands_days: Option<i64>,
+    mail_days: Option<i64>,
+    now: i64,
+) -> Result<RetentionCutoffs> {
+    if events_seconds
+        .into_iter()
+        .chain(processes_seconds)
+        .any(|seconds| seconds <= 0)
+    {
+        return Err(Error::new(
+            "invalid",
+            "event and process retention windows must be positive seconds",
+        ));
+    }
+    let seconds_cutoff = |seconds: i64| now.saturating_sub(seconds.saturating_mul(MS_PER_SECOND));
+    let commands_cutoff = match commands_days {
+        Some(days) => {
+            if days <= 0 {
+                return Err(Error::new(
+                    "invalid",
+                    "retention windows must be positive days",
+                ));
+            }
+            // Command/write bindings must outlive the retry window no
+            // matter how short the configured window is: a pruned id
+            // must read back as id_expired, never as a new request.
+            // The floor adds the allowed generator-clock skew, plus one
+            // millisecond so the integer-millisecond boundary favors
+            // retention: a ULID generated exactly the skew ahead of its
+            // row still reads expired after pruning.
+            let retry_floor = RETRY_WINDOW_MS + RETRY_CLOCK_SKEW_MS + 1;
+            Some(now.saturating_sub(days.saturating_mul(MS_PER_DAY).max(retry_floor)))
+        }
+        None => None,
+    };
+    let mail_cutoff = match mail_days {
+        Some(days) => {
+            if days <= 0 {
+                return Err(Error::new(
+                    "invalid",
+                    "retention windows must be positive days",
+                ));
+            }
+            // Mail rows must outlive the retry window plus twice the
+            // allowed clock skew no matter how short the configured
+            // window is. Two skews chain here: an admitted write-id ULID
+            // may run one skew ahead of its row's commit-clock stamps,
+            // and the absent-delivery rule itself allows the retry window
+            // plus one more skew before it reads `history_gap`. Past this
+            // floor a pruned delivery admitted through `mail.send` lands
+            // on the gap side of that rule on its own mailbox's read
+            // paths, never `not_found`.
+            let retry_floor = RETRY_WINDOW_MS + 2 * RETRY_CLOCK_SKEW_MS + 1;
+            Some(now.saturating_sub(days.saturating_mul(MS_PER_DAY).max(retry_floor)))
+        }
+        None => None,
+    };
+    Ok(RetentionCutoffs {
+        events: events_seconds.map(seconds_cutoff),
+        processes: processes_seconds.map(seconds_cutoff),
+        commands: commands_cutoff,
+        mail: mail_cutoff,
+    })
 }
 
 impl Store {
@@ -222,81 +299,34 @@ impl Store {
         mail_days: Option<i64>,
         now: i64,
     ) -> Result<RetentionReport> {
-        if events_seconds
-            .into_iter()
-            .chain(processes_seconds)
-            .any(|seconds| seconds <= 0)
-        {
-            return Err(Error::new(
-                "invalid",
-                "event and process retention windows must be positive seconds",
-            ));
-        }
-        let seconds_cutoff =
-            |seconds: i64| now.saturating_sub(seconds.saturating_mul(MS_PER_SECOND));
-        let commands_cutoff = match commands_days {
-            Some(days) => {
-                if days <= 0 {
-                    return Err(Error::new(
-                        "invalid",
-                        "retention windows must be positive days",
-                    ));
-                }
-                // Command/write bindings must outlive the retry window no
-                // matter how short the configured window is: a pruned id
-                // must read back as id_expired, never as a new request.
-                // The floor adds the allowed generator-clock skew, plus one
-                // millisecond so the integer-millisecond boundary favors
-                // retention: a ULID generated exactly the skew ahead of its
-                // row still reads expired after pruning.
-                let retry_floor = RETRY_WINDOW_MS + RETRY_CLOCK_SKEW_MS + 1;
-                Some(now.saturating_sub(days.saturating_mul(MS_PER_DAY).max(retry_floor)))
-            }
-            None => None,
-        };
-        let mail_cutoff = match mail_days {
-            Some(days) => {
-                if days <= 0 {
-                    return Err(Error::new(
-                        "invalid",
-                        "retention windows must be positive days",
-                    ));
-                }
-                // Mail rows must outlive the retry window plus twice the
-                // allowed clock skew no matter how short the configured
-                // window is. Two skews chain here: an admitted write-id ULID
-                // may run one skew ahead of its row's commit-clock stamps,
-                // and the absent-delivery rule itself allows the retry window
-                // plus one more skew before it reads `history_gap`. Past this
-                // floor a pruned delivery admitted through `mail.send` lands
-                // on the gap side of that rule on its own mailbox's read
-                // paths, never `not_found`.
-                let retry_floor = RETRY_WINDOW_MS + 2 * RETRY_CLOCK_SKEW_MS + 1;
-                Some(now.saturating_sub(days.saturating_mul(MS_PER_DAY).max(retry_floor)))
-            }
-            None => None,
-        };
-        let (events_deleted, pruned_through) = match events_seconds {
-            Some(seconds) => self.prune_events(seconds_cutoff(seconds))?,
+        let cutoffs = retention_cutoffs(
+            events_seconds,
+            processes_seconds,
+            commands_days,
+            mail_days,
+            now,
+        )?;
+        let (events_deleted, pruned_through) = match cutoffs.events {
+            Some(cutoff) => self.prune_events(cutoff)?,
             None => (0, coverage_pruned_through(&self.connection)?),
         };
         let (cleanup_plans_deleted, artifact_tombstones_deleted) =
             self.prune_cleanup_metadata(now)?;
-        let (commands_deleted, writes_deleted) = match commands_cutoff {
+        let (commands_deleted, writes_deleted) = match cutoffs.commands {
             Some(cutoff) => self.prune_commands_and_writes(cutoff)?,
             None => (0, 0),
         };
-        let mail_deleted = match mail_cutoff {
+        let mail_deleted = match cutoffs.mail {
             Some(cutoff) => self.prune_mail(cutoff)?,
             None => 0,
         };
-        let digests_deleted = match commands_cutoff {
+        let digests_deleted = match cutoffs.commands {
             Some(cutoff) => self.prune_delivered_digests(cutoff)?,
             None => 0,
         };
         // Exited child rows have an independent, shorter age window.
-        let (processes_deleted, processes_examined, process_scan_more) = match processes_seconds {
-            Some(seconds) => self.prune_exited_processes(seconds_cutoff(seconds))?,
+        let (processes_deleted, processes_examined, process_scan_more) = match cutoffs.processes {
+            Some(cutoff) => self.prune_exited_processes(cutoff)?,
             None => {
                 self.retention_processes_cursor = None;
                 (0, 0, false)
@@ -396,10 +426,11 @@ impl Store {
             commit_transaction(tx, &self.write_faulted)?;
             return Ok((0, pruned_through));
         };
-        let Some(end) = event_prune_end_tx(&tx, pruned_through, batch_end, cutoff)? else {
+        let end = event_prune_end(&tx, pruned_through, batch_end, cutoff)?.end;
+        if end <= pruned_through {
             commit_transaction(tx, &self.write_faulted)?;
             return Ok((0, pruned_through));
-        };
+        }
         let last_deleted: Option<i64> = tx
             .query_row(
                 "SELECT MAX(seq) FROM events WHERE seq > ?1 AND seq <= ?2",
@@ -491,28 +522,10 @@ impl Store {
                 // a budget stop resumes at the first unexamined root instead
                 // of skipping the rest of this batch on the next pass.
                 let previous_cursor = cursor.replace((*root_created, root.clone()));
-                let (members, truncated) = match subtree_members_tx(&self.connection, root) {
-                    Err(error) if error.code == "source_integrity" => {
-                        // A set past the traversal bound stays kept, as the
-                        // previous selection kept it, instead of failing the
-                        // pass on corruption-shaped history.
-                        continue;
-                    }
-                    result => result?,
-                };
-                // An oversize set is never partly pruned.
-                if truncated {
+                let Some(members) = bounded_command_set(&self.connection, root)? else {
                     continue;
-                }
-                if members.iter().any(|member| {
-                    member.is_open()
-                        || member.created_at > cutoff
-                        || member.turn_bound
-                        || member.workspace_ref
-                        || member.probe_ref
-                        || member.goal_ref
-                        || member.config_ref
-                }) {
+                };
+                if command_set_protection(&members, cutoff).is_some() {
                     continue;
                 }
                 if members.len() + doomed.len() > MAX_SET_MEMBERS {
@@ -561,11 +574,7 @@ impl Store {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(sql_error)?;
         let deleted = db!(tx.execute(
-            "DELETE FROM completion_digests WHERE id IN (
-                 SELECT id FROM completion_digests
-                 WHERE delivered_at IS NOT NULL AND delivered_at <= ?1
-                 ORDER BY delivered_at, id LIMIT ?2
-             )",
+            &format!("DELETE FROM completion_digests WHERE id IN ({PRUNE_DIGEST_SELECT})"),
             params![cutoff, MAX_PAGE_ENTRIES as i64],
         ));
         commit_transaction(tx, &self.write_faulted)?;
@@ -589,13 +598,13 @@ impl Store {
         // cannot make this pass scan an arbitrarily long prefix.
         let candidates = {
             let mut statement = tx
-                .prepare(
+                .prepare(&format!(
                     "SELECT rowid, updated_at FROM processes
                      INDEXED BY processes_exited_child_updated
-                     WHERE state = 'exited' AND role = 'child' AND updated_at < ?1
+                     WHERE {EXITED_CHILD} AND updated_at < ?1
                        AND (updated_at, rowid) > (?2, ?3)
-                     ORDER BY updated_at, rowid LIMIT ?4",
-                )
+                     ORDER BY updated_at, rowid LIMIT ?4"
+                ))
                 .map_err(sql_error)?;
             statement
                 .query_map(
@@ -612,12 +621,10 @@ impl Store {
             0
         } else {
             db!(tx.execute(
-                "DELETE FROM processes WHERE rowid IN (SELECT value FROM json_each(?1))
-                   AND NOT EXISTS (
-                       SELECT 1 FROM agents
-                       WHERE id = CAST(substr(processes.owner, 8, instr(processes.owner, '#') - 8) AS INTEGER)
-                         AND processes.owner = 'agent:a' || id || '#' || capacity_generation
-                   )",
+                &format!(
+                    "DELETE FROM processes WHERE rowid IN (SELECT value FROM json_each(?1))
+                   AND {PROCESS_WITHOUT_RESERVATION}"
+                ),
                 [encode_json(&rowids)?],
             ))
         };
@@ -680,11 +687,7 @@ impl Store {
                            AND read_at IS NULL
                            AND {LEGACY_ATTENTION_ADVISORY_MAIL_PREDICATE}
                            AND admitted_at <= ?2
-                           AND EXISTS (
-                               SELECT 1 FROM agents a
-                               WHERE a.id = messages.recipient
-                                 AND a.state IN ('stopped', 'failed', 'lost')
-                           )"
+                           AND {ADVISORY_TERMINAL_RECIPIENT}"
                     ),
                     params![encode_json(&candidate_ids)?, cutoff],
                 ));
@@ -698,11 +701,11 @@ impl Store {
         // once every message on the thread is gone, the bound can go. A new
         // mail on the same thread (same incident re-mailed) then wakes again.
         db!(tx.execute(
-            "DELETE FROM attention_wakes WHERE rowid IN (
-                 SELECT w.rowid FROM attention_wakes w
-                 WHERE NOT EXISTS (SELECT 1 FROM messages m WHERE m.thread = w.thread)
-                 LIMIT 512
-             )",
+            &format!(
+                "DELETE FROM attention_wakes WHERE rowid IN (
+                 SELECT w.rowid FROM attention_wakes w WHERE {ORPHAN_ATTENTION_WAKE} LIMIT 512
+             )"
+            ),
             [],
         ));
         commit_transaction(tx, &self.write_faulted)?;
@@ -727,9 +730,53 @@ fn read_passive_checkpoint(connection: &Connection) -> Result<(i64, i64, bool)> 
 /// The prune batch `prune_mail` deletes: acknowledged rows only, oldest ack
 /// first. Shared with the plan test so the asserted plan cannot drift from
 /// the executed query.
+const PRUNE_DIGEST_SELECT: &str = "SELECT id FROM completion_digests
+    WHERE delivered_at IS NOT NULL AND delivered_at <= ?1 ORDER BY delivered_at,id LIMIT ?2";
+const EXITED_CHILD: &str = "state = 'exited' AND role = 'child'";
+const PROCESS_WITHOUT_RESERVATION: &str = "NOT EXISTS (
+    SELECT 1 FROM agents
+    WHERE id = CAST(substr(processes.owner, 8, instr(processes.owner, '#') - 8) AS INTEGER)
+      AND processes.owner = 'agent:a' || id || '#' || capacity_generation
+)";
+const ADVISORY_TERMINAL_RECIPIENT: &str = "EXISTS (
+    SELECT 1 FROM agents a WHERE a.id = messages.recipient AND a.state IN ('stopped','failed','lost')
+)";
+const ORPHAN_ATTENTION_WAKE: &str =
+    "NOT EXISTS (SELECT 1 FROM messages m WHERE m.thread = w.thread)";
+
 const PRUNE_MAIL_SELECT: &str = "SELECT delivery_id FROM messages
              WHERE read_at IS NOT NULL AND read_at <= ?1 AND inline_ack_pending = 0
              ORDER BY read_at, delivery_id LIMIT ?2";
+
+fn bounded_command_set(connection: &Connection, root: &str) -> Result<Option<Vec<SubtreeMember>>> {
+    match subtree_members_tx(connection, root) {
+        Ok((members, false)) => Ok(Some(members)),
+        Ok((_, true)) => Ok(None),
+        // Preserve a set past the traversal bound without failing the pass.
+        Err(error) if error.code == "source_integrity" => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+fn command_set_protection(members: &[SubtreeMember], cutoff: i64) -> Option<&'static str> {
+    if members
+        .iter()
+        .any(|m| m.state == "unknown" || m.turn_state.as_deref() == Some("unknown"))
+    {
+        Some("unknown_outcome")
+    } else if members.iter().any(|m| m.workspace_ref || m.probe_ref) {
+        Some("custody")
+    } else if members
+        .iter()
+        .any(|m| m.is_open() || m.turn_state.is_some() || m.goal_ref || m.config_ref)
+    {
+        Some("live_projection")
+    } else if members.iter().any(|m| m.created_at > cutoff) {
+        Some("recent_set_member")
+    } else {
+        None
+    }
+}
 
 impl SubtreeMember {
     fn is_open(&self) -> bool {
@@ -740,27 +787,32 @@ impl SubtreeMember {
     }
 }
 
-/// Highest seq eligible for event pruning: an expired contiguous prefix below
-/// every live cursor, or `None` when nothing is eligible.
-fn event_prune_end_tx(
-    tx: &Transaction<'_>,
+struct EventPruneBoundary {
+    end: i64,
+    blocker: Option<&'static str>,
+}
+
+/// Expired contiguous prefix below every live cursor. The blocker explains
+/// the first row that prevents advancing the exclusive replay floor.
+fn event_prune_end(
+    tx: &Connection,
     pruned_through: i64,
     batch_end: i64,
     cutoff: i64,
-) -> Result<Option<i64>> {
+) -> Result<EventPruneBoundary> {
     // Enabled current/retiring cursors pin the events they still need; this is
     // the Store backlog pin model (disabled rules pin nothing). A live Git
     // cursor protects only unconsumed native file hints from its own Agent
     // generation. A source with no established cursor has no cursor pin.
-    let floor: Option<i64> = tx
+    let (rule, git): (Option<i64>, Option<i64>) = tx
         .query_row(
-            "SELECT MIN(pin) FROM (
+            "SELECT (SELECT MIN(pin) FROM (
                  SELECT current_cursor AS pin FROM rule_state WHERE enabled = 1
                  UNION ALL
                  SELECT retiring_cursor FROM rule_state
                  WHERE enabled = 1
                    AND retiring_cursor IS NOT NULL AND retire_through IS NOT NULL
-                 UNION ALL
+             )), (
                  SELECT MIN(e.seq) - 1 FROM events e
                  CROSS JOIN source_state s
                     ON s.agent = e.agent AND s.generation = e.generation AND s.source = 'git'
@@ -777,13 +829,24 @@ fn event_prune_end_tx(
                         OR json_extract(e.data, '$.redacted') = 1)
              )",
             params![pruned_through, batch_end],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .map_err(sql_error)?;
-    let ceiling = floor.map_or(batch_end, |pin| pin.min(batch_end));
-    if ceiling <= pruned_through {
-        return Ok(None);
+    let mut end = batch_end;
+    let mut blocker = None;
+    for (pin, reason) in [(rule, "rule"), (git, "source")] {
+        if let Some(pin) = pin.filter(|pin| *pin < end) {
+            end = pin;
+            blocker = Some(reason);
+        }
     }
+    if end <= pruned_through {
+        return Ok(EventPruneBoundary {
+            end: pruned_through,
+            blocker,
+        });
+    }
+    let ceiling = end;
     // The prefix must be contiguous: stop before the first unexpired row.
     let first_fresh: Option<i64> = tx
         .query_row(
@@ -792,7 +855,10 @@ fn event_prune_end_tx(
             |row| row.get(0),
         )
         .map_err(sql_error)?;
-    let mut end = first_fresh.map(|fresh| fresh - 1).unwrap_or(ceiling);
+    if let Some(fresh) = first_fresh {
+        end = fresh - 1;
+        blocker = Some("contiguous_prefix");
+    }
     // Only the latest batch of a source can be re-delivered idempotently: a
     // new batch replaces only its last-batch acknowledgement, so for an open
     // source pin only events at or after its latest batch start. Older native
@@ -816,8 +882,9 @@ fn event_prune_end_tx(
             |row| row.get(0),
         )
         .map_err(sql_error)?;
-    if let Some(pinned) = first_pinned {
-        end = end.min(pinned - 1);
+    if let Some(pinned) = first_pinned.filter(|pinned| *pinned - 1 < end) {
+        end = pinned - 1;
+        blocker = Some("source");
     }
     // `source.gap` events carry no native_id, so the native pin never covers
     // them — yet the Git coverage check re-reads the retained gap event by
@@ -843,13 +910,14 @@ fn event_prune_end_tx(
             |row| row.get(0),
         )
         .map_err(sql_error)?;
-    if let Some(gap) = first_gap {
-        end = end.min(gap - 1);
+    if let Some(gap) = first_gap.filter(|gap| *gap - 1 < end) {
+        end = gap - 1;
+        blocker = Some("source");
     }
-    if end <= pruned_through {
-        return Ok(None);
-    }
-    Ok(Some(end))
+    Ok(EventPruneBoundary {
+        end: end.max(pruned_through),
+        blocker,
+    })
 }
 
 /// Current `rule_history_coverage.pruned_through` for reports when the events
@@ -937,8 +1005,8 @@ fn subtree_members_tx(connection: &Connection, root: &str) -> Result<(Vec<Subtre
     let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
     let sql = format!(
         "SELECT c.id, 0, c.state, c.created_at,
-                EXISTS(
-                    SELECT 1 FROM turns t
+                (
+                    SELECT state FROM turns t
                     WHERE t.agent = c.target AND t.generation = c.generation
                       AND t.turn_id = c.turn_id AND t.state IN ('running', 'unknown')
                 ),
@@ -973,7 +1041,7 @@ fn subtree_members_tx(connection: &Connection, root: &str) -> Result<(Vec<Subtre
                 depth: row.get(1)?,
                 state: row.get(2)?,
                 created_at: row.get(3)?,
-                turn_bound: row.get(4)?,
+                turn_state: row.get(4)?,
                 workspace_ref: row.get(5)?,
                 probe_ref: row.get(6)?,
                 goal_ref: row.get(7)?,
@@ -1030,8 +1098,16 @@ fn prune_writes_tx(tx: &Transaction<'_>, cutoff: i64) -> Result<i64> {
     // exact retries read back as retained (plan present) or history-gap
     // (receipt pruned after reclaim).
     Ok(db!(tx.execute(
-        "DELETE FROM writes WHERE id IN (
-             SELECT id FROM writes WHERE created_at <= ?1
+        &format!("DELETE FROM writes WHERE id IN ({PRUNE_WRITE_SELECT})"),
+        params![
+            cutoff,
+            RETENTION_BATCH_ENTRIES,
+            super::goals::goal_round_running_outcome_json()?,
+        ],
+    )) as i64)
+}
+
+const PRUNE_WRITE_SELECT: &str = "SELECT id FROM writes WHERE created_at <= ?1
                AND method NOT LIKE 'inference.%'
                AND NOT EXISTS (SELECT 1 FROM launch_intents q WHERE q.id = writes.id)
                AND NOT EXISTS (SELECT 1 FROM checkpoint_restore_intents r WHERE r.id = writes.id)
@@ -1044,12 +1120,4 @@ fn prune_writes_tx(tx: &Transaction<'_>, cutoff: i64) -> Result<i64> {
                    json_extract(result, '$.state') IS 'running'
                    OR COALESCE(json_extract(result, '$.finished_at'), created_at) > ?1
                ))
-             ORDER BY created_at, id LIMIT ?2
-         )",
-        params![
-            cutoff,
-            RETENTION_BATCH_ENTRIES,
-            super::goals::goal_round_running_outcome_json()?,
-        ],
-    )) as i64)
-}
+             ORDER BY created_at, id LIMIT ?2";
