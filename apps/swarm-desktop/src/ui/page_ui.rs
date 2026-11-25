@@ -25,10 +25,12 @@ pub(super) fn page(name: &str, widest: f64, items: Vec<KeyedView>) -> View {
         .horizontal_scroll_bar_visibility(ScrollBarVisibility::Disabled)
         .automation_name(name)
         .content(
-            StackPanel::new()
-                .column(widest, tokens::spacing::LG, tokens::spacing::LG)
-                .spacing(tokens::spacing::MD)
-                .keyed_children(items),
+            Border::new().content(
+                StackPanel::new()
+                    .column(widest, tokens::spacing::LG, tokens::spacing::LG)
+                    .spacing(tokens::spacing::MD)
+                    .keyed_children(items),
+            ),
         )
         .into()
 }

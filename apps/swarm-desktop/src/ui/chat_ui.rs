@@ -1673,34 +1673,38 @@ impl DesktopApp {
             .grid_row(1)
             .vertical_scroll_bar_visibility(ScrollBarVisibility::Auto)
             .content(
-                StackPanel::new()
-                    .column(
-                        tokens::layout::HOME_WIDTH,
-                        tokens::layout::HOME_TOP,
-                        tokens::spacing::XL,
-                    )
-                    .spacing(tokens::spacing::HOME_GROUP_GAP)
-                    .keyed_children(crate::views::slots([
-                        Some(title),
-                        alert,
-                        Some(composer),
-                        Some(
-                            // The cards share the column in equal cells.
-                            Grid::new()
-                                .columns(vec![GridLength::STAR; cards.len()])
-                                .column_spacing(tokens::spacing::SM)
-                                .keyed_children(cards.into_iter().enumerate().map(
-                                    |(index, (key, card))| {
-                                        KeyedView::new(
-                                            key,
-                                            card.grid_column(index as i32)
-                                                .horizontal_alignment(HorizontalAlignment::Stretch),
-                                        )
-                                    },
-                                ))
-                                .into(),
-                        ),
-                    ])),
+                Border::new().content(
+                    StackPanel::new()
+                        .column(
+                            tokens::layout::HOME_WIDTH,
+                            tokens::layout::HOME_TOP,
+                            tokens::spacing::XL,
+                        )
+                        .spacing(tokens::spacing::HOME_GROUP_GAP)
+                        .keyed_children(crate::views::slots([
+                            Some(title),
+                            alert,
+                            Some(composer),
+                            Some(
+                                // The cards share the column in equal cells.
+                                Grid::new()
+                                    .columns(vec![GridLength::STAR; cards.len()])
+                                    .column_spacing(tokens::spacing::SM)
+                                    .keyed_children(cards.into_iter().enumerate().map(
+                                        |(index, (key, card))| {
+                                            KeyedView::new(
+                                                key,
+                                                card.grid_column(index as i32)
+                                                    .horizontal_alignment(
+                                                        HorizontalAlignment::Stretch,
+                                                    ),
+                                            )
+                                        },
+                                    ))
+                                    .into(),
+                            ),
+                        ])),
+                ),
             )
             .into()
     }

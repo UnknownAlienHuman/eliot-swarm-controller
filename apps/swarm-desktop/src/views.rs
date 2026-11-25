@@ -54,7 +54,10 @@ impl MaybeContent for Border {
 /// A content column (§6.3): stretched across its slot less the 32-DIP side
 /// gutters, at most `widest` wide and at least [`tokens::layout::MIN_COLUMN`];
 /// WinUI centres a stretched element its MaxWidth caps, so no width is
-/// derived from the window.
+/// derived from the window. A column is never a ScrollViewer's direct
+/// content: the default ScrollViewer style aligns content Left, which places
+/// a capped child by its desired width, off centre; a plain Border between
+/// them takes the viewport width and centres the column.
 pub trait Column: Sized {
     fn column(self, widest: f64, top: f64, bottom: f64) -> Self;
 }
