@@ -27,7 +27,8 @@ pub use crate::update_backup::{
     check_update_store_copy, copy_store_for_update_check, discard_update_backup,
     lock_update_publication, restore_update_backup, update_backup_path,
 };
-pub const STORE_SCHEMA_VERSION: i64 = eliot_store::Store::SCHEMA_VERSION;
+pub const STORE_SCHEMA_VERSION: i64 = Store::SCHEMA_VERSION;
+pub const RESTART_CONTINUATION_BRIEF_SCHEMA: i64 = Store::RESTART_CONTINUATION_BRIEF_SCHEMA;
 
 /// Start a daemon process that is independent of the caller's Unix
 /// session, with standard streams disconnected.
@@ -71,13 +72,6 @@ pub fn start_detached_daemon(executable: &Path, data_dir: &Path) -> std::io::Res
 
 pub fn continue_after_restart(path: &Path) -> Result<bool> {
     Ok(crate::config::load_daemon_config(path)?.on_restart == crate::config::OnRestart::Continue)
-}
-
-pub fn supports_restart_continuation_brief(path: &Path) -> Result<bool> {
-    let data = DataDir::open_existing(path)?;
-    let store = data.path().join("eliot.db");
-    validate_private_file(&store)?;
-    Store::open_read_only(&store)?.supports_restart_continuation_brief()
 }
 
 /// Returns the issuing parent daemon data directory when running inside a
