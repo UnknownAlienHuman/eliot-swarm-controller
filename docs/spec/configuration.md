@@ -1184,8 +1184,8 @@ project scope and an explicit launch scope. Null limits, empty scope or check-in
 lists, and a cadence that replaces idle checks require an explicit opt-out.
 Executable check overrides and escalation require Owner authority.
 
-`no_policy` requires a nonblank reason and skips both the policy-installed Goal and
-the Agent's fast project check. The caller can still supply a separate Goal within
+Only the Owner can grant `no_policy` with a nonblank reason. An exception skips
+both the policy-installed Goal and the Agent's fast project check. The caller can still supply a separate Goal within
 their existing authority. `swarm show` and the project's opt-out list show the
 retained reason. An ordinary switch within the same project carries it forward.
 

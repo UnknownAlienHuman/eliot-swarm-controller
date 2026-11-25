@@ -184,10 +184,11 @@ project-rule launches can tighten policy by lowering limits or the check deadlin
 adding check-input globs, or adding a scope that intersects the project scope.
 Only the Owner can grant a project policy opt-out with a nonblank `no_policy`
 reason. This includes Owner-authorized global rule and timer actions; a project rule
-or Agent cannot grant itself an exception. An opted-out reason frozen on an Agent
-may continue through a same-project switch, and retained retries preserve the
-original admission. An Owner-configured rule's opted-out launch event retains that
-rule's cause; project rules do not inherit Owner authority. Exact same-ID retries
+or Agent cannot grant itself an exception. A switch can carry the exact opt-out
+reason frozen on its source Agent within the same execution project. Switch
+requests have no exception selector, and Store verifies the source reason and
+project when admitting the successor. An Owner-configured rule's opted-out launch
+event retains the rule's cause; project rules do not inherit Owner authority. Exact same-ID retries
 replay the original caller-bound admission, while a queued Owner intent keeps its
 Owner principal and frozen request until arbitration. A historical queued intent
 whose principal is an Agent and whose request contains `no_policy` is refused when

@@ -1783,6 +1783,20 @@ impl Store {
                 ..
             } = decode_switch(parent.args.clone())?;
             let (agent, target) = source_tx(&tx, &source, self.hierarchy_limits, policy, true)?;
+            if let Some(reason) = request.args.get("no_policy")
+                && (target
+                    .as_ref()
+                    .is_some_and(|registration| registration.id != agent.project)
+                    || !agent
+                        .policy_opt_out_reason
+                        .as_deref()
+                        .is_some_and(|retained| reason.as_str() == Some(retained)))
+            {
+                return Err(Error::new(
+                    "not_allowed",
+                    "switch can only carry the source project's existing policy opt-out",
+                ));
+            }
             let manager = require_switch_project(&tx, &source, target_project.as_ref())?;
             if manager.is_some() != brief.enters_assignment {
                 return Err(Error::new(
