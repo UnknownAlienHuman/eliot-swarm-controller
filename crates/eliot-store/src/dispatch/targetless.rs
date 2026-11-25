@@ -128,22 +128,7 @@ pub(super) fn dispatch_tx(
             }
         }
         if repo_git_write_blocked_tx(tx, id, &common_dir)? {
-            if command.state == CommandState::Accepted {
-                update_command_state(tx, id, CommandState::Queued, None, None, now)?;
-                events.push(insert_daemon_command_event(
-                    tx,
-                    now,
-                    "command.queued",
-                    None,
-                    None,
-                    id,
-                    json!({
-                        "command_id": id,
-                        "verb": verb,
-                        "reason": "same_repository_write_pending",
-                    }),
-                )?);
-            }
+            super::queue_repository_write_tx(tx, command, now, events)?;
             let command = load_command(tx, id)?
                 .ok_or_else(|| Error::new("internal", "queued Git command disappeared"))?;
             return Ok(Some(command));

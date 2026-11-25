@@ -256,6 +256,14 @@ messages. A timeout after dispatch releases the correlation slot and settles the
 as `unknown` with the elapsed deadline as its reason. An unresolved transport or generation
 teardown also settles as `unknown`. The host never replays the steer.
 
+When an adapter reports incomplete native compaction, the optional Core
+`CompactionFailure` fact gives the stage and a bounded, redacted message.
+An error from a native event must be bound to the exact compaction turn.
+The router maps the fact to the retained command code, `where`, and origin
+after checking the command binding. An incomplete lifecycle or readback
+identifies the missing evidence. The fact leaves the effect state unchanged
+and cannot supply a completion receipt.
+
 A plugin with no native steer declares `steer_delivery: "turn_safe_point"` in its
 `session.ready` effective settings (Claude does); absent means a direct native steer, and
 any other value rejects the event as `invalid`. A daemon restart ends every live

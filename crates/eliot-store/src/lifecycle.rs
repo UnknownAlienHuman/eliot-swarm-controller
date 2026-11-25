@@ -2202,7 +2202,14 @@ fn settle_stopped_turn_unknown_tx(
             "turn",
             Some(agent_num),
             Some(generation),
-            json!({"command_id": command_id, "turn_id": turn_id, "reason": "stopped_without_terminal_result"}),
+            json!({
+                "command_id": command_id,
+                "turn_id": turn_id,
+                "reason": "stopped_without_terminal_result",
+                "where": "store.stop.turn",
+                "origin": core::FailureOrigin::Swarm,
+                "origin_evidence": "Stop proved exit and reader drain without a native terminal result",
+            }),
         ),
     )?);
     Ok(())

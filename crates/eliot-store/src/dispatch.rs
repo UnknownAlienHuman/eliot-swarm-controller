@@ -498,32 +498,17 @@ fn dispatch_worktree_remove_tx(
         ));
     }
     if repo_git_write_blocked_tx(tx, id, &workspace.repo_common_dir)? {
-        if command.state == CommandState::Accepted {
-            update_command_state(tx, id, CommandState::Queued, None, None, now)?;
-            events.push(insert_daemon_command_event(
-                tx,
-                now,
-                "command.queued",
-                Some(agent_num),
-                Some(agent.generation),
-                id,
-                json!({
-                    "command_id": id,
-                    "verb": "worktree.remove",
-                    "reason": "same_repository_write_pending",
-                }),
-            )?);
-        }
+        queue_repository_write_tx(tx, command, now, events)?;
         let queued = load_command(tx, id)?
             .ok_or_else(|| Error::new("internal", "queued removal disappeared"))?;
         return Ok(Some(queued));
     }
     let old = workspace.clone();
     workspace.phase = WorkspacePhase::Removing;
-    workspace.outcome = Some(
-        json!({"stage": "removal", "command_id": id, "previous_phase": old.phase,
-            "native_git_write_dispatched": false}),
-    );
+    let mut marker = json!({"stage": "removal", "command_id": id, "previous_phase": old.phase,
+        "native_git_write_dispatched": false});
+    workspace::preserve_workspace_stop_id(old.outcome.as_ref(), &mut marker);
+    workspace.outcome = Some(marker);
     workspace.updated_at = now;
     workspace::persist_workspace(tx, &old, &workspace)?;
     update_command_state(tx, id, CommandState::Dispatched, None, None, now)?;
@@ -538,6 +523,44 @@ fn dispatch_worktree_remove_tx(
         json!({"command_id": id, "verb": "worktree.remove"}),
     )?);
     Ok(None)
+}
+
+fn queue_repository_write_tx(
+    tx: &Transaction<'_>,
+    command: &CommandRecord,
+    now: i64,
+    events: &mut Vec<Event>,
+) -> Result<()> {
+    if command.state != CommandState::Accepted {
+        return Ok(());
+    }
+    let command_id = &command.command.id;
+    let cause = "same_repository_write_pending";
+    let outcome = json!({
+        "code": CommandState::Queued,
+        "cause": cause,
+        "message": "Another Git write or restore in this repository must clear first.",
+        "where": "store.dispatch.repository_write",
+        "origin": core::FailureOrigin::Swarm,
+    });
+    update_command_state(
+        tx,
+        command_id,
+        CommandState::Queued,
+        Some(&outcome),
+        None,
+        now,
+    )?;
+    events.push(insert_daemon_command_event(
+        tx,
+        now,
+        "command.queued",
+        command.target,
+        command.command.generation,
+        command_id,
+        json!({"command_id": command_id, "verb": command.command.verb, "reason": cause}),
+    )?);
+    Ok(())
 }
 
 /// Dispatch one `send`: generation, turn, settings-lane, and FIFO gates,

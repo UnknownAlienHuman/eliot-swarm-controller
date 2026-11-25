@@ -79,6 +79,15 @@ pub(crate) struct CompactionProgress {
     pub item_completed: bool,
     pub terminal_status: Option<String>,
     pub history_missing_tool_output: bool,
+    native_error: Option<(String, String)>,
+}
+
+impl CompactionProgress {
+    pub(crate) fn native_error_for(&self, command_id: &str) -> Option<&str> {
+        let (turn_id, message) = self.native_error.as_ref()?;
+        (self.accepted && self.command_id == command_id && self.turn_id.as_deref() == Some(turn_id))
+            .then_some(message.as_str())
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -1065,7 +1074,6 @@ impl EventProcessor {
                     self.record_unclassified_native("codex.native_rpc.turn_status", native_tag)
                         .await?;
                 }
-                let progress = self.status.compaction.as_mut().unwrap();
                 let status = match &notification.turn.status {
                     NativeTurnStatus::Completed => "completed",
                     NativeTurnStatus::Failed => "failed",
@@ -1073,10 +1081,15 @@ impl EventProcessor {
                     NativeTurnStatus::InProgress => "unknown",
                     NativeTurnStatus::Other => "unknown",
                 };
-                progress.history_missing_tool_output |= status == "failed"
-                    && notification.turn.error.as_ref().is_some_and(|error| {
-                        crate::native::types::history_missing_tool_output(&error.message)
-                    });
+                if let Some(error) = notification.turn.error.as_ref() {
+                    self.note_compaction_error(
+                        &notification.thread_id,
+                        &notification.turn.id,
+                        &error.message,
+                        status == "failed",
+                    );
+                }
+                let progress = self.status.compaction.as_mut().unwrap();
                 progress.terminal_status =
                     Some(
                         if status == "completed"
@@ -1089,25 +1102,47 @@ impl EventProcessor {
                         .to_owned(),
                     );
             }
-            "error"
-                if serde_json::from_value::<NativeErrorNotification>(params.clone()).is_ok_and(
-                    |notification| {
-                        notification.will_retry == Some(false)
-                            && notification.error.as_ref().is_some_and(|error| {
-                                crate::native::types::history_missing_tool_output(&error.message)
-                            })
-                    },
-                ) =>
-            {
-                self.status
-                    .compaction
-                    .as_mut()
-                    .unwrap()
-                    .history_missing_tool_output = true;
+            "error" => {
+                if let Ok(notification) =
+                    serde_json::from_value::<NativeErrorNotification>(params.clone())
+                    && notification.will_retry == Some(false)
+                    && let (Some(thread), Some(turn), Some(error)) = (
+                        notification.thread_id,
+                        notification.turn_id,
+                        notification.error,
+                    )
+                {
+                    self.note_compaction_error(&thread, &turn, &error.message, true);
+                }
             }
             _ => {}
         }
         Ok(true)
+    }
+
+    fn note_compaction_error(
+        &mut self,
+        thread_id: &str,
+        turn_id: &str,
+        message: &str,
+        detect_broken_history: bool,
+    ) {
+        let Some(progress) = self.status.compaction.as_mut().filter(|progress| {
+            progress.accepted
+                && self.status.thread_id.as_deref() == Some(thread_id)
+                && !turn_id.trim().is_empty()
+                && progress.turn_id.as_deref() == Some(turn_id)
+        }) else {
+            return;
+        };
+        let history_missing_tool_output =
+            detect_broken_history && crate::native::types::history_missing_tool_output(message);
+        let secrets = SecretPolicy::new(self.secrets.iter().cloned());
+        let message = secrets.redact_bounded(message.trim(), 768);
+        if !message.is_empty() {
+            progress.native_error = Some((turn_id.to_owned(), message));
+            progress.history_missing_tool_output |= history_missing_tool_output;
+        }
     }
 
     async fn flush_buffer(&mut self) -> Result<()> {

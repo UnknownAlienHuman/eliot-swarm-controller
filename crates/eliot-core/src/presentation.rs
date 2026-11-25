@@ -52,6 +52,10 @@ pub fn reason_words(code: &str) -> String {
         "lost" | "agent.lost" => "Lost contact with the Agent",
         "interrupted" => "Interrupted",
         "interrupted_by_owner" | "stopped_by_owner" => "Stopped by you",
+        "stopped_without_terminal_result" => "The Agent stopped before reporting the turn result",
+        "native_compaction_error" | "native_compaction_reply" => {
+            "The agent app reported a compaction error"
+        }
         "refused" | "rejected" => "The request was declined",
         "cancelled" => "Cancelled",
         "crashed" => "The Agent software stopped unexpectedly",

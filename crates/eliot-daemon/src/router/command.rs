@@ -12,8 +12,8 @@ use super::{
 use crate::common::now_ms;
 use crate::router::plugin_host::PendingCommand;
 use eliot_core::{
-    Agent, AgentState, Command, CommandState, Error, Event, FailureOrigin, FrozenScriptRun,
-    InjectPoint, Result, SecretPolicy, WorkspacePhase,
+    Agent, AgentState, Command, CommandState, CompactionFailure, Error, Event, FailureOrigin,
+    FrozenScriptRun, InjectPoint, Result, SecretPolicy, WorkspacePhase,
     api::{
         FrozenGitFetch, FrozenGitPublish, HarnessCapabilities, ProjectRegistrationView,
         configure_uses_native_session,
@@ -23,6 +23,7 @@ use eliot_core::{
 use eliot_core::{is_coordination_verb, is_start_verb, is_user_event_verb};
 use eliot_plugin::{MAX_EVENT_BYTES, sync::LockExt};
 use futures_util::future::BoxFuture;
+use serde::Deserialize;
 use serde_json::{Value, json};
 use std::sync::{Arc, Weak, atomic::Ordering};
 use tokio::sync::{broadcast, oneshot, watch};
@@ -1529,7 +1530,7 @@ impl Router {
                     true
                 }
                 "compact" => {
-                    let response = response.and_then(|value| {
+                    let response = response.and_then(|mut value| {
                         if value["state"] == "applied"
                             && (value["command_id"].as_str() != Some(id.as_str())
                                 || value["compaction"]["completed"] != true
@@ -1540,7 +1541,36 @@ impl Router {
                             return Err(Error::new(
                                 "unknown",
                                 "native compaction completion is unconfirmed",
+                            )
+                            .with_where("plugin.command.compact.receipt")
+                            .with_origin(
+                                FailureOrigin::HarnessContractMismatch,
+                                "the adapter reported applied without an exact completion receipt",
                             ));
+                        }
+                        if value["command_id"].as_str() == Some(id.as_str())
+                            && value["compaction"]["completed"] == false
+                            && matches!(value["state"].as_str(), Some("unknown" | "failed"))
+                            && let Some(raw) = value.get("compaction_failure")
+                            && let Ok(fact) = CompactionFailure::deserialize(raw)
+                            && !fact.message.trim().is_empty()
+                        {
+                            let mut error = fact.diagnostic();
+                            if value["state"] == "unknown" {
+                                error.message = format!(
+                                    "Compaction completion couldn't be confirmed. {}",
+                                    error.message
+                                )
+                                .into();
+                            }
+                            let error = self.sanitized_failure(&error, "plugin.command.compact");
+                            let diagnostic = self.command_error_outcome(&error, "code");
+                            if let (Some(outcome), Value::Object(diagnostic)) =
+                                (value.as_object_mut(), diagnostic)
+                            {
+                                outcome.remove("compaction_failure");
+                                outcome.extend(diagnostic);
+                            }
                         }
                         Ok(value)
                     });

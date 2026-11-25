@@ -1089,11 +1089,14 @@ impl WorkspaceManager {
         } else {
             outcome
         };
+        // Bound and redact all removal text, including a Git drain error, before
+        // it reaches the retained command, events or Owner inbox.
+        let outcome = self.redact_removal(outcome);
         let mut store = self.inner.store.lock().await;
         let change = store.settle_workspace_removal(
             &command.id,
             preparation.target_generation,
-            self.redact_removal(outcome),
+            outcome,
             now_ms(),
         )?;
         self.publish(&change.events);
@@ -1114,12 +1117,14 @@ impl WorkspaceManager {
         if slot.removal_may_have_begun(&command.id, preparation) {
             return removal_unknown("workspace_removal_may_have_begun");
         }
-        if self
+        if let Err(error) = self
             .wait_git_sources_closed(preparation, command, slot, deadline)
             .await
-            .is_err()
         {
-            return removal_unknown("workspace_git_drain_unknown");
+            return WorkspaceRemovalOutcome::Unknown {
+                code: "workspace_git_drain_unknown".to_owned(),
+                message: *error.message,
+            };
         }
         let expected_tip = command.args.get("expected_tip").and_then(Value::as_str);
         let mut outcome = match git

@@ -1843,10 +1843,23 @@ For a queued SEND, `swarm why COMMAND_ID` reports the retained command or turn
 that closes its send gate, including an unknown compaction's command ID and
 verb. The corresponding Owner inbox item identifies the queued inputs waiting
 on an unknown command.
-For a refused `worktree.remove`, `swarm why COMMAND_ID` shows the retained
-code, cause and failure location when available. `swarm why AGENT` includes
-that refusal while it is the current managed worktree outcome for the terminal
-Agent's generation. A later successful removal replaces it in Agent diagnosis.
+
+When the repository write gate queues a Git action or worktree removal,
+`swarm why COMMAND_ID` reports that another Git write or restore in the
+same repository must clear first. The queued outcome carries the cause
+at `store.dispatch.repository_write` until the command leaves the queue.
+
+For a failed or unknown `worktree.remove`, `swarm why COMMAND_ID` shows the
+retained nested code, cause and failure location when available. An unknown
+Git drain retains the failure from the drain check. `swarm why AGENT` includes
+the problem while it is the current managed worktree outcome for the terminal
+Agent's generation. The Owner inbox includes the retained message for unknown
+worktree removals and unknown compactions.
+
+A Stop refused because workspace cancellation was already committed identifies
+the original Stop when its ID is retained. A stopped turn without a native
+terminal result remains unknown and records the Stop that proved exit and
+reader drain at `store.stop.turn`.
 When a failure exists, the one-line `summary` starts with its origin
 (`provider origin: <target> <code> at <where>: <message>`). A healthy idle, busy,
 waiting or stopped Agent with no failure in the bounded recent generation read
