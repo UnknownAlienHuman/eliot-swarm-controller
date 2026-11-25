@@ -98,7 +98,7 @@ impl Warnings {
         self.malformed_dropped
     }
 
-    fn record_malformed_dropped(&mut self) {
+    pub(super) fn record_malformed_dropped(&mut self) {
         self.malformed_dropped = self.malformed_dropped.saturating_add(1);
     }
 
