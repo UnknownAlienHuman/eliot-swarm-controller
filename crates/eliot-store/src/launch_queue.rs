@@ -217,10 +217,16 @@ impl Store {
             // Recheck the retained caller generation and parent authority at the writer.
             hierarchy::resolve_launch_parent(&tx, principal, &request.args)?;
             let parent_generation = parent_generation(&tx, &request)?;
-            let assignment_epoch = if principal != "owner" && !project.is_empty() {
-                Some(project_assignment::read_assignment(&tx, project)?.epoch)
-            } else {
+            let assignment_epoch = if project.is_empty() {
                 None
+            } else {
+                check_arbitrated_project(&tx, project)?;
+                Some(project_assignment::queued_launch_epoch(
+                    &tx,
+                    principal,
+                    project,
+                    &request.args,
+                )?)
             };
             let count: i64 = tx
                 .query_row("SELECT COUNT(*) FROM launch_intents", [], |r| r.get(0))
@@ -358,19 +364,28 @@ impl Store {
                 .connection
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(sql_error)?;
-            if parent_generation(&tx, &request)? != intent.parent_generation
-                || (intent.assignment_epoch.is_some()
-                    && intent.assignment_epoch
-                        != Some(
-                            project_assignment::read_assignment(&tx, &intent.view.project)?.epoch,
-                        ))
-            {
+            if parent_generation(&tx, &request)? != intent.parent_generation {
                 return Err(Error::new(
                     "stale_generation",
-                    "queued launch authority changed",
+                    "queued launch parent generation changed",
                 ));
             }
-            check_arbitrated_project(&tx, &intent.view.project)?;
+            let project = &intent.view.project;
+            if !project.is_empty() {
+                check_arbitrated_project(&tx, project)?;
+                let epoch = project_assignment::queued_launch_epoch(
+                    &tx,
+                    &intent.principal,
+                    project,
+                    &request.args,
+                )?;
+                if epoch != intent.assignment_epoch.unwrap_or_default() {
+                    return Err(Error::new(
+                        "stale_assignment",
+                        "queued launch project assignment changed after enqueue",
+                    ));
+                }
+            }
             request.id = ulid::Ulid::new().to_string();
             request.args["admission_mode"] = json!("arbitrated");
             let previous = intent

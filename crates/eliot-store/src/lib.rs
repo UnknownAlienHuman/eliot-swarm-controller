@@ -44,7 +44,7 @@ pub use context::{
     ContextDispatch, SendInput, TurnInsertionEvidence, observe_context_digest_warnings,
 };
 pub use coordination::{MailSendOutcome, MailSendResult, NoticeClaim};
-pub use digests::{DigestRegisterOutcome, DigestRow, DigestTurn};
+pub use digests::{DigestRegisterOutcome, DigestRow, DigestTurn, child_run_digest_id};
 pub use failed_custody::FailedGenerationExitSnapshot;
 pub use fleet::{AgentListFilter, AgentListPage};
 pub use git::CodeProgressState;

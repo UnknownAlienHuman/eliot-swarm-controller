@@ -206,6 +206,8 @@ Checked layers record delivered increments, not full crash/load qualification.
   reservations and return exact project, manager and fleet usage.
 - [x] **3. Project transfer.** Build on H1/H2/H3 to transfer authority, team and
   workspace bindings atomically, with explicit drain and unknown handling.
+  Reject stale Owner and Agent launch intents, and move pending and unread
+  child wakes and cleanup with the workers while retaining the original receipts.
 - [x] **4a. Headless chat and work organization.** Grouped projection with
   attach/detach placement and tags (schema v64). Continue-in-project returns
   later through the existing switch/handoff path (#657).

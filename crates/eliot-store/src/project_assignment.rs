@@ -713,21 +713,16 @@ fn enforce_agent(
     hierarchy::parse_caller(conn, principal)?;
     project_transfer::fence(conn, principal, "coordination", Some(caller), None)?;
     for binding in bindings {
-        let eligible = if let Some((num, generation)) = binding.manager.zip(binding.generation) {
-            let manager = format_agent_id(num);
-            let registration = projects::project_registration_tx(conn, &binding.project)?;
-            registration.is_some()
-                && load_agent_by_num(conn, num)?.is_some_and(|agent| {
-                    agent.generation == generation && manager_live(agent.state)
-                })
-                && caller.project == binding.project
-                && (caller.id == manager || caller.root == manager)
-                && target.is_none_or(|a| {
-                    a.project == binding.project && (a.id == manager || a.root == manager)
-                })
-        } else {
-            false
-        };
+        let eligible = assignment_team_member(
+            conn,
+            caller,
+            &binding.project,
+            binding.manager.zip(binding.generation),
+        )? && target.is_none_or(|a| {
+            let manager = binding.manager.map(format_agent_id);
+            a.project == binding.project
+                && manager.is_some_and(|manager| a.id == manager || a.root == manager)
+        });
         if !eligible {
             return Err(Error::new(
                 "not_allowed",
@@ -736,6 +731,71 @@ fn enforce_agent(
         }
     }
     Ok(())
+}
+
+pub(super) fn queued_launch_epoch(
+    conn: &Connection,
+    principal: &str,
+    project: &str,
+    args: &Value,
+) -> Result<i64> {
+    let Some((manager, manager_generation, epoch, _)) = load_row(conn, project)? else {
+        return Ok(0);
+    };
+    let binding = manager.zip(manager_generation);
+    let parent = args.get("parent").and_then(Value::as_str);
+    if let Some(id) = parent {
+        let agent = load_agent_by_num(conn, parse_agent_id(id)?)?;
+        if !agent
+            .filter(|agent| manager_live(agent.state))
+            .map(|agent| assignment_team_member(conn, &agent, project, binding))
+            .transpose()?
+            .unwrap_or(false)
+        {
+            return Err(Error::new(
+                "stale_assignment",
+                "queued launch parent is outside the current project assignment",
+            ));
+        }
+    }
+    if let Some((id, generation)) = principal
+        .strip_prefix("agent:")
+        .and_then(|value| value.split_once(':'))
+    {
+        let caller = load_agent_by_num(conn, parse_agent_id(id)?)?
+            .filter(|agent| generation.parse::<i64>() == Ok(agent.generation))
+            .ok_or_else(|| {
+                Error::new(
+                    "stale_generation",
+                    "queued launch caller generation changed",
+                )
+            })?;
+        if !assignment_team_member(conn, &caller, project, binding)? {
+            return Err(Error::new(
+                "stale_assignment",
+                "queued launch caller is outside the current project assignment",
+            ));
+        }
+    }
+    Ok(epoch)
+}
+
+fn assignment_team_member(
+    conn: &Connection,
+    caller: &Agent,
+    project: &str,
+    manager_assignment: Option<(i64, i64)>,
+) -> Result<bool> {
+    let Some((num, generation)) = manager_assignment else {
+        return Ok(false);
+    };
+    let manager = format_agent_id(num);
+    let registration = projects::project_registration_tx(conn, project)?;
+    Ok(registration.is_some()
+        && load_agent_by_num(conn, num)?
+            .is_some_and(|agent| agent.generation == generation && manager_live(agent.state))
+        && caller.project == project
+        && (caller.id == manager || caller.root == manager))
 }
 
 fn enforce_launch(

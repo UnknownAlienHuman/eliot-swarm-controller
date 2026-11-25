@@ -1058,7 +1058,7 @@ or refusal. Use a fresh mutation ID to check a changed condition. Remote grants
 remain unsupported.
 
 - **Begin** retains an intent, keeps the assignment occupied and fences new A
-  controls and automated work addressed to A. Owner readback, replies,
+  controls, queued launches and automated work addressed to A. Owner readback, replies,
   interrupt and stop remain available. Other workers can finish work in their
   existing native sessions. Unsettled commands, approvals, unresolved Goal
   rounds and a blocked source Goal are reported. Source custody must close when
@@ -1083,11 +1083,27 @@ remain unsupported.
   successor's retained start so cleanup can find them after the old manager is
   deleted and the assignment is released. The original preparation identity is
   preserved. If the receipt remains with an earlier owner, deletion is blocked
-  while the path is bound or borrowed. Worker generations, references and
-  reservations stay in place. A successor team over its assignment limit and
-  unsettled queues block the transaction. Queues keep their
-  retained principals and assignment epochs are preserved. Project-owned rules
-  stay project-owned and targeted automation follows current membership.
+  while the path is bound or borrowed. Workers stay in the same registered
+  project and authorization scope. Their individual worktrees, generations,
+  native references and reservations stay in place. A successor team over its
+  assignment limit or unsettled commands block the transaction. Project-bound
+  launch intents retain the enqueue epoch and principal, including Owner
+  intents. Enqueue and admission both check the current team and any explicit
+  parent. An open transfer defers admission. A changed epoch or revoked parent
+  rejects the receipt as `stale_assignment`. A legacy intent without an epoch
+  can dispatch only while the project still has epoch zero. Project-owned rules
+  stay project-owned.
+  In the epoch transaction, the paused Goal and its check binding go to B.
+  Pending direct `child.run` digests move with the exact child and keep the
+  original registration. Pending child cleanup keeps its original Stop
+  provenance and follows that child. An admitted cleanup apply blocks transfer
+  until it settles. A committed worker digest or cleanup notice still unread
+  in A's mailbox is copied into B's mailbox, consumes A's unread slot and
+  triggers B's normal mail wake. Original delivery receipts and already-read
+  mail remain retained. A full destination mailbox blocks commit and leaves
+  the source mail unread. A pending digest first delivered after transfer
+  reports the initial delivery recipient as `delivery_to` while retaining the
+  requested recipient in `to`.
   Saved continuation context and any expressly selected source SENDs enter the
   ordinary Handoff delivery gate in the same transaction. The Owner may cite a
   retained original task and select ordered plain SENDs from the exact source

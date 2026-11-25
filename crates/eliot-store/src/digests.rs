@@ -9,13 +9,18 @@
 //! retained row, same id plus a different payload rejects with `id_conflict`.
 
 use super::{
-    Store, canonical, command_binding, commit_transaction, encode_json, load_agent_by_num,
+    Event, Store, canonical, command_binding, commit_transaction, encode_json, load_agent_by_num,
     sql_error, validate_id_age, write_binding,
 };
-use eliot_core::{Error, Result, api::SwarmDigestRequest, parse_agent_id};
+use eliot_core::{
+    Error, Result,
+    api::{MailLimits, SwarmDigestRequest},
+    parse_agent_id,
+};
 use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use sha2::{Digest, Sha256};
 
 // `a` is the recipient’s exact closed generation. Match both the retained
 // restart loss and the unread, delivered result it registered while live.
@@ -44,10 +49,13 @@ pub(super) const CLOSED_COMPLETION_PARENT: &str = r#"
     )
     AND EXISTS (
         SELECT 1 FROM messages m
-        JOIN completion_digests d ON d.delivered_mail_id = m.delivery_id
+        JOIN completion_digests d ON COALESCE(d.transferred_mail_id, d.delivered_mail_id) = m.delivery_id
         WHERE m.recipient = a.id AND m.recipient_generation = a.generation
           AND m.read_at IS NULL AND m.wake = 1 AND m.sender = 'swarm'
-          AND d.parent = a.id AND d.requester = 'agent:a' || a.id || ':' || a.generation
+          AND d.parent = a.id
+          AND (d.requester = 'agent:a' || a.id || ':' || a.generation
+               OR EXISTS (SELECT 1 FROM agents child
+                   WHERE child.id = d.transferred_child AND child.parent = d.parent))
     )
 "#;
 
@@ -56,6 +64,7 @@ pub(super) const CLOSED_COMPLETION_PARENT: &str = r#"
 pub struct DigestRow {
     pub id: String,
     pub parent: String,
+    pub requested_parent: Option<String>,
     pub mode: String,
     pub commands: Vec<String>,
     pub turns: Vec<DigestTurn>,
@@ -117,6 +126,7 @@ fn digest_payload(request: &SwarmDigestRequest) -> Result<Vec<u8>> {
 struct StoredDigestRow {
     id: String,
     parent: i64,
+    requested_parent: Option<i64>,
     mode: String,
     commands_json: String,
     turns_json: String,
@@ -140,7 +150,7 @@ fn pending_page_rows(
 ) -> Result<Vec<StoredDigestRow>> {
     let limit = limit.clamp(1, 256) as i64;
     let mut sql = String::from(
-        "SELECT id, parent, mode, commands, turns, requester, created_at, delivered_mail_id, delivered_at, payload_digest, hidden
+        "SELECT id, parent, mode, commands, turns, requester, created_at, delivered_mail_id, delivered_at, payload_digest, hidden, requested_parent
          FROM completion_digests INDEXED BY completion_digests_pending_cursor WHERE delivered_at IS NULL",
     );
     let mut params: Vec<rusqlite::types::Value> = Vec::new();
@@ -169,6 +179,7 @@ fn pending_page_rows(
                 delivered_at: row.get(8)?,
                 payload_digest: row.get(9)?,
                 hidden_json: row.get(10)?,
+                requested_parent: row.get(11)?,
             })
         })
         .map_err(sql_error)?;
@@ -189,6 +200,7 @@ fn parse_row(stored: StoredDigestRow) -> Result<DigestRow> {
     Ok(DigestRow {
         id: stored.id,
         parent: format!("a{}", stored.parent),
+        requested_parent: stored.requested_parent.map(super::format_agent_id),
         mode: stored.mode,
         commands,
         turns,
@@ -199,6 +211,113 @@ fn parse_row(stored: StoredDigestRow) -> Result<DigestRow> {
         payload_digest: stored.payload_digest,
         hidden,
     })
+}
+
+/// Derive the same completion id for registration, delivery and transfer.
+pub fn child_run_digest_id(id: &str) -> Result<String> {
+    let value = ulid::Ulid::from_string(id).map_err(|_| Error::invalid_mutation_id())?;
+    let original = value.to_bytes();
+    let mut hash = Sha256::new();
+    hash.update(b"child.run.digest");
+    hash.update(original);
+    // Keep the launch's admission timestamp and derive a separate, stable digest id.
+    let mut bytes = original;
+    bytes[6..].copy_from_slice(&hash.finalize()[..10]);
+    if bytes == original {
+        bytes[15] ^= 1;
+    }
+    Ok(ulid::Ulid::from_bytes(bytes).to_string())
+}
+
+/// Move direct child.run results with their exact controlled worker.
+/// Undelivered results keep their registration. An unread service delivery
+/// follows the worker while its original mail receipt stays readable.
+pub(super) fn follow_project_transfer(
+    tx: &Transaction<'_>,
+    from: &eliot_core::Agent,
+    to: &eliot_core::Agent,
+    moved: &[eliot_core::api::ReparentedAgent],
+    limits: MailLimits,
+    now: i64,
+    events: &mut Vec<Event>,
+) -> Result<()> {
+    let source = parse_agent_id(&from.id)?;
+    let destination = parse_agent_id(&to.id)?;
+    let direct = moved
+        .iter()
+        .filter(|member| {
+            member.previous_parent.as_deref() == Some(from.id.as_str())
+                && member.parent.as_deref() == Some(to.id.as_str())
+        })
+        .map(|member| parse_agent_id(&member.agent))
+        .collect::<Result<Vec<_>>>()?;
+    if direct.is_empty() {
+        return Ok(());
+    }
+    let mut launches = tx
+        .prepare_cached(
+            "SELECT l.id, l.principal, l.target
+         FROM json_each(?1) moved
+         JOIN commands l ON l.target=moved.value AND l.verb='launch' AND l.generation=1
+         JOIN commands input ON input.parent_command=l.id AND input.id=l.id || '/send'
+            AND input.target=l.target AND input.principal=l.principal
+            AND input.verb='send' AND input.link_kind='send' AND input.ordinal=0
+         WHERE l.principal GLOB 'agent:*'",
+        )
+        .map_err(sql_error)?;
+    let rows = launches
+        .query_map([encode_json(&direct)?], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })
+        .map_err(sql_error)?;
+    let mut find = tx
+        .prepare_cached(
+            "SELECT COALESCE(transferred_mail_id, delivered_mail_id) FROM completion_digests
+             WHERE id=?1 AND parent=?2 AND requester=?3 AND commands=?4 AND turns='[]' AND mode='all'",
+        )
+        .map_err(sql_error)?;
+    let mut change = tx
+        .prepare_cached(
+            "UPDATE completion_digests
+             SET requested_parent=COALESCE(requested_parent,parent), parent=?1,
+                 transferred_child=?2, transferred_mail_id=?3
+             WHERE id=?4",
+        )
+        .map_err(sql_error)?;
+    for row in rows {
+        let (launch, principal, child) = row.map_err(sql_error)?;
+        let Ok(digest) = child_run_digest_id(&launch) else {
+            continue;
+        };
+        let inputs = encode_json(&[format!("{launch}/send")])?;
+        let Some(delivery) = find
+            .query_row(params![digest, source, principal, inputs], |row| {
+                row.get::<_, Option<String>>(0)
+            })
+            .optional()
+            .map_err(sql_error)?
+        else {
+            continue;
+        };
+        let forwarded = if let Some(delivery) = delivery {
+            let Some(mail) =
+                Store::transfer_unread_service_mail(tx, &delivery, from, to, limits, now, events)?
+            else {
+                continue;
+            };
+            Some(mail.delivery_id)
+        } else {
+            None
+        };
+        change
+            .execute(params![destination, child, forwarded, digest])
+            .map_err(sql_error)?;
+    }
+    Ok(())
 }
 
 impl Store {
@@ -387,7 +506,7 @@ impl Store {
         let row: Option<StoredDigestRow> = self
             .connection
             .query_row(
-                "SELECT id, parent, mode, commands, turns, requester, created_at, delivered_mail_id, delivered_at, payload_digest, hidden
+                "SELECT id, parent, mode, commands, turns, requester, created_at, delivered_mail_id, delivered_at, payload_digest, hidden, requested_parent
                  FROM completion_digests WHERE id = ?1",
                 params![id],
                 |row| {
@@ -403,6 +522,7 @@ impl Store {
                         delivered_at: row.get(8)?,
                         payload_digest: row.get(9)?,
                         hidden_json: row.get(10)?,
+                requested_parent: row.get(11)?,
                     })
                 },
             )

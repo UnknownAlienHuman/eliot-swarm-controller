@@ -105,7 +105,7 @@ fn digest_results_locked(
         return Ok(results);
     };
     if !row.turns.is_empty()
-        || !super::child_run::child_run_digest_id(launch).is_ok_and(|id| id == row.id)
+        || !eliot_store::child_run_digest_id(launch).is_ok_and(|id| id == row.id)
     {
         return Ok(results);
     }
@@ -148,6 +148,7 @@ fn pending_response(
         mode: request.mode.clone(),
         state: "pending".to_owned(),
         delivery_id: None,
+        delivery_to: None,
         completed,
         results,
     };
@@ -161,12 +162,19 @@ fn delivered_response(
     results: Vec<WaitEntryResult>,
 ) -> Result<SwarmDigestResponse> {
     let completed = digest_mode_completed(row.mode.as_str(), &results);
+    let requested = row.requested_parent.as_ref().unwrap_or(&row.parent);
+    let delivery_to = delivery_id
+        .split_once('/')
+        .map(|(_, recipient)| recipient)
+        .filter(|recipient| *recipient != requested)
+        .map(str::to_owned);
     let response = SwarmDigestResponse {
         id: row.id.clone(),
-        to: row.parent.clone(),
+        to: requested.clone(),
         mode: row.mode.clone(),
         state: "delivered".to_owned(),
         delivery_id: Some(delivery_id),
+        delivery_to,
         completed,
         results,
     };
@@ -234,14 +242,6 @@ impl Router {
             let row = store
                 .digest_register(&requester, &request, &hidden, now_ms())?
                 .row;
-            if let Some(mail_id) = row.delivered_mail_id.clone() {
-                let results = digest_results_locked(&store, &row, &marks)?;
-                let response = delivered_response(&row, mail_id, results)?;
-                request.validate_response(&response)?;
-                return serde_json::to_value(response).map_err(|_| {
-                    Error::new("internal", "swarm.digest response could not be encoded")
-                });
-            }
             // A retry keeps the first admitted mask: an entry hidden then
             // stays hidden even after it moves into scope, so the persisted
             // mask applies before any excerpt is budgeted.
@@ -259,6 +259,27 @@ impl Router {
                     &marks,
                 )?
                 .results;
+            }
+            if row.requested_parent.is_some() {
+                // An exact retry still addresses the original mailbox. Use
+                // that caller's current scope and leave delivery to the worker.
+                let response = if let Some(mail_id) = row.delivered_mail_id.clone() {
+                    delivered_response(&row, mail_id, snapshot)?
+                } else {
+                    pending_response(&request, snapshot)?
+                };
+                request.validate_response(&response)?;
+                return serde_json::to_value(response).map_err(|_| {
+                    Error::new("internal", "swarm.digest response could not be encoded")
+                });
+            }
+            if let Some(mail_id) = row.delivered_mail_id.clone() {
+                let results = digest_results_locked(&store, &row, &marks)?;
+                let response = delivered_response(&row, mail_id, results)?;
+                request.validate_response(&response)?;
+                return serde_json::to_value(response).map_err(|_| {
+                    Error::new("internal", "swarm.digest response could not be encoded")
+                });
             }
             (row, snapshot)
         };
