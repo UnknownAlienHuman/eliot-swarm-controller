@@ -707,22 +707,9 @@ impl WorkspaceGit {
         &self,
         preparation: &WorkspacePreparation,
     ) -> WorkspaceCreationOutcome {
-        match self.inspect_created(preparation).await {
-            Ok(outcome) => outcome,
-            Err(error) => WorkspaceCreationOutcome::Unknown {
-                code: error.code.clone(),
-                message: (*error.message).clone(),
-                failure_where: Some(
-                    error
-                        .failure_where
-                        .clone()
-                        .map(String::from)
-                        .unwrap_or_else(|| "store.dispatch.workspace_gate".to_owned()),
-                ),
-                origin: Some(error.origin_or_unknown()),
-                origin_evidence: error.origin_evidence.clone().map(String::from),
-            },
-        }
+        self.inspect_created(preparation)
+            .await
+            .unwrap_or_else(unknown_workspace_readback)
     }
 
     /// Identity-only readback for an already accepted workspace. Dirty files and
@@ -747,22 +734,7 @@ impl WorkspaceGit {
             })
         }
         .await;
-        match readback {
-            Ok(outcome) => outcome,
-            Err(error) => WorkspaceCreationOutcome::Unknown {
-                code: error.code.clone(),
-                message: (*error.message).clone(),
-                failure_where: Some(
-                    error
-                        .failure_where
-                        .clone()
-                        .map(String::from)
-                        .unwrap_or_else(|| "store.dispatch.workspace_gate".to_owned()),
-                ),
-                origin: Some(error.origin_or_unknown()),
-                origin_evidence: error.origin_evidence.clone().map(String::from),
-            },
-        }
+        readback.unwrap_or_else(unknown_workspace_readback)
     }
 
     /// Resume-only readback. Branch drift is accepted only when the Git
@@ -919,22 +891,7 @@ impl WorkspaceGit {
             })
         }
         .await;
-        match readback {
-            Ok(outcome) => outcome,
-            Err(error) => WorkspaceCreationOutcome::Unknown {
-                code: error.code.clone(),
-                message: (*error.message).clone(),
-                failure_where: Some(
-                    error
-                        .failure_where
-                        .clone()
-                        .map(String::from)
-                        .unwrap_or_else(|| "store.dispatch.workspace_gate".to_owned()),
-                ),
-                origin: Some(error.origin_or_unknown()),
-                origin_evidence: error.origin_evidence.clone().map(String::from),
-            },
-        }
+        readback.unwrap_or_else(unknown_workspace_readback)
     }
 
     async fn verify_native_checkout_reflog(
@@ -2016,6 +1973,22 @@ impl WorkspaceGit {
     async fn read_line(&self, root: &Path, args: &[&str], deadline: Instant) -> Result<String> {
         let bytes = self.read(root, args, deadline).await?;
         line(&bytes)
+    }
+}
+
+fn unknown_workspace_readback(error: Error) -> WorkspaceCreationOutcome {
+    let origin = error.origin_or_unknown();
+    WorkspaceCreationOutcome::Unknown {
+        code: error.code,
+        message: *error.message,
+        failure_where: Some(
+            error
+                .failure_where
+                .map(String::from)
+                .unwrap_or_else(|| "store.dispatch.workspace_gate".to_owned()),
+        ),
+        origin: Some(origin),
+        origin_evidence: error.origin_evidence.map(String::from),
     }
 }
 
