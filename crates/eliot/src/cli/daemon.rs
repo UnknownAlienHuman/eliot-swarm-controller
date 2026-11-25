@@ -512,16 +512,24 @@ fn print_status_summary(response: &DaemonStatusResponse, data_dir: &Path) {
         );
     }
     for worker in &response.automation_tasks {
-        if worker.restart_count > 0 || worker.failure_code.is_some() {
-            let cause = worker
+        if worker.registration_missing || worker.restart_count > 0 || worker.failure_code.is_some()
+        {
+            let mut line = format!(
+                "Worker {} | {:?} | restarts: {}",
+                worker.name, worker.health, worker.restart_count
+            );
+            if worker.registration_missing {
+                line.push_str(" | registration missing");
+            }
+            if let Some(cause) = worker
                 .last_failure
                 .as_deref()
                 .or(worker.failure_code.as_deref())
-                .unwrap_or("unavailable");
-            println!(
-                "Worker {} | {:?} | restarts: {} | last failure: {cause}",
-                worker.name, worker.health, worker.restart_count
-            );
+            {
+                line.push_str(" | last failure: ");
+                line.push_str(cause);
+            }
+            println!("{line}");
         }
     }
     if let Some(retention) = &response.retention {

@@ -226,7 +226,10 @@ including across pages. Project registrations use current revision and
 path checks for each batch. One explicit or periodic/terminal-cache apply runs
 at a time. The daemon reserves the apply slot under the Store lock and keeps
 it until the effect outcome is recorded. A prepared restart can wait for an
-admitted apply, while its final seal refuses until that slot clears. Read progress
+admitted apply, while its final seal refuses until that slot clears. If a manual
+job holds the slot, the periodic cleanup records `busy` for that sweep. Its next
+attempt follows the normal schedule of at most one sweep start per 60 seconds.
+Read progress
 with `cleanup.status {id}` or repeat the original call with the same id and filters.
 The tally includes pages, page errors by reason, inventory issue count, applied,
 skipped by reason, failed, unknown, pending, and confirmed bytes reclaimed.

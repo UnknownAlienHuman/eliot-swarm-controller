@@ -1,12 +1,12 @@
 use crate::{logging, router::Router};
 use eliot_core::{
     Error, Result, SecretPolicy,
-    api::{DaemonStatusResponse, WorkerTaskStatus, truncate_bytes},
+    api::{WorkerTaskStatus, truncate_bytes},
 };
 use std::{future::Future, sync::Arc, time::Duration};
 use tokio::{sync::watch, task::JoinSet, time::Instant};
 
-pub(crate) const WORKER_NAMES: [&str; DaemonStatusResponse::MAX_AUTOMATION_TASKS] = [
+pub(crate) const WORKER_NAMES: &[&str] = &[
     "rule_worker",
     "goal_driver",
     "project_checks",
@@ -133,18 +133,6 @@ pub(crate) async fn supervise_with<F, Fut, H>(
     Fut: Future<Output = WorkerOutcome> + Send + 'static,
     H: FnMut(&Error) + Send + 'static,
 {
-    if !WORKER_NAMES.contains(&name) {
-        logging::record(
-            &reporter.policy,
-            "daemon.worker_status_unregistered",
-            &[("worker", name)],
-            Some(&Error::new(
-                "internal",
-                "worker has no daemon status registration",
-            )),
-        );
-        return;
-    }
     let mut restart_count = 0_u32;
     let mut consecutive_failures = 0_u32;
     loop {

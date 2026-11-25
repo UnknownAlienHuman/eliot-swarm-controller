@@ -152,8 +152,9 @@ fn terminal(r: &NativeTurnEvidenceRequest) -> Result<Option<TurnResolveStatus>> 
                 }
             },
             Some("task_aborted" | "turn_aborted") => match p["reason"].as_str() {
-                Some("interrupted") => Interrupted,
-                Some("replaced" | "review_ended" | "budget_limited") => Failed,
+                Some(reason) if crate::native::types::known_turn_abort_reason(reason) => {
+                    Interrupted
+                }
                 _ => {
                     return Err(Error::new(
                         "source_integrity",
