@@ -207,8 +207,12 @@ fn check_worktree_binding<'a>(
         .git
         .as_ref()
         .ok_or_else(|| Error::new("source_integrity", "worktree Git binding absent"))?;
-    if workspace.target_generation != artifact.generation
-        || workspace.worktree_path != artifact.path
+    // The workspace row passed in is the live binding loaded by agent, so
+    // its paths and branch prove the current tree. Its target generation
+    // advances past the artifact's creation-time fence on resume,
+    // restart-resume and switch; that drift is stale metadata, not a
+    // changed binding.
+    if workspace.worktree_path != artifact.path
         || workspace.worktree_path != git.worktree
         || workspace.repo_path != git.repo
         || workspace.repo_common_dir != git.common
@@ -3159,7 +3163,11 @@ impl Router {
             let id = eliot_store::cleanup_worktree_command_id(apply_id, &artifact.id)?;
             let mut request = SubmitCommand::new(id, "worktree.remove");
             request.target = Some(artifact.agent.clone());
-            request.expected_generation = Some(artifact.generation);
+            // The removal targets the live workspace binding, not the
+            // artifact's creation-time fence: resume, restart-resume and
+            // switch advance the generation without rolling that fence
+            // forward.
+            request.expected_generation = Some(preparation.target_generation);
             request.args = if item.reason == "already_absent" {
                 let git = check_worktree_binding(artifact, &preparation)?;
                 match std::fs::symlink_metadata(&git.admin) {

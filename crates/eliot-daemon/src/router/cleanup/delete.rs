@@ -237,9 +237,17 @@ impl Router {
                     Error::new("source_integrity", "managed worktree custody is absent")
                 })?
         };
+        // The workspace row is the live custody binding: resume, restart-resume
+        // and switch advance the agent generation (and re-bind the workspace)
+        // without rolling the creation-time artifact fence forward. A fence
+        // from an older generation of the same agent and path is stale
+        // metadata, not a custody change. Refuse only when the live binding
+        // does not cover this generation either.
+        let generation_drifted = artifact.generation != agent.generation
+            && workspace.target_generation != agent.generation;
         if artifact.kind != ArtifactKind::Worktree
             || artifact.agent != agent.id
-            || artifact.generation != agent.generation
+            || generation_drifted
             || artifact.state != "registered"
         {
             return Err(Error::new("busy", "managed worktree custody changed"));
