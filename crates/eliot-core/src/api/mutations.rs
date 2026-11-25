@@ -218,6 +218,20 @@ pub struct DaemonShutdownResponse {
     pub store_write_faulted: Option<bool>,
 }
 
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DaemonRestartStatusRequest {
+    #[serde(deserialize_with = "shutdown_id")]
+    pub restart_id: String,
+}
+
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DaemonRestartStatusResponse {
+    /// The current reason to wait. A ready read is advisory; restart rechecks
+    /// admission and blockers before sealing the Store.
+    pub blocker: Option<String>,
+}
+
 pub(super) fn nullable<'de, D: serde::Deserializer<'de>, T: Deserialize<'de>>(
     deserializer: D,
 ) -> std::result::Result<Option<T>, D::Error> {

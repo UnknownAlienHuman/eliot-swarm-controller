@@ -9,8 +9,9 @@ use super::support::{
 };
 use eliot_core::api::discovery::{IdentityRequest, IdentityResponse, MethodHelpRequest};
 use eliot_core::api::{
-    AgentGetRequest, AgentGetResponse, AgentSummary, DaemonShutdownRequest, HarnessCapabilities,
-    ShutdownMode, TurnGetRequest,
+    AgentGetRequest, AgentGetResponse, AgentSummary, DaemonRestartStatusRequest,
+    DaemonRestartStatusResponse, DaemonShutdownRequest, HarnessCapabilities, ShutdownMode,
+    TurnGetRequest,
 };
 use eliot_core::{Agent, AgentState, CommandState};
 use eliot_daemon::operator::{
@@ -638,37 +639,71 @@ async fn drain_prepared(
 ) -> Result<(), Failure> {
     let mut deadline = Instant::now() + wait;
     let mut next_report = Instant::now();
+    let progress_request = DaemonRestartStatusRequest {
+        restart_id: commit
+            .restart_id
+            .clone()
+            .ok_or_else(|| Failure::new(4, "restart commit is missing its preparation id"))?,
+    };
+    let mut supports_progress = true;
     loop {
         check_same_daemon(path, old)?;
-        match call_shutdown(path, commit).await {
-            Ok(()) => return Ok(()),
-            Err(error) if error.code.as_deref() == Some("restart_busy") => {
-                if Instant::now() >= deadline {
-                    if !std::mem::take(&mut interrupt_on_deadline) {
-                        return Err(Failure::new(
-                            5,
-                            format!(
-                                "admitted work did not finish before the update deadline. {}",
-                                error.message
-                            ),
-                        ));
-                    }
-                    deadline = Instant::now() + INTERRUPT_SETTLE_WAIT;
-                    Box::pin(stop_active_turns(path, old, deadline, stopped, |_| true)).await?;
+        let blocker = if supports_progress {
+            let progress = timeout(
+                Duration::from_secs(5),
+                eliot_daemon::client_call_typed::<_, DaemonRestartStatusResponse>(
+                    path,
+                    "daemon.restart_status",
+                    &progress_request,
+                ),
+            )
+            .await
+            .map_err(|_| Failure::timeout())?;
+            match progress {
+                Ok(response) => response.blocker,
+                Err(error) if error.code == "unsupported" => {
+                    // An older daemon still needs a bound Restart attempt
+                    // to extend its lease, so pace the compatibility path.
+                    supports_progress = false;
+                    None
                 }
+                Err(error) => return Err(Failure::for_read(error)),
             }
-            Err(error) => return Err(error),
+        } else {
+            None
+        };
+        let blocker = match blocker {
+            Some(message) => message,
+            None => match call_shutdown(path, commit).await {
+                Ok(()) => return Ok(()),
+                Err(error) if error.code.as_deref() == Some("restart_busy") => error.message,
+                Err(error) => return Err(error),
+            },
+        };
+        if Instant::now() >= deadline {
+            if !std::mem::take(&mut interrupt_on_deadline) {
+                return Err(Failure::new(
+                    5,
+                    format!("admitted work did not finish before the update deadline. {blocker}"),
+                ));
+            }
+            deadline = Instant::now() + INTERRUPT_SETTLE_WAIT;
+            Box::pin(stop_active_turns(path, old, deadline, stopped, |_| true)).await?;
         }
         if Instant::now() >= next_report {
             report_restart_progress(path).await;
             next_report = Instant::now() + Duration::from_secs(5);
         }
+        let interval = if supports_progress {
+            Duration::from_millis(200)
+        } else {
+            Duration::from_secs(1)
+        };
         #[expect(
             clippy::disallowed_methods,
             reason = "The update command polls restart settlement and reports drain progress"
         )]
-        sleep(Duration::from_millis(200).min(deadline.saturating_duration_since(Instant::now())))
-            .await;
+        sleep(interval.min(deadline.saturating_duration_since(Instant::now()))).await;
     }
 }
 

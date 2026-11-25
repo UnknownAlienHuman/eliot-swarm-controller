@@ -3336,9 +3336,15 @@ retain their existing restart behavior.
 
 The previous 90-second CLI ceiling left time inside the fixed 120-second
 admission lease for interruption and settlement. The lossless preparation
-carries a wait budget of 1–1800 seconds (default 60). Bound restart attempts renew
-the short 120-second inactivity lease within an absolute ceiling of the wait
-budget plus 60 seconds. While still quiescing, expiry or confirmed cancellation releases the parked
+carries a wait budget of 1–1800 seconds (default 60). The CLI reads
+`daemon.restart_status` with the exact preparation ID until its `blocker`
+is null, then submits the restart. The read shares the seal's blocker rules
+and renews only the matching, unexpired in-memory 120-second inactivity
+lease, capped at the wait budget plus 60 seconds. It creates no durable
+submission or receipt. The restart mutation still rechecks admission and
+blockers before sealing. For an older daemon without this read, the CLI
+paces bound restart attempts to one per second while waiting; those attempts
+renew the same lease. While still quiescing, expiry or confirmed cancellation releases the parked
 rows to the old daemon and reopens admission. If unparking fails on expiry,
 the daemon reopens admission and reports the cancellation error in its log.
 A writable Store rejects the affected queued SENDs with
