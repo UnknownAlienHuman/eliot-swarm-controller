@@ -124,6 +124,7 @@ impl Router {
                     pathspec.push(companion);
                 }
             } else if let Some(paths) = &diff.turn_paths {
+                diff.truncated |= paths.len() > MAX_DIFF_TEXT_FILES;
                 pathspec.extend(paths.iter().take(MAX_DIFF_TEXT_FILES).map(String::as_str));
             }
             let (bytes, truncated) = GitProbe::new()?
