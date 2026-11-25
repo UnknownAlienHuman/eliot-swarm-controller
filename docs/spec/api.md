@@ -3220,8 +3220,9 @@ carries a wait budget of 1–1800 seconds (default 60). Bound restart attempts r
 the short 120-second inactivity lease within an absolute ceiling of the wait
 budget plus 60 seconds. While still quiescing, expiry or confirmed cancellation releases the parked
 rows to the old daemon and reopens admission. At its deadline the CLI cancels by
-default. Ctrl-C (or Ctrl-Break on Windows) cancels through the same bound
-preparation. The CLI checks the running daemon advertises `drain_seconds` in
+default. The CLI prints the preparation ID; the Owner can cancel immediately
+with `swarm daemon update --cancel PREPARE_ID` on the same data directory.
+The CLI checks the running daemon advertises `drain_seconds` in
 full method help before preparing. A daemon without the field yields
 `unsupported`.
 With `--interrupt-on-deadline` it first uses ordinary non-force Stop for
@@ -3448,6 +3449,7 @@ swarm daemon [--foreground]
 swarm daemon install [--dry-run] | uninstall [--dry-run]
 swarm daemon stop [--drain|--force]
 swarm daemon update <RELEASE> [--wait-seconds N] [--interrupt-on-deadline]
+swarm daemon update --cancel PREPARE_ID
 swarm stand up [--root PATH] [--settings FILE] [--profile NAME]... [--binary PATH] [--ttl DURATION]
 swarm stand up [--root PATH] --read-only-copy DATA_DIR [--ttl DURATION]
 swarm stand down <PATH>

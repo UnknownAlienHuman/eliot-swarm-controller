@@ -118,8 +118,9 @@ pub(crate) async fn dispatch(
         },
         CliCommand::Daemon(args) if args.interrupt_on_deadline => {
             let Some(DaemonAction::Update {
-                release,
+                release: Some(release),
                 wait_seconds,
+                ..
             }) = args.action
             else {
                 return Err(Failure::new(

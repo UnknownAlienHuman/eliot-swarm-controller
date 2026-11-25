@@ -140,6 +140,22 @@ pub(crate) async fn run(
     .await
 }
 
+pub(super) async fn cancel(
+    data_dir: &Path,
+    restart_id: String,
+    id: Option<String>,
+    json_output: bool,
+) -> Result<u8, Failure> {
+    let mut request = DaemonShutdownRequest::new(mutation_id(id)?, ShutdownMode::CancelRestart);
+    request.restart_id = Some(restart_id);
+    call_shutdown(data_dir, &request).await?;
+    print_update_value(
+        &json!({"state": "update_cancelled", "admission": "open", "restart_id": request.restart_id}),
+        json_output,
+    );
+    Ok(0)
+}
+
 pub(super) async fn run_interrupting(
     source: PathBuf,
     data_dir: PathBuf,
@@ -571,51 +587,12 @@ async fn quiesce(
     interrupt_on_deadline: bool,
     stopped: &mut Vec<StoppedAgent>,
 ) -> Result<(), Failure> {
-    let cancelled = wait_for_update_cancel();
-    let preparing = call_shutdown(path, prepare);
-    tokio::pin!(cancelled, preparing);
-    tokio::select! {
-        result = &mut preparing => result?,
-        signal = &mut cancelled => {
-            // Let the prepare request settle before cancelling its lease.
-            let _ = preparing.await;
-            return Err(update_cancel_failure(signal));
-        }
-    }
-    tokio::select! {
-        result = drain_prepared(path, old, commit, wait, interrupt_on_deadline, stopped) => result,
-        signal = &mut cancelled => Err(update_cancel_failure(signal)),
-    }
-}
-
-fn update_cancel_failure(signal: std::io::Result<()>) -> Failure {
-    match signal {
-        Ok(()) => Failure::new(130, "daemon update cancelled by console interrupt"),
-        Err(error) => Failure::new(4, format!("listen for daemon update cancellation: {error}")),
-    }
-}
-
-async fn wait_for_update_cancel() -> std::io::Result<()> {
-    #[cfg(windows)]
-    {
-        let mut ctrl_break = tokio::signal::windows::ctrl_break()?;
-        tokio::select! {
-            signal = tokio::signal::ctrl_c() => signal,
-            _ = ctrl_break.recv() => Ok(()),
-        }
-    }
-    #[cfg(not(windows))]
-    tokio::signal::ctrl_c().await
-}
-
-async fn drain_prepared(
-    path: &Path,
-    old: &DaemonInfo,
-    commit: &DaemonShutdownRequest,
-    wait: Duration,
-    mut interrupt_on_deadline: bool,
-    stopped: &mut Vec<StoppedAgent>,
-) -> Result<(), Failure> {
+    call_shutdown(path, prepare).await?;
+    eprintln!(
+        "Update drain {} . Cancel with daemon update --cancel {}",
+        prepare.id, prepare.id
+    );
+    let mut interrupt_on_deadline = interrupt_on_deadline;
     let mut deadline = Instant::now() + wait;
     let mut next_report = Instant::now();
     loop {

@@ -1299,7 +1299,11 @@ pub(crate) enum DaemonAction {
     /// Drain admitted work and start a new daemon release.
     Update {
         /// Release directory or path to the replacement Swarm executable.
-        release: PathBuf,
+        #[arg(required_unless_present = "cancel", conflicts_with = "cancel")]
+        release: Option<PathBuf>,
+        /// Reopen admission for the named update drain if it has not sealed.
+        #[arg(long, value_name = "PREPARE_ID", conflicts_with = "wait_seconds")]
+        cancel: Option<String>,
         /// Maximum seconds to let already-admitted work finish.
         #[arg(long, default_value_t = 60, value_parser = clap::value_parser!(u64).range(1..=eliot_core::api::MAX_UPDATE_DRAIN_SECS))]
         wait_seconds: u64,
