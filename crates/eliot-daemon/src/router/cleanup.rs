@@ -318,7 +318,7 @@ impl Router {
                     .find(|outcome| outcome.artifact_id == item.artifact.id)
             });
             if item.verdict == "safe" {
-                sweep.would_remove += 1;
+                sweep.planned += 1;
             }
             let (outcome, reason, bytes) = if item.verdict != "safe" {
                 ("kept", item.reason.as_str(), 0)
@@ -341,17 +341,19 @@ impl Router {
                 .or_default();
             if let Some(size) = item.bytes {
                 if item.verdict == "safe" {
-                    class.would_remove = class.would_remove.saturating_add(size);
+                    class.planned = class.planned.saturating_add(size);
                 }
-                if outcome == "kept" {
-                    class.kept = class.kept.saturating_add(size);
+                match outcome {
+                    "would_remove" => class.would_remove = class.would_remove.saturating_add(size),
+                    "kept" => class.kept = class.kept.saturating_add(size),
+                    _ => {}
                 }
             } else {
                 class.unmeasured += 1;
             }
             class.removed = class.removed.saturating_add(bytes);
             match outcome {
-                "would_remove" => {}
+                "would_remove" => sweep.would_remove += 1,
                 "removed" => sweep.removed += 1,
                 "kept" => sweep.kept += 1,
                 _ => sweep.unknown += 1,
@@ -471,6 +473,7 @@ impl Router {
         progress.summary.finished_at = page.finished_at;
         progress.summary.enabled = page.enabled;
         progress.summary.plan_only &= page.plan_only;
+        progress.summary.planned += page.planned;
         progress.summary.would_remove += page.would_remove;
         progress.summary.removed += page.removed;
         progress.summary.kept += page.kept;
@@ -503,8 +506,8 @@ impl Router {
             (false, _) => "Set automation.auto_cleanup = true to apply.",
         };
         let message = format!(
-            "{} worktrees/artifacts would be removed, {} kept. Removed {}, unknown {}. {enablement}",
-            sweep.would_remove, sweep.kept, sweep.removed, sweep.unknown
+            "{} worktrees/artifacts planned for removal. Would remove {}, removed {}, kept {}, unknown {}. {enablement}",
+            sweep.planned, sweep.would_remove, sweep.removed, sweep.kept, sweep.unknown
         );
         let id = ulid::Ulid::new().to_string();
         let mut progress = self.progress_receiver();
@@ -2136,7 +2139,7 @@ impl Router {
             (agent, store.agent_artifact_root(id, generation)?)
         };
         let inventory_issue = match root {
-            Some(root) => self.discover_terminal_cargo_children(&root).await?,
+            Some(root) => self.discover_terminal_cargo_children(&root).await,
             None => None,
         };
         let inventory = self

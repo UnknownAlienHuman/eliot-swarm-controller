@@ -195,36 +195,40 @@ impl Router {
     pub(super) async fn discover_terminal_cargo_children(
         &self,
         root: &ArtifactView,
-    ) -> Result<Option<CleanupInventoryIssue>> {
+    ) -> Option<CleanupInventoryIssue> {
         // The terminal hook is opportunistic. Periodic inventory starts its
         // own scan, with continuation, to cover anything beyond this slice.
-        if self
+        match self
             .discover_owned_cleanup_children(
                 root,
                 true,
                 None,
                 Instant::now() + CLEANUP_BACKFILL_BUDGET,
             )
-            .await?
-            .is_some()
+            .await
         {
-            crate::logging::record(
-                &self.secret_policy_snapshot(),
-                "daemon.cleanup_discovery_incomplete",
-                &[
-                    ("agent", &root.agent),
-                    ("generation", &root.generation.to_string()),
-                    ("operation", "owned_root_scan_incomplete"),
-                ],
-                None,
-            );
-            return Ok(Some(self.owned_scan_issue(
+            Ok(Some(_)) => {
+                crate::logging::record(
+                    &self.secret_policy_snapshot(),
+                    "daemon.cleanup_discovery_incomplete",
+                    &[
+                        ("agent", &root.agent),
+                        ("generation", &root.generation.to_string()),
+                        ("operation", "owned_root_scan_incomplete"),
+                    ],
+                    None,
+                );
+                Some(self.owned_scan_issue(
                 root,
                 "owned_root_scan_incomplete",
                 "Terminal cache discovery ended after one slice; periodic inventory will scan this root",
-            )));
+            ))
+            }
+            Ok(None) => None,
+            Err(error) => {
+                Some(self.owned_scan_issue(root, "owned_root_scan_failed", &error.message))
+            }
         }
-        Ok(None)
     }
 
     async fn discover_owned_cleanup_children(

@@ -360,8 +360,8 @@ pub(crate) async fn run_status(data_dir: PathBuf, json_output: bool) -> Result<u
         {
             for (class, bytes) in &sweep.bytes_by_class {
                 println!(
-                    "  {class} | would remove {} bytes, removed {} bytes, kept {} bytes, {} unmeasured",
-                    bytes.would_remove, bytes.removed, bytes.kept, bytes.unmeasured,
+                    "  {class} | planned {} bytes, would remove {} bytes, removed {} bytes, kept {} bytes, {} unmeasured",
+                    bytes.planned, bytes.would_remove, bytes.removed, bytes.kept, bytes.unmeasured,
                 );
             }
         }
