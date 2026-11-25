@@ -1450,7 +1450,7 @@ fn prepare_update_release(source: &Path) -> Result<(PathBuf, String), Failure> {
         if needs_stage {
             let mut input = std::fs::File::open(source)
                 .map_err(|error| Failure::new(2, format!("open selected release: {error}")))?;
-            let output = std::fs::OpenOptions::new()
+            let mut output = std::fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)
                 .open(&artifact)
@@ -1462,7 +1462,7 @@ fn prepare_update_release(source: &Path) -> Result<(PathBuf, String), Failure> {
                     }
                 })?;
             created_by_attempt = true;
-            std::io::copy(&mut input, &output)
+            std::io::copy(&mut input, &mut output)
                 .and_then(|_| output.sync_all())
                 .map_err(|error| {
                     Failure::new(2, format!("stage versioned release image: {error}"))
