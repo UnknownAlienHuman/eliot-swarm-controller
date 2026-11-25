@@ -1779,7 +1779,9 @@ impl WorkspaceManager {
                         })?;
                     if preparation.outcome.as_ref().is_some_and(|outcome| {
                         outcome["result"]["code"] == "identity_changed"
-                            || eliot_store::Store::is_legacy_missing_branch_removal(outcome, id)
+                            // The existing paced reconciliation records the
+                            // no-write proof with the original command.
+                            || eliot_store::Store::is_no_write_unknown_removal(outcome, id)
                     }) {
                         return Ok(None);
                     }
