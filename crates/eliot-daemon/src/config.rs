@@ -2917,6 +2917,42 @@ pub(crate) fn profile_names_for_harness(data_root: &Path, harness: &str) -> Vec<
     names
 }
 
+/// Find a named review profile in one configuration revision. An explicit
+/// profile is a pin. A role preserves its configured candidate order.
+pub(crate) fn select_review_profile(
+    data_root: &Path,
+    pinned: Option<&str>,
+    role: Option<&str>,
+    approved: Option<&[String]>,
+    eligible: impl Fn(&str, &Value) -> bool,
+) -> core::Result<Option<String>> {
+    let Some((config, source)) = read_config(data_root)? else {
+        return Ok(None);
+    };
+    let candidates: Vec<&str> = if let Some(name) = pinned {
+        vec![name]
+    } else if let Some(role) = role {
+        config
+            .routing
+            .candidates(role)
+            .unwrap_or_default()
+            .iter()
+            .map(String::as_str)
+            .collect()
+    } else {
+        let mut names: Vec<_> = config.profiles.keys().map(String::as_str).collect();
+        names.sort_unstable();
+        names
+    };
+    Ok(candidates.into_iter().find_map(|name| {
+        if approved.is_some_and(|profiles| !profiles.iter().any(|approved| approved == name)) {
+            return None;
+        }
+        let snapshot = resolve_profile_in(&config, &source, name).ok()?;
+        eligible(name, &snapshot).then(|| name.to_owned())
+    }))
+}
+
 fn bind_route_and_capacity(
     profile_name: &str,
     entry: &ProfileEntry,

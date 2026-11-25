@@ -1,9 +1,11 @@
-use super::Router;
+use super::{PreparedSubmission, Router};
 use crate::git_monitor::GitProbe;
 use eliot_core::{
     Command, Error, Event, InjectArgs, InjectPoint, Result, ReviewWorktreeState, SubmitCommand,
     TrustedReviewLabels,
+    api::{ProjectRegistrationView, catalog_provider},
 };
+use serde_json::Value;
 
 pub(crate) const RULE_WORKTREE_GUARD_ARG: &str = "_rule_worktree_guard";
 
@@ -11,7 +13,96 @@ fn event_worktree_fingerprint(event: &Event) -> Option<&str> {
     event.data.pointer("/worktree/fingerprint")?.as_str()
 }
 
+struct ReviewModel {
+    provider: String,
+    family: String,
+}
+
+impl ReviewModel {
+    fn new(harness: &str, model: &str) -> Option<Self> {
+        let leaf = model.rsplit('/').next()?;
+        let stem = leaf
+            .split(['-', '_', ':', '@'])
+            .next()?
+            .rsplit('.')
+            .next()?;
+        let family = stem
+            .trim_end_matches(|ch: char| ch.is_ascii_digit())
+            .to_ascii_lowercase();
+        if family.is_empty() || matches!(family.as_str(), "auto" | "default") {
+            return None;
+        }
+        Some(Self {
+            provider: catalog_provider(harness, model).to_ascii_lowercase(),
+            family,
+        })
+    }
+
+    fn independent(&self, snapshot: &Value) -> bool {
+        snapshot["harness"]
+            .as_str()
+            .zip(snapshot["model"].as_str())
+            .and_then(|(harness, model)| Self::new(harness, model))
+            .is_some_and(|model| model.provider != self.provider && model.family != self.family)
+    }
+}
+
 impl Router {
+    pub(crate) async fn prepare_independent_review(
+        &self,
+        mut action: SubmitCommand,
+        project: Option<&ProjectRegistrationView>,
+        event: &Event,
+    ) -> Result<PreparedSubmission> {
+        let Some(subject) = event.subject.as_ref() else {
+            return Err(Error::new("bad_state", "review has no exact author turn"));
+        };
+        let author = self
+            .inner
+            .store
+            .lock()
+            .await
+            .review_author_model(event)?
+            .and_then(|model| ReviewModel::new(&subject.harness, &model))
+            .ok_or_else(|| Error::new("bad_state", "review author model is not retained"))?;
+        let name = crate::config::select_review_profile(
+            &self.inner.data_root,
+            action.args["profile"].as_str(),
+            action.args["role"].as_str(),
+            project.map(|project| project.profiles.as_slice()),
+            |name, snapshot| {
+                name != subject.profile
+                    && snapshot["setup"].as_array().is_none_or(Vec::is_empty)
+                    && author.independent(snapshot)
+            },
+        )?
+        .ok_or_else(|| {
+            Error::new(
+                "routing_unavailable",
+                "review requires an approved profile from a different provider and model family",
+            )
+        })?;
+        let args = action.args.as_object_mut().expect("rendered launch args");
+        args.remove("role");
+        args.insert("profile".to_owned(), Value::String(name));
+        let prepared = match project {
+            Some(project) => {
+                self.prepare_project_rule_submission(action, project)
+                    .await?
+            }
+            None => self.prepare_owner_submission(action).await?,
+        };
+        // Settings may change during launch preparation. Check what the
+        // ordinary admission path actually froze, including the model.
+        if !author.independent(&prepared.request.args["profile_snapshot"]) {
+            return Err(Error::new(
+                "routing_unavailable",
+                "frozen reviewer profile no longer has an independent provider and model family",
+            ));
+        }
+        Ok(prepared)
+    }
+
     pub(super) async fn check_rule_worktree_guard(&self, command: &Command) -> Result<()> {
         if command.verb != "launch" || command.args.get(RULE_WORKTREE_GUARD_ARG).is_none() {
             return Ok(());

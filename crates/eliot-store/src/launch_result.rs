@@ -2,6 +2,61 @@ use super::*;
 use eliot_core::api::ProjectManagerIdentity;
 
 impl Store {
+    /// The author model for the exact successful turn, from its native model
+    /// evidence or its retained effective model. Some adapters learn the model
+    /// only from assistant messages after the turn starts.
+    pub fn review_author_model(&self, event: &Event) -> Result<Option<String>> {
+        self.ensure_committed_reads()?;
+        let (Some(agent), Some(generation), Some(turn)) = (
+            event.agent.as_deref(),
+            event.generation,
+            event.data["turn_id"].as_str(),
+        ) else {
+            return Ok(None);
+        };
+        let completed = match event.kind.as_str() {
+            "turn.completed" => event.seq,
+            "project.worktree.check.passed" => {
+                let Some(seq) = event.data["completion_seq"].as_i64() else {
+                    return Ok(None);
+                };
+                seq
+            }
+            _ => return Ok(None),
+        };
+        if completed <= 0 || completed > event.seq {
+            return Ok(None);
+        }
+        self.connection
+            .prepare_cached(
+                "SELECT COALESCE((
+                     SELECT json_extract(recent.data, '$.model')
+                     FROM (
+                         SELECT seq, kind, source, data FROM events INDEXED BY owner_inbox_turn_events
+                         WHERE agent=?1 AND generation=?2 AND seq<?4
+                           AND json_type(data, '$.turn_id')='text'
+                           AND CAST(json_extract(data, '$.turn_id') AS TEXT)=?3
+                         ORDER BY seq DESC LIMIT 512
+                     ) recent
+                     WHERE recent.kind IN ('turn.model_observed', 'message.completed')
+                       AND recent.source<>'daemon'
+                       AND json_type(recent.data, '$.model')='text'
+                       AND json_extract(recent.data, '$.model_output') IS NOT 0
+                     ORDER BY recent.seq DESC LIMIT 1
+                 ), t.effective_model)
+                 FROM turns t
+                 WHERE t.agent=?1 AND t.generation=?2 AND t.turn_id=?3 AND t.outcome='success'",
+            )
+            .map_err(sql_error)?
+            .query_row(
+                params![parse_agent_id(agent)?, generation, turn, completed],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()
+            .map(Option::flatten)
+            .map_err(sql_error)
+    }
+
     pub fn pending_project_check_obligations(&self, after: i64, limit: i64) -> Result<Vec<Event>> {
         let mut statement = self.connection.prepare(
             "SELECT e.seq,e.ts,e.kind,e.agent,e.generation,e.source,e.native_id,e.data,e.subject,e.cause

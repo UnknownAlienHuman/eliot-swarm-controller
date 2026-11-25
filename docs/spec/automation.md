@@ -617,17 +617,17 @@ out of rule settings, argv, watch state and event payloads.
 
 ### Worktree review recipe
 
-Run `swarm rule install-review --project ID --author PROFILE --reviewer PROFILE --workspace PATH`
+Run `swarm rule install-review --project ID --author PROFILE --workspace PATH`
 to install [review-after-turn.toml](../../config/recipes/review-after-turn.toml)
 through the existing rule save API. To replace an existing file, supply its
 `--expected-revision` from `swarm rule read`. Approve launch, initial send and
-inject in the project registration. Use a distinct reviewer profile with native
-read-only permissions. The installer requires all three setup tokens to resolve
-before it saves the rule. The Owner explicitly installs the recipe because it
-launches a reviewer and delivers its result.
+inject in the project registration. Approve reviewer profiles with native read-only
+permissions. The Owner explicitly installs the recipe because it launches a reviewer
+and delivers its result.
 An assigned project reserves launches for its current team. To review from a separate
 checkout in that case, install an Owner rule, constrain the author's project in the
-trigger, and give the reviewer an unassigned checkout.
+trigger, and give the reviewer an unassigned checkout. Project-installed review
+launches inherit that project's policy. An Owner rule can specify `no_policy`.
 
 The launch rule matches a passed project check for the author turn, selects the
 recorded change size, and admits at most one review per fingerprint, up to two per
@@ -648,6 +648,18 @@ read failure leaves the obligation pending.
 and fingerprint before live admission and dispatch. This launch form requires live
 event processing. The binding is to the observed tree
 at those points. A reviewer reads the author's worktree, which can change during review.
+
+For launches with `include_patch_digest = true`, Swarm reads the latest native
+model observation, or the retained effective model, for the exact successful
+author turn and selects the first eligible named
+profile in lexical order. Project rules select only from the current registration's
+approved profiles. A `role` restricts selection to its ordered candidates. An
+explicit `profile` (the installer's optional `--reviewer`) pins a single candidate.
+The reviewer must differ in catalogue provider and model family, based on the
+case-insensitive model name stem. Profiles with setup or without a concrete model
+are skipped. The normal launch path freezes the profile and rechecks independence
+before admission. Missing author evidence or no eligible reviewer records a
+refusal without launching a reviewer.
 
 The recipe sets `include_patch_digest = true`. The daemon builds the existing
 `agent.patch_digest` summary under the rule's Owner or project authority, using the

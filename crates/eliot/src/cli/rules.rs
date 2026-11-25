@@ -437,7 +437,11 @@ pub(crate) async fn run_rule(
             workspace,
             expected_revision,
         } => {
-            if author.trim().is_empty() || reviewer.trim().is_empty() || author == reviewer {
+            if author.trim().is_empty()
+                || reviewer.as_deref().is_some_and(|profile| {
+                    profile.trim().is_empty() || profile == author || profile.contains("{{")
+                })
+            {
                 return Err(Failure::new(
                     2,
                     "review requires distinct author and reviewer profiles",
@@ -447,10 +451,12 @@ pub(crate) async fn run_rule(
                 return Err(Failure::new(2, "review workspace must be an absolute path"));
             }
             let template = include_str!("../../../../config/recipes/review-after-turn.toml");
-            let mut content = template.to_owned();
+            let profile_line = reviewer.map_or_else(String::new, |profile| {
+                format!("profile = {}", json!(profile))
+            });
+            let mut content = template.replace("{{REVIEW_PROFILE_LINE}}", &profile_line);
             for (token, value) in [
                 ("\"{{REVIEW_AUTHOR}}\"", &author),
-                ("\"{{REVIEW_REVIEWER}}\"", &reviewer),
                 ("\"{{REVIEW_WORKSPACE}}\"", &workspace),
             ] {
                 if !template.contains(token) || value.contains("{{") {
