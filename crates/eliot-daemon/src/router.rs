@@ -1881,11 +1881,8 @@ impl Router {
         } else {
             let mut store = self.inner.store.lock().await;
             let principal = principal_name(principal);
-            // Admission and restart preparation share this writer. The lease
-            // selected here cannot change before the command and marker commit.
-            let restart_id = self.restart_send_preparation(&submission.request().verb);
             let context = SubmissionContext {
-                restart_send: restart_id.as_deref(),
+                direct_command_rpc: true,
                 ..context
             };
             let submitted =
@@ -1964,13 +1961,28 @@ impl Router {
             return Ok(admission);
         }
         owner_inbox::check_binding(store)?;
-        if context.restart_send.is_none() {
+        // The direct RPC exemption must survive asynchronous preparation.
+        // The writer keeps the selected lease fixed through admission.
+        let restart_id = context
+            .direct_command_rpc
+            .then(|| self.restart_send_preparation(&request.verb))
+            .flatten();
+        if restart_id.is_none() {
             self.check_command_admission_mode(&request.verb)?;
         }
         if request.verb == "answer" {
             validate_answer_request(store, request)?;
         }
-        store.submit_with_context(principal, submission, workspace, context, now_ms())
+        store.submit_with_context(
+            principal,
+            submission,
+            workspace,
+            SubmissionContext {
+                restart_send: restart_id.as_deref(),
+                ..context
+            },
+            now_ms(),
+        )
     }
 
     fn check_command_admission_mode(&self, verb: &str) -> Result<()> {

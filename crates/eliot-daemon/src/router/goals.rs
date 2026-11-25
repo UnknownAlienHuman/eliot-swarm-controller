@@ -38,8 +38,8 @@ use eliot_core::{
 };
 use eliot_plugin::sync::LockExt;
 use eliot_store::{
-    GoalCheckDeadlineTarget, GoalCheckHistoryEntry, GoalCheckResult, GoalContinuation,
-    GoalRoundClaim, GoalRoundCommit, GoalRoundDecision, GoalRoundKey,
+    GoalCheckCustody, GoalCheckDeadlineTarget, GoalCheckHistoryEntry, GoalCheckResult,
+    GoalContinuation, GoalRoundClaim, GoalRoundCommit, GoalRoundDecision, GoalRoundKey,
 };
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
@@ -89,7 +89,7 @@ struct ClaimedGoalRound {
     check: Option<Pin<Box<dyn Future<Output = ProcessOutcome> + Send>>>,
     check_timeout_ms: Option<i64>,
     retry_timeout_ms: Option<i64>,
-    quiescent: bool,
+    check_custody: GoalCheckCustody,
     pending_decision: Option<GoalRoundCommit>,
     workspace_permit: Option<tokio::sync::OwnedMutexGuard<()>>,
     /// An explicit round is outside the driver's follow-up tracking, so its
@@ -132,6 +132,7 @@ impl ClaimedGoalRound {
             expected_revision: probe.view.revision,
             round_key: key,
             claim_seq,
+            check_custody: self.check_custody,
             check: None,
             check_history: None,
             check_timeout_ms: self.check_timeout_ms,
@@ -161,7 +162,7 @@ impl Drop for ClaimedGoalRound {
         let principal = self.principal.clone();
         let request = self.request.clone();
         let mut error = self.error.clone();
-        let mut quiescent = self.quiescent;
+        let mut check_custody = self.check_custody;
         let check_timeout_ms = self.check_timeout_ms;
         let retry_timeout_ms = self.retry_timeout_ms;
         self.cancellation.send_replace(true);
@@ -182,8 +183,8 @@ impl Drop for ClaimedGoalRound {
                 // Await this exact invocation, never reconstruct or replay it.
                 // run_owned_process retains and drains its existing supervisor.
                 let outcome = check.await;
-                quiescent = goal_check_quiescent(&outcome);
-                if !quiescent {
+                check_custody = goal_check_custody(&outcome);
+                if !check_custody.is_quiescent() {
                     let policy = router.secret_policy_snapshot();
                     error = match goal_check_result(outcome, &policy) {
                         Err(error) => error,
@@ -205,7 +206,7 @@ impl Drop for ClaimedGoalRound {
                     &principal,
                     &request,
                     &error,
-                    quiescent,
+                    check_custody,
                     check_timeout_ms,
                     retry_timeout_ms,
                 )
@@ -690,7 +691,7 @@ impl Router {
             check: None,
             check_timeout_ms: None,
             retry_timeout_ms: None,
-            quiescent: true,
+            check_custody: GoalCheckCustody::Exact,
             pending_decision: None,
             workspace_permit,
             wake_driver,
@@ -790,7 +791,7 @@ impl Router {
                     } else {
                         claimed.check_timeout_ms = Some(attempt_timeout_ms);
                     }
-                    claimed.quiescent = false;
+                    claimed.check_custody = GoalCheckCustody::Unconfirmed;
                     let started = Instant::now();
                     let check = claimed.check.insert(run_check(
                         command,
@@ -813,11 +814,11 @@ impl Router {
             };
             // Each attempt settles through the same owned-process supervisor.
             // The timeout retry stays inside this claimed Goal round.
-            claimed.quiescent = goal_check_quiescent(&outcome);
+            claimed.check_custody = goal_check_custody(&outcome);
             claimed.check = None;
             if !timeout_retry_attempted
                 && retry_safe
-                && claimed.quiescent
+                && claimed.check_custody.is_quiescent()
                 && !*cancellation.borrow()
                 && goal_timeout_retry_closed(&outcome)
             {
@@ -830,7 +831,7 @@ impl Router {
         let check = match goal_check_result(outcome, &policy) {
             Ok(check) => check,
             Err(error)
-                if claimed.quiescent
+                if claimed.check_custody.is_quiescent()
                     && matches!(
                         error.code.as_str(),
                         "check_unrunnable"
@@ -858,7 +859,7 @@ impl Router {
                         &principal,
                         &request,
                         &error,
-                        claimed.quiescent,
+                        claimed.check_custody,
                         claimed.check_timeout_ms,
                         claimed.retry_timeout_ms,
                     )
@@ -886,6 +887,7 @@ impl Router {
                 expected_revision: probe.view.revision,
                 round_key: key,
                 claim_seq,
+                check_custody: claimed.check_custody,
                 check: Some(check),
                 check_history: None,
                 check_timeout_ms: claimed.check_timeout_ms,
@@ -1004,6 +1006,7 @@ impl Router {
             expected_revision: probe.view.revision,
             round_key: key,
             claim_seq,
+            check_custody: claimed.check_custody,
             check: Some(check),
             check_history,
             check_timeout_ms: claimed.check_timeout_ms,
@@ -1078,30 +1081,20 @@ impl Router {
         principal: &str,
         request: &GoalRoundRequest,
         error: &Error,
-        quiescent: bool,
+        check_custody: GoalCheckCustody,
         check_timeout_ms: Option<i64>,
         retry_timeout_ms: Option<i64>,
     ) -> Error {
         let mut store = self.inner.store.lock().await;
-        let retained = if quiescent {
-            store.goal_abandon_round(
-                principal,
-                request,
-                error,
-                check_timeout_ms,
-                retry_timeout_ms,
-                now_ms(),
-            )
-        } else {
-            store.goal_hold_round_error(
-                principal,
-                request,
-                error,
-                check_timeout_ms,
-                retry_timeout_ms,
-                now_ms(),
-            )
-        };
+        let retained = store.goal_finish_round_error(
+            principal,
+            request,
+            error,
+            check_timeout_ms,
+            retry_timeout_ms,
+            now_ms(),
+            check_custody,
+        );
         match retained {
             Ok(retained) => {
                 self.publish_locked(&retained.events);
@@ -1139,13 +1132,14 @@ impl Router {
             let result = match store.goal_commit_round(commit, now_ms()) {
                 Ok(result) => result,
                 Err(error) => {
-                    match store.goal_abandon_round(
+                    match store.goal_finish_round_error(
                         principal,
                         request,
                         &error,
                         commit.check_timeout_ms,
                         commit.retry_timeout_ms,
                         now_ms(),
+                        commit.check_custody,
                     ) {
                         Ok(retained) => {
                             self.publish_locked(&retained.events);
@@ -2070,16 +2064,27 @@ async fn drain_pending_reconcile(
     }
 }
 
-/// Completed/Failed captures are returned only after cleanup (or before spawn).
-/// Unknown explicitly carries whether family quiescence was established.
-fn goal_check_quiescent(outcome: &ProcessOutcome) -> bool {
-    !matches!(
-        outcome,
-        ProcessOutcome::Unknown {
-            quiescent: false,
+/// Known process-group drainage releases the current round. Only a capture
+/// that proves exact family exit can also satisfy historical restart custody.
+fn goal_check_custody(outcome: &ProcessOutcome) -> GoalCheckCustody {
+    match outcome {
+        ProcessOutcome::NotSpawned(_)
+        | ProcessOutcome::ProgramUnrunnable(_)
+        | ProcessOutcome::Failed {
+            reason: ProcessFailure::InvalidTimeout | ProcessFailure::InputLimit,
+            capture: None,
+        } => GoalCheckCustody::Exact,
+        #[cfg(windows)]
+        ProcessOutcome::Completed(capture)
+        | ProcessOutcome::Failed {
+            capture: Some(capture),
             ..
-        }
-    )
+        } if capture.custody == crate::platform::CustodyGuarantee::Exact => GoalCheckCustody::Exact,
+        ProcessOutcome::Unknown {
+            quiescent: false, ..
+        } => GoalCheckCustody::Unconfirmed,
+        _ => GoalCheckCustody::Quiescent,
+    }
 }
 
 /// A timeout can authorize one retry only after the owned runner returned a

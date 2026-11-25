@@ -113,6 +113,13 @@ fn restart_resume_eligibility() -> String {
                OR (g.state = 'unknown' AND NOT (
                    ({clean_idle_session}) IS TRUE
                    AND g.generation < a.generation AND g.custody_closed = 1
+                   AND EXISTS (
+                       SELECT 1 FROM events old_exit INDEXED BY events_generation_custody
+                       WHERE old_exit.agent = g.agent AND old_exit.generation = g.generation
+                         AND old_exit.kind = 'capacity.released' AND old_exit.ts >= g.updated_at
+                         AND json_extract(old_exit.data, '$.custody') = 'exact'
+                         AND json_extract(old_exit.data, '$.orphan_possible') = 0
+                   )
                )))
     )
 "#,
