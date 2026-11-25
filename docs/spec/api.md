@@ -1434,11 +1434,15 @@ the pending page. The queue reports the wait code, scope and actor who can
 change that scope. `project.overview` reports live harnesses, active turns, queued
 work and retained unknown reservations as distinct counts.
 
-A direct `launch` either admits immediately or returns `capacity_unavailable`
-before creating a command, Agent or event. Fairness covers scheduled assignments
-and explicit interactive intents admitted by the arbiter. A direct Owner launch may
-use `--owner-override` to mark the command and its admission event as outside that
-fair ordering. It still checks all admission limits.
+An ordinary direct `launch` joins the same project arbitration pass as
+scheduled assignments and explicit interactive intents. It waits for an admission
+decision under its original command ID. A direct request denied by capacity or
+by earlier retained work in its project returns `capacity_unavailable` before
+creating a launch command, Agent, or reservation. Use `--queue` for an intent
+that must survive a refusal to admit immediately or a daemon restart. A lost
+direct reply requires a retry with the same ID. An Owner can explicitly use
+`--owner-override` to bypass fair ordering while still checking every
+admission limit.
 
 A manager uses `swarm project budget PROJECT --revision REV` with `--max-live`,
 `--priority`, `--pause` or `--resume` to apply an Owner-granted change to its current

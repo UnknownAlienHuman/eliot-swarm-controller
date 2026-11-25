@@ -854,8 +854,11 @@ Managed project automation uses the existing timer, routing and command path.
 Project-owned rules keep their registered policy. Manager-directed work must
 carry the current [assignment](coordination.md#project-manager-assignment) binding
 through admission and dispatch, including queued launch. An epoch change does not
-rewrite pending work or replay an uncertain effect. Project capacity and fair
-selection extend this same path when those increments are implemented.
+rewrite pending work or replay an uncertain effect. The timer arbiter visits one
+launch head per project per pass across assignments, queued intents, and ordinary
+direct requests. It retains the project rotation cursor with each admission and
+checks overlapping reservation scopes in the same transaction. A capacity release
+wakes the same arbiter.
 
 ### Resume a retained Agent
 

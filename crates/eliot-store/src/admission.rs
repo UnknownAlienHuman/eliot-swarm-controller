@@ -72,6 +72,9 @@ pub(super) fn command_payload_digest(request: &SubmitCommand) -> Result<Vec<u8>>
             .ok_or_else(|| Error::new("invalid", "launch args must be an object"))?;
         args.remove("instruction_sources");
         args.remove(LAUNCH_SOURCE_RULES_ARG);
+        if args.get("admission_mode").and_then(Value::as_str) == Some("arbitrated_direct") {
+            args.remove("admission_mode");
+        }
     }
     if request.verb == "launch"
         && semantic_args
@@ -1213,8 +1216,10 @@ fn admit_launch_tx(
     let mut accepted_data = json!({"command_id": request.id, "verb": "launch"});
     if request.args["owner_override"] == true && principal == "owner" {
         accepted_data["admission_mode"] = json!("owner_override");
-    } else if request.args["admission_mode"] == "arbitrated" {
-        accepted_data["admission_mode"] = json!("arbitrated");
+    } else if let Some(mode @ ("arbitrated" | "arbitrated_direct")) =
+        request.args["admission_mode"].as_str()
+    {
+        accepted_data["admission_mode"] = json!(mode);
     }
     if let Some(choice) = request.args.get("profile_choice") {
         accepted_data["profile_choice"] = choice.clone();
