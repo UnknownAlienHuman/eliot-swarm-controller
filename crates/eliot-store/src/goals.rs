@@ -1645,13 +1645,7 @@ impl Store {
     /// Resume can open a new generation before another task turn runs.
     /// Until then, the last turn on this Agent is still the completion evidence.
     fn goal_last_task_turn_unsuccessful(&self, goal: &GoalRow) -> Result<bool> {
-        let latest: Option<(
-            String,
-            Option<String>,
-            Option<String>,
-            Option<String>,
-            String,
-        )> = self
+        let latest = self
             .connection
             .query_row(
                 "SELECT t.state, t.status, t.outcome, t.resolution_source, a.harness
@@ -1663,11 +1657,11 @@ impl Store {
                 params![goal.agent_num, goal.generation],
                 |row| {
                     Ok((
-                        row.get(0)?,
-                        row.get(1)?,
-                        row.get(2)?,
-                        row.get(3)?,
-                        row.get(4)?,
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, String>(4)?,
                     ))
                 },
             )
