@@ -158,13 +158,11 @@ fn admitted_selector<'a>(names: &'a [Value], selector: &str) -> Option<&'a str> 
         .find(|name| env_name_matches(name, selector))
 }
 
-/// The identity binds admitted selector states and the default home inputs.
-/// The serialized inputs exist only during hashing. Credential values never
-/// enter the digest; presence binds the provider mode.
-pub(crate) fn native_route_identity(
+/// Credential values never enter route evidence. Only presence binds the mode.
+pub(crate) fn native_route_selectors(
     profile: &Value,
     mut lookup: impl FnMut(&str) -> core::Result<Option<String>>,
-) -> core::Result<String> {
+) -> core::Result<JsonMap<String, Value>> {
     let names = profile
         .get("pass_env")
         .and_then(Value::as_array)
@@ -191,9 +189,45 @@ pub(crate) fn native_route_identity(
             selectors.insert(selector.to_owned(), value.unwrap_or(Value::Null));
         }
     }
-    let digest = core::canonical_json_sha256(&Value::Object(selectors))
+    Ok(selectors)
+}
+
+pub(crate) fn native_route_identity(selectors: JsonMap<String, Value>) -> core::Result<String> {
+    route_digest(&Value::Object(selectors))
+}
+
+fn route_digest(value: &Value) -> core::Result<String> {
+    let digest = core::canonical_json_sha256(value)
         .map_err(|_| core::Error::new("internal", "native route identity could not be encoded"))?;
     Ok(digest.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
+pub(crate) fn native_route_fingerprints(
+    selectors: &JsonMap<String, Value>,
+) -> core::Result<JsonMap<String, Value>> {
+    selectors
+        .iter()
+        .map(|(name, value)| {
+            let safe = match value {
+                Value::Null => "unset".to_owned(),
+                Value::Bool(false) => "empty".to_owned(),
+                Value::Bool(true) => "present".to_owned(),
+                Value::String(text) if text.is_empty() => "empty".to_owned(),
+                _ => format!("sha256:{}", route_digest(value)?),
+            };
+            Ok((name.clone(), Value::String(safe)))
+        })
+        .collect()
+}
+
+/// Only absolute local paths, empty inputs and captured absence can be restored.
+/// Explicit private provider selectors remain verified live, never serialized.
+pub(crate) fn is_native_route_home_value(value: &Value) -> bool {
+    value.is_null()
+        || value.as_str().is_some_and(|text| {
+            text.is_empty()
+                || (Path::new(text).is_absolute() && !text.chars().any(char::is_control))
+        })
 }
 
 pub(crate) fn metadata_route_scope_known(
@@ -395,7 +429,7 @@ pub(crate) fn capture_native_store_inputs(
         snapshot["stand_native_store"] = Value::Bool(true);
     }
     if snapshot.get("harness").and_then(Value::as_str).is_some() {
-        let identity = native_route_identity(&snapshot, |name| {
+        let selectors = native_route_selectors(&snapshot, |name| {
             if let Some(selector) = native_store_selector(name)
                 && CODEX_STORE_SELECTORS.contains(&selector)
             {
@@ -411,7 +445,17 @@ pub(crate) fn capture_native_store_inputs(
                 })
                 .transpose()
         })?;
-        snapshot["native_route_identity"] = Value::String(identity);
+        let home = ROUTE_HOME_SELECTORS
+            .iter()
+            .filter_map(|name| {
+                let value = selectors.get(*name)?;
+                is_native_route_home_value(value).then(|| ((*name).to_owned(), value.clone()))
+            })
+            .collect();
+        snapshot["native_route_home"] = Value::Object(home);
+        snapshot["native_route_fingerprints"] =
+            Value::Object(native_route_fingerprints(&selectors)?);
+        snapshot["native_route_identity"] = Value::String(native_route_identity(selectors)?);
     }
     if policy.contains_value(&snapshot) {
         return Err(core::Error::new(

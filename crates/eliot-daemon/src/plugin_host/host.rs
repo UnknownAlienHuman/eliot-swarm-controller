@@ -3830,20 +3830,75 @@ fn prepare_process_environment(
         }
     }
 
+    if let Some(home) = profile.get("native_route_home") {
+        let home = home.as_object().ok_or_else(|| {
+            Error::new("invalid", "frozen native route home inputs are malformed")
+        })?;
+        for (name, value) in home {
+            if !crate::config::ROUTE_HOME_SELECTORS.contains(&name.as_str())
+                || !crate::config::is_native_route_home_value(value)
+            {
+                return Err(Error::new(
+                    "invalid",
+                    "frozen native route home inputs are malformed",
+                ));
+            }
+            if let Some(value) = value.as_str() {
+                insert_environment(&mut environment, name, value.to_owned());
+            } else {
+                environment.remove(name);
+            }
+        }
+    }
+
     let identity = match profile.get("native_route_identity") {
         None => None,
         Some(frozen) => {
-            let current = crate::config::native_route_identity(profile, |name| {
+            let selectors = crate::config::native_route_selectors(profile, |name| {
                 Ok(environment.iter().find_map(|(key, value)| {
                     (key == name || (cfg!(windows) && key.eq_ignore_ascii_case(name)))
                         .then(|| value.as_str().map(str::to_owned))
                         .flatten()
                 }))
             })?;
+            let current = crate::config::native_route_identity(selectors.clone())?;
             if frozen.as_str() != Some(current.as_str()) {
+                let prior = frozen
+                    .as_str()
+                    .filter(|value| {
+                        value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+                    })
+                    .unwrap_or("invalid");
+                let changed =
+                    if let Some(expected) = profile["native_route_fingerprints"].as_object() {
+                        let observed = crate::config::native_route_fingerprints(&selectors)?;
+                        // Only keys derived from the known selector set and valid
+                        // fingerprints can be displayed from persisted evidence.
+                        observed
+                            .iter()
+                            .filter_map(|(name, new)| {
+                                let old = expected.get(name)?.as_str()?;
+                                let new = new.as_str()?;
+                                (old != new
+                                    && (matches!(old, "unset" | "empty" | "present")
+                                        || old.strip_prefix("sha256:").is_some_and(|hash| {
+                                            hash.len() == 64
+                                                && hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+                                        })))
+                                .then(|| format!("{name} {old} -> {new}"))
+                            })
+                            .collect::<Vec<_>>()
+                    } else {
+                        Vec::new()
+                    };
+                let change = if changed.is_empty() {
+                    format!("native_route_identity {prior} -> {current}")
+                } else {
+                    changed.join(", ")
+                };
                 return Err(Error::new(
-                    "unavailable",
-                    "frozen native route could not be verified in the private environment",
+                    "profile_error",
+                    format!("frozen native route changed: {change}"),
                 ));
             }
             Some(current)

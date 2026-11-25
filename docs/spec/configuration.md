@@ -1305,12 +1305,18 @@ requires the retained effective `native_store_binding` and verifies it before na
 control. Capture proves only the supplied inputs, not the effective native home,
 database root or scope; native configuration can affect selection.
 
-Claude and XDG store selectors and private provider selectors are retained
-only in the opaque `native_route_identity`. The daemon verifies admitted
-selector states against the private process environment before using a
-captured route. Legacy snapshots lack that verification and bypass native
-read caches. Codex retains its existing execution inputs in
-`pass_env_values`. Public catalog scope omits store paths.
+Claude and XDG store selectors and private provider selectors bind to the
+opaque `native_route_identity`. New snapshots also retain per-selector
+fingerprints and the admitted default home paths (`HOME`, and on Windows
+`USERPROFILE` and `LOCALAPPDATA`), including captured absence. These paths
+belong to the native process environment and are restored from the snapshot
+when the controller executable or its startup environment changes. Admitted
+live selectors must still match. Refusals name the changed selectors and
+their safe states or fingerprints. Older snapshots with only an opaque
+identity still require an exact match and report both aggregate fingerprints
+on mismatch. Snapshots without an identity bypass native read caches. Codex
+retains its existing execution inputs in `pass_env_values`. Public catalog
+scope omits store paths and fingerprints.
 
 For a new Codex launch, resolve the effective store only after the actual workspace is
 prepared, including setup. The owned read-only
@@ -1339,7 +1345,8 @@ Agents without a binding refuse before control rather than selecting a store ane
 ProfileSnapshot {
   profile_name, harness, plugin,
   model?, effort?, permissions, control, args, mcp, mcp_allow,
-  literal_env, pass_env_values, native_route_identity?, secret_env_names, inherit_env,
+  literal_env, pass_env_values, native_route_identity?, native_route_home?,
+  native_route_fingerprints?, secret_env_names, inherit_env,
   account?, proxy?, billing?, workspace_mode, git_identity,
   route_binding?, capacity_scopes[], labels, stall_after, notify_parent, wake_on_mail,
   system_note?, setup[], scratch, source_files
