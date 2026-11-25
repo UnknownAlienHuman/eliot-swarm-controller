@@ -4513,11 +4513,10 @@ impl Router {
             registration
         };
         let mut registrations = [registration];
-        self.inner.monitoring.project_readbacks(
-            &mut registrations,
-            true,
-            request.include_git_state,
-        );
+        self.inner
+            .monitoring
+            .project_readbacks(&mut registrations, true, request.include_git_state)
+            .await;
         display_project_registration(&mut registrations[0]);
         let [registration] = registrations;
         registration.validate()?;
@@ -4543,11 +4542,10 @@ impl Router {
             }
             registrations
         };
-        self.inner.monitoring.project_readbacks(
-            &mut registrations,
-            false,
-            request.include_git_state,
-        );
+        self.inner
+            .monitoring
+            .project_readbacks(&mut registrations, false, request.include_git_state)
+            .await;
         for registration in &mut registrations {
             display_project_registration(registration);
         }

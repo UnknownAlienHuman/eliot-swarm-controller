@@ -57,6 +57,15 @@ impl WorkerReporter {
         self.router.note_worker_task_stopped(name);
     }
 
+    pub(crate) fn observation_failed(&self, name: &str, error: &Error) {
+        logging::record(
+            &self.router.secret_policy_snapshot(),
+            "daemon.worker_observation_failed",
+            &[("worker", name)],
+            Some(error),
+        );
+    }
+
     pub(crate) fn failed(
         &self,
         name: &str,

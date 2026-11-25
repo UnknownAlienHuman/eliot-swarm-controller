@@ -1067,11 +1067,13 @@ basename in the background. The Store lock is released before filesystem or
 Git work. `project.list` and `project.get` return the verified projection
 only for its observed watcher revision. Before publication, monitoring
 checks the registered checkout HEAD and index stamps on both sides of the
-Git read. An absent or invalidated observation omits origin and checkout
-details. Callers that send `include_git_state: true` receive
-`git_refreshing: true` in those rows. Current rows and callers using the
-original request omit the marker. Clients can read the projection again on
-their normal refresh cadence.
+Git read. Git configuration and checkout inventory changes depend on watcher
+coverage. Legacy callers get a bounded live Git read on a cache miss. Callers
+that send `include_git_state: true` receive `git_refreshing: true` without
+origin or checkout details while a watched observation is pending. They can
+poll again on their normal refresh cadence. When monitoring cannot cover or
+verify a repository, the daemon uses the bounded live Git read and includes
+`git_watch_unsupported: true` for opted-in callers.
 Malformed and pathless remotes produce no name, and the origin URL itself
 never leaves the daemon.
 
@@ -3187,8 +3189,11 @@ claim all workspace changes belong to that Agent. Claims are live state, so the
 digest does not reconstruct which claim was active when an edit occurred. A requested
 stale generation still returns `stale_generation`. Interactive reads reuse Git's
 patch input only within the same filesystem observation revision, checkout HEAD,
-and index stamp. Claims and attribution are read for the current request. Guarded
-review keeps its fresh worktree fingerprint.
+and index stamp. The revision depends on filesystem watcher coverage for Git
+configuration, attributes, and tracked and untracked worktree changes. The
+HEAD and index stamps do not attest to those inputs on their own. Claims and
+attribution are read for the current request. Guarded review keeps its fresh
+worktree fingerprint.
 
 `agent.diff` accepts [AgentDiffRequest](../../crates/eliot-core/src/api/git.rs)
 and returns `AgentDiffResponse` for that Agent's current workspace and generation.

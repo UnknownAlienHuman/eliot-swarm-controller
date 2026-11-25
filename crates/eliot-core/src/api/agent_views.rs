@@ -1737,6 +1737,9 @@ pub struct ProjectRegistrationView {
     /// Opt-in marker. Git monitoring has no current observation for this registration.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub git_refreshing: bool,
+    /// Opt-in marker. This read used bounded live Git because monitoring cannot verify the scope.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub git_watch_unsupported: bool,
 }
 
 #[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1853,7 +1856,9 @@ impl ProjectRegistrationView {
     /// Pure readback grammar. Store/daemon own canonical repository identity and
     /// the authority checks for the explicit profile/action allowsets.
     pub fn validate(&self) -> Result<()> {
-        if self.git_refreshing && (self.origin.is_some() || !self.checkouts.is_empty()) {
+        if self.git_refreshing
+            && (self.git_watch_unsupported || self.origin.is_some() || !self.checkouts.is_empty())
+        {
             return Err(Error::new(
                 "invalid",
                 "refreshing project readback carries Git data",

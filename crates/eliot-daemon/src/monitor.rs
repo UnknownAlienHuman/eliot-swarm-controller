@@ -1317,15 +1317,17 @@ impl Monitoring {
         self.release_inactive_watchers(&HashSet::new(), true);
     }
 
-    pub(crate) fn project_readbacks(
+    pub(crate) async fn project_readbacks(
         &self,
         registrations: &mut [eliot_core::api::ProjectRegistrationView],
         single: bool,
         include_git_state: bool,
     ) {
+        let unavailable = self.inner.git_unavailable.lock_recover().is_some();
         self.inner
             .project_readbacks
-            .apply(registrations, single, include_git_state);
+            .apply(registrations, single, include_git_state, unavailable)
+            .await;
     }
 
     pub(crate) async fn run_git(
@@ -1334,8 +1336,9 @@ impl Monitoring {
         reporter: crate::daemon::workers::WorkerReporter,
     ) -> Result<()> {
         tokio::try_join!(
-            self.clone().run_workspace_git(shutdown.clone(), reporter),
-            self.run_project_readbacks(shutdown),
+            self.clone()
+                .run_workspace_git(shutdown.clone(), reporter.clone()),
+            self.run_project_readbacks(shutdown, reporter),
         )?;
         Ok(())
     }
@@ -1343,6 +1346,7 @@ impl Monitoring {
     pub(crate) async fn run_project_readbacks(
         &self,
         mut shutdown: watch::Receiver<bool>,
+        reporter: crate::daemon::workers::WorkerReporter,
     ) -> Result<()> {
         let mut ticks = interval(SAMPLE_INTERVAL);
         ticks.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -1366,20 +1370,16 @@ impl Monitoring {
                     "owner",
                     None,
                     crate::router::PAGE_MAX,
-                );
-                match registrations {
-                    Ok(registrations) => {
-                        crate::workspace_git::WorkspaceGit::refresh_project_readbacks(
-                            cache,
-                            &registrations,
-                        )
-                        .await
-                    }
-                    Err(_) => cache.clear(),
-                }
+                )?;
+                crate::workspace_git::WorkspaceGit::refresh_project_readbacks(
+                    cache,
+                    &registrations,
+                    &reporter,
+                )
+                .await
             };
             tokio::select! {
-                _ = refresh => {}
+                result = refresh => result?,
                 _ = shutdown.changed() => break,
             }
         }

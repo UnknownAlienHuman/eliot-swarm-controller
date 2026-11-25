@@ -1,6 +1,7 @@
 //! Read-only Git checkout identities rooted in an existing registration.
 
 use super::*;
+use crate::daemon::workers::WorkerReporter;
 use crate::fs_invalidation::{FilesystemRevision, WorkspaceInvalidation};
 use crate::platform::is_reparse_point;
 use eliot_core::api::{ProjectCheckoutView, ProjectRegistrationView};
@@ -8,7 +9,7 @@ use eliot_plugin::sync::LockExt;
 use futures_util::{StreamExt, stream};
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, OnceLock},
 };
 
 const MAX_CHECKOUTS: usize = 1_000;
@@ -18,8 +19,13 @@ const PROJECT_WATCH_CHECKOUTS: usize = 256;
 
 #[derive(Default)]
 pub(crate) struct ProjectReadCache {
-    entries: Mutex<HashMap<String, Arc<CachedProjectReadback>>>,
+    entries: Mutex<HashMap<String, Arc<ProjectObservation>>>,
     wake: Arc<tokio::sync::Notify>,
+}
+
+enum ProjectObservation {
+    Current(CachedProjectReadback),
+    Fallback(Error),
 }
 
 struct CachedProjectReadback {
@@ -37,13 +43,12 @@ struct WatchedProject {
 }
 
 impl ProjectReadCache {
-    /// Publish only the observation for the current watched revision. This
-    /// projection performs no filesystem work and never joins a refresh.
-    pub(crate) fn apply(
+    pub(crate) async fn apply(
         &self,
         registrations: &mut [ProjectRegistrationView],
         single: bool,
         include_git_state: bool,
+        force_fallback: bool,
     ) {
         let mut groups = BTreeMap::<String, Vec<&mut ProjectRegistrationView>>::new();
         for registration in &mut *registrations {
@@ -52,38 +57,71 @@ impl ProjectReadCache {
                 .or_default()
                 .push(registration);
         }
-        let mut missing = false;
-        for (common, group) in groups {
-            let entry = self.entries.lock_recover().get(&common).cloned();
-            let paths = group.iter().map(|registration| &registration.checkout);
-            let current = entry.filter(|entry| {
-                entry.watched.current()
-                    && if single {
-                        paths
-                            .clone()
-                            .all(|path| entry.watched.registrations.contains(path))
-                    } else {
-                        entry.watched.registrations.iter().eq(paths)
+
+        let deadline = Instant::now() + ORIGIN_READ_TIME;
+        let git = OnceLock::new();
+        stream::iter(groups)
+            .for_each_concurrent(4, |(common, group)| {
+                let git = &git;
+                async move {
+                    let entry = self.entries.lock_recover().get(&common).cloned();
+                    if let Some(ProjectObservation::Current(entry)) = entry.as_deref()
+                        && entry.watched.current()
+                    {
+                        let mut paths = group.iter().map(|registration| &registration.checkout);
+                        let matched = if single {
+                            paths.all(|path| entry.watched.registrations.contains(path))
+                        } else {
+                            entry.watched.registrations.iter().eq(paths)
+                        };
+                        if matched {
+                            let origin = entry.origin.clone();
+                            let checkouts = entry.checkouts.clone();
+                            if entry.watched.current() {
+                                assign_readbacks(group, origin, checkouts);
+                                return;
+                            }
+                        }
                     }
-            });
-            if let Some(entry) = current {
-                let origin = entry.origin.clone();
-                let checkouts = entry.checkouts.clone();
-                if entry.watched.current() {
+
+                    let unsupported = force_fallback
+                        || !cfg!(any(windows, target_os = "linux"))
+                        || matches!(entry.as_deref(), Some(ProjectObservation::Fallback(_)));
+                    if include_git_state && !unsupported {
+                        for registration in group {
+                            registration.git_refreshing = true;
+                        }
+                        self.wake.notify_one();
+                        return;
+                    }
+                    let (origin, checkouts) = if Instant::now() < deadline
+                        && let Some(git) = git.get_or_init(|| WorkspaceGit::new().ok())
+                    {
+                        let paths = group
+                            .iter()
+                            .map(|registration| registration.checkout.clone())
+                            .collect();
+                        tokio::time::timeout_at(
+                            deadline,
+                            git.read_project(&common, paths, None, deadline),
+                        )
+                        .await
+                        .map(|(origin, checkouts, _)| (origin, checkouts))
+                        .unwrap_or_default()
+                    } else {
+                        (None, Vec::new())
+                    };
+                    let mut group = group;
+                    for registration in &mut group {
+                        registration.git_watch_unsupported = include_git_state && unsupported;
+                    }
                     assign_readbacks(group, origin, checkouts);
-                    continue;
+                    if !unsupported {
+                        self.wake.notify_one();
+                    }
                 }
-            }
-            for registration in group {
-                registration.git_refreshing = include_git_state;
-                registration.origin = None;
-                registration.checkouts.clear();
-            }
-            missing = true;
-        }
-        if missing {
-            self.wake.notify_one();
-        }
+            })
+            .await;
         let mut remaining = CHECKOUT_READBACK_BYTES;
         for registration in registrations {
             bound_checkouts(&mut registration.checkouts, &mut remaining);
@@ -113,49 +151,48 @@ impl ProjectReadCache {
         }
     }
 
-    async fn verified(
-        &self,
-        common: &str,
-        registrations: &[String],
-    ) -> Option<Arc<CachedProjectReadback>> {
-        let entry = self.entries.lock_recover().get(common).cloned()?;
+    async fn verified(&self, common: &str, registrations: &[String]) -> bool {
+        let entry = self.entries.lock_recover().get(common).cloned();
+        let Some(ProjectObservation::Current(entry)) = entry.as_deref() else {
+            return false;
+        };
         if entry.watched.registrations != registrations || !entry.watched.current() {
-            return None;
+            return false;
         }
         let paths = registrations.to_vec();
         let common = common.to_owned();
-        let stamps = tokio::task::spawn_blocking(move || project_stamps(&paths, &common))
-            .await
-            .ok()??;
-        (stamps == entry.watched.stamps && entry.watched.current()).then_some(entry)
+        let stamps = tokio::task::spawn_blocking(move || project_stamps(&paths, &common)).await;
+        matches!(stamps, Ok(Ok(stamps)) if stamps == entry.watched.stamps && entry.watched.current())
     }
 
-    fn live_watcher(
-        &self,
-        common: &str,
-        registrations: &[String],
-    ) -> Option<(Arc<WorkspaceInvalidation>, HashSet<String>)> {
-        let entry = self.entries.lock_recover().get(common).cloned()?;
-        if entry.watched.registrations != registrations || entry.watched.watcher.is_degraded() {
-            return None;
+    fn take_current(&self, common: &str) -> Option<Arc<ProjectObservation>> {
+        let mut entries = self.entries.lock_recover();
+        if matches!(
+            entries.get(common).map(Arc::as_ref),
+            Some(ProjectObservation::Current(_))
+        ) {
+            entries.remove(common)
+        } else {
+            None
         }
-        Some((
-            Arc::clone(&entry.watched.watcher),
-            entry.watched.checkout_roots.clone(),
-        ))
     }
 
-    fn replace(&self, common: String, value: Option<CachedProjectReadback>) {
-        let retired = {
+    fn record_fallback(&self, common: String, error: Error, reporter: &WorkerReporter) {
+        {
             let mut entries = self.entries.lock_recover();
-            match value {
-                Some(value) => entries.insert(common, Arc::new(value)),
-                None => entries.remove(&common),
+            if let Some(ProjectObservation::Fallback(previous)) =
+                entries.get(&common).map(Arc::as_ref)
+                && previous.code == error.code
+                && previous.message == error.message
+            {
+                return;
             }
-        };
-        if retired.is_some() {
-            tokio::task::spawn_blocking(move || drop(retired));
+            entries.insert(
+                common,
+                Arc::new(ProjectObservation::Fallback(error.clone())),
+            );
         }
+        reporter.observation_failed("git_sampler", &error);
     }
 }
 
@@ -165,15 +202,10 @@ impl WatchedProject {
     }
 }
 
-fn project_stamps(paths: &[String], common: &str) -> Option<Vec<CheckoutReadStamp>> {
+fn project_stamps(paths: &[String], common: &str) -> Result<Vec<CheckoutReadStamp>> {
     paths
         .iter()
-        .map(|path| {
-            DiffCheckout::open(path, Some(common))
-                .ok()?
-                .read_stamp()
-                .ok()
-        })
+        .map(|path| DiffCheckout::open(path, Some(common))?.read_stamp())
         .collect()
 }
 
@@ -430,7 +462,8 @@ impl WorkspaceGit {
     pub(crate) async fn refresh_project_readbacks(
         cache: &ProjectReadCache,
         registrations: &[ProjectRegistrationView],
-    ) {
+        reporter: &WorkerReporter,
+    ) -> Result<()> {
         let mut groups = BTreeMap::<String, Vec<String>>::new();
         for registration in registrations {
             groups
@@ -440,157 +473,189 @@ impl WorkspaceGit {
         }
         cache.retain(&groups);
         if groups.is_empty() {
-            return;
+            return Ok(());
         }
-        let Ok(git) = Self::new() else {
-            cache.clear();
-            return;
-        };
+        let git = Self::new()?;
         stream::iter(groups)
-            .for_each_concurrent(4, |(common_dir, registration_keys)| {
+            .for_each_concurrent(4, |(common, paths)| {
                 let git = &git;
                 async move {
-                    if cache
-                        .verified(&common_dir, &registration_keys)
-                        .await
-                        .is_some()
-                    {
+                    if cache.verified(&common, &paths).await {
                         return;
                     }
-                    let watch_common = common_dir.clone();
-                    let watch_paths = registration_keys.clone();
-                    let existing = cache.live_watcher(&common_dir, &registration_keys);
-                    // Also fences a stamp mismatch detected before its
-                    // filesystem notification reaches the watcher.
-                    cache.replace(common_dir.clone(), None);
-                    let wake = Arc::clone(&cache.wake);
-                    let Some(watched) = tokio::task::spawn_blocking(move || {
-                        let (watcher, checkout_roots) = match existing {
-                            Some(watcher) => watcher,
-                            None => {
-                                let (watcher, roots) =
-                                    project_watcher(&watch_common, &watch_paths, wake)?;
-                                (Arc::new(watcher), roots)
-                            }
-                        };
-                        let revision = watcher.revision()?;
-                        let stamps = project_stamps(&watch_paths, &watch_common)?;
-                        let state = WatchedProject {
-                            watcher,
-                            revision,
-                            registrations: watch_paths,
-                            stamps,
-                            checkout_roots,
-                        };
-                        state.current().then_some(state)
-                    })
-                    .await
-                    .ok()
-                    .flatten() else {
-                        return;
-                    };
-                    let deadline = Instant::now() + ORIGIN_READ_TIME;
-                    let (origin, (mut checkouts, complete)) =
-                        tokio::join!(git.project_origin(&common_dir, deadline), async {
-                            let Ok(common) = canonical_root(&common_dir) else {
-                                return (Vec::new(), false);
-                            };
-                            let registered = registration_keys.clone();
-                            let (repositories, inventory) = tokio::join!(
-                                tokio::task::spawn_blocking({
-                                    let common = common.clone();
-                                    move || {
-                                        let main = registered
-                                            .iter()
-                                            .find_map(|checkout| {
-                                                main_checkout(&common, Path::new(checkout))
-                                            })
-                                            .or_else(|| main_checkout(&common, common.parent()?));
-                                        let linked = linked_checkouts(&common);
-                                        main.into_iter()
-                                            .chain(linked)
-                                            .take(MAX_CHECKOUTS)
-                                            .collect::<Vec<_>>()
-                                    }
-                                }),
-                                git.project_entries(&common, deadline),
-                            );
-                            let mut complete = repositories.is_ok() && inventory.is_ok();
-                            let inventory = inventory.unwrap_or_default();
-                            complete &= {
-                                // The first Git record is the repository's
-                                // main checkout, which can be outside the
-                                // registration. Only main_checkout selects
-                                // it. All linked records must be watched.
-                                inventory.iter().skip(1).all(|entry| {
-                                    entry.path.to_str().is_some_and(|path| {
-                                        watched
-                                            .checkout_roots
-                                            .contains(eliot_core::workspace_path_key(path).as_ref())
-                                    })
-                                })
-                            };
-                            let mut by_path = BTreeMap::new();
-                            for entry in &inventory {
-                                if let Some(path) = entry.path.to_str() {
-                                    by_path
-                                        .entry(eliot_core::workspace_path_key(path))
-                                        .and_modify(|value| *value = None)
-                                        .or_insert(Some(entry));
-                                }
-                            }
-                            let repositories = repositories.unwrap_or_default();
-                            let expected = repositories.len();
-                            let checkouts: Vec<_> = stream::iter(repositories)
-                                .map(|repo| {
-                                    let entry = repo.root.to_str().and_then(|path| {
-                                        by_path
-                                            .get(&eliot_core::workspace_path_key(path))
-                                            .copied()
-                                            .flatten()
-                                    });
-                                    git.checkout_readback(repo, entry.cloned(), deadline)
-                                })
-                                .buffered(8)
-                                .filter_map(std::future::ready)
-                                .collect()
-                                .await;
-                            complete &= checkouts.len() == expected;
-                            complete &= {
-                                checkouts.iter().all(|checkout| {
-                                    watched.checkout_roots.contains(
-                                        eliot_core::workspace_path_key(&checkout.path).as_ref(),
-                                    )
-                                })
-                            };
-                            (checkouts, complete)
-                        });
-                    let cacheable = complete && origin.is_ok() && Instant::now() < deadline;
-                    let origin = origin.ok().flatten();
-                    let mut remaining = CHECKOUT_READBACK_BYTES;
-                    bound_checkouts(&mut checkouts, &mut remaining);
-                    let cached = if cacheable && watched.current() {
-                        let common = common_dir.clone();
-                        let paths = registration_keys;
-                        let stamps =
-                            tokio::task::spawn_blocking(move || project_stamps(&paths, &common))
-                                .await
-                                .ok()
-                                .flatten();
-                        (stamps.as_ref() == Some(&watched.stamps) && watched.current()).then(|| {
-                            CachedProjectReadback {
-                                watched,
-                                origin,
-                                checkouts,
-                            }
-                        })
-                    } else {
-                        None
-                    };
-                    cache.replace(common_dir, cached);
+                    let previous = cache.take_current(&common);
+                    let result = git
+                        .observe_project(&common, paths, &cache.wake, previous)
+                        .await;
+                    match result {
+                        Ok(Some(readback)) => {
+                            cache
+                                .entries
+                                .lock_recover()
+                                .insert(common, Arc::new(ProjectObservation::Current(readback)));
+                        }
+                        Ok(None) => {}
+                        Err(error) => cache.record_fallback(common, error, reporter),
+                    }
                 }
             })
             .await;
+        Ok(())
+    }
+
+    async fn observe_project(
+        &self,
+        common: &str,
+        paths: Vec<String>,
+        wake: &Arc<tokio::sync::Notify>,
+        previous: Option<Arc<ProjectObservation>>,
+    ) -> Result<Option<CachedProjectReadback>> {
+        let watch_common = common.to_owned();
+        let wake = Arc::clone(wake);
+        let watched = tokio::task::spawn_blocking(move || {
+            let (watcher, checkout_roots) = match previous.as_deref() {
+                Some(ProjectObservation::Current(entry))
+                    if entry.watched.registrations == paths
+                        && !entry.watched.watcher.is_degraded() =>
+                {
+                    (
+                        Arc::clone(&entry.watched.watcher),
+                        entry.watched.checkout_roots.clone(),
+                    )
+                }
+                _ => project_watcher(&watch_common, &paths, wake)
+                    .map(|(watcher, roots)| (Arc::new(watcher), roots))?,
+            };
+            let revision = watcher.revision().ok_or_else(|| {
+                problem("unavailable", "project Git watcher lost checkout coverage")
+            })?;
+            let stamps = project_stamps(&paths, &watch_common)?;
+            let watched = WatchedProject {
+                watcher,
+                revision,
+                registrations: paths,
+                stamps,
+                checkout_roots,
+            };
+            Ok::<_, Error>(watched.current().then_some(watched))
+        })
+        .await
+        .map_err(|_| problem("internal", "project Git watcher task failed"))??;
+        let Some(watched) = watched else {
+            return Ok(None);
+        };
+        let deadline = Instant::now() + ORIGIN_READ_TIME;
+        let (origin, mut checkouts, complete) = self
+            .read_project(
+                common,
+                watched.registrations.clone(),
+                Some(&watched.checkout_roots),
+                deadline,
+            )
+            .await;
+        if !watched.current() {
+            return Ok(None);
+        }
+        if !complete {
+            return Err(problem(
+                "unavailable",
+                "project Git observation could not verify the complete checkout inventory",
+            ));
+        }
+        let common = common.to_owned();
+        let paths = watched.registrations.clone();
+        let stamps = tokio::task::spawn_blocking(move || project_stamps(&paths, &common))
+            .await
+            .map_err(|_| problem("internal", "project checkout stamp task failed"))??;
+        let mut remaining = CHECKOUT_READBACK_BYTES;
+        bound_checkouts(&mut checkouts, &mut remaining);
+        Ok(
+            (stamps == watched.stamps && watched.current()).then_some(CachedProjectReadback {
+                watched,
+                origin,
+                checkouts,
+            }),
+        )
+    }
+
+    async fn read_project(
+        &self,
+        common_dir: &str,
+        registration_keys: Vec<String>,
+        watched: Option<&HashSet<String>>,
+        deadline: Instant,
+    ) -> (Option<String>, Vec<ProjectCheckoutView>, bool) {
+        let (origin, (checkouts, complete)) =
+            tokio::join!(self.project_origin(common_dir, deadline), async {
+                let Ok(common) = canonical_root(common_dir) else {
+                    return (Vec::new(), false);
+                };
+                let registered = registration_keys;
+                let (repositories, inventory) = tokio::join!(
+                    tokio::task::spawn_blocking({
+                        let common = common.clone();
+                        move || {
+                            let main = registered
+                                .iter()
+                                .find_map(|checkout| main_checkout(&common, Path::new(checkout)))
+                                .or_else(|| main_checkout(&common, common.parent()?));
+                            let linked = linked_checkouts(&common);
+                            main.into_iter()
+                                .chain(linked)
+                                .take(MAX_CHECKOUTS)
+                                .collect::<Vec<_>>()
+                        }
+                    }),
+                    self.project_entries(&common, deadline),
+                );
+                let mut complete = repositories.is_ok() && inventory.is_ok();
+                let inventory = inventory.unwrap_or_default();
+                complete &= watched.is_none_or(|watched| {
+                    // The first Git record is the repository's
+                    // main checkout, which can be outside the
+                    // registration. Only main_checkout selects
+                    // it. All linked records must be watched.
+                    inventory.iter().skip(1).all(|entry| {
+                        entry.path.to_str().is_some_and(|path| {
+                            watched.contains(eliot_core::workspace_path_key(path).as_ref())
+                        })
+                    })
+                });
+                let mut by_path = BTreeMap::new();
+                for entry in &inventory {
+                    if let Some(path) = entry.path.to_str() {
+                        by_path
+                            .entry(eliot_core::workspace_path_key(path))
+                            .and_modify(|value| *value = None)
+                            .or_insert(Some(entry));
+                    }
+                }
+                let repositories = repositories.unwrap_or_default();
+                let expected = repositories.len();
+                let checkouts: Vec<_> = stream::iter(repositories)
+                    .map(|repo| {
+                        let entry = repo.root.to_str().and_then(|path| {
+                            by_path
+                                .get(&eliot_core::workspace_path_key(path))
+                                .copied()
+                                .flatten()
+                        });
+                        self.checkout_readback(repo, entry.cloned(), deadline)
+                    })
+                    .buffered(8)
+                    .filter_map(std::future::ready)
+                    .collect()
+                    .await;
+                complete &= checkouts.len() == expected;
+                complete &= watched.is_none_or(|watched| {
+                    checkouts.iter().all(|checkout| {
+                        watched.contains(eliot_core::workspace_path_key(&checkout.path).as_ref())
+                    })
+                });
+                (checkouts, complete)
+            });
+        let complete = complete && origin.is_ok() && Instant::now() < deadline;
+        (origin.ok().flatten(), checkouts, complete)
     }
 
     async fn project_entries(
@@ -877,40 +942,52 @@ fn project_watcher(
     common: &str,
     registrations: &[String],
     wake: Arc<tokio::sync::Notify>,
-) -> Option<(WorkspaceInvalidation, HashSet<String>)> {
+) -> Result<(WorkspaceInvalidation, HashSet<String>)> {
     use notify::RecursiveMode;
     use std::collections::BTreeSet;
 
-    let common = canonical_root(common).ok()?;
+    let unsupported = || {
+        problem(
+            "unsupported",
+            "project Git watcher cannot cover the checkout bindings",
+        )
+    };
+    let common = canonical_root(common).map_err(|_| unsupported())?;
     let registry = common.join("worktrees");
     let mut paths = BTreeMap::from([(common.clone(), RecursiveMode::NonRecursive)]);
     let mut roots = BTreeSet::new();
     for registration in registrations {
-        roots.insert(canonical_root(registration).ok()?);
+        roots.insert(canonical_root(registration).map_err(|_| unsupported())?);
     }
-    roots.insert(common.parent()?.to_owned());
+    roots.insert(common.parent().ok_or_else(unsupported)?.to_owned());
     match fs::symlink_metadata(&registry) {
         Ok(metadata) if metadata.is_dir() && !is_reparse_point(&metadata) => {
             paths.insert(registry.clone(), RecursiveMode::Recursive);
-            for (i, entry) in fs::read_dir(&registry).ok()?.enumerate() {
+            for (i, entry) in fs::read_dir(&registry)
+                .map_err(|_| unsupported())?
+                .enumerate()
+            {
                 if i >= PROJECT_WATCH_CHECKOUTS {
-                    return None;
+                    return Err(problem(
+                        "unsupported",
+                        "project Git watcher checkout limit exceeded",
+                    ));
                 }
-                let entry = entry.ok()?;
-                if !entry.file_type().ok()?.is_dir() {
+                let entry = entry.map_err(|_| unsupported())?;
+                if !entry.file_type().map_err(|_| unsupported())?.is_dir() {
                     continue;
                 }
                 let admin = entry.path();
-                let gitdir = metadata_line(&admin.join("gitdir")).ok()?;
-                let pointer = pointer_path(&admin, &gitdir)?;
-                if pointer.file_name()?.to_str()? != ".git" {
-                    return None;
+                let gitdir = metadata_line(&admin.join("gitdir")).map_err(|_| unsupported())?;
+                let pointer = pointer_path(&admin, &gitdir).ok_or_else(unsupported)?;
+                if pointer.file_name().and_then(|name| name.to_str()) != Some(".git") {
+                    return Err(unsupported());
                 }
-                roots.insert(pointer.parent()?.to_owned());
+                roots.insert(pointer.parent().ok_or_else(unsupported)?.to_owned());
             }
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        _ => return None,
+        _ => return Err(unsupported()),
     }
     for name in ["refs", "info", "reftable"] {
         let path = common.join(name);
@@ -935,12 +1012,15 @@ fn project_watcher(
                         .or_insert(RecursiveMode::NonRecursive);
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                _ => return None,
+                _ => return Err(unsupported()),
             }
         }
     }
     if paths.len() > 4 * PROJECT_WATCH_CHECKOUTS {
-        return None;
+        return Err(problem(
+            "unsupported",
+            "project Git watcher path limit exceeded",
+        ));
     }
 
     let checkout_roots = roots.iter().map(|root| key(root)).collect();
@@ -956,6 +1036,11 @@ fn project_watcher(
             .and_then(|tail| tail.strip_prefix('/'));
         let binding = bindings.contains(&path)
             || path == registry
+            || ["refs", "info", "reftable"].iter().any(|name| {
+                path.strip_prefix(&common)
+                    .and_then(|tail| tail.strip_prefix('/'))
+                    == Some(*name)
+            })
             || admin.is_some_and(|tail| {
                 !tail.contains('/') || tail.ends_with("/gitdir") || tail.ends_with("/commondir")
             });
@@ -991,7 +1076,7 @@ fn project_watcher(
             .is_some_and(|(_, file)| tracked_file(file));
         (binding || common_metadata || worktree_metadata, binding)
     })
-    .ok()
+    .map_err(|_| unsupported())
     .map(|watcher| (watcher, checkout_roots))
 }
 
@@ -1000,6 +1085,9 @@ fn project_watcher(
     _common: &str,
     _registrations: &[String],
     _wake: Arc<tokio::sync::Notify>,
-) -> Option<(WorkspaceInvalidation, HashSet<String>)> {
-    None
+) -> Result<(WorkspaceInvalidation, HashSet<String>)> {
+    Err(problem(
+        "unsupported",
+        "project Git watchers are unavailable on this platform",
+    ))
 }

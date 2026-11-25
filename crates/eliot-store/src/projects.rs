@@ -1332,6 +1332,7 @@ fn normalize_registration(input: &ProjectRegistrationInput) -> Result<ProjectReg
         origin: None,
         checkouts: Vec::new(),
         git_refreshing: false,
+        git_watch_unsupported: false,
     };
     view.validate()?;
     Ok(ProjectRegistrationInput {
@@ -1586,5 +1587,6 @@ fn project_registration_from_row(
         origin: None,
         checkouts: Vec::new(),
         git_refreshing: false,
+        git_watch_unsupported: false,
     })
 }
