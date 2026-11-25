@@ -291,12 +291,6 @@ impl WaitEntryResult {
         self
     }
 
-    /// Attach work facts captured for this exact Agent generation.
-    pub fn with_facts(mut self, facts: ChildRunFacts) -> Self {
-        self.facts = facts;
-        self
-    }
-
     pub fn validate(&self) -> Result<()> {
         if self.kind != "command" && self.kind != "turn" {
             return Err(Error::new(
