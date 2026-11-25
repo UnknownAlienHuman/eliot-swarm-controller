@@ -1415,11 +1415,10 @@ impl Store {
         id: &str,
         now: i64,
         expected_agent: &Agent,
-        binding: &NativeStoreBinding,
-        startup: Option<&Value>,
+        binding: &core::ProfileStoreResult,
     ) -> Result<Change<Command>> {
         self.ensure_writer_healthy()?;
-        let result = self.dispatch_inner(id, now, Some((expected_agent, binding, startup)), None);
+        let result = self.dispatch_inner(id, now, Some((expected_agent, binding)), None);
         self.fault_on_persistence_error(&result);
         result
     }

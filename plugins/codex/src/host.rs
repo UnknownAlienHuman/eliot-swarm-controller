@@ -164,6 +164,7 @@ struct TargetEnvironment {
 struct NativeStartContext<'a> {
     route: &'a CodexRoute,
     store: &'a NativeStoreBinding,
+    catalogue_digest: Option<&'a str>,
     metadata_secrets: &'a [String],
 }
 
@@ -174,6 +175,7 @@ struct ValidatedStartPlan {
     resume_subject: Option<eliot_plugin::session::ResumeSubject>,
     route: CodexRoute,
     frozen_store: NativeStoreBinding,
+    catalogue_digest: Option<String>,
     requested_model: Option<String>,
     daemon_model: Option<String>,
     requested_effort: Option<String>,
@@ -275,6 +277,22 @@ fn validate_start_plan(
     }
     let route = CodexRoute::from_profile(frozen_profile)?;
     let frozen_store = frozen_store_binding(profile)?;
+    let catalogue_digest = profile
+        .get("native_launch_metadata")
+        .and_then(|metadata| metadata.get("catalogue_digest"))
+        .map(|digest| {
+            digest
+                .as_str()
+                .filter(|digest| eliot_core::is_lowercase_hex(digest, 64))
+                .map(str::to_owned)
+                .ok_or_else(|| {
+                    Error::new(
+                        "profile_error",
+                        "Codex frozen catalogue digest is malformed",
+                    )
+                })
+        })
+        .transpose()?;
     // The frozen profile's Codex fields decode once against the core
     // vocabulary; that decode is the boundary check.
     let fields: ProfileFields =
@@ -431,6 +449,7 @@ fn validate_start_plan(
         resume_subject,
         route,
         frozen_store,
+        catalogue_digest,
         requested_model,
         daemon_model,
         requested_effort,
@@ -590,7 +609,7 @@ impl CodexPlugin {
             "native.archive" => self.native_archive(&request.params).await,
             "agent.attach" => self.attach(&request.params).await,
             "agent.detach" => self.detach(&request.params).await,
-            "agent.start" => self.start(&request.params, client).await,
+            "agent.start" => Box::pin(self.start(&request.params, client)).await,
             "agent.command" => self.command(&request.params).await,
             "agent.snapshot" => self.snapshot(&request.params).await,
             "agent.stop" => self.stop(&request.params).await,
@@ -1247,6 +1266,7 @@ impl CodexPlugin {
             NativeStartContext {
                 route: &plan.route,
                 store: &plan.frozen_store,
+                catalogue_digest: plan.catalogue_digest.as_deref(),
                 metadata_secrets: &plan.metadata_secrets,
             },
         )
@@ -1834,6 +1854,7 @@ impl CodexPlugin {
                 client,
                 workspace,
                 context.metadata_secrets,
+                context.catalogue_digest,
                 Instant::now() + RPC_TIMEOUT,
             )
             .await?;

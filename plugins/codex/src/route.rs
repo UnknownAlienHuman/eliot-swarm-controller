@@ -5,11 +5,13 @@
 use crate::native::NativeClient;
 use eliot_core::{Error, Result, RouteBinding, SecretPolicy};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::{
     ffi::{OsStr, OsString},
+    io::Read,
     path::Path,
 };
-use tokio::time::Instant;
+use tokio::time::{Instant, timeout_at};
 
 pub(super) const CHATGPT_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
 
@@ -292,6 +294,7 @@ impl CodexRoute {
         client: &NativeClient,
         cwd: &Path,
         metadata_secrets: &[String],
+        expected_catalogue: Option<&str>,
         deadline: Instant,
     ) -> Result<()> {
         let response = client
@@ -309,21 +312,21 @@ impl CodexRoute {
         let config = response
             .get("config")
             .ok_or_else(|| route_error("Codex config/read omitted effective config"))?;
-        self.verify_config(config, metadata_secrets)
+        self.verify_config(config, metadata_secrets)?;
+        if let Some(old) = expected_catalogue {
+            let new = model_catalogue_digest(config, deadline).await?;
+            if old != new {
+                return Err(Error::new(
+                    "model_catalogue_changed",
+                    format!("Codex model catalogue digest changed: old {old}, new {new}"),
+                )
+                .with_where("plugin.codex.route.model_catalog_json"));
+            }
+        }
+        Ok(())
     }
 
     fn verify_config(&self, config: &Value, metadata_secrets: &[String]) -> Result<()> {
-        // Codex selects a static catalogue before either the built-in provider
-        // catalogue or the frozen named route's model_catalog_url.
-        if config
-            .get("model_catalog_json")
-            .is_some_and(|value| !value.is_null())
-        {
-            return Err(route_error(
-                "Codex model_catalog_json overrides the frozen route's catalogue source",
-            )
-            .with_where("plugin.codex.route.model_catalog_json"));
-        }
         if SecretPolicy::new(metadata_secrets.iter().map(String::as_str)).contains_value(config) {
             return Err(route_error(
                 "Codex effective config contains a configured credential",
@@ -492,6 +495,58 @@ fn quote_path(path: &Path) -> Result<String> {
         .to_str()
         .ok_or_else(|| route_error("Codex Agent MCP path is not valid Unicode"))?;
     quote(value)
+}
+
+/// Hash the effective catalogue. The prefix distinguishes the provider
+/// default (0) from a configured file's exact bytes (1).
+pub(crate) async fn model_catalogue_digest(config: &Value, deadline: Instant) -> Result<String> {
+    let failed = || {
+        route_error("Codex model catalogue identity could not be read")
+            .with_where("plugin.codex.route.model_catalog_json")
+    };
+    let config = config.as_object().ok_or_else(failed)?;
+    let Some(selected) = config
+        .get("model_catalog_json")
+        .filter(|value| !value.is_null())
+    else {
+        return Ok(format_digest(&Sha256::digest([0])));
+    };
+    let path = selected
+        .as_str()
+        .map(Path::new)
+        .filter(|path| path.is_absolute())
+        .ok_or_else(failed)?
+        .to_path_buf();
+    timeout_at(
+        deadline,
+        tokio::task::spawn_blocking(move || -> std::io::Result<String> {
+            if !std::fs::metadata(&path)?.is_file() {
+                return Err(std::io::Error::from(std::io::ErrorKind::InvalidInput));
+            }
+            let mut file = std::fs::File::open(path)?;
+            let mut digest = Sha256::new();
+            digest.update([1]);
+            let mut bytes = [0_u8; 16 * 1024];
+            loop {
+                if Instant::now() >= deadline {
+                    return Err(std::io::Error::from(std::io::ErrorKind::TimedOut));
+                }
+                let read = file.read(&mut bytes)?;
+                if read == 0 {
+                    return Ok(format_digest(&digest.finalize()));
+                }
+                digest.update(&bytes[..read]);
+            }
+        }),
+    )
+    .await
+    .map_err(|_| failed())?
+    .map_err(|_| failed())?
+    .map_err(|_| failed())
+}
+
+fn format_digest(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 fn route_error(message: &'static str) -> Error {

@@ -1278,13 +1278,7 @@ impl Router {
                 }
                 let dispatched = match launch_binding {
                     Some((expected_agent, binding)) => store
-                        .dispatch_with_native_store_binding(
-                            id,
-                            now_ms(),
-                            expected_agent,
-                            &binding.binding,
-                            binding.startup.as_ref(),
-                        )
+                        .dispatch_with_native_store_binding(id, now_ms(), expected_agent, binding)
                         .map(|change| {
                             (
                                 change.value,

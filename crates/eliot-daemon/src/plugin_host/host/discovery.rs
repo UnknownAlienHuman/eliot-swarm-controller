@@ -880,6 +880,10 @@ impl PluginHost {
                 .any(|value| value.is_empty() || value.chars().any(char::is_control))
                 || !std::path::Path::new(&binding.home).is_absolute()
                 || !std::path::Path::new(&binding.root).is_absolute()
+                || preparation
+                    .catalogue_digest
+                    .as_deref()
+                    .is_some_and(|digest| !eliot_core::is_lowercase_hex(digest, 64))
             {
                 return Err(Error::new(
                     "source_integrity",

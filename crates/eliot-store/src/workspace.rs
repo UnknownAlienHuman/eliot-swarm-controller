@@ -920,8 +920,7 @@ pub(super) fn require_managed_path_ready(connection: &Connection, path: &str) ->
 pub(super) fn launch_snapshot_with_native_store(
     agent: &Agent,
     expected: &Agent,
-    binding: &NativeStoreBinding,
-    startup: Option<&Value>,
+    preparation: &core::ProfileStoreResult,
     command_id: &str,
 ) -> Result<String> {
     if expected.id != agent.id
@@ -937,6 +936,7 @@ pub(super) fn launch_snapshot_with_native_store(
             "launch target changed during native store verification",
         ));
     }
+    let binding = &preparation.binding;
     let mut snapshot = agent.profile_snapshot.clone();
     let object = snapshot
         .as_object_mut()
@@ -966,11 +966,15 @@ pub(super) fn launch_snapshot_with_native_store(
     // parent's launch-only metadata. This fresh generation-zero dispatch
     // binds its own preparation; retained/uncertain commands cannot enter here.
     object.remove("native_launch_metadata");
-    if let Some(startup) = startup {
-        object.insert(
-            "native_launch_metadata".to_owned(),
-            json!({"command_id":command_id, "data":startup}),
-        );
+    if preparation.startup.is_some() || preparation.catalogue_digest.is_some() {
+        let mut metadata = json!({"command_id": command_id});
+        if let Some(startup) = &preparation.startup {
+            metadata["data"] = startup.clone();
+        }
+        if let Some(digest) = &preparation.catalogue_digest {
+            metadata["catalogue_digest"] = json!(digest);
+        }
+        object.insert("native_launch_metadata".to_owned(), metadata);
     }
     let encoded = encode_json(&snapshot)?;
     let mut start = core::AgentStartParams::new(&agent.id, 1, command_id);
