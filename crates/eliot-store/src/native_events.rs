@@ -1386,7 +1386,7 @@ fn persist_turn_terminal(
     if native_event.kind == "turn.unknown" && next_agent.active_turn.as_deref() == Some(turn_id) {
         // Keep pending native requests available for exact late readback.
         return context::settle_ended_turn_context_tx(
-            tx, agent_num, generation, turn_id, true, now,
+            tx, agent_num, generation, turn_id, false, now,
         );
     }
     db!(tx.execute(
@@ -1410,7 +1410,7 @@ fn persist_turn_terminal(
         agent_num,
         generation,
         turn_id,
-        !next_agent.is_terminal(),
+        state != TurnState::Unknown && !next_agent.is_terminal(),
         now,
     )
 }

@@ -137,17 +137,6 @@ pub struct RetainedInjectArgs {
     pub trusted_review_labels: Option<TrustedReviewLabels>,
 }
 
-impl RetainedInjectArgs {
-    pub fn allows_next_input_fallback(&self) -> bool {
-        // Older admissions stored only the resolved point. Unmarked in-turn
-        // rows retain the fallback behavior they had when admitted.
-        matches!(
-            self.point,
-            InjectPoint::TurnSafePoint | InjectPoint::ActiveTurn
-        ) && self.fallback_to_next_input.unwrap_or(true)
-    }
-}
-
 pub fn decode_retained_inject_args(value: &Value) -> serde_json::Result<RetainedInjectArgs> {
     let args: RetainedInjectArgs = serde_json::from_value(value.clone())?;
     if let Some(labels) = &args.trusted_review_labels

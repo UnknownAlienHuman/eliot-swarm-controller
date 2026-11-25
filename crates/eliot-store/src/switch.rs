@@ -2426,7 +2426,10 @@ impl Store {
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(sql_error)?;
             let parent = switch_parent(&tx, id)?;
-            if parent.state != CommandState::Dispatched {
+            if !matches!(
+                parent.state,
+                CommandState::Accepted | CommandState::Queued | CommandState::Dispatched
+            ) {
                 return Ok(Change {
                     value: parent,
                     events: Vec::new(),

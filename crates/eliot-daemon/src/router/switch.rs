@@ -62,7 +62,9 @@ impl Router {
         match store.fail_switch_preparation(id, error, &policy, now_ms()) {
             Ok(change) => {
                 self.publish_locked(&change.events);
-                log_refusal(&policy, id, &error.code, &error.message);
+                if !change.events.is_empty() && change.value.state == CommandState::Rejected {
+                    log_refusal(&policy, id, &error.code, &error.message);
+                }
             }
             Err(error) => crate::logging::record(
                 &policy,
@@ -715,7 +717,9 @@ impl Router {
                 let mut store = self.inner.store.lock().await;
                 if let Ok(change) = store.fail_switch_preparation(id, &error, &policy, now_ms()) {
                     self.publish_locked(&change.events);
-                    log_refusal(&policy, id, &error.code, &error.message);
+                    if !change.events.is_empty() && change.value.state == CommandState::Rejected {
+                        log_refusal(&policy, id, &error.code, &error.message);
+                    }
                 }
                 self.signal_progress();
                 self.signal_launch_arbitration();

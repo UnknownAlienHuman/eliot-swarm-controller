@@ -1655,7 +1655,7 @@ pub(super) fn settle_ended_turn_context_tx(
             .ok_or_else(|| Error::new("source_integrity", "turn context disappeared"))?;
         let args = decode_inject_args(&record.command.args)?;
         let expired = args.expires_at_ms.is_some_and(|expires| expires <= now);
-        if args.allows_next_input_fallback() && can_move && !expired {
+        if can_move && !expired && allows_next_input_fallback(tx, &record, &args)? {
             let outcome = move_context_to_next_input(tx, &command_id, now)?;
             events.push(super::native_events::PendingCommandEvent {
                 command_id: command_id.clone(),
@@ -1760,6 +1760,61 @@ pub(super) fn move_context_to_next_input(
 pub(super) fn next_input_available(agent: &Agent) -> bool {
     !agent.is_terminal()
         && context_points(agent).is_ok_and(|points| points.contains(&InjectPoint::NextInput))
+}
+
+pub(super) fn allows_next_input_fallback(
+    tx: &Transaction<'_>,
+    record: &CommandRecord,
+    args: &core::RetainedInjectArgs,
+) -> Result<bool> {
+    if let Some(allowed) = args.fallback_to_next_input {
+        return Ok(allowed);
+    }
+    if args.point == InjectPoint::Soonest {
+        return Ok(true);
+    }
+    if args.point == InjectPoint::NextInput {
+        return Ok(false);
+    }
+    // Legacy admissions kept the resolved point, but their request digest
+    // still binds the caller's original point. An unproven match stays bound.
+    let command = &record.command;
+    let Some((_, _, digest)) = command_binding(tx, &command.id)? else {
+        return Ok(false);
+    };
+    let mut request = SubmitCommand::new(command.id.as_str(), "inject");
+    request.target = command.target.clone();
+    request.expected_generation = command.expected_generation;
+    request.expected_turn_id = record.expected_turn_id.clone();
+    for key in ["point", "at"] {
+        let mut semantic_args = json!({"text": args.text});
+        semantic_args[key] = json!(InjectPoint::Soonest);
+        if let Some(expires) = args.expires_at_ms {
+            semantic_args["expires_at_ms"] = json!(expires);
+        }
+        if legacy_request_digest_matches(&request, &semantic_args, &digest)? {
+            return Ok(true);
+        }
+        if args.expires_at_ms.is_none() {
+            semantic_args["expires_at_ms"] = Value::Null;
+            if legacy_request_digest_matches(&request, &semantic_args, &digest)? {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+fn legacy_request_digest_matches(
+    request: &SubmitCommand,
+    args: &Value,
+    digest: &[u8],
+) -> Result<bool> {
+    match admission::command_semantic_payload(request, args.clone()) {
+        Ok(payload) => Ok(canonical::digest(&payload)? == digest),
+        Err(error) if error.code == "frame_too_large" => Ok(false),
+        Err(error) => Err(error),
+    }
 }
 
 pub(super) fn turn_accepts_context_tx(

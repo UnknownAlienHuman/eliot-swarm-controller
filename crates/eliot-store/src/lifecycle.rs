@@ -97,8 +97,8 @@ impl Store {
             if state == CommandState::Rejected
                 && record.state == CommandState::Dispatched
                 && args.point == InjectPoint::ActiveTurn
-                && args.allows_next_input_fallback()
                 && args.expires_at_ms.is_none_or(|expires| expires > now)
+                && context::allows_next_input_fallback(tx, &record, &args)?
                 && let Some(target) = record.target
                 && let Some(agent) = load_agent_by_num(tx, target)?
                 && Some(agent.generation) == record.command.generation
