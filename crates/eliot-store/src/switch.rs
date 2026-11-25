@@ -188,6 +188,8 @@ pub struct SwitchContinuation {
     pub kind: Option<core::ProviderRestrictionKind>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub held_since: Option<i64>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub withheld_fresh_session: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -486,7 +488,20 @@ fn require_unwithheld_route(
     successor: &Value,
     profile: Option<&str>,
     now: i64,
+    continuation: Option<SwitchContinuation>,
 ) -> Result<()> {
+    if let Some(continuation) = continuation.filter(|route| route.withheld_fresh_session) {
+        if continuation.reason == HandoffReason::ProviderResponseWithheld
+            && profile == Some(source.profile.as_str())
+            && core::withheld_fresh_session_matches(&source.profile_snapshot, successor)
+        {
+            return Ok(());
+        }
+        return Err(Error::new(
+            PROVIDER_ROUTE_WITHHELD,
+            "fresh session requires the refusing preset, provider binding and model",
+        ));
+    }
     let withheld = automatic::withheld_provider_routes(tx, source, now)?;
     let route_withheld =
         core::provider_response_route_key(successor).is_some_and(|route| withheld.contains(&route));
@@ -1913,6 +1928,7 @@ impl Store {
                     &request.args["profile_snapshot"],
                     request.args.get("profile").and_then(Value::as_str),
                     now,
+                    continuation,
                 )?;
             }
             if continuation.is_some() || requested_by.is_some() {
@@ -2305,6 +2321,7 @@ impl Store {
                             &destination.profile_snapshot,
                             Some(destination.profile.as_str()),
                             now,
+                            continuation,
                         )?;
                     }
                     if let Some(failure) = provider_failure {

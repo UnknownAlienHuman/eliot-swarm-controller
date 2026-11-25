@@ -786,10 +786,12 @@ persisted command binding when the terminal names none. Observer-only Agents and
 turns without an exact local send cannot trigger handoff. The fact's typed detection
 provenance is retained by recovery and Store.
 The daemon's [automatic handoff policy](configuration.md#automatic-handoff-918)
-uses it to continue the work with its retained task inputs and sources on another
-eligible preset. The original command and terminal outcome remain in history.
-Automatic continuation excludes the source provider route. An unavailable successor
-is an Owner decision.
+uses it to continue the work with the standard handoff brief. The original
+command and terminal outcome remain in history. One reserved fresh session on
+the same preset is allowed per task lineage in 30 minutes, with its original
+provider binding and explicit model. Otherwise only Owner-configured fallback
+presets are eligible, subject to withheld-route evidence. An unavailable
+successor is an Owner decision.
 
 The `launch` action submits the existing ordinary launch command with flat fields. An
 explicit `profile` or a routing `role` may be supplied; they are mutually exclusive.

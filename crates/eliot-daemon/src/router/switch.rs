@@ -312,6 +312,7 @@ impl Router {
                 Some(HandoffRoute {
                     reason: value.reason,
                     kind: value.kind,
+                    withheld_fresh_session: value.withheld_fresh_session,
                     role: None,
                     allowed: None,
                 })
@@ -321,6 +322,7 @@ impl Router {
                 Some(HandoffRoute {
                     reason: HandoffReason::Routing,
                     kind: None,
+                    withheld_fresh_session: false,
                     role: Some(role.to_owned()),
                     allowed: Some(self.manager_successors(manager, &source).await?),
                 })

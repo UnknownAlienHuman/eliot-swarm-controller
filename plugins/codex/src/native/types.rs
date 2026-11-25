@@ -525,15 +525,19 @@ pub struct NativeTurnError {
 /// a response for a session without an authorized hardware key. No structured
 /// `codexErrorInfo` variant is known for this hold, so this sentence is the
 /// fallback evidence on every terminal path (live, readback and history).
-const PROVIDER_RESPONSE_WITHHELD_MESSAGE: &str = "You're approved for Daybreak Blue, but this response cannot be shown as this session was not authenticated with one of your authorized hardware keys. Please re-authenticate with your hardware key and try your request again.";
+const PROVIDER_RESPONSE_WITHHELD_SUFFIX: &str = "re approved for Daybreak Blue, but this response cannot be shown as this session was not authenticated with one of your authorized hardware keys. Please re-authenticate with your hardware key and try your request again.";
 pub(crate) const WITHHELD_LEGACY_EVIDENCE: &str = "text_fallback";
 
-/// Outer whitespace is benign; nested metadata and other output are not part
-/// of this signal.
+/// Match both captured apostrophe spellings. Other text and nested metadata
+/// are outside this signal.
 pub(crate) fn response_withheld_fact_from_message(
     message: &str,
 ) -> Option<ProviderResponseWithheldFact> {
-    (message.trim() == PROVIDER_RESPONSE_WITHHELD_MESSAGE).then(|| {
+    let suffix = message
+        .trim()
+        .strip_prefix("You")?
+        .strip_prefix(['\'', '’'])?;
+    (suffix == PROVIDER_RESPONSE_WITHHELD_SUFFIX).then(|| {
         ProviderResponseWithheldFact::new(
             ProviderResponseWithheldDetection::ExactNativeMessage,
             None,

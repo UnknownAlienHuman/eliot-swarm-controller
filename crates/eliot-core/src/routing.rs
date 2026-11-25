@@ -228,6 +228,18 @@ pub fn provider_profile_refusal_marker(profile: &str) -> String {
     format!("profile:{profile}")
 }
 
+/// A fresh session on a withheld preset must retain its explicit native model.
+/// A harness default cannot prove the same model across two sessions.
+pub fn withheld_fresh_session_matches(source: &Value, candidate: &Value) -> bool {
+    source["harness"]
+        .as_str()
+        .is_some_and(|harness| candidate["harness"] == harness)
+        && source["model"]
+            .as_str()
+            .is_some_and(|model| !model.trim().is_empty() && candidate["model"] == model)
+        && provider_response_route_key(source) == provider_response_route_key(candidate)
+}
+
 /// Why `candidate` may not take over work from `source` automatically or at a
 /// manager's request; `None` when its authority is provably equal or narrower.
 /// Credentials, model and executable belong to the candidate profile the Owner

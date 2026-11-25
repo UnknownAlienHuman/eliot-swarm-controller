@@ -19,6 +19,7 @@ const LOST_SCAN_LIMIT: i64 = 64;
 const WITHHELD_SCAN_LIMIT: i64 = 64;
 const WITHHELD_ROUTE_HISTORY_LIMIT: i64 = 32;
 const WITHHELD_ROUTE_TTL_MS: i64 = 60 * 60 * 1_000;
+const WITHHELD_FRESH_SESSION_WINDOW_MS: i64 = 30 * 60 * 1_000;
 const MAX_SWITCHES_PER_TASK: i64 = 3;
 type HandoffBudgetState = (i64, Option<i64>, Option<i64>, Option<String>, Option<i64>);
 
@@ -45,6 +46,24 @@ fn lineage_for(
         )
         .optional()
         .map_err(sql_error)
+}
+
+fn withheld_fresh_session_available(
+    connection: &Connection,
+    agent: &Agent,
+    now: i64,
+) -> Result<bool> {
+    let num = parse_agent_id(&agent.id)?;
+    let lineage =
+        lineage_for(connection, num, agent.generation)?.map_or(num, |(lineage, _)| lineage);
+    let last: Option<Option<i64>> = connection.query_row(
+        "SELECT withheld_fresh_session_at FROM automatic_handoff_budgets WHERE lineage_agent = ?1",
+        [lineage],
+        |row| row.get(0),
+    ).optional().map_err(sql_error)?;
+    Ok(last
+        .flatten()
+        .is_none_or(|last| now.saturating_sub(last) >= WITHHELD_FRESH_SESSION_WINDOW_MS))
 }
 
 #[derive(Clone, Debug)]
@@ -367,6 +386,11 @@ fn insert_lineage_generation_tx(
 }
 
 impl Store {
+    pub fn withheld_fresh_session_available(&self, source: &Agent, now: i64) -> Result<bool> {
+        self.ensure_committed_reads()?;
+        withheld_fresh_session_available(&self.connection, source, now)
+    }
+
     pub fn withheld_provider_routes(&self, source: &Agent, now: i64) -> Result<HashSet<String>> {
         self.ensure_committed_reads()?;
         withheld_provider_routes(&self.connection, source, now)
@@ -1096,6 +1120,7 @@ impl Store {
     pub fn reserve_automatic_handoff(
         &mut self,
         candidate: &AutomaticHandoff,
+        withheld_fresh_session: bool,
         policy: &core::SecretPolicy,
         now: i64,
     ) -> Result<Change<Option<SwitchResponse>>> {
@@ -1115,6 +1140,12 @@ impl Store {
             else {
                 return Ok(none());
             };
+            if withheld_fresh_session
+                && (candidate.reason != HandoffReason::ProviderResponseWithheld
+                    || !withheld_fresh_session_available(&tx, &agent, now)?)
+            {
+                return Ok(none());
+            }
             let withheld_turn = if candidate.reason == HandoffReason::ProviderResponseWithheld {
                 let Some(event_seq) = candidate.withheld_event_seq else {
                     return Ok(none());
@@ -1222,6 +1253,7 @@ impl Store {
                 reason: candidate.reason,
                 kind: candidate.kind,
                 held_since: candidate.held_since,
+                withheld_fresh_session,
             })
             .map_err(|_| Error::new("internal", "cannot encode handoff reason"))?;
             args[OWNER_AUTOMATION] = json!(true);
@@ -1235,6 +1267,24 @@ impl Store {
                 }
                 Err(error) => return Err(error),
             };
+            if withheld_fresh_session {
+                let (lineage, _) = lineage_for(&tx, num, agent.generation)?.ok_or_else(|| {
+                    Error::new("source_integrity", "fresh session has no task lineage")
+                })?;
+                let changed = tx
+                    .execute(
+                        "UPDATE automatic_handoff_budgets SET withheld_fresh_session_at = ?1
+                     WHERE lineage_agent = ?2 AND last_switch_command = ?3",
+                        params![now, lineage, request.id],
+                    )
+                    .map_err(sql_error)?;
+                if changed != 1 {
+                    return Err(Error::new(
+                        "source_integrity",
+                        "fresh session has no reserved switch budget",
+                    ));
+                }
+            }
             change.events.push(insert_daemon_event(
                 &tx,
                 now,

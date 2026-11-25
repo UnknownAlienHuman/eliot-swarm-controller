@@ -998,17 +998,34 @@ impl Router {
     }
 
     async fn admit_automatic_handoff(&self, candidate: &AutomaticHandoff) -> Result<()> {
-        let route = HandoffRoute {
+        let mut route = HandoffRoute {
             reason: candidate.reason,
             kind: candidate.kind,
+            withheld_fresh_session: candidate.reason == HandoffReason::ProviderResponseWithheld
+                && self
+                    .inner
+                    .store
+                    .lock()
+                    .await
+                    .withheld_fresh_session_available(&candidate.agent, now_ms())?,
             role: None,
             allowed: None,
         };
         let mut probe = SubmitCommand::new(String::new(), "launch");
-        if let Err(error) = self
+        let mut selected = self
             .route_handoff(&mut probe, &candidate.agent, &route)
-            .await
+            .await;
+        if route.withheld_fresh_session
+            && selected
+                .as_ref()
+                .is_err_and(|error| error.routing.is_some())
         {
+            route.withheld_fresh_session = false;
+            selected = self
+                .route_handoff(&mut probe, &candidate.agent, &route)
+                .await;
+        }
+        if let Err(error) = selected {
             let Some((message, blocked)) =
                 super::routing::handoff_waiting_message(&error, candidate.reason)
             else {
@@ -1025,7 +1042,12 @@ impl Router {
             if self.inner.mode.load(Ordering::SeqCst) != MODE_OPEN {
                 return Ok(());
             }
-            let change = store.reserve_automatic_handoff(candidate, &policy, now_ms())?;
+            let change = store.reserve_automatic_handoff(
+                candidate,
+                route.withheld_fresh_session,
+                &policy,
+                now_ms(),
+            )?;
             self.publish_locked(&change.events);
             if let Some(value) = &change.value {
                 self.schedule_command(value.id.clone(), None);

@@ -589,10 +589,12 @@ uncertain send, which remains in the source session and is named in the handoff 
 Codex 0.167.1's native `TurnError` requires `message` and may include
 `additionalDetails`, `codexErrorInfo` and `misalignment` metadata. Its generated
 schema has no dedicated provider-withholding code. The adapter falls back to the
-failed turn's exact error message after trimming outer whitespace. It applies the
+failed turn's exact error message after trimming outer whitespace. The captured
+native rollout uses U+2019 in “You’re.” The ASCII apostrophe spelling is also
+recognized. It applies the
 same classification to stream terminals, native turn readback and rollout history.
 The adapter uses the
-[Codex 0.167.1 TurnError message constant](../../plugins/codex/src/native/types.rs#L520)
+[Codex TurnError matcher](../../plugins/codex/src/native/types.rs#L520)
 to translate that case into the shared typed fact.
 
 A match sets `provider_response_withheld: true` and carries the shared typed
