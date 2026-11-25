@@ -75,7 +75,7 @@ impl Router {
         let limit = request.effective_limit()?;
         let projection = self
             .read_owner_projection(Some(OwnerInboxPage {
-                after: request.after,
+                after: request.into_page_after(),
                 aged_only,
                 limit,
             }))
@@ -83,7 +83,7 @@ impl Router {
         let mut page = projection.items;
         let next = if page.len() > limit {
             page.pop();
-            page.last().map(|item| item.cursor())
+            page.last().map(|item| item.page_cursor())
         } else {
             None
         };

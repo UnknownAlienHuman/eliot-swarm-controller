@@ -883,6 +883,9 @@ fn print_owner_inbox(response: &OwnerInboxResponse, json_output: bool) -> Result
             };
             println!("{}@{} · {age}", item.cursor(), item.revision);
             println!("  {}", item.reason);
+            if let Some(group) = item.group.as_ref().filter(|group| group.affected > 1) {
+                println!("  {} affected Agents", group.affected);
+            }
             if let Some(detail) = &item.detail {
                 println!("  {detail}");
             }

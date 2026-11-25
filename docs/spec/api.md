@@ -839,7 +839,7 @@ snake_case kind, subject, subject revision,
 age in milliseconds, one-line reason, optional recommended action and offered
 choices. An action names the existing method and JSON arguments that implement
 the choice. The projection includes harness requests, unknown command/turn
-outcomes, owner-required holds, unarchived lost/failed Agents, blocked Goals,
+outcomes, owner-required holds, blocked Goals,
 launch items waiting for the owner, #871 stuck objects, handoffs after a turn with
 uncertain effects (`handoff`) and [work not recorded in Git](monitoring.md#work-recorded-in-git)
 (`work_not_in_git`). For a stuck Goal
@@ -854,26 +854,36 @@ selected mutation. For every kind, the revision binds the subject facts, reason,
 offered choices, and recommendation, including the methods and arguments. An
 item gets a new revision when a recommendation appears, changes, or disappears.
 A stale item returns `stale_item`. A snooze lasts until
-the next event on that subject. Supply required inputs in `args` to fill the
+the next event on that subject. An unknown outcome remains visible until
+settled, including when an older revision has a retained snooze. Supply required inputs in `args` to fill the
 choice's displayed input fields. The same decision ID and payload reuse the
 same inner mutation ID. [Owner inbox DTOs](../../crates/eliot-core/src/api/owner_inbox.rs)
 
-By default, the `agent` item includes the latest failed Owner Resume for the
-current generation of a lost or failed Agent. A stopped Agent gets one item if
-its latest current-generation Resume failed. A newer Resume supersedes the
-prior failure unless it was cancelled. A new generation, archiving, or a
-completed handoff ends the old item's visibility. The latest failure remains
-inspectable through `agent.get`. Each command retains its own receipt. This
-projection needs no configuration key.
+Lost, failed, stopped, archived and handed-off Agents leave no general
+lifecycle reminder in the inbox. An explicit Owner Resume that failed or\nwas rejected leaves one item for a stopped, failed or lost Agent until a\nnewer non-cancelled Resume, a new generation, archiving or handoff\nsupersedes it. The item shows the exact latest failure and its receipt.\nThe Owner can still inspect an Agent and
+its latest failed Resume through `agent.get`, and inspect each exact command
+receipt. Open requests and ordinary Goal items require a current subject.
+Work-at-risk and unknown outcomes keep their own items. An applied handoff
+no longer duplicates a separately displayed unknown source command or turn.
+Exact settlement of the linked source turn also closes that handoff notice.
+A notice stays visible when the source outcome cannot be established. A
+session-loss wait records its unfinished turn when known and closes on
+exact settlement when no other turn, queued input or active Goal still
+needs that generation.
 
-Items are ordered by their opaque cursor; `after` is exclusive. `next` is the
-last returned item's cursor only when another item exists. `daemon.sidebar`
-and full `daemon.status` report counts for exactly the same reportable,
-unsnoozed projection in one read snapshot. Both fold the projection into
-per-kind totals without retaining the complete item vector; status also streams
-its liveness and health summaries. `owner.inbox` streams those summaries while
-buffering at most `limit + 1` matching items, preserving kind/subject ordering,
-the exclusive `after` cursor, and filtering `aged` items before pagination.
+Current handoff waits with the same recorded routing refusal, harness,
+profile and account appear once with `group.affected`. The oldest unsnoozed
+member supplies the exact item reference and inspection; profile review
+names the shared remedy. Inspection and snooze still bind to that displayed
+member. Counts reflect visible groups in the inbox, sidebar and status.
+`waiting_over_24h` counts decision subjects before grouping, including snoozed
+subjects. The aged page filters subjects before grouping.
+
+The projection orders work blockers before other unknown outcomes and
+work-at-risk, then recommendations and remaining notices. Kind and stable
+subject or cause identity break ties. `after` is an exclusive opaque cursor
+from `next`. The server restarts at the first page for an old kind/subject cursor. The reader bounds the page to `limit + 1` rows while folding
+routing groups and counts in the same read snapshot. No Owner key is required.
 
 For a missing worktree with a retained checkpoint, the inbox instructions include
 `git worktree prune`, `git worktree add`, and the exact
