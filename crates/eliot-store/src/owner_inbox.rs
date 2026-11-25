@@ -442,10 +442,10 @@ fn project_unknown_commands(
 ) -> eliot_core::Result<()> {
     let mut stmt = projection_query(db,
         "SELECT c.id,c.verb,c.method,c.target,c.generation,c.turn_id,c.created_at,c.state,
-                COALESCE((SELECT e.ts FROM events e
+                COALESCE((SELECT e.ts FROM events e INDEXED BY owner_inbox_unknown_receipt
                   WHERE e.kind='command.unknown'
                   AND CAST(json_extract(e.data,'$.command_id') AS TEXT)=c.id ORDER BY e.seq DESC LIMIT 1),c.updated_at),
-                COALESCE((SELECT MAX(e.seq) FROM events e
+                COALESCE((SELECT MAX(e.seq) FROM events e INDEXED BY owner_inbox_unknown_receipt
                   WHERE e.kind='command.unknown'
                   AND CAST(json_extract(e.data,'$.command_id') AS TEXT)=c.id),0),
                 json_extract(c.outcome,'$.stage'),
@@ -1064,7 +1064,7 @@ fn project_work_not_in_git(
     let mut stmt = projection_query(
         db,
         "SELECT c.agent, c.generation, c.state, c.updated_at
-         FROM git_checkpoints c JOIN agents a ON a.id = c.agent AND a.generation = c.generation
+         FROM git_checkpoints c CROSS JOIN agents a ON a.id = c.agent AND a.generation = c.generation
          WHERE a.archived = 0
            AND (c.state = 'failed'
                 OR (c.state = 'snapshot' AND a.state IN ('stopped','lost','failed')))
@@ -1439,7 +1439,7 @@ fn project_agents(
                 json_extract(aw.condition,'$.seconds'), resume.id, resume.updated_at
          FROM agents a
          LEFT JOIN commands resume ON resume.id = CASE WHEN a.state IN ('failed','lost','stopped') THEN (
-             SELECT newest.id FROM commands newest INDEXED BY commands_target
+             SELECT newest.id FROM commands newest INDEXED BY owner_inbox_resume_tip
              WHERE newest.target=a.id AND newest.generation=a.generation
                AND newest.verb='resume' AND newest.principal='owner' AND newest.state<>'cancelled'
              ORDER BY newest.created_at DESC,newest.rowid DESC LIMIT 1
@@ -1460,9 +1460,10 @@ fn project_agents(
                              AND ws.source NOT IN ('daemon','os','git','workspace_process'))))
                   ))
          WHERE a.observe_only=0 AND a.archived=0
-            AND json_type(a.profile_snapshot, '$._harness_check') IS NULL
-            AND (a.state IN ('created','starting','idle','busy','waiting','failed','lost','unknown')
-                 OR resume.id IS NOT NULL)", "a.id=?1", bindings)?;
+           AND CASE WHEN a.state IN ('created','starting','idle','busy','waiting','failed','lost','unknown')
+                     OR resume.id IS NOT NULL
+               THEN json_type(a.profile_snapshot, '$._harness_check') IS NULL
+               ELSE 0 END", "a.id=?1", bindings)?;
     let rows = stmt
         .query_map(bindings, |r| {
             Ok((

@@ -2162,7 +2162,10 @@ impl Store {
     /// unknowns: no page cap, so an older retained unknown can never hide
     /// behind the classification bound and block drain forever.
     pub fn count_retained_unknown_commands(&self) -> Result<i64> {
-        let sql = format!("SELECT COUNT(*) FROM commands WHERE {RETAINED_UNKNOWN_PREDICATE}");
+        let sql = format!(
+            "SELECT COUNT(*) FROM commands INDEXED BY commands_retained_unknown_page
+             WHERE {RETAINED_UNKNOWN_PREDICATE}"
+        );
         self.connection
             .query_row(&sql, [], |row| row.get(0))
             .map_err(sql_error)
