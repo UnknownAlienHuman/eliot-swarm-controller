@@ -535,6 +535,14 @@ Read effective model/provider/cwd/permissions from documented native fields. The
 requested effort echoed on the ChatGPT route. When an endpoint/billing fact is not
 exposed, report it as unverified rather than inventing readback. An unexpected effective route does not authorize further input.
 
+The direct route uses the native OpenAI catalogue source. A named Responses
+route uses the `model_catalog_url` derived from its frozen endpoint. Launch,
+Resume and model enumeration verify effective native configuration before
+starting a thread or listing models. A configured `model_catalog_json` takes
+precedence over those sources, so the adapter refuses it with `profile_error`
+at `plugin.codex.route.model_catalog_json`. It does not rewrite the Owner's
+configuration or substitute a different catalogue.
+
 Controlled launch resolves the effective native store through a dedicated read-only
 `profile.store` reader after workspace preparation, then commits its binding with launch
 dispatch, together with the minimal-policy MCP projection from the same config response.
