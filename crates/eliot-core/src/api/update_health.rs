@@ -70,6 +70,21 @@ pub struct UpdateStartEvidence {
     pub command_id: Option<String>,
 }
 
+#[derive(Default, JsonSchema, Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct UpdateStartSummary {
+    pub ready: usize,
+    pub not_dispatched: usize,
+    pub refused: usize,
+    pub unknown: usize,
+}
+
+impl UpdateStartSummary {
+    pub fn total(&self) -> usize {
+        self.ready + self.not_dispatched + self.refused + self.unknown
+    }
+}
+
 impl UpdateStartEvidence {
     pub fn deterministic_swarm_refusal(&self) -> bool {
         self.state == UpdateStartState::Refused
@@ -94,6 +109,8 @@ pub enum UpdateHealthResponse {
         complete: bool,
         requested: usize,
         attempts: Vec<UpdateStartEvidence>,
+        #[serde(default)]
+        summary: UpdateStartSummary,
     },
     AdapterProbe {
         evidence: UpdateStartEvidence,
