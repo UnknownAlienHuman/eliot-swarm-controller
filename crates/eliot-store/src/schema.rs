@@ -37,7 +37,7 @@ const AGENT_RESULT_READS_VERSION: i64 = 144;
 const FLUENT_READ_REVISIONS_VERSION: i64 = 145;
 const DESKTOP_USAGE_LOOKUP_VERSION: i64 = 146;
 const SWITCH_CHILD_ID_RESERVATIONS_VERSION: i64 = 147;
-const WITHHELD_FRESH_SESSION_VERSION: i64 = 150;
+const WITHHELD_FRESH_SESSION_VERSION: i64 = 148;
 
 fn has_restart_continuation_brief_column(connection: &Connection) -> Result<bool> {
     connection
