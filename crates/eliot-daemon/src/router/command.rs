@@ -1250,6 +1250,30 @@ impl Router {
             self.refresh_model_hold_for_dispatch(command).await;
             let change = {
                 let mut store = self.inner.store.lock().await;
+                if command.verb == "send" && self.lossless_quiescing() {
+                    match store.restart_send_parked(id) {
+                        Ok(true) => {
+                            let mut wake = self.inner.progress.subscribe();
+                            drop(store);
+                            while self.lossless_quiescing() {
+                                if wake.changed().await.is_err() {
+                                    return None;
+                                }
+                            }
+                            if self.inner.mode.load(Ordering::SeqCst) != super::MODE_OPEN {
+                                return None;
+                            }
+                            continue;
+                        }
+                        Ok(false) => {}
+                        Err(error) => {
+                            let write_faulted = store.is_write_faulted();
+                            drop(store);
+                            self.settle_dispatch_error(id, &error, write_faulted).await;
+                            return None;
+                        }
+                    }
+                }
                 let dispatched = match launch_binding {
                     Some((expected_agent, binding)) => store
                         .dispatch_with_native_store_binding(

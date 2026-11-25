@@ -2172,7 +2172,9 @@ HEAD branches, and a clean status. Store durably retains the original and observ
 branch names; cleanup continues to use the original frozen branch. Dirty or ambiguous
 worktrees remain fenced for Owner inspection.
 
-`swarm daemon update --interrupt-on-deadline` uses the ordinary Stop custody
+`swarm daemon update --wait-seconds N` allows 1–1800 seconds for admitted work
+to drain naturally, with a 60-second default. The CLI reports active turn ages
+during the wait. With `--interrupt-on-deadline` it uses the ordinary Stop custody
 path for captured active turns after the wait expires. Under `continue`, an
 applied Stop with proven process exit and native source drain allows resume with
 the same framed Swarm continuation brief after replacement or rollback. The Owner

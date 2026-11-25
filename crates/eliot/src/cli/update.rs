@@ -1,6 +1,6 @@
 //! Replace a running daemon without replaying an Agent input.
 
-use super::daemon::{STARTUP_WAIT, shutdown_daemon};
+use super::daemon::{STARTUP_WAIT, daemon_now_ms, shutdown_daemon};
 use super::operator::{
     agents, check_same_daemon, require_running, start_owned, start_update, status, wait_for_exit,
 };
@@ -209,7 +209,8 @@ async fn run_update(
         .filter(|agent| !agent.state.is_terminal())
         .map(|agent| json!({"agent": agent.id, "generation": agent.generation, "state": agent.state}))
         .collect::<Vec<_>>();
-    let prepare = DaemonShutdownRequest::new(mutation_id(None)?, ShutdownMode::PrepareRestart);
+    let mut prepare = DaemonShutdownRequest::new(mutation_id(None)?, ShutdownMode::PrepareRestart);
+    prepare.drain_seconds = Some(wait_seconds);
     let mut commit = DaemonShutdownRequest::new(mutation_id(None)?, ShutdownMode::Restart);
     commit.restart_id = Some(prepare.id.clone());
     commit.backup = true;
@@ -244,6 +245,12 @@ async fn run_update(
     .await;
     let commit_reply_uncertain = committed.is_err();
     if let Err(error) = committed {
+        if error.message.contains("drain_seconds") && error.message.contains("unknown field") {
+            return Err(Failure::new(
+                2,
+                "daemon update requires a daemon that supports lossless restart drains (drain_seconds); no restart effect was applied",
+            ));
+        }
         match reconcile_preparation(&data_dir, &old, &cancel).await {
             result @ (Preparation::Open | Preparation::Unconfirmed) => {
                 let recovered = matches!(result, Preparation::Open);
@@ -570,17 +577,8 @@ async fn quiesce(
     stopped: &mut Vec<StoppedAgent>,
 ) -> Result<(), Failure> {
     call_shutdown(path, prepare).await?;
-    // Stop through the native protocol while terminal events can still commit.
-    // A forced process exit can leave the retained session marked busy.
-    Box::pin(stop_active_turns(
-        path,
-        old,
-        Instant::now() + INTERRUPT_SETTLE_WAIT,
-        stopped,
-        |agent| HarnessCapabilities::of(&agent.harness).restart_requires_idle,
-    ))
-    .await?;
     let mut deadline = Instant::now() + wait;
+    let mut next_report = Instant::now();
     loop {
         check_same_daemon(path, old)?;
         match call_shutdown(path, commit).await {
@@ -602,11 +600,60 @@ async fn quiesce(
             }
             Err(error) => return Err(error),
         }
+        if Instant::now() >= next_report {
+            report_restart_progress(path).await;
+            next_report = Instant::now() + Duration::from_secs(5);
+        }
         #[expect(
             clippy::disallowed_methods,
-            reason = "The update command waits for the replacement daemon's readiness"
+            reason = "The update command polls restart settlement and reports drain progress"
         )]
-        sleep(Duration::from_millis(200)).await;
+        sleep(Duration::from_millis(200).min(deadline.saturating_duration_since(Instant::now())))
+            .await;
+    }
+}
+
+async fn report_restart_progress(path: &Path) {
+    let report = timeout(Duration::from_secs(2), status(path)).await;
+    let Ok(Ok(snapshot)) = report else {
+        eprintln!("Update drain status unavailable");
+        return;
+    };
+    let Some(drain) = snapshot.drain else {
+        return;
+    };
+    eprintln!(
+        "Update drain: {} running turn(s){}",
+        drain.running_turns_count,
+        if drain.running_turns_truncated {
+            " (status list truncated)"
+        } else {
+            ""
+        }
+    );
+    let starts = timeout(
+        Duration::from_secs(2),
+        futures::future::join_all(drain.running_turns.iter().map(|turn| async {
+            let request =
+                TurnGetRequest::new(turn.agent.clone(), turn.generation, turn.turn_id.clone());
+            eliot_daemon::client_call_typed::<_, eliot_core::Turn>(path, "turn.get", &request)
+                .await
+                .ok()
+                .and_then(|turn| turn.started_at)
+        })),
+    )
+    .await
+    .unwrap_or_default();
+    let now = daemon_now_ms() as i64;
+    for (index, turn) in drain.running_turns.iter().enumerate() {
+        let age = starts.get(index).copied().flatten().map_or_else(
+            || "age unavailable".to_owned(),
+            |started| format!("active for {}s", now.saturating_sub(started).max(0) / 1_000),
+        );
+        eprintln!(
+            "  turn {} · agent {} generation {} · {}",
+            turn.turn_id, turn.agent, turn.generation, age
+        );
     }
 }
 

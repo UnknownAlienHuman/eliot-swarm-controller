@@ -278,7 +278,7 @@ fn dispatch_resume_tx(
     workspace::gate_workspace_start(tx, agent, &command.command, next_generation)?;
     capacity::require_reservation_tx(tx, agent_num, next_generation)?;
     for old_id in pending_command_ids(tx, agent_num, agent.generation)? {
-        if old_id == id {
+        if old_id == id || super::restart_queue::is_parked(tx, &old_id)? {
             continue;
         }
         let outcome = json!({"reason": "generation_resumed"});

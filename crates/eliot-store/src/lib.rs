@@ -29,6 +29,7 @@ mod git_integration_custody;
 mod projects;
 pub use git_integration_custody::IntegrationCustody;
 mod provider_holds;
+mod restart_queue;
 mod result_page;
 mod rules;
 mod scripts;
@@ -153,7 +154,8 @@ const RESTART_COMMANDS_WHERE: &str = "state = 'dispatched'
     OR (state IN ('accepted', 'queued') AND NOT (
             verb = 'inject' AND principal GLOB 'swarm_note:*'
             AND COALESCE(json_extract(args, '$.point'), '') IN ('next_input', 'turn_safe_point')
-        ) AND NOT (state = 'queued' AND target IS NOT NULL AND EXISTS (
+        ) AND NOT EXISTS (SELECT 1 FROM restart_deferred_sends d WHERE d.command_id = commands.id)
+        AND NOT (state = 'queued' AND target IS NOT NULL AND EXISTS (
             SELECT 1 FROM agents a WHERE a.id = commands.target
               AND (commands.generation < a.generation OR (
                 commands.generation = a.generation AND (
@@ -161,6 +163,33 @@ const RESTART_COMMANDS_WHERE: &str = "state = 'dispatched'
                   OR EXISTS(SELECT 1 FROM agent_successors h WHERE h.agent = a.id
                       AND h.generation = commands.generation))))
         )))";
+fn has_restart_work_on(connection: &Connection, lossless: bool) -> Result<bool> {
+    let needs_idle = core::api::SUPPORTED_HARNESSES
+        .iter()
+        .filter(|harness| core::api::HarnessCapabilities::of(harness).restart_requires_idle)
+        .collect::<Vec<_>>();
+    let active: bool = connection
+        .prepare_cached(
+            "SELECT EXISTS(SELECT 1 FROM agents WHERE observe_only=0 AND
+           (state IN ('created','starting') OR
+            ((active_turn IS NOT NULL OR state IN ('busy','waiting'))
+              AND (?1 OR harness IN (SELECT value FROM json_each(?2))))))",
+        )
+        .map_err(sql_error)?
+        .query_row(params![lossless, encode_json(&needs_idle)?], |row| {
+            row.get(0)
+        })
+        .map_err(sql_error)?;
+    if active {
+        return Ok(true);
+    }
+    let sql = format!("SELECT EXISTS(SELECT 1 FROM commands WHERE {RESTART_COMMANDS_WHERE})");
+    connection
+        .prepare_cached(&sql)
+        .map_err(sql_error)?
+        .query_row([], |row| row.get(0))
+        .map_err(sql_error)
+}
 const COMMAND_RECORD_SELECT: &str = command_record_select!();
 /// Live Agent rows that can still produce work. Shared by the bounded drain
 /// list and its total for the same honest-truncation reason as unsettled
@@ -195,7 +224,8 @@ const RECOVER_ACCEPTED_COMMAND_FILTER: &str =
            AND NOT EXISTS (SELECT 1 FROM workspaces w WHERE w.agent = commands.target AND w.start_command_id = commands.id))
        OR (link_kind = 'switch' AND ordinal = 2 AND verb = 'stop' AND state = 'accepted'
            AND EXISTS (SELECT 1 FROM commands p WHERE p.id = commands.parent_command
-                       AND p.method = 'swarm.switch' AND p.state = 'failed')))";
+                       AND p.method = 'swarm.switch' AND p.state = 'failed')))
+       AND NOT EXISTS (SELECT 1 FROM restart_deferred_sends d WHERE d.command_id=commands.id)";
 
 /// Retained-unresolved unknowns as a SQL predicate over durable Store facts
 /// (on the `commands` table, without alias): a stored `unknown` command whose
@@ -1239,23 +1269,10 @@ impl Store {
             ));
         }
         if seal {
-            // The router's preflight can race with command admission. Recheck
-            // the diagnostics predicate under this immediate transaction,
-            // before writing restart gaps or the receipt.
-            let restart_commands: bool = tx
-                .query_row(
-                    &format!(
-                        "SELECT EXISTS(SELECT 1 FROM commands WHERE {RESTART_COMMANDS_WHERE})"
-                    ),
-                    [],
-                    |row| row.get(0),
-                )
-                .map_err(sql_error)?;
-            if restart_commands {
-                return Err(Error::new(
-                    "restart_busy",
-                    "commands still block daemon restart",
-                ));
+            // Recheck under the immediate transaction before gaps and receipt.
+            let lossless = semantic_payload["lossless_drain"] == true;
+            if has_restart_work_on(&tx, lossless)? {
+                return Err(Error::new("restart_busy", "admitted work is still running"));
             }
             for (agent, generation) in native_sources {
                 let agent_num = parse_agent_id(agent)?;
@@ -1273,6 +1290,19 @@ impl Store {
                         &tx, &current, id, now,
                     )?);
                 }
+            }
+        }
+        if method == "daemon.shutdown" && !seal {
+            match semantic_payload["mode"].as_str() {
+                Some("prepare_restart") if semantic_payload["drain_seconds"].is_u64() => {
+                    restart_queue::park(&tx, id)?;
+                }
+                Some("cancel_restart") => {
+                    if let Some(restart_id) = semantic_payload["restart_id"].as_str() {
+                        restart_queue::unpark(&tx, restart_id)?;
+                    }
+                }
+                _ => {}
             }
         }
         validate_id_age(id, now)?;
@@ -2014,33 +2044,9 @@ impl Store {
             .map_err(sql_error)
     }
 
-    /// Exact gate for a planned restart. The router holds the writer while
-    /// evaluating this gate and closing the last control admissions.
-    pub fn has_restart_work(&self) -> Result<bool> {
-        let needs_idle = core::api::SUPPORTED_HARNESSES
-            .iter()
-            .filter(|harness| core::api::HarnessCapabilities::of(harness).restart_requires_idle)
-            .collect::<Vec<_>>();
-        // Some runtimes preserve a busy session across process exit. Their
-        // turns must reach a terminal before we seal the Store.
-        let starting: bool = self
-            .connection
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM agents WHERE observe_only = 0 AND
-                (state IN ('created', 'starting') OR
-                 ((active_turn IS NOT NULL OR state IN ('busy','waiting'))
-                   AND harness IN (SELECT value FROM json_each(?1)))))",
-                [encode_json(&needs_idle)?],
-                |row| row.get(0),
-            )
-            .map_err(sql_error)?;
-        if starting {
-            return Ok(true);
-        }
-        let sql = format!("SELECT EXISTS(SELECT 1 FROM commands WHERE {RESTART_COMMANDS_WHERE})");
-        self.connection
-            .query_row(&sql, [], |row| row.get(0))
-            .map_err(sql_error)
+    /// Cheap preflight before backing up. The seal repeats it in its own transaction.
+    pub fn has_restart_work(&self, lossless: bool) -> Result<bool> {
+        has_restart_work_on(&self.connection, lossless)
     }
 
     pub fn restart_command_blockers(&self, limit: i64) -> Result<Vec<(String, String, String)>> {

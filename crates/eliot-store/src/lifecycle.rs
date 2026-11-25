@@ -266,6 +266,13 @@ impl Store {
             )?;
         }
 
+        if record.command.verb == "resume"
+            && state == CommandState::Applied
+            && let (Some(agent), Some(generation)) = (target, generation)
+        {
+            super::restart_queue::release_after_resume(&tx, agent, generation, now, &mut events)?;
+        }
+
         if record.command.verb == "send" && state != CommandState::Applied {
             context::settle_send_claims_tx(tx, &record, state, now, &mut events)?;
         }
@@ -1557,8 +1564,9 @@ pub(super) fn stop_exited_idle_on_restart_tx(
                AND t.generation = a.generation AND t.state IN ('running', 'unknown'))
            AND NOT EXISTS (SELECT 1 FROM pending_requests r WHERE r.agent = a.id
                AND r.generation = a.generation AND r.state = 'pending')
-           AND NOT EXISTS (SELECT 1 FROM commands c WHERE c.target = a.id
-               AND c.generation = a.generation AND c.state IN ('accepted', 'queued', 'dispatched', 'unknown'))",
+           AND NOT EXISTS (SELECT 1 FROM commands c WHERE c.target=a.id AND c.generation=a.generation
+             AND (c.state IN ('dispatched','unknown') OR (c.state IN ('accepted','queued')
+               AND NOT EXISTS (SELECT 1 FROM restart_deferred_sends d WHERE d.command_id=c.id))))",
         params![now, agent, generation],
     ));
     if stopped == 0 {
@@ -1684,7 +1692,10 @@ pub(super) fn transition_lost_tx(
         )?);
     }
     for command_id in pending_command_ids(tx, agent_num, generation)? {
-        if super::handoff::held_successor_tx(tx, &command_id)? {
+        if super::handoff::held_successor_tx(tx, &command_id)?
+            || (reason == core::DAEMON_RESTART_REASON
+                && super::restart_queue::is_parked(tx, &command_id)?)
+        {
             continue;
         }
         cancel_pending_command_tx(

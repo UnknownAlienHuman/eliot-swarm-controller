@@ -27,6 +27,7 @@ const ATTENTION_ENDPOINTS_CUSTODY_VERSION: i64 = 134;
 const PROJECT_OVERVIEW_GIT_VERSION: i64 = 135;
 const BROKEN_NATIVE_SESSION_VERSION: i64 = 136;
 const CHILD_CLEANUP_VERSION: i64 = 137;
+const RESTART_DEFERRED_SENDS_VERSION: i64 = 138;
 const RESTART_CONTINUATION_BRIEF_VERSION: i64 = 139;
 const NEXT_INPUT_CONTEXT_EXPIRY_VERSION: i64 = 140;
 
@@ -254,6 +255,37 @@ impl Store {
                      WHERE state = 'pending' OR (state = 'kept' AND notice_delivered = 0);
                  INSERT INTO schema_migrations(version) VALUES (137);"
             ).map_err(sql_error)?;
+            tx.commit().map_err(sql_error)?;
+        }
+        // Migration 139 shipped before 138. Use the receipt rather than the
+        // maximum version to decide whether parked SEND custody is available.
+        let has_restart_deferred_sends: bool = self
+            .connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version = ?1)",
+                [RESTART_DEFERRED_SENDS_VERSION],
+                |row| row.get(0),
+            )
+            .map_err(sql_error)?;
+        if !has_restart_deferred_sends {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            tx.execute_batch(
+                "CREATE TABLE restart_deferred_sends (
+                   command_id TEXT PRIMARY KEY NOT NULL REFERENCES commands(id) ON DELETE CASCADE,
+                   restart_id TEXT NOT NULL,
+                   native_scope TEXT NOT NULL,
+                   native_ref TEXT NOT NULL
+                 );",
+            )
+            .map_err(sql_error)?;
+            tx.execute(
+                "INSERT INTO schema_migrations(version) VALUES (?1)",
+                [RESTART_DEFERRED_SENDS_VERSION],
+            )
+            .map_err(sql_error)?;
             tx.commit().map_err(sql_error)?;
         }
         if current < RESTART_CONTINUATION_BRIEF_VERSION {

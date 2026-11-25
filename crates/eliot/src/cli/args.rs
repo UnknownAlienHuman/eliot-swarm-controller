@@ -1296,12 +1296,12 @@ pub(crate) enum DaemonAction {
         #[arg(long)]
         dry_run: bool,
     },
-    /// Stop Agents, drain the daemon and start a new release.
+    /// Drain admitted work and start a new daemon release.
     Update {
         /// Release directory or path to the replacement Swarm executable.
         release: PathBuf,
         /// Maximum seconds to let already-admitted work finish.
-        #[arg(long, default_value_t = 60, value_parser = clap::value_parser!(u64).range(1..=90))]
+        #[arg(long, default_value_t = 60, value_parser = clap::value_parser!(u64).range(1..=eliot_core::api::MAX_UPDATE_DRAIN_SECS))]
         wait_seconds: u64,
     },
 }

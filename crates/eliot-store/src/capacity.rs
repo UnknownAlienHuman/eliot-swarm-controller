@@ -75,7 +75,9 @@ fn restart_resume_eligibility() -> String {
     AND NOT EXISTS (
         SELECT 1 FROM commands c
         WHERE c.target = a.id AND c.generation = a.generation
-          AND (c.state IN ('accepted', 'queued', 'dispatched', 'unknown')
+          AND (c.state IN ('dispatched', 'unknown')
+               OR (c.state IN ('accepted','queued')
+                   AND NOT EXISTS (SELECT 1 FROM restart_deferred_sends d WHERE d.command_id=c.id))
                OR (c.verb = 'stop' AND c.principal = 'owner' AND c.state = 'applied')
                OR (c.verb = 'stop' AND c.state = 'cancelled'
                    AND json_extract(c.outcome, '$.reason') = 'generation_lost')

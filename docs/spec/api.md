@@ -3200,23 +3200,36 @@ it and read the event high-water mark and Agent projection. The temporary copy
 is removed before the admission fence. A failed check leaves the old daemon in
 service. The running daemon uses the planned-restart
 `daemon.shutdown` modes. `prepare_restart` records a bounded admission
-fence before the CLI submits any Agent Stop commands. A new launch, including
-`child.run`, is refused during the fence with `daemon_update_in_progress`
-and an instruction to retry after the update. Previously queued launches stay
-queued. The writer accepts `restart` after Agent starts, unsettled commands
-and daemon-owned workers settle. Queued commands left on stopped or handed-off
-Agents, and commands queued for an older generation, are excluded from this gate. A restart refusal names the blocking
-commands by verb, ID and state, with a bounded list. Claude requires a native terminal before
-replacement. The CLI stops an exact busy Claude generation under the fence
-and verifies its terminal, process exit, and reader drain while the Store is
-still writable. Other in-flight native turns can be interrupted during
-restart. Unclaimed deferred notes are cancelled with their old generation.
-The default deadline action is `cancel_restart`,
-which reopens the same daemon. With `--interrupt-on-deadline`, the CLI sends
-ordinary non-force Stop commands bound to the captured Agent generations and
-active turns, submitting busy roots first. It allows a bounded interval for
-custody and restart settlement.
-Failure to settle cancels the restart. The fence also expires if its client disappears. Before
+fence and parks admitted, never-dispatched direct SENDs for controlled
+sessions. The command must target the current generation without an explicit
+generation or turn constraint. Linked and selector inputs retain their own
+admission rules. New work is refused during the fence. Stop and native
+request-resolution controls remain available so admitted turns can progress.
+The CLI reports active turn IDs, Agent generations and elapsed age to stderr.
+The writer waits for every controlled turn, start and already-dispatched
+command to settle, plus daemon-owned workers. Queued commands on stopped or
+handed-off Agents and commands queued for an older generation are excluded
+from this gate. A restart refusal names the blocking commands by verb, ID and
+state in a bounded list. Unclaimed deferred Swarm notes
+retain their existing restart behavior.
+
+The previous 90-second CLI ceiling left time inside the fixed 120-second
+admission lease for interruption and settlement. The lossless preparation
+carries a wait budget of 1–1800 seconds (default 60). Bound restart attempts renew
+the short 120-second inactivity lease within an absolute ceiling of the wait
+budget plus 60 seconds. Expiry or confirmed cancellation releases the parked
+rows to the old daemon and reopens admission. At its deadline the CLI cancels by
+default. With `--interrupt-on-deadline` it first uses ordinary non-force Stop for
+the captured active turns, busy roots first, and allows the bounded custody and
+settlement interval before cancellation.
+
+Parked rows are durable before the online backup. The seal transaction repeats
+the readiness check before writing its receipt. After an applied Resume on the
+same native subject, parked SENDs retain their original IDs and FIFO order and
+receive the new execution generation. A held, failed or uncertain Resume keeps
+the parked rows pending. Dispatched and unknown input is excluded from parking
+and remains subject to normal recovery.
+Before
 committing the restart, the writer checks free space, creates an online
 SQLite backup next to `eliot.db`, and verifies SQLite integrity and the
 source page count. The restart receipt commits only after the old Store
