@@ -147,9 +147,10 @@ impl DesktopApp {
     /// history, or a panel kind the daemon counts. The read is decided by
     /// these facts as they stand, never by the order the reads arrive in,
     /// so a restart rebuilds the panel from the inbox. One read is in
-    /// flight at a time, and only for facts not already read: a detail
-    /// refresh with the same facts reads nothing, and facts that change
-    /// during a read are read on its reply.
+    /// flight at a time. With nothing shown it reads only for facts not
+    /// already read: a detail refresh with the same facts reads nothing,
+    /// and facts that change during a read are read on its reply. While an
+    /// item shows, each detail read checks it again.
     pub(in crate::ui) fn read_decisions(&mut self, context: &ComponentContext<Self>) {
         let (Some(agent), Some(detail), Ok(data_dir)) = (
             self.selected_agent_id(),
@@ -184,7 +185,15 @@ impl DesktopApp {
             }
             return;
         }
-        if self.chat.decisions_facts.as_ref() == Some(&facts) {
+        // While the panel shows an item, every detail read checks it again:
+        // its revision changes with events the facts do not count (a new
+        // attention report), and a choice on a stale revision is refused.
+        let showing = self
+            .chat
+            .decisions
+            .as_ref()
+            .is_some_and(|(shown, items, _)| *shown == agent && !items.is_empty());
+        if !showing && self.chat.decisions_facts.as_ref() == Some(&facts) {
             return;
         }
         if self.chat.decisions_reading {
@@ -311,6 +320,9 @@ impl DesktopApp {
             )),
             Err(error) => self.alert(format!("{words} refused: {}", error.user_message())),
         }
+        // The panel reads the inbox again after any choice: a resolved item
+        // leaves, and a refused one (a stale revision) shows its current one.
+        self.chat.decisions_facts = None;
         self.queue_reread(
             Invalidation {
                 detail: true,
