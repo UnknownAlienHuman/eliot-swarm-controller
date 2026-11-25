@@ -31,7 +31,7 @@ use eliot_core::local_provider::LocalProvider;
 use eliot_core::{Error, FailureOrigin, Result, SecretPolicy};
 use eliot_plugin::{
     StderrCapture,
-    retry::{NATIVE_READINESS_BUDGET, RetryOperation, poll_idempotent},
+    retry::{NATIVE_READINESS_BUDGET, Retry, RetryFact, RetryOperation, poll_idempotent},
     session::paths_equal,
     skill, spawn_stderr, spawn_stderr_with_line_signal,
 };
@@ -43,6 +43,7 @@ use tokio::process::Command;
 use tokio::{
     net::TcpListener,
     process::Child,
+    sync::oneshot,
     time::{Instant, timeout_at},
 };
 
@@ -680,11 +681,15 @@ impl OwnedServer {
         // Both pipes drain continuously with the shared redacting tail;
         // stdout carries the `server listening` line and MCP spawn notes.
         let capture = std::sync::Arc::new(capture);
+        let (listen_signal, listening) = oneshot::channel();
         let stdout = spawn_stderr_with_line_signal(
             stdout,
             capture.clone(),
             format!("server listening on http://127.0.0.1:{port}"),
-            || drop(super::startup::Step::new("server_listening")),
+            move || {
+                drop(super::startup::Step::new("server_listening"));
+                let _ = listen_signal.send(());
+            },
         );
         let stderr = spawn_stderr(stderr, capture.clone());
 
@@ -701,7 +706,7 @@ impl OwnedServer {
         // full 60 s bound, but the whole launch still answers inside the
         // daemon agent.start budget.
         let ready_deadline = (Instant::now() + NATIVE_READINESS_BUDGET).min(envelope);
-        if let Err(error) = server.await_ready(ready_deadline).await {
+        if let Err(error) = server.await_launch_ready(listening, ready_deadline).await {
             // Bounded best-effort cleanup: the generation Job reaps anything
             // left once the daemon retires the plugin on the failed value,
             // so a wedged child cannot stack another minute here. The
@@ -715,6 +720,26 @@ impl OwnedServer {
         Ok(server)
     }
 
+    /// Wait for the owned server's native listening line. Older outputs or
+    /// slow/redirection cases fall back after one normal poll interval.
+    /// Neither the line nor the timeout can establish server identity.
+    async fn await_launch_ready(
+        &mut self,
+        listening: oneshot::Receiver<()>,
+        deadline: Instant,
+    ) -> Result<()> {
+        let mut fallback = Retry::new(RetryOperation::ReadinessPoll);
+        let exited = tokio::select! {
+            result = self.child.wait() => Some(result),
+            _ = listening => None,
+            _ = fallback.wait(RetryFact::Idempotent, Some(deadline)) => None,
+        };
+        if let Some(status) = exited {
+            return Err(self.startup_exit_error(status));
+        }
+        self.await_ready(deadline).await
+    }
+
     /// Poll `GET /api/config` until it proves the live server is ours: the
     /// password authenticates it and the config documents name our
     /// per-Agent config file. An early child exit fails fast with the
@@ -723,39 +748,12 @@ impl OwnedServer {
         use std::ops::ControlFlow;
 
         poll_idempotent(RetryOperation::ReadinessPoll, deadline, async || {
-            let status = self.child.try_wait().map_err(|error| {
-                Error::new(
-                    "native_spawn",
-                    format!("OpenCode serve exit readback failed: {error}"),
-                )
-            });
-            let status = match status {
-                Ok(status) => status,
-                Err(error) => return ControlFlow::Break(Err(error)),
-            };
-            if let Some(status) = status {
-                let tail = self
-                    .stderr
-                    .as_ref()
-                    .map(|stderr| stderr.snapshot().text)
-                    .unwrap_or_default();
-                return ControlFlow::Break(Err(Error::new(
-                    "native_spawn",
-                    format!(
-                        "OpenCode serve exited during startup ({status}){}",
-                        if tail.trim().is_empty() {
-                            String::new()
-                        } else {
-                            format!(": {}", tail.lines().last().unwrap_or_default())
-                        }
-                    ),
-                )
-                .with_where("plugin.opencode.start.spawn")
-                .with_exit(status.code())
-                .with_origin(
-                    FailureOrigin::Environment,
-                    "native serve process exited during startup",
-                )));
+            match self.child.try_wait() {
+                Ok(None) => {}
+                Ok(Some(status)) => {
+                    return ControlFlow::Break(Err(self.startup_exit_error(Ok(status))));
+                }
+                Err(error) => return ControlFlow::Break(Err(self.startup_exit_error(Err(error)))),
             }
             let _timing = super::startup::Step::new("serve_config_probe");
             match self.http.get_config(deadline).await {
@@ -772,6 +770,39 @@ impl OwnedServer {
                 "OpenCode serve did not become ready before its deadline",
             ))
         })
+    }
+
+    fn startup_exit_error(&self, status: std::io::Result<std::process::ExitStatus>) -> Error {
+        let status = match status {
+            Ok(status) => status,
+            Err(error) => {
+                return Error::new(
+                    "native_spawn",
+                    format!("OpenCode serve exit readback failed: {error}"),
+                );
+            }
+        };
+        let tail = self
+            .stderr
+            .as_ref()
+            .map(|stderr| stderr.snapshot().text)
+            .unwrap_or_default();
+        let detail = tail
+            .lines()
+            .last()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| format!(": {line}"))
+            .unwrap_or_default();
+        Error::new(
+            "native_spawn",
+            format!("OpenCode serve exited during startup ({status}){detail}"),
+        )
+        .with_where("plugin.opencode.start.spawn")
+        .with_exit(status.code())
+        .with_origin(
+            FailureOrigin::Environment,
+            "native serve process exited during startup",
+        )
     }
 
     pub fn pid(&self) -> Option<u32> {
