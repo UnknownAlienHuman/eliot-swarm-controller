@@ -61,6 +61,7 @@ pub(super) fn is_route_selector_env_name(name: &str) -> bool {
 
 pub fn declaration() -> HarnessCapabilities {
     HarnessCapabilities {
+        catalogue_provider: eliot_core::api::harness::CatalogueProvider::Fixed("openai"),
         instruction_inventory: crate::instructions::INSTRUCTION_INVENTORY,
         model_login_source: Some(eliot_core::api::harness::ModelLoginSource::Files {
             root_env: "CODEX_HOME",
@@ -79,6 +80,7 @@ pub fn declaration() -> HarnessCapabilities {
             }),
         }),
         native_route: NativeRoute::ResponsesProxy {
+            endpoint_keys: &["codex"],
             reserved_providers: &[
                 "openai",
                 "amazon-bedrock",
@@ -89,6 +91,16 @@ pub fn declaration() -> HarnessCapabilities {
             ],
         },
         profile: ProfileCapabilities {
+            read_only_markers: &[("collaboration_mode", "plan")],
+            named_profile: Some(crate::profile_config::MAPPING),
+            environment: eliot_core::api::harness::ProfileEnvironment {
+                auth_scope: CODEX_PROXY_SELECTOR_ENV_NAMES,
+                cleanup_roots: CODEX_PROXY_SELECTOR_ENV_NAMES,
+                protected_env: CODEX_PROXY_SELECTOR_ENV_NAMES,
+                protected_home_paths: &[".codex"],
+                protected_cleanup_names: &[".codex"],
+                ..Default::default()
+            },
             script_wrapper_cmd: true,
             project_doc_max_bytes: true,
             native_subagents_policy: Some(NativeSubagentsPolicy::deny_by_default()),
@@ -124,11 +136,25 @@ pub fn declaration() -> HarnessCapabilities {
         provider_response_withholding: true,
         provider_response_route_identity: Some(response_route_identity),
         route_client_key_env_selector: Some(is_route_selector_env_name),
-        owner_rules_delivery: eliot_core::api::OwnerRulesDeliveryMethod::CodexDeveloperInstructions,
+        owner_rules_delivery: eliot_core::api::OwnerRulesDeliveryMethod::DeveloperInstructions,
         project_instruction_read: crate::instructions::PROJECT_READ,
         user_instruction_files: crate::instructions::USER_FILES,
         requires_pass_env: true,
-        requires_frozen_store_inputs: true,
+        frozen_store_environment: Some(eliot_core::api::harness::FrozenStoreEnvironment {
+            display_name: "Codex",
+            selectors: CODEX_PROXY_SELECTOR_ENV_NAMES,
+            account_identity_keys: &[
+                ("codex_home", "CODEX_HOME"),
+                ("codex_sqlite_home", "CODEX_SQLITE_HOME"),
+            ],
+            private_directory: "codex-home",
+            guard_file: "config.toml",
+            direct_login_refusal: (
+                "stand_codex_login_unsupported",
+                "Codex ChatGPT/OAuth login is unavailable in a private stand; select a named Codex profile with an adopted Responses proxy",
+            ),
+            binding_refusal: "Codex on a private stand requires its stand-owned home and SQLite root; launch a fresh Agent if the retained store is outside the stand",
+        }),
         native_discovery: true,
         resume_previous_turn: true,
         reconcile_unfinished_tools: true,
@@ -139,7 +165,7 @@ pub fn declaration() -> HarnessCapabilities {
         compact: true,
         observed_families: eliot_core::OBSERVED_ROLLOUT_FAMILIES,
         observed_live_families: eliot_core::OBSERVED_ROLLOUT_FAMILIES,
-        native_child_families: &eliot_core::CODEX_NATIVE_CHILD_FAMILIES,
+        native_child_families: NATIVE_CHILD_FAMILIES,
         executable_stems: &["codex"],
         windows_detached_stdio: true,
         version_prefixes: &["codex-cli", "codex"],
@@ -183,3 +209,5 @@ fn native_access_bounds(snapshot: &Value) -> Option<NativeAccessBounds> {
         _ => None,
     }
 }
+
+pub(super) const NATIVE_CHILD_FAMILIES: &[&str] = &["session", "turn", "message"];

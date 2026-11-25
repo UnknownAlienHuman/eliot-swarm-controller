@@ -10,10 +10,36 @@ use std::{ffi::OsString, path::Path};
 pub const MODEL: &str = "claude-haiku-5-5";
 
 pub const ADAPTER: TextInferenceAdapter = TextInferenceAdapter {
+    executable_key: "claude_executable",
+    decode_route,
+    invalid_executable: "inference requires the installed absolute Claude executable",
+    credentials_file: ".credentials.json",
+    credentials_unavailable: "private Claude login is unavailable",
+    credential_values,
     arguments,
     environment,
     result,
 };
+
+fn decode_route(bytes: &[u8]) -> Option<std::path::PathBuf> {
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Route {
+        claude_executable: std::path::PathBuf,
+    }
+    serde_json::from_slice::<Route>(bytes)
+        .ok()
+        .map(|route| route.claude_executable)
+}
+
+fn credential_values(native: &serde_json::Value) -> [Option<&str>; 2] {
+    ["accessToken", "refreshToken"].map(|key| {
+        native
+            .get("claudeAiOauth")
+            .and_then(|oauth| oauth.get(key))
+            .and_then(serde_json::Value::as_str)
+    })
+}
 
 fn environment(native_home: &Path) -> Vec<(&'static str, OsString)> {
     // The native refusal predicate has separate switches from HTTP retry.

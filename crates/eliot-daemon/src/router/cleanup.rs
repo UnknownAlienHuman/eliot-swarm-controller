@@ -120,20 +120,16 @@ fn validate_cleanup_path(path: &Path) -> Result<()> {
 }
 
 fn require_cleanup_outside_native_home(canonical: &Path) -> Result<()> {
-    for env in [
-        "USERPROFILE",
-        "HOME",
-        "CODEX_HOME",
-        "CODEX_SQLITE_HOME",
-        "CLAUDE_CONFIG_DIR",
-    ] {
+    let home_roots = ["USERPROFILE", "HOME"]
+        .into_iter()
+        .map(|name| (name, false));
+    let native_roots = crate::config::profile_environments()
+        .flat_map(|profile| profile.cleanup_roots.iter().map(|&name| (name, true)));
+    for (env, protect_descendants) in home_roots.chain(native_roots) {
         if let Some(home) = std::env::var_os(env).and_then(|p| std::fs::canonicalize(p).ok())
             && (canonical == home
                 || home.starts_with(canonical)
-                || (matches!(
-                    env,
-                    "CODEX_HOME" | "CODEX_SQLITE_HOME" | "CLAUDE_CONFIG_DIR"
-                ) && canonical.starts_with(home)))
+                || (protect_descendants && canonical.starts_with(home)))
         {
             return Err(Error::new(
                 "not_allowed",

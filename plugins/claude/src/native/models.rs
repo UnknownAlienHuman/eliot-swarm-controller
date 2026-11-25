@@ -2,7 +2,8 @@
 
 use std::{ffi::OsString, path::Path, time::Duration};
 
-use eliot_core::{Error, Result, SecretPolicy, api::native_profile::CLAUDE_EFFORT_LEVELS};
+use crate::CLAUDE_EFFORT_LEVELS;
+use eliot_core::{Error, Result, SecretPolicy};
 use eliot_plugin::{
     native_transport::NativeLaunch,
     protocol::{ModelListParams, ModelListPart},

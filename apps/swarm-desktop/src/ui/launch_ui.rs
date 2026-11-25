@@ -422,7 +422,7 @@ impl DesktopApp {
                 claude_efforts: if effort_locked {
                     &[]
                 } else {
-                    eliot_daemon::CLAUDE_EFFORT_LEVELS
+                    eliot::profile_vocabulary::CLAUDE_EFFORT_LEVELS
                 },
             });
             if preview.is_some() {
@@ -451,7 +451,7 @@ impl DesktopApp {
             current: preset_current.as_ref().unwrap_or(&self.launch.choice),
             auto_detail: &auto_detail,
             efforts: &self.launch.efforts,
-            claude_efforts: eliot_daemon::CLAUDE_EFFORT_LEVELS,
+            claude_efforts: eliot::profile_vocabulary::CLAUDE_EFFORT_LEVELS,
         });
         if let Some(error) = self.launch.catalog_refresh_error.as_deref() {
             // The cached catalogue remains usable, but make a failed refresh
@@ -2022,14 +2022,14 @@ pub(super) fn agent_access_label(settings: &crate::configure::Settings) -> Strin
 
 /// The access chip's words for a profile's permissions.
 pub(super) fn access_label(permissions: Option<&str>) -> String {
-    use eliot_core::api::native_profile::CodexPermissions;
+    use eliot_core::api::native_profile::SandboxPermissions;
     let Some(value) = permissions else {
         return "Default access".to_owned();
     };
-    match CodexPermissions::parse(value) {
-        Some(CodexPermissions::DangerFullAccess) => "Full access".to_owned(),
-        Some(CodexPermissions::ReadOnly) => "Read only".to_owned(),
-        Some(CodexPermissions::WorkspaceWrite) => "Workspace write".to_owned(),
+    match SandboxPermissions::parse(value) {
+        Some(SandboxPermissions::DangerFullAccess) => "Full access".to_owned(),
+        Some(SandboxPermissions::ReadOnly) => "Read only".to_owned(),
+        Some(SandboxPermissions::WorkspaceWrite) => "Workspace write".to_owned(),
         None => value.replace(['-', '_'], " "),
     }
 }

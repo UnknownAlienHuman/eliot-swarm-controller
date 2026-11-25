@@ -1578,17 +1578,17 @@ fn validate_candidate(source: &str) -> core::Result<()> {
 fn validate_parsed(config: &FileConfig, source: &str) -> core::Result<()> {
     for (name, proxy) in &config.proxies {
         let proxy = proxy.get_ref();
-        if core::api::HarnessCapabilities::is_reserved_proxy_provider(name) {
+        if let Some(provider) = core::api::HarnessCapabilities::reserved_proxy_provider(name) {
             return Err(core::Error::new(
                 "profile_error",
-                "proxy name collides with a builtin Codex provider",
+                format!("proxy name collides with a builtin {provider} provider"),
             ));
         }
         let route = core::RouteBinding {
             name: name.clone(),
             endpoint: proxy.attach.clone(),
             readiness_path: proxy.health.clone(),
-            provider_base_url: proxy.base_url_for.codex.clone(),
+            provider_base_url: proxy.base_url_for.provider_url.clone(),
             client_key_env_name: proxy.api_key_env.clone(),
         };
         route

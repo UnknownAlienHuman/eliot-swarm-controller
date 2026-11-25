@@ -194,7 +194,7 @@ impl Router {
         let mut snapshot = self.resolve_profile_cached(candidate)?;
         crate::config::capture_native_store_inputs(
             &mut snapshot,
-            self.inner.stand_codex_home.as_deref(),
+            self.inner.stand_store_root.as_deref(),
         )?;
         let withheld = self
             .inner
@@ -802,7 +802,7 @@ impl Router {
                 Ok(mut snapshot) => {
                     if crate::config::capture_native_store_inputs(
                         &mut snapshot,
-                        self.inner.stand_codex_home.as_deref(),
+                        self.inner.stand_store_root.as_deref(),
                     )
                     .is_err()
                     {
@@ -1010,13 +1010,17 @@ impl Router {
 }
 
 fn account_identity(snapshot: &Value) -> Value {
-    json!({"account":snapshot.get("account"), "native_store":snapshot.get("native_store_binding"),
+    let mut identity = json!({"account":snapshot.get("account"), "native_store":snapshot.get("native_store_binding"),
         "native_route_identity":snapshot.get("native_route_identity"),
-        "codex_home":snapshot.pointer("/pass_env_values/CODEX_HOME"),
-        "codex_sqlite_home":snapshot.pointer("/pass_env_values/CODEX_SQLITE_HOME"),
         "integration":snapshot.get("auth_integration"), "route":snapshot.get("route_binding"),
         "pass_env":snapshot.get("pass_env"), "api_key_env":snapshot.get("api_key_env"),
-        "literal_env":snapshot.get("literal_env")})
+        "literal_env":snapshot.get("literal_env")});
+    for (key, selector) in
+        crate::config::frozen_store_environments().flat_map(|native| native.account_identity_keys)
+    {
+        identity[*key] = snapshot["pass_env_values"][*selector].clone();
+    }
+    identity
 }
 
 pub(super) fn switch_account_identity(snapshot: &Value) -> Value {

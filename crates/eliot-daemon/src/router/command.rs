@@ -704,7 +704,7 @@ impl Router {
             && let Err(error) = self
                 .inner
                 .workspaces
-                .prepare(id, self.inner.stand_codex_home.as_deref())
+                .prepare(id, self.inner.stand_store_root.as_deref())
                 .await
         {
             self.settle_workspace_prepare_error(command, &error).await;
@@ -1189,7 +1189,9 @@ impl Router {
             return None;
         }
         let launch_binding = if let Some(agent) = launch_agent {
-            if eliot_core::api::HarnessCapabilities::of(&agent.harness).requires_frozen_store_inputs
+            if eliot_core::api::HarnessCapabilities::of(&agent.harness)
+                .frozen_store_environment
+                .is_some()
             {
                 let workspace = match agent.workspace.as_deref() {
                     Some(workspace) => workspace,

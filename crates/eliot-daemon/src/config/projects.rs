@@ -221,17 +221,10 @@ fn path_comparison_key(path: &Path) -> PathBuf {
 /// the Owner's chats where applicable.
 fn protected_paths(data_root: &Path) -> Vec<PathBuf> {
     let mut protected = vec![data_root.to_owned()];
-    for name in [
-        "CODEX_HOME",
-        "CODEX_SQLITE_HOME",
-        "CLAUDE_CONFIG_DIR",
-        "MUSE_CONFIG_DIR",
-        "OPENCODE_CONFIG_DIR",
-        "XDG_CONFIG_HOME",
-        "XDG_DATA_HOME",
-        "APPDATA",
-        "LOCALAPPDATA",
-    ] {
+    let platform = ["APPDATA", "LOCALAPPDATA"];
+    let native_env =
+        super::profile_environments().flat_map(|profile| profile.protected_env.iter().copied());
+    for name in native_env.chain(platform) {
         if let Some(path) = std::env::var_os(name).filter(|path| !path.is_empty()) {
             protected.push(PathBuf::from(path));
         }
@@ -239,16 +232,9 @@ fn protected_paths(data_root: &Path) -> Vec<PathBuf> {
     for name in ["USERPROFILE", "HOME"] {
         if let Some(home) = std::env::var_os(name).filter(|path| !path.is_empty()) {
             let home = PathBuf::from(home);
-            for relative in [
-                ".codex",
-                ".claude",
-                ".config",
-                ".local/share",
-                ".gemini",
-                ".antigravity",
-                ".agy",
-                ".muse",
-            ] {
+            let native_paths = super::profile_environments()
+                .flat_map(|profile| profile.protected_home_paths.iter().copied());
+            for relative in native_paths.chain([".config", ".local/share"]) {
                 protected.push(home.join(relative));
             }
             #[cfg(windows)]

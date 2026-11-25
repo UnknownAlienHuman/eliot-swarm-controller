@@ -4,7 +4,9 @@ use eliot_core::api::harness::{
     AdhocAccess, AdhocLaunchDefaults, AdhocModel, AdhocPermissions, NativeQuotaReadback,
     ProjectInstructionRead, QuotaEvidenceReader, QuotaUsageWindows,
 };
-use eliot_core::api::native_profile::{CodexApprovalPolicy, CodexPermissions};
+use eliot_core::api::native_profile::{
+    NativeProfileRefusal, NativeProfileResult, SandboxApprovalPolicy, SandboxPermissions,
+};
 use eliot_core::{Error, McpPolicy, Result, api::InstructionReadStatus};
 use serde_json::{Map, Value};
 use std::path::Path;
@@ -74,14 +76,14 @@ pub fn apply_adhoc_permissions(
             values,
         } => {
             let sandbox = if full && full_changes_sandbox {
-                CodexPermissions::DangerFullAccess
+                SandboxPermissions::DangerFullAccess
             } else {
-                CodexPermissions::default()
+                SandboxPermissions::default()
             };
             snapshot.insert("permissions".to_owned(), Value::from(sandbox.as_str()));
             snapshot.insert(
                 "approval_policy".to_owned(),
-                Value::from(CodexApprovalPolicy::default().as_str()),
+                Value::from(SandboxApprovalPolicy::default().as_str()),
             );
             if let Some(access) = access {
                 let [ask, auto, full] = values;
@@ -128,4 +130,26 @@ pub fn project_instruction_read(
         .then(|| profile["cmd_version"].as_str().map(str::to_owned))
         .flatten();
     (status, version)
+}
+pub fn validated_native_choice<'a>(
+    field: &'static str,
+    value: Option<&'a str>,
+    allowed: &[&str],
+    refusal: &str,
+    code: &'static str,
+) -> NativeProfileResult<Option<&'a str>> {
+    let value = value.map(str::trim);
+    if value.is_some_and(|value| !allowed.contains(&value)) {
+        return Err(NativeProfileRefusal::new(field, refusal, code));
+    }
+    Ok(value)
+}
+
+pub fn reject_unmapped_native_fields(
+    checks: &[(&'static str, bool, &str)],
+) -> NativeProfileResult<()> {
+    match checks.iter().find(|(_, present, _)| *present) {
+        Some((field, _, refusal)) => Err(NativeProfileRefusal::new(field, *refusal, "unsupported")),
+        None => Ok(()),
+    }
 }

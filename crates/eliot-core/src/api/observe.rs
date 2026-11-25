@@ -1,7 +1,7 @@
 //! Heavy-work, session-growth and harness-doctor readbacks. The daemon owns
 //! detection and commit; these DTOs only shape the fleet and per-Agent views.
 
-use super::native_profile::{CodexCollaborationMode, CodexPermissions};
+use super::native_profile::SandboxPermissions;
 use crate::{Error, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -788,10 +788,11 @@ pub fn is_read_only_or_audit_profile(agent: &crate::Agent) -> bool {
         .chain(agent.effective.as_ref())
         .any(|obj| {
             let text = |key: &str| obj.get(key).and_then(Value::as_str);
-            text("permissions") == Some(CodexPermissions::ReadOnly.as_str())
-                || text("permission_mode") == Some("plan")
-                || text("mode") == Some("plan")
-                || text("collaboration_mode") == Some(CodexCollaborationMode::Plan.as_str())
+            text("permissions") == Some(SandboxPermissions::ReadOnly.as_str())
+                || crate::api::HarnessCapabilities::declarations()
+                    .iter()
+                    .flat_map(|(_, caps)| caps.profile.read_only_markers)
+                    .any(|(field, value)| text(field) == Some(*value))
         });
     if snapshot_read_only {
         return true;

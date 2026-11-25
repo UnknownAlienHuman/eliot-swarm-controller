@@ -71,11 +71,21 @@ when it connects); after that wait, and for other explicit discovery reads at on
 refuse `busy` with a message naming `metadata_readers` and its limit.
 
 Catalogue requests use [`ModelListParams`](../../crates/eliot-plugin/src/protocol.rs).
+An adapter declares how to derive a provider label from native model IDs.
+Shared catalogue and desktop reads use that declaration with the original ID.
+For retained turns that predate typed outcomes, Store uses the adapter's legacy
+status decoder when one is declared. Newly reported outcomes use the universal
+turn vocabulary.
 OpenCode reads ids and model metadata (names and variants) in separate reader lifetimes, sharing one admission
 slot and read deadline. Each phase closes its owned family before the next starts
 or a result is returned. The host joins metadata by exact `provider/model` ID.
 Optional metadata failures permit ids-only output only after
 confirmed cleanup; cancellation or unconfirmed closure never becomes success.
+
+Adapters declare native MCP document locations and fields when the host
+prepares a configuration. The host owns bounded traversal, reserved-identity
+checks and private publication. Native skill wrappers likewise supply a
+manifest through their adapter while the host owns publication and custody.
 
 A launch or configure passes its explicit or frozen model selector to the
 harness unchanged. An exact catalogue row provides model metadata, including

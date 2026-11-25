@@ -62,7 +62,7 @@ impl ChildState {
             generation: self.binding.agent_generation,
             harness: "Codex",
             id_prefix: "codex",
-            families: &eliot_core::NATIVE_CHILD_FAMILIES,
+            families: crate::capabilities::NATIVE_CHILD_FAMILIES,
             writes_blocked: &mut self.writes_blocked,
             gap_reported: &mut self.gap_reported,
             gap_number: &mut self.gap_number,
@@ -89,7 +89,7 @@ impl ChildState {
             generation: self.binding.agent_generation,
             harness: "Codex",
             id_prefix: "codex",
-            families: &eliot_core::NATIVE_CHILD_FAMILIES,
+            families: crate::capabilities::NATIVE_CHILD_FAMILIES,
             writes_blocked: &mut self.writes_blocked,
             gap_reported: &mut self.gap_reported,
             gap_number: &mut self.gap_number,
@@ -115,7 +115,7 @@ impl ChildState {
             generation: self.binding.agent_generation,
             harness: "Codex",
             id_prefix: "codex",
-            families: &eliot_core::NATIVE_CHILD_FAMILIES,
+            families: crate::capabilities::NATIVE_CHILD_FAMILIES,
             writes_blocked: &mut self.writes_blocked,
             gap_reported: &mut self.gap_reported,
             gap_number: &mut self.gap_number,
@@ -875,7 +875,7 @@ impl EventProcessor {
             &self.credential,
             registration.clone(),
             "codex",
-            &eliot_core::CODEX_NATIVE_CHILD_FAMILIES,
+            crate::capabilities::NATIVE_CHILD_FAMILIES,
         )
         .await
         {

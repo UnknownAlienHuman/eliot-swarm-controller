@@ -139,7 +139,7 @@ pub(super) async fn read_child_state(
     }
 }
 
-pub(super) async fn is_codex_producer(store: &StoreHandle, producer: &str) -> Result<bool> {
+pub(super) async fn has_native_child_grant(store: &StoreHandle, producer: &str) -> Result<bool> {
     let store = timeout_at(super::deadline(), store.lock())
         .await
         .map_err(|_| Error::new("unknown", "native child producer read timed out"))?;

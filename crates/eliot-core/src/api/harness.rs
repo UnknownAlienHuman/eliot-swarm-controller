@@ -119,6 +119,13 @@ pub struct AdhocLaunchDefaults {
     pub installed_profile_mcp: crate::McpPolicy,
 }
 
+/// Bounded metadata-only native integration inventory.
+#[derive(Clone, Copy, Debug)]
+pub struct NativeAuthInventory {
+    pub arguments: &'static [&'static str],
+    pub decode_ids: fn(&[u8]) -> Option<Vec<String>>,
+}
+
 /// Reasoning effort accepted by an ad-hoc launch.
 #[derive(Clone, Copy, Debug)]
 pub enum AdhocEffort {
@@ -245,13 +252,78 @@ pub enum ModelLoginSource {
     Keyring(fn() -> Option<u64>),
 }
 
+/// Environment vocabulary contributed by an adapter. Stable selector names
+/// are retained in snapshots and in the opaque route identity.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ProfileEnvironment {
+    pub store_paths: &'static [&'static str],
+    pub legacy_captured_paths: &'static [&'static str],
+    pub route_values: &'static [&'static str],
+    pub binary_modes: &'static [&'static str],
+    pub credential_presence: &'static [&'static str],
+    pub model_pins: &'static [&'static str],
+    pub credential_directory: Option<&'static str>,
+    pub managed_update: &'static [&'static str],
+    pub forwarded_update: Option<&'static str>,
+    pub auth_scope: &'static [&'static str],
+    pub protected_cleanup_names: &'static [&'static str],
+    pub cleanup_roots: &'static [&'static str],
+    pub protected_env: &'static [&'static str],
+    pub protected_home_paths: &'static [&'static str],
+    pub local_provider_reserved_env: &'static [&'static str],
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct FrozenStoreEnvironment {
+    pub display_name: &'static str,
+    pub selectors: &'static [&'static str],
+    pub account_identity_keys: &'static [(&'static str, &'static str)],
+    pub private_directory: &'static str,
+    pub guard_file: &'static str,
+    pub direct_login_refusal: (&'static str, &'static str),
+    pub binding_refusal: &'static str,
+}
+
+/// Native MCP config locations and JSON keys translated by the adapter.
+/// The host owns bounded scanning, reserved identities and private publication.
+#[derive(Clone, Copy, Debug)]
+pub struct NativeMcpSources {
+    pub name: &'static str,
+    pub file: &'static str,
+    pub global_dir: &'static str,
+    pub workspace_layers: &'static [&'static str],
+    pub workspace_settings: &'static str,
+    pub redirected_home_key: &'static str,
+    pub plugins_directory: &'static str,
+    pub plugins_manifest: &'static str,
+    pub redirect_keys: &'static [&'static str],
+    pub servers_key: &'static str,
+    pub disabled_key: &'static str,
+    pub http_keys: &'static [&'static str],
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct NativeSkillWrapper {
+    pub directory: &'static str,
+    pub filename: &'static str,
+    pub manifest: fn() -> Result<String>,
+}
+
+/// Adapter-specific diagnostic vocabulary retained by older turn and gap records.
+#[derive(Clone, Copy, Debug)]
+pub struct ViewProjectionRecovery {
+    pub unavailable_prefix: &'static str,
+    pub unresolved_reason: &'static str,
+}
+
 /// Native profile vocabulary used by the daemon and the desktop editor.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ProfileCapabilities {
-    pub model_pin_selectors: bool,
+    pub environment: ProfileEnvironment,
+    pub named_profile: Option<super::native_profile::NativeProfileMapping>,
+    pub read_only_markers: &'static [(&'static str, &'static str)],
     pub route_selectors_resolved: bool,
     pub route_scope_secret_names: &'static [&'static str],
-    pub config_dir_credential: bool,
     pub latest_cmd: bool,
     pub script_wrapper_cmd: bool,
     pub command_refusal: Option<fn(&str) -> Option<&'static str>>,
@@ -276,6 +348,7 @@ pub enum NativeRoute {
     FixedCredential(&'static str),
     ResponsesProxy {
         reserved_providers: &'static [&'static str],
+        endpoint_keys: &'static [&'static str],
     },
     AuthIntegration,
 }
@@ -283,10 +356,19 @@ pub enum NativeRoute {
 impl NativeRoute {
     pub fn reserves_proxy_provider(self, name: &str) -> bool {
         match self {
-            Self::ResponsesProxy { reserved_providers } => reserved_providers
+            Self::ResponsesProxy {
+                reserved_providers, ..
+            } => reserved_providers
                 .iter()
                 .any(|provider| name.eq_ignore_ascii_case(provider)),
             _ => false,
+        }
+    }
+
+    pub fn proxy_endpoint_keys(self) -> &'static [&'static str] {
+        match self {
+            Self::ResponsesProxy { endpoint_keys, .. } => endpoint_keys,
+            _ => &[],
         }
     }
 }
@@ -325,6 +407,7 @@ pub struct HarnessCapabilities {
     pub profile: ProfileCapabilities,
     pub native_route: NativeRoute,
     pub native_auth: Option<NativeAuthCapability>,
+    pub auth_inventory: Option<NativeAuthInventory>,
     /// How to freeze a launch without a saved profile and seed its installed preset.
     pub adhoc_launch: Option<AdhocLaunchDefaults>,
     /// `None` when the adapter has no ad-hoc effort mapping.
@@ -341,6 +424,7 @@ pub struct HarnessCapabilities {
     pub models_workspace_preview: bool,
     /// Published native aliases used when a verified live catalogue is unavailable.
     pub documented_models: Option<DocumentedModelCatalog>,
+    pub catalogue_provider: CatalogueProvider,
     pub model_catalogue_presentation: Option<ModelCataloguePresentation>,
     pub model_reader: ModelReaderOptions,
     pub model_login_source: Option<ModelLoginSource>,
@@ -350,6 +434,7 @@ pub struct HarnessCapabilities {
     pub initial_model_refusal_cleanup: bool,
     /// Supported reasoning-effort vocabulary when `configure` restricts it.
     pub allowed_configure_efforts: Option<&'static [&'static str]>,
+    pub configure_invalid_effort: Option<&'static str>,
     /// How `configure` interacts with the live native session.
     pub configure_session_mode: ConfigureSessionMode,
     /// Live native `configure` requires an idle session with no active turn.
@@ -375,7 +460,8 @@ pub struct HarnessCapabilities {
     /// Failed turns backfill `native_error_message` / `effective_model` on readback.
     pub backfill_failed_turn_readback: bool,
     /// Supports `source.gap` view-projection recovery on active turns.
-    pub view_projection_gap_recovery: bool,
+    pub view_projection_recovery: Option<ViewProjectionRecovery>,
+    pub oversized_frame_prefixes: &'static [&'static str],
     /// Stream families granted for `observe` attachment.
     pub observed_families: &'static [&'static str],
     /// Stream families granted for live `observe` publication.
@@ -392,7 +478,7 @@ pub struct HarnessCapabilities {
     /// Product prefixes stripped when normalizing `--version` strings.
     pub version_prefixes: &'static [&'static str],
     /// Retained turn status can be a native print result subtype.
-    pub legacy_result_status: bool,
+    pub legacy_result_status: Option<fn(Option<&str>) -> crate::TurnOutcome>,
     /// Interpretation of retained input counts before normalization.
     pub input_token_accounting: InputTokenAccounting,
     /// Native output and reasoning counts are disjoint.
@@ -415,7 +501,8 @@ pub struct HarnessCapabilities {
     /// The adapter is waiting on a route repair before unattended checks.
     pub defer_harness_check: bool,
     /// Writes a prepared MCP configuration before start.
-    pub prepared_mcp_config: bool,
+    pub prepared_mcp_config: Option<NativeMcpSources>,
+    pub skill_wrapper: Option<NativeSkillWrapper>,
     /// Resolves the launch executable through reader discovery.
     pub reader_executable_discovery: bool,
     /// Resumes with a command-scoped config overlay.
@@ -437,7 +524,7 @@ pub struct HarnessCapabilities {
     /// Profiles must carry an explicit `pass_env` array.
     pub requires_pass_env: bool,
     /// Profiles that have a frozen store input must carry it.
-    pub requires_frozen_store_inputs: bool,
+    pub frozen_store_environment: Option<FrozenStoreEnvironment>,
     /// Supports discovering existing native sessions through a dedicated reader.
     pub native_discovery: bool,
     /// Native archive support and the binding required by its reader.
@@ -531,6 +618,12 @@ impl HarnessCapabilities {
         &Self::registration().declarations
     }
 
+    /// Adapter declarations in composition order, including those with no
+    /// persisted Agent. Root protection applies to all installed adapters.
+    pub fn declarations() -> &'static [(&'static str, Self)] {
+        Self::registered()
+    }
+
     /// Project instruction candidates in stable catalogue order.
     pub fn project_instruction_inventory() -> &'static [InstructionInventoryPath] {
         &Self::registration().instructions
@@ -579,6 +672,17 @@ impl HarnessCapabilities {
             .iter()
             .any(|(_, caps)| caps.native_route.reserves_proxy_provider(name))
     }
+
+    /// Exact registered provider label for a reserved route name.
+    pub fn reserved_proxy_provider(name: &str) -> Option<&'static str> {
+        Self::registered().iter().find_map(|(harness, caps)| {
+            caps.native_route.reserves_proxy_provider(name).then(|| {
+                caps.profile
+                    .named_profile
+                    .map_or(*harness, |profile| profile.name)
+            })
+        })
+    }
 }
 
 /// Whether `name` is one of the supported native harnesses.
@@ -605,20 +709,6 @@ pub const MAX_HARNESS_SOURCE_BYTES: usize = 64;
 /// Maximum quota note length.
 pub const MAX_HARNESS_QUOTA_NOTE_BYTES: usize = 1024;
 
-/// Environment markers that select an external Claude route. The daemon
-/// refuses them from the frozen environment and the Claude quota reader
-/// refuses them from native `settings.json`; both share this one list.
-pub const CLAUDE_EXTERNAL_ROUTE_MARKERS: &[&str] = &[
-    "ANTHROPIC_API_KEY",
-    "ANTHROPIC_AUTH_TOKEN",
-    "ANTHROPIC_BASE_URL",
-    "CLAUDE_CODE_USE_ANTHROPIC_AWS",
-    "CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD",
-    "CLAUDE_CODE_USE_BEDROCK",
-    "CLAUDE_CODE_USE_VERTEX",
-    "CLAUDE_CODE_USE_FOUNDRY",
-    "CLAUDE_CODE_USE_MANTLE",
-];
 /// Maximum encoded bytes for structured quota details (provider-verbatim
 /// quota signals, never secrets or personal data).
 pub const MAX_HARNESS_QUOTA_DETAILS_BYTES: usize = 8192;
@@ -963,11 +1053,6 @@ impl ConfigureSupport {
         }
     }
 }
-
-/// Muse stable schema's closed reasoning effort vocabulary.
-pub const MUSE_REASONING_EFFORT_TIERS: [&str; 8] = [
-    "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra",
-];
 
 /// Whether a dispatched `configure` must switch the live native session
 /// through the owned plugin with native proof before the Router stores
@@ -1656,30 +1741,35 @@ impl ModelsCatalogResponse {
     }
 }
 
-/// Provider display label for a model catalogue ID, also used by the desktop
-/// without loading the adapter registry.
+/// Adapter rule for model IDs without a nonempty provider prefix.
+#[derive(Clone, Copy, Debug, Default)]
+pub enum CatalogueProvider {
+    #[default]
+    Harness,
+    Fixed(&'static str),
+    ModelFamily,
+    ModelPrefix,
+}
+
+/// Provider label for a model ID, resolved through the registered adapters.
+/// Panics if the built-in adapter declarations are not registered.
 pub fn catalog_provider(harness: &str, id: &str) -> String {
-    if let Some((provider, _)) = id.split_once('/')
-        && !provider.trim().is_empty()
-    {
+    let strategy = HarnessCapabilities::of(harness).catalogue_provider;
+    let prefix = id.split_once('/').map(|(provider, _)| provider);
+    if let Some(provider) = prefix.filter(|provider| !provider.trim().is_empty()) {
         return provider.to_owned();
     }
-    match harness {
-        "codex" => "openai".to_owned(),
-        "claude" => "anthropic".to_owned(),
-        "muse" => "meta".to_owned(),
-        "antigravity" => id
+    match strategy {
+        CatalogueProvider::Harness => harness,
+        CatalogueProvider::Fixed(provider) => provider,
+        CatalogueProvider::ModelFamily => id
             .split(['-', '_'])
             .next()
             .filter(|family| !family.trim().is_empty())
-            .unwrap_or(harness)
-            .to_owned(),
-        "opencode" => id
-            .split_once('/')
-            .map(|(provider, _)| provider.to_owned())
-            .unwrap_or_else(|| harness.to_owned()),
-        _ => harness.to_owned(),
+            .unwrap_or(harness),
+        CatalogueProvider::ModelPrefix => prefix.unwrap_or(harness),
     }
+    .to_owned()
 }
 
 /// Cursor for one catalogue entry: `harness:id`.

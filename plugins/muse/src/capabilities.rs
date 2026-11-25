@@ -13,6 +13,7 @@ use serde_json::Value;
 
 pub fn declaration() -> HarnessCapabilities {
     HarnessCapabilities {
+        catalogue_provider: eliot_core::api::harness::CatalogueProvider::Fixed("meta"),
         instruction_inventory: crate::instructions::INSTRUCTION_INVENTORY,
         model_login_source: Some(eliot_core::api::harness::ModelLoginSource::Files {
             root_env: "XDG_CONFIG_HOME",
@@ -35,6 +36,16 @@ pub fn declaration() -> HarnessCapabilities {
         }),
         native_route: NativeRoute::FixedCredential("ambient"),
         profile: ProfileCapabilities {
+            named_profile: Some(crate::profile_config::MAPPING),
+            environment: eliot_core::api::harness::ProfileEnvironment {
+                auth_scope: &["MUSE_AUTH_PATH", "META_API_KEY"],
+                managed_update: &["MUSE_NO_AUTO_UPDATE", "MUSE_UPDATE_INTERVAL_SECONDS"],
+                forwarded_update: Some("MUSE_UPDATE_INTERVAL_SECONDS"),
+                protected_env: &["MUSE_CONFIG_DIR"],
+                protected_home_paths: &[".muse"],
+                protected_cleanup_names: &[".muse"],
+                ..Default::default()
+            },
             approval_field: Some("approval"),
             native_subagents_policy: Some(NativeSubagentsPolicy::allow_by_default()),
             ..ProfileCapabilities::default()
@@ -75,7 +86,8 @@ pub fn declaration() -> HarnessCapabilities {
         launch_default_policy: LaunchDefaultPolicy::OmitForServerDefault,
         guard_refusal_point: Some(InjectPoint::ActiveTurn),
         guard_refusal_choice_error: Some("Muse guarded request offers multiple refusal options"),
-        allowed_configure_efforts: Some(&eliot_core::api::MUSE_REASONING_EFFORT_TIERS),
+        configure_invalid_effort: Some("Muse effort is not a supported reasoning tier"),
+        allowed_configure_efforts: Some(&crate::native::types::REASONING_EFFORT_TIERS),
         configure_session_mode: ConfigureSessionMode::WhenModelPresent,
         configure_requires_idle_turn: true,
         configure_carries_previous_overlay: true,
@@ -89,8 +101,11 @@ pub fn declaration() -> HarnessCapabilities {
             source: crate::allowance::STREAM_SOURCE,
             unavailable: crate::allowance::unavailable,
         }),
-        view_projection_gap_recovery: true,
-        native_child_families: &eliot_core::MUSE_NATIVE_CHILD_FAMILIES,
+        view_projection_recovery: Some(eliot_core::api::harness::ViewProjectionRecovery {
+            unavailable_prefix: VIEW_UNAVAILABLE_REASON_PREFIX,
+            unresolved_reason: "Muse native view recovery did not prove live delivery after the recorded gap",
+        }),
+        native_child_families: &["turn"],
         native_child_history_refusal: Some(
             "native history is unsupported for Muse child observations",
         ),
@@ -167,3 +182,5 @@ fn native_access_bounds(snapshot: &Value) -> Option<NativeAccessBounds> {
         _ => None,
     }
 }
+
+pub(super) const VIEW_UNAVAILABLE_REASON_PREFIX: &str = "Muse native view is unavailable";

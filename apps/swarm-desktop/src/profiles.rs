@@ -8,9 +8,11 @@
 //! comments. Validation and saving stay with the daemon (`settings.save`, dry
 //! run first), which runs its own parser and launch resolution.
 
+use eliot::profile_vocabulary::{
+    ANTIGRAVITY_MODES, CLAUDE_EFFORTS, CLAUDE_PERMISSION_MODES, MUSE_APPROVALS, MUSE_PERMISSIONS,
+};
 use eliot_core::api::native_profile::{
-    ANTIGRAVITY_MODES, CLAUDE_EFFORTS, CLAUDE_PERMISSION_MODES, COMMON_EFFORTS,
-    CodexApprovalPolicy, CodexPermissions, MUSE_APPROVALS, MUSE_PERMISSIONS, NativeSubagentsPolicy,
+    COMMON_EFFORTS, NativeSubagentsPolicy, SandboxApprovalPolicy, SandboxPermissions,
 };
 use eliot_daemon::operator::{native_subagents_policy, profile_draft_blocks};
 use std::ops::Range;
@@ -58,12 +60,12 @@ pub fn form_fields(harness: &str, efforts: Option<&[String]>) -> Vec<FormField> 
             FormField {
                 key: "permissions",
                 label: "Permissions",
-                values: list(&CodexPermissions::ALL.map(CodexPermissions::as_str)),
+                values: list(&SandboxPermissions::ALL.map(SandboxPermissions::as_str)),
             },
             FormField {
                 key: "approval_policy",
                 label: "Approval policy",
-                values: list(&CodexApprovalPolicy::ALL.map(CodexApprovalPolicy::as_str)),
+                values: list(&SandboxApprovalPolicy::ALL.map(SandboxApprovalPolicy::as_str)),
             },
         ],
         "claude" => vec![
@@ -88,7 +90,7 @@ pub fn form_fields(harness: &str, efforts: Option<&[String]>) -> Vec<FormField> 
             FormField {
                 key: "permissions",
                 label: "Permissions",
-                values: list(&MUSE_PERMISSIONS.map(CodexPermissions::as_str)),
+                values: list(&MUSE_PERMISSIONS.map(SandboxPermissions::as_str)),
             },
         ],
         "antigravity" => vec![FormField {

@@ -571,7 +571,7 @@ schema has no dedicated provider-withholding code. The adapter falls back to the
 failed turn's exact error message after trimming outer whitespace. It applies the
 same classification to stream terminals, native turn readback and rollout history.
 The adapter uses the
-[recorded Codex 0.167.1 TurnError message](../../plugins/codex/fixtures/withheld-turn-error-message-0.167.1.txt)
+[Codex 0.167.1 TurnError message constant](../../plugins/codex/src/native/types.rs#L520)
 to translate that case into the shared typed fact.
 
 A match sets `provider_response_withheld: true` and carries the shared typed

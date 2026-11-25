@@ -154,23 +154,15 @@ fn valid_base_url(value: &str) -> bool {
 }
 
 fn valid_key_env(name: &str) -> bool {
-    const RESERVED: &[&str] = &[
-        "PATH",
-        "OPENCODE_CONFIG",
-        "OPENCODE_CONFIG_CONTENT",
-        "OPENCODE_CONFIG_DIR",
-        "OPENCODE_CONFIG_PROJECT_DISABLE",
-        "OPENCODE_PASSWORD",
-        "XDG_CONFIG_HOME",
-        "XDG_DATA_HOME",
-    ];
     name.len() <= 256
         && name.starts_with(|ch: char| ch.is_ascii_alphabetic() || ch == '_')
         && name
             .bytes()
             .all(|ch| ch.is_ascii_alphanumeric() || ch == b'_')
         && !name.to_ascii_uppercase().starts_with("ELIOT_")
-        && !RESERVED
+        && !name.eq_ignore_ascii_case("PATH")
+        && !crate::api::HarnessCapabilities::declarations()
             .iter()
+            .flat_map(|(_, caps)| caps.profile.environment.local_provider_reserved_env)
             .any(|reserved| name.eq_ignore_ascii_case(reserved))
 }

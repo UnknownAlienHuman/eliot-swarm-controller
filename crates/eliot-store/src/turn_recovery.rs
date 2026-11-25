@@ -80,7 +80,9 @@ impl Store {
             }
             unknown => {
                 let reason = if binding.view_projection_gap {
-                    core::MUSE_VIEW_UNKNOWN_REASON_PREFIX
+                    core::api::HarnessCapabilities::of(&agent.harness)
+                        .view_projection_recovery
+                        .map_or("Native view recovery did not prove live delivery after the recorded gap", |cap| cap.unresolved_reason)
                 } else if matches!(unknown, RecoveredTurn::NativeExited) {
                     "native_exit_without_session_terminal"
                 } else {
@@ -356,9 +358,9 @@ fn active_turn_recovery(
             turn_id: turn_id.to_owned(),
             source_event_seq,
             view_projection_gap: eliot_core::api::HarnessCapabilities::of(&agent.harness)
-                .view_projection_gap_recovery
-                && reason.is_some_and(|value| {
-                    value.starts_with(core::MUSE_VIEW_UNAVAILABLE_REASON_PREFIX)
+                .view_projection_recovery
+                .is_some_and(|cap| {
+                    reason.is_some_and(|value| value.starts_with(cap.unavailable_prefix))
                 }),
         }),
     )

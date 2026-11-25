@@ -5,8 +5,66 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
-/// Claude's closed reasoning-effort vocabulary for frozen profiles.
-pub const CLAUDE_EFFORT_LEVELS: &[&str] = &CLAUDE_EFFORTS;
+/// Typed vendor-facing part of a named profile. The daemon retains the
+/// source location and validates all shared fields.
+pub struct NativeProfileInput<'a> {
+    pub model: Option<&'a str>,
+    pub effort: Option<&'a str>,
+    pub approval: Option<&'a str>,
+    pub collaboration_mode: Option<&'a str>,
+    pub permissions: Option<&'a str>,
+    pub approval_policy: Option<&'a str>,
+    pub project_doc_max_bytes: Option<u64>,
+    pub auth_integration: Option<&'a str>,
+    pub mode: Option<&'a str>,
+    pub dangerously_skip_permissions: Option<bool>,
+    pub local_provider: Option<&'a crate::local_provider::LocalProvider>,
+}
+
+pub struct NativeProfileRefusal {
+    pub field: &'static str,
+    pub reason: String,
+    pub code: &'static str,
+}
+
+impl NativeProfileRefusal {
+    pub fn new(field: &'static str, reason: impl Into<String>, code: &'static str) -> Self {
+        Self {
+            field,
+            reason: reason.into(),
+            code,
+        }
+    }
+}
+
+pub type NativeProfileResult<T> = Result<T, NativeProfileRefusal>;
+type MapNativeFields =
+    fn(&NativeProfileInput<'_>, &mut Map<String, Value>) -> NativeProfileResult<()>;
+type MapNativeRoute =
+    fn(&NativeProfileInput<'_>, &[String], &mut Map<String, Value>) -> NativeProfileResult<()>;
+
+#[derive(Clone, Copy, Debug)]
+pub enum ProfileEffort {
+    Freeform,
+    Choices {
+        allowed: &'static [&'static str],
+        refusal: &'static str,
+    },
+    Adapter,
+}
+
+/// Adapter-owned validation, defaults and native field projection.
+#[derive(Clone, Copy, Debug)]
+pub struct NativeProfileMapping {
+    pub name: &'static str,
+    pub model: Option<fn(&str) -> NativeProfileResult<()>>,
+    pub effort: ProfileEffort,
+    pub fields: MapNativeFields,
+    pub route: Option<MapNativeRoute>,
+    pub mcp_minimal: bool,
+    pub mcp_allow: bool,
+    pub control_before_mcp: bool,
+}
 
 /// Native subagent policy for one built-in harness.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -45,29 +103,18 @@ impl NativeSubagentsPolicy {
     }
 }
 
-/// Codex CLI's documented default for project instructions.
-pub const CODEX_DEFAULT_PROJECT_DOC_MAX_BYTES: u64 = 32 * 1024;
-
-/// The native override shared by the launch report and Codex argv.
-pub fn codex_project_doc_override(profile: &Map<String, Value>) -> Option<u64> {
-    if profile.get(crate::PROVIDER_PROBE_LAUNCH_ARG) == Some(&Value::Bool(true)) {
-        return Some(0);
-    }
-    profile.get("project_doc_max_bytes").and_then(Value::as_u64)
-}
-
-/// Codex `permissions`, its sandbox mode. An omitted value is
+/// Shared profile sandbox permissions. An omitted value is
 /// `workspace-write`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
-pub enum CodexPermissions {
+pub enum SandboxPermissions {
     ReadOnly,
     #[default]
     WorkspaceWrite,
     DangerFullAccess,
 }
 
-impl CodexPermissions {
+impl SandboxPermissions {
     pub const ALL: [Self; 3] = [Self::ReadOnly, Self::WorkspaceWrite, Self::DangerFullAccess];
 
     pub fn as_str(self) -> &'static str {
@@ -83,16 +130,16 @@ impl CodexPermissions {
     }
 }
 
-/// Codex `approval_policy`. An omitted value is `never`.
+/// Shared profile approval policy. An omitted value is `never`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
-pub enum CodexApprovalPolicy {
+pub enum SandboxApprovalPolicy {
     #[default]
     Never,
     OnRequest,
 }
 
-impl CodexApprovalPolicy {
+impl SandboxApprovalPolicy {
     pub const ALL: [Self; 2] = [Self::Never, Self::OnRequest];
 
     pub fn as_str(self) -> &'static str {
@@ -103,15 +150,15 @@ impl CodexApprovalPolicy {
     }
 }
 
-/// Codex `collaboration_mode`.
+/// Shared profile collaboration mode.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
-pub enum CodexCollaborationMode {
+pub enum CollaborationMode {
     Default,
     Plan,
 }
 
-impl CodexCollaborationMode {
+impl CollaborationMode {
     pub const ALL: [Self; 2] = [Self::Default, Self::Plan];
 
     pub fn as_str(self) -> &'static str {
@@ -121,51 +168,6 @@ impl CodexCollaborationMode {
         }
     }
 }
-
-/// The Codex-specific fields of a frozen profile, decoded once at the plugin
-/// boundary. Other keys of the snapshot are read by their own owners.
-#[derive(Clone, Debug, Default, Deserialize)]
-pub struct CodexProfileFields {
-    #[serde(default)]
-    pub model: Option<String>,
-    #[serde(default)]
-    pub daemon_model: Option<String>,
-    #[serde(default)]
-    pub effort: Option<String>,
-    #[serde(default)]
-    pub collaboration_mode: Option<CodexCollaborationMode>,
-    #[serde(default)]
-    pub permissions: CodexPermissions,
-    #[serde(default)]
-    pub approval_policy: CodexApprovalPolicy,
-    #[serde(default)]
-    pub native_subagents: Option<String>,
-}
-
-/// Claude Code `--permission-mode` values (profile key `approval`).
-pub const CLAUDE_PERMISSION_MODES: [&str; 6] = [
-    "manual",
-    "auto",
-    "acceptEdits",
-    "plan",
-    "dontAsk",
-    "bypassPermissions",
-];
-
-/// Claude Code `--effort` levels: the CLI's closed vocabulary.
-pub const CLAUDE_EFFORTS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
-
-/// Muse `approval` modes.
-pub const MUSE_APPROVALS: [&str; 4] = ["onRequest", "promptUnmatched", "denyUnmatched", "allowAll"];
-
-/// Muse `permissions`: the subset of the Codex sandbox modes Muse maps.
-pub const MUSE_PERMISSIONS: [CodexPermissions; 2] = [
-    CodexPermissions::WorkspaceWrite,
-    CodexPermissions::DangerFullAccess,
-];
-
-/// Antigravity `mode` values.
-pub const ANTIGRAVITY_MODES: [&str; 3] = ["plan", "auto", "accept-edits"];
 
 /// The effort tiers the desktop offers for Codex and Muse when the harness
 /// catalogue gives none.

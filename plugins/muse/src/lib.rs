@@ -8,8 +8,11 @@ mod host;
 pub mod install;
 mod instructions;
 mod native;
+mod profile_config;
 mod quota;
 
 pub async fn run_muse() -> eliot_core::Result<()> {
     host::run().await
 }
+
+pub use profile_config::{MUSE_APPROVALS, MUSE_PERMISSIONS};

@@ -85,9 +85,8 @@ pub use naming::{
     standard_branch, standard_leaf, task_slug,
 };
 pub use native_child::{
-    CODEX_NATIVE_CHILD_FAMILIES, ChildRegistration, ChildRegistrationAck,
-    MUSE_NATIVE_CHILD_FAMILIES, NATIVE_CHILD_FAMILIES, NativeChildActivity,
-    NativeChildActivityState, native_child_families_for_harness,
+    ChildRegistration, ChildRegistrationAck, NativeChildActivity, NativeChildActivityState,
+    native_child_families_for_harness,
 };
 pub use native_data::{
     UNCLASSIFIED_NATIVE_EVENT, is_native_discriminator, validate_unclassified_native_data,
@@ -909,36 +908,14 @@ impl TurnOutcome {
         }
     }
 
-    /// Harness-aware classification for rows written before canonical
-    /// outcomes existed, using the stored harness and that adapter's
-    /// recognized native reasons. Claude rows carry the raw terminal reason
-    /// (`success`/`completed` -> success; `cancelled`/`interrupted` ->
-    /// interrupted; `error`/`failed`/`failure` and the `api_error*` family
-    /// -> failure). Every other harness carries the normalized lifecycle
-    /// status and uses [`Self::classify_legacy_status`]. Anything else is
-    /// unknown, never success.
+    /// Decode a retained native result using its adapter's historical vocabulary.
     pub fn classify_legacy_status_for_harness(harness: &str, status: Option<&str>) -> Self {
-        if !api::HarnessCapabilities::of(harness).legacy_result_status {
-            return Self::classify_legacy_status(status);
-        }
-        match status.map(str::trim) {
-            Some("success") | Some("completed") => Self::Success,
-            Some("cancelled") | Some("interrupted") => Self::Interrupted,
-            Some("error") | Some("failed") | Some("failure") => Self::Failure,
-            Some(reason) => {
-                let lower = reason.to_lowercase();
-                if lower.starts_with("api_error")
-                    || lower.starts_with("error")
-                    || lower.starts_with("failed")
-                    || lower.starts_with("failure")
-                {
-                    Self::Failure
-                } else {
-                    Self::Unknown
-                }
-            }
-            None => Self::Unknown,
-        }
+        api::HarnessCapabilities::of(harness)
+            .legacy_result_status
+            .map_or_else(
+                || Self::classify_legacy_status(status),
+                |decode| decode(status),
+            )
     }
 }
 
@@ -1602,9 +1579,6 @@ pub struct CompactionUsageEcho {
 /// three outcomes are exactly countable from the journal (see the Muse
 /// harness page). Prefixes (not full reasons) are matched
 /// so cursor-bearing suffixes stay free to evolve without breaking the count.
-pub const MUSE_VIEW_UNAVAILABLE_REASON_PREFIX: &str = "Muse native view is unavailable";
-pub const MUSE_VIEW_UNKNOWN_REASON_PREFIX: &str =
-    "Muse native view recovery did not prove live delivery after the recorded gap";
 /// Marker key the readback-recovery path attaches to an otherwise unchanged
 /// `turn.completed`; its only legal value is [`VIEW_RECOVERY_READBACK`].
 pub const VIEW_RECOVERY_MARKER_FIELD: &str = "view_recovery";

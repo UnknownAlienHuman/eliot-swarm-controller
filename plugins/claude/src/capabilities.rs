@@ -1,18 +1,25 @@
 //! Claude native adapter capability declaration.
 
+use crate::CLAUDE_EFFORT_LEVELS;
 use eliot_core::McpPolicy;
 use eliot_core::api::harness::{
     AdhocEffort, AdhocLaunchDefaults, DocumentedModelCatalog, ModelReaderOptions,
     NativeAccessBounds, NativeAuthCapability, NativeAuthCheck, NativeAuthCommand,
     NativeAuthInvocation, NativeAuthState, NativeQuotaReadback, NativeRoute, ProfileCapabilities,
 };
-use eliot_core::api::native_profile::{CLAUDE_EFFORT_LEVELS, NativeSubagentsPolicy};
+use eliot_core::api::native_profile::NativeSubagentsPolicy;
 use eliot_core::api::{ConfigureSessionMode, HarnessCapabilities, InputTokenAccounting};
 use eliot_plugin::capabilities::{adhoc_launch, quota_readback, sandbox_permissions};
 use serde_json::Value;
 
 pub fn declaration() -> HarnessCapabilities {
     HarnessCapabilities {
+        skill_wrapper: Some(eliot_core::api::harness::NativeSkillWrapper {
+            directory: ".claude-plugin",
+            filename: "plugin.json",
+            manifest: skill_manifest,
+        }),
+        catalogue_provider: eliot_core::api::harness::CatalogueProvider::Fixed("anthropic"),
         instruction_inventory: crate::instructions::INSTRUCTION_INVENTORY,
         model_login_source: Some(eliot_core::api::harness::ModelLoginSource::Files {
             root_env: "CLAUDE_CONFIG_DIR",
@@ -32,11 +39,54 @@ pub fn declaration() -> HarnessCapabilities {
         }),
         native_route: NativeRoute::FixedCredential("claude-cli-oauth"),
         profile: ProfileCapabilities {
+            read_only_markers: &[("permission_mode", "plan")],
+            named_profile: Some(crate::profile_config::MAPPING),
+            environment: eliot_core::api::harness::ProfileEnvironment {
+                store_paths: &["CLAUDE_CONFIG_DIR"],
+                legacy_captured_paths: &["CLAUDE_CONFIG_DIR"],
+                route_values: &[
+                    "ANTHROPIC_BASE_URL",
+                    "ANTHROPIC_AWS_BASE_URL",
+                    "ANTHROPIC_BEDROCK_BASE_URL",
+                    "ANTHROPIC_BEDROCK_MANTLE_BASE_URL",
+                    "ANTHROPIC_FOUNDRY_BASE_URL",
+                    "ANTHROPIC_FOUNDRY_RESOURCE",
+                    "ANTHROPIC_VERTEX_BASE_URL",
+                    "ANTHROPIC_VERTEX_PROJECT_ID",
+                ],
+                binary_modes: &[
+                    "CLAUDE_CODE_USE_ANTHROPIC_AWS",
+                    "CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD",
+                    "CLAUDE_CODE_USE_BEDROCK",
+                    "CLAUDE_CODE_USE_VERTEX",
+                    "CLAUDE_CODE_USE_FOUNDRY",
+                    "CLAUDE_CODE_USE_MANTLE",
+                ],
+                credential_presence: &[
+                    "ANTHROPIC_API_KEY",
+                    "ANTHROPIC_AUTH_TOKEN",
+                    "CLAUDE_CODE_OAUTH_TOKEN",
+                ],
+                model_pins: &[
+                    "ANTHROPIC_MODEL",
+                    "ANTHROPIC_DEFAULT_MODEL",
+                    "ANTHROPIC_DEFAULT_FABLE_MODEL",
+                    "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+                    "ANTHROPIC_DEFAULT_OPUS_MODEL",
+                    "ANTHROPIC_DEFAULT_SONNET_MODEL",
+                    "ANTHROPIC_CUSTOM_MODEL_OPTION",
+                ],
+                credential_directory: Some("CLAUDE_CONFIG_DIR"),
+                auth_scope: &["CLAUDE_CONFIG_DIR"],
+                cleanup_roots: &["CLAUDE_CONFIG_DIR"],
+                protected_env: &["CLAUDE_CONFIG_DIR"],
+                protected_home_paths: &[".claude"],
+                protected_cleanup_names: &[".claude"],
+                ..Default::default()
+            },
             approval_field: Some("permission_mode"),
-            model_pin_selectors: true,
             route_selectors_resolved: true,
             route_scope_secret_names: &["CLAUDE_CODE_OAUTH_TOKEN"],
-            config_dir_credential: true,
             latest_cmd: true,
             command_refusal: Some(eliot_plugin::capabilities::absolute_native_command_refusal),
             native_subagents_policy: Some(NativeSubagentsPolicy::deny_by_default()),
@@ -83,8 +133,7 @@ pub fn declaration() -> HarnessCapabilities {
         native_access_bounds: Some(native_access_bounds),
         effort: true,
         manager_preference: Some(1),
-        owner_rules_delivery:
-            eliot_core::api::OwnerRulesDeliveryMethod::ClaudeAppendSystemPromptFile,
+        owner_rules_delivery: eliot_core::api::OwnerRulesDeliveryMethod::AppendSystemPromptFile,
         project_instruction_read: crate::instructions::PROJECT_READ,
         user_instruction_files: crate::instructions::USER_FILES,
         resume_config: true,
@@ -96,7 +145,7 @@ pub fn declaration() -> HarnessCapabilities {
         executable_stems: &["claude"],
         windows_detached_stdio: true,
         version_prefixes: &["claude-code", "claude"],
-        legacy_result_status: true,
+        legacy_result_status: Some(legacy_result_outcome),
         input_token_accounting: InputTokenAccounting::ExcludesCacheWrites,
         ..HarnessCapabilities::default()
     }
@@ -139,4 +188,49 @@ fn native_access_bounds(snapshot: &Value) -> Option<NativeAccessBounds> {
         None => Some((1, 3)),
         Some(_) => None,
     }
+}
+
+fn legacy_result_outcome(status: Option<&str>) -> eliot_core::TurnOutcome {
+    use eliot_core::TurnOutcome;
+    match status.map(str::trim) {
+        Some("success" | "completed") => TurnOutcome::Success,
+        Some("cancelled" | "interrupted") => TurnOutcome::Interrupted,
+        Some("error" | "failed" | "failure") => TurnOutcome::Failure,
+        Some(reason)
+            if {
+                let lower = reason.to_lowercase();
+                ["api_error", "error", "failed", "failure"]
+                    .iter()
+                    .any(|prefix| lower.starts_with(prefix))
+            } =>
+        {
+            TurnOutcome::Failure
+        }
+        _ => TurnOutcome::Unknown,
+    }
+}
+
+/// Environment markers that select an external Claude route. The daemon
+/// refuses them from the frozen environment and the Claude quota reader
+/// refuses them from native `settings.json`; both share this one list.
+pub(crate) const EXTERNAL_ROUTE_MARKERS: &[&str] = &[
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "ANTHROPIC_BASE_URL",
+    "CLAUDE_CODE_USE_ANTHROPIC_AWS",
+    "CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD",
+    "CLAUDE_CODE_USE_BEDROCK",
+    "CLAUDE_CODE_USE_VERTEX",
+    "CLAUDE_CODE_USE_FOUNDRY",
+    "CLAUDE_CODE_USE_MANTLE",
+];
+
+fn skill_manifest() -> eliot_core::Result<String> {
+    serde_json::to_string_pretty(&serde_json::json!({
+        "name": eliot_plugin::skill::SKILL_NAME,
+        "version": env!("CARGO_PKG_VERSION"),
+        "description": "Eliot Swarm coordination: identity, mail, claims, shared variables, children and handoff.",
+        "skills": ["./skills/eliot-swarm"],
+    }))
+    .map_err(|_| eliot_core::Error::new("internal", "skill plugin manifest could not be encoded"))
 }

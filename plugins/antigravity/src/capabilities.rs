@@ -12,6 +12,11 @@ use serde_json::Value;
 
 pub fn declaration() -> HarnessCapabilities {
     HarnessCapabilities {
+        oversized_frame_prefixes: &[
+            "Antigravity stream ended on an oversized frame (frame_oversized ",
+            "Antigravity stream contained an invalid frame (frame_oversized ",
+        ],
+        catalogue_provider: eliot_core::api::harness::CatalogueProvider::ModelFamily,
         instruction_inventory: crate::instructions::INSTRUCTION_INVENTORY,
         #[cfg(windows)]
         model_login_source: Some(eliot_core::api::harness::ModelLoginSource::Keyring(|| {
@@ -25,6 +30,13 @@ pub fn declaration() -> HarnessCapabilities {
         native_auth: None,
         native_route: NativeRoute::FixedCredential("antigravity-cli-keyring"),
         profile: ProfileCapabilities {
+            read_only_markers: &[("mode", "plan")],
+            named_profile: Some(crate::profile_config::MAPPING),
+            environment: eliot_core::api::harness::ProfileEnvironment {
+                protected_home_paths: &[".gemini", ".antigravity", ".agy"],
+                protected_cleanup_names: &[".antigravity"],
+                ..Default::default()
+            },
             command_refusal: Some(|cmd| {
                 (!eliot_plugin::install::cli_identity_matches(cmd, crate::install::CLI_STEM)).then_some(
                 "must name the native `agy` CLI, not the Antigravity IDE executable (which does not implement the ACP/model CLI and is never launched); install the `agy` CLI and put it on PATH",
@@ -56,7 +68,20 @@ pub fn declaration() -> HarnessCapabilities {
         documentation_section: Some("docs/harnesses/antigravity.md#native-identity-and-transport"),
         native_access_bounds: Some(native_access_bounds),
         effort: true,
-        prepared_mcp_config: true,
+        prepared_mcp_config: Some(eliot_core::api::harness::NativeMcpSources {
+            name: "Antigravity",
+            file: crate::mcp::MCP_CONFIG_FILE,
+            global_dir: ".gemini/config",
+            workspace_layers: &[".agents", ".agent", "_agents", "_agent"],
+            workspace_settings: ".gemini/config.json",
+            redirected_home_key: "personal_customization_dir",
+            plugins_directory: "plugins",
+            plugins_manifest: "plugins.json",
+            redirect_keys: &["entries", "inherits"],
+            servers_key: "mcpServers",
+            disabled_key: "disabled",
+            http_keys: &["serverUrl", "url", "httpUrl"],
+        }),
         owner_rules_delivery: OwnerRulesDeliveryMethod::FirstInput,
         user_instruction_files: crate::instructions::USER_FILES,
         reader_executable_discovery: true,

@@ -1,3 +1,4 @@
+use crate::profile_config::ProfileFields;
 use crate::{
     events::{self, EventConfig, EventHandle, TurnFacts},
     mcp::{
@@ -21,9 +22,7 @@ use crate::{
     observe::{self, ObserverSession},
     route::CodexRoute,
 };
-use eliot_core::api::native_profile::{
-    CodexCollaborationMode, CodexPermissions, CodexProfileFields,
-};
+use eliot_core::api::native_profile::{CollaborationMode, SandboxPermissions};
 use eliot_core::{
     CompactionFailure, CompactionFailureStage, ContextOutcome, Error, InjectArgs, InjectPoint,
     McpPolicy, NativeStoreBinding, Result, SecretPolicy,
@@ -278,7 +277,7 @@ fn validate_start_plan(
     let frozen_store = frozen_store_binding(profile)?;
     // The frozen profile's Codex fields decode once against the core
     // vocabulary; that decode is the boundary check.
-    let fields: CodexProfileFields =
+    let fields: ProfileFields =
         serde_json::from_value(frozen_profile.clone()).map_err(|error| {
             Error::new(
                 "profile_error",
@@ -306,13 +305,13 @@ fn validate_start_plan(
     }
     let requested_effort = non_blank(fields.effort);
     let collaboration_mode = fields.collaboration_mode.map(|mode| match mode {
-        CodexCollaborationMode::Default => NativeCollaborationModeKind::Default,
-        CodexCollaborationMode::Plan => NativeCollaborationModeKind::Plan,
+        CollaborationMode::Default => NativeCollaborationModeKind::Default,
+        CollaborationMode::Plan => NativeCollaborationModeKind::Plan,
     });
     let sandbox_mode = match fields.permissions {
-        CodexPermissions::ReadOnly => NativeSandboxMode::ReadOnly,
-        CodexPermissions::WorkspaceWrite => NativeSandboxMode::WorkspaceWrite,
-        CodexPermissions::DangerFullAccess => NativeSandboxMode::DangerFullAccess,
+        SandboxPermissions::ReadOnly => NativeSandboxMode::ReadOnly,
+        SandboxPermissions::WorkspaceWrite => NativeSandboxMode::WorkspaceWrite,
+        SandboxPermissions::DangerFullAccess => NativeSandboxMode::DangerFullAccess,
     };
     let permissions = fields.permissions.as_str().to_owned();
     let approval_policy = fields.approval_policy.as_str().to_owned();
@@ -1149,7 +1148,7 @@ impl CodexPlugin {
                 &plugin_disables,
                 plan.native_subagents.as_deref(),
                 plan.provider_probe,
-                eliot_core::api::native_profile::codex_project_doc_override(&plan.profile),
+                crate::instructions::project_doc_override(&plan.profile),
             )?,
             cwd: plan.workspace.clone(),
             environment: plan.environment.clone(),

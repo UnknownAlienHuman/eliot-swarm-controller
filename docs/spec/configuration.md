@@ -1289,6 +1289,16 @@ follow reload. Resume uses the stored profile. Explicit profile replacement for 
 generation-changing operation remains part of the final contract; the current resume
 command has no profile override.
 
+Adapter composition declares which environment selectors identify a native
+store, which values distinguish a private route, and which roots custody and
+cleanup protect. Shared code resolves and validates the declared paths,
+captures the same snapshot keys, and hashes credential presence where declared.
+The adapter supplies its stand directory and native guard-file name. Shared
+code checks custody and prohibits linked paths before a native operation.
+Named-profile validation uses the adapter's native field mapping, including
+its refusal text and defaults. Shared configuration owns source locations,
+shared fields and validation order.
+
 New launch/attach admissions [capture](../../crates/eliot-daemon/src/config.rs) only
 the nonsecret `CODEX_HOME` and `CODEX_SQLITE_HOME` inputs in
 `profile_snapshot.pass_env_values`. Each selector is explicitly `null` when not

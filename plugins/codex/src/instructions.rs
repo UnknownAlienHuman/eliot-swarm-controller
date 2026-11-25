@@ -3,10 +3,7 @@
 use eliot_core::api::InstructionInventoryPath;
 use eliot_core::api::InstructionReadStatus::Documented;
 use eliot_core::api::harness::{ProjectInstructionRead, UserInstructionFiles};
-use eliot_core::api::native_profile::{
-    CODEX_DEFAULT_PROJECT_DOC_MAX_BYTES, codex_project_doc_override,
-};
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 pub(super) const INSTRUCTION_INVENTORY: &[InstructionInventoryPath] = &[
     InstructionInventoryPath {
@@ -39,6 +36,17 @@ pub(super) const USER_FILES: Option<UserInstructionFiles> = Some(UserInstruction
 fn project_doc_max_bytes(profile: &Value) -> u64 {
     profile
         .as_object()
-        .and_then(codex_project_doc_override)
-        .unwrap_or(CODEX_DEFAULT_PROJECT_DOC_MAX_BYTES)
+        .and_then(project_doc_override)
+        .unwrap_or(DEFAULT_PROJECT_DOC_MAX_BYTES)
+}
+
+/// Codex CLI's documented default for project instructions.
+const DEFAULT_PROJECT_DOC_MAX_BYTES: u64 = 32 * 1024;
+
+/// The native override shared by the launch report and Codex argv.
+pub(super) fn project_doc_override(profile: &Map<String, Value>) -> Option<u64> {
+    if profile.get(eliot_core::PROVIDER_PROBE_LAUNCH_ARG) == Some(&Value::Bool(true)) {
+        return Some(0);
+    }
+    profile.get("project_doc_max_bytes").and_then(Value::as_u64)
 }
