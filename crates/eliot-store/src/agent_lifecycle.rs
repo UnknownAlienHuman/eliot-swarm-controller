@@ -295,8 +295,9 @@ fn current_agent_tree_tx(
             return Err(Error::new(
                 "busy",
                 format!(
-                    "{} still has {blocker}; {method} requires {} custody",
+                    "{} still has {}; {method} requires {} custody",
                     row.id,
+                    blocker.detail,
                     if observers { "drained" } else { "resolved" }
                 ),
             ));
@@ -821,6 +822,11 @@ pub(crate) fn default_list_custody_agents(connection: &Connection) -> Result<Vec
     Ok(agents.into_iter().collect())
 }
 
+pub(super) struct CustodyBlocker {
+    pub(super) detail: String,
+    pub(super) unknown_artifact: bool,
+}
+
 /// A settled managed workspace keeps its process source open until removal.
 /// Only delete preflight can defer that exact generation's source. Every
 /// live process remains a blocker, and record deletion requires closure.
@@ -829,19 +835,22 @@ pub(super) fn custody_blocker_tx(
     agent: i64,
     observers: bool,
     workspace_cleanup_generation: Option<i64>,
-) -> Result<Option<String>> {
+) -> Result<Option<CustodyBlocker>> {
     tx.query_row(
-        "SELECT state||' '||role||' process '||pid||' ('||owner||')' FROM processes
+        "SELECT state||' '||role||' process '||pid||' ('||owner||')',0 FROM processes
              WHERE state IN ('running','unknown')
                AND (owner GLOB 'agent:a'||?1||'#*' OR owner GLOB 'workspace:a'||?1||'#*')
-         UNION ALL SELECT 'unknown artifact '||id FROM artifacts WHERE agent=?1 AND json_extract(body,'$.state')='unknown'
-         UNION ALL SELECT 'open '||source||' source (generation '||generation||')' FROM source_state
+         UNION ALL SELECT 'unknown artifact '||id,1 FROM artifacts WHERE agent=?1 AND json_extract(body,'$.state')='unknown'
+         UNION ALL SELECT 'open '||source||' source (generation '||generation||')',0 FROM source_state
              WHERE agent=?1 AND state='open' AND source!='daemon'
                AND (?2 OR source NOT IN ('os','git','workspace_process'))
                AND NOT (source='workspace_process' AND generation IS ?3)
          LIMIT 1",
         params![agent, observers, workspace_cleanup_generation],
-        |row| row.get(0),
+        |row| Ok(CustodyBlocker {
+            detail: row.get(0)?,
+            unknown_artifact: row.get(1)?,
+        }),
     )
     .optional()
     .map_err(sql_error)

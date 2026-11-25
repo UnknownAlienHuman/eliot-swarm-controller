@@ -2738,6 +2738,10 @@ fn record_store_batch_rejection(
         "unknown" | "busy" | "not_allowed" | "stale_generation" => error.code.as_str(),
         _ => "rejected",
     };
+    // Only the Store's fixed fence diagnostic is safe here. Other
+    // persistence and validation messages can contain batch data.
+    let writer_fence =
+        (error.failure_where.as_deref() == Some("store.writer_fence")).then_some(error);
     crate::logging::record(
         &policy,
         &code,
@@ -2750,7 +2754,7 @@ fn record_store_batch_rejection(
             ("validation", &validation),
             ("outcome", outcome),
         ],
-        None,
+        writer_fence,
     );
 }
 

@@ -1071,6 +1071,9 @@ automation for Owner review. Maintenance also pauses a task-bearing launch's exa
 unresolved probe once the bound generation ends and its native custody drains, or
 after the Owner resolves the exact inactive turn. It preserves the Agent, turn and
 workspace. An uncertain probe is never replayed.
+An unknown cleanup artifact keeps deletion fenced. Probe recovery reports the
+Agent and artifact and ends that cleanup attempt immediately. A live custody
+blocker is eligible for the bounded drain wait.
 If a minimal request cannot be prepared safely for the frozen profile, the daemon
 paces background preparation with a five-minute defer. The persisted deadline
 for a fresh launch and the admission budget stay available. A maintenance probe
@@ -1425,6 +1428,8 @@ internal operation/command. Each carries a bounded, redacted cause and available
 typed failure diagnostics. Logs omit request payloads, credentials, and
 unrecognized method text. Shutdown cancels pending retries. A worker restart
 reconciles retained state and keeps the normal Store and router gates on effects.
+An event batch refused by a faulted Store writer logs the fixed writer-fence
+diagnostic. Batch contents and raw persistence messages remain outside the log.
 
 `watch`, `top`, `show`, `daemon.status` query projections/events. They expose generation,
 active/unknown turn/input/transition gate, source owner/cursor/gap, custody
@@ -1608,6 +1613,11 @@ The attention worker samples liveness on startup and every three minutes (#871).
 An unchanged Stuck candidate becomes reportable after two consecutive sweeps.
 Swarm logs `daemon.liveness_stuck` once per episode and exposes the current
 subject in the Owner inbox. Each command has at most one current command item.
+An active Goal with a running turn on its bound Agent generation waits for that
+turn while the native source is open or an owned process is running. This
+applies when a cadence slot becomes due during a long tool call. A start with
+neither a dispatcher nor running custody still qualifies for Stuck after
+confirmation.
 The `swarm status` liveness summary includes the number of confirmed commands
 without a dispatcher and the oldest command's ID and age, including snoozed
 items (#929, #883).

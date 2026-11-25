@@ -1757,6 +1757,16 @@ fn project_goals(
          AND NOT EXISTS(SELECT 1 FROM goal_markers m WHERE m.agent=g.agent AND m.mode=g.mode
             AND m.generation=g.generation AND m.revision=g.revision AND m.state='unknown'),
        EXISTS(SELECT 1 FROM goal_markers m WHERE m.agent=g.agent AND m.mode=g.mode AND m.generation=g.generation AND m.revision=g.revision AND m.state='running'),
+       a.state IN ('busy','waiting') AND a.generation=g.generation AND EXISTS(
+         SELECT 1 FROM turns t WHERE t.agent=a.id AND t.generation=a.generation
+           AND t.turn_id=a.active_turn AND t.state='running'
+       ) AND (
+         EXISTS(SELECT 1 FROM source_state s WHERE s.agent=a.id AND s.generation=a.generation
+           AND s.state='open' AND s.source NOT IN ('daemon','os','git','workspace_process'))
+         OR EXISTS(SELECT 1 FROM processes p WHERE p.owner IN (
+           'agent:a'||a.id||'#'||a.generation,'workspace:a'||a.id||'#'||a.generation)
+           AND p.state='running')
+       ),
        COALESCE((SELECT MAX(e.seq) FROM events e WHERE e.agent=g.agent AND e.generation=g.generation AND e.kind='goal.changed'),0),
        json_extract(g.state,'$.cadence_anchor_ms') + json_extract(g.definition,'$.cadence_ms')
            * (COALESCE(json_extract(g.state,'$.last_committed_slot'),0) + 1),
@@ -1776,9 +1786,10 @@ fn project_goals(
                 r.get::<_, i64>(5)?,
                 r.get::<_, bool>(6)?,
                 r.get::<_, bool>(7)?,
-                r.get::<_, i64>(8)?,
-                r.get::<_, Option<i64>>(9)?,
-                r.get::<_, bool>(10)?,
+                r.get::<_, bool>(8)?,
+                r.get::<_, i64>(9)?,
+                r.get::<_, Option<i64>>(10)?,
+                r.get::<_, bool>(11)?,
             ))
         })
         .map_err(sql_error)?;
@@ -1792,6 +1803,7 @@ fn project_goals(
             since,
             reconciler_active,
             round_active,
+            turn_active,
             event_seq,
             timer_due,
             deferral_paused,
@@ -1813,7 +1825,9 @@ fn project_goals(
                 state: status,
                 since,
                 owner_item: status == GoalStatus::Blocked || deferral_paused,
-                round_active: round_active || (reconciler_active && timer_due.is_none()),
+                round_active: round_active
+                    || (!turn_active && reconciler_active && timer_due.is_none()),
+                turn_active,
                 timer_due: timer_due.filter(|_| reconciler_active),
             },
             now,
