@@ -1582,9 +1582,11 @@ window closes, and only when it changed. It reads `window` from the file before 
 exists, so the window opens at that size, place and maximized state with no move after the
 first frame; a place no longer on an attached monitor is clamped into the nearest one's work
 area, and without `x`/`y` Windows chooses the place. `panels` (`{sidebar, pane}`: the
-sidebar's width from 200 to 360 DIPs and the context pane's from 320 to 720, as their drag
-handles left them) is written once when a handle is released; Settings › Appearance › Reset
-panel widths removes it, and without it the desktop uses its default widths.
+sidebar's width from 200 to 360 DIPs and the context pane's from 320 to 720, in whole DIPs
+as their drag handles left them) is read with `window`, so the first frame lays out at those
+widths. It is written once when a drag on a handle ends, or when the keyboard focus leaves a
+handle the arrow keys moved. Settings › Appearance › Reset panel widths removes it, and
+without it the desktop uses its default widths.
 When the daemon cannot start, the local Owner can open Settings (Repair
 settings) from the startup failure view. Repair uses the daemon's settings reader and
 revision-checked writer under the private daemon lock. After a repair save

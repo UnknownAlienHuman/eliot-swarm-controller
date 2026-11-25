@@ -285,6 +285,8 @@ struct DesktopInput {
     workspace: Option<PathBuf>,
     /// `[desktop] window`, read before the window exists.
     window: Option<crate::settings::WindowPlacement>,
+    /// `[desktop] panels`, read with `window`.
+    panels: Option<crate::settings::Panels>,
     size_note: SizeNote,
 }
 
@@ -294,11 +296,10 @@ impl PartialEq for DesktopInput {
     }
 }
 
-/// The window's size note: the last observed client width (the panel
-/// handles' bound) and the last normal client size with the data directory
-/// it belongs to, for the one `[desktop]` write after the window closes.
-/// [`split_ui`]'s size observer writes the sizes; the window names the
-/// data directory. Shared with [`run`], which outlives the component.
+/// The window's size note: the last normal client size with the data
+/// directory it belongs to, for the one `[desktop]` write after the window
+/// closes. [`split_ui`]'s size observer writes the size; the window names
+/// the data directory. Shared with [`run`], which outlives the component.
 #[derive(Clone, Default)]
 struct SizeNote(Arc<Mutex<Sizes>>);
 
@@ -308,7 +309,6 @@ struct Sizes {
     /// The normal (not maximized) client size, once at least 640 x 480;
     /// the saved size until then.
     size: Option<(u32, u32)>,
-    width: Option<f64>,
 }
 
 impl PartialEq for SizeNote {
@@ -333,18 +333,11 @@ impl SizeNote {
         self.with(|sizes| sizes.data_dir = Some(data_dir));
     }
 
-    /// A size observation: the client width, and the size when normal.
-    fn observe(&self, width: f64, normal: Option<(u32, u32)>) {
-        self.with(|sizes| {
-            sizes.width = Some(width);
-            if normal.is_some() {
-                sizes.size = normal;
-            }
-        });
-    }
-
-    fn width(&self) -> Option<f64> {
-        self.with(|sizes| sizes.width).flatten()
+    /// A size observation: the client size when normal.
+    fn observe(&self, normal: Option<(u32, u32)>) {
+        if normal.is_some() {
+            self.with(|sizes| sizes.size = normal);
+        }
     }
 
     fn size(&self) -> Option<(u32, u32)> {
@@ -910,23 +903,31 @@ impl Component for DesktopApp {
             status: "Connecting to the daemon…".to_owned(),
             alert: None,
             dialog: dialog_ui::Focus::default(),
-            prefs: crate::settings::Preferences::default(),
+            // The saved panel widths from the first frame, as the daemon's
+            // read will report them.
+            prefs: crate::settings::Preferences {
+                panels: input.panels,
+                ..crate::settings::Preferences::default()
+            },
             prefs_saving: false,
             prefs_rev: 0,
             startup_done: false,
             focus_held: None,
             size_note: input.size_note.clone(),
             preferred_window: input.window.map(|window| (window.width, window.height)),
-            // The first frame's guess from the saved size, until the size
-            // observer posts.
-            layout: split_ui::Layout::of(
-                input.window.map_or(tokens::layout::WINDOW_WIDTH, |window| {
-                    f64::from(window.width)
-                }),
-                tokens::layout::SIDEBAR_WIDTH,
-                false,
-                tokens::layout::PANEL_WIDTH,
-            ),
+            // The first frame's guess from the saved size and panel widths,
+            // until the size observer posts.
+            layout: {
+                let widths = split_ui::PanelWidths::of(input.panels);
+                split_ui::Layout::of(
+                    input.window.map_or(tokens::layout::WINDOW_WIDTH, |window| {
+                        f64::from(window.width)
+                    }),
+                    widths.sidebar,
+                    false,
+                    widths.pane,
+                )
+            },
             preferences_loaded: false,
             fields_primed: true,
             prime_epoch: 0,
@@ -1110,15 +1111,18 @@ impl Component for DesktopApp {
 /// size and place and its maximized state persist once into `[desktop]`,
 /// only when they differ from the saved value.
 pub fn run(workspace: Option<PathBuf>) -> Result<(), String> {
-    let window = client::data_dir()
+    let saved = client::data_dir()
         .ok()
-        .and_then(|data_dir| crate::settings::saved_window(&data_dir));
+        .map(|data_dir| crate::settings::saved_desktop(&data_dir))
+        .unwrap_or_default();
+    let window = saved.window;
     let size_note = SizeNote::new(window.map(|window| (window.width, window.height)));
     // On this thread, which creates the window (Reactor runs WinUI here).
     let placement = crate::window_place::install(window);
     let result = App::run_component::<DesktopApp>(DesktopInput {
         workspace,
         window,
+        panels: saved.panels,
         size_note: size_note.clone(),
     })
     .map_err(|error| error.to_string());

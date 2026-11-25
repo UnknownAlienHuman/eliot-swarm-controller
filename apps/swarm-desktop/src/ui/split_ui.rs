@@ -2,12 +2,11 @@
 //! main card and the docked context pane, with a drag handle on each
 //! panel's inner edge.
 //!
-//! [`SplitShell`] owns both panel widths, so a drag step re-renders it
-//! alone: the window's subtrees reach it as input and compare equal.
-//! [`Breakpoints`] is the one observer of the window's size; its view is
-//! one empty element, and it posts to the window only when the size class
-//! or the docking result changes (§6.2), so a resize inside one class
-//! costs the window nothing.
+//! [`SplitShell`] owns both panel widths and is the one observer of the
+//! window's size, so a drag or resize step re-renders it alone: the
+//! window's subtrees reach it as input and compare equal. It posts to the
+//! window only when the size class or the docking result changes (§6.2),
+//! so a resize inside one class costs the window nothing.
 
 use super::*;
 use tokens::layout::{
@@ -63,12 +62,21 @@ impl Layout {
         };
         Self {
             class,
-            docks: width >= sidebar + MAIN_REQUIRED_WIDTH + pane + DOCK_GAP,
+            docks: spare(width, sidebar, pane) >= 0.0,
         }
     }
 }
 
-/// The two resizable widths, as `[desktop] panels` keeps them.
+/// What a client `width` leaves beyond the sidebar, the main area's
+/// required width, the docked `pane` (0 when none) and the gap: §6.2 docks
+/// the pane while it is not negative, and a handle may widen its panel by
+/// at most this much.
+fn spare(width: f64, sidebar: f64, pane: f64) -> f64 {
+    width - (sidebar + MAIN_REQUIRED_WIDTH + pane + DOCK_GAP)
+}
+
+/// The two resizable widths, as `[desktop] panels` keeps them: whole DIPs
+/// (a handle rounds once, in [`SplitShell::resize`]).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(super) struct PanelWidths {
     pub(super) sidebar: f64,
@@ -95,8 +103,8 @@ impl PanelWidths {
 
     pub(super) fn saved(self) -> crate::settings::Panels {
         crate::settings::Panels {
-            sidebar: self.sidebar.round() as u32,
-            pane: self.pane.round() as u32,
+            sidebar: self.sidebar as u32,
+            pane: self.pane as u32,
         }
     }
 }
@@ -180,7 +188,11 @@ pub(super) enum Edge {
 }
 
 pub(super) enum SplitMsg {
+    /// The window's client size.
+    Size(WindowSize),
     Pressed(Edge, PointerEventInfo),
+    /// A move over or captured by a handle; with the left button up (a
+    /// release the handle never saw) the drag ends as on release.
     Moved(Edge, PointerEventInfo),
     /// Release or capture loss: the drag ends and the widths persist.
     Ended(Edge),
@@ -198,6 +210,8 @@ struct Drag {
 }
 
 pub(super) struct SplitShell {
+    /// The observed client width; none until the first size observation.
+    window: Option<f64>,
     widths: PanelWidths,
     /// The saved widths last adopted (a reset in Settings changes them).
     adopted: PanelWidths,
@@ -205,11 +219,45 @@ pub(super) struct SplitShell {
     hover: Option<Edge>,
     mode: Side,
     docked: bool,
+    /// The pane is requested at its Wide preset.
+    wide: bool,
+    /// The layout last posted to the window.
+    posted: Option<Layout>,
+    /// The window has its icon (set once it is shown).
+    icon_set: bool,
     note: SizeNote,
+    on_layout: Callback<Layout>,
     on_widths: Callback<PanelWidths>,
 }
 
 impl SplitShell {
+    /// The requested pane width, which decides docking: the Wide preset's,
+    /// or the handle's.
+    fn requested_pane(&self) -> f64 {
+        if self.wide {
+            PANEL_WIDE_WIDTH
+        } else {
+            self.widths.pane
+        }
+    }
+
+    /// Posts the layout of the observed width when it changed.
+    fn post_layout(&mut self) {
+        let Some(window) = self.window else {
+            return;
+        };
+        let layout = Layout::of(
+            window,
+            self.widths.sidebar,
+            self.mode == Side::Rail,
+            self.requested_pane(),
+        );
+        if self.posted != Some(layout) {
+            self.posted = Some(layout);
+            self.on_layout.call(layout);
+        }
+    }
+
     /// The sidebar's width beside the main area.
     fn sidebar_beside(&self) -> f64 {
         match self.mode {
@@ -218,21 +266,33 @@ impl SplitShell {
         }
     }
 
-    /// `edge`'s width moved to `width`, within its bounds and keeping the
-    /// main area at its required width beside the other panel.
+    /// `edge`'s width moved to `width`: whole DIPs, within its bounds and
+    /// keeping the main area at its required width beside the other panel
+    /// ([`spare`]). Nothing moves before the first size observation.
     fn resize(&mut self, edge: Edge, width: f64) {
-        let window = self.note.width().unwrap_or(f64::MAX);
+        let Some(window) = self.window else {
+            return;
+        };
+        let pane = if self.docked {
+            self.requested_pane()
+        } else {
+            0.0
+        };
+        let most = (self.width(edge) + spare(window, self.sidebar_beside(), pane)).floor();
+        let width = width.round().min(most);
         match edge {
             Edge::Sidebar => {
-                let pane = if self.docked { self.widths.pane } else { 0.0 };
-                let room = window - pane - MAIN_REQUIRED_WIDTH - DOCK_GAP;
-                self.widths.sidebar = width.min(room).clamp(SIDEBAR_MIN_WIDTH, SIDEBAR_MAX_WIDTH);
+                self.widths.sidebar = width.clamp(SIDEBAR_MIN_WIDTH, SIDEBAR_MAX_WIDTH);
             }
-            Edge::Pane => {
-                let room = window - self.sidebar_beside() - MAIN_REQUIRED_WIDTH - DOCK_GAP;
-                self.widths.pane = width.min(room).clamp(PANEL_MIN_WIDTH, PANEL_MAX_WIDTH);
-            }
+            Edge::Pane => self.widths.pane = width.clamp(PANEL_MIN_WIDTH, PANEL_MAX_WIDTH),
         }
+        self.post_layout();
+    }
+
+    /// The drag ends and the widths persist.
+    fn end_drag(&mut self) {
+        self.drag = None;
+        self.persist();
     }
 
     fn width(&self, edge: Edge) -> f64 {
@@ -307,13 +367,18 @@ impl Component for SplitShell {
 
     fn create(input: &SplitInput, _context: &ComponentContext<Self>) -> Self {
         Self {
+            window: None,
             widths: input.widths,
             adopted: input.widths,
             drag: None,
             hover: None,
             mode: input.mode,
             docked: input.pane.is_some() && !input.over,
+            wide: input.wide,
+            posted: None,
+            icon_set: false,
             note: input.note.clone(),
+            on_layout: input.on_layout.clone(),
             on_widths: input.on_widths.clone(),
         }
     }
@@ -321,15 +386,34 @@ impl Component for SplitShell {
     fn input_changed(&mut self, input: &SplitInput, _context: &ComponentContext<Self>) {
         self.mode = input.mode;
         self.docked = input.pane.is_some() && !input.over;
+        self.wide = input.wide;
+        self.note = input.note.clone();
+        self.on_layout = input.on_layout.clone();
         self.on_widths = input.on_widths.clone();
         if input.widths != self.adopted {
             self.widths = input.widths;
             self.adopted = input.widths;
         }
+        self.post_layout();
     }
 
     fn update(&mut self, message: SplitMsg, _context: &ComponentContext<Self>) {
         match message {
+            SplitMsg::Size(size) => {
+                // Until the window is shown the next size observation
+                // tries again.
+                if !self.icon_set {
+                    self.icon_set = crate::app_window::set_icon();
+                }
+                self.window = Some(size.width);
+                // A maximized size is not the size the window restores to.
+                let normal = size.width >= 640.0
+                    && size.height >= 480.0
+                    && !crate::window_place::maximized();
+                self.note
+                    .observe(normal.then_some((size.width as u32, size.height as u32)));
+                self.post_layout();
+            }
             SplitMsg::Pressed(edge, info) => {
                 self.drag = Some(Drag {
                     edge,
@@ -341,6 +425,10 @@ impl Component for SplitShell {
                 let Some(drag) = self.drag.as_ref().filter(|drag| drag.edge == edge) else {
                     return;
                 };
+                if !info.is_left_button_pressed {
+                    self.end_drag();
+                    return;
+                }
                 let moved = info.window_x - drag.start_x;
                 let width = match edge {
                     Edge::Sidebar => drag.start_width + moved,
@@ -350,8 +438,7 @@ impl Component for SplitShell {
             }
             SplitMsg::Ended(edge) => {
                 if self.drag.as_ref().is_some_and(|drag| drag.edge == edge) {
-                    self.drag = None;
-                    self.persist();
+                    self.end_drag();
                 }
             }
             SplitMsg::Hover(edge) => self.hover = edge,
@@ -436,30 +523,11 @@ impl Component for SplitShell {
                     .keyed_children(crate::views::slots([Some(subtree(&input.main)), pane])),
             )
             .into();
-        // The requested pane width decides docking: the Wide preset's, or
-        // the handle's.
-        let requested = if input.wide {
-            PANEL_WIDE_WIDTH
-        } else {
-            self.widths.pane
-        };
+        context.on_window_size(context.callback(SplitMsg::Size));
         let columns = Grid::new()
             .background(ThemeBrush::SolidBackground)
             .columns([GridLength::Auto, GridLength::STAR])
-            .keyed_children([
-                KeyedView::new("side", side),
-                KeyedView::new("card", card),
-                KeyedView::new(
-                    "breakpoints",
-                    View::component::<Breakpoints>(BreakpointsInput {
-                        sidebar: self.widths.sidebar,
-                        rail: input.mode == Side::Rail,
-                        pane: requested,
-                        note: input.note.clone(),
-                        on_layout: input.on_layout.clone(),
-                    }),
-                ),
-            ]);
+            .keyed_children([KeyedView::new("side", side), KeyedView::new("card", card)]);
         // A compact window opens the sidebar over the main area in the
         // native navigation pane (light dismiss); the split view is always
         // there, so crossing 900 DIPs keeps the main card's tree.
@@ -476,82 +544,5 @@ impl Component for SplitShell {
             .content(columns)
             .on_pane_closed(input.on_overlay_closed.clone())
             .into()
-    }
-}
-
-#[derive(Clone, PartialEq)]
-struct BreakpointsInput {
-    /// The sidebar's resizable width.
-    sidebar: f64,
-    /// The rail shows instead (hidden by choice).
-    rail: bool,
-    /// The requested pane width.
-    pane: f64,
-    note: SizeNote,
-    on_layout: Callback<Layout>,
-}
-
-/// The one window-size observer: an empty element (Reactor's fast path).
-/// It keeps the size note for the `[desktop]` write at close and posts the
-/// layout only when it changes.
-struct Breakpoints {
-    width: Option<f64>,
-    posted: Option<Layout>,
-    /// The window has its icon (set once it is shown).
-    icon_set: bool,
-    input: BreakpointsInput,
-}
-
-impl Breakpoints {
-    fn post(&mut self) {
-        let Some(width) = self.width else {
-            return;
-        };
-        let input = &self.input;
-        let layout = Layout::of(width, input.sidebar, input.rail, input.pane);
-        if self.posted != Some(layout) {
-            self.posted = Some(layout);
-            input.on_layout.call(layout);
-        }
-    }
-}
-
-impl Component for Breakpoints {
-    type Input = BreakpointsInput;
-    type Message = WindowSize;
-
-    fn create(input: &BreakpointsInput, _context: &ComponentContext<Self>) -> Self {
-        Self {
-            width: None,
-            posted: None,
-            icon_set: false,
-            input: input.clone(),
-        }
-    }
-
-    fn input_changed(&mut self, input: &BreakpointsInput, _context: &ComponentContext<Self>) {
-        self.input = input.clone();
-        self.post();
-    }
-
-    fn update(&mut self, size: WindowSize, _context: &ComponentContext<Self>) {
-        // Until the window is shown the next size observation tries again.
-        if !self.icon_set {
-            self.icon_set = crate::app_window::set_icon();
-        }
-        self.width = Some(size.width);
-        // A maximized size is not the size the window restores to.
-        let normal =
-            size.width >= 640.0 && size.height >= 480.0 && !crate::window_place::maximized();
-        self.input.note.observe(
-            size.width,
-            normal.then_some((size.width as u32, size.height as u32)),
-        );
-        self.post();
-    }
-
-    fn view(&self, _input: &BreakpointsInput, context: &mut ViewContext<Self>) -> View {
-        context.on_window_size(context.callback(|size: WindowSize| size));
-        Border::new().into()
     }
 }

@@ -1333,13 +1333,12 @@ fn section_source(
     if section == SettingsSection::Desktop
         && let Some(object) = normalized.as_object_mut()
     {
-        // TOML has no null: omit null window/last_access like the
-        // pre-existing window handling, so a JSON null round-trips.
-        if object.get("window").is_some_and(JsonValue::is_null) {
-            object.remove("window");
-        }
-        if object.get("last_access").is_some_and(JsonValue::is_null) {
-            object.remove("last_access");
+        // TOML has no null: omit the optional fields the reader shows as
+        // null, so a JSON null round-trips.
+        for field in ["window", "last_access", "panels"] {
+            if object.get(field).is_some_and(JsonValue::is_null) {
+                object.remove(field);
+            }
         }
     }
     let section_value = toml::Value::try_from(normalized).map_err(|_| {
