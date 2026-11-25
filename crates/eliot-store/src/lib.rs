@@ -39,7 +39,9 @@ pub use attribution::WhoWorkerRow;
 pub use capacity::{OwnedExitProof, RecordedProcess, RestartResumeCandidate, RetainedGeneration};
 pub use command_children::{CommandChildrenPage, history_expired};
 pub use config_overlay::AgentConfig;
-pub use context::{ContextDispatch, SendInput, TurnInsertionEvidence};
+pub use context::{
+    ContextDispatch, SendInput, TurnInsertionEvidence, observe_context_digest_warnings,
+};
 pub use coordination::{MailSendOutcome, MailSendResult, NoticeClaim};
 pub use digests::{DigestRegisterOutcome, DigestRow, DigestTurn};
 pub use failed_custody::FailedGenerationExitSnapshot;

@@ -62,15 +62,8 @@ impl Router {
         match store.fail_switch_preparation(id, error, &policy, now_ms()) {
             Ok(change) => {
                 self.publish_locked(&change.events);
-                if change.value.state == CommandState::Rejected {
-                    let outcome = change.value.outcome.as_ref();
-                    let code = outcome
-                        .and_then(|value| value["error"].as_str())
-                        .unwrap_or("rejected");
-                    let reason = outcome
-                        .and_then(|value| value["error_reason"].as_str())
-                        .unwrap_or("switch was already rejected");
-                    log_refusal(&policy, id, code, reason);
+                if change.value.state == CommandState::Rejected && !change.events.is_empty() {
+                    log_refusal(&policy, id, &error.code, &error.message);
                 }
             }
             Err(error) => crate::logging::record(

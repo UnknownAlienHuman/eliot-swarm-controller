@@ -12,6 +12,16 @@ use eliot_core::{
     turn_started_data,
 };
 use serde::{Deserialize, Serialize};
+use std::sync::OnceLock;
+
+type ContextDigestWarning = fn(&str, Option<&str>, Option<&str>, &Error);
+static CONTEXT_DIGEST_WARNING: OnceLock<ContextDigestWarning> = OnceLock::new();
+
+/// Install the daemon's diagnostic sink once. A warning has no effect on
+/// the Store transaction or the retained delivery outcome.
+pub fn observe_context_digest_warnings(observer: ContextDigestWarning) {
+    let _ = CONTEXT_DIGEST_WARNING.set(observer);
+}
 
 const CONTEXT_ITEMS_ARG: &str = "context_items";
 
@@ -1786,30 +1796,44 @@ pub(super) fn allows_next_input_fallback(
     request.target = command.target.clone();
     request.expected_generation = command.expected_generation;
     request.expected_turn_id = record.expected_turn_id.clone();
+    let mut warned = false;
+    let mut matches = |args: &Value| {
+        match admission::command_semantic_payload(&request, args.clone())
+            .and_then(|payload| canonical::digest(&payload))
+        {
+            Ok(candidate) => candidate == digest,
+            Err(error) => {
+                if !warned && let Some(warn) = CONTEXT_DIGEST_WARNING.get() {
+                    warn(
+                        &command.id,
+                        command.target.as_deref(),
+                        command.turn_id.as_deref(),
+                        &error,
+                    );
+                    warned = true;
+                }
+                // Failure to reconstruct a digest cannot authorize a move or block settlement.
+                false
+            }
+        }
+    };
     for key in ["point", "at"] {
         let mut semantic_args = json!({"text": args.text});
         semantic_args[key] = json!(InjectPoint::Soonest);
         if let Some(expires) = args.expires_at_ms {
             semantic_args["expires_at_ms"] = json!(expires);
         }
-        if legacy_request_digest_matches(&request, &semantic_args, &digest) {
+        if matches(&semantic_args) {
             return Ok(true);
         }
         if args.expires_at_ms.is_none() {
             semantic_args["expires_at_ms"] = Value::Null;
-            if legacy_request_digest_matches(&request, &semantic_args, &digest) {
+            if matches(&semantic_args) {
                 return Ok(true);
             }
         }
     }
     Ok(false)
-}
-
-fn legacy_request_digest_matches(request: &SubmitCommand, args: &Value, digest: &[u8]) -> bool {
-    // Failure to reconstruct a legacy digest cannot authorize a move or block settlement.
-    admission::command_semantic_payload(request, args.clone())
-        .and_then(|payload| canonical::digest(&payload))
-        .is_ok_and(|candidate| candidate == digest)
 }
 
 pub(super) fn turn_accepts_context_tx(
