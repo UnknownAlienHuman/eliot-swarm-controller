@@ -188,6 +188,12 @@ impl RoutePreflight {
     fn check_candidate_holds(&self) -> bool {
         !self.arbitrated || self.automatic
     }
+
+    fn has_explicit_quota_policy(&self) -> bool {
+        self.quota_policies
+            .values()
+            .any(|policy| policy.ranks_routes)
+    }
 }
 
 impl Router {
@@ -673,11 +679,8 @@ impl Router {
         mut decision: RoutingDecision,
         mut preflight: RoutePreflight,
     ) -> Result<(String, String, Value)> {
-        let rank_by_quota = !preflight.prefer_candidate_order
-            && preflight
-                .quota_policies
-                .values()
-                .any(|policy| policy.ranks_routes);
+        let rank_by_quota =
+            !preflight.prefer_candidate_order && preflight.has_explicit_quota_policy();
         preflight.discovery_deadline =
             Some(std::time::Instant::now() + crate::adhoc::DISCOVERY_BUDGET);
         let mut selected: Option<AvailableRoute> = None;
@@ -955,7 +958,10 @@ impl Router {
                 }
             }
         }
-        let quota = if preflight.arbitrated && preflight.quota_policies.is_empty() {
+        let quota = if preflight.arbitrated
+            && !preflight.quota_policies.contains_key(name)
+            && !preflight.has_explicit_quota_policy()
+        {
             CandidateQuota {
                 status: RouteQuotaStatus::Unknown,
                 unmapped: false,
