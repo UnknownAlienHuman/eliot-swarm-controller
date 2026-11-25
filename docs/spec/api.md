@@ -3002,8 +3002,9 @@ resends previous input.
 `turn.preview.watch {agent,generation,turn_id,revision?}` uses the Agent read
 scope of `turn.get`. Supply the visible turn's exact binding and the last
 returned non-null revision. The first call returns the current state. A long
-poll waits up to 20 seconds and returns
-`{revision:null,preview:null,ended:false}` on timeout. A changed revision
+poll waits up to 20 seconds. On timeout it returns the same revision with
+`preview:null,ended:false`. The daemon limits concurrent calls to 32 overall
+and four per principal. Excess calls return `busy`. A changed revision
 replaces the preview with `{message_id,text,truncated}`, or clears it if
 `preview` is null. A turn that is no longer active returns `ended:true` with
 a null preview. Discard the preview on terminal notification or selection change.

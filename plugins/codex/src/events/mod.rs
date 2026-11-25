@@ -1888,6 +1888,9 @@ impl EventProcessor {
             "turn_id": turn_id,
             "text": text,
         });
+        if eliot_core::api::valid_preview_id(item_id) {
+            data["message_id"] = Value::String(item_id.to_owned());
+        }
         let phase = native_message_phase(item);
         if let Some(phase) = phase {
             data["phase"] = Value::String(phase.to_owned());

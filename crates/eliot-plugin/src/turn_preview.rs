@@ -25,7 +25,6 @@ impl TurnPreviewChunk {
     pub fn valid(&self) -> bool {
         valid_preview_id(&self.turn_id)
             && valid_preview_id(&self.message_id)
-            && !self.text.is_empty()
             && self.text.len() <= MAX_CHUNK_BYTES
     }
 }
@@ -36,6 +35,7 @@ pub struct PreviewSender {
     generation: i64,
     current: Option<(String, String)>,
     next: u64,
+    truncated: bool,
 }
 
 impl PreviewSender {
@@ -57,43 +57,52 @@ impl PreviewSender {
             generation,
             current: None,
             next: 0,
+            truncated: false,
         }
     }
 
     pub fn offer(&mut self, turn_id: &str, message_id: &str, mut text: &str) {
-        if !valid_preview_id(turn_id) || !valid_preview_id(message_id) {
+        if !self.bind(turn_id, message_id) || self.truncated {
             return;
         }
-        self.bind(turn_id, message_id);
         while !text.is_empty() {
+            // Keep one queue slot available for a gap even if no later delta
+            // arrives to expose the missing sequence.
+            if self.queue.capacity() <= 1 {
+                self.gap(turn_id, message_id);
+                return;
+            }
             let (chunk, remaining) = text.split_at(text.floor_char_boundary(MAX_CHUNK_BYTES));
             text = remaining;
-            let sequence = self.next;
-            self.next = self.next.saturating_add(1);
-            if self
-                .queue
-                .try_send(TurnPreviewChunk {
-                    agent_id: self.agent_id.clone(),
-                    generation: self.generation,
-                    turn_id: turn_id.to_owned(),
-                    message_id: message_id.to_owned(),
-                    sequence,
-                    text: chunk.to_owned(),
-                })
-                .is_err()
-            {
-                break;
-            }
+            self.enqueue(turn_id, message_id, chunk);
         }
     }
 
-    /// A native pump drop consumes a sequence before any later text.
+    /// An empty chunk marks the retained prefix truncated.
     pub fn gap(&mut self, turn_id: &str, message_id: &str) {
-        self.bind(turn_id, message_id);
-        self.next = self.next.saturating_add(1);
+        if self.bind(turn_id, message_id) && !self.truncated {
+            self.truncated = true;
+            self.enqueue(turn_id, message_id, "");
+        }
     }
 
-    fn bind(&mut self, turn_id: &str, message_id: &str) {
+    fn enqueue(&mut self, turn_id: &str, message_id: &str, text: &str) {
+        let sequence = self.next;
+        self.next = self.next.saturating_add(1);
+        let _ = self.queue.try_send(TurnPreviewChunk {
+            agent_id: self.agent_id.clone(),
+            generation: self.generation,
+            turn_id: turn_id.to_owned(),
+            message_id: message_id.to_owned(),
+            sequence,
+            text: text.to_owned(),
+        });
+    }
+
+    fn bind(&mut self, turn_id: &str, message_id: &str) -> bool {
+        if !valid_preview_id(turn_id) || !valid_preview_id(message_id) {
+            return false;
+        }
         if self
             .current
             .as_ref()
@@ -101,6 +110,8 @@ impl PreviewSender {
         {
             self.current = Some((turn_id.to_owned(), message_id.to_owned()));
             self.next = 0;
+            self.truncated = false;
         }
+        true
     }
 }

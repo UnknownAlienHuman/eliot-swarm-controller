@@ -3581,23 +3581,16 @@ fn source_secret_snapshot(
     environment: &Value,
     mut known: Vec<String>,
 ) -> Arc<[String]> {
-    if let (Some(names), Some(environment)) = (
-        profile.get("pass_env").and_then(Value::as_array),
-        environment.as_object(),
-    ) {
-        for name in names
-            .iter()
-            .filter_map(Value::as_str)
-            .chain(profile["api_key_env"].as_str())
-        {
-            if let Some(value) = environment.iter().find_map(|(key, value)| {
-                let matches = if cfg!(windows) {
-                    key.eq_ignore_ascii_case(name)
-                } else {
-                    key == name
-                };
-                matches.then(|| value.as_str()).flatten()
-            }) {
+    if let Some(environment) = environment.as_object() {
+        let api_key = profile["api_key_env"].as_str();
+        for (name, value) in environment {
+            if (eliot_plugin::session::is_secret_name(name)
+                || eliot_plugin::session::is_passed_env(name, profile.get("pass_env"))
+                || api_key.is_some_and(|key| {
+                    name == key || (cfg!(windows) && name.eq_ignore_ascii_case(key))
+                }))
+                && let Some(value) = value.as_str()
+            {
                 known.push(value.to_owned());
             }
         }

@@ -1175,11 +1175,15 @@ impl EventProcessor {
         {
             return;
         }
-        self.refresh_terminal_deadline();
         let Some(turn) = self.status.active_turn_id.as_deref() else {
             return;
         };
         if gap {
+            if let Some((bound_turn, message)) = &self.preview_message
+                && bound_turn == turn
+            {
+                self.preview.gap(turn, message);
+            }
             self.preview_message = None;
         }
         let event = &record["event"];
@@ -1827,6 +1831,12 @@ impl EventProcessor {
             "text": text.clone(),
         });
         self.scope_turn_command(&mut data);
+        if let Some(id) = record["message"]["id"]
+            .as_str()
+            .filter(|id| eliot_core::api::valid_preview_id(id))
+        {
+            data["message_id"] = Value::String(id.to_owned());
+        }
         if let Some(model) = observed_model {
             data["model"] = Value::String(model);
         }
