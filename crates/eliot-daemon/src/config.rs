@@ -2917,6 +2917,48 @@ pub(crate) fn profile_names_for_harness(data_root: &Path, harness: &str) -> Vec<
     names
 }
 
+/// Install-time reviewer-pin check for `swarm rule install-review --reviewer`.
+///
+/// Returns a refusal naming the pinned reviewer when its frozen harness/model
+/// can never satisfy reviewer independence against the author's frozen
+/// harness/model: a reviewer model with no usable family stem, or the same
+/// catalogue provider and model family as the author. Returns `None` when the
+/// pin looks independent or either side cannot be resolved here; the runtime
+/// refusal (which names the pinned profile) stays the backstop for those
+/// cases.
+pub fn review_pin_refusal(data_root: &Path, author: &str, reviewer: &str) -> Option<String> {
+    let (config, source) = read_config(data_root).ok()??;
+    let snapshot = |name: &str| resolve_profile_in(&config, &source, name).ok();
+    let reviewer_snapshot = snapshot(reviewer)?;
+    let reviewer_harness = reviewer_snapshot.get("harness").and_then(Value::as_str)?;
+    let reviewer_model = reviewer_snapshot
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let Some(reviewer_family) = core::api::model_family(reviewer_model) else {
+        return Some(format!(
+            "unknown model family for reviewer profile {reviewer:?} (model {reviewer_model:?}); \
+             the reviewer needs a concrete model from a different provider and model family than the author",
+        ));
+    };
+    let reviewer_provider =
+        core::api::catalog_provider(reviewer_harness, reviewer_model).to_ascii_lowercase();
+    let author_snapshot = snapshot(author)?;
+    let author_harness = author_snapshot.get("harness").and_then(Value::as_str)?;
+    let author_model = author_snapshot.get("model").and_then(Value::as_str)?;
+    let author_family = core::api::model_family(author_model)?;
+    let author_provider =
+        core::api::catalog_provider(author_harness, author_model).to_ascii_lowercase();
+    if reviewer_provider == author_provider && reviewer_family == author_family {
+        return Some(format!(
+            "reviewer profile {reviewer:?} shares the author's provider ({reviewer_provider}) \
+             and model family ({reviewer_family}); \
+             choose a reviewer from a different provider and model family",
+        ));
+    }
+    None
+}
+
 /// Find a named review profile in one configuration revision. An explicit
 /// profile is a pin. A role preserves its configured candidate order.
 pub(crate) fn select_review_profile(

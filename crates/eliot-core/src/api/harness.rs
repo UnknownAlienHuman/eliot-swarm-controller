@@ -1863,6 +1863,27 @@ pub fn catalog_cursor(harness: &str, id: &str) -> String {
     format!("{harness}:{id}")
 }
 
+/// Lowercase model-family stem for reviewer-independence checks, derived from
+/// the case-insensitive model name stem (provider prefix stripped, version
+/// digits stripped). Returns `None` when the id carries no usable stem:
+/// empty ids, the `auto`/`default` placeholders, and stems that are only a
+/// dotted numeric suffix (for example `qwen2.5-coder` or `llama3.1-70b`).
+pub fn model_family(id: &str) -> Option<String> {
+    let leaf = id.rsplit('/').next()?;
+    let stem = leaf
+        .split(['-', '_', ':', '@'])
+        .next()?
+        .rsplit('.')
+        .next()?;
+    let family = stem
+        .trim_end_matches(|ch: char| ch.is_ascii_digit())
+        .to_ascii_lowercase();
+    if family.is_empty() || matches!(family.as_str(), "auto" | "default") {
+        return None;
+    }
+    Some(family)
+}
+
 /// Case-insensitive substring match over model id, display name, provider
 /// and harness. An empty query matches everything.
 pub fn catalog_matches(entry: &ModelsCatalogEntry, query: &str) -> bool {

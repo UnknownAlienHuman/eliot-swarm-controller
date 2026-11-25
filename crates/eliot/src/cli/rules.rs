@@ -450,6 +450,12 @@ pub(crate) async fn run_rule(
             if !Path::new(&workspace).is_absolute() {
                 return Err(Failure::new(2, "review workspace must be an absolute path"));
             }
+            if let Some(reviewer) = reviewer.as_deref()
+                && let Some(refusal) =
+                    eliot_daemon::review_pin_refusal(&data_dir, &author, reviewer)
+            {
+                return Err(Failure::new(2, refusal));
+            }
             let template = include_str!("../../../../config/recipes/review-after-turn.toml");
             let profile_line = reviewer.map_or_else(String::new, |profile| {
                 format!("profile = {}", json!(profile))

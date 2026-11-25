@@ -655,6 +655,8 @@ author turn and selects the first eligible named
 profile in lexical order. Project rules select only from the current registration's
 approved profiles. A `role` restricts selection to its ordered candidates. An
 explicit `profile` (the installer's optional `--reviewer`) pins a single candidate.
+An Owner rule has no project allowlist, so pin it with `profile` or restrict it
+with `role`; with neither, selection takes the lexically first eligible profile.
 The reviewer must differ in catalogue provider and model family, based on the
 case-insensitive model name stem. Profiles with setup or without a concrete model
 are skipped. The normal launch path freezes the profile and rechecks independence
