@@ -455,6 +455,13 @@ Flow:
 6. only a `ready` row whose target generation matches the start command permits that
    generation's native dispatch.
 
+A fresh launch with no setup may reuse its final Git identity readback when
+the same preparation operation just committed the exact `ready` row. The
+daemon still checks that row and generation at dispatch. An external checkout
+or HEAD move after that readback and before dispatch can escape detection in
+this interval. A recovered `ready` row, a Resume, and a launch that ran setup
+get a fresh Git identity readback before dispatch.
+
 A preparation error with an exact creation marker proving no Git write or setup
 dispatch settles the command and workspace with the original error code and message.
 A refused Resume restores its exact prior `ready` marker. Later Resume attempts
