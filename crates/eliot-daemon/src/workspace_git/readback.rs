@@ -270,7 +270,7 @@ impl WorkspaceGit {
                                             .collect::<Vec<_>>()
                                     }
                                 }),
-                                git.entries(&common, deadline),
+                                git.project_entries(&common, deadline),
                             );
                             let inventory = inventory.unwrap_or_default();
                             let mut by_path = BTreeMap::new();
@@ -290,9 +290,9 @@ impl WorkspaceGit {
                                             .copied()
                                             .flatten()
                                     });
-                                    git.checkout_readback(repo, entry, deadline)
+                                    git.checkout_readback(repo, entry.cloned(), deadline)
                                 })
-                                .buffered(4)
+                                .buffered(8)
                                 .filter_map(std::future::ready)
                                 .collect()
                                 .await
@@ -322,18 +322,51 @@ impl WorkspaceGit {
         }
     }
 
+    async fn project_entries(
+        &self,
+        common: &Path,
+        deadline: Instant,
+    ) -> Result<Vec<WorktreeEntry>> {
+        let output = self
+            .git
+            .project_git_metadata(
+                common,
+                &["worktree", "list", "--porcelain", "-z"],
+                None,
+                deadline,
+            )
+            .await?;
+        if output.code != 0 {
+            return Err(problem(
+                "unavailable",
+                "Git worktree registry could not be read",
+            ));
+        }
+        Self::parse_worktree_entries(&output.stdout)
+    }
+
     async fn checkout_readback(
         &self,
         repo: Repository,
-        entry: Option<&WorktreeEntry>,
+        entry: Option<WorktreeEntry>,
         deadline: Instant,
     ) -> Option<ProjectCheckoutView> {
-        let head = repo.git_dir.join("HEAD");
-        reject_links(&head).ok()?;
-        if !fs::symlink_metadata(&head).is_ok_and(|metadata| metadata.is_file()) {
-            return None;
-        }
-        let branch = match entry.and_then(|entry| inventory_head(&repo, &head, entry)) {
+        let (repo, branch) = tokio::task::spawn_blocking(move || {
+            let head = repo.git_dir.join("HEAD");
+            let branch = entry
+                .as_ref()
+                .and_then(|entry| inventory_head(&repo, &head, entry));
+            if branch.is_none() {
+                reject_links(&head).ok()?;
+                if !fs::symlink_metadata(&head).is_ok_and(|metadata| metadata.is_file()) {
+                    return None;
+                }
+            }
+            Some((repo, branch))
+        })
+        .await
+        .ok()??;
+        let branch = match branch {
             Some(branch) => branch,
             None => {
                 let binding = GitBinding {
@@ -342,10 +375,10 @@ impl WorkspaceGit {
                 };
                 let output = self
                     .git
-                    .workspace_command_bound(
+                    .project_git_metadata(
                         &repo.root,
                         &["symbolic-ref", "--quiet", "--no-recurse", "HEAD"],
-                        binding,
+                        Some(binding),
                         deadline,
                     )
                     .await

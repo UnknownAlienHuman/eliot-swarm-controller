@@ -185,6 +185,21 @@ impl Store {
         Ok(rows.into_iter().collect())
     }
 
+    /// The digest compares a single exact admitted path while holding the
+    /// Store lock. Stop at the second live owner, which proves it is shared.
+    pub fn workspace_singly_owned(&self, workspace: &str) -> Result<bool> {
+        self.connection
+            .query_row(
+                "SELECT COUNT(*) = 1 FROM (
+                 SELECT 1 FROM agents WHERE workspace = ?1
+                   AND state NOT IN ('stopped','failed','lost') LIMIT 2
+             )",
+                [workspace],
+                |row| row.get(0),
+            )
+            .map_err(sql_error)
+    }
+
     fn resolve_claim_agent(
         &self,
         principal: &str,

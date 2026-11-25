@@ -1540,6 +1540,36 @@ impl GitProbe {
             .await
     }
 
+    /// These built-in metadata reads do not run filters, aliases, or merge
+    /// drivers. Use the ordinary owned leaf and deadlines without inventorying
+    /// executable configuration for each repository and checkout.
+    pub(crate) async fn project_git_metadata(
+        &self,
+        root: &Path,
+        args: &[&str],
+        binding: Option<GitBinding<'_>>,
+        deadline: Instant,
+    ) -> Result<Captured> {
+        if !matches!(
+            args,
+            [
+                "config",
+                "--local",
+                "--no-includes",
+                "--get",
+                "remote.origin.url"
+            ] | ["worktree", "list", "--porcelain", "-z"]
+                | ["symbolic-ref", "--quiet", "--no-recurse", "HEAD"]
+        ) {
+            return Err(Error::new(
+                "invalid",
+                "unsupported project Git metadata read",
+            ));
+        }
+        self.run_scoped(root, args, &[], &[], deadline, binding)
+            .await
+    }
+
     /// Run merge-tree with output objects confined to the private view.
     pub(crate) async fn preview_merge(
         &self,
