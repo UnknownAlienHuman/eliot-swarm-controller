@@ -12,4 +12,5 @@ eliot-core.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 rusqlite = { workspace = true, features = ["backup"] }
+sha2.workspace = true
 ulid.workspace = true

@@ -274,7 +274,7 @@ impl Store {
                                 db!(tx.execute_batch("ROLLBACK TO project_transfer_commit; RELEASE project_transfer_commit"));
                                 value.blockers.push(blocker(&error.code, None));
                             }
-                            Err(error) if error.code == "capacity_unavailable" => {
+                            Err(error) if matches!(error.code.as_str(), "capacity_unavailable" | "project_transfer_child_cleanup_blocked") => {
                                 db!(tx.execute_batch("ROLLBACK TO project_transfer_commit; RELEASE project_transfer_commit"));
                                 value.blockers.push(blocker(&error.code, Some(*error.message)));
                             }
@@ -706,6 +706,8 @@ fn commit_transfer(
         workspace::transfer_workspace_custody(tx, path, from, to, now, &mut events)?;
     }
     write_next_assignment(tx, &value.assignment, Some((to_num, to.generation)), None)?;
+    digests::follow_project_transfer(tx, from, to, &moved.value.moved)?;
+    child_cleanup::follow_project_transfer(tx, from, to, &moved.value.moved)?;
     delete_intent(tx, &from.project)?;
     capacity::require_assignment_fits(tx, &from.project, capacity_policy)?;
     let assignment = read_assignment(tx, &from.project)?;

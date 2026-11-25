@@ -44,7 +44,8 @@ macro_rules! self_completion_mail {
             SELECT 1 FROM completion_digests d
             WHERE d.id = substr(m.delivery_id, 1, instr(m.delivery_id, '/') - 1)
               AND d.delivered_mail_id = m.delivery_id AND d.parent = m.recipient
-              AND d.requester = ('agent:a' || m.recipient || ':' || m.recipient_generation)
+              AND (d.requester = ('agent:a' || m.recipient || ':' || m.recipient_generation)
+                   OR d.requested_parent IS NOT NULL)
         )"
     };
 }
@@ -2227,7 +2228,8 @@ fn render_inline_mail_tx(
                AND (?4 = 0 OR COALESCE(m.thread, '') NOT LIKE 'attention-%'
                     OR ({ATTENTION_WAKING_THREAD_SQL}))
                AND (digest.id IS NULL OR (digest.parent = m.recipient
-                    AND digest.requester = ?3 AND m.sender IN ('owner', 'swarm')))
+                    AND (digest.requester = ?3 OR digest.requested_parent IS NOT NULL)
+                    AND m.sender IN ('owner', 'swarm')))
              ORDER BY m.id ASC",
         ))
         .map_err(sql_error)?;

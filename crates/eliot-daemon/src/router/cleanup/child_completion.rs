@@ -36,6 +36,7 @@ impl Router {
                         continue;
                     }
                     Err(error) if error.code == "interrupted" => return Err(error),
+                    Err(error) if error.code == "child_cleanup_rebound" => continue,
                     Err(error)
                         if error.code == "busy"
                             && error.message.as_ref()
@@ -88,6 +89,7 @@ impl Router {
     async fn clean_completed_child_worktree(&self, job: &ChildCleanupJob) -> Result<()> {
         let (child, workspace) = {
             let store = self.inner.store.lock().await;
+            store.verify_child_cleanup_manager(job)?;
             let child = store
                 .get_agent(&job.child)?
                 .ok_or_else(|| Error::new("not_found", "child missing"))?;
@@ -234,12 +236,11 @@ impl Router {
             }
             Err(error) => return Err(error),
         }
-        let (plan, mut response, is_new) =
-            self.inner
-                .store
-                .lock()
-                .await
-                .begin_cleanup_apply("owner", &apply, now_ms(), false)?;
+        let (plan, mut response, is_new) = {
+            let mut store = self.inner.store.lock().await;
+            store.verify_child_cleanup_manager(job)?;
+            store.begin_cleanup_apply("owner", &apply, now_ms(), false)?
+        };
         if is_new {
             self.apply_cleanup_artifacts(
                 "owner",
@@ -315,6 +316,15 @@ impl Router {
     }
 
     async fn send_child_cleanup_notice(&self, job: &ChildCleanupJob) -> Result<()> {
+        // The sweep may have cached this row before a project transfer
+        // rebound it. Refresh immediately before binding the notice ID so the
+        // retained mail payload names the current manager.
+        let job = self
+            .inner
+            .store
+            .lock()
+            .await
+            .reserve_child_cleanup_ids(&job.child, job.child_generation)?;
         let request = MailSendRequest {
             id: child_cleanup_id(&job.notice_id)?.to_owned(),
             to: vec![job.parent.clone()],
@@ -339,13 +349,15 @@ impl Router {
                     agent.parent.as_deref() == Some(&job.parent)
                         && agent.generation == job.child_generation
                 });
-            in_scope
-                .then(|| self.mail_send_locked(&mut store, SWARM_MAIL_SENDER, &request, false))
-                .transpose()?
+            if !in_scope {
+                return Err(Error::new(
+                    "stale_generation",
+                    "child cleanup parent binding changed before notice submission",
+                ));
+            }
+            self.mail_send_locked(&mut store, SWARM_MAIL_SENDER, &request, false)?
         };
-        if let Some(change) = change {
-            self.mail_send_finish(&request, change).await?;
-        }
+        self.mail_send_finish(&request, change).await?;
         self.inner
             .store
             .lock()

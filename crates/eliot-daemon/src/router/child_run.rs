@@ -12,7 +12,6 @@ use eliot_core::{
     },
 };
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 use std::collections::{BTreeSet, HashMap};
 
 const CHILD_RUN_CHANGED_FILES_READ: usize = MAX_CHILD_RUN_CHANGED_FILES + 1;
@@ -292,7 +291,7 @@ impl Router {
         principal: &Principal,
         register: bool,
     ) -> Result<ChildRunWake> {
-        let digest_id = child_run_digest_id(id)?;
+        let digest_id = eliot_store::child_run_digest_id(id)?;
         let exists = self
             .inner
             .store
@@ -569,21 +568,6 @@ fn status_from_wait(entry: &WaitEntryResult) -> Result<ChildRunStatus> {
             "child.run received an unknown wait status",
         )),
     }
-}
-
-pub(super) fn child_run_digest_id(id: &str) -> Result<String> {
-    let value = ulid::Ulid::from_string(id).map_err(|_| Error::invalid_mutation_id())?;
-    let original = value.to_bytes();
-    let mut hash = Sha256::new();
-    hash.update(b"child.run.digest");
-    hash.update(original);
-    // Keep the launch's admission timestamp and derive a separate, stable digest id.
-    let mut bytes = original;
-    bytes[6..].copy_from_slice(&hash.finalize()[..10]);
-    if bytes == original {
-        bytes[15] ^= 1;
-    }
-    Ok(ulid::Ulid::from_bytes(bytes).to_string())
 }
 
 fn encode_child_run(response: ChildRunResponse) -> Result<Value> {

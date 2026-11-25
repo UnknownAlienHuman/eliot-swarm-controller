@@ -713,21 +713,16 @@ fn enforce_agent(
     hierarchy::parse_caller(conn, principal)?;
     project_transfer::fence(conn, principal, "coordination", Some(caller), None)?;
     for binding in bindings {
-        let eligible = if let Some((num, generation)) = binding.manager.zip(binding.generation) {
-            let manager = format_agent_id(num);
-            let registration = projects::project_registration_tx(conn, &binding.project)?;
-            registration.is_some()
-                && load_agent_by_num(conn, num)?.is_some_and(|agent| {
-                    agent.generation == generation && manager_live(agent.state)
-                })
-                && caller.project == binding.project
-                && (caller.id == manager || caller.root == manager)
-                && target.is_none_or(|a| {
-                    a.project == binding.project && (a.id == manager || a.root == manager)
-                })
-        } else {
-            false
-        };
+        let eligible = assignment_team_member(
+            conn,
+            caller,
+            &binding.project,
+            binding.manager.zip(binding.generation),
+        )? && target.is_none_or(|a| {
+            let manager = binding.manager.map(format_agent_id);
+            a.project == binding.project
+                && manager.is_some_and(|manager| a.id == manager || a.root == manager)
+        });
         if !eligible {
             return Err(Error::new(
                 "not_allowed",
@@ -736,6 +731,65 @@ fn enforce_agent(
         }
     }
     Ok(())
+}
+
+pub(super) fn require_current_project_team(
+    conn: &Connection,
+    principal: &str,
+    project: &str,
+) -> Result<()> {
+    let Some((id, generation)) = principal
+        .strip_prefix("agent:")
+        .and_then(|value| value.split_once(':'))
+    else {
+        return Ok(());
+    };
+    let num = parse_agent_id(id)?;
+    let generation = generation.parse::<i64>().map_err(|_| {
+        Error::new(
+            "stale_assignment",
+            "queued launch caller is not authorized for the current project assignment",
+        )
+    })?;
+    let caller = load_agent_by_num(conn, num)?
+        .filter(|agent| agent.generation == generation)
+        .ok_or_else(|| {
+            Error::new(
+                "stale_assignment",
+                "queued launch caller is not authorized for the current project assignment",
+            )
+        })?;
+    let assignment = read_assignment(conn, project)?;
+    if !assignment_team_member(
+        conn,
+        &caller,
+        project,
+        assignment.manager.zip(assignment.generation),
+    )? {
+        return Err(Error::new(
+            "stale_assignment",
+            "queued launch caller is not authorized for the current project assignment",
+        ));
+    }
+    Ok(())
+}
+
+fn assignment_team_member(
+    conn: &Connection,
+    caller: &Agent,
+    project: &str,
+    manager_assignment: Option<(i64, i64)>,
+) -> Result<bool> {
+    let Some((num, generation)) = manager_assignment else {
+        return Ok(false);
+    };
+    let manager = format_agent_id(num);
+    let registration = projects::project_registration_tx(conn, project)?;
+    Ok(registration.is_some()
+        && load_agent_by_num(conn, num)?
+            .is_some_and(|agent| agent.generation == generation && manager_live(agent.state))
+        && caller.project == project
+        && (caller.id == manager || caller.root == manager))
 }
 
 fn enforce_launch(

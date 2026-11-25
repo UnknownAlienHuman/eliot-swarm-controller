@@ -217,6 +217,9 @@ impl Store {
             // Recheck the retained caller generation and parent authority at the writer.
             hierarchy::resolve_launch_parent(&tx, principal, &request.args)?;
             let parent_generation = parent_generation(&tx, &request)?;
+            if !project.is_empty() {
+                project_assignment::require_current_project_team(&tx, principal, project)?;
+            }
             let assignment_epoch = if principal != "owner" && !project.is_empty() {
                 Some(project_assignment::read_assignment(&tx, project)?.epoch)
             } else {

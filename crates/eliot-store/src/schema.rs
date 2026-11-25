@@ -1,6 +1,6 @@
 use super::*;
 
-pub(super) const CURRENT_SCHEMA_VERSION: i64 = SOURCE_REPLAY_COMPARISON_VERSION;
+pub(super) const CURRENT_SCHEMA_VERSION: i64 = CHILD_DIGEST_ASSIGNMENT_VERSION;
 const HARNESS_CHECK_SCHEMA_VERSION: i64 = 112;
 const WORK_TRUTH_VERSION: i64 = 113;
 const WORK_TRUTH_INTENT_VERSION: i64 = 114;
@@ -31,6 +31,7 @@ const RESTART_DEFERRED_SENDS_VERSION: i64 = 138;
 const RESTART_CONTINUATION_BRIEF_VERSION: i64 = 139;
 const NEXT_INPUT_CONTEXT_EXPIRY_VERSION: i64 = 140;
 const SOURCE_REPLAY_COMPARISON_VERSION: i64 = 141;
+const CHILD_DIGEST_ASSIGNMENT_VERSION: i64 = 142;
 
 fn has_restart_continuation_brief_column(connection: &Connection) -> Result<bool> {
     connection
@@ -362,6 +363,20 @@ impl Store {
             tx.execute(
                 "INSERT INTO schema_migrations(version) VALUES (?1)",
                 [SOURCE_REPLAY_COMPARISON_VERSION],
+            )
+            .map_err(sql_error)?;
+            tx.commit().map_err(sql_error)?;
+        }
+        if current < CHILD_DIGEST_ASSIGNMENT_VERSION {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            tx.execute_batch("ALTER TABLE completion_digests ADD COLUMN requested_parent INTEGER;")
+                .map_err(sql_error)?;
+            tx.execute(
+                "INSERT INTO schema_migrations(version) VALUES (?1)",
+                [CHILD_DIGEST_ASSIGNMENT_VERSION],
             )
             .map_err(sql_error)?;
             tx.commit().map_err(sql_error)?;

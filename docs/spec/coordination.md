@@ -1086,8 +1086,13 @@ remain unsupported.
   while the path is bound or borrowed. Worker generations, references and
   reservations stay in place. A successor team over its assignment limit and
   unsettled queues block the transaction. Queues keep their
-  retained principals and assignment epochs are preserved. Project-owned rules
-  stay project-owned and targeted automation follows current membership.
+  retained principals and assignment epochs are preserved. New queued launches
+  recheck current membership before an intent is written. Project-owned rules
+  stay project-owned. Undelivered direct `child.run` digests follow the moved
+  child to the new manager with the same registration and mail ID. An already
+  delivered digest stays with its recorded recipient. Pending child cleanup
+  follows the moved child and retains the Stop receipt. An admitted cleanup
+  apply blocks transfer until it settles.
   Saved continuation context and any expressly selected source SENDs enter the
   ordinary Handoff delivery gate in the same transaction. The Owner may cite a
   retained original task and select ordered plain SENDs from the exact source

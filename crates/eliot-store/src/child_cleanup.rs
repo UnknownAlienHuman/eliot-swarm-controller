@@ -1,4 +1,5 @@
 use super::*;
+use eliot_core::api::ReparentedAgent;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ChildCleanupState {
@@ -38,9 +39,16 @@ pub struct ChildCleanupJob {
     pub notice_delivered: bool,
 }
 
-const CHILD_CLEANUP_SELECT: &str = "SELECT 'a' || child, child_generation, 'a' || parent,
+macro_rules! child_cleanup_columns {
+    () => {
+        "SELECT 'a' || child, child_generation, 'a' || parent,
     parent_generation, not_before, state, reason, detail,
-    plan_id, apply_id, notice_id, notice_delivered FROM child_cleanup";
+    plan_id, apply_id, notice_id, notice_delivered"
+    };
+}
+
+const CHILD_CLEANUP_COLUMNS: &str = child_cleanup_columns!();
+const CHILD_CLEANUP_SELECT: &str = concat!(child_cleanup_columns!(), " FROM child_cleanup");
 
 /// Admit retirement from the applied manager Stop that targeted a live child.
 /// The native stream can record session.ended before the command settles.
@@ -207,7 +215,136 @@ fn cleanup_job_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ChildCleanu
     })
 }
 
+/// Rebind pending child cleanup work for the exact direct workers moved
+/// between project managers. The original stop_id remains its provenance.
+pub(super) fn follow_project_transfer(
+    tx: &Transaction<'_>,
+    from: &Agent,
+    to: &Agent,
+    moved_agents: &[ReparentedAgent],
+) -> Result<()> {
+    if from.id == to.id {
+        return Err(Error::new(
+            "invalid",
+            "project transfer managers must differ",
+        ));
+    }
+    let source = parse_agent_id(&from.id)?;
+    let destination = parse_agent_id(&to.id)?;
+    for moved in moved_agents.iter().filter(|moved| {
+        moved.previous_parent.as_deref() == Some(from.id.as_str())
+            && moved.parent.as_deref() == Some(to.id.as_str())
+    }) {
+        let child = parse_agent_id(&moved.agent)?;
+        let binding: Option<(ChildCleanupJob, String)> = tx
+            .query_row(
+                &format!("{CHILD_CLEANUP_COLUMNS}, stop_id FROM child_cleanup WHERE child=?1 AND child_generation=?2"),
+                params![child, moved.generation],
+                |row| Ok((cleanup_job_from_row(row)?, row.get(12)?)),
+            )
+            .optional()
+            .map_err(sql_error)?;
+        let Some((job, stop_id)) = binding else {
+            continue;
+        };
+        if job.state == ChildCleanupState::Removed || job.notice_delivered {
+            continue;
+        }
+        if job.parent != from.id {
+            return Err(cleanup_transfer_blocked(
+                &job,
+                "is bound to another manager",
+            ));
+        }
+        let stop_is_original_applied_manager_stop: bool = tx
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM commands c
+                     WHERE c.id = ?1 AND c.target = ?2 AND c.generation = ?3 AND c.verb = 'stop'
+                       AND principal LIKE 'agent:%' AND state = 'applied'
+                       AND EXISTS (SELECT 1 FROM events e WHERE e.agent = c.target
+                         AND e.generation = c.generation AND e.kind = 'command.dispatched'
+                         AND json_extract(e.data, '$.command_id') = c.id
+                         AND json_extract(e.data, '$.live_at_dispatch') = 1))",
+                params![stop_id, child, moved.generation],
+                |row| row.get(0),
+            )
+            .map_err(sql_error)?;
+        if !stop_is_original_applied_manager_stop {
+            return Err(cleanup_transfer_blocked(
+                &job,
+                "has no applied manager Stop",
+            ));
+        }
+        if job.state == ChildCleanupState::Pending
+            && let Some(apply_id) = &job.apply_id
+            && write_binding(tx, apply_id)?.is_some()
+        {
+            return Err(cleanup_transfer_blocked(
+                &job,
+                "has an admitted cleanup apply",
+            ));
+        }
+        if let Some(notice_id) = &job.notice_id
+            && let Some((principal, method, _, _)) = write_binding(tx, notice_id)?
+        {
+            if principal != core::api::SWARM_MAIL_SENDER || method != "mail.send" {
+                return Err(cleanup_transfer_blocked(
+                    &job,
+                    "has a conflicting notice receipt",
+                ));
+            }
+            // The stable notice ID already reached its earlier recipient.
+            // Retain that result without delivering another notice.
+            db!(tx.execute(
+                "UPDATE child_cleanup SET notice_delivered=1 WHERE child=?1 AND child_generation=?2",
+                params![child, moved.generation],
+            ));
+            continue;
+        }
+        db!(tx.execute(
+            "UPDATE child_cleanup SET parent=?1, parent_generation=?2
+             WHERE child=?3 AND child_generation=?4 AND parent=?5 AND parent_generation=?6",
+            params![
+                destination,
+                to.generation,
+                child,
+                moved.generation,
+                source,
+                job.parent_generation
+            ],
+        ));
+    }
+    Ok(())
+}
+
+fn cleanup_transfer_blocked(job: &ChildCleanupJob, reason: &str) -> Error {
+    Error::new(
+        "project_transfer_child_cleanup_blocked",
+        format!("child {} cleanup {reason}", job.child),
+    )
+}
+
 impl Store {
+    pub fn verify_child_cleanup_manager(&self, expected: &ChildCleanupJob) -> Result<()> {
+        let current: (i64, i64) = self.connection.query_row(
+            "SELECT parent,parent_generation FROM child_cleanup WHERE child=?1 AND child_generation=?2",
+            params![parse_agent_id(&expected.child)?, expected.child_generation],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ).map_err(sql_error)?;
+        if current
+            != (
+                parse_agent_id(&expected.parent)?,
+                expected.parent_generation,
+            )
+        {
+            return Err(Error::new(
+                "child_cleanup_rebound",
+                "child cleanup moved to the successor manager",
+            ));
+        }
+        Ok(())
+    }
+
     /// Return due cleanup rows and kept rows whose notice still needs delivery.
     pub fn child_cleanup_due(&self, now: i64, limit: usize) -> Result<Vec<ChildCleanupJob>> {
         let limit = i64::try_from(limit)
