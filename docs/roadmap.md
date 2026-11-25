@@ -216,6 +216,10 @@ Checked layers record delivered increments, not full crash/load qualification.
   attach/detach placement and tags (schema v64). The Owner can continue a
   projectless chat in an active assignment through switch and handoff, with
   a prepared worktree and a retained link to the original chat.
+  - [x] **Content grouping.** Owner-only `chat.group` applies ordered literal
+    rules to the bounded final text of an exact completed retained turn,
+    revision-guards the link, and reads back its `content_source`; text and
+    rule literals are not stored.
 - [x] **4b. Fair queue.** Arbitrate automation assignments across projects and support
   explicit queued interactive launch, wait readback and scoped manager budgets.
   Ordinary direct launches share the same project rotation and capacity

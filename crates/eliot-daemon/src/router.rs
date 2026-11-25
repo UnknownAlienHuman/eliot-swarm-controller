@@ -1058,6 +1058,7 @@ impl Router {
             "chat.attach" => self.chat_attach(&params, &principal).await,
             "chat.detach" => self.chat_detach(&params, &principal).await,
             "chat.tag" => self.chat_tag(&params, &principal).await,
+            "chat.group" => self.chat_group(&params, &principal).await,
             "command.cancel" => self.command_cancel(&params, &principal).await,
             "project.transfer" => {
                 self.project_transfer(&params, &principal, context.owner_process)

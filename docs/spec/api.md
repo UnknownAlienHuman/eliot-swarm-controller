@@ -540,7 +540,8 @@ command id frozen at claim. The settled event's persisted `kind` is exactly
 | `project.assignment.get/claim/launch/release` | Current registered project manager, explicit adoption or manager launch, and revision-bound release through the ordinary command path. See [project manager assignments](#project-manager-assignments). |
 | `chat.organization` | owner-only grouped work projection by project assignment, manager, repository/worktree and ancestry, with event-watermark and per-group readback; no client repeats Git discovery or grouping. See [Chat organization](#chat-organization). |
 | `chat.attach` / `chat.detach` | owner-only chat placement moves between a retained project and the no-project bucket; optional per-Agent `expected_revision` refuses a stale write with `conflict`; committed per-Agent link readback; execution scope, workspace and history untouched |
-| `chat.tag` | owner-only replacement tag groups for Agents or chats (an omitted tag list clears); optional per-Agent `expected_revision` refuses a stale write with `conflict`; committed per-Agent link readback |
+| `chat.tag` | Owner-only replacement tag groups for Agents or chats. Clears `content_source` and returns the committed links. Optional per-Agent `expected_revision` refuses a stale write with `conflict`. |
+| `chat.group` | Owner-only revisioned grouping from one exact retained turn using ordered literal rules. See [Chat organization](#chat-organization). |
 | `project.discover` | owner-only opened Git checkout registration through the settings writer; non-Git paths return no project |
 | `routing.preview` | owner-only advisory `RoutingDecision` for a role, computed like admission without admitting, freezing or reserving; see configuration |
 | `timer.get/run` | owner-only timer read and idempotent manual firing |
@@ -640,16 +641,16 @@ Store projections. Response encoding runs after the Store mutex is released.
 ### Chat organization
 
 The owning semantics are [Coordination: Conversation association](coordination.md#conversation-association).
-Owner only, with identical behavior from the CLI (`swarm chat ...`), MCP
-(`chat.organization`, `chat.attach`, `chat.detach`, `chat.tag`) and the desktop
-(its sidebar projects, and a task's Attach to project, Detach from project and
-Tags).
-Organization is placement, never authority: attach, detach and tag write the
-organizational overlay beside the Agent id through Owner-only Store
-transactions (`chat_organization` with placement, tags and a link revision
-beside the Agent id, schema v64 and v65, plus the switch's display-only
-`continued_from` pointer, v66, which these writes preserve); the execution project, scope,
-workspace and history of every Agent keep their retained values.
+Owner-only CLI and MCP operations share the daemon path (`chat.organization`,
+`chat.attach`, `chat.detach`, `chat.tag` and `chat.group`). The desktop's
+existing surfaces include its sidebar projects and a task's Attach to project,
+Detach from project and Tags actions; a content-grouping UI follows the
+explicit Owner action described in the owning spec.
+Organization is placement, never authority: attach, detach, tag and group write
+the organizational overlay beside the Agent id through Owner-only Store
+transactions. The `chat_organization` overlay stores placement, tags and a link
+revision (v64 and v65), the switch's preserved `continued_from` pointer (v66),
+and optional `content_source` (v156).
 
 `chat.organization` (`ChatOrganizationRequest`/`ChatOrganizationResponse` in
 [`organization.rs`](../../crates/eliot-core/src/api/organization.rs)) groups
@@ -689,30 +690,64 @@ execution labels and group by their overlay link alone; a legacy chat that
 carries an execution project reads in the no-project bucket until attached.
 
 `chat.attach` places 1-16 chats under a retained project; `chat.detach` returns
-1-16 chats to the no-project bucket. `chat.tag` replaces the tag groups of
-1-16 Agents or chats with at most 16 trimmed nonempty tags of at most 64 bytes
-each; an omitted tag list clears every tag. The batch bound keeps the worst
-nominal receipt (every link with a full-length project and a full tag set)
-inside the 64 KiB retained-result bound. Every mutation carries an id:
-exact replay returns the committed result before current-state checks, and the
-response carries the committed per-Agent links (`id`, `links:
-Vec<OrgLinkView>` with placement, tags, the new link `revision` and any
-`continued_from`). The
-optional `expected_revision` carries, per selected Agent in order, the link
-revision it was read with (`agent.list` `organization_revision`, 0 before its
-first organization write); a write whose revision moved since, by any caller,
-is refused whole with `conflict` and changes nothing. The desktop menu always
-carries it; the CLI omits it. Each fresh write appends one
+1-16 chats to the no-project bucket. Both preserve tags and `content_source`.
+`chat.tag` clears `content_source` and replaces the tag groups of 1-16 Agents
+or chats with at most 16 trimmed nonempty tags of at most 64 bytes each.
+An omitted tag list clears every tag. The batch bound keeps the worst nominal
+receipt (every link with a full-length project and a full tag set) inside the
+64 KiB retained-result bound. Its optional `expected_revision` carries, per
+selected Agent in order, the link revision it was read with
+(`organization_revision`, 0 before its first organization write). CLI callers
+can carry these revisions with repeated `--revision REV` in Agent order.
+
+Owner-only `chat.group` accepts one exact turn source and 1-16 ordered rules.
+Its request is:
+
+```json
+{
+  "id": "<write-id>",
+  "source": {"agent": "aN", "generation": 3, "turn_id": "<turn-id>"},
+  "expected_revision": 4,
+  "rules": [
+    {"tag": "TAG", "contains": "LITERAL"}
+  ]
+}
+```
+
+The source must identify a retained completed turn with nonblank `final_text`
+within the existing 64 KiB event-byte limit. The method reads only that exact
+final text; it does not fetch a native transcript or call a provider. Each
+rule tag is unique and obeys the existing trimmed, nonempty 64-byte tag limit.
+Each `contains` is a nonblank literal of 1-256 UTF-8 bytes, used as supplied
+in a case-sensitive substring match. Matching rules contribute tags in input
+order. If any match, they replace the Agent's tags while keeping its
+placement, `content_source` becomes the exact source, and the link revision
+advances. If none match, `no_match` leaves tags, revision and source
+unchanged. A missing source turn returns
+`not_found`; a turn without usable bounded completed text returns
+`content_unavailable`.
+
+The required `expected_revision` is the observed link revision
+(`organization_revision` from `agent.list`, or 0 before the first organization
+write); a stale value returns `conflict` with no change. Grouping adds no copy
+of the turn text or rule literals to the overlay or write result. The
+`content_source` appears in `chat.organization` members and in the returned
+`OrgLinkView`; attach/detach preserve it and manual `chat.tag` clears it.
+
+Every mutation carries an id: exact replay returns its committed result before
+current-state checks, and reuse with a different binding or payload returns
+`id_conflict`. The response carries committed per-Agent links (`id`,
+`links: Vec<OrgLinkView>`) with placement, tags, new link `revision`, any
+`continued_from`, and optional `content_source`. Each fresh write appends one
 `organization.changed` event (`OrganizationChangedEvent`) in the same
 transaction, naming each written Agent with the group its `agent.list` row
 now reads in, its tags and its link revision, so a client refreshes the rows
 it already loaded by id; the projection's event watermark advances, and the
-router publishes it after commit. Rename
-stays the desktop
+router publishes it after commit. Rename stays the desktop
 `[desktop] display_names` presentation preference and archive stays
 `agent.archive`. Errors include `invalid`, `not_found`, `not_allowed`,
-`conflict`, `bad_state`, `unavailable`, `id_conflict`, `source_integrity` and
-mutation binding/age errors.
+`conflict`, `bad_state`, `unavailable`, `content_unavailable`, `no_match`,
+`id_conflict`, `source_integrity` and mutation binding/age errors.
 
 ### Authenticated method discovery
 
@@ -3849,7 +3884,8 @@ swarm detach A [--generation N]
 swarm chat organization [--project P] [--after P] [--archived]
 swarm chat attach CHAT... --project P
 swarm chat detach CHAT...
-swarm chat tag AGENT... [--tag TAG]...
+swarm chat tag AGENT... [--tag TAG]... [--revision REV]...
+swarm chat group AGENT --generation N --turn-id ID --revision REV --rule TAG=LITERAL [--rule TAG=LITERAL ...]
 swarm provider holds [--after SCOPE] [--limit N]
 swarm provider clear-hold SCOPE --corrective-evidence credentials_updated|configuration_updated|owner_verified [--expected-probe-command ID]
 swarm project assignment claim PROJECT [AGENT --generation N --revision REVISION]

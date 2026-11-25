@@ -587,7 +587,8 @@ display group. It leaves native session, execution workspace, permissions and
 historical command attribution intact: association is placement, never
 authority. The headless association API stores the overlay and its link
 revision beside the existing Agent or chat identity (schema v64 and v65; v66
-adds the switch's `continued_from` pointer).
+adds the switch's `continued_from` pointer). Content grouping also keeps the
+exact source turn reference as optional overlay metadata.
 
 - `chat.organization` returns the grouped projection: teams by project
   assignment, manager, repository or worktree, and ancestry, with
@@ -599,13 +600,36 @@ adds the switch's `continued_from` pointer).
   Absent local evidence, its retained parent and root can supply the link.
   Ambiguous evidence leaves the row in the no-project bucket.
 - `chat.attach` moves chats under a retained project; `chat.detach` returns
-  them to the no-project bucket. `chat.tag` replaces tag groups. Every write
+  them to the no-project bucket. Both preserve tags and `content_source`.
+  `chat.tag` replaces tag groups and clears `content_source`. Every write
   advances each written link's revision; a write carrying the revision it
   read is refused whole when another write moved it since. Each mutation
   returns the committed per-Agent links; each fresh write appends one
   `organization.changed` event in the same transaction, naming each written
   Agent's resulting group, tags and revision, so the projection's event
   watermark advances and clients refresh loaded rows by id.
+- Owner-only `chat.group` applies 1-16 explicit rules to one Agent, using only
+  the exact retained turn named by `{agent, generation, turn_id}`. The turn
+  must be completed and have nonblank retained `final_text` within the
+  existing 64 KiB event-byte limit. Each nonblank literal is 1-256 UTF-8
+  bytes and is matched as a case-sensitive substring, in rule order; rule
+  tags are unique, trimmed, nonempty tags under the existing 64-byte tag
+  limit. When any rule matches, the link's tags are replaced with the matching
+  tags in input order, its placement stays unchanged, its revision advances,
+  and its `content_source` records that exact turn. `no_match` leaves tags,
+  revision and source unchanged. The
+  required `expected_revision` is compared with the current link revision
+  (zero before its first write); a stale value returns `conflict` without a
+  change. Exact request-ID replay returns its original committed result.
+  The grouping operation persists no copy of the turn text or rule literals,
+  and makes no provider call or authority change.
+- The exact `content_source` is present in `chat.organization` members and in
+  each mutation's returned link. An Opus UI can expose `Group by content` as
+  an explicit Owner action: select a completed retained turn, enter literal
+  rules, submit its observed `agent.list.organization_revision`, and render
+  the returned tags and source reference. On `no_match` keep the view; on
+  `conflict` reread the organization row before another attempt. The UI sends
+  no turn text to a provider.
 - The Owner continues a projectless chat through `swarm switch --project` and
   the existing switch/handoff path. A chat's placement, tags, and original
   execution scope stay attached to its original identity.

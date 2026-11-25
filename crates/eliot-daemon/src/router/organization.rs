@@ -5,7 +5,7 @@
 //! Store transactions.
 use super::*;
 use eliot_core::api::{
-    ChatAttachRequest, ChatDetachRequest, ChatOrganizationRequest, ChatTagRequest,
+    ChatAttachRequest, ChatDetachRequest, ChatGroupRequest, ChatOrganizationRequest, ChatTagRequest,
 };
 
 impl Router {
@@ -52,6 +52,11 @@ impl Router {
                     request.validate()?;
                     store.detach_chats(&principal_name(principal), &request, now_ms())?
                 }
+                "chat.group" => {
+                    let request: ChatGroupRequest =
+                        eliot_core::api::discovery::decode_params(params.clone())?;
+                    store.group_by_content(&principal_name(principal), &request, now_ms())?
+                }
                 _ => {
                     let request: ChatTagRequest =
                         eliot_core::api::discovery::decode_params(params.clone())?;
@@ -78,6 +83,11 @@ impl Router {
 
     pub(super) async fn chat_tag(&self, params: &Value, principal: &Principal) -> Result<Value> {
         self.organization_mutation(params, principal, "chat.tag")
+            .await
+    }
+
+    pub(super) async fn chat_group(&self, params: &Value, principal: &Principal) -> Result<Value> {
+        self.organization_mutation(params, principal, "chat.group")
             .await
     }
 }

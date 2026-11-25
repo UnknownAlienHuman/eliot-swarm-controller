@@ -13,6 +13,7 @@ use super::{
     agent_lifecycle::ArchivedFilter,
     overview::{OverviewManagerView, ProjectTotals, ScopeUsage},
     project_assignment::ProjectAssignment,
+    waits::WaitTurnRef,
 };
 use crate::{AgentState, Error, Result, parse_agent_id};
 use schemars::JsonSchema;
@@ -26,6 +27,7 @@ pub const MAX_ORG_AGENTS: usize = 16;
 pub const MAX_ORG_TAGS: usize = 16;
 /// Most bytes of one tag.
 pub const MAX_ORG_TAG_BYTES: usize = 64;
+const MAX_GROUP_LITERAL_BYTES: usize = 256;
 /// Most members read back in one organization group.
 pub const MAX_ORG_MEMBERS_PER_GROUP: usize = 200;
 /// Most members read back across all groups of one projection.
@@ -118,6 +120,9 @@ pub struct OrgLinkView {
     /// display-only provenance dangling without faulting the Store.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub continued_from: Option<String>,
+    /// Exact turn whose retained text was used to derive the current tags.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_source: Option<WaitTurnRef>,
 }
 
 /// The revision of a freshly written overlay row; older retained receipts
@@ -142,6 +147,7 @@ impl OrgLinkView {
         if let Some(source) = &self.continued_from {
             parse_agent_id(source)?;
         }
+        validate_content_source(&self.agent, self.content_source.as_ref())?;
         Ok(())
     }
 }
@@ -175,6 +181,9 @@ pub struct OrgMemberView {
     /// [`OrgLinkView::continued_from`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub continued_from: Option<String>,
+    /// Exact turn whose retained text was used to derive the current tags.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_source: Option<WaitTurnRef>,
     /// True when this row is grouped by its placement link, not execution.
     #[serde(default)]
     pub placed: bool,
@@ -218,8 +227,25 @@ impl OrgMemberView {
         if let Some(source) = &self.continued_from {
             parse_agent_id(source)?;
         }
+        validate_content_source(&self.agent, self.content_source.as_ref())?;
         Ok(())
     }
+}
+
+fn validate_content_source(agent: &str, source: Option<&WaitTurnRef>) -> Result<()> {
+    if let Some(source) = source {
+        source.validate()?;
+        if source.agent != agent
+            || source.turn_id.len() > 256
+            || source.turn_id.contains(char::is_control)
+        {
+            return Err(Error::new(
+                "invalid",
+                "content source must bind this Agent to a turn id of at most 256 bytes",
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// One organization group: a retained project team, or the unplaced bucket
@@ -628,11 +654,9 @@ impl ChatTagRequest {
         reply.validate()?;
         if reply.id != self.id
             || reply.links.len() != self.agents.len()
-            || reply
-                .links
-                .iter()
-                .zip(&self.agents)
-                .any(|(link, agent)| &link.agent != agent || link.tags != self.tags)
+            || reply.links.iter().zip(&self.agents).any(|(link, agent)| {
+                &link.agent != agent || link.tags != self.tags || link.content_source.is_some()
+            })
         {
             return Err(Error::new("unknown", "tag response binding differs"));
         }
@@ -640,8 +664,88 @@ impl ChatTagRequest {
     }
 }
 
-/// The `organization.changed` event kind: one per fresh attach, detach or
-/// tag write, published after commit.
+/// One literal rule in an explicit content grouping request.
+#[derive(Clone, Debug, JsonSchema, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContentGroupRule {
+    pub tag: String,
+    pub contains: String,
+}
+
+/// `chat.group`: replace one Agent's tags using its exact retained turn.
+#[derive(Clone, Debug, JsonSchema, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChatGroupRequest {
+    pub id: String,
+    pub source: WaitTurnRef,
+    pub expected_revision: i64,
+    pub rules: Vec<ContentGroupRule>,
+}
+
+impl ChatGroupRequest {
+    pub fn validate(&self) -> Result<()> {
+        validate_mutation_id(&self.id)?;
+        parse_agent_id(&self.source.agent)?;
+        validate_content_source(&self.source.agent, Some(&self.source))?;
+        if self.expected_revision < 0 || self.expected_revision == i64::MAX {
+            return Err(Error::invalid_field(
+                "expected_revision",
+                "nonnegative link revision",
+            ));
+        }
+        if self.rules.is_empty() || self.rules.len() > MAX_ORG_TAGS {
+            return Err(Error::new(
+                "invalid",
+                "content grouping requires 1 to 16 rules",
+            ));
+        }
+        validate_tags(
+            &self
+                .rules
+                .iter()
+                .map(|rule| rule.tag.clone())
+                .collect::<Vec<_>>(),
+        )?;
+        if self.rules.iter().any(|rule| {
+            rule.contains.trim().is_empty() || rule.contains.len() > MAX_GROUP_LITERAL_BYTES
+        }) {
+            return Err(Error::invalid_field(
+                "rules.contains",
+                "nonblank literal of at most 256 bytes",
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn validate_response(&self, reply: &ChatOrganizationMutationResponse) -> Result<()> {
+        reply.validate()?;
+        let [link] = reply.links.as_slice() else {
+            return Err(Error::new(
+                "unknown",
+                "content grouping response binding differs",
+            ));
+        };
+        let mut rules = self.rules.iter();
+        if reply.id != self.id
+            || link.content_source.as_ref() != Some(&self.source)
+            || Some(link.revision) != self.expected_revision.checked_add(1)
+            || link.tags.is_empty()
+            || !link
+                .tags
+                .iter()
+                .all(|tag| rules.any(|rule| rule.tag == *tag))
+        {
+            return Err(Error::new(
+                "unknown",
+                "content grouping response binding differs",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// The `organization.changed` event kind: one per fresh organization write,
+/// published after commit.
 pub const ORGANIZATION_CHANGED_KIND: &str = "organization.changed";
 
 /// One Agent row as an organization write left it: the group its

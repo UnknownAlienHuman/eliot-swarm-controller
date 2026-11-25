@@ -229,11 +229,11 @@ pub use observe::{
     ProjectCheckConfiguration, SessionGrowthView, WorkSummaryView, is_read_only_or_audit_profile,
 };
 pub use organization::{
-    ChatAttachRequest, ChatDetachRequest, ChatOrganizationMutationResponse,
-    ChatOrganizationRequest, ChatOrganizationResponse, ChatTagRequest, MAX_ORG_AGENTS,
-    MAX_ORG_MEMBERS_PER_GROUP, MAX_ORG_MEMBERS_TOTAL, MAX_ORG_TAG_BYTES, MAX_ORG_TAGS,
-    ORGANIZATION_CHANGED_KIND, OrgGroupView, OrgLinkView, OrgMemberView, OrgRowChange,
-    OrganizationChangedEvent,
+    ChatAttachRequest, ChatDetachRequest, ChatGroupRequest, ChatOrganizationMutationResponse,
+    ChatOrganizationRequest, ChatOrganizationResponse, ChatTagRequest, ContentGroupRule,
+    MAX_ORG_AGENTS, MAX_ORG_MEMBERS_PER_GROUP, MAX_ORG_MEMBERS_TOTAL, MAX_ORG_TAG_BYTES,
+    MAX_ORG_TAGS, ORGANIZATION_CHANGED_KIND, OrgGroupView, OrgLinkView, OrgMemberView,
+    OrgRowChange, OrganizationChangedEvent,
 };
 pub use overview::{
     FleetTotals, HarnessCount, LifecycleTotals, NativeChildView, OverviewCoverage,
