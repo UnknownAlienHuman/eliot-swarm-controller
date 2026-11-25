@@ -323,7 +323,9 @@ Agent termination or custody release schedules a bounded cache-only pass
 through the same guarded plan and apply lane. The periodic sweep covers missed
 events and held candidates. A completed turn leaves the live Agent's cache intact.
 Historical roots remain eligible after the Agent has ended and all its
-generations' custody and outcomes have settled. Stand cleanup also checks the
+generations' custody and outcomes have settled. A running or unknown Goal
+round keeps the cache because a Goal checker can hold the artifact root
+independently of the Agent process. Stand cleanup also checks the
 stand's own custody and retains internal managed worktrees pending guarded removal.
 Automatic stand removal also requires an untouched scratch repository and
 fresh merge proof for external worktrees before their guarded removal.

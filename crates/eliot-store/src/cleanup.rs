@@ -1582,7 +1582,8 @@ impl Store {
                    SELECT 1 FROM processes INDEXED BY processes_live_owner
                    WHERE state IN ('running','unknown') AND
                      (owner GLOB 'agent:a'||?1||'#*' OR owner GLOB 'workspace:a'||?1||'#*')
-                 ) FROM agents WHERE id=?1",
+                 ) OR EXISTS (SELECT 1 FROM goal_markers WHERE agent=?1)
+                 FROM agents WHERE id=?1",
                     [agent_num],
                     |r| r.get(0),
                 )
