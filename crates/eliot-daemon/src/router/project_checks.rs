@@ -661,40 +661,11 @@ async fn schedule_edit(router: &Router, event: Event, driver: &mut CheckDriver) 
         return;
     };
     let key = WorkKey { agent, generation };
-    let mut independent_changed_fingerprint = None;
-    if event.source == "git" && matches!(event.kind.as_str(), "file.changed" | "git.changed") {
-        let Ok(fingerprint) = work_fingerprint(&workspace).await else {
-            return;
-        };
-        independent_changed_fingerprint = Some(fingerprint.clone());
-        match router
-            .inner
-            .store
-            .lock()
-            .await
-            .project_check_unknown_blocks_fingerprint(&key.agent, key.generation, &fingerprint)
-        {
-            Ok(true) => return,
-            Ok(false) => {}
-            Err(error) => {
-                log_error(
-                    router,
-                    "daemon.project_check_unknown_lookup_failed",
-                    &key,
-                    event.seq,
-                    &error,
-                );
-                return;
-            }
-        }
-    }
     if let Some(state) = driver.check_states.get_mut(&key)
         && state.uncertain
     {
-        let new_fingerprint = event.data["worktree"]["fingerprint"]
-            .as_str()
-            .or(independent_changed_fingerprint.as_deref());
-        if new_fingerprint.is_some_and(|fingerprint| {
+        let captured = event.data["worktree"]["fingerprint"].as_str();
+        if captured.is_some_and(|fingerprint| {
             !state.unknown_fingerprints.is_empty()
                 && !state
                     .unknown_fingerprints
@@ -702,6 +673,19 @@ async fn schedule_edit(router: &Router, event: Event, driver: &mut CheckDriver) 
                     .any(|unknown| unknown == fingerprint)
         }) {
             state.uncertain = false;
+        } else if captured.is_some_and(|fingerprint| {
+            state
+                .unknown_fingerprints
+                .iter()
+                .any(|unknown| unknown == fingerprint)
+        }) {
+            settle_project_check_obligations(router, std::slice::from_ref(&event), "stale").await;
+            return;
+        } else if state.unknown_fingerprints.is_empty()
+            || event.source != "git"
+            || !matches!(event.kind.as_str(), "file.changed" | "git.changed")
+        {
+            return;
         }
     }
     if driver
@@ -829,7 +813,12 @@ async fn start_due_checks(
                             .any(|unknown| unknown == fingerprint)
                     })
             });
-            (state.uncertain && !has_independent_review)
+            (state.uncertain
+                && if edit.review.is_empty() {
+                    state.unknown_fingerprints.is_empty()
+                } else {
+                    !has_independent_review
+                })
                 || (edit.review.is_empty() && edit.seq <= state.checked_seq)
         }) {
             if let Some(edit) = driver.pending.remove(&key) {
@@ -898,6 +887,21 @@ async fn start_due_checks(
                 task_shutdown,
             )
             .await;
+            let mut unknown_fingerprints = if disposition.uncertain {
+                edit.review
+                    .iter()
+                    .filter_map(|event| event.data["worktree"]["fingerprint"].as_str())
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            };
+            if disposition.uncertain
+                && let Some(fingerprint) = disposition.fingerprint.as_ref()
+                && !unknown_fingerprints.contains(fingerprint)
+            {
+                unknown_fingerprints.push(fingerprint.clone());
+            }
             WorkCompletion {
                 key: task_key,
                 event_seq: edit.seq,
@@ -906,15 +910,7 @@ async fn start_due_checks(
                 passed: disposition.passed,
                 review_event_count: edit.review.len(),
                 review_events: edit.review.clone(),
-                unknown_fingerprints: if disposition.uncertain {
-                    edit.review
-                        .iter()
-                        .filter_map(|event| event.data["worktree"]["fingerprint"].as_str())
-                        .map(str::to_owned)
-                        .collect()
-                } else {
-                    Vec::new()
-                },
+                unknown_fingerprints,
             }
         });
     }
@@ -984,10 +980,58 @@ async fn check_after_edit(
             };
         }
     };
+    let blocked_unknown = router
+        .inner
+        .store
+        .lock()
+        .await
+        .project_check_unknown_blocks_fingerprint(&key.agent, key.generation, &before);
+    match blocked_unknown {
+        Ok(true) => {
+            settle_project_check_obligations(router, &edit.review, "unknown").await;
+            return CheckDisposition {
+                uncertain: true,
+                fingerprint: Some(before),
+                passed: None,
+            };
+        }
+        Err(error) => {
+            settle_project_check_obligations(router, &edit.review, "unknown").await;
+            log_error(
+                router,
+                "daemon.project_check_unknown_lookup_failed",
+                key,
+                event_seq,
+                &error,
+            );
+            return CheckDisposition {
+                uncertain: true,
+                fingerprint: Some(before),
+                passed: None,
+            };
+        }
+        Ok(false) => {}
+    }
     let review = edit
         .review
         .iter()
         .find(|event| event.data["worktree"]["fingerprint"] == before && work.check.is_some());
+    if !edit.review.is_empty() && review.is_none() {
+        for event in &edit.review {
+            if event.data["worktree"]["fingerprint"] != before {
+                record_worktree_check_outcome(router, key, event, &work.config.id, Some(&before))
+                    .await;
+            } else {
+                settle_project_check_obligations(router, std::slice::from_ref(event), "refused")
+                    .await;
+            }
+        }
+        return CheckDisposition {
+            uncertain: false,
+            fingerprint: Some(before),
+            passed: None,
+        };
+    }
     let prior_pass = prior_pass
         .filter(|pass| pass.fingerprint == before && work.check.as_ref() == Some(&pass.check));
     if prior_pass.is_some() || (review.is_none() && prior_fingerprint == Some(before.as_str())) {
@@ -1032,6 +1076,54 @@ async fn check_after_edit(
     let mut passed = None;
     let mut check_changed_worktree = false;
     if !work.config.format.is_empty() {
+        let dispatch_fingerprint = match work_fingerprint(&work.workspace).await {
+            Ok(fingerprint) => fingerprint,
+            Err(_) => {
+                settle_project_check_obligations(router, &edit.review, "refused").await;
+                return CheckDisposition {
+                    uncertain: false,
+                    fingerprint: None,
+                    passed: None,
+                };
+            }
+        };
+        if dispatch_fingerprint != before {
+            for event in &edit.review {
+                record_worktree_check_outcome(
+                    router,
+                    key,
+                    event,
+                    &work.config.id,
+                    Some(&dispatch_fingerprint),
+                )
+                .await;
+            }
+            settle_project_check_obligations(router, &edit.review, "stale").await;
+            return CheckDisposition {
+                uncertain: false,
+                fingerprint: Some(dispatch_fingerprint),
+                passed: None,
+            };
+        }
+        if router
+            .inner
+            .store
+            .lock()
+            .await
+            .project_check_unknown_blocks_fingerprint(
+                &key.agent,
+                key.generation,
+                &dispatch_fingerprint,
+            )
+            .unwrap_or(true)
+        {
+            settle_project_check_obligations(router, &edit.review, "unknown").await;
+            return CheckDisposition {
+                uncertain: true,
+                fingerprint: Some(dispatch_fingerprint),
+                passed: None,
+            };
+        }
         match run_argv(
             &work.config.format,
             &work.workspace,
@@ -1060,7 +1152,7 @@ async fn check_after_edit(
                 );
                 return CheckDisposition {
                     uncertain: true,
-                    fingerprint: None,
+                    fingerprint: Some(before.clone()),
                     passed: None,
                 };
             }
@@ -1087,6 +1179,62 @@ async fn check_after_edit(
         let before_check = checked_fingerprint
             .clone()
             .or_else(|| work.config.format.is_empty().then(|| before.clone()));
+        let Some(before_check) = before_check else {
+            settle_project_check_obligations(router, &edit.review, "unknown").await;
+            return CheckDisposition {
+                uncertain: true,
+                fingerprint: None,
+                passed: None,
+            };
+        };
+        let dispatch_fingerprint = match work_fingerprint(&work.workspace).await {
+            Ok(fingerprint) => fingerprint,
+            Err(_) => {
+                settle_project_check_obligations(router, &edit.review, "refused").await;
+                return CheckDisposition {
+                    uncertain: false,
+                    fingerprint: None,
+                    passed: None,
+                };
+            }
+        };
+        if before_check != dispatch_fingerprint {
+            for event in &edit.review {
+                record_worktree_check_outcome(
+                    router,
+                    key,
+                    event,
+                    &work.config.id,
+                    Some(&dispatch_fingerprint),
+                )
+                .await;
+            }
+            settle_project_check_obligations(router, &edit.review, "stale").await;
+            return CheckDisposition {
+                uncertain: false,
+                fingerprint: Some(dispatch_fingerprint),
+                passed: None,
+            };
+        }
+        if router
+            .inner
+            .store
+            .lock()
+            .await
+            .project_check_unknown_blocks_fingerprint(
+                &key.agent,
+                key.generation,
+                &dispatch_fingerprint,
+            )
+            .unwrap_or(true)
+        {
+            settle_project_check_obligations(router, &edit.review, "unknown").await;
+            return CheckDisposition {
+                uncertain: true,
+                fingerprint: Some(dispatch_fingerprint),
+                passed: None,
+            };
+        }
         match run_argv(
             &check.argv,
             check.cwd.as_deref().unwrap_or(&work.workspace),
@@ -1126,7 +1274,7 @@ async fn check_after_edit(
                 log_worker(router, "daemon.project_check_unknown", Some(key), &reason);
                 return CheckDisposition {
                     uncertain: true,
-                    fingerprint: None,
+                    fingerprint: Some(dispatch_fingerprint),
                     passed: None,
                 };
             }
@@ -1186,6 +1334,14 @@ async fn check_after_edit(
             "the worktree after the project commands could not be verified",
         );
     }
+    if !edit.review.is_empty() {
+        settle_project_check_obligations(
+            router,
+            &edit.review,
+            if uncertain { "unknown" } else { "refused" },
+        )
+        .await;
+    }
     CheckDisposition {
         uncertain,
         fingerprint: checked_fingerprint,
@@ -1207,14 +1363,44 @@ async fn record_worktree_check_outcome(
     let mut store = router.inner.store.lock().await;
     match store.record_project_worktree_check_outcome(event, project, changed_fingerprint, now_ms())
     {
-        Ok(change) => router.publish_locked(&change.events),
-        Err(error) => log_error(
-            router,
-            "daemon.project_worktree_check_receipt_failed",
-            key,
-            event.seq,
-            &error,
-        ),
+        Ok(change) => {
+            let published = !change.events.is_empty()
+                || store
+                    .has_project_worktree_check_outcome(event)
+                    .unwrap_or(false);
+            router.publish_locked(&change.events);
+            if !published
+                && let Err(error) = store.settle_project_check_obligation(event, "stale", now_ms())
+            {
+                log_error(
+                    router,
+                    "daemon.project_worktree_obligation_settlement_failed",
+                    key,
+                    event.seq,
+                    &error,
+                );
+            }
+        }
+        Err(error) => {
+            log_error(
+                router,
+                "daemon.project_worktree_check_receipt_failed",
+                key,
+                event.seq,
+                &error,
+            );
+            if let Err(settlement_error) =
+                store.settle_project_check_obligation(event, "unknown", now_ms())
+            {
+                log_error(
+                    router,
+                    "daemon.project_worktree_obligation_settlement_failed",
+                    key,
+                    event.seq,
+                    &settlement_error,
+                );
+            }
+        }
     }
 }
 
