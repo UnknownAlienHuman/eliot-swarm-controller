@@ -1374,6 +1374,7 @@ async fn rollback(
     .await;
     let (candidate_state, candidate_admission) = match (published, &restored) {
         (Some(candidate), Err(_)) => observe_rollback_candidate(path, candidate).await,
+        // A successful restore already retired the candidate and waited for its exit.
         (Some(_), Ok(_)) => ("exited", None),
         (None, _) => ("unpublished", None),
     };

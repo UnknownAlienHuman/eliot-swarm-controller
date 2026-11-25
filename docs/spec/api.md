@@ -3454,7 +3454,9 @@ generation, retained subject, workspace, profile name and startup kind bind the
 comparison to the previous daemon's accepted validation. A boot attempt skipped
 before dispatch, including a cancelled command, is reported as `not_dispatched`.
 The report counts every startup outcome and names how many exceed the evidence
-detail limit.
+detail limit. When boot resumes exceed the 128-subject detail cap, refusals
+beyond the cap cannot be matched in evidence, so the health decision stays
+incomplete and holds the rollback; that conservative hold is intended.
 
 A deterministic Swarm validation refusal for a previously accepted matching
 subject requests rollback only when boot evidence is complete and all attempts
