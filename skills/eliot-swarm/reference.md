@@ -7,7 +7,10 @@ readback. Add `--metadata` to result when you need the current Agent metadata.
 
 ## Delegation
 
-`child.run` inherits the caller's workspace and profile. Supply `text`; optionally name task source paths and an allow-listed profile. The initial request is `{text, sources?, profile?, wait_ms?}`. A returned id resumes the same child with `{id, wait_ms}`.
+`child.run` inherits the caller's workspace and profile. The initial request is
+`{text, sources?, profile?, wait_ms?}`. It returns immediately by default and
+wakes the parent with the pending result. Supply a positive `wait_ms` to wait now.
+A returned id reads the same child's result with `{id, wait_ms?}`.
 
 Use `wait_ms:0` if you can finish your turn and take the completion wake. To stay in your turn, launch with a bounded wait and continue with the same `id` only if the result is `still_running`. Read `status`, `final_text` and available `facts`. Use `agent.result` with the exact Agent, generation and turn if the text is truncated.
 

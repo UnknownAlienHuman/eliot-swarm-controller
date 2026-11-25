@@ -9,7 +9,7 @@ Skip Swarm when your task needs no child, mail, shared state or shared-file coor
 
 ## Swarm does this for you
 
-- `child.run` waits for the child or arranges a durable wake. Use either path to avoid `sleep` and polling.
+- `child.run` returns immediately by default. Swarm wakes you with the result if the child is still running.
 - Child results include available `facts` such as changed files, commits and the last Goal check. Ask for a short answer.
 - Swarm can deliver mail inline and acknowledges it at turn start. Mail returns unread without delivery evidence.
 - When automatic Goal checks are enabled, Swarm runs them after eligible turns and includes diagnostics in failure continuations.
@@ -23,7 +23,7 @@ Skip Swarm when your task needs no child, mail, shared state or shared-file coor
 
 ## Delegate when needed
 
-`child.run` inherits your workspace and profile. Provide `text`; `sources` and an allow-listed `profile` are optional. Use `wait_ms:0` if you can finish and take the durable wake; use a bounded wait to get the result now. If it returns `still_running`, continue with the same id. Keep your own ULID when you need to recover a lost launch reply; retry that reply with the same id and payload. Check `status` and `final_text`; if truncated, use `agent.result` with the exact Agent, generation and turn. Never replay an uncertain effect.
+`child.run` inherits your workspace and profile. Provide `text`. Set `wait_ms` if you need the result before continuing. When `completion_wake` is `pending`, continue your work or end the turn and receive the result by mail. For an explicit readback, use the same operation id. Retry a lost launch reply with the same id and payload. If the result is truncated, use `agent.result` with the exact Agent, generation and turn. Never replay an uncertain effect.
 
 ## Keep work in Git
 

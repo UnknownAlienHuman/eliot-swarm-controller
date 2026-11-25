@@ -958,17 +958,20 @@ input is `args.text`, committed as the launch's linked `SEND`; `sources` uses th
 existing bounded source delivery and replay path.
 `worktree` and `base` use the same rules as an ordinary Agent child launch.
 
-`wait_ms` defaults to 20,000 and is limited to 25,000 ms per call, leaving
-response time within the native 30-second MCP/plugin RPC deadline. `wait_ms:0`
-takes an immediate durable snapshot. The same method continues with
-`{id, wait_ms?}` and reads the same launch's exact linked first input; it never
-launches or sends again. A pending or `unknown` result, and every zero-wait
-request, registers the existing completion digest over that one linked input.
+`wait_ms` defaults to zero for a new child and 20,000 ms for a continuation.
+Each call allows at most 25,000 ms within the native 30-second MCP/plugin deadline.
+A zero-wait call reads an immediate durable snapshot. The same method continues
+with `{id, wait_ms?}` and reads the same launch's exact linked first input.
+A continuation cannot launch the child or send input again. A pending or
+`unknown` result registers the existing completion digest over that input.
+An explicit `wait_ms:0` also registers delivery if the child already settled.
 The registration id is a deterministic sibling ULID, preserving retry
 identity while keeping the digest reservation separate from the launch
 command id. Existing digest delivery provides one durable completion mail
 wake, including after a daemon restart. A digest retry reuses its registration
 and mail identity.
+A manager with a pending completion wake can do other work or finish its turn
+and receive the result through ordinary addressed mail.
 
 The compact response contains the exact input status, bound Agent/generation
 when visible, the retained managed `branch` when available, a `branch_error` code
