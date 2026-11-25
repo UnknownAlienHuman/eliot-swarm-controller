@@ -708,15 +708,11 @@ impl Router {
     /// Provider-supported account quota readback: timestamp, scope and an
     /// explicit supported/unsupported/unknown status, cached per account.
     /// Starts no model turn, performs no inference and never polls per
-    /// Agent. Codex reads `account/rateLimits/read` (plus `account/usage/read`
-    /// when useful) and Muse reads `usage --json` through a dedicated metadata
-    /// reader; Claude reads the CLI OAuth usage endpoint, OpenCode reads the
-    /// Go account usage endpoint, and Antigravity reads
-    /// `retrieveUserQuotaSummary`. Every reader projects provider quota
-    /// signals into `details`: Codex keeps its `rateLimits` shape, the other
-    /// four use `windows[]` with `usedPercent`/`resetsAtMs`. Routing and the
-    /// catalogue consume all five through one normalized projection
-    /// ([`catalog::projected_quota`]).
+    /// Agent. Each adapter reads its provider-supported quota source and
+    /// projects signals into its declared detail shape. Routing and the
+    /// catalogue consume all adapters through one normalized projection
+    /// ([`catalog::projected_quota`]). Sparse stream observations use the same
+    /// typed window projection and only decorate cached detail readbacks.
     /// A method-not-found or schema mismatch stays `unsupported` or `unknown`
     /// naming the checked method; no numbers are fabricated. A quota failure
     /// never selects another model or account.
@@ -731,7 +727,7 @@ impl Router {
             eliot_core::api::discovery::decode_params(params.clone())?;
         let (harness, snapshot, label) = self.resolve_quota_target(request, deadline).await?;
         let evidence = self
-            .quota_for_snapshot(harness, snapshot.clone(), label.clone(), deadline, false)
+            .quota_for_snapshot(harness, snapshot.clone(), label.clone(), deadline)
             .await?;
         let now = now_ms();
         let reserve_readback = snapshot.as_ref().map(|snapshot| {
@@ -776,7 +772,7 @@ impl Router {
         deadline: Instant,
     ) -> Result<catalog::ScopedQuota> {
         let (harness, snapshot, label) = self.resolve_quota_target(request, deadline).await?;
-        self.quota_for_snapshot(harness, snapshot, label, deadline, false)
+        self.quota_for_snapshot(harness, snapshot, label, deadline)
             .await
     }
 
@@ -806,9 +802,6 @@ impl Router {
         snapshot: Option<Value>,
         label: String,
         deadline: Instant,
-        // Hold release needs a native full read; do not mix in sparse stream
-        // observations or reuse a response that may already contain them.
-        force_full_read: bool,
     ) -> Result<catalog::ScopedQuota> {
         let request = eliot_core::api::HarnessQuotaRequest {
             harness: harness.clone(),
@@ -871,8 +864,7 @@ impl Router {
             )
         };
         let route_verified = cache_key.is_some();
-        if !force_full_read
-            && let Some(key) = &cache_key
+        if let Some(key) = &cache_key
             && let Some(mut hit) = self.cached_quota(key)
         {
             self.overlay_quota_observation(
@@ -996,12 +988,12 @@ impl Router {
         profile: &Value,
         deadline: Instant,
     ) -> Result<()> {
-        if !HarnessCapabilities::of(&response.harness)
+        let Some(projection) = HarnessCapabilities::of(&response.harness)
             .quota_readback
-            .is_some_and(|readback| readback.stream_observations)
-        {
+            .and_then(|readback| readback.window_projection)
+        else {
             return Ok(());
-        }
+        };
         let (Some(identity), Some(since), Some(details)) =
             (identity, login.file_change_ms(), response.details.as_mut())
         else {
@@ -1032,7 +1024,7 @@ impl Router {
             // or its ordinary-usage authorization. Hold release still requires
             // the actual read to be newer than the hold.
             for observation in observations {
-                overlay_quota_windows(details, &observation);
+                Self::overlay_quota_windows(details, &observation, projection);
             }
         }
         Ok(())
@@ -1044,29 +1036,43 @@ impl Router {
     fn overlay_quota_windows(
         details: &mut Value,
         observation: &eliot_core::api::harness::QuotaObservation,
+        projection: eliot_core::api::harness::QuotaWindowProjection,
     ) {
-        let Some(rates) = details.get_mut("rateLimits").and_then(Value::as_object_mut) else {
+        let Some(container) = details
+            .get_mut(projection.container_key)
+            .and_then(Value::as_object_mut)
+        else {
             return;
         };
         for window in &observation.windows {
-            let key = match window.label.as_str() {
-                "Primary" => "primary",
-                "Secondary" => "secondary",
-                _ => continue,
+            let Some(slot) = projection
+                .slots
+                .iter()
+                .find(|slot| slot.label == window.label)
+            else {
+                continue;
             };
-            let entry = rates.entry(key.to_owned()).or_insert_with(|| json!({}));
+            let entry = container
+                .entry(slot.selector_key.to_owned())
+                .or_insert_with(|| json!({}));
             let Some(fields) = entry.as_object_mut() else {
                 continue;
             };
-            fields.insert("usedPercent".to_owned(), json!(window.used_percent));
-            if let Some(at) = window.resets_at_ms {
-                fields.insert("resetsAt".to_owned(), json!(at / 1_000));
+            fields.insert(slot.used_percent_key.to_owned(), json!(window.used_percent));
+            if let (Some(reset_key), Some(at)) = (slot.reset_key, window.resets_at_ms) {
+                let value = match slot.reset_unit {
+                    eliot_core::api::harness::QuotaResetUnit::Milliseconds => at,
+                    eliot_core::api::harness::QuotaResetUnit::Seconds => at / 1_000,
+                };
+                fields.insert(reset_key.to_owned(), json!(value));
             }
-            if let Some(minutes) = window.window_duration_mins {
-                fields.insert("windowDurationMins".to_owned(), json!(minutes));
+            if let (Some(key), Some(minutes)) =
+                (slot.duration_mins_key, window.window_duration_mins)
+            {
+                fields.insert(key.to_owned(), json!(minutes));
             }
         }
-        details["liveWindowsObservedAtMs"] = json!(observation.observed_at_ms);
+        details[projection.observed_at_key] = json!(observation.observed_at_ms);
     }
 
     /// Page the installed harness catalogues for the current settings revision.

@@ -193,6 +193,9 @@ impl Router {
             if let Some(hold) = holds.get(&candidate.scope)
                 && hold.uses_passive_quota_readback()
             {
+                // This path is capability-gated to retained quota readers.
+                // Codex declares only stream projection; its hold stays on the
+                // native SEND probe path.
                 match self.recheck_quota_hold(hold).await {
                     Ok(true) => continue,
                     Ok(false) => {}
@@ -253,8 +256,6 @@ impl Router {
                 Some(agent.profile_snapshot),
                 agent.profile,
                 std::time::Instant::now() + Duration::from_secs(25),
-                // Sparse Codex notifications cannot make a held quota available.
-                true,
             )
             .await?;
         let now = now_ms();

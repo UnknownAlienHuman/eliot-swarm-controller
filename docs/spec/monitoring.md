@@ -1106,6 +1106,13 @@ The ordinary resume and handoff paths then see the released scope. A failed,
 stale or exhausted read keeps the hold and defers the next background check.
 This check needs the refusing generation's verified route and replaces
 automatic model probes for these holds. Unresolved probes remain fenced.
+Passive release is limited to providers that declare `retained_quota`; the
+Store repeats that capability check and requires a full-read timestamp newer
+than the exact unchanged hold. Codex sparse account-window observations can
+decorate quota readbacks for routing and display, but Codex has no retained
+quota capability and cannot use passive quota-readback release. Codex holds
+retain the existing reset-deadline and explicit Owner correction paths; when a
+probe is due, the native SEND probe owns quota-based release.
 Each admitted probe records `provider.hold_probe_started` and known
 completion records `provider.hold_probe_finished`. A successful exact-turn native
 completion with no restriction clears the hold. A known failure keeps the hold,

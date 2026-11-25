@@ -24,7 +24,7 @@ pub const fn quota_readback(
         description,
         unsupported_note: None,
         route_refusal: None,
-        stream_observations: false,
+        window_projection: None,
     }
 }
 
