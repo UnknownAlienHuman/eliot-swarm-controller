@@ -309,10 +309,19 @@ and artifacts under exact Swarm-created generation roots, including archived ter
 Agents. Automatic worktree removal requires a clean checkout and a local Git ancestry
 proof that the current base contains the branch. Dirty or unmerged worktrees are
 kept with their sizes for the Owner. Disjoint owned artifacts can age out independently.
-Before freezing each automatic inventory, the daemon scans the direct
-children of durable owned artifact roots. A Cargo lock and build layout,
-plus a cache signature or Rust metadata, identify a regenerable target.
-A private stand needs the matching registry, identity, issuer and expiry.
+Manual and automatic plans discover candidates before freezing the inventory.
+Discovery looks for Cargo targets up to three levels below durable owned
+artifact roots, without crossing repository or stand boundaries. A Cargo lock
+and build layout plus a cache signature or Rust metadata identify the cache.
+The durable root identifies the producer. Stock Cargo markers and a directory
+name alone confer no Agent ownership. The configured retention age does not
+apply to these targets. An explicit registration expiry still holds.
+A private stand must be a direct child with matching registry, identity,
+issuer and expiry. Stands, worktrees and other artifacts retain their age gates.
+After explicit automatic-cleanup enablement and the startup preview, committed
+Agent termination or custody release schedules a bounded cache-only pass
+through the same guarded plan and apply lane. The periodic sweep covers missed
+events and held candidates. A completed turn leaves the live Agent's cache intact.
 Historical roots remain eligible after the Agent has ended and all its
 generations' custody and outcomes have settled. Stand cleanup also checks the
 stand's own custody and retains internal managed worktrees pending guarded removal.

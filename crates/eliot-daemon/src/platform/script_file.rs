@@ -504,15 +504,7 @@ impl CleanupTree {
         }
         let parent = Directory::open(path.parent().ok_or_else(refused)?)?;
         let name = path.file_name().ok_or_else(refused)?;
-        let root = native::open_cleanup(parent.handle(), name, true).map_err(|error| {
-            if error.raw_os_error()
-                == Some(windows_sys::Win32::Foundation::ERROR_SHARING_VIOLATION as i32)
-            {
-                Error::new("busy", "artifact root has a conflicting Windows handle")
-            } else {
-                refused()
-            }
-        })?;
+        let root = native::open_cleanup(parent.handle(), name, true).map_err(cleanup_open_error)?;
         check(&root, true)?;
         let identity = serde_json::to_string(&eliot_plugin::file_identity(&root).map_err(io)?)
             .map_err(|_| refused())?;
@@ -556,7 +548,8 @@ impl CleanupTree {
             {
                 self.contains_daemon_lock = true;
             }
-            let child = native::open_cleanup(&directory, &name, is_dir).map_err(|_| refused())?;
+            let child =
+                native::open_cleanup(&directory, &name, is_dir).map_err(cleanup_open_error)?;
             if is_dir {
                 check(&child, true)?;
                 self.visit(child, depth + 1, deadline)?;
@@ -605,6 +598,18 @@ impl CleanupTree {
             drop(file);
         }
         Ok(self.bytes)
+    }
+}
+
+#[cfg(windows)]
+fn cleanup_open_error(error: std::io::Error) -> Error {
+    use windows_sys::Win32::Foundation::{ERROR_LOCK_VIOLATION, ERROR_SHARING_VIOLATION};
+    if error.raw_os_error().is_some_and(|code| {
+        code == ERROR_SHARING_VIOLATION as i32 || code == ERROR_LOCK_VIOLATION as i32
+    }) {
+        Error::new("busy", "artifact tree has a conflicting Windows handle")
+    } else {
+        refused()
     }
 }
 
@@ -665,6 +670,9 @@ fn check_cleanup_file(file: &File) -> Result<u64> {
     let metadata = file.metadata().map_err(|_| refused())?;
     if crate::platform::is_reparse_point(&metadata) || !metadata.is_file() {
         return Err(refused());
+    }
+    if metadata.permissions().readonly() {
+        return Err(Error::new("not_allowed", "cleanup refuses read-only files"));
     }
     if native::links(file).map_err(|_| refused())? != 1 {
         return Err(Error::new(

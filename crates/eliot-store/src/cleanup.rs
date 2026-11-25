@@ -293,7 +293,7 @@ impl Store {
             .prepare_cached(
                 "SELECT ar.seq,ar.body FROM artifacts ar JOIN agents a ON a.id=ar.agent
              WHERE ar.seq>?1 AND a.capacity_generation IS NULL
-               AND (a.state IN ('stopped','failed') OR (a.archived=1 AND a.state='lost'))
+               AND (a.state IN ('stopped','failed') OR (a.archived=1 AND a.state IN ('idle','lost')))
                AND json_extract(ar.body,'$.state')='ownership_root'
                AND json_extract(ar.body,'$.purpose')='Swarm artifact root'
              ORDER BY ar.seq LIMIT ?2",
@@ -325,6 +325,47 @@ impl Store {
         let root = cleanup_path(&root.path);
         let path = cleanup_path(&artifact.path);
         Ok(path != root && path.starts_with(&root))
+    }
+
+    /// Reclassify an existing exact build registration without changing its
+    /// owner, identity, expiry or plan binding.
+    pub fn recognize_registered_cargo_target(
+        &mut self,
+        existing: &ArtifactView,
+        discovered: &ArtifactView,
+    ) -> Result<()> {
+        if discovered.kind != ArtifactKind::Build
+            || discovered.purpose != core::api::SWARM_CARGO_TARGET_ARTIFACT_PURPOSE
+            || existing.kind != ArtifactKind::Build
+            || existing.state != "registered"
+            || existing.purpose == discovered.purpose
+            || existing.agent != discovered.agent
+            || existing.generation != discovered.generation
+            || existing.path != discovered.path
+            || existing.identity != discovered.identity
+            || !self.contains_owned_cleanup_child(discovered)?
+        {
+            return Ok(());
+        }
+        self.ensure_writer_healthy()?;
+        let mut updated = existing.clone();
+        updated.purpose.clone_from(&discovered.purpose);
+        let result = self
+            .connection
+            .execute(
+                "UPDATE artifacts SET body=?1 WHERE id=?2 AND path=?3
+                 AND json_extract(body,'$.state')='registered'
+                 AND json_extract(body,'$.identity')=?4",
+                params![
+                    encode_json(&updated)?,
+                    existing.id,
+                    existing.path,
+                    existing.identity
+                ],
+            )
+            .map_err(sql_error);
+        self.fault_on_persistence_error(&result);
+        result.map(|_| ())
     }
 
     /// Derive ownership from the retained generation's frozen workspace or
@@ -788,18 +829,38 @@ impl Store {
     /// project-wide prefix the way the shared inventory page could be.
     /// Unknown attempt fences are untouched: this only selects rows.
     pub fn cleanup_retirement_inventory(&self, agent: &Agent) -> Result<(Vec<ArtifactView>, bool)> {
+        self.cleanup_terminal_inventory(agent, false)
+    }
+
+    pub fn cleanup_terminal_cargo_targets(&self, agent: &Agent) -> Result<Vec<ArtifactView>> {
+        self.cleanup_terminal_inventory(agent, true)
+            .map(|(items, _)| items)
+    }
+
+    fn cleanup_terminal_inventory(
+        &self,
+        agent: &Agent,
+        cargo_only: bool,
+    ) -> Result<(Vec<ArtifactView>, bool)> {
         let mut statement = self
             .connection
             .prepare(
                 "SELECT body FROM artifacts WHERE agent = ?1 AND generation = ?2
                  AND json_extract(body, '$.state') = 'registered'
                  AND json_extract(body, '$.kind') IN ('build', 'temp', 'worktree')
+                 AND (NOT ?3 OR (json_extract(body, '$.kind') = 'build'
+                      AND json_extract(body, '$.purpose') = ?4))
                  ORDER BY seq ASC LIMIT 65",
             )
             .map_err(sql_error)?;
         let rows = statement
             .query_map(
-                params![parse_agent_id(&agent.id)?, agent.generation],
+                params![
+                    parse_agent_id(&agent.id)?,
+                    agent.generation,
+                    cargo_only,
+                    core::api::SWARM_CARGO_TARGET_ARTIFACT_PURPOSE
+                ],
                 |row| row.get::<_, String>(0),
             )
             .map_err(sql_error)?;
@@ -1500,9 +1561,14 @@ impl Store {
         };
         let probe = agent.is_automatic_provider_probe();
         let owned_child = self.contains_owned_cleanup_child(artifact)?;
+        let archived_idle_cargo = owned_child
+            && agent.archived
+            && agent.state == AgentState::Idle
+            && artifact.kind == ArtifactKind::Build;
         if artifact.generation > agent.generation
             || (agent.generation != artifact.generation && !owned_child)
             || !(cleanup_terminal(agent.state)
+                || archived_idle_cargo
                 || ((probe || (owned_child && agent.archived)) && agent.state == AgentState::Lost))
         {
             return Ok(false);
@@ -1679,7 +1745,13 @@ fn same_known_custody(existing: &ArtifactView, artifact: &ArtifactView) -> bool 
         && existing.generation == artifact.generation
         && existing.path == artifact.path
         && existing.kind == artifact.kind
-        && existing.purpose == artifact.purpose
+        && (existing.purpose == artifact.purpose
+            || (existing.purpose == core::api::SWARM_CARGO_TARGET_ARTIFACT_PURPOSE
+                && artifact.kind == ArtifactKind::Build
+                && matches!(
+                    artifact.purpose.as_str(),
+                    "frozen CARGO_TARGET_DIR" | "frozen profile scratch"
+                )))
         && existing.identity == artifact.identity
 }
 

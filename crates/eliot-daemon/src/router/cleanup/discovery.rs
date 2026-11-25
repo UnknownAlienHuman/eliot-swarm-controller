@@ -1,13 +1,17 @@
-//! Discover regenerable and private-stand children of durable artifact roots.
+//! Discover regenerable targets and private stands under durable artifact roots.
 use super::*;
+use std::collections::VecDeque;
 use std::time::UNIX_EPOCH;
 
-const MAX_ROOT_ENTRIES: usize = 256;
+const MAX_DISCOVERY_ENTRIES: usize = 1024;
+const MAX_CARGO_DEPTH: usize = 3;
 
 impl Router {
     pub(super) async fn backfill_owned_cleanup_children(
         &self,
         mut after: i64,
+        principal: &str,
+        project: Option<&str>,
     ) -> Result<Option<i64>> {
         let deadline = Instant::now() + CLEANUP_BACKFILL_BUDGET;
         for _ in 0..4 {
@@ -25,7 +29,20 @@ impl Router {
                     return Ok(Some(after));
                 }
                 after = seq;
-                if let Err(error) = self.discover_owned_cleanup_children(&root).await
+                if project.is_some_and(|project| root.project != project)
+                    || (principal != "owner"
+                        && !self
+                            .inner
+                            .store
+                            .lock()
+                            .await
+                            .cleanup_authorized(principal, &root)?)
+                {
+                    continue;
+                }
+                if let Err(error) = self
+                    .discover_owned_cleanup_children(&root, false, deadline)
+                    .await
                     && matches!(error.code.as_str(), "internal" | "unavailable")
                 {
                     crate::logging::record(
@@ -40,90 +57,31 @@ impl Router {
         Ok(Some(after))
     }
 
-    async fn discover_owned_cleanup_children(&self, root: &ArtifactView) -> Result<()> {
+    pub(super) async fn discover_owned_cleanup_children(
+        &self,
+        root: &ArtifactView,
+        cargo_only: bool,
+        deadline: Instant,
+    ) -> Result<()> {
         let path = self.verify_discovery_root(root)?;
         let daemon_root = self.inner.data_root.clone();
         let root = root.clone();
-        let candidates = tokio::task::spawn_blocking(move || -> Result<Vec<ArtifactView>> {
-            let directory = Directory::open(&path)?;
-            let entries = directory.entries().map_err(discovery_io)?;
-            let mut candidates = Vec::new();
-            for entry in entries.take(MAX_ROOT_ENTRIES) {
-                let entry = entry.map_err(discovery_io)?;
-                let path = path.join(entry.file_name());
-                if validate_cleanup_path(&path).is_err() {
-                    continue;
-                }
-                let Ok(metadata) = std::fs::symlink_metadata(&path) else {
-                    continue;
-                };
-                if !metadata.is_dir()
-                    || crate::platform::is_reparse_point(&metadata)
-                    || metadata.file_type().is_symlink()
-                {
-                    continue;
-                }
-                let Ok(identity) = directory_identity(&path) else {
-                    continue;
-                };
-                let stand = crate::stand_cleanup::owned_stand_artifact_times(
-                    &daemon_root,
-                    &path,
-                    &identity,
-                )
-                .ok()
-                .flatten();
-                let (kind, purpose, created_at, expires_at) = match stand {
-                    Some((created, expires)) => (
-                        ArtifactKind::DataDir,
-                        SWARM_STAND_ARTIFACT_PURPOSE,
-                        created,
-                        Some(expires),
-                    ),
-                    None if cargo_target(&path) => {
-                        let Some(modified) = metadata
-                            .modified()
-                            .ok()
-                            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-                            .and_then(|d| i64::try_from(d.as_millis()).ok())
-                        else {
-                            continue;
-                        };
-                        (
-                            ArtifactKind::Build,
-                            SWARM_CARGO_TARGET_ARTIFACT_PURPOSE,
-                            modified.max(root.created_at),
-                            None,
-                        )
-                    }
-                    None => continue,
-                };
-                candidates.push(ArtifactView {
-                    id: ulid::Ulid::new().to_string(),
-                    agent: root.agent.clone(),
-                    generation: root.generation,
-                    project: root.project.clone(),
-                    tree: Vec::new(),
-                    path: path.to_string_lossy().into_owned(),
-                    kind,
-                    purpose: purpose.to_owned(),
-                    identity,
-                    created_at,
-                    expires_at,
-                    state: "registered".to_owned(),
-                    git: None,
-                });
-            }
-            Ok(candidates)
+        let candidates = tokio::task::spawn_blocking(move || {
+            discover_children(path, &root, &daemon_root, cargo_only, deadline)
         })
         .await
         .map_err(|_| Error::new("internal", "artifact discovery worker did not settle"))??;
         let mut store = self.inner.store.lock().await;
         for artifact in candidates {
-            if store.known_artifact_path(&artifact.path)?.is_none()
-                && store.cleanup_agent_quiescent(&artifact)?
-            {
-                store.record_known_artifact(artifact)?;
+            if !store.cleanup_agent_quiescent(&artifact)? {
+                continue;
+            }
+            match store.known_artifact_path(&artifact.path)? {
+                None => store.record_known_artifact(artifact)?,
+                Some(existing) if artifact.kind == ArtifactKind::Build => {
+                    store.recognize_registered_cargo_target(&existing, &artifact)?;
+                }
+                Some(_) => {}
             }
         }
         Ok(())
@@ -177,11 +135,124 @@ impl Router {
                 "owned cleanup child binding changed",
             ));
         }
-        if artifact.purpose == SWARM_CARGO_TARGET_ARTIFACT_PURPOSE && !cargo_target(&canonical) {
-            return Err(Error::new("not_allowed", "Cargo target evidence changed"));
+        if artifact.purpose == SWARM_CARGO_TARGET_ARTIFACT_PURPOSE {
+            check_cargo_ancestors(&canonical, &root)?;
+            if !cargo_target(&Directory::open(&canonical)?) {
+                return Err(Error::new("not_allowed", "Cargo target evidence changed"));
+            }
         }
         Ok(canonical)
     }
+}
+
+fn discover_children(
+    path: PathBuf,
+    root: &ArtifactView,
+    daemon_root: &Path,
+    cargo_only: bool,
+    deadline: Instant,
+) -> Result<Vec<ArtifactView>> {
+    let mut directories = VecDeque::from([(path, 1)]);
+    let mut candidates = Vec::new();
+    let mut remaining = MAX_DISCOVERY_ENTRIES;
+    'directories: while let Some((parent, depth)) = directories.pop_front() {
+        let Ok(parent) = Directory::open(&parent) else {
+            continue;
+        };
+        for entry in parent.entries().map_err(discovery_io)? {
+            if remaining == 0 || Instant::now() >= deadline {
+                break 'directories;
+            }
+            remaining -= 1;
+            let entry = entry.map_err(discovery_io)?;
+            let path = parent.path.join(entry.file_name());
+            if !entry.file_type().is_ok_and(|kind| kind.is_dir())
+                || validate_cleanup_path(&path).is_err()
+            {
+                continue;
+            }
+            let Ok(directory) = Directory::open(&path) else {
+                continue;
+            };
+            let identity = directory.identity()?;
+            let stand = if depth == 1 && !cargo_only {
+                crate::stand_cleanup::owned_stand_artifact_times(daemon_root, &path, &identity)
+                    .ok()
+                    .flatten()
+            } else {
+                None
+            };
+            let (kind, purpose, created_at, expires_at) = if let Some((created, expires)) = stand {
+                (
+                    ArtifactKind::DataDir,
+                    SWARM_STAND_ARTIFACT_PURPOSE,
+                    created,
+                    Some(expires),
+                )
+            } else if protected_cargo_parent(&path) {
+                continue;
+            } else if cargo_target(&directory) {
+                let modified = entry
+                    .metadata()
+                    .ok()
+                    .and_then(|metadata| metadata.modified().ok())
+                    .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+                    .and_then(|time| i64::try_from(time.as_millis()).ok())
+                    .unwrap_or(root.created_at);
+                (
+                    ArtifactKind::Build,
+                    SWARM_CARGO_TARGET_ARTIFACT_PURPOSE,
+                    modified.max(root.created_at),
+                    None,
+                )
+            } else {
+                if depth < MAX_CARGO_DEPTH {
+                    directories.push_back((path, depth + 1));
+                }
+                continue;
+            };
+            candidates.push(ArtifactView {
+                id: ulid::Ulid::new().to_string(),
+                agent: root.agent.clone(),
+                generation: root.generation,
+                project: root.project.clone(),
+                tree: Vec::new(),
+                path: path.to_string_lossy().into_owned(),
+                kind,
+                purpose: purpose.to_owned(),
+                identity,
+                created_at,
+                expires_at,
+                state: "registered".to_owned(),
+                git: None,
+            });
+        }
+    }
+    Ok(candidates)
+}
+
+fn protected_cargo_parent(path: &Path) -> bool {
+    [".git", "daemon.lock", crate::stand_cleanup::STAND_MARKER]
+        .iter()
+        .any(|name| {
+            !matches!(
+                std::fs::symlink_metadata(path.join(name)),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound
+            )
+        })
+}
+
+fn check_cargo_ancestors(path: &Path, root: &Path) -> Result<()> {
+    for parent in path.ancestors().take_while(|parent| *parent != root) {
+        let _directory = Directory::open(parent)?;
+        if protected_cargo_parent(parent) {
+            return Err(Error::new(
+                "not_allowed",
+                "Cargo target crosses a repository or stand boundary",
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn discovery_io(error: std::io::Error) -> Error {
@@ -191,10 +262,7 @@ fn discovery_io(error: std::io::Error) -> Error {
     )
 }
 
-fn cargo_target(path: &Path) -> bool {
-    let Ok(directory) = Directory::open(path) else {
-        return false;
-    };
+fn cargo_target(directory: &Directory) -> bool {
     let cache_tag = directory
         .file("CACHEDIR.TAG")
         .and_then(|mut file| crate::platform::script_file::read(&mut file))
@@ -211,7 +279,7 @@ fn cargo_target(path: &Path) -> bool {
         });
     (cache_tag || rustc_metadata)
         && ["debug", "release"].into_iter().any(|profile| {
-            let profile = path.join(profile);
+            let profile = directory.path.join(profile);
             Directory::open(&profile).is_ok_and(|dir| dir.file(".cargo-lock").is_ok())
                 && ["deps", "build"]
                     .into_iter()

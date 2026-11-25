@@ -843,7 +843,8 @@ negative, wrong-type and unknown automation values are invalid.
 Child completion cleanup uses the worktree removal quiet period. The age-based
 sweep leaves direct-child worktree retirement to the guarded completion path.
 `auto_cleanup_after` defaults to seven days and accepts a positive duration
-such as `"14d"`. Every automatic apply uses the
+such as `"14d"`. It does not delay verified Cargo caches of quiescent terminal
+Agents. Every automatic apply uses the
 [cleanup retention policy](coordination.md#registered-artifacts-and-cleanup-k69) through
 the same guarded plan and apply path as the cleanup UI and CLI.
 

@@ -1235,6 +1235,8 @@ impl Router {
         now: i64,
         allow_fenced_root: bool,
     ) -> Result<Option<String>> {
+        let cargo_cache = artifact.kind == ArtifactKind::Build
+            && artifact.purpose == SWARM_CARGO_TARGET_ARTIFACT_PURPOSE;
         let (agent, ended_at) = {
             let store = self.inner.store.lock().await;
             let Some(agent) = store.get_agent(&artifact.agent)? else {
@@ -1243,13 +1245,19 @@ impl Router {
             if agent.generation != artifact.generation && !artifact.is_owned_cleanup_child() {
                 return Ok(Some("stale_generation".to_owned()));
             }
-            if !agent.state.is_terminal() {
+            if !(agent.state.is_terminal()
+                || (cargo_cache && agent.archived && agent.state == AgentState::Idle))
+            {
                 return Ok(Some("agent_not_terminal".to_owned()));
             }
             if artifact.kind == ArtifactKind::Worktree && agent.parent.is_some() {
                 return Ok(Some("child_completion_only".to_owned()));
             }
-            let ended_at = store.terminal_agent_end_time(&agent)?;
+            let ended_at = if cargo_cache {
+                None
+            } else {
+                Some(store.terminal_agent_end_time(&agent)?)
+            };
             (agent, ended_at)
         };
         // An explicit expiry only extends retention; it never shortens it.
@@ -1266,7 +1274,7 @@ impl Router {
             ));
         }
         let cutoff = now.saturating_sub(retention_ms);
-        if artifact.created_at >= cutoff || ended_at >= cutoff {
+        if ended_at.is_some_and(|ended_at| artifact.created_at >= cutoff || ended_at >= cutoff) {
             return Ok(Some("retention_age".to_owned()));
         }
         if artifact.state == "ownership_root" {
@@ -1412,6 +1420,7 @@ impl Router {
                 safe_ids: None,
                 kept_ids: None,
                 backfill_after: None,
+                owned_backfill_after: None,
                 inventory_rank: None,
                 inventory_seq_after: None,
                 request_binding: None,
@@ -1432,21 +1441,21 @@ impl Router {
         {
             return Err(Error::new("invalid", "cleanup continuation is stale"));
         }
-        if auto_cleanup && page.snapshot_seq.is_none() {
-            let cursor = page
-                .backfill_after
-                .as_deref()
-                .map(eliot_core::parse_agent_id)
-                .transpose()?
-                .unwrap_or(0);
-            if let Some(after) = self.backfill_owned_cleanup_children(cursor).await? {
-                page.backfill_after = Some(format!("a{after}"));
+        if page.snapshot_seq.is_none() && page.owned_backfill_after != Some(0) {
+            let cursor = page.owned_backfill_after.unwrap_or(0);
+            if let Some(after) = self
+                .backfill_owned_cleanup_children(cursor, &name, request.project.as_deref())
+                .await?
+            {
+                page.owned_backfill_after = Some(after);
                 page.request_binding = Some(binding);
                 plan.truncated = true;
                 plan.continuation = Some(page.encode()?);
                 return Ok(plan);
             }
-        } else if !auto_cleanup && page.snapshot_seq.is_none() {
+            page.owned_backfill_after = Some(0);
+        }
+        if !auto_cleanup && page.snapshot_seq.is_none() {
             // Backfill within one slice, then freeze the inventory on the
             // first candidate page. Large or slow fleets resume the backfill.
             page.backfill_after = match self
@@ -1765,6 +1774,7 @@ impl Router {
                     safe_ids,
                     kept_ids,
                     backfill_after: None,
+                    owned_backfill_after: None,
                     inventory_rank: keep_scan_cursor.then_some(next_rank),
                     inventory_seq_after: if keep_scan_cursor { next_seq } else { None },
                     request_binding: Some(binding),
@@ -2046,6 +2056,93 @@ impl Router {
         }
     }
 
+    /// Release a terminal generation's caches via the ordinary automatic lane.
+    /// The sweep catches missed events, closed gates and entries beyond the cap.
+    pub(crate) async fn release_terminal_cargo_targets(&self, agent: &str, generation: i64) {
+        if let Err(error) = self
+            .release_terminal_cargo_targets_inner(agent, generation)
+            .await
+        {
+            crate::logging::record(
+                &self.secret_policy_snapshot(),
+                "daemon.terminal_cargo_cleanup_failed",
+                &[("agent", agent)],
+                Some(&error),
+            );
+        }
+    }
+
+    async fn release_terminal_cargo_targets_inner(&self, id: &str, generation: i64) -> Result<()> {
+        if self.inner.mode.load(Ordering::SeqCst) != MODE_OPEN
+            || !self
+                .inner
+                .automatic_cleanup
+                .lock_recover()
+                .first_sweep_complete
+            || crate::config::load_automation_config(&self.inner.data_root)?.auto_cleanup
+                != Some(true)
+        {
+            return Ok(());
+        }
+        let (agent, root) = {
+            let store = self.inner.store.lock().await;
+            let Some(agent) = store.get_agent(id)?.filter(|agent| {
+                agent.generation == generation
+                    && (matches!(agent.state, AgentState::Stopped | AgentState::Failed)
+                        || (agent.archived
+                            && matches!(agent.state, AgentState::Idle | AgentState::Lost)))
+            }) else {
+                return Ok(());
+            };
+            (agent, store.agent_artifact_root(id, generation)?)
+        };
+        if let Some(root) = root {
+            self.discover_owned_cleanup_children(
+                &root,
+                true,
+                Instant::now() + CLEANUP_BACKFILL_BUDGET,
+            )
+            .await?;
+        }
+        let inventory = self
+            .inner
+            .store
+            .lock()
+            .await
+            .cleanup_terminal_cargo_targets(&agent)?;
+        let mut plan = CleanupPlan {
+            plan_id: ulid::Ulid::new().to_string(),
+            created_at: now_ms(),
+            items: Vec::new(),
+            inventory_issues: Vec::new(),
+            truncated: false,
+            continuation: None,
+        };
+        let deadline = Instant::now() + CLEANUP_PLAN_MAX_PREFLIGHT;
+        for artifact in inventory {
+            let Ok(candidate) =
+                timeout_at(deadline, self.classify_retirement_artifact(artifact)).await
+            else {
+                break;
+            };
+            plan.items.push(candidate);
+        }
+        if plan.items.is_empty() {
+            return Ok(());
+        }
+        if plan.items.iter().any(|item| item.verdict == "safe") {
+            self.inner
+                .store
+                .lock()
+                .await
+                .retain_cleanup_plan("owner", &plan, now_ms())?;
+        }
+        let applied = self.apply_automatic_cleanup_plan(&plan).await?;
+        self.record_automatic_cleanup(&plan, applied.as_ref(), true, false)
+            .await?;
+        Ok(())
+    }
+
     /// Reconcile disappearance independently of the retention cleanup policy.
     /// The ordinary removal command binds generation and rechecks absence.
     pub(crate) async fn reconcile_missing_worktrees(
@@ -2167,29 +2264,10 @@ impl Router {
         let plan = self
             .auto_cleanup_plan(&params, retention_ms, !plan_only)
             .await?;
-        let selected = plan
-            .items
-            .iter()
-            .filter(|item| item.verdict == "safe")
-            .map(|item| item.artifact.id.clone())
-            .collect::<Vec<_>>();
-        let applied: Option<CleanupApplyResponse> = if plan_only || selected.is_empty() {
+        let applied = if plan_only {
             None
         } else {
-            let request = json!({
-                "id": ulid::Ulid::new().to_string(),
-                "plan_id": plan.plan_id,
-                "artifacts": selected,
-            });
-            let value = self
-                .cleanup_apply_plan(&request, &Principal::Owner, true)
-                .await?;
-            Some(serde_json::from_value(value).map_err(|_| {
-                Error::new(
-                    "source_integrity",
-                    "automatic cleanup outcome readback failed",
-                )
-            })?)
+            self.apply_automatic_cleanup_plan(&plan).await?
         };
         let page = self
             .record_automatic_cleanup(
@@ -2215,6 +2293,35 @@ impl Router {
                 .first_sweep_complete = true;
         }
         Ok(())
+    }
+
+    async fn apply_automatic_cleanup_plan(
+        &self,
+        plan: &CleanupPlan,
+    ) -> Result<Option<CleanupApplyResponse>> {
+        let selected: Vec<_> = plan
+            .items
+            .iter()
+            .filter(|item| item.verdict == "safe")
+            .map(|item| item.artifact.id.clone())
+            .collect();
+        if selected.is_empty() {
+            return Ok(None);
+        }
+        let request = json!({
+            "id": ulid::Ulid::new().to_string(),
+            "plan_id": plan.plan_id,
+            "artifacts": selected,
+        });
+        let value = self
+            .cleanup_apply_plan(&request, &Principal::Owner, true)
+            .await?;
+        serde_json::from_value(value).map(Some).map_err(|_| {
+            Error::new(
+                "source_integrity",
+                "automatic cleanup outcome readback failed",
+            )
+        })
     }
 
     async fn automatic_cleanup_effect_gate(&self, artifact: &ArtifactView) -> Result<()> {
