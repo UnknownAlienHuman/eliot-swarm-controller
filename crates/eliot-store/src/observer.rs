@@ -707,25 +707,6 @@ impl Store {
         let id = parse_agent_id(agent)?;
         let current = load_agent_by_num(&self.connection, id)?
             .ok_or_else(|| Error::new("not_found", "Agent was not found"))?;
-        self.observer_active_for_agent(&current, generation)
-    }
-
-    /// Read the nonterminal list and observation-source state from one Store handle.
-    pub fn list_nonterminal_agents_with_observer_status(
-        &self,
-        limit: usize,
-    ) -> Result<Vec<(Agent, bool)>> {
-        self.list_nonterminal_agents(limit)?
-            .into_iter()
-            .map(|agent| {
-                let active = self.observer_active_for_agent(&agent, agent.generation)?;
-                Ok((agent, active))
-            })
-            .collect()
-    }
-
-    fn observer_active_for_agent(&self, current: &Agent, generation: i64) -> Result<bool> {
-        let id = parse_agent_id(&current.id)?;
         Ok(current.observe_only
             && current.generation == generation
             && source_open(&self.connection, id, generation)?

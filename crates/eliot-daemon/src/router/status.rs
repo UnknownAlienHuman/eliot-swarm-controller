@@ -457,10 +457,17 @@ impl Router {
         // because the predicate already excluded every one of them.
         {
             let store = self.inner.store.lock().await;
-            let (agents, active_observers): (Vec<_>, Vec<_>) = store
-                .list_nonterminal_agents_with_observer_status(STATUS_BLOCKER_MAX)?
-                .into_iter()
-                .unzip();
+            let agents = store.list_nonterminal_agents(STATUS_BLOCKER_MAX)?;
+            let active_observers = agents
+                .iter()
+                .map(|agent| {
+                    if agent.observe_only {
+                        store.observer_active(&agent.id, agent.generation)
+                    } else {
+                        Ok(false)
+                    }
+                })
+                .collect::<Result<Vec<_>>>()?;
             let unsettled_commands =
                 store.list_unsettled_commands_excluding_retained(STATUS_BLOCKER_MAX)?;
             let unsettled_total = store.count_unsettled_commands_excluding_retained()?;
