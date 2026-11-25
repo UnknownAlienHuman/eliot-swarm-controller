@@ -28,7 +28,8 @@ pub(crate) struct RunGrantConfig {
 pub(crate) struct AutomationConfig {
     #[serde(default = "default_max_event_backlog")]
     pub(crate) max_event_backlog: i64,
-    /// An omitted setting is plan-only. Explicit `true` permits age-eligible cleanup.
+    /// Omission enables guarded child completion cleanup and previews age-based cleanup.
+    /// Explicit `true` also permits age-based removal. Explicit `false` pauses both.
     #[serde(default)]
     pub(crate) auto_cleanup: Option<bool>,
     /// Minimum age before automatic cleanup, measured from the later of the

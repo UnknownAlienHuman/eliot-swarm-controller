@@ -176,11 +176,11 @@ impl Router {
             .store
             .lock()
             .await
-            .cleanup_worktree_blocker(&artifact)?
+            .retirement_plan_gate(&artifact)?
         {
             return Err(Error::new(
                 reason,
-                "worktree has a retained assignment or borrower",
+                "worktree did not pass the guarded retirement preflight",
             ));
         }
         self.apply_completed_child_plan(job, artifact).await
