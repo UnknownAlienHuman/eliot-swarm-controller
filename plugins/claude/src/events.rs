@@ -2098,6 +2098,11 @@ impl EventProcessor {
     /// One native callback exists per request ID; a possible write fences it.
     /// Neither a conflicting ask nor a turn result proves that ID safe to reuse.
     async fn deny_stray_request(&mut self, request_id: &str) {
+        self.deny_stray_request_with_message(request_id, DENY_MESSAGE)
+            .await;
+    }
+
+    async fn deny_stray_request_with_message(&mut self, request_id: &str, message: &str) {
         if self.permission_admission_fenced || self.deny_uncertain.contains(request_id) {
             return;
         }
@@ -2123,7 +2128,7 @@ impl EventProcessor {
             .respond_control(
                 request_id,
                 PermissionResult::Deny {
-                    message: DENY_MESSAGE.to_owned(),
+                    message: message.to_owned(),
                 },
                 Instant::now() + EVENT_DEADLINE,
             )
@@ -2896,6 +2901,22 @@ impl EventProcessor {
         };
         self.refresh_terminal_deadline();
         let command_id = self.status.active_command_id.clone();
+        if let Err(error) = ClaudeClient::preflight_control_response(
+            request_id,
+            PermissionResult::Allow {
+                updated_input: body.input.clone().unwrap_or(Value::Null),
+            },
+        ) {
+            if error.code == "frame_too_large" {
+                self.deny_stray_request_with_message(
+                    request_id,
+                    "Claude permission input exceeds the outbound allow-response limit; denied without truncation",
+                )
+                .await;
+                return Ok(());
+            }
+            return Err(error);
+        }
         let policy = SecretPolicy::new(self.secrets.iter().cloned());
         // The public approval fact carries only a neutral summary (the
         // decision-relevant operation: command/description/cwd and file/path

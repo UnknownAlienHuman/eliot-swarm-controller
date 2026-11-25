@@ -22,6 +22,7 @@ mod goal_scope;
 mod goals;
 mod handoff;
 mod harness_check;
+pub(crate) use harness_check::HarnessCheckCleanupScan;
 mod hierarchy;
 mod inference;
 mod insertion_facts;

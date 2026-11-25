@@ -142,6 +142,28 @@ impl ClaudeProcess {
 }
 
 impl ClaudeClient {
+    /// Check the exact permission response before publishing the approval.
+    /// `encode_frame` applies the shared native limit to the complete JSON
+    /// record plus its terminating newline, so callers can reject an allow
+    /// whose `updatedInput` cannot be echoed without changing the input.
+    pub fn preflight_control_response(request_id: &str, result: PermissionResult) -> Result<()> {
+        Self::encode_control_response(request_id, result).map(drop)
+    }
+
+    fn encode_control_response(request_id: &str, result: PermissionResult) -> Result<String> {
+        encode_frame(
+            LABELS.server,
+            &OutboundControlResponse {
+                kind: "control_response",
+                response: OutboundControlResponseBody {
+                    subtype: "success",
+                    request_id: request_id.to_owned(),
+                    response: result,
+                },
+            },
+        )
+    }
+
     /// One stdin `control_request` round trip. Only a `success` subtype proves
     /// the request ran; an `error` subtype, a lost reply and a closed stream
     /// all leave the outcome unknown, never rejected.
@@ -166,17 +188,7 @@ impl ClaudeClient {
                 "Claude permission reply requires the exact native request id",
             ));
         }
-        let encoded = encode_frame(
-            LABELS.server,
-            &OutboundControlResponse {
-                kind: "control_response",
-                response: OutboundControlResponseBody {
-                    subtype: "success",
-                    request_id: request_id.to_owned(),
-                    response: result,
-                },
-            },
-        )?;
+        let encoded = Self::encode_control_response(request_id, result)?;
         self.write_encoded(encoded, deadline).await
     }
 

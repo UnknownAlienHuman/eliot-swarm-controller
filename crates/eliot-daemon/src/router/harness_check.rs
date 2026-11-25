@@ -38,6 +38,35 @@ pub(crate) struct HarnessCheckWork {
 const CHECK_CLEANUP_WAIT: Duration = Duration::from_secs(5);
 /// How long the drive waits for the scenario turn to start before steering.
 const CHECK_STEER_ARM_WAIT: Duration = Duration::from_secs(30);
+const CLEANUP_CANDIDATE_PAGE: usize = 64;
+
+/// A pass can span maintenance ticks. A failed cleanup is retried on the
+/// next pass without blocking checks of later IDs in this pass.
+#[derive(Default)]
+pub(crate) struct HarnessCheckCleanupScan {
+    after: Option<String>,
+    found: bool,
+}
+
+impl HarnessCheckCleanupScan {
+    fn page(&mut self, store: &eliot_store::Store, max: usize) -> Result<Option<Vec<String>>> {
+        let (page, cursor, more) =
+            store.list_harness_check_agents(self.after.as_deref(), CLEANUP_CANDIDATE_PAGE)?;
+        let mut orphans: Vec<_> = page.into_iter().map(|agent| agent.id).collect();
+        self.found |= !orphans.is_empty();
+        if orphans.len() > max {
+            orphans.truncate(max);
+            self.after = orphans.last().cloned();
+        } else if more {
+            self.after = cursor;
+        } else {
+            self.after = None;
+            let found = std::mem::take(&mut self.found);
+            return Ok(found.then_some(orphans));
+        }
+        Ok(Some(orphans))
+    }
+}
 
 impl Router {
     /// Refresh the Store from the observed installation and admit one due
@@ -46,6 +75,7 @@ impl Router {
         &self,
         available: usize,
         inventory: &crate::adhoc::CheckInventory,
+        cleanup_scan: &mut HarnessCheckCleanupScan,
     ) -> Result<(Vec<HarnessCheckWork>, Vec<String>)> {
         if available == 0 || self.inner.mode.load(Ordering::SeqCst) != MODE_OPEN {
             return Ok((Vec::new(), Vec::new()));
@@ -67,8 +97,9 @@ impl Router {
                     store.note_harness_installed(harness, candidate.version.as_deref(), now)?;
                 }
             }
-            let orphans = Self::orphaned_harness_check_agents(&store)?;
-            if !orphans.is_empty() {
+            if let Some(orphans) =
+                cleanup_scan.page(&store, available.min(eliot_core::HARNESS_CHECK_BATCH_LIMIT))?
+            {
                 return Ok((Vec::new(), orphans));
             }
             store.due_harness_checks(now, usize::MAX)?
@@ -121,24 +152,6 @@ impl Router {
             }
         }
         Ok((started, Vec::new()))
-    }
-
-    /// With no live drives, every retained check Agent needs cleanup.
-    fn orphaned_harness_check_agents(store: &eliot_store::Store) -> Result<Vec<String>> {
-        let mut orphans = Vec::new();
-        let mut after: Option<String> = None;
-        loop {
-            let (page, more) = store.list_agents(after.as_deref(), 64)?;
-            after = page.last().map(|agent| agent.id.clone());
-            orphans.extend(
-                page.into_iter()
-                    .filter(Agent::is_harness_check)
-                    .map(|agent| agent.id),
-            );
-            if !more || after.is_none() {
-                return Ok(orphans);
-            }
-        }
     }
 
     fn cheapest_harness_profile(&self, harness: &str) -> Option<String> {
