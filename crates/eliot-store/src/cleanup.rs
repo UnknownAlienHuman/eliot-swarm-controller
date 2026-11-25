@@ -1433,10 +1433,7 @@ impl Store {
         self.cleanup_worktree_blocker(artifact)
     }
 
-    pub fn cleanup_worktree_blocker(
-        &self,
-        artifact: &ArtifactView,
-    ) -> Result<Option<&'static str>> {
+    fn cleanup_worktree_blocker(&self, artifact: &ArtifactView) -> Result<Option<&'static str>> {
         self.ensure_committed_reads()?;
         if artifact.kind != ArtifactKind::Worktree {
             return Ok(None);

@@ -303,7 +303,7 @@ StreamableHTTP runtime sizing is unchanged. It exposes exactly one
 tool, `swarm`, with required `method` (non-empty string) and `params` (object), and
 forwards calls through the existing authenticated local client. Ordinary mode uses
 [`eliot_daemon::client_call`](../../crates/eliot-daemon/src/daemon.rs); `--require-agent`
-uses [`eliot_daemon::client_call_with_agent_identity`](../../crates/eliot-daemon/src/daemon.rs).
+uses [`eliot_daemon::client_call_with_agent_mcp_tool`](../../crates/eliot-daemon/src/daemon.rs).
 Ordinary stdio authenticates with `api.identity` before MCP initialization so the
 daemon's local Owner refusal is reported when the bridge connects.
 Both reuse the daemon methods and shared Core DTOs. Call known methods directly.

@@ -101,7 +101,7 @@ where
     R: AsyncRead + Unpin,
 {
     /// Connect the Eliot plugin peer to arbitrary reader and writer streams.
-    pub fn from_io<W>(reader: R, writer: W) -> Self
+    fn from_io<W>(reader: R, writer: W) -> Self
     where
         W: AsyncWrite + Unpin + Send + 'static,
     {

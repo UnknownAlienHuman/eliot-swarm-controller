@@ -17,7 +17,7 @@ use ulid::Ulid;
 
 const AGENT_WAKE_METHOD: &str = "agent.wake";
 const MAX_ACTIVE_AGENT_WAKES: i64 = 1_024;
-pub const MAX_AGENT_WAKE_PAGE: usize = 128;
+const MAX_AGENT_WAKE_PAGE: usize = 128;
 const AGENT_WAKE_RETENTION_MS: i64 = 25 * 60 * 60 * 1_000;
 const MAX_AGENT_WAKE_PRE_ADMISSION_ATTEMPTS: u32 = 5;
 const MAX_AGENT_WAKE_FAILURE_REASON_BYTES: usize = 384;

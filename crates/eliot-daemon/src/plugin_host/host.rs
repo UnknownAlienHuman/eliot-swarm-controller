@@ -2634,7 +2634,7 @@ async fn cleanup_startup(
             command_id: actor.start_command.id.clone(),
         });
     }
-    cleanup_actor(&actor.state, &actor.key, &actor.plugin_credential, false).await;
+    cleanup_actor(&actor.state, &actor.key, &actor.plugin_credential);
 }
 
 /// Retire one validated failed-start plugin without entering the live actor
@@ -2673,7 +2673,7 @@ async fn retire_failed_start(
             command_id: actor.start_command.id.clone(),
         });
     }
-    cleanup_actor(&actor.state, &actor.key, &actor.plugin_credential, false).await;
+    cleanup_actor(&actor.state, &actor.key, &actor.plugin_credential);
 }
 
 fn snapshot_future(
@@ -4533,12 +4533,7 @@ fn note_unknown_commands(state: &HostState, events: &[eliot_core::Event]) {
     }
 }
 
-async fn cleanup_actor(
-    state: &Weak<HostState>,
-    key: &AgentKey,
-    plugin_credential: &str,
-    _planned_exit: bool,
-) {
+fn cleanup_actor(state: &Weak<HostState>, key: &AgentKey, plugin_credential: &str) {
     let Some(state) = state.upgrade() else {
         return;
     };

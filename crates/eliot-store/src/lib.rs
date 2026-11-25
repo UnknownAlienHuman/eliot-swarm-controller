@@ -2480,7 +2480,6 @@ impl Store {
                     active.insert(key.to_owned());
                 }
                 "tool.completed" if active.remove(key) => {}
-                "tool.completed" => return Ok(ActiveToolCoverage::Unknown),
                 _ => return Ok(ActiveToolCoverage::Unknown),
             }
         }

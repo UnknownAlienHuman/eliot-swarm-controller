@@ -307,9 +307,7 @@ fn switch_budget_available(connection: &Connection, agent: &Agent, now: i64) -> 
     let updated_at = updated_at.unwrap_or(now);
     Ok(match state.as_deref() {
         Some("rejected") => updated_at + REJECTED_RETRY_MS <= now,
-        Some("refused") => updated_at + REFUSED_RETRY_MS <= now,
-        Some("failed") => updated_at + REFUSED_RETRY_MS <= now,
-        Some("reserved" | "unknown" | "applied") | None => false,
+        Some("refused" | "failed") => updated_at + REFUSED_RETRY_MS <= now,
         _ => false,
     })
 }

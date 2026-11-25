@@ -1679,7 +1679,6 @@ async fn reconcile_event_rules(
                 advance_rule_cursor(
                     router,
                     rule,
-                    true,
                     retiring.through.min(high_water),
                     RuleCursorOutcome::NoMatch,
                 )
@@ -1692,8 +1691,7 @@ async fn reconcile_event_rules(
                 continue;
             }
             if !rule.state.enabled || !rule.definition.enabled {
-                advance_rule_cursor(router, rule, false, high_water, RuleCursorOutcome::Disabled)
-                    .await?;
+                advance_rule_cursor(router, rule, high_water, RuleCursorOutcome::Disabled).await?;
             } else if !process_rule_cursor(router, rule, false, high_water).await? {
                 return Ok(false);
             }
@@ -1805,7 +1803,6 @@ async fn process_rule_cursor(
                         advance_rule_cursor(
                             router,
                             rule,
-                            retiring,
                             event.seq,
                             RuleCursorOutcome::SkippedCauseDepth,
                         )
@@ -1814,14 +1811,8 @@ async fn process_rule_cursor(
                     }
                     Ok(RuleEvaluation::IncompleteKey) => {
                         flush_rule_no_match(router, rule, retiring, &mut no_match_through).await?;
-                        advance_rule_cursor(
-                            router,
-                            rule,
-                            retiring,
-                            event.seq,
-                            RuleCursorOutcome::Suppressed,
-                        )
-                        .await?;
+                        advance_rule_cursor(router, rule, event.seq, RuleCursorOutcome::Suppressed)
+                            .await?;
                         continue;
                     }
                     Ok(RuleEvaluation::LaunchResultInsertion { .. }) => {
@@ -1832,7 +1823,6 @@ async fn process_rule_cursor(
                         advance_rule_cursor(
                             router,
                             rule,
-                            retiring,
                             event.seq,
                             rule_cursor_rejection(router, &error),
                         )
@@ -1865,7 +1855,6 @@ async fn process_rule_cursor(
                     advance_rule_cursor(
                         router,
                         rule,
-                        retiring,
                         event.seq,
                         rule_cursor_rejection(router, &error),
                     )
@@ -1899,7 +1888,6 @@ async fn process_rule_cursor(
                     advance_rule_cursor(
                         router,
                         rule,
-                        retiring,
                         event.seq,
                         rule_cursor_rejection(router, &error),
                     )
@@ -2020,7 +2008,6 @@ fn rule_cursor(rule: &ActiveRule, retiring: bool) -> Option<i64> {
 async fn advance_rule_cursor(
     router: &Router,
     rule: &mut ActiveRule,
-    _retiring: bool,
     through: i64,
     outcome: RuleCursorOutcome,
 ) -> Result<()> {
@@ -2039,7 +2026,7 @@ async fn flush_rule_no_match(
     if let Some(through) = through.take()
         && through > rule_cursor(rule, retiring).unwrap_or(through)
     {
-        advance_rule_cursor(router, rule, retiring, through, RuleCursorOutcome::NoMatch).await?;
+        advance_rule_cursor(router, rule, through, RuleCursorOutcome::NoMatch).await?;
     }
     Ok(())
 }
@@ -2740,18 +2727,6 @@ fn timer_wake_delay(timer: &ActiveTimer, now: i64) -> Option<Duration> {
     ))
 }
 
-/// Catch-up preparation must verify the frozen Agent target and generation
-/// before admission exactly for the Agent-bound project verbs. This is the
-/// single closed project-rule verb classification enforced by
-/// `authorize_command` (router/auth.rs): targetless coordination actions
-/// (`run`, `launch`, `notify`, `emit`, `mail.send`, `var.set`) and project
-/// Git actions (`git.fetch`) skip Agent scope checks here exactly as they
-/// do on the live path. Unknown verbs stay fail-closed at ordinary
-/// admission.
-fn project_rule_catch_up_binds_agent(verb: &str) -> bool {
-    crate::router::project_rule_action_binds_agent_target(verb)
-}
-
 async fn evaluate_event_action(
     router: &Router,
     rule: &ActiveRule,
@@ -2862,7 +2837,7 @@ pub(crate) async fn prepare_rule_catch_up_actions(
     for (event, request) in rendered {
         let event_seq = event.seq;
         if let Some(project) = project
-            && project_rule_catch_up_binds_agent(request.verb.as_str())
+            && crate::router::project_rule_action_binds_agent_target(request.verb.as_str())
         {
             let target = request
                 .target
