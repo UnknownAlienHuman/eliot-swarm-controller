@@ -2793,6 +2793,16 @@ expire for routing, catalogue availability and hold release. No quota query
 starts a turn, performs inference or polls Agents. Run
 `swarm quota --harness H [--profile P]` from the CLI.
 
+For a verified direct Codex route, the read uses newer `quota.observed` account
+windows to update an existing successful cached `account/rateLimits/read`.
+Each observation must come from the current generation of the same account and
+route, with readiness after the tracked sign-in file's last change. The update
+retains the read's model windows and authorization fields. The full read's
+timestamp and `ttl_ms` still govern routing and hold release. Sparse updates
+apply in order. The unmodified read is used if the update sequence exceeds its
+bound. The optional
+`details.liveWindowsObservedAtMs` identifies the rolling window sample.
+
 The quota response includes the effective [Owner reserve](configuration.md#owner-quota-reserve-872)
 and `swarm quota` displays it with the recommended setting of 20%. For current
 account-wide windows with known bounds, the command reports retained Swarm

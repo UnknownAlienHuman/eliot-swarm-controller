@@ -1201,6 +1201,7 @@ impl CodexPlugin {
                 generation: params.generation,
                 secrets: plan.secrets.clone(),
                 native_scope: String::new(),
+                publish_account_quota: matches!(&plan.route, CodexRoute::Direct),
             },
         );
         let mut session = AgentSession {

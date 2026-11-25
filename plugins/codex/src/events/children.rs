@@ -1203,6 +1203,8 @@ impl EventProcessor {
             "thread/tokenUsage/updated" => {
                 self.note_child_token_usage(child_thread, &params)?;
             }
+            // This notification is process-account evidence, never child quota.
+            "account/rateLimits/updated" => {}
             "warning" => {
                 let policy = SecretPolicy::new(self.secrets.iter().cloned());
                 let state = self

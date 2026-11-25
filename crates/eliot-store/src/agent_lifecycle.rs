@@ -1066,9 +1066,47 @@ impl Store {
         snapshot: &Value,
         now: i64,
     ) -> Result<Option<core::api::harness::QuotaObservation>> {
-        let row: Option<String> = self
-            .connection
-            .query_row(
+        Ok(self
+            .quota_observations(harness, route_identity, snapshot, now, None)?
+            .pop())
+    }
+
+    /// Read the complete sparse update sequence since a confirmed read, oldest first.
+    pub fn quota_observations_after(
+        &self,
+        harness: &str,
+        route_identity: &str,
+        snapshot: &Value,
+        now: i64,
+        login_changed_at: i64,
+        fetched_at: i64,
+    ) -> Result<Vec<core::api::harness::QuotaObservation>> {
+        self.quota_observations(
+            harness,
+            route_identity,
+            snapshot,
+            now,
+            Some((login_changed_at, fetched_at)),
+        )
+    }
+
+    fn quota_observations(
+        &self,
+        harness: &str,
+        route_identity: &str,
+        snapshot: &Value,
+        now: i64,
+        read_bound: Option<(i64, i64)>,
+    ) -> Result<Vec<core::api::harness::QuotaObservation>> {
+        self.ensure_committed_reads()?;
+        const MAX_ROLLING_UPDATES: i64 = 64;
+        let limit = if read_bound.is_some() {
+            MAX_ROLLING_UPDATES + 1
+        } else {
+            1
+        };
+        let (login_changed_at, observed_after) = read_bound.unzip();
+        let mut query = self.connection.prepare_cached(
                 "SELECT e.data FROM events e JOIN agents a ON a.id=e.agent
              WHERE e.kind='quota.observed' AND a.harness=?1 AND a.generation=e.generation
                AND json_extract(a.profile_snapshot,'$.native_route_identity')=?2
@@ -1078,22 +1116,48 @@ impl Store {
                AND json_extract(a.profile_snapshot,'$.literal_env') IS json_extract(?3,'$.literal_env')
                AND json_extract(a.profile_snapshot,'$.route_binding') IS json_extract(?3,'$.route_binding')
                AND json_extract(e.data,'$.observation.observedAtMs') <= ?4
-             ORDER BY json_extract(e.data,'$.observation.observedAtMs') DESC,e.seq DESC LIMIT 1",
-                params![harness, route_identity, encode_json(snapshot)?, now],
-                |r| r.get(0),
+               AND (?6 IS NULL OR json_extract(e.data,'$.observation.observedAtMs')>?6)
+               AND (?5 IS NULL OR EXISTS (
+                 SELECT 1 FROM events ready INDEXED BY events_agent
+                  WHERE ready.agent=e.agent AND ready.generation=e.generation
+                    AND ready.kind='session.ready' AND ready.source='stream'
+                    AND ready.seq<e.seq AND ready.ts>?5))
+             ORDER BY json_extract(e.data,'$.observation.observedAtMs') DESC,e.seq DESC LIMIT ?7",
+            ).map_err(sql_error)?;
+        let rows = query
+            .query_map(
+                params![
+                    harness,
+                    route_identity,
+                    encode_json(snapshot)?,
+                    now,
+                    login_changed_at,
+                    observed_after,
+                    limit
+                ],
+                |row| row.get::<_, String>(0),
             )
-            .optional()
+            .map_err(sql_error)?
+            .collect::<rusqlite::Result<Vec<_>>>()
             .map_err(sql_error)?;
-        row.map(|data| {
-            let value: Value = decode_json(&data)?;
-            let observation: core::api::harness::QuotaObservation =
-                serde_json::from_value(value.get("observation").cloned().unwrap_or(Value::Null))
-                    .map_err(|_| {
-                        Error::new("source_integrity", "retained quota observation invalid")
-                    })?;
-            observation.validate()?;
-            Ok(observation)
-        })
-        .transpose()
+        if rows.len() > MAX_ROLLING_UPDATES as usize {
+            // The on-demand result is still usable. Never apply an incomplete
+            // range of sparse updates that may miss the first value in a pair.
+            return Ok(Vec::new());
+        }
+        rows.into_iter()
+            .rev()
+            .map(|data| {
+                let value: Value = decode_json(&data)?;
+                let observation: core::api::harness::QuotaObservation = serde_json::from_value(
+                    value.get("observation").cloned().unwrap_or(Value::Null),
+                )
+                .map_err(|_| {
+                    Error::new("source_integrity", "retained quota observation invalid")
+                })?;
+                observation.validate()?;
+                Ok(observation)
+            })
+            .collect()
     }
 }

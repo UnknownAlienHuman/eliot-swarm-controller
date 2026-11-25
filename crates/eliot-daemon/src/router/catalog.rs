@@ -868,12 +868,17 @@ impl Router {
             )
         };
         let route_verified = cache_key.is_some();
-        if let Some(hit) = cache_key.as_ref().and_then(|key| {
-            self.inner
-                .catalog_cache
-                .lock_recover()
-                .get_quota(key, now_ms())
-        }) {
+        if let Some(key) = &cache_key
+            && let Some(mut hit) = self.cached_quota(key)
+        {
+            self.overlay_quota_observation(
+                &mut hit,
+                &key.login,
+                route.identity.as_deref(),
+                &profile,
+                deadline,
+            )
+            .await?;
             request.validate_response(&hit)?;
             return Ok(catalog::ScopedQuota {
                 response: hit,
@@ -970,6 +975,63 @@ impl Router {
             response,
             route_verified,
         })
+    }
+
+    fn cached_quota(&self, key: &ModelSourceIdentity) -> Option<HarnessQuotaResponse> {
+        self.inner
+            .catalog_cache
+            .lock_recover()
+            .get_quota(key, now_ms())
+    }
+
+    async fn overlay_quota_observation(
+        &self,
+        response: &mut HarnessQuotaResponse,
+        login: &NativeLoginRevision,
+        identity: Option<&str>,
+        profile: &Value,
+        deadline: Instant,
+    ) -> Result<()> {
+        let Some(overlay) = HarnessCapabilities::of(&response.harness)
+            .quota_readback
+            .and_then(|readback| readback.stream_overlay)
+        else {
+            return Ok(());
+        };
+        let (Some(identity), Some(since), Some(details)) =
+            (identity, login.file_change_ms(), response.details.as_mut())
+        else {
+            return Ok(());
+        };
+        if response.status != eliot_core::api::HARNESS_QUOTA_SUPPORTED
+            || details["state"] == "error"
+        {
+            return Ok(());
+        }
+        let now = now_ms();
+        let observations = {
+            let Ok(store) = tokio::time::timeout_at(deadline.into(), self.inner.store.lock()).await
+            else {
+                return Ok(());
+            };
+            store.quota_observations_after(
+                &response.harness,
+                identity,
+                profile,
+                now,
+                since,
+                response.fetched_at_ms,
+            )?
+        };
+        if login.is_current() {
+            // A sparse watch update does not refresh the full read's timestamp
+            // or its ordinary-usage authorization. Hold release still requires
+            // the actual read to be newer than the hold.
+            for observation in observations {
+                overlay(details, &observation);
+            }
+        }
+        Ok(())
     }
 
     /// Page the installed harness catalogues for the current settings revision.
@@ -1714,6 +1776,13 @@ enum NativeLoginRevision {
 }
 
 impl NativeLoginRevision {
+    fn file_change_ms(&self) -> Option<i64> {
+        let Self::Files(files) = self else {
+            return None;
+        };
+        files.first()?.1.as_ref()?.modified_at_ms()
+    }
+
     fn is_tracked(&self) -> bool {
         match self {
             // The first declared file is the sign-in store. Later entries
