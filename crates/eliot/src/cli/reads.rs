@@ -1018,7 +1018,15 @@ pub(crate) async fn run_diff(
             .validate_response(&response)
             .map_err(Failure::invalid_response)?;
         for file in response.files {
-            print!("{}", file.text);
+            let mut text = String::with_capacity(file.text.len());
+            for character in file.text.chars() {
+                if character.is_control() && !matches!(character, '\t' | '\n') {
+                    text.extend(character.escape_default());
+                } else {
+                    text.push(character);
+                }
+            }
+            print!("{text}");
             if file.truncated {
                 if !file.text.is_empty() && !file.text.ends_with('\n') {
                     println!();

@@ -3074,7 +3074,8 @@ It uses the same Owner, self and managed Agent scope as `agent.git` and
 - `branch` compares the managed worktree's frozen base to the worktree, matching
   the review digest's scope. A workspace with no frozen base uses HEAD.
 - `last-turn` limits the branch patch to the completed turn's reported edit paths
-  and names that turn. These paths scope the current patch. They convey no
+  and names that turn. Git receives those bounded paths literally. They scope the
+  current patch and convey no
   historical hunk attribution. Commands without reported paths add no files.
 
 The optional `path` limits Git to one literal workspace-relative path. When the
@@ -3085,6 +3086,7 @@ file observation. Missing observation coverage or any output limit sets
 `truncated`. Core bounds the returned text to 256 KiB, 100 files and 1,000
 hunks. The daemon starts at most one owned Git process per call with a
 five-second deadline and bounded cleanup. The desktop reads on open or Refresh.
+The CLI text view escapes terminal control characters except tabs and newlines.
 
 `who` composes existing L3 projections per current worker: the roster
 holds every non-terminal Agent in scope (at most 100, oldest first, with

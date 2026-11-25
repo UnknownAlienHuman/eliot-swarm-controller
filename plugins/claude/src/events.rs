@@ -2386,7 +2386,10 @@ impl EventProcessor {
         let policy = SecretPolicy::new(self.secrets.iter().cloned());
         let shell_cwd = body.input.get("cwd").and_then(Value::as_str).filter(|cwd| {
             body.input["tool_name"].as_str() == Some("Bash")
-                && self.tool_names.get(&tool_use_id).map(String::as_str) == Some("Bash")
+                && self
+                    .tool_names
+                    .get(&tool_use_id)
+                    .is_some_and(|(name, _)| name == "Bash")
                 && cwd.len() <= MAX_TOOL_COMMAND_BYTES
                 && Path::new(cwd).is_absolute()
                 && !cwd.chars().any(char::is_control)

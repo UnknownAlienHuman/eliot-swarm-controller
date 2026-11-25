@@ -123,6 +123,8 @@ impl Router {
                 {
                     pathspec.push(companion);
                 }
+            } else if let Some(paths) = &diff.turn_paths {
+                pathspec.extend(paths.iter().take(MAX_DIFF_TEXT_FILES).map(String::as_str));
             }
             let (bytes, truncated) = GitProbe::new()?
                 .diff_output(&checkout, &base, &pathspec)
@@ -141,7 +143,7 @@ impl Router {
                         diff.read_untracked(&checkout.root.path, &entry.path);
                     }
                 }
-            } else {
+            } else if diff.needs_untracked_snapshot() {
                 diff.truncated = true;
             }
         }
@@ -194,6 +196,21 @@ struct PatchBuilder<'a> {
 }
 
 impl PatchBuilder<'_> {
+    fn needs_untracked_snapshot(&self) -> bool {
+        let missing = |path: &str| {
+            !self
+                .files
+                .iter()
+                .any(|file| file.path == path || file.original_path.as_deref() == Some(path))
+        };
+        if let Some(path) = self.selection {
+            return missing(path);
+        }
+        self.turn_paths
+            .as_ref()
+            .is_none_or(|paths| paths.iter().any(|path| missing(path)))
+    }
+
     fn matches(&self, path: &str, original: Option<&str>) -> bool {
         self.selection
             .is_none_or(|chosen| chosen == path || original == Some(chosen))
