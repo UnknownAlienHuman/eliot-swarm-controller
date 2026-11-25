@@ -156,9 +156,6 @@ pub(super) struct PaneState {
     folded: HashSet<String>,
     /// Details sections whose open state the owner flipped.
     flipped: HashSet<&'static str>,
-    /// A Goal control is in flight.
-    goal_busy: bool,
-    goal_note: Option<String>,
 }
 
 impl PaneState {
@@ -202,12 +199,6 @@ pub(super) enum PaneMsg {
     OpenTerminal,
     /// Open or close a Details section.
     Section(&'static str),
-    Goal(client::GoalControl),
-    GoalDone(
-        String,
-        client::GoalControl,
-        Box<MutationResult<eliot_core::api::GoalView>>,
-    ),
     /// Copy text (what it is, the text).
     Copy(String, String),
 }
@@ -344,41 +335,6 @@ impl DesktopApp {
             PaneMsg::Section(key) => {
                 if !self.pane.flipped.remove(key) {
                     self.pane.flipped.insert(key);
-                }
-            }
-            PaneMsg::Goal(client::GoalControl::Clear) => {
-                // Clearing ends the goal for good: the same question as
-                // Stop Agent, bound to the open Agent.
-                if let Some(agent) = self.selected_agent_id().and_then(|id| self.tree_agent(&id)) {
-                    self.menu.confirm = Some((
-                        super::menu_ui::Target::Agent(agent),
-                        super::menu_ui::Action::ClearGoal,
-                    ));
-                }
-            }
-            PaneMsg::Goal(control) => {
-                if let Some(agent) = self.selected_agent_id() {
-                    self.goal_control(agent, control, context);
-                }
-            }
-            PaneMsg::GoalDone(agent, control, result) => {
-                self.pane.goal_busy = false;
-                match *result {
-                    Ok(goal) => {
-                        self.pane.goal_note = None;
-                        let goal =
-                            (goal.status != eliot_core::api::GoalStatus::Cleared).then_some(goal);
-                        if self.selected_agent_id().as_deref() == Some(agent.as_str()) {
-                            self.chat.goal = Some((agent, goal));
-                        }
-                    }
-                    Err(error) => {
-                        self.pane.goal_note = Some(format!(
-                            "{} did not go through: {}",
-                            control.label(),
-                            error.user_message()
-                        ));
-                    }
                 }
             }
             PaneMsg::Copy(what, text) => match crate::clipboard::set_text(&text) {
@@ -649,34 +605,6 @@ impl DesktopApp {
                 })
             });
             Message::Pane(PaneMsg::MergeSettled(agent, Box::new(result)))
-        });
-    }
-
-    /// `goal.pause`, `goal.resume` or `goal.clear` on `agent`'s goal, one at
-    /// a time.
-    pub(super) fn goal_control(
-        &mut self,
-        agent: String,
-        control: client::GoalControl,
-        context: &ComponentContext<Self>,
-    ) {
-        let Ok(data_dir) = self.data_dir.clone() else {
-            return;
-        };
-        if self.pane.goal_busy {
-            return;
-        }
-        self.pane.goal_busy = true;
-        self.pane.goal_note = None;
-        let mutation_id = client::new_mutation_id();
-        let _task = context.spawn_background(move |_| {
-            let result = client::block_on(client::goal_control(
-                &data_dir,
-                mutation_id,
-                &agent,
-                control,
-            ));
-            Message::Pane(PaneMsg::GoalDone(agent, control, Box::new(result)))
         });
     }
 
@@ -1723,66 +1651,33 @@ impl DesktopApp {
             .into()
     }
 
-    /// Details › Goal's controls where the daemon has the call: Pause or
-    /// Resume and Clear; a round is the daemon's (Run a round now and Edit
-    /// say why they are not here).
-    pub(super) fn goal_actions(
+    /// Details › Goal's one action: Set goal… or Edit goal…, which opens
+    /// the Goal dialog ([`super::goal_ui`]) with Save, Pause, Resume and
+    /// Clear as the daemon allows them.
+    pub(super) fn goal_action(
         &self,
-        goal: &eliot_core::api::GoalView,
+        agent: &str,
+        has_goal: bool,
         context: &mut ViewContext<Self>,
-    ) -> Vec<KeyedView> {
-        use eliot_core::api::GoalStatus;
-        let busy = self.pane.goal_busy;
-        let control =
-            |control: client::GoalControl, context: &mut ViewContext<Self>| -> KeyedView {
-                KeyedView::new(
-                    control.label(),
-                    controls::text_button()
-                        .is_enabled(!busy)
-                        .automation_name(format!("{} goal", control.label()))
-                        .on_click(context.message(Message::Pane(PaneMsg::Goal(control))))
-                        .content(controls::label(control.label())),
-                )
-            };
-        let unavailable = |label: &str, why: &str| -> KeyedView {
-            KeyedView::new(
-                label.to_owned(),
-                Border::new()
-                    .content(
-                        controls::text_button()
-                            .is_enabled(false)
-                            .automation_name(format!("{label}: {why}"))
-                            .content(controls::label(label)),
-                    )
-                    .tooltip(why),
-            )
+    ) -> KeyedView {
+        let words = if has_goal {
+            "Edit goal…"
+        } else {
+            "Set goal…"
         };
-        let mut actions = vec![unavailable(
-            "Run a round now",
-            "A round needs the daemon's idle or cadence key; a stuck goal offers one in the Inbox",
-        )];
-        match goal.status {
-            GoalStatus::Active | GoalStatus::Blocked => {
-                actions.push(control(client::GoalControl::Pause, context));
-            }
-            GoalStatus::Paused => actions.push(control(client::GoalControl::Resume, context)),
-            GoalStatus::Completed | GoalStatus::Cleared => {}
-        }
-        actions.push(unavailable(
-            "Edit",
-            "Editing a goal is not in the desktop yet: swarm goal set changes it",
-        ));
-        if goal.status != GoalStatus::Cleared {
-            actions.push(control(client::GoalControl::Clear, context));
-        }
-        let mut rows = vec![KeyedView::new("actions", toolbar(actions, Vec::new()))];
-        if let Some(note) = &self.pane.goal_note {
-            rows.push(KeyedView::new(
-                "note",
-                super::page_ui::error_line(note.clone()),
-            ));
-        }
-        rows
+        KeyedView::new(
+            words,
+            Border::new()
+                .horizontal_alignment(HorizontalAlignment::Left)
+                .content(
+                    controls::outlined()
+                        .automation_name(words.trim_end_matches('…'))
+                        .on_click(context.message(Message::Goal(super::goal_ui::GoalMsg::Open(
+                            agent.to_owned(),
+                        ))))
+                        .content(controls::label(words)),
+                ),
+        )
     }
 }
 

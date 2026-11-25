@@ -226,7 +226,7 @@ impl DesktopApp {
                 ))
                 .on_click(context.callback(|()| Message::Launch(LaunchMsg::Toggle(Pop::Effort)))),
             controls::chip_content(Some(controls::glyph::MODEL), &label, true),
-            &[Pop::Effort, Pop::Model, Pop::Manage],
+            &[Pop::Effort, Pop::Model],
             FlyoutPlacement::TopEdgeAlignedLeft,
             context,
         )
@@ -634,28 +634,63 @@ impl DesktopApp {
         )
     }
 
-    /// The context fill beside the main action: how full the session's
-    /// context is, as the harness reports it ("Context 34%", used and window
-    /// in its tooltip); a click opens Details. Nothing when the harness
-    /// reports no context fill.
+    /// The context beside the main action (brand book §9.5), small text as
+    /// the harness reports it: "Context 34%" against a known window, else
+    /// the tokens used ("Context 54k tokens"), else "Context unavailable",
+    /// never 0%. Its tooltip says whose context it is and how fresh; a click
+    /// opens Details. Provider quota is the usage ring's, not this.
     fn context_ring(&self, context: &mut ViewContext<Self>) -> Option<View> {
-        let (used, window) = self.bound_detail().ok().and_then(|detail| detail.context)?;
-        let share = (used as f64 / window as f64 * 100.0).clamp(0.0, 100.0);
-        let words = format!(
-            "Context {}% \u{b7} {}k of {}k tokens",
-            share.round(),
-            used / 1_000,
-            window / 1_000
-        );
-        // The fill in words ("Context 34%"), no ring.
+        let detail = self.bound_detail().ok()?;
+        let harness = crate::picker::harness_label(&detail.harness);
+        let (label, words) = match &detail.context {
+            Some(fill) => {
+                let age = fill.observed_at.map_or_else(String::new, |at| {
+                    format!(
+                        ", reported {} ago",
+                        monitor::elapsed_label(crate::handoff::now_ms().saturating_sub(at))
+                    )
+                });
+                match (fill.used, fill.window, fill.percent()) {
+                    (Some(used), Some(window), Some(share)) => (
+                        format!("Context {}%", share.round()),
+                        format!(
+                            "This {harness} session's context: {} of {} tokens{age}.",
+                            monitor::group(used),
+                            monitor::group(window)
+                        ),
+                    ),
+                    (Some(used), _, _) => (
+                        format!("Context {}k tokens", used / 1_000),
+                        format!(
+                            "This {harness} session's context: {} tokens{age}; {harness} does not report the window.",
+                            monitor::group(used)
+                        ),
+                    ),
+                    (None, window, _) => (
+                        "Context unavailable".to_owned(),
+                        format!(
+                            "{harness} reports {}not the tokens this session's context holds{age}.",
+                            window.map_or_else(String::new, |window| format!(
+                                "a {}-token window but ",
+                                monitor::group(window)
+                            ))
+                        ),
+                    ),
+                }
+            }
+            None => (
+                "Context unavailable".to_owned(),
+                format!("{harness} has not reported this session's context."),
+            ),
+        };
         Some(
             controls::bar_button(false)
                 .style(ButtonStyle::Subtle)
-                .automation_name(format!("{words} (open Details)"))
+                .automation_name(format!("{label}. {words} (open Details)"))
                 .on_click(
                     context.message(Message::Monitor(MonitorMsg::PanelChosen(Panel::Details))),
                 )
-                .content(controls::label(&format!("Context {}%", share.round())))
+                .content(controls::secondary(label))
                 .tooltip(words),
         )
     }
@@ -1248,17 +1283,19 @@ fn start_split(
 ) -> View {
     use super::menu_ui::{Action, Entry};
     let ready = enabled && !draft_blank;
-    let items = vec![
+    // Queue it while the draft can start; Attach an existing session… is
+    // not in the desktop yet (disabled, the reason in its label).
+    let items = super::menu_ui::menu_items(&[
         if ready {
-            MenuItem::item(Action::QueueLaunch.label(), Action::QueueLaunch.label())
+            Entry::item(Action::QueueLaunch)
         } else {
-            MenuItem::disabled(Action::QueueLaunch.label(), Action::QueueLaunch.label())
+            Entry::unavailable(Action::QueueLaunch, "write the task first")
         },
-        MenuItem::disabled(Action::AttachSession.label(), Action::AttachSession.label()),
-    ];
-    // The menu offers Queue it only (the other item is disabled).
-    let offered = [Entry::item(Action::QueueLaunch)];
-    debug_assert!(super::menu_ui::offers(&offered, Action::QueueLaunch));
+        Entry::unavailable(
+            Action::AttachSession,
+            "not in the desktop yet: swarm attach",
+        ),
+    ]);
     StackPanel::new()
         .orientation(Orientation::Horizontal)
         .spacing(tokens::spacing::XS)
@@ -1279,8 +1316,8 @@ fn start_split(
                 .menu(Menu::new(
                     items,
                     // Capture-free: one identity across renders.
-                    crate::views::menu_keys(context.callback(|label: String| {
-                        match super::menu_ui::Action::from_label(&label) {
+                    crate::views::menu_keys(context.callback(|key: String| {
+                        match super::menu_ui::Action::from_key(&key) {
                             Some(super::menu_ui::Action::QueueLaunch) => {
                                 Message::Launch(LaunchMsg::QueueDraft)
                             }

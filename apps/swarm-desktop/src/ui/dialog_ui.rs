@@ -11,7 +11,13 @@ pub(super) struct Focus {
     pub(super) epoch: u64,
     pub(super) close: ElementRef<Button>,
     pub(super) primary: ElementRef<Button>,
+    /// A form's first field, which takes the keyboard where Enter must not
+    /// choose for the owner (the Goal dialog).
+    pub(super) field: ElementRef<TextBox>,
 }
+
+/// The Goal dialog's kind ([`DesktopApp::dialog_kind`]).
+const GOAL: u8 = 10;
 
 pub(super) fn surface(
     context: &mut ViewContext<DesktopApp>,
@@ -76,6 +82,8 @@ impl DesktopApp {
             8
         } else if self.settings.daemon_confirm.is_some() {
             9
+        } else if self.goal.open.is_some() {
+            GOAL
         } else {
             0
         }
@@ -114,11 +122,16 @@ impl DesktopApp {
             return;
         }
         let later = context.sender();
-        let accepted = self.dialog.primary.request_focus_result(move |result| {
+        let fallback = move |result: Result<bool, FocusError>| {
             if !matches!(result, Ok(true)) {
                 let _ = later.send(Message::DialogFocusFallback(epoch, tries));
             }
-        });
+        };
+        let accepted = if self.dialog.kind == GOAL {
+            self.dialog.field.request_focus_result(fallback)
+        } else {
+            self.dialog.primary.request_focus_result(fallback)
+        };
         if !accepted {
             self.focus_dialog_close(epoch, tries, context);
         }
@@ -164,6 +177,19 @@ impl DesktopApp {
             7 => self.fresh_confirmed(false, context),
             8 => self.inbox_update(inbox_ui::InboxMsg::BulkConfirmed(false), context),
             9 => self.settings_update(SettingsMsg::DaemonConfirmed(false), context),
+            GOAL => {
+                let confirming = self
+                    .goal
+                    .open
+                    .as_ref()
+                    .is_some_and(|open| open.confirm_clear());
+                let msg = if confirming {
+                    goal_ui::GoalMsg::ClearAnswered(false)
+                } else {
+                    goal_ui::GoalMsg::Closed
+                };
+                self.goal_update(msg, context);
+            }
             _ => {}
         }
     }

@@ -412,7 +412,7 @@ impl DesktopApp {
         let open = self
             .launch
             .open
-            .filter(|pop| matches!(pop, launch_ui::Pop::Model | launch_ui::Pop::Manage))
+            .filter(|pop| *pop == launch_ui::Pop::Model)
             .filter(|_| {
                 self.launch
                     .preset_target()

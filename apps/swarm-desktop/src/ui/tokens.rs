@@ -221,6 +221,11 @@ pub mod layout {
     pub const SOURCE_MAX_HEIGHT: f64 = 420.0;
     /// The hand-off dialog: ContentDialog's maximum.
     pub const HANDOFF_DIALOG_WIDTH: f64 = 548.0;
+    /// The Goal dialog's card, and its goal field's height range: about
+    /// three lines to start with, scrolling past about eight.
+    pub const GOAL_DIALOG_WIDTH: f64 = 520.0;
+    pub const GOAL_TEXT_MIN_HEIGHT: f64 = 76.0;
+    pub const GOAL_TEXT_MAX_HEIGHT: f64 = 180.0;
     /// The hand-off dialog's scrolling body.
     pub const DIALOG_MAX_HEIGHT: f64 = 520.0;
     /// A dropdown inside the hand-off dialog.
@@ -252,8 +257,11 @@ pub mod layout {
     /// First window client size; the user resizes freely after.
     pub const WINDOW_WIDTH: f64 = 1440.0;
     pub const WINDOW_HEIGHT: f64 = 900.0;
-    /// The model picker above the composer.
-    pub const PICKER_WIDTH: f64 = 600.0;
+    /// The model picker above the composer. WinUI's default FlyoutPresenter
+    /// is at most `FlyoutThemeMaxWidth` (456) wide and scrolls sideways past
+    /// it; inside its `FlyoutContentPadding` (16 a side) and border (1, or
+    /// 2 in high contrast) 420 is left, so the picker never scrolls sideways.
+    pub const PICKER_WIDTH: f64 = 420.0;
     /// The composer's project chip trims a long project name past this
     /// width.
     pub const PROJECT_CHIP_WIDTH: f64 = 280.0;

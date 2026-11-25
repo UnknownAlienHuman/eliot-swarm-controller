@@ -26,6 +26,55 @@ pub const HARNESSES: [&str; 5] = ["codex", "claude", "opencode", "muse", "antigr
 /// `models.catalog` availability of a model under a provider hold.
 const HELD: &str = eliot_core::api::harness::CATALOG_HELD;
 
+/// Whether a model row can run now, as `models.catalog` knows it
+/// (`available`, `held`, `unknown`): a row is Ready only when the catalogue
+/// says so, never by default (brand book §8.3).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Availability {
+    Ready,
+    /// No quota or hold signal is known (or it is stale).
+    Unknown,
+    /// A provider hold covers the harness scope.
+    Held,
+    /// Not a model row (Auto, a preset).
+    NotModel,
+}
+
+impl Availability {
+    fn of(catalog: &str) -> Self {
+        match catalog {
+            eliot_core::api::harness::CATALOG_AVAILABLE => Self::Ready,
+            HELD => Self::Held,
+            _ => Self::Unknown,
+        }
+    }
+
+    /// A row the catalogue does not list (Claude's CLI default, a typed or
+    /// remembered id). `models.catalog` reads holds for every profile-less
+    /// row of a harness from one scope, that harness's ad-hoc profile
+    /// (`profile:<adhoc>`), which a profile-less launch also uses, so a
+    /// hold on any such row covers this one. Quota is per model: never
+    /// Ready.
+    fn unlisted(reply: Option<&ModelsCatalogResponse>, harness: &str) -> Self {
+        let held = reply.is_some_and(|reply| {
+            reply.models.iter().any(|model| {
+                model.harness == harness && model.profile.is_none() && model.availability == HELD
+            })
+        });
+        if held { Self::Held } else { Self::Unknown }
+    }
+
+    /// The row's own label for it.
+    pub fn label(self) -> Option<&'static str> {
+        match self {
+            Self::Ready => Some("Ready"),
+            Self::Unknown => Some("Quota unknown"),
+            Self::Held => Some("On hold"),
+            Self::NotModel => None,
+        }
+    }
+}
+
 /// A harness code in the owner's words.
 pub fn harness_label(code: &str) -> &str {
     match code {
@@ -238,6 +287,10 @@ pub struct Item {
     pub disabled: Option<String>,
     /// Hidden by Manage models (shown only because a search found it).
     pub hidden: bool,
+    /// The model's provider in the owner's words (empty for Auto and a
+    /// preset).
+    pub provider: String,
+    pub availability: Availability,
 }
 
 impl Item {
@@ -389,6 +442,8 @@ pub fn rows(inputs: &Inputs) -> Vec<Row> {
             favorite: false,
             disabled: None,
             hidden: false,
+            provider: String::new(),
+            availability: Availability::NotModel,
         }));
     }
 
@@ -472,6 +527,8 @@ pub fn rows(inputs: &Inputs) -> Vec<Row> {
                     .unwrap_or_else(|| "cannot start now".to_owned())
             }),
             hidden: false,
+            provider: String::new(),
+            availability: Availability::NotModel,
         })
         .collect();
     if !presets.is_empty() {
@@ -484,6 +541,16 @@ pub fn rows(inputs: &Inputs) -> Vec<Row> {
             "no-match",
             &format!("No models match “{query}”. Clear the search to see every model."),
         ));
+    }
+    // A stale catalogue's quota signal is stale too: never Ready.
+    if reply.is_some_and(|reply| reply.stale) {
+        for row in &mut rows {
+            if let Row::Choice(item) = row
+                && item.availability == Availability::Ready
+            {
+                item.availability = Availability::Unknown;
+            }
+        }
     }
     rows
 }
@@ -671,6 +738,7 @@ fn claude_rows(
         item.hidden = !visible(inputs, model);
         rows.push(Row::Choice(item));
     }
+    let unlisted = Availability::unlisted(Some(reply), code);
     let item = |key: String, model: Option<String>, title: String, detail: String| {
         let effort = row_effort(inputs, &key, code, model.as_deref(), None, None);
         Item {
@@ -691,11 +759,16 @@ fn claude_rows(
             default: false,
             disabled: None,
             hidden: false,
+            provider: provider_label("anthropic"),
+            availability: unlisted,
         }
     };
     if named {
+        // Not `claude:<id>`: a catalogue may list a model whose id is
+        // `default`, and two rows must never share a key (the highlight,
+        // the row's effort and its native element follow the key).
         rows.push(Row::Choice(item(
-            "claude:default".to_owned(),
+            "claude::cli-default".to_owned(),
             None,
             "Default model".to_owned(),
             "the Claude Code CLI picks".to_owned(),
@@ -703,7 +776,7 @@ fn claude_rows(
     }
     if let Some(typed) = typed {
         rows.push(Row::Choice(item(
-            format!("claude:typed:{typed}"),
+            format!("claude::typed:{typed}"),
             Some(typed.to_owned()),
             typed.to_owned(),
             "use this model id".to_owned(),
@@ -782,6 +855,11 @@ fn remembered_item(
                 default: false,
                 disabled: None,
                 hidden: false,
+                provider: provider_label(&eliot_core::api::catalog_provider(
+                    &known.harness,
+                    &known.model,
+                )),
+                availability: Availability::unlisted(reply, &known.harness),
             }
         }
     };
@@ -857,6 +935,8 @@ fn catalog_item(
         disabled: (model.availability == HELD)
             .then(|| "on hold: provider limit or outage".to_owned()),
         hidden: false,
+        provider: provider_label(&model.provider),
+        availability: Availability::of(&model.availability),
         key,
     }
 }

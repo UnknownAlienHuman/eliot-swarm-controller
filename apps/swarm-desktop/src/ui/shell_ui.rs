@@ -2497,6 +2497,8 @@ impl DesktopApp {
             self.inbox_confirmation(context)
         } else if self.settings.daemon_confirm.is_some() {
             Some(self.daemon_confirmation(context))
+        } else if let Some(dialog) = self.goal_dialog(context) {
+            Some(dialog)
         } else {
             Some(self.task_dialog(context))
         };

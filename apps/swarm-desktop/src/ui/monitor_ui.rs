@@ -1359,26 +1359,11 @@ impl DesktopApp {
             None => goal_rows.push(KeyedView::new("reading", controls::secondary("Reading…"))),
             Some(None) => {
                 goal_rows.push(KeyedView::new("none", controls::secondary("No goal.")));
-                goal_rows.push(KeyedView::new(
-                    "set",
-                    Border::new()
-                        .horizontal_alignment(HorizontalAlignment::Left)
-                        .content(
-                            controls::text_button()
-                                .is_enabled(false)
-                                .automation_name(
-                                    "Set goal: setting a goal is not in the desktop yet",
-                                )
-                                .content(controls::label("Set goal…")),
-                        )
-                        .tooltip(
-                            "Setting a goal is not in the desktop yet: swarm goal set does it",
-                        ),
-                ));
+                goal_rows.push(self.goal_action(&id, false, context));
             }
             Some(Some(goal)) => {
                 goal_rows.extend(goal_lines(goal, now));
-                goal_rows.extend(self.goal_actions(goal, context));
+                goal_rows.push(self.goal_action(&id, true, context));
             }
         }
         items.push(KeyedView::new(
@@ -1615,20 +1600,34 @@ impl DesktopApp {
         // Context: the fill and the session's tokens, then what Swarm
         // loads (project instructions and the owner rules' delivery).
         let mut context_rows: Vec<KeyedView> = Vec::new();
-        if let Some((used, window)) = detail.and_then(|detail| detail.context) {
-            let percent = 100.0 * used as f64 / window as f64;
+        if let Some(fill) = detail.and_then(|detail| detail.context.as_ref()) {
             context_rows.push(KeyedView::new(
                 "used",
                 page_ui::kv_text(
                     "Used",
-                    format!(
-                        "{} of {} tokens",
-                        monitor::group(used),
-                        monitor::group(window)
-                    ),
+                    match (fill.used, fill.window) {
+                        (Some(used), Some(window)) => format!(
+                            "{} of {} tokens",
+                            monitor::group(used),
+                            monitor::group(window)
+                        ),
+                        (Some(used), None) => {
+                            format!("{} tokens (window not reported)", monitor::group(used))
+                        }
+                        (None, window) => format!(
+                            "not reported{}",
+                            window.map_or_else(String::new, |window| format!(
+                                " (window {} tokens)",
+                                monitor::group(window)
+                            ))
+                        ),
+                    },
                 ),
             ));
-            context_rows.push(KeyedView::new("meter", controls::meter(percent, false)));
+            // A meter only against a known window.
+            if let Some(percent) = fill.percent() {
+                context_rows.push(KeyedView::new("meter", controls::meter(percent, false)));
+            }
         }
         let usage = match read {
             Some(read) => monitor_view::usage_lines(read),

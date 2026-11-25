@@ -40,8 +40,6 @@ pub(super) enum Pop {
     /// The model picker: a new task's, a preset's, or the open Agent's
     /// (its own route's models, applied through `configure`).
     Model,
-    /// The picker's Manage models panel (OpenCode's).
-    Manage,
     Access,
     Project,
     /// The open Agent's effort steps and the way into its model picker
@@ -112,10 +110,8 @@ pub(super) enum LaunchMsg {
     ProjectQuery(String),
     /// A project row (its checkout) or [`OTHER_FOLDER`].
     ProjectChosen(String),
-    /// The picker's sliders button: open Manage models.
+    /// The picker's Manage models: Settings › Models (§8.3).
     ManageOpened,
-    /// Manage models' back arrow: the picker again.
-    ManageClosed,
     /// Manage models' search field.
     ManageQuery(String),
     /// One model's toggle in Manage models.
@@ -422,12 +418,21 @@ impl DesktopApp {
                     eliot::profile_vocabulary::CLAUDE_EFFORT_LEVELS
                 },
             });
-            if preview.is_some() {
-                for row in &mut rows {
-                    if let Row::Choice(item) = row {
+            // The Agent's account or profile under a hold: every row says
+            // so (its next turn waits for the provider).
+            let held = detail
+                .provider_hold
+                .as_ref()
+                .is_some_and(|hold| hold.state == eliot_core::ProviderHoldState::Held);
+            for row in &mut rows {
+                if let Row::Choice(item) = row {
+                    if preview.is_some() {
                         item.disabled.get_or_insert_with(|| {
                             "Checking which models this task can use…".to_owned()
                         });
+                    }
+                    if held {
+                        item.availability = picker::Availability::Held;
                     }
                 }
             }
@@ -769,20 +774,13 @@ impl DesktopApp {
                 }
             }
             LaunchMsg::ManageOpened => {
-                // The same flyout, its content switched in place.
-                self.launch.open = Some(Pop::Manage);
+                // Manage models is a Settings page (brand book §8.3): the
+                // picker closes and Settings › Models lists which models
+                // the picker shows.
+                self.close_popover();
                 self.launch.manage_query.clear();
-                crate::shortcuts::set_popover(HookPopover::Panel);
                 self.load_catalog(context);
-                self.request_show(context);
-                self.post_focus_field(FIELD_FOCUS_TRIES, 0, context);
-            }
-            LaunchMsg::ManageClosed => {
-                self.launch.open = Some(Pop::Model);
-                self.launch.highlight = picker::initial(&self.picker_rows());
-                crate::shortcuts::set_popover(HookPopover::Picker);
-                self.request_show(context);
-                self.post_focus_field(FIELD_FOCUS_TRIES, 0, context);
+                self.shell_update(ShellMsg::SettingsPage(Page::Models), context);
             }
             LaunchMsg::ManageQuery(text) => self.launch.manage_query = text,
             LaunchMsg::ManageModel {
@@ -998,7 +996,6 @@ impl DesktopApp {
                 self.post_focus_field(FIELD_FOCUS_TRIES, 0, context);
                 self.reveal(context);
             }
-            Pop::Manage => self.launch_update(LaunchMsg::ManageOpened, context),
             Pop::Access => {
                 self.launch.access_highlight = Some(self.launch.access());
                 crate::shortcuts::set_popover(HookPopover::List);
@@ -1148,10 +1145,6 @@ impl DesktopApp {
             return;
         };
         match key {
-            PopoverKey::Escape if pop == Pop::Manage => {
-                self.launch_update(LaunchMsg::ManageClosed, context);
-                return;
-            }
             // Tab returns the keyboard to the composer: the popover would
             // otherwise keep taking its Enter.
             PopoverKey::Escape | PopoverKey::Tab => {
@@ -1161,7 +1154,7 @@ impl DesktopApp {
             _ => {}
         }
         match pop {
-            Pop::Manage | Pop::Usage | Pop::Quotas => {}
+            Pop::Usage | Pop::Quotas => {}
             Pop::Effort => {
                 let efforts = self.agent_efforts();
                 let at = self
@@ -1306,10 +1299,7 @@ impl DesktopApp {
     /// Focus the open popover's search field; a refused or unbound focus
     /// is tried again, `tries` times in all.
     fn focus_field(&mut self, tries: u8, context: &ComponentContext<Self>) {
-        if !matches!(
-            self.launch.open,
-            Some(Pop::Model | Pop::Manage | Pop::Project)
-        ) {
+        if !matches!(self.launch.open, Some(Pop::Model | Pop::Project)) {
             return;
         }
         let Some(left) = tries.checked_sub(1) else {
@@ -1367,7 +1357,7 @@ impl DesktopApp {
     }
 
     fn unified_catalog_picker_visible(&self) -> bool {
-        matches!(self.launch.open, Some(Pop::Model | Pop::Manage))
+        matches!(self.launch.open, Some(Pop::Model))
             && (self.main == Main::Conversation && self.selected_agent_id().is_none()
                 || self.main == Main::Settings && self.launch.preset.is_some())
     }
@@ -1998,11 +1988,11 @@ impl LaunchOutcome {
     }
 }
 
-/// The chip a popover opens from: the model picker, Manage models and the
-/// open Agent's effort popover share the model chip.
+/// The chip a popover opens from: the model picker and the open Agent's
+/// effort popover share the model chip.
 fn chip_of(pop: Pop) -> u8 {
     match pop {
-        Pop::Model | Pop::Manage | Pop::Effort => 0,
+        Pop::Model | Pop::Effort => 0,
         Pop::Access => 1,
         Pop::Project => 2,
         Pop::Usage => 3,

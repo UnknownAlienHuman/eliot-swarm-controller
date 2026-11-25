@@ -1,9 +1,11 @@
-//! The sidebar's right-click menus (owner review 2026-11-16): a project's
-//! or subproject's New task here, Open folder, Rename, Collapse or Expand,
-//! Archive finished tasks, Delete stopped tasks and Remove from Swarm (k142,
-//! through [`super::bulk_ui`]); a chat's or task's Rename, Stop (while it is live, idle
-//! included), Move under another task (k113, [`super::move_ui`]), Resume
-//! (a lost one), Archive or Unarchive, Delete, Copy Agent ID and Open folder.
+//! The sidebar's right-click menus (owner review 2026-11-16, brand book
+//! §7.4): a project's or subproject's New task here; Open folder, Rename,
+//! Collapse or Expand; Archive finished tasks and Delete stopped tasks; and
+//! Remove from Swarm (k142, through [`super::bulk_ui`]). A chat's or task's
+//! Open, Rename and Tags; Attach or Detach; Hand off or switch model and
+//! Goal; Move under another task (k113, [`super::move_ui`]); Archive or
+//! Unarchive; Resume, Stop Agent and Force stop; Delete; Copy Agent ID and
+//! Open folder. The conversation header's "…" is the same task menu.
 //!
 //! Delete follows the Store's rule (`docs/spec/core.md`, explicit Agent
 //! tree removal): only a stopped or failed tree, once drained. Its
@@ -24,11 +26,13 @@
 //! (arrows, Enter, Esc), light dismiss and placement. Reactor's `MenuItem`
 //! is text only: before the menu opens, `crate::flyout` gives each native
 //! item its glyph and the menu its accessible name. Every item, here and in
-//! the conversation header's "…", is a typed [`Action`] with one fixed label; Reactor reports a chosen
-//! item only by that label, the labels are proven distinct at compile time,
-//! and the label maps back to its action, which runs only if the opened
-//! menu offered it. No project or task name is ever an item (the tags item
-//! only shows the current tags). More is a submenu. "Attach to project…"
+//! the conversation header's "…", is a typed [`Action`] keyed by its stable
+//! key; Reactor reports a chosen item by that key, the keys are proven
+//! distinct at compile time, and the key maps back to its action, which
+//! runs only if the opened menu offered it enabled. The task and project
+//! menus follow the brand book's groups (§7.4): an often-needed action
+//! that cannot run now stays, disabled with a short reason; a feature the
+//! desktop does not have is not shown. "Attach to project…"
 //! opens its own chooser, a WinUI `Flyout` at the row ([`DesktopApp::attach_anchor`]) whose rows are keyed
 //! by the project's id and checkout, never by its name. All modal
 //! confirmations use the common body/footer and native focus host in
@@ -80,20 +84,20 @@ impl Target {
     }
 }
 
-/// Declares [`Action`] from one list, so every action has exactly one label,
-/// and glyph, and [`Action::ALL`] lists every variant.
+/// Declares [`Action`] from one list, so every action has exactly one
+/// stable key, label and glyph, and [`Action::ALL`] lists every variant.
 macro_rules! actions {
-    ($($(#[$doc:meta])* $variant:ident => ($label:expr, $glyph:expr),)*) => {
+    ($($(#[$doc:meta])* $variant:ident => ($key:expr, $label:expr, $glyph:expr),)*) => {
         /// One menu command of a row menu or the conversation header's "…".
         ///
-        /// Reactor 0.100.0's `Menu` reports a chosen item only by its label
-        /// (its `on_click` is a `Callback<String>`; each native
-        /// `MenuFlyoutItem.Click` enqueues the item's label, never its key),
-        /// so the label is the only payload a menu can carry. Each action
-        /// owns one fixed label, the labels are proven distinct at compile
-        /// time (the assertion below), menus are built from actions and a
-        /// chosen label maps back through [`Action::from_label`]: no label
-        /// can stand for two actions, in any build.
+        /// Reactor 0.101's `Menu` reports a chosen item by its `MenuItem`
+        /// key (`Callback<Key>`), so every item carries its action's stable
+        /// key and [`Action::from_key`] maps the reported key back; the
+        /// visible text is never a payload. The text can then say what the
+        /// item does in this state (Tags lists the current tags, an
+        /// unavailable item gives its reason) without changing what a click
+        /// runs. Keys are proven distinct at compile time (the assertion
+        /// below), so no key can stand for two actions, in any build.
         #[derive(Clone, Copy, Debug, PartialEq, Eq)]
         pub(super) enum Action {
             $($(#[$doc])* $variant,)*
@@ -103,7 +107,14 @@ macro_rules! actions {
             /// Every action, in declaration order.
             pub(super) const ALL: &'static [Action] = &[$(Action::$variant,)*];
 
-            /// The text a menu shows for it and Reactor reports back.
+            /// The stable key its menu item carries and Reactor reports.
+            pub(super) const fn key(self) -> &'static str {
+                match self {
+                    $(Action::$variant => $key,)*
+                }
+            }
+
+            /// The text a menu shows for it.
             pub(super) const fn label(self) -> &'static str {
                 match self {
                     $(Action::$variant => $label,)*
@@ -121,62 +132,63 @@ macro_rules! actions {
 }
 
 actions! {
-    NewTaskHere => ("New task here", controls::glyph::NEW_TASK),
-    OpenFolder => ("Open folder", controls::glyph::OPEN_FOLDER),
-    Rename => ("Rename", controls::glyph::RENAME),
+    /// Open the task's conversation.
+    Open => ("open", "Open", controls::glyph::CHAT),
+    NewTaskHere => ("new-task-here", "New task here", controls::glyph::NEW_TASK),
+    OpenFolder => ("open-folder", "Open folder", controls::glyph::OPEN_FOLDER),
+    Rename => ("rename", "Rename", controls::glyph::RENAME),
     /// Expand a collapsed project.
-    Expand => ("Expand", controls::glyph::CHEVRON_DOWN),
+    Expand => ("expand", "Expand", controls::glyph::CHEVRON_DOWN),
     /// Collapse a project.
-    Collapse => ("Collapse", controls::glyph::CHEVRON_RIGHT),
+    Collapse => ("collapse", "Collapse", controls::glyph::CHEVRON_RIGHT),
     /// Archive every finished task of the project or subproject.
-    ArchiveFinished => ("Archive finished tasks…", controls::glyph::ARCHIVE),
+    ArchiveFinished => ("archive-finished", "Archive finished tasks…", controls::glyph::ARCHIVE),
     /// Delete every stopped task of the project or subproject.
-    DeleteStopped => ("Delete stopped tasks…", controls::glyph::DELETE),
-    RemoveProject => ("Remove from Swarm…", controls::glyph::DELETE),
+    DeleteStopped => ("delete-stopped", "Delete stopped tasks…", controls::glyph::DELETE),
+    RemoveProject => ("remove-project", "Remove from Swarm…", controls::glyph::DELETE),
     /// The Projects label's "…": archive every finished task.
-    ArchiveAllFinished => ("Archive all finished tasks…", controls::glyph::ARCHIVE),
-    /// The Projects label's "…": delete every stopped task.
-    DeleteAllStopped => ("Delete all stopped tasks…", controls::glyph::DELETE),
-    /// The Projects label's "…": remove the projects no task uses.
-    RemoveUnused => ("Remove unused projects…", controls::glyph::DELETE),
-    /// "Move under another task…": open the picker.
-    MoveUnder => ("Move under another task…", controls::glyph::MOVE),
-    /// "Attach to project…": open the project chooser at the row.
-    AttachMenu => ("Attach to project…", controls::glyph::FOLDER),
-    /// Return the chat to the no-project bucket.
-    Detach => ("Detach from project", controls::glyph::FOLDER),
-    /// Edit the Agent's tags inline (the item shows the current tags).
-    EditTags => ("Tags…", controls::glyph::TAG),
-    Archive => ("Archive", controls::glyph::ARCHIVE),
-    Unarchive => ("Unarchive", controls::glyph::ARCHIVE),
-    /// Resume an ended task in its conversation.
-    Resume => ("Resume", controls::glyph::RESUME),
-    /// Stop the Agent itself (it asks first: the Agent's work ends).
-    Stop => ("Stop Agent…", controls::glyph::STOP),
-    /// The More submenu (never chosen itself).
-    More => ("More", controls::glyph::MORE),
-    Delete => ("Delete…", controls::glyph::DELETE),
-    CopyId => ("Copy Agent ID", controls::glyph::COPY),
-    /// The conversation header's Copy branch name.
-    CopyBranch => ("Copy branch name", controls::glyph::COPY),
-    /// The conversation header's Agent details.
-    Details => ("Agent details", controls::glyph::INFO),
-    /// The conversation header's handoff or switch.
-    Handoff => ("Hand off or switch model…", controls::glyph::FORWARD),
-    /// Detach Eliot's observer from an observed Agent (header only).
-    DetachObserver => ("Detach", controls::glyph::EXTERNAL),
-    /// The conversation header's Force stop (it asks first).
-    ForceStop => ("Force stop…", controls::glyph::STOP),
-    /// Details › Goal's Clear (it asks first: the goal ends).
-    ClearGoal => ("Clear goal…", controls::glyph::GOAL),
-    /// Home's Start task menu: queue the task (`launch.enqueue`).
-    QueueLaunch => ("Queue it", controls::glyph::SCHEDULE),
-    /// Home's Start task menu: attach a running native session, which the
-    /// desktop does not have yet (shown disabled, the reason in its label).
-    AttachSession => (
-        "Attach an existing session… (not in the desktop yet: swarm attach)",
-        controls::glyph::EXTERNAL
+    ArchiveAllFinished => (
+        "archive-all-finished",
+        "Archive all finished tasks…",
+        controls::glyph::ARCHIVE
     ),
+    /// The Projects label's "…": delete every stopped task.
+    DeleteAllStopped => ("delete-all-stopped", "Delete all stopped tasks…", controls::glyph::DELETE),
+    /// The Projects label's "…": remove the projects no task uses.
+    RemoveUnused => ("remove-unused", "Remove unused projects…", controls::glyph::DELETE),
+    /// "Move under another task…": open the picker.
+    MoveUnder => ("move-under", "Move under another task…", controls::glyph::MOVE),
+    /// "Attach to project…": open the project chooser at the row.
+    AttachMenu => ("attach", "Attach to project…", controls::glyph::FOLDER),
+    /// Return the chat to the no-project bucket.
+    Detach => ("detach", "Detach from project", controls::glyph::FOLDER),
+    /// Edit the Agent's tags inline (the item shows the current tags).
+    EditTags => ("tags", "Tags…", controls::glyph::TAG),
+    /// Hand the task off, or switch its model (`swarm.handoff`/`swarm.switch`).
+    Handoff => ("handoff", "Hand off or switch model…", controls::glyph::FORWARD),
+    /// Set, edit, pause, resume or clear the task's Goal (one dialog).
+    Goal => ("goal", "Goal…", controls::glyph::GOAL),
+    Archive => ("archive", "Archive", controls::glyph::ARCHIVE),
+    Unarchive => ("unarchive", "Unarchive", controls::glyph::ARCHIVE),
+    /// Resume an ended task in its conversation.
+    Resume => ("resume", "Resume", controls::glyph::RESUME),
+    /// Stop the Agent itself (it asks first: the Agent's work ends).
+    Stop => ("stop", "Stop Agent…", controls::glyph::STOP),
+    /// Force stop (it asks first).
+    ForceStop => ("force-stop", "Force stop…", controls::glyph::STOP),
+    Delete => ("delete", "Delete…", controls::glyph::DELETE),
+    CopyId => ("copy-id", "Copy Agent ID", controls::glyph::COPY),
+    /// The conversation header's Copy branch name.
+    CopyBranch => ("copy-branch", "Copy branch name", controls::glyph::COPY),
+    /// The conversation header's Agent details.
+    Details => ("details", "Agent details", controls::glyph::INFO),
+    /// Detach Eliot's observer from an observed Agent (header only).
+    DetachObserver => ("detach-observer", "Detach", controls::glyph::EXTERNAL),
+    /// Home's Start task menu: queue the task (`launch.enqueue`).
+    QueueLaunch => ("queue-launch", "Queue it", controls::glyph::SCHEDULE),
+    /// Home's Start task menu: attach a running native session, which the
+    /// desktop does not have yet (shown disabled with the reason).
+    AttachSession => ("attach-session", "Attach an existing session…", controls::glyph::EXTERNAL),
 }
 
 /// Whether `a` and `b` hold the same text, in a constant context.
@@ -195,14 +207,18 @@ const fn same_text(a: &str, b: &str) -> bool {
     true
 }
 
-// Compile time: no two actions share a label, so a reported label names
-// exactly one action.
+// Compile time: no two actions share a key (a reported key names exactly
+// one action) or a label (a native item's glyph is matched by its text).
 const _: () = {
     let all = Action::ALL;
     let mut first = 0;
     while first < all.len() {
         let mut second = first + 1;
         while second < all.len() {
+            assert!(
+                !same_text(all[first].key(), all[second].key()),
+                "two menu actions share a key"
+            );
             assert!(
                 !same_text(all[first].label(), all[second].label()),
                 "two menu actions share a label"
@@ -214,93 +230,128 @@ const _: () = {
 };
 
 impl Action {
-    /// The action whose label Reactor reported, by an exhaustive search of
+    /// The action whose key Reactor reported, by an exhaustive search of
     /// [`Action::ALL`].
-    pub(super) fn from_label(label: &str) -> Option<Self> {
-        Self::ALL
-            .iter()
-            .copied()
-            .find(|action| action.label() == label)
+    pub(super) fn from_key(key: &str) -> Option<Self> {
+        Self::ALL.iter().copied().find(|action| action.key() == key)
     }
 }
 
-/// One item of a row menu: a command, or a submenu of commands.
+/// One item of a row menu: a command, or the line between two groups.
 #[derive(Clone, Debug, PartialEq)]
 pub(super) enum Entry {
     Item {
         action: Action,
         /// What the item shows in place of its label (Tags lists the
-        /// current tags); display only: the native item's text is replaced
-        /// as the menu opens, and a choice still reports the label.
-        display: Option<String>,
+        /// current tags); its key stays the action's.
+        text: Option<String>,
+        /// Why an often-needed action cannot run now: the item is shown
+        /// disabled with this short reason.
+        unavailable: Option<&'static str>,
     },
-    Submenu {
-        action: Action,
-        items: Vec<Entry>,
-    },
+    Separator,
 }
 
 impl Entry {
     pub(super) fn item(action: Action) -> Self {
         Self::Item {
             action,
-            display: None,
+            text: None,
+            unavailable: None,
         }
     }
 
-    pub(super) fn action(&self) -> Action {
-        match self {
-            Self::Item { action, .. } | Self::Submenu { action, .. } => *action,
+    /// An often-needed action that cannot run now, disabled with `why`.
+    pub(super) fn unavailable(action: Action, why: &'static str) -> Self {
+        Self::Item {
+            action,
+            text: None,
+            unavailable: Some(why),
         }
     }
+
+    /// The action of a command that can run now.
+    pub(super) fn offered(&self) -> Option<Action> {
+        match self {
+            Self::Item {
+                action,
+                unavailable: None,
+                ..
+            } => Some(*action),
+            _ => None,
+        }
+    }
+
+    /// The text its native item shows.
+    fn shown(&self) -> Option<String> {
+        let Self::Item {
+            action,
+            text,
+            unavailable,
+        } = self
+        else {
+            return None;
+        };
+        let text = text.as_deref().unwrap_or(action.label());
+        Some(match unavailable {
+            Some(why) => format!("{text} ({why})"),
+            None => text.to_owned(),
+        })
+    }
+}
+
+/// `groups` in order, one separator between two non-empty groups.
+pub(super) fn grouped(groups: impl IntoIterator<Item = Vec<Entry>>) -> Vec<Entry> {
+    let mut entries = Vec::new();
+    for group in groups.into_iter().filter(|group| !group.is_empty()) {
+        if !entries.is_empty() {
+            entries.push(Entry::Separator);
+        }
+        entries.extend(group);
+    }
+    entries
 }
 
 /// The automation id prefix of a sidebar row's "…" button, followed by the
 /// row's key (`agent:<id>`, `project:<key>`); its menu opens under it.
 pub(super) const MORE_ID_PREFIX: &str = "eliot-more:";
 
-/// Reactor's menu items for `entries`, each keyed and labelled by its
-/// action's label.
+/// Reactor's menu items for `entries`: each command keyed by its action's
+/// stable key, an unavailable one disabled, each separator keyed by its
+/// place.
 pub(super) fn menu_items(entries: &[Entry]) -> Vec<MenuItem> {
     entries
         .iter()
-        .map(|entry| {
-            let label = entry.action().label();
-            match entry {
-                Entry::Item { .. } => MenuItem::item(label, label),
-                Entry::Submenu { items, .. } => MenuItem::submenu(label, label, menu_items(items)),
+        .enumerate()
+        .map(|(index, entry)| match (entry, entry.shown()) {
+            (Entry::Item { action, .. }, Some(text)) if entry.offered().is_some() => {
+                MenuItem::item(action.key(), text)
             }
+            (Entry::Item { action, .. }, Some(text)) => MenuItem::disabled(action.key(), text),
+            _ => MenuItem::separator(format!("group-{index}")),
         })
         .collect()
 }
 
-/// Whether the menu `entries` offers `action`, at any depth: a choice runs
-/// only in the menu that offered it.
+/// Whether the menu `entries` offers `action` enabled: a choice runs only
+/// in the menu that offered it.
 pub(super) fn offers(entries: &[Entry], action: Action) -> bool {
-    entries.iter().any(|entry| match entry {
-        Entry::Item { action: item, .. } => *item == action,
-        Entry::Submenu { items, .. } => offers(items, action),
-    })
+    entries.iter().any(|entry| entry.offered() == Some(action))
 }
 
-/// How each command of `entries` looks natively: its glyph and display
-/// text, by label (`crate::flyout::MenuDress`).
-fn entry_looks(entries: &[Entry], looks: &mut Vec<crate::flyout::MenuLook>) {
-    for entry in entries {
-        let action = entry.action();
-        let display = match entry {
-            Entry::Item { display, .. } => display.clone(),
-            Entry::Submenu { items, .. } => {
-                entry_looks(items, looks);
-                None
-            }
-        };
-        looks.push(crate::flyout::MenuLook {
-            label: action.label(),
-            display,
-            glyph: action.glyph(),
-        });
-    }
+/// How each command of `entries` looks natively: its glyph, by the text it
+/// shows (`crate::flyout::MenuDress`).
+fn entry_looks(entries: &[Entry]) -> Vec<crate::flyout::MenuLook> {
+    entries
+        .iter()
+        .filter_map(|entry| match entry {
+            Entry::Item { action, .. } => Some(crate::flyout::MenuLook {
+                text: entry.shown()?,
+                glyph: action.glyph(),
+            }),
+            Entry::Separator => None,
+        })
+        .collect()
 }
 
 #[derive(Clone, Debug)]
@@ -315,8 +366,8 @@ pub(super) enum MenuMsg {
     /// Show the menu or attach chooser asked for with this epoch once its
     /// render committed (tries left).
     Show(u64, u8),
-    /// A menu item was chosen (mapped from the label Reactor reports by
-    /// [`Action::from_label`]).
+    /// A menu item was chosen (mapped from the key Reactor reports by
+    /// [`Action::from_key`]).
     Picked(Action),
     /// A row of the attach chooser was chosen: the project's id and
     /// checkout.
@@ -491,8 +542,7 @@ impl DesktopApp {
                 let shown = if self.renders.get() <= self.menu.show_after {
                     Err("its render has not committed".to_owned())
                 } else {
-                    let mut items = Vec::new();
-                    entry_looks(&open.entries, &mut items);
+                    let items = entry_looks(&open.entries);
                     let name = format!("Actions for {}", open.target.title());
                     let dress = crate::flyout::MenuDress {
                         name: &name,
@@ -943,6 +993,24 @@ impl DesktopApp {
             (Action::Stop, Target::Agent(agent)) if !agent.native_child => {
                 self.menu.confirm = Some((target, action));
             }
+            (Action::ForceStop, Target::Agent(agent)) if !agent.native_child => {
+                let bound = BoundAction::agent_control(&agent.id, agent.generation);
+                self.chat.confirm_force = Some((bound, self.agent_label(agent)));
+            }
+            (Action::Open, Target::Agent(agent)) => {
+                self.shell_update(ShellMsg::AgentOpened(agent.clone()), context);
+            }
+            (Action::Handoff, Target::Agent(agent)) => self.handoff_update(
+                handoff_ui::HandoffMsg::Open {
+                    agent: agent.id.clone(),
+                    generation: agent.generation,
+                },
+                context,
+            ),
+            (Action::Goal, Target::Agent(agent)) => {
+                let agent = agent.id.clone();
+                self.goal_update(super::goal_ui::GoalMsg::Open(agent), context);
+            }
             (Action::Archive | Action::Unarchive, Target::Agent(agent)) => {
                 self.submit_archive(agent.clone(), action == Action::Archive, false, context);
             }
@@ -997,10 +1065,6 @@ impl DesktopApp {
     ) {
         if let (Action::Stop, Target::Agent(agent)) = (action, &target) {
             self.stop_agent(&agent.id, agent.generation, context);
-            return;
-        }
-        if let (Action::ClearGoal, Target::Agent(agent)) = (action, &target) {
-            self.goal_control(agent.id.clone(), client::GoalControl::Clear, context);
             return;
         }
         if let (Action::Delete, Target::Agent(agent)) = (action, target) {
@@ -1119,9 +1183,7 @@ impl DesktopApp {
         });
     }
 
-    /// The menu's entries for a target, in order: the destructive one last.
-    /// Every item is an [`Action`] with its fixed label (unique at compile
-    /// time); the tags item only shows the current tags.
+    /// The menu's entries for a target, in the brand book's groups (§7.4).
     pub(super) fn menu_entries(&self, target: &Target) -> Vec<Entry> {
         match target {
             Target::Project {
@@ -1130,99 +1192,154 @@ impl DesktopApp {
                 checkout,
                 ..
             } => {
-                let mut entries = Vec::new();
-                if self.can_launch_here(checkout) {
-                    entries.push(Entry::item(Action::NewTaskHere));
-                }
-                entries.extend([
-                    Entry::item(Action::OpenFolder),
-                    Entry::item(Action::Rename),
-                    Entry::item(if *collapsed {
-                        Action::Expand
+                // New task here: a missing or unread folder says why.
+                let key = nav::path_key(checkout);
+                let new_task = self
+                    .checkouts()
+                    .into_iter()
+                    .find(|known| nav::path_key(&known.path) == key)
+                    .map(|known| {
+                        if known.missing {
+                            Entry::unavailable(Action::NewTaskHere, "folder missing")
+                        } else if known.paused() {
+                            Entry::unavailable(Action::NewTaskHere, "still reading it")
+                        } else {
+                            Entry::item(Action::NewTaskHere)
+                        }
+                    });
+                grouped([
+                    new_task.into_iter().collect(),
+                    vec![
+                        Entry::item(Action::OpenFolder),
+                        Entry::item(Action::Rename),
+                        Entry::item(if *collapsed {
+                            Action::Expand
+                        } else {
+                            Action::Collapse
+                        }),
+                    ],
+                    vec![
+                        Entry::item(Action::ArchiveFinished),
+                        Entry::item(Action::DeleteStopped),
+                    ],
+                    // Only a registered checkout can be forgotten.
+                    if self.registrations_in(checkouts).is_empty() {
+                        Vec::new()
                     } else {
-                        Action::Collapse
-                    }),
-                    Entry::item(Action::ArchiveFinished),
-                    Entry::item(Action::DeleteStopped),
-                ]);
-                // Only a registered checkout can be forgotten.
-                if !self.registrations_in(checkouts).is_empty() {
-                    entries.push(Entry::item(Action::RemoveProject));
-                }
-                entries
+                        vec![Entry::item(Action::RemoveProject)]
+                    },
+                ])
             }
             Target::Tags(_) => Vec::new(),
-            Target::Agent(agent) => {
-                let mut entries = vec![Entry::item(Action::Rename)];
-                if !agent.native_child {
-                    entries.push(Entry::item(Action::MoveUnder));
-                }
-                // Placement and tags (`chat.attach`/`chat.detach`/`chat.tag`):
-                // attach and detach place chats; tags group any task. The
-                // projects are rows of the attach chooser, never items here.
-                if agent.chat
-                    && !agent.pending
-                    && self.nav.organization.registered().next().is_some()
-                {
-                    entries.push(Entry::item(Action::AttachMenu));
-                }
-                if agent.chat && agent.organization.is_some() {
-                    entries.push(Entry::item(Action::Detach));
-                }
-                if !agent.native_child && !agent.pending {
-                    entries.push(Entry::Item {
-                        action: Action::EditTags,
-                        display: (!agent.tags.is_empty())
-                            .then(|| format!("Tags: {}…", agent.tags.join(", "))),
-                    });
-                }
-                if !agent.native_child {
-                    entries.push(Entry::item(if agent.archived {
-                        Action::Unarchive
-                    } else {
-                        Action::Archive
-                    }));
-                }
-                // A lost task cannot be deleted (the Store keeps it):
-                // resume it, or archive it to hide it.
-                if matches!(
-                    agent.state,
-                    eliot_core::AgentState::Lost
-                        | eliot_core::AgentState::Stopped
-                        | eliot_core::AgentState::Failed
-                ) && !agent.native_child
-                {
-                    entries.push(Entry::item(Action::Resume));
-                }
-                if agent.live() && !agent.native_child {
-                    entries.push(Entry::item(Action::Stop));
-                }
-                entries.push(Entry::Submenu {
-                    action: Action::More,
-                    items: self.developer_entries(target),
-                });
-                // The destructive action ends the menu.
-                if !agent.native_child && agent.deletable() {
-                    entries.push(Entry::item(Action::Delete));
-                }
-                entries
-            }
+            Target::Agent(agent) => self.task_entries(agent, None),
         }
     }
 
-    /// The developer commands of a task (its menu's More): Copy Agent ID
-    /// and Open folder.
-    pub(super) fn developer_entries(&self, target: &Target) -> Vec<Entry> {
-        let Target::Agent(agent) = target else {
-            return Vec::new();
+    /// A task's menu (§7.4), the sidebar row's and the conversation
+    /// header's alike: Open, Rename, Tags; Attach or Detach; Hand off or
+    /// switch model, Goal; Move under another task; Archive or Unarchive;
+    /// Resume, Stop Agent, Force stop; Delete; Copy Agent ID, Open folder.
+    /// `header` is the open conversation's readback (its menu has no Open
+    /// and adds Copy branch name and an observer's Detach). An observed
+    /// native child offers only what applies to it; an action that settles
+    /// while another is in flight says it waits.
+    pub(super) fn task_entries(&self, agent: &UiAgent, header: Option<&UiDetail>) -> Vec<Entry> {
+        const WAITING: &str = "waiting for the last action";
+        let observed = agent.native_child;
+        let busy = self.submitting();
+        let ended = !agent.live();
+        let mut open = Vec::new();
+        if header.is_none() {
+            open.push(Entry::item(Action::Open));
+        }
+        open.push(Entry::item(Action::Rename));
+        if !observed && !agent.pending {
+            open.push(Entry::Item {
+                action: Action::EditTags,
+                text: (!agent.tags.is_empty()).then(|| format!("Tags: {}…", agent.tags.join(", "))),
+                unavailable: None,
+            });
+        }
+        // Placement (`chat.attach`/`chat.detach`): chats only; the
+        // projects are rows of the attach chooser, never items here.
+        let mut placement = Vec::new();
+        if agent.chat && !agent.pending && self.nav.organization.registered().next().is_some() {
+            placement.push(Entry::item(Action::AttachMenu));
+        }
+        if agent.chat && agent.organization.is_some() {
+            placement.push(Entry::item(Action::Detach));
+        }
+        let mut work = Vec::new();
+        if !observed && !agent.pending {
+            work.push(if busy {
+                Entry::unavailable(Action::Handoff, WAITING)
+            } else {
+                Entry::item(Action::Handoff)
+            });
+            work.push(Entry::item(Action::Goal));
+        }
+        let mut lifecycle = Vec::new();
+        if !observed {
+            // A lost task cannot be deleted (the Store keeps it): resume
+            // it, or archive it to hide it.
+            if ended {
+                lifecycle.push(if busy {
+                    Entry::unavailable(Action::Resume, WAITING)
+                } else {
+                    Entry::item(Action::Resume)
+                });
+            } else if busy {
+                lifecycle.push(Entry::unavailable(Action::Stop, WAITING));
+            } else if header
+                .is_none_or(|detail| self.stop_button(&agent.id, detail.generation).is_some())
+            {
+                lifecycle.push(Entry::item(Action::Stop));
+                lifecycle.push(Entry::item(Action::ForceStop));
+            }
+        } else if header.is_some() && !busy {
+            lifecycle.push(Entry::item(Action::DetachObserver));
+        }
+        let delete = if observed {
+            Vec::new()
+        } else if agent.deletable() {
+            vec![Entry::item(Action::Delete)]
+        } else if agent.state == eliot_core::AgentState::Lost {
+            vec![Entry::unavailable(
+                Action::Delete,
+                "lost: resume or archive it",
+            )]
+        } else {
+            vec![Entry::unavailable(Action::Delete, "stop it first")]
         };
-        let mut entries = vec![Entry::item(Action::CopyId)];
+        let mut copy = vec![Entry::item(Action::CopyId)];
         // No-project chats have only a private daemon workspace. Other
         // tasks need a real workspace or an absolute legacy project path.
         if agent_folder(agent).is_some() {
-            entries.push(Entry::item(Action::OpenFolder));
+            copy.push(Entry::item(Action::OpenFolder));
         }
-        entries
+        if header.is_some_and(|detail| detail.branch.is_some()) {
+            copy.push(Entry::item(Action::CopyBranch));
+        }
+        grouped([
+            open,
+            placement,
+            work,
+            if observed {
+                Vec::new()
+            } else {
+                vec![Entry::item(Action::MoveUnder)]
+            },
+            if observed {
+                Vec::new()
+            } else if agent.archived {
+                vec![Entry::item(Action::Unarchive)]
+            } else {
+                vec![Entry::item(Action::Archive)]
+            },
+            lifecycle,
+            delete,
+            copy,
+        ])
     }
 
     pub(super) fn task_dialog(&self, context: &mut ViewContext<Self>) -> ContentDialog {
@@ -1268,8 +1385,8 @@ impl DesktopApp {
             .vertical_alignment(VerticalAlignment::Top)
             .menu(Menu::new(
                 items,
-                crate::views::menu_keys(context.callback(|label: String| {
-                    Action::from_label(&label).map_or(Message::Menu(MenuMsg::Ignored), |action| {
+                crate::views::menu_keys(context.callback(|key: String| {
+                    Action::from_key(&key).map_or(Message::Menu(MenuMsg::Ignored), |action| {
                         Message::Menu(MenuMsg::Picked(action))
                     })
                 })),
@@ -1325,14 +1442,6 @@ impl DesktopApp {
                     agent.id, agent.generation
                 ),
                 "Stop Agent",
-            ),
-            Target::Agent(agent) if action == Action::ClearGoal => (
-                format!("Clear the goal of “{}”?", target.title()),
-                format!(
-                    "Swarm clears Agent {}'s goal: no more rounds or checks run for it. The Agent and its work stay; a new goal starts from swarm goal set.",
-                    agent.id
-                ),
-                "Clear goal",
             ),
             Target::Agent(agent) if action == Action::Delete => {
                 let history = match agent.harness.as_str() {

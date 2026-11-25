@@ -466,6 +466,15 @@ pub(super) struct ChatState {
     /// The open Agent's Eliot Goal as last read (`goal.get`): the Agent
     /// it was read for and the goal, `None` inside when it has none.
     pub(super) goal: Option<(String, Option<eliot_core::api::GoalView>)>,
+    /// A `goal.get` is in flight: another request waits for its reply.
+    pub(super) goal_reading: bool,
+    /// The goal may have changed after that read began (a goal action
+    /// settled, the inbox counts moved): its reply is dropped and the goal
+    /// is read once more.
+    pub(super) goal_again: bool,
+    /// The open Agent's last `goal.get` failed: the Agent and the error.
+    /// `goal` keeps the value last read (an error is not "no goal").
+    pub(super) goal_error: Option<(String, String)>,
     /// The open Agent's `owner.inbox` items (requests, unconfirmed
     /// outcomes), for the decision panel.
     pub(super) decisions: Option<(String, Vec<eliot_core::api::OwnerInboxItem>, i64)>,
@@ -1075,9 +1084,19 @@ impl DesktopApp {
                 });
             }
             ChatMsg::GoalRead(agent, read) => {
-                if self.selected_agent_id().as_deref() == Some(agent.as_str()) {
-                    // A failed read shows no mark rather than a stale one.
-                    self.chat.goal = Some((agent, read.ok().flatten().map(|goal| *goal)));
+                self.chat.goal_reading = false;
+                if std::mem::take(&mut self.chat.goal_again) {
+                    // It may predate a goal action or a count change.
+                    self.read_goal(context);
+                } else if self.selected_agent_id().as_deref() == Some(agent.as_str()) {
+                    match read {
+                        Ok(goal) => {
+                            self.chat.goal = Some((agent, goal.map(|goal| *goal)));
+                            self.chat.goal_error = None;
+                        }
+                        // The value last read stays, with the error beside it.
+                        Err(error) => self.chat.goal_error = Some((agent, error)),
+                    }
                 }
             }
             ChatMsg::DecisionsRead(agent, read) => {

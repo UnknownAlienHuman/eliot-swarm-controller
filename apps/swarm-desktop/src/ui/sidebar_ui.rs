@@ -488,8 +488,8 @@ fn projects_label(input: &SidebarInput, context: &mut ViewContext<Sidebar>) -> K
                         .menu(Menu::new(
                             items,
                             // Capture-free: one identity across renders.
-                            crate::views::menu_keys(context.callback(|label: String| {
-                                Message::Bulk(BulkMsg::Menu(Action::from_label(&label)))
+                            crate::views::menu_keys(context.callback(|key: String| {
+                                Message::Bulk(BulkMsg::Menu(Action::from_key(&key)))
                             })),
                         )),
                 ))
