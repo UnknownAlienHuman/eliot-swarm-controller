@@ -1,10 +1,9 @@
 //! Grammar for the implemented command/turn/result read calls. These identifiers
 //! select existing records; they never admit or retry an external effect.
 
-use super::mutations::nullable;
+use super::{agent_views::objects, mutations::nullable};
 use crate::{Agent, Command, Error, Result, Turn};
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value};
 
 #[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -340,7 +339,7 @@ impl CommandChildrenRequest {
 #[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CommandChildrenResponse {
-    #[serde(deserialize_with = "object_commands")]
+    #[serde(deserialize_with = "objects")]
     pub children: Vec<Command>,
     #[serde(deserialize_with = "nullable")]
     pub next: Option<String>,
@@ -354,7 +353,7 @@ pub struct AgentResultResponse {
     pub generation: i64,
     /// The current generation, also available without the full Agent DTO.
     pub current_generation: i64,
-    #[serde(deserialize_with = "object_turns")]
+    #[serde(deserialize_with = "objects")]
     pub turns: Vec<Turn>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_metadata: Option<Agent>,
@@ -382,16 +381,17 @@ fn present_command_id<'de, D: serde::Deserializer<'de>>(
 }
 
 fn validate_id(value: &str) -> Result<()> {
+    validate_identifier(value, "read identifiers must be non-empty strings")
+}
+
+pub(super) fn validate_identifier(value: &str, message: &'static str) -> Result<()> {
     if value.trim().is_empty() {
-        return Err(Error::new(
-            "invalid",
-            "read identifiers must be non-empty strings",
-        ));
+        return Err(Error::new("invalid", message));
     }
     Ok(())
 }
 
-fn validate_generation(value: i64) -> Result<()> {
+pub(super) fn validate_generation(value: i64) -> Result<()> {
     if value < 0 {
         return Err(Error::new(
             "invalid",
@@ -419,7 +419,7 @@ fn optional_project<'de, D: serde::Deserializer<'de>>(
     Ok(project)
 }
 
-fn generation<'de, D: serde::Deserializer<'de>>(
+pub(super) fn generation<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
 ) -> std::result::Result<i64, D::Error> {
     let value = i64::deserialize(deserializer)?;
@@ -443,28 +443,4 @@ fn present_result_cursor<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
 ) -> std::result::Result<Option<ResultCursor>, D::Error> {
     ResultCursor::deserialize(deserializer).map(Some)
-}
-
-fn object_turns<'de, D: serde::Deserializer<'de>>(
-    deserializer: D,
-) -> std::result::Result<Vec<Turn>, D::Error> {
-    let objects = Vec::<Map<String, Value>>::deserialize(deserializer)?;
-    objects
-        .into_iter()
-        .map(|object| {
-            serde_json::from_value(Value::Object(object)).map_err(serde::de::Error::custom)
-        })
-        .collect()
-}
-
-fn object_commands<'de, D: serde::Deserializer<'de>>(
-    deserializer: D,
-) -> std::result::Result<Vec<Command>, D::Error> {
-    let objects = Vec::<Map<String, Value>>::deserialize(deserializer)?;
-    objects
-        .into_iter()
-        .map(|object| {
-            serde_json::from_value(Value::Object(object)).map_err(serde::de::Error::custom)
-        })
-        .collect()
 }
