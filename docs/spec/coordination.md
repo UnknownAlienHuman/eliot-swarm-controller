@@ -158,9 +158,15 @@ resume at admission and dispatch. Windows
 pins ancestors, opens the entire bounded tree through relative handles without
 delete sharing for every directory and file until disposition/close, refuses
 reparse points and deletes by handle disposition. A scan is bounded to 262,144
-entries and by its deadline. Any file whose link count is
-not exactly one keeps the entire tree with `hard_link`, including Cargo targets
-with shared binaries. For owned trees, Windows ignores a regular file's read-only
+entries and by its deadline. Most artifacts require one link per file. For an
+identity-bound Cargo target, Windows enumerates every name of a multiply linked
+file and pins each only if it is inside that target. A link outside the target
+keeps the entire cache with `external_hard_link`. An unverified enumeration
+also keeps it. The primary handle denies data access through all names and
+the alias handles deny rename and deletion at their respective names. Any
+conflicting open keeps the entire target with `busy`. Counts are checked again
+before alias removal, and bytes are counted once per underlying file.
+For owned trees, Windows ignores a regular file's read-only
 attribute only at disposition on its pinned handle. Guarded scans at both plan
 and apply refuse repository
 roots (including bare repositories), every `.git` entry, and native/user config

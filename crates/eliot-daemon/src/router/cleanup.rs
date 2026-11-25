@@ -53,14 +53,19 @@ impl CleanupRemoval {
 }
 
 #[cfg(windows)]
-async fn open_cleanup_tree(path: PathBuf, budget: Duration) -> Result<CleanupTree> {
+async fn open_cleanup_tree(
+    path: PathBuf,
+    budget: Duration,
+    cargo_links: bool,
+) -> Result<CleanupTree> {
     let deadline = std::time::Instant::now() + budget;
     let retry_until = Instant::now() + budget.min(Duration::from_secs(2));
     loop {
         let path = path.clone();
-        let result = tokio::task::spawn_blocking(move || CleanupTree::open(&path, deadline))
-            .await
-            .map_err(|_| Error::new("internal", "cleanup scan worker did not settle"))?;
+        let result =
+            tokio::task::spawn_blocking(move || CleanupTree::open(&path, deadline, cargo_links))
+                .await
+                .map_err(|_| Error::new("internal", "cleanup scan worker did not settle"))?;
         if !result.as_ref().is_err_and(|error| error.code == "busy")
             || Instant::now() >= retry_until
         {
@@ -98,6 +103,10 @@ const SWARM_ARTIFACT_ROOT_PURPOSE: &str = "Swarm artifact root";
 
 fn is_stand_artifact(artifact: &ArtifactView) -> bool {
     artifact.kind == ArtifactKind::DataDir && artifact.purpose == SWARM_STAND_ARTIFACT_PURPOSE
+}
+
+fn is_cargo_target_artifact(artifact: &ArtifactView) -> bool {
+    artifact.kind == ArtifactKind::Build && artifact.purpose == SWARM_CARGO_TARGET_ARTIFACT_PURPOSE
 }
 
 fn validate_cleanup_path(path: &Path) -> Result<()> {
@@ -1235,8 +1244,7 @@ impl Router {
         now: i64,
         allow_fenced_root: bool,
     ) -> Result<Option<String>> {
-        let cargo_cache = artifact.kind == ArtifactKind::Build
-            && artifact.purpose == SWARM_CARGO_TARGET_ARTIFACT_PURPOSE;
+        let cargo_cache = is_cargo_target_artifact(artifact);
         let (agent, ended_at) = {
             let store = self.inner.store.lock().await;
             let Some(agent) = store.get_agent(&artifact.agent)? else {
@@ -2472,7 +2480,8 @@ impl Router {
         }
         #[cfg(windows)]
         {
-            let tree = open_cleanup_tree(path, scan_budget).await?;
+            let tree =
+                open_cleanup_tree(path, scan_budget, is_cargo_target_artifact(artifact)).await?;
             if tree.identity != artifact.identity {
                 return Err(Error::new(
                     "identity_changed",
@@ -2911,7 +2920,12 @@ impl Router {
         }
         #[cfg(windows)]
         {
-            let tree = open_cleanup_tree(path, Duration::from_secs(120)).await?;
+            let tree = open_cleanup_tree(
+                path,
+                Duration::from_secs(120),
+                is_cargo_target_artifact(artifact),
+            )
+            .await?;
             if tree.identity != artifact.identity {
                 return Err(Error::new(
                     "identity_changed",

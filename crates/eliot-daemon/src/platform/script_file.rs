@@ -14,6 +14,9 @@ use std::path::{Component, Path, PathBuf};
 
 use eliot_core::{Error, Result, api::MAX_SCRIPT_EDIT_BYTES};
 
+#[cfg(windows)]
+mod hard_links;
+
 fn refused() -> Error {
     Error::new(
         "not_allowed",
@@ -481,13 +484,14 @@ fn conflict() -> Error {
     )
 }
 
-/// A complete bounded tree, opened exclusively before the first delete.
+/// A complete bounded tree, pinned before the first delete.
 /// Ancestors cannot be renamed and leaves are opened relative to held parents.
 /// No pathname unlink fallback is available on Unix.
 #[cfg(windows)]
 pub(crate) struct CleanupTree {
     _parent: Directory,
-    entries: Vec<File>,
+    entries: Vec<CleanupEntry>,
+    scanned: usize,
     pub(crate) identity: String,
     pub(crate) bytes: u64,
     pub(crate) contains_daemon_lock: bool,
@@ -497,8 +501,18 @@ pub(crate) struct CleanupTree {
 const MAX_CLEANUP_TREE_ENTRIES: usize = 262_144;
 
 #[cfg(windows)]
+enum CleanupEntry {
+    Plain(File),
+    CargoLinks(hard_links::Group),
+}
+
+#[cfg(windows)]
 impl CleanupTree {
-    pub(crate) fn open(path: &Path, deadline: std::time::Instant) -> Result<Self> {
+    pub(crate) fn open(
+        path: &Path,
+        deadline: std::time::Instant,
+        cargo_links: bool,
+    ) -> Result<Self> {
         if let Some(name) = path.file_name().and_then(|name| name.to_str()) {
             cleanup_name(name)?;
         }
@@ -511,19 +525,34 @@ impl CleanupTree {
         let mut tree = Self {
             _parent: parent,
             entries: Vec::new(),
+            scanned: 1,
             identity,
             bytes: 0,
             contains_daemon_lock: false,
         };
-        tree.visit(root, 0, deadline)?;
+        let mut links = cargo_links
+            .then(|| hard_links::Scan::new(&root, path))
+            .transpose()?;
+        tree.visit(&root, Path::new(""), 0, deadline, links.as_mut())?;
+        if let Some(links) = links {
+            links.finish()?;
+        }
+        tree.entries.push(CleanupEntry::Plain(root));
         Ok(tree)
     }
 
-    fn visit(&mut self, directory: File, depth: usize, deadline: std::time::Instant) -> Result<()> {
+    fn visit(
+        &mut self,
+        directory: &File,
+        relative: &Path,
+        depth: usize,
+        deadline: std::time::Instant,
+        mut links: Option<&mut hard_links::Scan<'_>>,
+    ) -> Result<()> {
         if depth >= 64 {
             return Err(Error::new("unavailable", "cleanup depth bound"));
         }
-        let children = native::children(&directory, deadline).map_err(io)?;
+        let children = native::children(directory, deadline).map_err(io)?;
         if ["HEAD", "objects", "refs"].iter().all(|expected| {
             children
                 .iter()
@@ -535,9 +564,8 @@ impl CleanupTree {
             ));
         }
         for (name, is_dir) in children {
-            if self.entries.len() >= MAX_CLEANUP_TREE_ENTRIES
-                || std::time::Instant::now() >= deadline
-            {
+            self.scanned += 1;
+            if self.scanned > MAX_CLEANUP_TREE_ENTRIES || std::time::Instant::now() >= deadline {
                 return Err(Error::new("unavailable", "cleanup tree exceeds scan bound"));
             }
             let text = name.to_str().ok_or_else(refused)?;
@@ -548,28 +576,77 @@ impl CleanupTree {
             {
                 self.contains_daemon_lock = true;
             }
+            let child_relative = links.as_ref().map(|_| relative.join(&name));
+            if let Some((links, relative)) = links.as_deref_mut().zip(child_relative.as_deref())
+                && links.visited(relative)
+            {
+                if is_dir {
+                    return Err(hard_links::unverified());
+                }
+                continue;
+            }
             let child =
-                native::open_cleanup(&directory, &name, is_dir).map_err(cleanup_open_error)?;
+                native::open_cleanup(directory, &name, is_dir).map_err(cleanup_open_error)?;
             if is_dir {
                 check(&child, true)?;
-                self.visit(child, depth + 1, deadline)?;
+                self.visit(
+                    &child,
+                    child_relative.as_deref().unwrap_or(relative),
+                    depth + 1,
+                    deadline,
+                    links.as_deref_mut(),
+                )?;
+                self.entries.push(CleanupEntry::Plain(child));
             } else {
                 let len = cleanup_file_size(&child)?;
-                require_single_cleanup_link(&child)?;
+                let count = native::links(&child).map_err(cleanup_open_error)?;
+                let entry = if count == 1 {
+                    CleanupEntry::Plain(child)
+                } else if let Some((links, relative)) =
+                    links.as_deref_mut().zip(child_relative.as_deref())
+                {
+                    CleanupEntry::CargoLinks(links.pin(
+                        child,
+                        relative,
+                        count,
+                        self.scanned,
+                        deadline,
+                    )?)
+                } else {
+                    return Err(hard_links::refuse_multiple_links());
+                };
                 self.bytes = self.bytes.checked_add(len).ok_or_else(refused)?;
-                self.entries.push(child);
+                self.entries.push(entry);
             }
         }
-        if self.entries.len() >= MAX_CLEANUP_TREE_ENTRIES {
-            return Err(Error::new("unavailable", "cleanup tree exceeds scan bound"));
-        }
-        self.entries.push(directory);
         Ok(())
     }
 
     /// Every error after the first attempted disposition is unknown. No retry.
     pub(crate) fn remove(mut self, cancelled: impl Fn() -> bool) -> Result<u64> {
-        for (index, file) in self.entries.drain(..).enumerate() {
+        for entry in &self.entries {
+            if let CleanupEntry::CargoLinks(group) = entry {
+                group.validate()?;
+            }
+        }
+        for (index, entry) in self.entries.drain(..).enumerate() {
+            if cancelled() {
+                return Err(if index == 0 {
+                    Error::new(
+                        "interrupted",
+                        "forced shutdown interrupted cleanup before deletion",
+                    )
+                } else {
+                    Error::new("unknown", "forced shutdown interrupted a partial cleanup")
+                });
+            }
+            let file = match entry {
+                CleanupEntry::Plain(file) => file,
+                CleanupEntry::CargoLinks(group) => {
+                    group.remove(&cancelled)?;
+                    continue;
+                }
+            };
             let unknown = |_| {
                 Error::new(
                     "unknown",
@@ -583,16 +660,6 @@ impl CleanupTree {
                     "unknown",
                     "link count changed after preflight; no replay",
                 ));
-            }
-            if cancelled() {
-                return Err(if index == 0 {
-                    Error::new(
-                        "interrupted",
-                        "forced shutdown interrupted cleanup before deletion",
-                    )
-                } else {
-                    Error::new("unknown", "forced shutdown interrupted a partial cleanup")
-                });
             }
             native::delete_cleanup_entry(&file)
                 .map_err(|_| Error::new("unknown", "partial cleanup; no replay"))?;
@@ -693,10 +760,7 @@ fn cleanup_file_size(file: &File) -> Result<u64> {
 #[cfg(windows)]
 fn require_single_cleanup_link(file: &File) -> Result<()> {
     if native::links(file).map_err(|_| refused())? != 1 {
-        return Err(Error::new(
-            "hard_link",
-            "cleanup refuses files with multiple links",
-        ));
+        return Err(hard_links::refuse_multiple_links());
     }
     Ok(())
 }
@@ -780,6 +844,20 @@ mod native {
 
     pub(super) fn open_cleanup(parent: &File, name: &OsStr, directory: bool) -> io::Result<File> {
         open_mode(parent, name, directory, false, true)
+    }
+
+    pub(super) fn open_cleanup_alias(parent: &File, name: &OsStr) -> io::Result<File> {
+        // The exclusive primary guards data access. NTFS allows a delete-only
+        // open on a different link when it shares the primary's read access.
+        // Omitting delete sharing pins this name against rename and deletion.
+        open_relative(
+            parent,
+            name,
+            DELETE | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+            FILE_SHARE_READ,
+            FILE_OPEN,
+            FILE_SYNCHRONOUS_IO_NONALERT | FILE_NON_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT,
+        )
     }
 
     pub(super) fn open_hint(parent: &File, path: &OsStr) -> io::Result<File> {
