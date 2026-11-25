@@ -83,14 +83,30 @@ impl DesktopApp {
             .collect();
         StackPanel::new().spacing(tokens::spacing::SM).children((
             controls::card_title("Appearance"),
-            controls::settings_card(vec![KeyedView::new(
-                "theme",
-                controls::setting_row(
-                    "Theme",
-                    "System follows Windows; High Contrast always does",
-                    View::from(theme_picker),
+            controls::settings_card(vec![
+                KeyedView::new(
+                    "theme",
+                    controls::setting_row(
+                        "Theme",
+                        "System follows Windows; High Contrast always does",
+                        View::from(theme_picker),
+                    ),
                 ),
-            )]),
+                KeyedView::new(
+                    "panels",
+                    controls::setting_row(
+                        "Panel widths",
+                        "Drag a panel's edge to resize it",
+                        View::from(
+                            controls::outlined()
+                                .is_enabled(self.prefs.panels.is_some())
+                                .automation_name("Reset panel widths")
+                                .on_click(context.message(Message::Shell(ShellMsg::PanelsReset)))
+                                .content(controls::label("Reset panel widths")),
+                        ),
+                    ),
+                ),
+            ]),
             controls::card_title("Start and work"),
             controls::settings_card(
                 vec![

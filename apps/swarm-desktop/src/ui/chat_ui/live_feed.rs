@@ -238,11 +238,7 @@ impl DesktopApp {
     /// by a Swarm restart" as a service line; a failed one's diagnosis as
     /// the "What went wrong" card with Details. Resume itself is the
     /// composer's one action, never repeated here.
-    pub(super) fn loss_notice(
-        &self,
-        column: Option<f64>,
-        context: &mut ViewContext<Self>,
-    ) -> Option<View> {
+    pub(super) fn loss_notice(&self, context: &mut ViewContext<Self>) -> Option<View> {
         let detail = self.chat.detail.as_ref()?;
         let agent = self.selected_agent_id()?;
         let (read, generation, words) = self.chat.loss.as_ref()?;
@@ -252,26 +248,19 @@ impl DesktopApp {
         }
         let place = Border::new()
             .grid_row(4)
-            .maybe_width(column)
-            .max_width(tokens::layout::READING_WIDTH)
-            .horizontal_alignment(HorizontalAlignment::Center)
-            .margin(Thickness::new(0.0, tokens::spacing::SM, 0.0, 0.0))
+            .column(tokens::layout::READING_WIDTH, tokens::spacing::SM, 0.0)
             .automation_name(words);
         match detail.state {
             eliot_core::AgentState::Lost => Some(
                 place
-                    .content(
-                        StackPanel::new()
-                            .orientation(Orientation::Horizontal)
-                            .spacing(tokens::spacing::SM)
-                            .horizontal_alignment(HorizontalAlignment::Center)
-                            .children((
-                                controls::muted_icon(controls::glyph::RESTART),
-                                controls::secondary(words.to_owned())
-                                    .vertical_alignment(VerticalAlignment::Center)
-                                    .text_trimming(TextTrimming::CharacterEllipsis),
-                            )),
-                    )
+                    .content(controls::row_grid(
+                        Some(controls::muted_icon(controls::glyph::RESTART)),
+                        controls::secondary(words.to_owned())
+                            .text_trimming(TextTrimming::CharacterEllipsis)
+                            .into(),
+                        None,
+                        tokens::spacing::SM,
+                    ))
                     .into(),
             ),
             eliot_core::AgentState::Failed => Some(
@@ -290,14 +279,15 @@ impl DesktopApp {
                             .column_spacing(tokens::spacing::ROW)
                             .children((
                                 controls::critical_icon(controls::glyph::ERROR, tokens::icon::ROW),
-                                StackPanel::new()
+                                Grid::new()
                                     .grid_column(1)
-                                    .orientation(Orientation::Horizontal)
-                                    .spacing(tokens::spacing::XS)
+                                    .columns([GridLength::Auto, GridLength::STAR])
+                                    .column_spacing(tokens::spacing::XS)
                                     .vertical_alignment(VerticalAlignment::Center)
                                     .children((
                                         controls::text("What went wrong", tokens::text::BUTTON),
                                         controls::body(words.to_owned())
+                                            .grid_column(1)
                                             .text_trimming(TextTrimming::CharacterEllipsis),
                                     )),
                                 controls::text_button()

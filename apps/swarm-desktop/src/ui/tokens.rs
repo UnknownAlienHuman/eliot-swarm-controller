@@ -152,21 +152,38 @@ pub mod state {
 
 /// Widths and placements of the app's own layout.
 pub mod layout {
-    /// The sidebar, and the Settings navigation that replaces it.
+    /// The sidebar, and the Settings navigation that replaces it, at its
+    /// default width; its handle keeps it between the bounds (at most 360,
+    /// so a 900-DIP window keeps the main area's 520 beside it).
     pub const SIDEBAR_WIDTH: f64 = 264.0;
+    pub const SIDEBAR_MIN_WIDTH: f64 = 200.0;
+    pub const SIDEBAR_MAX_WIDTH: f64 = 360.0;
+    /// The sidebar hidden to its icons.
+    pub const RAIL_WIDTH: f64 = super::height::CONTROL + 2.0 * SIDEBAR_GUTTER;
     /// The sidebar's side gutter.
     pub const SIDEBAR_GUTTER: f64 = 8.0;
     pub const SIDEBAR_PADDING: f64 = 12.0;
-    /// The right pane at its Normal and Wide widths.
+    /// The right pane at its default and Wide widths; its handle keeps it
+    /// between the bounds.
     pub const PANEL_WIDTH: f64 = 480.0;
     pub const PANEL_WIDE_WIDTH: f64 = READING_WIDTH;
-    /// Below this window width the pane overlays the main area.
-    pub const PANEL_OVERLAY_BELOW: f64 = 1200.0;
+    pub const PANEL_MIN_WIDTH: f64 = 320.0;
+    pub const PANEL_MAX_WIDTH: f64 = PANEL_WIDE_WIDTH;
+    /// A panel's drag handle, and one arrow-key step of it.
+    pub const SPLITTER: f64 = 6.0;
+    pub const SPLIT_STEP: f64 = 10.0;
+    /// The §6.2 size classes by client width: Medium from 900, Wide from
+    /// 1280, Wider from 1520.
+    pub const MEDIUM_FROM: f64 = 900.0;
+    pub const WIDE_FROM: f64 = 1280.0;
+    pub const WIDER_FROM: f64 = 1520.0;
+    /// §6.2 docking: the pane docks when the window holds the sidebar,
+    /// the main area's required width, the pane and this separation.
+    pub const MAIN_REQUIRED_WIDTH: f64 = 520.0;
+    pub const DOCK_GAP: f64 = 16.0;
     pub const FILTER_WIDTH: f64 = 168.0;
     /// The selected pane tab's underline.
     pub const TAB_INDICATOR: f64 = 3.0;
-    /// The main area never narrows below this.
-    pub const MAIN_MIN_WIDTH: f64 = 480.0;
     /// The conversation and composer column.
     pub const READING_WIDTH: f64 = 720.0;
     pub const HOME_WIDTH: f64 = 760.0;
@@ -205,12 +222,6 @@ pub mod layout {
     pub const COMPOSER_MAX_HEIGHT: f64 = 200.0;
     pub const COMPOSER_MIN_HEIGHT: f64 = 44.0;
     pub const SPLIT_MENU: f64 = 34.0;
-    /// The Home bar's fixed part.
-    pub const HOME_BAR_FIXED: f64 = 480.0;
-    /// The composer shows its hint from this width.
-    pub const COMPOSER_HINT_MIN_WIDTH: f64 = 560.0;
-    pub const COMPOSER_ACTIONS_WIDTH: f64 = 190.0;
-    pub const COMPOSER_LABEL_MIN_WIDTH: f64 = 80.0;
     pub const SOURCE_MIN_HEIGHT: f64 = 240.0;
     pub const SOURCE_MAX_HEIGHT: f64 = 420.0;
     /// The hand-off dialog: ContentDialog's maximum.

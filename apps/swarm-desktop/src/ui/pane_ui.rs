@@ -175,6 +175,8 @@ pub(super) enum PaneMsg {
     Wide,
     /// The Full view toggle.
     Full,
+    /// Back to conversation: the pane over the main area closes.
+    Back,
     /// The open tab's Refresh (and Retry).
     Refresh,
     /// A Changes read landed (its epoch), or was dropped (`None`).
@@ -216,6 +218,10 @@ impl DesktopApp {
             PaneMsg::Tab(panel) => self.choose_panel(panel, context),
             PaneMsg::Wide => self.pane.wide = !self.pane.wide,
             PaneMsg::Full => self.pane.full = !self.pane.full,
+            PaneMsg::Back => {
+                self.pane.full = false;
+                self.close_panel();
+            }
             PaneMsg::Refresh => match self.panel {
                 Panel::Changes => self.read_changes(context),
                 Panel::Terminal => self.read_processes(context),
@@ -692,11 +698,23 @@ impl DesktopApp {
             .into()
     }
 
-    /// The strip (`.tabs`): the four tabs, then Wide and Full view, over an
-    /// a hairline.
+    /// The strip (`.tabs`): Back to conversation when the pane lies over
+    /// the main area, the four tabs, then Wide and Full view, over a
+    /// hairline.
     fn tab_strip(&self, context: &mut ViewContext<Self>) -> View {
         let mut cells: Vec<KeyedView> = Vec::new();
         let mut columns = Vec::new();
+        if !self.pane_docked() {
+            columns.push(GridLength::Auto);
+            cells.push(KeyedView::new(
+                "back",
+                controls::icon_button()
+                    .automation_name("Back to conversation")
+                    .on_click(context.message(Message::Pane(PaneMsg::Back)))
+                    .content(controls::icon(controls::glyph::BACK))
+                    .tooltip("Back to conversation"),
+            ));
+        }
         for panel in Panel::TABS {
             let selected = self.panel == panel;
             let column = cells.len() as i32;
@@ -1182,7 +1200,6 @@ impl DesktopApp {
                         selected.then_some(controls::glyph::CHECK),
                         &words,
                         false,
-                        tokens::layout::PROJECT_CHIP_WIDTH,
                     )),
             ));
         }

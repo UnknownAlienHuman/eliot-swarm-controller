@@ -327,8 +327,8 @@ impl DesktopApp {
         }
         Some(
             controls::card()
-                .maybe_width(self.settings_column_width())
-                .horizontal_alignment(HorizontalAlignment::Center)
+                .min_width(tokens::layout::MIN_COLUMN)
+                .max_width(tokens::page::SETTINGS_WIDTH)
                 .margin(Thickness::uniform(tokens::spacing::SM))
                 .content(
                     StackPanel::new()

@@ -54,11 +54,7 @@ impl DesktopApp {
     /// history exists, then every turn in the reading column. It is its own
     /// component: a window render compares its input and redraws it only
     /// when the conversation, its expanded rows or the column changed.
-    pub(super) fn transcript_view(
-        &self,
-        column: Option<f64>,
-        context: &mut ViewContext<Self>,
-    ) -> View {
+    pub(super) fn transcript_view(&self, context: &mut ViewContext<Self>) -> View {
         // Settings and a project page leave the conversation as New task does.
         let conversation = match self.main {
             Main::Conversation => self.selected_agent_id().unwrap_or_default(),
@@ -130,7 +126,6 @@ impl DesktopApp {
             },
             expanded: Rc::new(self.chat.expanded.clone()),
             callbacks: Rc::new(callbacks),
-            column,
             load_older,
             empty,
             automation_id: TRANSCRIPT_ID,
@@ -141,15 +136,16 @@ impl DesktopApp {
 
 /// A new task's first message and its "Starting Codex…" line while the
 /// launch is submitted, in the transcript's place and shape.
-pub(super) fn starting_view(text: &str, label: &str, column: Option<f64>) -> View {
+pub(super) fn starting_view(text: &str, label: &str) -> View {
     let (shown, files) = crate::attachments::split(text);
     StackPanel::new()
         .grid_row(1)
-        .maybe_width(column)
-        .max_width(tokens::layout::READING_WIDTH)
-        .horizontal_alignment(HorizontalAlignment::Center)
+        .column(
+            tokens::layout::READING_WIDTH,
+            tokens::spacing::MD,
+            tokens::spacing::MD,
+        )
         .vertical_alignment(VerticalAlignment::Top)
-        .margin(Thickness::xy(0.0, tokens::spacing::MD))
         .spacing(tokens::spacing::SM)
         .children((
             // The owner's message as the transcript will show it: the

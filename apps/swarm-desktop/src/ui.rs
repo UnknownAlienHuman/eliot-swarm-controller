@@ -37,7 +37,7 @@ use eliot_core::api::{
 };
 use windows_reactor::*;
 
-use crate::views::{MaybeContent, MaybeSize};
+use crate::views::{Column, MaybeContent};
 
 mod automation_ui;
 mod bulk_ui;
@@ -61,6 +61,7 @@ mod scripts_ui;
 mod settings_ui;
 mod shell_ui;
 mod sidebar_ui;
+mod split_ui;
 mod usage_ui;
 pub(crate) use crate::tokens;
 
@@ -275,18 +276,18 @@ enum Message {
 }
 
 /// The input to the single desktop window: the workspace, the saved window
-/// placement its first frame opens with, and the shared slot that remembers
+/// placement its first frame opens with, and the size note that remembers
 /// the last observed window size for the one `[desktop]` write after the
-/// window closes (windows-reactor 0.100.0 exposes no close hook:
-/// `ViewContext` offers only `on_color_scheme`, `on_window_size`,
-/// `window_title` and `window_visuals`).
+/// window closes.
 #[derive(Clone)]
 struct DesktopInput {
     /// `--workspace`, when given.
     workspace: Option<PathBuf>,
     /// `[desktop] window`, read before the window exists.
     window: Option<crate::settings::WindowPlacement>,
-    close_window: CloseWindow,
+    /// `[desktop] panels`, read with `window`.
+    panels: Option<crate::settings::Panels>,
+    size_note: SizeNote,
 }
 
 impl PartialEq for DesktopInput {
@@ -295,25 +296,57 @@ impl PartialEq for DesktopInput {
     }
 }
 
-/// What the one write after the window closes carries: the data directory
-/// it belongs to and the last observed size.
-type ClosePayload = Option<(PathBuf, (u32, u32))>;
-
-/// The last observed window size and the data directory it belongs to, for
-/// the one write after the window closes. Shared with [`run`], which
-/// outlives the component.
+/// The window's size note: the last normal client size with the data
+/// directory it belongs to, for the one `[desktop]` write after the window
+/// closes. [`split_ui`]'s size observer writes the size; the window names
+/// the data directory. Shared with [`run`], which outlives the component.
 #[derive(Clone, Default)]
-struct CloseWindow(Arc<Mutex<ClosePayload>>);
+struct SizeNote(Arc<Mutex<Sizes>>);
 
-impl CloseWindow {
-    fn store(&self, data_dir: PathBuf, window: (u32, u32)) {
-        if let Ok(mut slot) = self.0.lock() {
-            *slot = Some((data_dir, window));
+#[derive(Default)]
+struct Sizes {
+    data_dir: Option<PathBuf>,
+    /// The normal (not maximized) client size, once at least 640 x 480;
+    /// the saved size until then.
+    size: Option<(u32, u32)>,
+}
+
+impl PartialEq for SizeNote {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl SizeNote {
+    fn new(size: Option<(u32, u32)>) -> Self {
+        Self(Arc::new(Mutex::new(Sizes {
+            size,
+            ..Sizes::default()
+        })))
+    }
+
+    fn with<T>(&self, read: impl FnOnce(&mut Sizes) -> T) -> Option<T> {
+        self.0.lock().ok().map(|mut sizes| read(&mut sizes))
+    }
+
+    fn set_data_dir(&self, data_dir: PathBuf) {
+        self.with(|sizes| sizes.data_dir = Some(data_dir));
+    }
+
+    /// A size observation: the client size when normal.
+    fn observe(&self, normal: Option<(u32, u32)>) {
+        if normal.is_some() {
+            self.with(|sizes| sizes.size = normal);
         }
     }
 
+    fn size(&self) -> Option<(u32, u32)> {
+        self.with(|sizes| sizes.size).flatten()
+    }
+
     fn load(&self) -> Option<(PathBuf, (u32, u32))> {
-        self.0.lock().ok().and_then(|slot| slot.clone())
+        self.with(|sizes| sizes.data_dir.clone().zip(sizes.size))
+            .flatten()
     }
 }
 
@@ -327,8 +360,6 @@ struct DesktopApp {
     status: String,
     /// A notice for the owner above the composer, until dismissed.
     alert: Option<String>,
-    /// The window has its icon (set once it is shown).
-    icon_set: bool,
     dialog: dialog_ui::Focus,
     /// The `[desktop]` preferences (theme, what opens at start).
     prefs: crate::settings::Preferences,
@@ -342,18 +373,13 @@ struct DesktopApp {
     /// Keyboard focus held back until the window is the foreground window
     /// (see `take_focus`).
     focus_held: Option<FocusTarget>,
-    /// The window's client width in DIPs, once observed.
-    window_width: Option<f64>,
-    /// The window's client height in DIPs (menu placement clamps to it).
-    window_height: Option<f64>,
-    /// The normal (not maximized) client size for the one `[desktop]`
-    /// write at close, once at least 640 x 480; the saved size until then.
-    window_size: Option<(u32, u32)>,
     /// The saved window size the first frame declares (constant: a later
     /// declaration would resize the window after it is shown).
     preferred_window: Option<(u32, u32)>,
-    /// The last observed size for the one `[desktop]` write at close.
-    close_window: CloseWindow,
+    /// The window's sizes (see [`SizeNote`]).
+    size_note: SizeNote,
+    /// The size class and docking result the size observer last posted.
+    layout: split_ui::Layout,
     /// `[desktop]` was read.
     preferences_loaded: bool,
     /// False for the one render after the screen tree is re-created: the
@@ -876,18 +902,32 @@ impl Component for DesktopApp {
             data_dir,
             status: "Connecting to the daemon…".to_owned(),
             alert: None,
-            icon_set: false,
             dialog: dialog_ui::Focus::default(),
-            prefs: crate::settings::Preferences::default(),
+            // The saved panel widths from the first frame, as the daemon's
+            // read will report them.
+            prefs: crate::settings::Preferences {
+                panels: input.panels,
+                ..crate::settings::Preferences::default()
+            },
             prefs_saving: false,
             prefs_rev: 0,
             startup_done: false,
             focus_held: None,
-            window_width: None,
-            window_height: None,
-            window_size: input.window.map(|window| (window.width, window.height)),
-            close_window: input.close_window.clone(),
+            size_note: input.size_note.clone(),
             preferred_window: input.window.map(|window| (window.width, window.height)),
+            // The first frame's guess from the saved size and panel widths,
+            // until the size observer posts.
+            layout: {
+                let widths = split_ui::PanelWidths::of(input.panels);
+                split_ui::Layout::of(
+                    input.window.map_or(tokens::layout::WINDOW_WIDTH, |window| {
+                        f64::from(window.width)
+                    }),
+                    widths.sidebar,
+                    false,
+                    widths.pane,
+                )
+            },
             preferences_loaded: false,
             fields_primed: true,
             prime_epoch: 0,
@@ -936,6 +976,7 @@ impl Component for DesktopApp {
                 shortcuts: None,
                 pace: live::Pace::default(),
                 sidebar_collapsed: false,
+                overlay_open: false,
                 history: Default::default(),
                 place_read: None,
                 place_epoch: 0,
@@ -1001,7 +1042,7 @@ impl Component for DesktopApp {
         if let Err(error) = crate::elements::install() {
             app.status = error;
         }
-        app.note_window_size();
+        app.note_data_dir();
         if let Ok(data_dir) = app.data_dir.clone() {
             let _start = app.start_connection(data_dir, 0, context);
         }
@@ -1017,6 +1058,7 @@ impl Component for DesktopApp {
     }
 
     fn update(&mut self, message: Message, context: &ComponentContext<Self>) {
+        let here = self.location();
         match message {
             Message::DialogClosed(epoch) => {
                 if self.dialog.epoch == epoch {
@@ -1045,6 +1087,10 @@ impl Component for DesktopApp {
             Message::Pane(msg) => self.pane_update(msg, context),
             Message::Reveal(item, path) => self.reveal_path(item, path),
         }
+        // A place opened from the compact window's navigation pane closes it.
+        if self.nav.overlay_open && self.location() != here {
+            self.nav.overlay_open = false;
+        }
         self.record_location();
         crate::vendor_sign_in::set_daemon_down(self.daemon_down());
         self.sync_monitor();
@@ -1065,16 +1111,19 @@ impl Component for DesktopApp {
 /// size and place and its maximized state persist once into `[desktop]`,
 /// only when they differ from the saved value.
 pub fn run(workspace: Option<PathBuf>) -> Result<(), String> {
-    let window = client::data_dir()
+    let saved = client::data_dir()
         .ok()
-        .and_then(|data_dir| crate::settings::saved_window(&data_dir));
-    let close_window = CloseWindow::default();
+        .map(|data_dir| crate::settings::saved_desktop(&data_dir))
+        .unwrap_or_default();
+    let window = saved.window;
+    let size_note = SizeNote::new(window.map(|window| (window.width, window.height)));
     // On this thread, which creates the window (Reactor runs WinUI here).
     let placement = crate::window_place::install(window);
     let result = App::run_component::<DesktopApp>(DesktopInput {
         workspace,
         window,
-        close_window: close_window.clone(),
+        panels: saved.panels,
+        size_note: size_note.clone(),
     })
     .map_err(|error| error.to_string());
     let closed = match placement {
@@ -1084,7 +1133,7 @@ pub fn run(workspace: Option<PathBuf>) -> Result<(), String> {
             None
         }
     };
-    if let Some((data_dir, (width, height))) = close_window.load() {
+    if let Some((data_dir, (width, height))) = size_note.load() {
         // Without a read placement the saved place stays as it was.
         let placement = crate::settings::WindowPlacement {
             width,

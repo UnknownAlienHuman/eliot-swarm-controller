@@ -571,7 +571,6 @@ impl DesktopApp {
         });
         let target = self.row_target(&format!("project:{}", state.key));
         View::component::<ProjectView>(ProjectInput {
-            width: self.page_width(tokens::page::WIDTH),
             name: self.place_title(&state.checkout),
             checkout: state.checkout.clone(),
             key: state.key.clone(),
@@ -761,8 +760,6 @@ struct WhoView {
 /// What the project page shows, read by the window.
 #[derive(Clone, PartialEq)]
 pub(super) struct ProjectInput {
-    /// The page column's width.
-    width: Option<f64>,
     name: String,
     checkout: String,
     key: String,
@@ -887,7 +884,11 @@ impl Component for ProjectView {
             "columns",
             page_ui::columns(left, tokens::spacing::MD, right),
         ));
-        page_ui::page(&format!("Project {}", input.name), input.width, items)
+        page_ui::page(
+            &format!("Project {}", input.name),
+            tokens::page::WIDTH,
+            items,
+        )
     }
 }
 

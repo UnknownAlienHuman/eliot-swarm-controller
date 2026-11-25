@@ -305,15 +305,11 @@ impl DesktopApp {
         &self,
         bound: &BoundAction,
         title: &str,
-        column: Option<f64>,
         context: &mut ViewContext<Self>,
     ) -> View {
         Border::new()
             .grid_row(4)
-            .maybe_width(column)
-            .max_width(tokens::layout::READING_WIDTH)
-            .horizontal_alignment(HorizontalAlignment::Center)
-            .margin(Thickness::new(0.0, tokens::spacing::SM, 0.0, 0.0))
+            .column(tokens::layout::READING_WIDTH, tokens::spacing::SM, 0.0)
             .background(ThemeBrush::SystemCriticalBackground)
             .corner_radius(tokens::radius::CONTAINER)
             .padding(Thickness::uniform(tokens::spacing::MD))
@@ -426,7 +422,7 @@ impl Pill {
             Self::Stopped => None,
         };
         Border::new()
-            .height(tokens::height::BADGE)
+            .min_height(tokens::height::BADGE)
             .corner_radius(tokens::radius::CONTROL)
             .border_brush(ThemeBrush::CardStroke)
             .border_thickness(Thickness::uniform(tokens::layout::HAIRLINE))
@@ -535,7 +531,6 @@ impl Component for Header {
                     Some(controls::glyph::GOAL),
                     words,
                     false,
-                    tokens::layout::PROJECT_CHIP_WIDTH,
                 ))
                 .into()
         });
@@ -625,7 +620,7 @@ impl Component for Header {
             "Terminal (Ctrl+J)",
         );
         let bar = Border::new()
-            .height(tokens::height::HEADER)
+            .min_height(tokens::height::HEADER)
             .border_brush(ThemeBrush::CardStroke)
             .border_thickness(Thickness::new(0.0, 0.0, 0.0, tokens::layout::HAIRLINE))
             .padding(Thickness::new(

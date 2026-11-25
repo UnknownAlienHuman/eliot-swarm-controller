@@ -86,6 +86,11 @@ const INDEX: &[(Page, &str, &str)] = &[
     ),
     (
         Page::General,
+        "Panel widths",
+        "reset panel widths sidebar pane resize width",
+    ),
+    (
+        Page::General,
         "On startup",
         "startup start conversation open reopen last task",
     ),
@@ -2128,53 +2133,59 @@ impl DesktopApp {
             },
             |error| Some(self.read_error(error, context)),
         );
-        let width = self.settings_column_width();
         // The page's tree is keyed by page, so its editors are new controls
-        // (see `reprime_fields`).
+        // (see `reprime_fields`). The capped column sits in a plain Border,
+        // not directly in the ScrollViewer (`views::Column`).
         let scroll = ScrollViewer::new()
             .vertical_scroll_bar_visibility(ScrollBarVisibility::Auto)
             .content(
-                StackPanel::new()
-                    .maybe_width(width)
-                    .horizontal_alignment(HorizontalAlignment::Center)
-                    .margin(Thickness::uniform(tokens::spacing::LG))
-                    .spacing(tokens::spacing::MD)
-                    .keyed_children(
-                        // Absent optional rows are skipped; the present ones keep their keys.
-                        vec![
-                            Some(KeyedView::new(
-                                format!("title:{}", page.label()),
-                                page_ui::toolbar(
-                                    page_ui::title(page.label()),
-                                    page.has_config()
-                                        .then(|| {
-                                            KeyedView::new(
-                                                "config",
-                                                controls::text_button()
-                                                    .automation_name("Open config.toml")
-                                                    .on_click(context.message(Message::Settings(
-                                                        SettingsMsg::OpenConfig,
-                                                    )))
-                                                    .content(controls::link_content(
-                                                        "Open config.toml",
-                                                    )),
-                                            )
-                                        })
-                                        .into_iter()
-                                        .collect(),
-                                ),
-                            )),
-                            status.map(|status| KeyedView::new("settings-read-status", status)),
-                            self.repair_startup_retry_view(context)
-                                .map(|view| KeyedView::new("repair-startup-retry", view)),
-                            self.settings_issues_view(page, context)
-                                .map(|view| KeyedView::new("settings-section-issues", view)),
-                            body.map(|body| KeyedView::new(format!("body:{}", page.label()), body)),
-                        ]
-                        .into_iter()
-                        .flatten()
-                        .collect::<Vec<_>>(),
-                    ),
+                Border::new().content(
+                    StackPanel::new()
+                        .min_width(tokens::layout::MIN_COLUMN)
+                        .max_width(tokens::page::SETTINGS_WIDTH)
+                        .margin(Thickness::uniform(tokens::spacing::LG))
+                        .spacing(tokens::spacing::MD)
+                        .keyed_children(
+                            // Absent optional rows are skipped; the present ones keep their keys.
+                            vec![
+                                Some(KeyedView::new(
+                                    format!("title:{}", page.label()),
+                                    page_ui::toolbar(
+                                        page_ui::title(page.label()),
+                                        page.has_config()
+                                            .then(|| {
+                                                KeyedView::new(
+                                                    "config",
+                                                    controls::text_button()
+                                                        .automation_name("Open config.toml")
+                                                        .on_click(context.message(
+                                                            Message::Settings(
+                                                                SettingsMsg::OpenConfig,
+                                                            ),
+                                                        ))
+                                                        .content(controls::link_content(
+                                                            "Open config.toml",
+                                                        )),
+                                                )
+                                            })
+                                            .into_iter()
+                                            .collect(),
+                                    ),
+                                )),
+                                status.map(|status| KeyedView::new("settings-read-status", status)),
+                                self.repair_startup_retry_view(context)
+                                    .map(|view| KeyedView::new("repair-startup-retry", view)),
+                                self.settings_issues_view(page, context)
+                                    .map(|view| KeyedView::new("settings-section-issues", view)),
+                                body.map(|body| {
+                                    KeyedView::new(format!("body:{}", page.label()), body)
+                                }),
+                            ]
+                            .into_iter()
+                            .flatten()
+                            .collect::<Vec<_>>(),
+                        ),
+                ),
             );
         // The save status stays in view below the page, however far the
         // page is scrolled.
@@ -2274,15 +2285,6 @@ impl DesktopApp {
             ));
         }
         Some(controls::settings_card(rows))
-    }
-
-    /// The settings column: one explicit width, so every page's groups
-    /// line up (content-sized until the window size is observed).
-    pub(super) fn settings_column_width(&self) -> Option<f64> {
-        self.main_width().map(|width| {
-            (width - 2.0 * tokens::spacing::LG)
-                .clamp(tokens::layout::MIN_COLUMN, tokens::page::SETTINGS_WIDTH)
-        })
     }
 
     /// Whether the page's changes save as they are made (no Save button):

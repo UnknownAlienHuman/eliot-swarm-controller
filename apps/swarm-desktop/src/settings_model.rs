@@ -762,6 +762,14 @@ pub fn desktop_section(
                 .collect::<Vec<_>>()
         ),
     );
+    match preferences.panels {
+        Some(panels) => {
+            map.insert("panels".to_owned(), json!(panels));
+        }
+        None => {
+            map.remove("panels");
+        }
+    }
     // The size replaces only width and height: the saved place and
     // maximized state stay until the close write replaces them.
     if let Some((width, height)) = window {

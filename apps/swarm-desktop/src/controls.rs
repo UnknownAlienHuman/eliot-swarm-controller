@@ -231,7 +231,7 @@ pub fn section_label(value: impl Into<String>) -> TextBlock {
 /// The sidebar's section label row: the label at the rows' content edge.
 pub fn section_row(value: &str) -> View {
     Border::new()
-        .height(height::CONTROL)
+        .min_height(height::CONTROL)
         .padding(Thickness::xy(spacing::ROW, 0.0))
         .margin(Thickness::new(0.0, spacing::INSET, 0.0, 0.0))
         .content(section_label(value.to_owned()).vertical_alignment(VerticalAlignment::Center))
@@ -321,19 +321,62 @@ pub fn dropdown_chevron() -> View {
     icon_sized(glyph::CHEVRON_DOWN, icon_size::CHEVRON)
 }
 
+/// The one row layout (the row rule): `Grid [Auto lead, STAR text, Auto
+/// trailing]`. The star cell holds the one trimmable text; a second text
+/// takes its own star cell (see [`row_content`]); absent parts take no
+/// column, so no gap shifts the text.
+pub fn row_grid(lead: Option<View>, text: View, trailing: Option<View>, gap: f64) -> View {
+    let mut columns = Vec::new();
+    let mut cells: Vec<KeyedView> = Vec::new();
+    if let Some(lead) = lead {
+        columns.push(GridLength::Auto);
+        cells.push(KeyedView::new(
+            "lead",
+            Border::new()
+                .vertical_alignment(VerticalAlignment::Center)
+                .content(lead),
+        ));
+    }
+    columns.push(GridLength::STAR);
+    cells.push(KeyedView::new(
+        "text",
+        Border::new()
+            .grid_column(cells.len() as i32)
+            .vertical_alignment(VerticalAlignment::Center)
+            .content(text),
+    ));
+    if let Some(trailing) = trailing {
+        columns.push(GridLength::Auto);
+        cells.push(KeyedView::new(
+            "trailing",
+            Border::new()
+                .grid_column(cells.len() as i32)
+                .vertical_alignment(VerticalAlignment::Center)
+                .content(trailing),
+        ));
+    }
+    Grid::new()
+        .columns(columns)
+        .column_spacing(gap)
+        .keyed_children(cells)
+        .into()
+}
+
+/// A trimmable label: one line, an ellipsis where it ends.
+fn trimmed(label: &str, style: TypeStyle) -> TextBlock {
+    text(label.to_owned(), style)
+        .vertical_alignment(VerticalAlignment::Center)
+        .text_trimming(TextTrimming::CharacterEllipsis)
+}
+
 /// Icon and label side by side: a row or menu entry.
 pub fn icon_label(glyph: &str, label: &str) -> View {
-    StackPanel::new()
-        .orientation(Orientation::Horizontal)
-        .spacing(spacing::ROW)
-        .children((
-            icon(glyph),
-            TextBlock::new()
-                .text(label)
-                .vertical_alignment(VerticalAlignment::Center)
-                .text_trimming(TextTrimming::CharacterEllipsis),
-        ))
-        .into()
+    row_grid(
+        Some(icon(glyph)),
+        trimmed(label, style::BODY).into(),
+        None,
+        spacing::ROW,
+    )
 }
 
 /// A labelled button's label.
@@ -473,48 +516,26 @@ pub fn row_content(
     note: &str,
     trailing: impl Into<Option<View>>,
 ) -> View {
-    let mut columns = Vec::new();
-    let mut cells: Vec<KeyedView> = Vec::new();
-    if let Some(glyph) = glyph {
-        columns.push(GridLength::Auto);
-        cells.push(KeyedView::new("icon", Border::new().content(icon(glyph))));
-    }
-    let title_cell = TextBlock::new()
-        .text(title)
-        .vertical_alignment(VerticalAlignment::Center)
-        .text_trimming(TextTrimming::CharacterEllipsis);
-    columns.push(if note.is_empty() {
-        GridLength::STAR
+    let title = trimmed(title, style::BODY);
+    // A note is a second text: its own star cell (a third of the room),
+    // at the right beside the trailing mark.
+    let text: View = if note.is_empty() {
+        title.into()
     } else {
-        GridLength::Auto
-    });
-    cells.push(KeyedView::new(
-        "title",
-        title_cell.grid_column(cells.len() as i32),
-    ));
-    if !note.is_empty() {
-        columns.push(GridLength::STAR);
-        cells.push(KeyedView::new(
-            "note",
-            secondary(note.to_owned())
-                .grid_column(cells.len() as i32)
-                .vertical_alignment(VerticalAlignment::Center)
-                .text_trimming(TextTrimming::CharacterEllipsis),
-        ));
-    }
-    columns.push(GridLength::Auto);
-    let trailing_cell = Border::new()
-        .grid_column(cells.len() as i32)
-        .vertical_alignment(VerticalAlignment::Center);
-    cells.push(KeyedView::new(
-        "trailing",
-        trailing_cell.maybe_content(trailing.into()),
-    ));
-    Grid::new()
-        .columns(columns)
-        .column_spacing(spacing::ROW)
-        .keyed_children(cells)
-        .into()
+        Grid::new()
+            .columns([GridLength::Star(2.0), GridLength::STAR])
+            .column_spacing(spacing::ROW)
+            .children((
+                title,
+                secondary(note.to_owned())
+                    .grid_column(1)
+                    .horizontal_alignment(HorizontalAlignment::Right)
+                    .vertical_alignment(VerticalAlignment::Center)
+                    .text_trimming(TextTrimming::CharacterEllipsis),
+            ))
+            .into()
+    };
+    row_grid(glyph.map(icon), text, trailing.into(), spacing::ROW)
 }
 
 /// A nav row's content: its icon, its label and a trailing caption
@@ -539,24 +560,13 @@ pub fn chip() -> Button {
 /// taking no input; `attention` draws its icon in the critical color. Its
 /// tooltip goes on the cell around it.
 pub fn fixed_chip(attention: bool, glyph: Option<&str>, label: &str, name: &str) -> View {
-    let mut parts: Vec<KeyedView> = Vec::new();
-    if let Some(glyph) = glyph {
-        parts.push(KeyedView::new(
-            "icon",
-            if attention {
-                critical_icon(glyph, icon_size::SMALL)
-            } else {
-                small_icon(glyph)
-            },
-        ));
-    }
-    parts.push(KeyedView::new(
-        "label",
-        text(label.to_owned(), style::CHIP)
-            .vertical_alignment(VerticalAlignment::Center)
-            .max_width(layout::PROJECT_CHIP_WIDTH)
-            .text_trimming(TextTrimming::CharacterEllipsis),
-    ));
+    let lead = glyph.map(|glyph| {
+        if attention {
+            critical_icon(glyph, icon_size::SMALL)
+        } else {
+            small_icon(glyph)
+        }
+    });
     Border::new()
         .min_height(height::CHIP)
         .border_brush(ThemeBrush::CardStroke)
@@ -564,14 +574,16 @@ pub fn fixed_chip(attention: bool, glyph: Option<&str>, label: &str, name: &str)
         .corner_radius(radius::CONTROL)
         .padding(Thickness::xy(spacing::INSET, 0.0))
         .vertical_alignment(VerticalAlignment::Center)
+        .horizontal_alignment(HorizontalAlignment::Left)
         .automation_name(name)
-        .content(
-            StackPanel::new()
-                .orientation(Orientation::Horizontal)
-                .spacing(spacing::CHIP_GAP)
-                .vertical_alignment(VerticalAlignment::Center)
-                .keyed_children(parts),
-        )
+        .content(row_grid(
+            lead,
+            trimmed(label, style::CHIP)
+                .max_width(layout::PROJECT_CHIP_WIDTH)
+                .into(),
+            None,
+            spacing::CHIP_GAP,
+        ))
         .into()
 }
 
@@ -581,27 +593,46 @@ pub fn reveal_button() -> HyperlinkButton {
     HyperlinkButton::new()
 }
 
-/// A chip's content: an optional icon, the label (trimmed at `max`), an
-/// optional chevron.
-pub fn chip_content(glyph: Option<&str>, label: &str, chevron: bool, max: f64) -> View {
-    let mut parts: Vec<KeyedView> = Vec::new();
-    if let Some(glyph) = glyph {
-        parts.push(KeyedView::new("icon", small_icon(glyph)));
-    }
-    parts.push(KeyedView::new(
-        "label",
-        text(label.to_owned(), style::CHIP)
-            .vertical_alignment(VerticalAlignment::Center)
-            .max_width(max)
-            .text_trimming(TextTrimming::CharacterEllipsis),
-    ));
-    if chevron {
-        parts.push(KeyedView::new("chevron", dropdown_chevron()));
-    }
-    StackPanel::new()
-        .orientation(Orientation::Horizontal)
-        .spacing(spacing::CHIP_GAP)
-        .keyed_children(parts)
+/// A chip's content (the row rule): an optional icon, the label (trimmed
+/// to the room the chip gets, at most a project chip's width), an optional
+/// chevron.
+pub fn chip_content(glyph: Option<&str>, label: &str, chevron: bool) -> View {
+    row_grid(
+        glyph.map(small_icon),
+        trimmed(label, style::CHIP)
+            .max_width(layout::PROJECT_CHIP_WIDTH)
+            .into(),
+        chevron.then(dropdown_chevron),
+        spacing::CHIP_GAP,
+    )
+}
+
+/// A row of chips, 6 DIPs apart: the first chip takes the star cell and
+/// trims its label when the row runs out of room; the others keep their
+/// size.
+pub fn chip_row(chips: Vec<View>) -> View {
+    let columns: Vec<GridLength> = (0..chips.len())
+        .map(|index| {
+            if index == 0 {
+                GridLength::STAR
+            } else {
+                GridLength::Auto
+            }
+        })
+        .collect();
+    Grid::new()
+        .columns(columns)
+        .column_spacing(spacing::CHIP_GAP)
+        .keyed_children(chips.into_iter().enumerate().map(|(index, chip)| {
+            KeyedView::new(
+                index,
+                Border::new()
+                    .grid_column(index as i32)
+                    .horizontal_alignment(HorizontalAlignment::Left)
+                    .vertical_alignment(VerticalAlignment::Center)
+                    .content(chip),
+            )
+        }))
         .into()
 }
 
@@ -726,17 +757,14 @@ pub fn file_chip() -> Button {
 
 /// A file chip's icon and its name.
 pub fn file_chip_content(glyph: &str, name: &str) -> View {
-    StackPanel::new()
-        .orientation(Orientation::Horizontal)
-        .spacing(spacing::XS)
-        .children((
-            icon_sized(glyph, icon_size::CHEVRON),
-            text(name.to_owned(), style::BODY)
-                .vertical_alignment(VerticalAlignment::Center)
-                .max_width(layout::PROJECT_CHIP_WIDTH)
-                .text_trimming(TextTrimming::CharacterEllipsis),
-        ))
-        .into()
+    row_grid(
+        Some(icon_sized(glyph, icon_size::CHEVRON)),
+        trimmed(name, style::BODY)
+            .max_width(layout::PROJECT_CHIP_WIDTH)
+            .into(),
+        None,
+        spacing::XS,
+    )
 }
 
 /// A suggestion card on Home: a default button with its icon and label at
@@ -782,7 +810,7 @@ pub fn composer_card(place: Grid, content: impl Into<View>) -> View {
 /// The header's status pill: the tone's mark and a caption of at most
 /// `label_width` that also trims to the room the pill is given (a grid, as
 /// a horizontal stack never trims).
-pub fn status_pill(tone: StatusTone, label: &str, label_width: f64) -> View {
+pub fn status_pill(tone: StatusTone, label: &str) -> View {
     Border::new()
         .min_height(height::BADGE)
         .corner_radius(radius::CONTROL)
@@ -792,21 +820,12 @@ pub fn status_pill(tone: StatusTone, label: &str, label_width: f64) -> View {
         .horizontal_alignment(HorizontalAlignment::Left)
         .vertical_alignment(VerticalAlignment::Center)
         .automation_name(label)
-        .content(
-            Grid::new()
-                .columns([GridLength::Auto, GridLength::STAR])
-                .column_spacing(spacing::CHIP_GAP)
-                .children((
-                    Border::new()
-                        .vertical_alignment(VerticalAlignment::Center)
-                        .content(status_mark(tone, layout::BADGE_DOT)),
-                    text(label.to_owned(), style::CAPTION)
-                        .grid_column(1)
-                        .vertical_alignment(VerticalAlignment::Center)
-                        .max_width(label_width)
-                        .text_trimming(TextTrimming::CharacterEllipsis),
-                )),
-        )
+        .content(row_grid(
+            Some(status_mark(tone, layout::BADGE_DOT)),
+            trimmed(label, style::CAPTION).into(),
+            None,
+            spacing::CHIP_GAP,
+        ))
         .into()
 }
 
@@ -1193,7 +1212,7 @@ pub fn sidebar_row(
 /// A section label row: the label, its actions at the end.
 pub fn section_label_row(value: &str, actions: impl Into<Option<View>>) -> View {
     Border::new()
-        .height(height::CONTROL)
+        .min_height(height::CONTROL)
         .padding(Thickness::new(spacing::ROW, 0.0, spacing::XS, 0.0))
         .content(
             Grid::new()

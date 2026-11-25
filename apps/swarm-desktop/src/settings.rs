@@ -154,6 +154,14 @@ pub const MAX_DISPLAY_NAME_CHARS: usize = 120;
 /// The longest collapsed-project key `[desktop]` accepts.
 pub const MAX_COLLAPSED_KEY: usize = 256;
 
+/// `[desktop] panels`: the sidebar's and the context pane's widths in DIPs,
+/// as their handles left them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+pub struct Panels {
+    pub sidebar: u32,
+    pub pane: u32,
+}
+
 /// The `[desktop]` preferences the window applies.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Preferences {
@@ -173,6 +181,8 @@ pub struct Preferences {
     pub collapsed_groups: Vec<String>,
     /// Owner-given names of sidebar projects and Agents.
     pub names: Vec<DisplayName>,
+    /// The panel widths; the defaults when absent.
+    pub panels: Option<Panels>,
 }
 
 impl Preferences {
@@ -202,6 +212,7 @@ impl Preferences {
             names: field("display_names")
                 .and_then(|value| serde_json::from_value(value).ok())
                 .unwrap_or_default(),
+            panels: field("panels").and_then(|value| serde_json::from_value(value).ok()),
         }
     }
 
@@ -583,21 +594,37 @@ pub fn window(reply: &SettingsReadResponse) -> Option<WindowPlacement> {
     serde_json::from_value(window.clone()).ok()
 }
 
-/// `[desktop] window` read from the settings file before the window exists
-/// (the daemon may not run yet), so the first frame already has the saved
-/// size and place. Anything unreadable opens at the defaults.
-pub fn saved_window(data_dir: &Path) -> Option<WindowPlacement> {
-    let source = read_config_source(data_dir).ok()??;
-    let value: toml::Value = toml::from_str(&source).ok()?;
-    value
-        .get("desktop")?
-        .get("window")?
-        .clone()
-        .try_into()
+/// `[desktop] window` and `panels` as read from the settings file before
+/// the window exists.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SavedDesktop {
+    pub window: Option<WindowPlacement>,
+    pub panels: Option<Panels>,
+}
+
+/// `[desktop]` read from the settings file before the window exists (the
+/// daemon may not run yet), so the first frame already has the saved size,
+/// place and panel widths. Anything unreadable opens at the defaults.
+pub fn saved_desktop(data_dir: &Path) -> SavedDesktop {
+    let desktop = read_config_source(data_dir)
         .ok()
-        .filter(|window: &WindowPlacement| {
-            eliot_daemon::desktop_window_in_bounds(window.width, window.height, window.x, window.y)
-        })
+        .flatten()
+        .and_then(|source| toml::from_str::<toml::Value>(&source).ok())
+        .and_then(|mut value| value.as_table_mut()?.remove("desktop"));
+    let field = |name: &str| desktop.as_ref()?.get(name).cloned();
+    SavedDesktop {
+        window: field("window")
+            .and_then(|window| window.try_into().ok())
+            .filter(|window: &WindowPlacement| {
+                eliot_daemon::desktop_window_in_bounds(
+                    window.width,
+                    window.height,
+                    window.x,
+                    window.y,
+                )
+            }),
+        panels: field("panels").and_then(|panels| panels.try_into().ok()),
+    }
 }
 
 pub async fn save(

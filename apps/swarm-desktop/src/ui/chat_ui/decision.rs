@@ -291,11 +291,7 @@ impl DesktopApp {
     /// The decision panel (`DecisionPanel`) in the composer's place: the
     /// kind line with "1 of N", the agent's words, the subject in the code
     /// ground, the actions. `None` when nothing waits.
-    pub(super) fn decision_panel(
-        &self,
-        column: Option<f64>,
-        context: &mut ViewContext<Self>,
-    ) -> Option<View> {
+    pub(super) fn decision_panel(&self, context: &mut ViewContext<Self>) -> Option<View> {
         let items = self.decisions();
         if items.is_empty() {
             return None;
@@ -721,15 +717,11 @@ impl DesktopApp {
         Some(
             Border::new()
                 .grid_row(5)
-                .maybe_width(column)
-                .max_width(tokens::layout::READING_WIDTH)
-                .horizontal_alignment(HorizontalAlignment::Center)
-                .margin(Thickness::new(
-                    0.0,
+                .column(
+                    tokens::layout::READING_WIDTH,
                     tokens::spacing::SM,
-                    0.0,
                     tokens::spacing::LG,
-                ))
+                )
                 .content(card)
                 .into(),
         )
@@ -1077,14 +1069,16 @@ impl DesktopApp {
                         .column_spacing(tokens::spacing::ROW)
                         .children((
                             controls::icon(controls::glyph::HOLD),
-                            StackPanel::new()
+                            Grid::new()
                                 .grid_column(1)
-                                .orientation(Orientation::Horizontal)
-                                .spacing(tokens::spacing::XS)
+                                .columns([GridLength::Auto, GridLength::STAR])
+                                .column_spacing(tokens::spacing::XS)
                                 .vertical_alignment(VerticalAlignment::Center)
                                 .children((
                                     controls::text(lead, tokens::text::BUTTON),
-                                    controls::body(rest).text_trimming(TextTrimming::CharacterEllipsis),
+                                    controls::body(rest)
+                                        .grid_column(1)
+                                        .text_trimming(TextTrimming::CharacterEllipsis),
                                 )),
                             Border::new()
                                 .grid_column(2)
@@ -1155,7 +1149,7 @@ impl DesktopApp {
         let words = words.join(" \u{b7} ");
         Some(
             Border::new()
-                .height(tokens::height::CONTROL)
+                .min_height(tokens::height::CONTROL)
                 .padding(Thickness::xy(tokens::spacing::INSET, 0.0))
                 .automation_name(words.clone())
                 .content(
@@ -1190,10 +1184,9 @@ impl DesktopApp {
             _ => return None,
         };
         Some(
-            StackPanel::new()
-                .orientation(Orientation::Horizontal)
-                .spacing(tokens::spacing::SM)
-                .horizontal_alignment(HorizontalAlignment::Center)
+            Grid::new()
+                .columns([GridLength::STAR, GridLength::Auto])
+                .column_spacing(tokens::spacing::SM)
                 .margin(Thickness::xy(0.0, tokens::spacing::XS))
                 .automation_name(words.clone())
                 .keyed_children(crate::views::slots([
@@ -1206,6 +1199,7 @@ impl DesktopApp {
                     if retry {
                         Some(
                             controls::text_button()
+                                .grid_column(1)
                                 .automation_name("Retry live updates")
                                 .on_click(context.message(Message::Chat(ChatMsg::LiveRetry)))
                                 .content(controls::label("Retry"))
@@ -1214,6 +1208,7 @@ impl DesktopApp {
                     } else if start {
                         Some(
                             controls::text_button()
+                                .grid_column(1)
                                 .automation_name("Start Swarm")
                                 .on_click(context.message(Message::Shell(ShellMsg::RetryStartup)))
                                 .content(controls::label("Start Swarm"))
