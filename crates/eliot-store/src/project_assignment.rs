@@ -81,6 +81,7 @@ impl Store {
         let write = AssignmentWrite::new(&request.id, CLAIM, principal, request, now)?;
         self.change_project_assignment(write, |tx| {
             let (registration, caller) = authorize_project(tx, principal, &request.project)?;
+            project_transfer::require_no_intent(tx, &request.project)?;
             let (id, generation) = match (&request.manager, &caller) {
                 (Some(ProjectManagerIdentity::Remote { .. }), _) => {
                     return Err(Error::new(

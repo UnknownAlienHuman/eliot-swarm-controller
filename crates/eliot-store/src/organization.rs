@@ -154,10 +154,12 @@ impl LinkRequest<'_> {
 fn organization_roots(conn: &Connection, project: &str, archived: &str) -> Result<Vec<i64>> {
     let mut statement = conn
         .prepare(&format!(
-            "SELECT a.id FROM agents a WHERE a.parent IS NULL AND a.observe_only = 0
-             AND a.chat = 0 AND {} = ?1 AND {archived}
-             ORDER BY a.id LIMIT ?2",
-            retained_project("a")
+            "WITH {} SELECT a.id FROM organization_links link JOIN agents a ON a.id=link.agent
+             WHERE link.project=?1 ORDER BY a.id LIMIT ?2",
+            organization_links_sql(&format!(
+                "SELECT a.id FROM agents a WHERE a.parent IS NULL AND a.observe_only=0
+                 AND a.chat=0 AND {archived}"
+            ))
         ))
         .map_err(sql_error)?;
     let rows = statement
@@ -226,41 +228,69 @@ fn repository_evidence(agent: &str) -> String {
     )
 }
 
-/// Resolve the retained registration or unambiguous repository evidence.
-/// Only absent evidence falls back to the parent; ambiguity stays unplaced.
-fn retained_agent_project(agent: &str, parent: &str) -> String {
-    let evidence = repository_evidence(agent);
+/// A set of presentation links for the selected Agents. Compute local
+/// evidence once for each selected Agent, parent and root. Retained
+/// worktrees are reached by their unique path or owner primary key.
+pub(super) fn organization_links_sql(candidates: &str) -> String {
+    let checkout = checkout_key_sql("r.checkout");
+    let common_dir = checkout_key_sql("r.repo_common_dir");
+    let workspace = checkout_key_sql("a.workspace");
+    let project = checkout_key_sql("a.project");
+    let owned_path = checkout_key_sql("owned.worktree_path");
+    let owned_common = checkout_key_sql("owned.repo_common_dir");
+    let borrowed_common = checkout_key_sql("borrowed.repo_common_dir");
     format!(
-        "CASE WHEN EXISTS (SELECT 1 FROM project_registrations r WHERE r.id={agent}.project)
-         THEN {agent}.project ELSE (
-             SELECT CASE COUNT(*) WHEN 0 THEN {parent} WHEN 1 THEN MIN(r.id) END
-             FROM project_registrations r WHERE {evidence})
-         END"
-    )
-}
-
-fn retained_project(agent: &str) -> String {
-    let root = retained_agent_project("root", "NULL");
-    let parent = retained_agent_project("parent", &root);
-    retained_agent_project(
-        agent,
-        &format!(
-            "(SELECT {parent} FROM agents parent
-              LEFT JOIN agents root ON root.id={agent}.root AND root.id<>parent.id
-                   AND root.parent IS NULL AND root.chat=0
-              WHERE parent.id={agent}.parent AND parent.id<>{agent}.id
-                    AND parent.root={agent}.root AND parent.chat=0)"
-        ),
-    )
-}
-
-/// One grouping key for pages, totals, and Agent list readback. Execution
-/// labels and the scope that authorizes effects stay on the retained Agent.
-pub(super) fn organization_group() -> String {
-    format!(
-        "CASE WHEN a.chat=1 THEN (SELECT r.id FROM project_registrations r WHERE r.id=o.project_link)
-              ELSE {} END",
-        retained_project("a")
+        "organization_candidates(id) AS MATERIALIZED ({candidates}),
+         organization_subjects(id) AS (
+             SELECT id FROM organization_candidates
+             UNION SELECT a.parent FROM organization_candidates c JOIN agents a ON a.id=c.id
+             WHERE a.parent IS NOT NULL
+             UNION SELECT a.root FROM organization_candidates c JOIN agents a ON a.id=c.id
+             WHERE a.parent IS NOT NULL AND a.root IS NOT NULL
+         ),
+         organization_registrations AS MATERIALIZED (
+             SELECT r.id, {checkout} AS checkout_key, {common_dir} AS common_key
+             FROM project_registrations r
+         ),
+         organization_evidence AS MATERIALIZED (
+             SELECT a.id, registered.id AS declared_project, {project} AS project_key,
+                    {workspace} AS workspace_key, {owned_common} AS owned_common_key,
+                    {borrowed_common} AS borrowed_common_key
+             FROM organization_subjects s JOIN agents a ON a.id=s.id
+             LEFT JOIN project_registrations registered ON registered.id=a.project
+             LEFT JOIN workspaces owned ON owned.agent=a.id AND {owned_path}={workspace}
+             LEFT JOIN workspaces borrowed ON borrowed.worktree_path=a.workspace
+             WHERE a.chat=0
+         ),
+         organization_legacy AS (
+             SELECT e.id, CASE WHEN COUNT(*)=1 THEN MIN(r.id) END AS project
+             FROM organization_evidence e JOIN organization_registrations r
+               ON r.checkout_key IN (e.project_key,e.workspace_key)
+               OR r.common_key IN (e.owned_common_key,e.borrowed_common_key)
+             WHERE e.declared_project IS NULL GROUP BY e.id
+         ),
+         organization_local AS MATERIALIZED (
+             SELECT e.id, COALESCE(e.declared_project,l.project) AS project,
+                    e.declared_project IS NOT NULL OR l.id IS NOT NULL AS has_evidence
+             FROM organization_evidence e LEFT JOIN organization_legacy l ON l.id=e.id
+         ),
+         organization_links AS (
+             SELECT a.id AS agent,
+                    CASE WHEN a.chat=1 THEN placed.id
+                         WHEN own.has_evidence THEN own.project
+                         WHEN parent_link.has_evidence THEN parent_link.project
+                         ELSE root_link.project END AS project
+             FROM organization_candidates c JOIN agents a ON a.id=c.id
+             LEFT JOIN chat_organization o ON o.agent=a.id AND a.chat=1
+             LEFT JOIN project_registrations placed ON placed.id=o.project_link
+             LEFT JOIN agents parent ON parent.id=a.parent AND parent.id<>a.id
+                    AND parent.root=a.root AND parent.chat=0
+             LEFT JOIN agents root ON root.id=a.root AND root.id<>parent.id
+                    AND root.parent IS NULL AND root.chat=0
+             LEFT JOIN organization_local own ON own.id=a.id
+             LEFT JOIN organization_local parent_link ON parent_link.id=parent.id
+             LEFT JOIN organization_local root_link ON root_link.id=root.id
+         )"
     )
 }
 
@@ -275,10 +305,9 @@ pub(super) fn agent_organization(
     let (group, raw_tags, revision): (Option<String>, Option<String>, Option<i64>) = conn
         .query_row(
             &format!(
-                "SELECT {}, o.tags, o.revision
-                 FROM agents a LEFT JOIN chat_organization o ON o.agent = a.id
-                 WHERE a.id = ?1",
-                organization_group()
+                "WITH {} SELECT link.project, o.tags, o.revision
+                 FROM organization_links link LEFT JOIN chat_organization o ON o.agent=link.agent",
+                organization_links_sql("SELECT ?1")
             ),
             [agent],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
@@ -302,15 +331,17 @@ fn organization_count(
     let archived = read.archived;
     let sql = |predicate: &str, first: usize| {
         format!(
-            "SELECT COUNT(*) FROM agents a LEFT JOIN chat_organization o ON o.agent = a.id
-             WHERE {archived} AND {predicate}{}",
+            "WITH {} SELECT COUNT(*) FROM organization_links link JOIN agents a ON a.id=link.agent
+             WHERE {predicate}{}",
+            organization_links_sql(&format!("SELECT a.id FROM agents a WHERE {archived}")),
             read.query_suffix(first)
         )
     };
     let total: i64 = match project {
         Some(name) => {
-            let predicate = format!("{} = ?1", organization_group());
-            let mut statement = conn.prepare(&sql(&predicate, 2)).map_err(sql_error)?;
+            let mut statement = conn
+                .prepare(&sql("link.project = ?1", 2))
+                .map_err(sql_error)?;
             let mut params: Vec<rusqlite::types::Value> = vec![name.to_owned().into()];
             params.extend(read.query_params());
             statement
@@ -319,7 +350,7 @@ fn organization_count(
         }
         None => {
             let mut statement = conn
-                .prepare(&sql(&format!("{} IS NULL", organization_group()), 1))
+                .prepare(&sql("link.project IS NULL", 1))
                 .map_err(sql_error)?;
             statement
                 .query_row(
@@ -407,28 +438,28 @@ fn organization_members(
     let archived = read.archived;
     let take = i64::try_from(take)
         .map_err(|_| Error::new("internal", "organization page bound is invalid"))?;
-    let group = organization_group();
+    let links = organization_links_sql(&format!("SELECT a.id FROM agents a WHERE {archived}"));
     let mut statement = match project {
         Some(_) => conn
             .prepare(&format!(
-                "SELECT a.id, a.generation, a.state, a.harness, a.parent, a.root, a.project,
+                "WITH {links} SELECT a.id, a.generation, a.state, a.harness, a.parent, a.root, a.project,
                         a.chat, a.archived, a.observe_only, a.workspace,
                         o.project_link, o.tags, o.continued_from
-                 FROM agents a LEFT JOIN chat_organization o ON o.agent = a.id
-                 WHERE {group} = ?1
-                   AND {archived}{}
+                 FROM organization_links link JOIN agents a ON a.id=link.agent
+                 LEFT JOIN chat_organization o ON o.agent=a.id
+                 WHERE link.project = ?1{}
                  ORDER BY a.id LIMIT ?2",
                 read.query_suffix(3)
             ))
             .map_err(sql_error)?,
         None => conn
             .prepare(&format!(
-                "SELECT a.id, a.generation, a.state, a.harness, a.parent, a.root, a.project,
+                "WITH {links} SELECT a.id, a.generation, a.state, a.harness, a.parent, a.root, a.project,
                         a.chat, a.archived, a.observe_only, a.workspace,
                         o.project_link, o.tags, o.continued_from
-                 FROM agents a LEFT JOIN chat_organization o ON o.agent = a.id
-                 WHERE {group} IS NULL
-                   AND {archived}{}
+                 FROM organization_links link JOIN agents a ON a.id=link.agent
+                 LEFT JOIN chat_organization o ON o.agent=a.id
+                 WHERE link.project IS NULL{}
                  ORDER BY a.id LIMIT ?1",
                 read.query_suffix(2)
             ))
@@ -624,10 +655,10 @@ impl Store {
         {
             let mut totals = conn
                 .prepare(&format!(
-                    "SELECT {}, COUNT(*)
-                     FROM agents a LEFT JOIN chat_organization o ON o.agent = a.id
-                     WHERE {archived}{} GROUP BY 1",
-                    organization_group(),
+                    "WITH {} SELECT link.project, COUNT(*)
+                     FROM organization_links link JOIN agents a ON a.id=link.agent
+                     WHERE 1=1{} GROUP BY link.project",
+                    organization_links_sql(&format!("SELECT a.id FROM agents a WHERE {archived}")),
                     read.query_suffix(1),
                 ))
                 .map_err(sql_error)?;
