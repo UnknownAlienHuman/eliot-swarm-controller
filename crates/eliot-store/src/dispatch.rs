@@ -651,9 +651,10 @@ fn dispatch_send_tx(
     // reassociation keeps this stamp, so a send committed
     // before an overlay never runs under newer configuration.
     let revision = current_config_revision_tx(tx, agent_num, agent.generation)?;
+    let assignment_usage = usage::send_assignment_usage(tx, agent)?;
     db!(tx.execute(
-        "UPDATE commands SET config_revision = ?1 WHERE id = ?2",
-        params![revision, id],
+        "UPDATE commands SET config_revision = ?1, assignment_usage = ?2 WHERE id = ?3",
+        params![revision, assignment_usage, id],
     ));
     let mut send_args = context::send_args(&command.command.args, &claimed_input.context_items)?;
     if let Some(text) = &claimed_input.text_with_mail {

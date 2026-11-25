@@ -6754,8 +6754,10 @@ fn insert_turn(tx: &Transaction<'_>, turn: TurnInsert<'_>) -> Result<()> {
     db!(tx.execute(
         "INSERT INTO turns(agent, generation, turn_id, start_command_id, state, status, outcome, native_status,
                            final_text, started_at, completed_at, usage, config_revision,
-                           preceded_by, effective_model, insertion_seq, native_trigger)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+                           preceded_by, effective_model, insertion_seq, native_trigger, assignment_usage)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17,
+                 (SELECT assignment_usage FROM commands
+                  WHERE id = ?4 AND verb = 'send' AND target = ?1 AND generation = ?2))",
         params![
             turn.agent,
             turn.generation,

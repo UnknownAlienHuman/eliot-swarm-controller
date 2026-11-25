@@ -2123,6 +2123,14 @@ pub(crate) struct ProjectAssignmentArgs {
 pub(crate) enum ProjectAssignmentCommand {
     /// Read a project's current assignment.
     Get { project: String },
+    /// Read turn usage for an assignment epoch, or the project's unattributed turns.
+    Usage {
+        project: String,
+        #[arg(long, value_parser = clap::value_parser!(i64).range(1..))]
+        epoch: Option<i64>,
+        #[arg(long, value_parser = clap::value_parser!(i64).range(1..))]
+        after: Option<i64>,
+    },
     /// Claim as the current Agent, or explicitly name a manager at a revision.
     Claim {
         project: String,
