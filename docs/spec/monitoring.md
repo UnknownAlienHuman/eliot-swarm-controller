@@ -1602,6 +1602,11 @@ are integer microseconds, and p50 and p95 use nearest rank. The ten slowest
 retained calls contain method and duration only. Sampling adds no per-call
 log lines and resets on daemon restart.
 
+Intentional waits stay outside both the method windows and the slowest-call
+list. This includes `swarm.wait`, `events.subscribe`, `inject.wait`, and
+`mail.inbox` or `child.run` calls that request a positive wait. Ordinary
+`events.read` and `events.bounds` remain measured.
+
 ## Swarm autonomy
 
 [`autonomy.get`](api.md#agent-and-daemon-read-views) reports the Store evidence for

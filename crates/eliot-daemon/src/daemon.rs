@@ -2204,10 +2204,12 @@ async fn serve_connection_with_write_timeout(
     let mut measured = false;
     let mut rpc_context = None;
     let mut store_wait = Duration::ZERO;
+    let mut latency_method = None;
     let response = match incoming {
         Ok(Some(Ok(line))) if line.len().saturating_add(1) <= MAX_RPC_FRAME_BYTES => {
             match decode_request(&line) {
                 Ok(request) => {
+                    latency_method = Router::rpc_latency_method(&request);
                     measured = request.params.get("_timing") == Some(&Value::Bool(true));
                     let is_shutdown = request.method == "daemon.shutdown"
                         && !matches!(
@@ -2324,8 +2326,9 @@ async fn serve_connection_with_write_timeout(
     if wrote_response {
         if let Some(context) = rpc_context.as_ref()
             && context.principal != "unauthenticated"
+            && let Some(method) = latency_method
         {
-            router.record_rpc_latency(&context.method, accepted_at.elapsed(), store_wait);
+            router.record_rpc_latency(method, accepted_at.elapsed(), store_wait);
         }
     } else {
         let (principal, method) = rpc_context

@@ -1077,17 +1077,30 @@ impl Router {
         self.signal_progress();
     }
 
+    pub(crate) fn rpc_latency_method(request: &eliot_plugin::RpcRequest) -> Option<&'static str> {
+        let method = discovery::canonical_method(&request.method)?;
+        match method {
+            "swarm.wait" | "events.subscribe" | "inject.wait" => None,
+            "mail.inbox" | "child.run"
+                if request.params["_payload"]["wait_ms"]
+                    .as_u64()
+                    .is_some_and(|wait| wait > 0) =>
+            {
+                None
+            }
+            _ => Some(method),
+        }
+    }
+
     pub(crate) fn record_rpc_latency(
         &self,
-        method: &str,
+        method: &'static str,
         duration: Duration,
         store_wait: Duration,
     ) {
-        if let Some(method) = discovery::canonical_method(method) {
-            self.inner
-                .rpc_latencies
-                .record(method, duration, store_wait);
-        }
+        self.inner
+            .rpc_latencies
+            .record(method, duration, store_wait);
     }
 
     pub(crate) async fn request_force(&self) {
