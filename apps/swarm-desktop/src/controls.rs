@@ -1134,6 +1134,20 @@ pub enum RowMark {
     Failed,
 }
 
+impl RowMark {
+    /// The mark's own name for a screen reader, when the row gives no more
+    /// precise word (`Lost`, `Provider hold`).
+    pub fn word(self) -> &'static str {
+        match self {
+            Self::Working => "Working",
+            Self::Waiting => "Waiting",
+            Self::Idle => "Idle",
+            Self::Queued => "Queued",
+            Self::Failed => "Failed",
+        }
+    }
+}
+
 /// The view of a row's state mark in its slot: `word` names it for a
 /// screen reader; the row's text or tooltip says it on screen. A stopped
 /// row has no mark (`None` where a mark is optional).

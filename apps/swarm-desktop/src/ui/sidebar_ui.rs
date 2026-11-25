@@ -978,7 +978,7 @@ fn agent_row(task: &TaskEntry, input: &SidebarInput, context: &mut ViewContext<S
         end
     };
     let kid = row.depth > 0;
-    let leading = mark.map(|mark| controls::row_mark(mark, word.unwrap_or("Failed")));
+    let leading = mark.map(|mark| controls::row_mark(mark, word.unwrap_or(mark.word())));
     let row_button = controls::sub_row(selected)
         .automation_name(name)
         .on_click(context.message(Message::Shell(ShellMsg::AgentOpened(agent.clone()))))
