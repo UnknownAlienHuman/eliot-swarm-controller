@@ -21,8 +21,8 @@ use eliot_core::api::HarnessModelEntry;
 use eliot_core::local_provider::LocalProvider;
 use eliot_core::{ContextItem, Error, FailureOrigin, InjectPoint, McpPolicy, Result, SecretPolicy};
 use eliot_plugin::{
-    AgentCommandParams, AgentSnapshotParams, AgentStartParams, AgentStopParams, InitializeParams,
-    MAX_TEXT_BYTES, Peer, PeerClient, PluginManifest, RpcRequest,
+    AgentCommandParams, AgentCommandVerb, AgentSnapshotParams, AgentStartParams, AgentStopParams,
+    InitializeParams, MAX_TEXT_BYTES, Peer, PeerClient, PluginManifest, RpcRequest,
     protocol::{
         AgentModelCatalogue, AgentModelsParams, ModelListParams, ModelListPart,
         NativeArchiveParams, stream_sources,
@@ -2767,13 +2767,15 @@ impl OpenCodePlugin {
             &params.command_id,
             "OpenCode",
         )?;
-        match params.verb.as_str() {
-            "send" => self.send_command(params).await,
-            "configure" => self.configure_command(params).await,
-            "compact" => self.compact_command(params).await,
-            "steer" => self.steer_command(params).await,
-            "interrupt" => self.interrupt_command(params).await,
-            "approve" | "deny" | "answer" => self.reply_command(params).await,
+        match &params.verb {
+            AgentCommandVerb::Send => self.send_command(params).await,
+            AgentCommandVerb::Configure => self.configure_command(params).await,
+            AgentCommandVerb::Compact => self.compact_command(params).await,
+            AgentCommandVerb::Steer => self.steer_command(params).await,
+            AgentCommandVerb::Interrupt => self.interrupt_command(params).await,
+            AgentCommandVerb::Approve | AgentCommandVerb::Deny | AgentCommandVerb::Answer => {
+                self.reply_command(params).await
+            }
             _ => Err(Error::new(
                 "unsupported",
                 "OpenCode plugin command verb is not implemented",
@@ -3548,7 +3550,7 @@ impl OpenCodePlugin {
                 params.command_id,
                 request_id,
                 turn_id,
-                params.verb,
+                params.verb.as_str().to_owned(),
                 params.args,
             )
             .await

@@ -434,12 +434,79 @@ pub struct InitializeParams {
     pub config: Value,
 }
 
+/// Controls crossing the native plugin boundary. An unrecognized spelling
+/// still reaches the adapter's normal unsupported-command path.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AgentCommandVerb {
+    Send,
+    Steer,
+    Interrupt,
+    Compact,
+    Inject,
+    Configure,
+    Approve,
+    Deny,
+    Answer,
+    Other(String),
+}
+
+impl AgentCommandVerb {
+    fn known(verb: &str) -> Option<Self> {
+        Some(match verb {
+            "send" => Self::Send,
+            "steer" => Self::Steer,
+            "interrupt" => Self::Interrupt,
+            "compact" => Self::Compact,
+            "inject" => Self::Inject,
+            "configure" => Self::Configure,
+            "approve" => Self::Approve,
+            "deny" => Self::Deny,
+            "answer" => Self::Answer,
+            _ => return None,
+        })
+    }
+
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Send => "send",
+            Self::Steer => "steer",
+            Self::Interrupt => "interrupt",
+            Self::Compact => "compact",
+            Self::Inject => "inject",
+            Self::Configure => "configure",
+            Self::Approve => "approve",
+            Self::Deny => "deny",
+            Self::Answer => "answer",
+            Self::Other(verb) => verb,
+        }
+    }
+}
+
+impl From<&str> for AgentCommandVerb {
+    fn from(verb: &str) -> Self {
+        Self::known(verb).unwrap_or_else(|| Self::Other(verb.to_owned()))
+    }
+}
+
+impl Serialize for AgentCommandVerb {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for AgentCommandVerb {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let verb = String::deserialize(deserializer)?;
+        Ok(Self::known(&verb).unwrap_or(Self::Other(verb)))
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AgentCommandParams {
     pub agent_id: String,
     pub generation: i64,
     pub command_id: String,
-    pub verb: String,
+    pub verb: AgentCommandVerb,
     /// Daemon-authorized Owner interrupt of this controlled native session.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub owner_control: bool,

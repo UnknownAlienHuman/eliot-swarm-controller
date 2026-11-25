@@ -236,6 +236,10 @@ quota decisions, routing, and hold settlement.
 | `initialize` | protocol, frozen plugin config, private instance directory, optional `store_root` (required by OpenCode) | return actual manifest |
 | `agent.start` | agent/generation, profile, workspace, target environment, note, source plan/state, optional resume subject/linked initial input | establish session; input/result settle separately; a proven startup refusal returns a bound `"state": "failed"` with a short non-secret `reason` |
 | `agent.command` | agent/generation, command id, verb/args, exact turn/request where required | applied/rejected/failed/unknown, native mechanism and application point |
+
+The native command envelope carries the stable verb spelling. Host and adapter
+dispatch use the shared typed verb. The frozen launch model and effort share one
+projection for adapters that apply retained effort overrides at turn time.
 | `agent.stop` | agent/generation, command id | gracefully close the bound controlled native session and drain its events |
 | `agent.snapshot` | controlled command/turn binding, or exact subject plus `observation` page query | bounded readback; private history never acknowledges controlled effects |
 | `model.list` | [`ModelListParams`](../../crates/eliot-plugin/src/protocol.rs) | Read a dedicated reader's normalized `ModelCatalogue`. OpenCode can return optional metadata for the primary inventory from a second owned reader. |

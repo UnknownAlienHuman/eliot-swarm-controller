@@ -7,8 +7,8 @@ use crate::{
 };
 use eliot_core::{ContextItem, Error, InjectPoint, McpPolicy, Result, SecretPolicy};
 use eliot_plugin::{
-    AgentCommandParams, AgentSnapshotParams, AgentStartParams, AgentStopParams, InitializeParams,
-    MAX_TEXT_BYTES, Peer, PeerClient, PluginManifest, RpcRequest,
+    AgentCommandParams, AgentCommandVerb, AgentSnapshotParams, AgentStartParams, AgentStopParams,
+    InitializeParams, MAX_TEXT_BYTES, Peer, PeerClient, PluginManifest, RpcRequest,
     native_transport::NativeLaunch,
     protocol::stream_sources,
     session::{
@@ -672,22 +672,19 @@ impl ClaudePlugin {
         // stays absent separately from the effective readback. A resume
         // running under an inherited `configure` overlay realigns to the
         // overlay's effective model instead of the frozen snapshot.
-        let requested_model: Option<String> = params
-            .model_override
-            .clone()
-            .filter(|value| !value.trim().is_empty())
-            .or_else(|| {
-                profile
-                    .get("model")
-                    .and_then(Value::as_str)
-                    .filter(|value| !value.trim().is_empty())
-                    .map(str::to_owned)
-            });
+
         // The daemon freezes the closed CLI permission-mode vocabulary here;
         // unset means the CLI-default posture.
         let requested_permission_mode =
             optional_profile_text(profile, "permission_mode", "Claude")?;
-        let requested_effort = optional_profile_text(profile, "effort", "Claude")?;
+        let eliot_plugin::session::FrozenLaunchModel {
+            model: requested_model,
+            effort: requested_effort,
+        } = eliot_plugin::session::FrozenLaunchModel::read(
+            profile,
+            params.model_override.as_deref(),
+            "Claude",
+        )?;
         // Frozen worker MCP policy: inherit keeps the normal MCP precedence,
         // minimal is enforced with the installed `--strict-mcp-config` flag.
         let requested_mcp_policy = McpPolicy::parse_snapshot(profile)
@@ -1176,15 +1173,15 @@ impl ClaudePlugin {
             &params.command_id,
             "Claude",
         )?;
-        match params.verb.as_str() {
-            "send" => self.send_command(params).await,
-            "configure" => self.configure_command(params).await,
-            "steer" => Err(Error::new(
+        match &params.verb {
+            AgentCommandVerb::Send => self.send_command(params).await,
+            AgentCommandVerb::Configure => self.configure_command(params).await,
+            AgentCommandVerb::Steer => Err(Error::new(
                 "native_not_dispatched",
                 "Claude steer is delivered through turn_safe_point tool hooks",
             )),
-            "interrupt" => self.interrupt_command(params).await,
-            "approve" | "deny" => self.reply_request(params).await,
+            AgentCommandVerb::Interrupt => self.interrupt_command(params).await,
+            AgentCommandVerb::Approve | AgentCommandVerb::Deny => self.reply_request(params).await,
             _ => Err(Error::new(
                 "unsupported",
                 "Claude plugin command verb is not implemented",
@@ -1493,7 +1490,7 @@ impl ClaudePlugin {
                 params.command_id.clone(),
                 request_id.to_owned(),
                 turn_id.to_owned(),
-                params.verb.clone(),
+                params.verb.as_str().to_owned(),
                 params.args.clone(),
                 native,
             )

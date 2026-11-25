@@ -28,9 +28,9 @@ use eliot_core::{
     McpPolicy, NativeStoreBinding, Result, SecretPolicy,
 };
 use eliot_plugin::{
-    AgentCommandParams, AgentSnapshotParams, AgentStartParams, AgentStopParams, DiscoverParams,
-    InitializeParams, MAX_EVENT_BYTES, MAX_TEXT_BYTES, ObserverAttachParams, ObserverDetachParams,
-    ObserverSnapshotParams, Peer, PeerClient, PluginManifest, RpcRequest,
+    AgentCommandParams, AgentCommandVerb, AgentSnapshotParams, AgentStartParams, AgentStopParams,
+    DiscoverParams, InitializeParams, MAX_EVENT_BYTES, MAX_TEXT_BYTES, ObserverAttachParams,
+    ObserverDetachParams, ObserverSnapshotParams, Peer, PeerClient, PluginManifest, RpcRequest,
     protocol::{ProfileStoreParams, stream_sources},
     resume::ResumePreflight,
     session::{
@@ -2017,13 +2017,15 @@ impl CodexPlugin {
             &params.command_id,
             "Codex",
         )?;
-        match params.verb.as_str() {
-            "send" => self.send_command(params).await,
-            "compact" => self.compact_command(params).await,
-            "steer" => self.steer(params).await,
-            "inject" => self.inject_active_turn(params).await,
-            "interrupt" => self.interrupt(params).await,
-            "approve" | "deny" | "answer" => self.reply_request(params).await,
+        match &params.verb {
+            AgentCommandVerb::Send => self.send_command(params).await,
+            AgentCommandVerb::Compact => self.compact_command(params).await,
+            AgentCommandVerb::Steer => self.steer(params).await,
+            AgentCommandVerb::Inject => self.inject_active_turn(params).await,
+            AgentCommandVerb::Interrupt => self.interrupt(params).await,
+            AgentCommandVerb::Approve | AgentCommandVerb::Deny | AgentCommandVerb::Answer => {
+                self.reply_request(params).await
+            }
             _ => Err(Error::new(
                 "unsupported",
                 "Codex plugin command verb is not implemented",
@@ -2576,7 +2578,7 @@ impl CodexPlugin {
             .get("text")
             .and_then(Value::as_str)
             .ok_or_else(|| Error::new("invalid", "Codex steer requires args.text"))?;
-        if params.verb != "inject" && text.len() > MAX_TEXT_BYTES {
+        if params.verb != AgentCommandVerb::Inject && text.len() > MAX_TEXT_BYTES {
             return Ok(rejected_control("Codex steer input exceeds 512 KiB"));
         }
         if session.secrets.iter().any(|secret| text.contains(secret)) {
@@ -2776,7 +2778,7 @@ impl CodexPlugin {
                 params.command_id.clone(),
                 request_id.to_owned(),
                 turn_id.to_owned(),
-                params.verb.clone(),
+                params.verb.as_str().to_owned(),
                 params.args.clone(),
             )
             .await

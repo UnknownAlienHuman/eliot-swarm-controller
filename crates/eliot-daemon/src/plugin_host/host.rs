@@ -22,7 +22,7 @@ use eliot_core::{
     api::{ArtifactKind, ArtifactView},
 };
 use eliot_plugin::{
-    AgentCommandParams, PluginManifest, StderrCapture, StderrView,
+    AgentCommandParams, AgentCommandVerb, PluginManifest, StderrCapture, StderrView,
     protocol::{AgentModelsParams, ModelCatalogue},
     spawn_plugin_stderr,
     sync::LockExt,
@@ -3077,24 +3077,24 @@ fn record_plugin_error(
     );
 }
 
-fn plugin_command_args(command: &Command) -> Result<Value> {
+fn plugin_command_args(command: &Command, verb: &AgentCommandVerb) -> Result<Value> {
     let mut args = command
         .args
         .as_object()
         .cloned()
         .ok_or_else(|| Error::new("invalid", "plugin command args must be an object"))?;
-    match command.verb.as_str() {
-        "send" => {
+    match verb {
+        AgentCommandVerb::Send => {
             args.remove("notice_kind");
             args.remove("inline_digest");
         }
-        "configure" => {
+        AgentCommandVerb::Configure => {
             // The model/effort overlay rides to the plugin verbatim: the
             // plugin performs the harness-native switch (OpenCode,
             // Antigravity) and proves it before the Router stores anything.
             // A configure carries no turn or request binding.
         }
-        "compact" => {
+        AgentCommandVerb::Compact => {
             if !args.is_empty() || command.turn_id.is_some() || command.request_id.is_some() {
                 return Err(Error::new(
                     "native_not_dispatched",
@@ -3102,7 +3102,7 @@ fn plugin_command_args(command: &Command) -> Result<Value> {
                 ));
             }
         }
-        "steer" | "interrupt" => {
+        AgentCommandVerb::Steer | AgentCommandVerb::Interrupt => {
             if !command.is_owner_interrupt() && command.turn_id.is_none() {
                 return Err(Error::new(
                     "stale_generation",
@@ -3110,7 +3110,7 @@ fn plugin_command_args(command: &Command) -> Result<Value> {
                 ));
             }
         }
-        "inject" => {
+        AgentCommandVerb::Inject => {
             args.remove("_trusted_review_labels");
             args.remove("_fallback_to_next_input");
             // Direct active_turn inject: keep the original typed payload and the
@@ -3132,7 +3132,7 @@ fn plugin_command_args(command: &Command) -> Result<Value> {
                 )
             })?;
         }
-        "approve" | "deny" | "answer" => {
+        AgentCommandVerb::Approve | AgentCommandVerb::Deny | AgentCommandVerb::Answer => {
             command
                 .turn_id
                 .as_ref()
@@ -3239,16 +3239,17 @@ fn agent_command_params(
     context: Vec<ContextItem>,
     config: Option<&eliot_store::AgentConfig>,
 ) -> Result<Value> {
-    let mut args = plugin_command_args(command)?;
+    let verb = AgentCommandVerb::from(command.verb.as_str());
+    let mut args = plugin_command_args(command, &verb)?;
     if let Some(args) = args.as_object_mut() {
         args.remove("context_items");
     }
-    let config = config.filter(|_| command.verb == "send");
+    let config = config.filter(|_| verb == AgentCommandVerb::Send);
     serde_json::to_value(AgentCommandParams {
         agent_id: agent.id.clone(),
         generation: agent.generation,
         command_id: command.id.clone(),
-        verb: command.verb.clone(),
+        verb,
         owner_control: command.is_owner_interrupt(),
         turn_id: command.turn_id.clone(),
         request_id: command.request_id.clone(),
