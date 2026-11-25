@@ -42,19 +42,11 @@ const LICENCES: [(&str, &[u8]); 3] = [
 
 /// The Windows fonts behind the shipped text faces.
 const TEXT_FALLBACK: &str = "Segoe UI Variable Text, Segoe UI";
-const MONO_FALLBACK: &str = "Cascadia Mono, Consolas";
 
 /// XAML `FontFamily` values, already escaped for an attribute.
 pub struct Families {
     /// Roboto, then Segoe UI.
     pub text: String,
-    /// Roboto Mono, then Cascadia Mono. Reactor 0.100 sets no per-element
-    /// family; code blocks take it through their control type's style.
-    #[allow(
-        dead_code,
-        reason = "code blocks move to Roboto Mono with the styles increment"
-    )]
-    pub mono: String,
     /// Eliot Symbols at grade 0, for light themes.
     pub symbols: String,
     /// Eliot Symbols at grade -25, for dark themes.
@@ -67,7 +59,6 @@ pub fn families() -> &'static Families {
     FAMILIES.get_or_init(|| match write_fonts() {
         Ok(names) => Families {
             text: family(&names[0], "Roboto", Some(TEXT_FALLBACK)),
-            mono: family(&names[1], "Roboto Mono", Some(MONO_FALLBACK)),
             symbols: family(&names[2], "Eliot Symbols", None),
             symbols_dark: family(&names[3], "Eliot Symbols Dark", None),
         },
