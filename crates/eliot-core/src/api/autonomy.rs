@@ -162,6 +162,16 @@ pub struct AutonomyGoalRounds {
 #[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
 pub struct AutonomyWaits {
     pub calls: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_queue: Option<AutonomyRow<AutonomyIdleQueue>>,
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
+pub struct AutonomyIdleQueue {
+    pub admitted: u64,
+    pub admitted_wait_ms: u64,
+    pub pending: u64,
+    pub pending_wait_ms: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
@@ -216,6 +226,22 @@ pub struct AutonomyWorkInGit {
     pub not_in_git: u64,
     pub handoffs: u64,
     pub automatic_handoffs: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unknown_turns: Option<AutonomyRow<AutonomyUnknownTurns>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accepted_change_cost: Option<AutonomyRow<AutonomyAcceptedChangeCost>>,
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
+pub struct AutonomyUnknownTurns {
+    pub unknown: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
+pub struct AutonomyAcceptedChangeCost {
+    pub accepted_changes: u64,
+    pub observed_tokens: Option<u64>,
+    pub observed_tokens_per_accepted_change: Option<f64>,
 }
 
 #[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]

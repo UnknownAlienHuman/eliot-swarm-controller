@@ -2,9 +2,11 @@
 
 mod activity;
 mod fleet;
+mod outcomes;
 mod shell;
 
 pub(super) use activity::SHELL_COVERING_INDEX;
+pub(super) use outcomes::INDEXES as OUTCOME_INDEXES;
 
 use super::{Result, Store, sql_error};
 use eliot_core::api::AutonomyResponse;
@@ -30,7 +32,8 @@ fn window_changes(
     ] {
         if from <= through
             && (activity::window_changes(connection, from, through)?
-                || fleet::window_changes(connection, from, through)?)
+                || fleet::window_changes(connection, from, through)?
+                || outcomes::window_changes(connection, from, through)?)
         {
             return Ok(true);
         }
@@ -79,8 +82,16 @@ impl Store {
         let mut report = match reusable {
             Some(response) => response,
             None => {
-                let activity = activity::read(connection, since, until)?;
+                let mut activity = activity::read(connection, since, until)?;
                 let fleet = fleet::read(connection, since, until, confirmed)?;
+                if let Some(work) = &mut activity.work_in_git.counts {
+                    work.accepted_change_cost = Some(outcomes::accepted_change_cost(
+                        connection,
+                        since,
+                        until,
+                        fleet.tokens,
+                    )?);
+                }
                 let response = AutonomyResponse {
                     since_ms: since,
                     until_ms: until,
@@ -103,6 +114,9 @@ impl Store {
                 response
             }
         };
+        if let Some(waits) = &mut report.waits.counts {
+            waits.idle_queue = Some(outcomes::idle_queue(connection, since, until)?);
+        }
         if event_window_pruned(connection, since)? {
             let reason = "the event retention boundary overlaps the requested window";
             report.checks.limit_coverage(reason);
@@ -118,6 +132,14 @@ impl Store {
             report.notes.limit_coverage(reason);
             report.executor_swarm.limit_coverage(reason);
             report.work_in_git.limit_coverage(reason);
+            if let Some(unknown) = report
+                .work_in_git
+                .counts
+                .as_mut()
+                .and_then(|work| work.unknown_turns.as_mut())
+            {
+                unknown.limit_coverage(reason);
+            }
         }
         Ok(report)
     }

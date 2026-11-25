@@ -1,6 +1,6 @@
 use super::*;
 
-pub(super) const CURRENT_SCHEMA_VERSION: i64 = REMOTE_MANAGERS_VERSION;
+pub(super) const CURRENT_SCHEMA_VERSION: i64 = AUTONOMY_OUTCOMES_VERSION;
 const HARNESS_CHECK_SCHEMA_VERSION: i64 = 112;
 const WORK_TRUTH_VERSION: i64 = 113;
 const WORK_TRUTH_INTENT_VERSION: i64 = 114;
@@ -43,6 +43,7 @@ const ORGANIZATION_MEMBERSHIP_INDEX_VERSION: i64 = 150;
 const PROJECT_CHECK_OBLIGATIONS_VERSION: i64 = 151;
 const ASSIGNMENT_USAGE_VERSION: i64 = 152;
 const REMOTE_MANAGERS_VERSION: i64 = 153;
+const AUTONOMY_OUTCOMES_VERSION: i64 = 154;
 
 fn has_restart_continuation_brief_column(connection: &Connection) -> Result<bool> {
     connection
@@ -2824,6 +2825,9 @@ impl Store {
                  ALTER TABLE project_assignments ADD COLUMN remote_anchor_generation INTEGER;",
                 Some(REMOTE_MANAGERS_VERSION),
             )?;
+        }
+        if current < AUTONOMY_OUTCOMES_VERSION {
+            self.migrate_sql(autonomy::OUTCOME_INDEXES, Some(AUTONOMY_OUTCOMES_VERSION))?;
         }
         Ok(())
     }

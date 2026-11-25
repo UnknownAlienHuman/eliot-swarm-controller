@@ -6,6 +6,8 @@ use eliot_core::api::{
 use rusqlite::{Connection, params};
 use std::collections::BTreeMap;
 
+use super::outcomes::WindowTokens;
+
 const INPUT_CAP: usize = 10_000;
 const FETCH_LIMIT: i64 = INPUT_CAP as i64 + 1;
 const LIST_CAP: usize = 20;
@@ -14,6 +16,7 @@ pub(super) struct Fleet {
     pub(super) project_policy: AutonomyRow<AutonomyProjectPolicy>,
     pub(super) owner_waiting: AutonomyRow<AutonomyOwnerWaiting>,
     pub(super) usage: AutonomyRow<AutonomyUsage>,
+    pub(super) tokens: WindowTokens,
 }
 
 pub(super) const INDEXES: &str = r#"
@@ -47,10 +50,12 @@ pub(super) fn read(
         ));
     }
 
+    let (usage, tokens) = read_usage(tx, since, until)?;
     Ok(Fleet {
         project_policy: read_project_policy(tx, since, until)?,
         owner_waiting: read_owner_waiting(tx, until, confirmed)?,
-        usage: read_usage(tx, since, until)?,
+        usage,
+        tokens,
     })
 }
 
@@ -263,7 +268,7 @@ fn read_usage(
     tx: &Connection,
     since: i64,
     until: i64,
-) -> eliot_core::Result<AutonomyRow<AutonomyUsage>> {
+) -> eliot_core::Result<(AutonomyRow<AutonomyUsage>, WindowTokens)> {
     let manager = manager_at_sql("agents.id", "candidates.observed_at");
     let mut statement = tx
         .prepare_cached(&format!(
@@ -305,6 +310,7 @@ fn read_usage(
     let mut missing_context = false;
     let mut unsettled_turn = false;
     let mut missing_agent = false;
+    let mut tokens = WindowTokens::default();
 
     while let Some(row) = rows.next().map_err(crate::sql_error)? {
         if examined == INPUT_CAP {
@@ -333,6 +339,7 @@ fn read_usage(
         };
         let harness = row.get::<_, String>(2).map_err(crate::sql_error)?;
         let usage = crate::decode_turn_usage(&usage_json, &harness)?;
+        tokens.observe(&usage)?;
 
         role_usage.observe_turn(manager, &usage)?;
 
@@ -393,14 +400,18 @@ fn read_usage(
     if missing_agent {
         reasons.push("some retained turns lack current Agent hierarchy evidence".to_owned());
     }
+    tokens.incomplete |= input_overflow || missing_usage || unsettled_turn || missing_agent;
     let source = "sqlite:turns.usage.normalized+agents.parent";
     if !input.observed
         && counts.observed_calls == 0
         && (missing_usage || input.incomplete || unsettled_turn || missing_agent)
     {
-        return Ok(AutonomyRow::unavailable(source, &reasons.join(". ")));
+        return Ok((
+            AutonomyRow::unavailable(source, &reasons.join(". ")),
+            tokens,
+        ));
     }
-    Ok(row_with_coverage(source, reasons, counts))
+    Ok((row_with_coverage(source, reasons, counts), tokens))
 }
 
 fn row_with_coverage<T>(source: &str, reasons: Vec<String>, counts: T) -> AutonomyRow<T> {
