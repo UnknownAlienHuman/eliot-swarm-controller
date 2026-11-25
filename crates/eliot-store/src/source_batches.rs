@@ -13,6 +13,7 @@ const NATIVE_FIELD_REFUSED: &str = "source.native_field_refused";
 pub struct PreparedSourceBatch {
     batch: SourceBatch,
     refused: Vec<usize>,
+    replay_policy: core::SecretPolicy,
 }
 
 impl PreparedSourceBatch {
@@ -57,7 +58,11 @@ impl PreparedSourceBatch {
                 data.insert("redacted".to_owned(), Value::Bool(true));
             }
         }
-        Ok(Self { batch, refused })
+        Ok(Self {
+            batch,
+            refused,
+            replay_policy: policy,
+        })
     }
 
     pub fn as_batch(&self) -> &SourceBatch {
@@ -949,7 +954,11 @@ impl Store {
         project_check: Option<bool>,
         now: i64,
     ) -> Result<BatchCommit> {
-        let PreparedSourceBatch { mut batch, refused } = prepared;
+        let PreparedSourceBatch {
+            mut batch,
+            refused,
+            replay_policy,
+        } = prepared;
         let observed = expected_subject.is_some() || native_producer.is_some();
         if let Some(worktree) = completion_worktree.as_ref() {
             worktree.validate()?;
@@ -979,15 +988,17 @@ impl Store {
                 "native batch exceeds 900 KiB",
             ));
         }
-        let event_payload_digests = batch
+        let replay_events: Vec<_> = batch
             .events
             .iter()
-            .map(|event| canonical::digest(&event.semantic_value()))
+            .map(core::NativeEvent::semantic_value)
+            .collect();
+        let event_payload_digests = replay_events
+            .iter()
+            .map(canonical::digest)
             .collect::<Result<Vec<_>>>()?;
-        let batch_digest = batch
-            .semantic_digest()
-            .map_err(|error| Error::new("invalid", error.to_string()))?
-            .to_vec();
+        let replay_payload = Value::Array(replay_events);
+        let batch_digest = canonical::digest(&replay_payload)?;
         for event in batch
             .events
             .iter_mut()
@@ -1132,8 +1143,16 @@ impl Store {
             .ok_or_else(|| Error::new("source_integrity", "source has no committed state"))?;
 
         if source.last_batch_id.as_deref() == Some(batch.batch_id.as_str()) {
-            if source.last_batch_digest.as_deref() == Some(batch_digest.as_slice())
-                && source.cursor == batch.cursor
+            if source.cursor == batch.cursor
+                && (source.last_batch_digest.as_deref() == Some(batch_digest.as_slice())
+                    || replay_matches(
+                        tx,
+                        agent_num,
+                        batch.generation,
+                        &batch.source,
+                        &replay_policy,
+                        &replay_payload,
+                    )?)
             {
                 let mut native_wake_cancel = read_native_wake_cancellation(
                     tx,
@@ -1533,7 +1552,7 @@ impl Store {
              SET cursor = ?1, last_store_seq = COALESCE(NULLIF(?2, 0), last_store_seq), last_batch_id = ?3,
                  last_batch_digest = ?4, last_batch_first_seq = ?5,
                  last_batch_last_seq = ?6, state = ?7, updated_at = ?8,
-                 last_batch_dropped = ?12
+                 last_batch_dropped = ?12, last_batch_replay = ?13
              WHERE agent = ?9 AND generation = ?10 AND source = ?11",
             params![
                 batch.cursor,
@@ -1548,6 +1567,7 @@ impl Store {
                 batch.generation,
                 batch.source,
                 dropped_unclassified,
+                encode_json(&replay_payload)?,
             ],
         ));
         let native_wake_cancel =
@@ -1564,6 +1584,103 @@ impl Store {
             },
             events: committed_events,
         })
+    }
+}
+
+/// A retry can have a different scoped literal set. Compare only the
+/// safe, retained canonical payload, never a digest of unredacted text.
+fn replay_matches(
+    tx: &Transaction<'_>,
+    agent: i64,
+    generation: i64,
+    source: &str,
+    policy: &core::SecretPolicy,
+    incoming: &Value,
+) -> Result<bool> {
+    let stored: Option<String> = tx.query_row(
+        "SELECT last_batch_replay FROM source_state WHERE agent=?1 AND generation=?2 AND source=?3",
+        params![agent, generation, source], |row| row.get(0),
+    ).map_err(sql_error)?;
+    let Some(stored) = stored else {
+        // Earlier receipts still require the exact original digest.
+        return Ok(false);
+    };
+    let mut stored = decode_json(&stored)?;
+    policy.redact_values(&mut stored);
+    let (Some(stored), Some(incoming)) = (stored.as_array(), incoming.as_array()) else {
+        return Err(Error::new(
+            "source_integrity",
+            "native replay receipt is invalid",
+        ));
+    };
+    Ok(stored.len() == incoming.len()
+        && stored.iter().zip(incoming).all(|(left, right)| {
+            left["kind"] == right["kind"]
+                && left["native_id"] == right["native_id"]
+                && left["ts"] == right["ts"]
+                && replay_body_matches(&left["data"], &right["data"])
+        }))
+}
+
+fn replay_body_matches(retained: &Value, incoming: &Value) -> bool {
+    let (Some(retained), Some(incoming)) = (retained.as_object(), incoming.as_object()) else {
+        return replay_text_matches(retained, incoming);
+    };
+    // This top-level flag tells readers that some value was masked. It is
+    // not a native fact and varies with the run-local literal scope.
+    let fields = |object: &Map<String, Value>| {
+        object
+            .keys()
+            .filter(|key| key.as_str() != "redacted")
+            .count()
+    };
+    fields(retained) == fields(incoming)
+        && retained.iter().all(|(key, left)| {
+            key == "redacted"
+                || incoming
+                    .get(key)
+                    .is_some_and(|right| replay_text_matches(left, right))
+        })
+}
+
+fn replay_text_matches(retained: &Value, incoming: &Value) -> bool {
+    match (retained, incoming) {
+        (Value::String(retained), Value::String(incoming)) => {
+            let marker = core::api::REDACTION_MARKER;
+            let Some((prefix, tail)) = retained.split_once(marker) else {
+                return retained == incoming;
+            };
+            let (middle, suffix) = tail.rsplit_once(marker).unwrap_or(("", tail));
+            let Some(mut content) = incoming
+                .strip_prefix(prefix)
+                .and_then(|text| text.strip_suffix(suffix))
+            else {
+                return false;
+            };
+            for part in middle.split(marker).filter(|part| !part.is_empty()) {
+                let Some((_, rest)) = content.split_once(part) else {
+                    return false;
+                };
+                content = rest;
+            }
+            true
+        }
+        (Value::Array(left), Value::Array(right)) => {
+            left.len() == right.len()
+                && left
+                    .iter()
+                    .zip(right)
+                    .all(|(left, right)| replay_text_matches(left, right))
+        }
+        (Value::Object(left), Value::Object(right)) => {
+            left.len() == right.len()
+                && left.iter().all(|(key, value)| {
+                    right
+                        .get(key)
+                        .is_some_and(|right| replay_text_matches(value, right))
+                })
+        }
+        _ => retained == incoming,
     }
 }
 

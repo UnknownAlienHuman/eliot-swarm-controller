@@ -110,6 +110,36 @@ impl SecretPolicy {
         }
     }
 
+    /// Recognize credentials in a structured input without changing its bindings.
+    pub fn contains_native_value(&self, value: &Value) -> bool {
+        self.contains_native_field(value, None)
+    }
+
+    fn contains_native_field(&self, value: &Value, field: Option<&str>) -> bool {
+        match value {
+            Value::String(text) => matches!(self.redact_field_text(text, field), Cow::Owned(_)),
+            Value::Array(values) => values
+                .iter()
+                .any(|value| self.contains_native_field(value, field)),
+            Value::Object(values) => values.iter().any(|(key, value)| {
+                self.contains_native_secret(key) || self.contains_native_field(value, Some(key))
+            }),
+            _ => false,
+        }
+    }
+
+    /// Publishing keys is safe only if they are credential-free. Keys carry
+    /// schema and must never be silently replaced with another key.
+    pub fn contains_native_key(&self, value: &Value) -> bool {
+        match value {
+            Value::Object(values) => values.iter().any(|(key, value)| {
+                self.contains_native_secret(key) || self.contains_native_key(value)
+            }),
+            Value::Array(values) => values.iter().any(|value| self.contains_native_key(value)),
+            _ => false,
+        }
+    }
+
     /// Prepare an owned display value before applying a caller's size bound.
     pub fn redacted_values(&self, mut value: Value) -> Value {
         self.redact_values(&mut value);

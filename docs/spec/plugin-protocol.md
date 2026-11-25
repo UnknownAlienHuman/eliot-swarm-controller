@@ -582,11 +582,17 @@ commit order and the ACK identifies refused positions. Bounded adapter views
 apply the same policy before truncation. Native outcomes, recovery text and
 daemon diagnostics use the same matcher and scoped literal set.
 
-Redaction is stable on repeated application, so same-ID replay of normalized
-content reproduces the digest. Digests exclude transport IDs and timing. The
-Store also compares the cursor. Historical rows and replay receipts keep
-their original contents. A legacy replay whose normalization now changes its
-digest returns the existing source-integrity refusal.
+The latest batch receipt retains bounded, redacted canonical content beside
+the digest. On a same-ID retry with an exact cursor, a digest mismatch can
+compare this receipt under the current run-local literal policy. Text already
+masked by the retained literal marker is opaque. The comparison requires all
+visible text, keys, typed values and event identities to agree. It only returns
+the existing receipt and never applies an effect. Legacy receipts without
+comparison data still require the original digest. Digests exclude transport
+IDs and timing. The Store rejects shaped credentials in command arguments
+before hashing or admission. Its common command-outcome and event writers
+sanitize text before encoding and refuse credential-bearing event keys or
+bindings.
 
 A source permits at most one unacknowledged batch. Keep later input in a bounded spool.
 

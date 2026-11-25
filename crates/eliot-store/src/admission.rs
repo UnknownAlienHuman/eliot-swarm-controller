@@ -48,6 +48,7 @@ pub(super) fn command_payload_digest(request: &SubmitCommand) -> Result<Vec<u8>>
         ));
     }
     validate_ulid(&request.id)?;
+    reject_shaped_command_args(&request.args)?;
 
     let mut semantic_args = if request.verb == "git.fetch" {
         serde_json::from_value::<core::api::FrozenGitFetch>(request.args.clone())
