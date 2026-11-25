@@ -23,11 +23,11 @@ use crate::LEGACY_ATTENTION_ADVISORY_MAIL_PREDICATE;
 use eliot_core::{
     Agent, AgentState, CommandState,
     api::{
-        MAIL_NOTICE_COOLDOWN_MS, MailAckRequest, MailAckResponse, MailDefinitionArgs, MailDelivery,
-        MailDeliverySummary, MailInboxRequest, MailInboxResponse, MailLimits, MailMode,
-        MailReadRequest, MailSendRequest, MailSendResponse, SWARM_MAIL_SENDER, VarDefinitionArgs,
-        VarGetRequest, VarGetResponse, VarScope, VarSetRequest, VarSetResponse, digest_thread,
-        parse_var_scope,
+        MAIL_NOTICE_COOLDOWN_MS, MailAckRequest, MailAckResponse, MailDefinitionArgs,
+        MailDeliveredEvent, MailDelivery, MailDeliverySummary, MailInboxRequest, MailInboxResponse,
+        MailLimits, MailMode, MailReadRequest, MailSendRequest, MailSendResponse,
+        SWARM_MAIL_SENDER, VarDefinitionArgs, VarGetRequest, VarGetResponse, VarScope,
+        VarSetRequest, VarSetResponse, digest_thread, parse_var_scope,
     },
     fence_untrusted_text, parse_agent_id,
 };
@@ -46,7 +46,8 @@ struct PreparedVarSet {
     payload_digest: Vec<u8>,
 }
 
-/// The retained digest includes null optional fields and the resolved scope.
+/// The retained digest omits the request ID and uses the resolved scope and
+/// explicit nulls where the request omits optional fields.
 #[derive(serde::Serialize)]
 struct VarSetDigest<'a> {
     scope: &'a str,
@@ -167,6 +168,8 @@ struct PreparedMailAck {
     payload_digest: Vec<u8>,
 }
 
+/// The retained digest omits the ID, writes null optional text fields and
+/// omits the legacy default wake, unlike the request envelope.
 #[derive(serde::Serialize)]
 struct MailSendDigest<'a> {
     to: &'a [String],
@@ -185,6 +188,8 @@ struct MailAckDigest<'a> {
     deliveries: &'a [String],
 }
 
+/// One stored delivery binds the resolved sender and concrete recipient.
+/// It deliberately excludes request-wide recipient lists and wake behavior.
 #[derive(serde::Serialize)]
 struct MailContentDigest<'a> {
     sender: &'a str,
@@ -194,14 +199,6 @@ struct MailContentDigest<'a> {
     text: &'a str,
     thread: Option<&'a str>,
     reply_to_delivery: Option<&'a str>,
-}
-
-#[derive(serde::Serialize)]
-struct MailDeliveredEvent<'a> {
-    recipient: &'a str,
-    delivery_id: &'a str,
-    sender: &'a str,
-    thread: Option<&'a str>,
 }
 
 pub(super) fn parse_sender(principal: &str, domain: &str) -> Result<Sender> {
@@ -298,15 +295,24 @@ impl Store {
                 ));
             }
         }
+        let MailSendRequest {
+            id: _,
+            to,
+            mode,
+            wake,
+            text,
+            thread,
+            reply_to_delivery,
+        } = request;
         Ok(PreparedMailSend {
             sender,
             payload_digest: canonical::digest_serializable(&MailSendDigest {
-                to: &request.to,
-                mode: request.mode,
-                text: &request.text,
-                thread: request.thread.as_deref(),
-                reply_to_delivery: request.reply_to_delivery.as_deref(),
-                wake: (!request.wake).then_some(false),
+                to,
+                mode: *mode,
+                text,
+                thread: thread.as_deref(),
+                reply_to_delivery: reply_to_delivery.as_deref(),
+                wake: (!wake).then_some(false),
             })?,
         })
     }
@@ -770,12 +776,20 @@ impl Store {
                 "variable value exceeds the 16 KiB bound",
             ));
         }
+        let VarSetRequest {
+            id: _,
+            scope: _,
+            key,
+            value,
+            expect_version,
+            note,
+        } = request;
         let payload_digest = canonical::digest_serializable(&VarSetDigest {
             scope: &encoded_scope,
-            key: &request.key,
-            value: &request.value,
-            expect_version: request.expect_version,
-            note: request.note.as_deref(),
+            key,
+            value,
+            expect_version: *expect_version,
+            note: note.as_deref(),
         })?;
         Ok(PreparedVarSet {
             encoded_scope,
@@ -1650,10 +1664,14 @@ impl Store {
         now: i64,
     ) -> Result<(MailSendResponse, Vec<super::Event>)> {
         limits.validate()?;
-        let to = &definition.to;
-        let text = &definition.text;
-        let thread = definition.thread.as_deref();
-        let reply_to_delivery = definition.reply_to_delivery.as_deref();
+        let MailDefinitionArgs {
+            to,
+            text,
+            thread,
+            reply_to_delivery,
+        } = definition;
+        let thread = thread.as_deref();
+        let reply_to_delivery = reply_to_delivery.as_deref();
         let mut recipients = Vec::with_capacity(to.len());
         for recipient in to {
             let num = parse_agent_id(recipient)?;
