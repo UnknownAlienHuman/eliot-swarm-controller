@@ -1,6 +1,6 @@
 use super::*;
 
-pub(super) const CURRENT_SCHEMA_VERSION: i64 = DESKTOP_USAGE_LOOKUP_VERSION;
+pub(super) const CURRENT_SCHEMA_VERSION: i64 = SWITCH_CHILD_ID_RESERVATIONS_VERSION;
 const HARNESS_CHECK_SCHEMA_VERSION: i64 = 112;
 const WORK_TRUTH_VERSION: i64 = 113;
 const WORK_TRUTH_INTENT_VERSION: i64 = 114;
@@ -36,6 +36,7 @@ const OWNER_PROJECTION_LOOKUP_VERSION: i64 = 143;
 const AGENT_RESULT_READS_VERSION: i64 = 144;
 const FLUENT_READ_REVISIONS_VERSION: i64 = 145;
 const DESKTOP_USAGE_LOOKUP_VERSION: i64 = 146;
+const SWITCH_CHILD_ID_RESERVATIONS_VERSION: i64 = 147;
 
 fn has_restart_continuation_brief_column(connection: &Connection) -> Result<bool> {
     connection
@@ -2716,6 +2717,47 @@ impl Store {
             self.migrate_sql(
                 include_str!("../migrations/repeat_failure_alerts.sql"),
                 Some(REPEAT_FAILURE_ALERTS_VERSION),
+            )?;
+        }
+        if current < SWITCH_CHILD_ID_RESERVATIONS_VERSION {
+            self.migrate_sql(
+                "CREATE TABLE switch_child_id_reservations (
+                     id TEXT PRIMARY KEY NOT NULL,
+                     switch_command TEXT NOT NULL REFERENCES commands(id) ON DELETE CASCADE,
+                     kind TEXT NOT NULL CHECK(kind IN ('launch','handoff'))
+                 ) WITHOUT ROWID;
+                 INSERT INTO switch_child_id_reservations(id,switch_command,kind)
+                   SELECT json_extract(c.outcome,'$.launch_command'),c.id,'launch'
+                   FROM commands c
+                   WHERE c.method='swarm.switch' AND c.verb='switch'
+                     AND c.state IN ('accepted','queued','dispatched','unknown')
+                     AND json_valid(c.outcome)
+                     AND json_type(c.outcome,'$.launch_command')='text'
+                     AND NOT EXISTS (SELECT 1 FROM commands b WHERE b.id=json_extract(c.outcome,'$.launch_command'))
+                     AND NOT EXISTS (SELECT 1 FROM writes b WHERE b.id=json_extract(c.outcome,'$.launch_command'))
+                     AND NOT EXISTS (SELECT 1 FROM completion_digests b WHERE b.id=json_extract(c.outcome,'$.launch_command'))
+                   ON CONFLICT(id) DO NOTHING;
+                 INSERT INTO switch_child_id_reservations(id,switch_command,kind)
+                   SELECT json_extract(c.outcome,'$.handoff_command'),c.id,'handoff'
+                   FROM commands c
+                   WHERE c.method='swarm.switch' AND c.verb='switch'
+                     AND c.state IN ('accepted','queued','dispatched','unknown')
+                     AND json_valid(c.outcome)
+                     AND json_type(c.outcome,'$.handoff_command')='text'
+                     AND NOT EXISTS (SELECT 1 FROM commands b WHERE b.id=json_extract(c.outcome,'$.handoff_command'))
+                     AND NOT EXISTS (SELECT 1 FROM writes b WHERE b.id=json_extract(c.outcome,'$.handoff_command'))
+                     AND NOT EXISTS (SELECT 1 FROM completion_digests b WHERE b.id=json_extract(c.outcome,'$.handoff_command'))
+                   ON CONFLICT(id) DO NOTHING;
+                 CREATE TRIGGER switch_child_id_commands BEFORE INSERT ON commands
+                   WHEN EXISTS(SELECT 1 FROM switch_child_id_reservations WHERE id=NEW.id)
+                   BEGIN SELECT RAISE(ABORT,'switch_child_id_reserved'); END;
+                 CREATE TRIGGER switch_child_id_writes BEFORE INSERT ON writes
+                   WHEN EXISTS(SELECT 1 FROM switch_child_id_reservations WHERE id=NEW.id)
+                   BEGIN SELECT RAISE(ABORT,'switch_child_id_reserved'); END;
+                 CREATE TRIGGER switch_child_id_digests BEFORE INSERT ON completion_digests
+                   WHEN EXISTS(SELECT 1 FROM switch_child_id_reservations WHERE id=NEW.id)
+                   BEGIN SELECT RAISE(ABORT,'switch_child_id_reserved'); END;",
+                Some(SWITCH_CHILD_ID_RESERVATIONS_VERSION),
             )?;
         }
         Ok(())
