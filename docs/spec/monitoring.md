@@ -661,6 +661,14 @@ drivers. They use the same leaf custody, deadline and output bounds without
 starting a separate executable-configuration probe. Reads of worktree content
 and commands that can invoke configured drivers retain that probe.
 
+That skip is intentional: an unreadable configuration, an ambiguous
+`filter.unset`/`filter.unspecified` name, or executable configuration beyond
+the observation bound no longer refuses these metadata reads. The allowlisted
+built-ins never consult filter, alias or merge-driver commands, so the probe
+would only add spawns without removing any execution path. An unreadable
+configuration still fails the read itself through Git's own exit status,
+which callers report as a read failure rather than a successful observation.
+
 Diff/log commands additionally pass `--no-ext-diff --no-textconv`. Monitor-built Git
 commands also set `core.safecrlf=false`, so a CRLF conversion warning for a dirty file
 under `core.autocrlf` is not read as a failure by the leaf fence; none of them checks
