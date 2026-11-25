@@ -4,10 +4,12 @@ use crate::platform::unix::{LinuxProcessSweep, enumerate_process_sweep};
 use crate::{
     bus::Bus,
     common::now_ms,
+    config::GitBaseNoticeConfig,
     fs_invalidation::WorkspaceInvalidation,
     git_monitor::{GitProbe, WorktreeCapture, normalize_hint, worktree_capture_from_snapshot},
     platform::CustodyObserver,
     router::SecretSet,
+    workspace_git::DiffCheckout,
 };
 use eliot_core::{
     Agent, Error, FileChangeHint, GitBaseline, GitHintPage, GitSnapshot, ProcessIdentity,
@@ -98,6 +100,7 @@ struct State {
     git_bindings: Mutex<HashMap<Key, String>>,
     git_workspaces: Mutex<HashMap<String, Arc<GitWorkspace>>>,
     git_unavailable: Mutex<Option<String>>,
+    git_base_notices: Mutex<GitBaseNoticeConfig>,
     observe: Mutex<ObserveThresholds>,
 }
 
@@ -267,8 +270,10 @@ struct GitBindingInput {
 struct GitGroup {
     baseline: Option<GitBaseline>,
     base_oid: Option<String>,
+    base_ref: Option<String>,
     common_dir: Option<String>,
     quiet: bool,
+    observe_upstream: bool,
     inputs: Vec<GitBindingInput>,
     edited_paths: Vec<String>,
     paths_complete: bool,
@@ -290,9 +295,18 @@ impl Monitoring {
                 git_bindings: Mutex::new(HashMap::new()),
                 git_workspaces: Mutex::new(HashMap::new()),
                 git_unavailable: Mutex::new(None),
+                git_base_notices: Mutex::new(GitBaseNoticeConfig::default()),
                 observe: Mutex::new(ObserveThresholds::default()),
             }),
         }
+    }
+
+    pub(crate) fn set_git_base_notice_config(&self, config: GitBaseNoticeConfig) {
+        *self.inner.git_base_notices.lock_recover() = config;
+    }
+
+    pub(crate) fn git_base_notice_config(&self) -> GitBaseNoticeConfig {
+        *self.inner.git_base_notices.lock_recover()
     }
 
     pub(crate) fn mark_unavailable(&self, code: &str) {
@@ -1340,6 +1354,7 @@ impl Monitoring {
     }
 
     async fn git_inputs(&self) -> Result<HashMap<String, GitGroup>> {
+        let observe_upstream = self.git_base_notice_config().enabled;
         let bindings = self.inner.git_bindings.lock_recover().clone();
         // Deterministic chunk order so the per-acquisition bound does not
         // depend on `HashMap` iteration order.
@@ -1382,8 +1397,10 @@ impl Monitoring {
                         entry.insert(GitGroup {
                             baseline: store.git_baseline(workspace)?,
                             base_oid: retained.as_ref().map(|row| row.base_oid.clone()),
+                            base_ref: retained.as_ref().and_then(|row| row.base_ref.clone()),
                             common_dir: retained.map(|row| row.repo_common_dir),
                             quiet: true,
+                            observe_upstream: false,
                             inputs: Vec::new(),
                             edited_paths,
                             paths_complete,
@@ -1394,6 +1411,8 @@ impl Monitoring {
                 let cursor = store.git_cursor(&key.0, key.1)?;
                 let page = store.git_hint_page(&key.0, key.1, cursor, PAGE_LIMIT)?;
                 group.quiet &= current.state == eliot_core::AgentState::Idle && !historical;
+                group.observe_upstream |=
+                    observe_upstream && !historical && current.receives_git_base_notices();
                 group.inputs.push(GitBindingInput {
                     key: key.clone(),
                     terminal: historical || current.is_terminal(),
@@ -1688,6 +1707,29 @@ impl Monitoring {
                     snapshot.history_complete = false;
                     snapshot.history_gap = true;
                 }
+                if group.observe_upstream
+                    && !final_flush
+                    && let Some(branch) = snapshot.branch.as_deref()
+                    && branch.len() <= 256
+                    && eliot_core::api::valid_diff_path(branch)
+                    && let Ok(checkout) =
+                        DiffCheckout::open(&workspace, group.common_dir.as_deref())
+                    && checkout.head().ok().as_ref() == snapshot.head.as_ref()
+                    && snapshot.head.is_some()
+                    && let Ok(tip) = checkout.origin_default()
+                    && tip.branch() != Some(branch)
+                    && self.check_git_value(serde_json::json!(tip)).is_ok()
+                {
+                    snapshot.upstream_dependency = group
+                        .base_ref
+                        .as_deref()
+                        .zip(group.base_oid.as_deref())
+                        .and_then(|(base, oid)| checkout.base_dependency(base, oid))
+                        .filter(|dependency| {
+                            self.check_git_value(serde_json::json!(dependency)).is_ok()
+                        });
+                    snapshot.upstream = Some(tip);
+                }
                 self.check_git_value(
                     serde_json::to_value(&snapshot)
                         .map_err(|_| Error::new("internal", "Git snapshot could not be encoded"))?,
@@ -1885,6 +1927,8 @@ impl Monitoring {
             base_oid: base_oid.map(ToOwned::to_owned),
             committed_paths: Vec::new(),
             base_complete: false,
+            upstream: None,
+            upstream_dependency: None,
             work: None,
         };
         loop {

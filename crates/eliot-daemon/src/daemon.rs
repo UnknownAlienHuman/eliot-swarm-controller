@@ -614,6 +614,7 @@ async fn initialize_runtime(
     );
     let automation_config =
         crate::config::load_automation_config(data_dir.path()).map_err(startup_config_failure)?;
+    router.set_git_base_notice_config(automation_config.git_base_notices);
     let cloud_mcp_config =
         crate::config::load_cloud_mcp_config(data_dir.path()).map_err(startup_config_failure)?;
     let attention_config = router.attention_config();

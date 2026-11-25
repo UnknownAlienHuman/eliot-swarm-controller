@@ -1015,6 +1015,65 @@ pub(crate) fn cleanup_after_settlement(data_root: &Path, view: &Path) {
     let _ = crate::router::remove_dir_all(view);
 }
 
+/// Merge the pinned commits in a private bare directory. The source object
+/// database is an alternate and never receives the preview's objects.
+pub(crate) async fn preview_conflicting_paths(
+    data_root: &Path,
+    git: &GitProbe,
+    common: &Path,
+    upstream: &str,
+    head: &str,
+    deadline: Instant,
+) -> Result<Vec<String>> {
+    if !is_git_oid(upstream) || !is_git_oid(head) || upstream.len() != head.len() {
+        return Err(Error::new("invalid", "invalid Git merge preview commits"));
+    }
+    let objects = git_path_argument(&shared_object_directory(common)?)?;
+    if objects.contains(['\n', '\r']) {
+        return Err(Error::new("invalid", "invalid Git object directory"));
+    }
+    let view = private_view_path(data_root, &Ulid::new().to_string())?;
+    create_private_environment_root(&view)?;
+    let result = async {
+        for directory in ["refs", "objects", "objects/info"] {
+            create_private_directory_new(&view.join(directory))?;
+        }
+        write_private_file_new(&view.join("HEAD"), b"ref: refs/heads/preview\n")?;
+        write_private_file_new(&view.join(".eliot-empty-global"), b"")?;
+        let config = if head.len() == 64 {
+            "[core]\n\trepositoryformatversion = 1\n\tbare = true\n[extensions]\n\tobjectformat = sha256\n"
+        } else {
+            "[core]\n\trepositoryformatversion = 0\n\tbare = true\n"
+        };
+        write_private_file_new(&view.join("config"), config.as_bytes())?;
+        write_private_file_new(&view.join("objects/info/alternates"), format!("{objects}\n").as_bytes())?;
+        let output = git.preview_merge(&view, upstream, head, deadline).await?;
+        if output.code == 0 {
+            return Ok(Vec::new());
+        }
+        let invalid = || unavailable("Git merge preview could not verify the conflicting paths");
+        if output.code != 1 || output.stdout.last() != Some(&0) {
+            return Err(invalid());
+        }
+        let mut records = output.stdout.split(|byte| *byte == 0);
+        records.next().and_then(|tree| std::str::from_utf8(tree).ok())
+            .filter(|tree| is_git_oid(tree)).ok_or_else(invalid)?;
+        let mut paths = Vec::new();
+        for record in records {
+            if record.is_empty() {
+                if paths.is_empty() { return Err(invalid()); }
+                paths.sort_unstable();
+                paths.dedup();
+                return Ok(paths);
+            }
+            paths.push(std::str::from_utf8(record).map_err(|_| invalid())?.to_owned());
+        }
+        Err(invalid())
+    }.await;
+    cleanup_after_settlement(data_root, &view);
+    result
+}
+
 /// The fetch only writes its private ref, so an unchanged tracking ref proves
 /// the later CAS never ran; any other readback stays unknown.
 async fn settle_failed_transfer(

@@ -815,13 +815,18 @@ ignored content within these frozen directories, never tracked dirt.
 
 ## Daemon and automation settings
 
-Backlog and automatic cleanup are root-level automation options.
+Backlog and automatic cleanup are root-level automation options. Local Git
+base movement notices have their own automation table.
 
 ```toml
 [automation]
 max_event_backlog = 100000
 auto_cleanup = true
 auto_cleanup_after = "7d"
+
+[automation.git_base_notices]
+enabled = true
+wake = true
 ```
 
 `max_event_backlog` is a positive signed 64-bit integer. It defaults to `100000`; zero,
@@ -841,6 +846,11 @@ sweep leaves direct-child worktree retirement to the guarded completion path.
 such as `"14d"`. Every automatic apply uses the
 [cleanup retention policy](coordination.md#registered-artifacts-and-cleanup-k69) through
 the same guarded plan and apply path as the cleanup UI and CLI.
+
+Both Git base notice keys default to `true`. Set `enabled = false` to pause
+observation and new deliveries. Set `wake = false` to retain notices in mail
+until the manager's next ordinary input. Settings Save applies both keys live.
+See [branch dependence notices](automation.md#branch-dependence-notices).
 
 Store retention uses the `[daemon.retention]` table.
 

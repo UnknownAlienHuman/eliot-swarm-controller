@@ -371,6 +371,8 @@ impl GitProbe {
             base_oid: base_oid.map(str::to_owned),
             committed_paths,
             base_complete,
+            upstream: None,
+            upstream_dependency: None,
             work: Some(work),
         })
     }
@@ -1498,6 +1500,46 @@ impl GitProbe {
         }
         self.run_scoped(root, args, &overrides, &[], deadline, Some(binding))
             .await
+    }
+
+    /// Run merge-tree with output objects confined to the private view.
+    pub(crate) async fn preview_merge(
+        &self,
+        view: &Path,
+        upstream: &str,
+        head: &str,
+        deadline: Instant,
+    ) -> Result<Captured> {
+        let args = [
+            "merge-tree",
+            "--write-tree",
+            "--name-only",
+            "-z",
+            "--",
+            upstream,
+            head,
+        ];
+        let mut command = self.build_command(
+            view,
+            &args,
+            &[],
+            Some(GitBinding {
+                git_dir: view,
+                common_dir: view,
+            }),
+        )?;
+        command
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env(
+                "GIT_CONFIG_GLOBAL",
+                git_path_argument(&view.join(".eliot-empty-global"))?,
+            )
+            .env("GIT_ATTR_NOSYSTEM", "1");
+        let (code, stdout) = Self::capture_git(command, &[], deadline, |stdout| {
+            bounded_read(stdout, OUTPUT_BYTES)
+        })
+        .await?;
+        Ok(Captured { code, stdout })
     }
 
     /// Build, but never execute, an explicitly authorized workspace mutation.

@@ -1,6 +1,7 @@
 //! Read-only Git checkout identities rooted in an existing registration.
 
 use super::*;
+use crate::platform::is_reparse_point;
 use eliot_core::api::{ProjectCheckoutView, ProjectRegistrationView};
 use futures_util::{StreamExt, stream};
 use std::collections::BTreeMap;
@@ -83,6 +84,86 @@ impl DiffCheckout {
                 value.starts_with("refs/heads/") && eliot_core::api::valid_diff_path(value)
             })
             .ok_or_else(no_head)?;
+        self.reference_oid(reference)
+    }
+
+    pub(crate) fn on_branch(&self, branch: &str, oid: &str) -> bool {
+        let matches_branch = self
+            .git_dir
+            .file("HEAD")
+            .and_then(|file| read_diff_metadata(file, 4096))
+            .and_then(|bytes| line(&bytes))
+            .is_ok_and(|head| head.strip_prefix("ref: refs/heads/") == Some(branch));
+        matches_branch && self.head().is_ok_and(|head| head == oid)
+    }
+
+    pub(crate) fn base_dependency(
+        &self,
+        base: &str,
+        oid: &str,
+    ) -> Option<eliot_core::GitBaseDependency> {
+        if base == "HEAD" || is_git_oid(base) {
+            return None;
+        }
+        let reference = if base.starts_with("refs/") {
+            base.to_owned()
+        } else if base.starts_with("origin/") {
+            format!("refs/remotes/{base}")
+        } else {
+            format!("refs/heads/{base}")
+        };
+        let mut dependency = eliot_core::GitBaseDependency {
+            reference,
+            base_oid: oid.to_owned(),
+            tip: None,
+            verified: false,
+        };
+        if !dependency.valid() {
+            return None;
+        }
+        dependency.tip = self.read_reference_oid(&dependency.reference).ok()?;
+        dependency.verified = dependency.tip.as_deref() == Some(oid);
+        Some(dependency)
+    }
+
+    pub(crate) fn origin_default(&self) -> Result<eliot_core::GitUpstreamTip> {
+        let (dir, name) =
+            Directory::open(&self.common_dir.path)?.descend("refs/remotes/origin/HEAD")?;
+        let head = line(&read_diff_metadata(dir.file(&name)?, 4096)?)?;
+        let reference = head
+            .strip_prefix("ref: ")
+            .filter(|value| {
+                value.starts_with("refs/remotes/origin/")
+                    && value.len() <= 256
+                    && eliot_core::api::valid_diff_path(value)
+            })
+            .ok_or_else(|| problem("unavailable", "cannot resolve the local origin default"))?;
+        let tip = eliot_core::GitUpstreamTip {
+            reference: reference.to_owned(),
+            oid: self.reference_oid(reference)?,
+        };
+        tip.branch()
+            .is_some()
+            .then_some(tip)
+            .ok_or_else(|| problem("unavailable", "invalid local origin default"))
+    }
+
+    fn reference_oid(&self, reference: &str) -> Result<String> {
+        let no_head = || problem("unavailable", "cannot resolve the checkout Git ref");
+        self.read_reference_oid(reference)?.ok_or_else(no_head)
+    }
+
+    fn read_reference_oid(&self, reference: &str) -> Result<Option<String>> {
+        let no_head = || problem("unavailable", "cannot resolve the checkout Git ref");
+        if self
+            .common_dir
+            .path
+            .join("reftable")
+            .try_exists()
+            .map_err(|_| no_head())?
+        {
+            return Err(no_head());
+        }
         let loose = self.common_dir.path.join(reference);
         let oid = match fs::symlink_metadata(&loose) {
             Ok(_) => {
@@ -90,17 +171,39 @@ impl DiffCheckout {
                 line(&read_diff_metadata(dir.file(&name)?, 4096)?)?
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                // Verify all existing parents before using a missing loose ref as evidence.
+                let mut ancestor = loose.parent().ok_or_else(no_head)?;
+                while ancestor != self.common_dir.path {
+                    match fs::symlink_metadata(ancestor) {
+                        Ok(meta) if !meta.is_dir() || is_reparse_point(&meta) => {
+                            return Err(no_head());
+                        }
+                        Ok(_) => {}
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(_) => return Err(no_head()),
+                    }
+                    ancestor = ancestor.parent().ok_or_else(no_head)?;
+                }
+                let packed = self.common_dir.path.join("packed-refs");
+                match fs::symlink_metadata(&packed) {
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                    Err(_) => return Err(no_head()),
+                    Ok(_) => {}
+                }
                 let bytes = read_diff_metadata(self.common_dir.file("packed-refs")?, 1024 * 1024)?;
-                std::str::from_utf8(&bytes)
+                let Some(oid) = std::str::from_utf8(&bytes)
                     .map_err(|_| no_head())?
                     .lines()
                     .filter_map(|entry| entry.split_once(' '))
                     .find_map(|(oid, name)| (name == reference).then_some(oid.to_owned()))
-                    .ok_or_else(no_head)?
+                else {
+                    return Ok(None);
+                };
+                oid
             }
             Err(_) => return Err(no_head()),
         };
-        is_git_oid(&oid).then_some(oid).ok_or_else(no_head)
+        is_git_oid(&oid).then_some(Some(oid)).ok_or_else(no_head)
     }
 }
 

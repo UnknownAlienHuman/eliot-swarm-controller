@@ -1063,6 +1063,10 @@ impl Router {
         self.inner.monitoring.set_observe_thresholds(thresholds);
     }
 
+    pub(crate) fn set_git_base_notice_config(&self, config: crate::config::GitBaseNoticeConfig) {
+        self.inner.monitoring.set_git_base_notice_config(config);
+    }
+
     pub(crate) fn response_finished(&self, shutdown_requested: bool) {
         if shutdown_requested && self.inner.mode.load(Ordering::SeqCst) != MODE_OPEN {
             self.inner.shutdown_ready.store(true, Ordering::SeqCst);
