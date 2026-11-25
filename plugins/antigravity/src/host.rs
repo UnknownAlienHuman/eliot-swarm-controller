@@ -2,8 +2,8 @@ use std::{collections::BTreeMap, path::PathBuf};
 
 use eliot_core::{Error, Result};
 use eliot_plugin::{
-    AgentCommandParams, AgentSnapshotParams, AgentStartParams, AgentStopParams, InitializeParams,
-    Peer, PeerClient, PluginManifest, RpcRequest,
+    AgentCommandParams, AgentCommandVerb, AgentSnapshotParams, AgentStartParams, AgentStopParams,
+    InitializeParams, Peer, PeerClient, PluginManifest, RpcRequest,
     protocol::{ManifestFeatures, stream_sources},
     session::{
         decode, initialize_fields_valid, model_catalogue_profile, not_initialized,
@@ -261,7 +261,7 @@ impl Plugin {
                     "Antigravity",
                 )?;
                 let session = self.bound(&params.agent_id, params.generation)?;
-                if params.verb == "steer" {
+                if params.verb == AgentCommandVerb::Steer {
                     match session.begin_steer(params).await? {
                         SteerStart::Deferred(waiter) => Ok(DispatchOutcome::Deferred(waiter)),
                     }

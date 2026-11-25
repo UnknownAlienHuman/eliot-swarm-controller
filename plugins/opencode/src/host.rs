@@ -21,8 +21,8 @@ use eliot_core::api::HarnessModelEntry;
 use eliot_core::local_provider::LocalProvider;
 use eliot_core::{ContextItem, Error, FailureOrigin, InjectPoint, McpPolicy, Result, SecretPolicy};
 use eliot_plugin::{
-    AgentCommandParams, AgentSnapshotParams, AgentStartParams, AgentStopParams, InitializeParams,
-    MAX_TEXT_BYTES, Peer, PeerClient, PluginManifest, RpcRequest,
+    AgentCommandParams, AgentCommandVerb, AgentSnapshotParams, AgentStartParams, AgentStopParams,
+    InitializeParams, MAX_TEXT_BYTES, Peer, PeerClient, PluginManifest, RpcRequest,
     protocol::{
         AgentModelCatalogue, AgentModelsParams, ModelListParams, ModelListPart,
         NativeArchiveParams, stream_sources,
@@ -2767,13 +2767,15 @@ impl OpenCodePlugin {
             &params.command_id,
             "OpenCode",
         )?;
-        match params.verb.as_str() {
-            "send" => self.send_command(params).await,
-            "configure" => self.configure_command(params).await,
-            "compact" => self.compact_command(params).await,
-            "steer" => self.steer_command(params).await,
-            "interrupt" => self.interrupt_command(params).await,
-            "approve" | "deny" | "answer" => self.reply_command(params).await,
+        match &params.verb {
+            AgentCommandVerb::Send => self.send_command(params).await,
+            AgentCommandVerb::Configure => self.configure_command(params).await,
+            AgentCommandVerb::Compact => self.compact_command(params).await,
+            AgentCommandVerb::Steer => self.steer_command(params).await,
+            AgentCommandVerb::Interrupt => self.interrupt_command(params).await,
+            AgentCommandVerb::Approve | AgentCommandVerb::Deny | AgentCommandVerb::Answer => {
+                self.reply_command(params).await
+            }
             _ => Err(Error::new(
                 "unsupported",
                 "OpenCode plugin command verb is not implemented",
@@ -3104,9 +3106,7 @@ impl OpenCodePlugin {
         params: &AgentCommandParams,
     ) -> Result<String> {
         let text = params
-            .args
-            .get("text")
-            .and_then(Value::as_str)
+            .input_text()
             .ok_or_else(|| Error::new("invalid", "OpenCode send requires args.text"))?;
         if text.len() > MAX_TEXT_BYTES {
             return Err(Error::new(
@@ -3351,14 +3351,14 @@ impl OpenCodePlugin {
     /// dispatches behind the unresolved input.
     async fn steer_command(&mut self, params: AgentCommandParams) -> Result<Value> {
         let session = ready_session(&mut self.session, &params)?;
-        let command_id = params.command_id;
-        let turn_id = params.turn_id;
-        let text = match params.args.get("text").and_then(Value::as_str) {
+        let text = match params.input_text() {
             Some(text) => text.to_owned(),
             None => {
                 return Err(Error::new("invalid", "OpenCode steer requires args.text"));
             }
         };
+        let command_id = params.command_id;
+        let turn_id = params.turn_id;
         if text.len() > MAX_TEXT_BYTES {
             return Err(Error::new(
                 "frame_too_large",
@@ -3548,7 +3548,7 @@ impl OpenCodePlugin {
                 params.command_id,
                 request_id,
                 turn_id,
-                params.verb,
+                params.verb.as_str().to_owned(),
                 params.args,
             )
             .await
@@ -4304,16 +4304,10 @@ fn mcp_names(servers: &[McpServerReadback]) -> Value {
 /// selects the documented `Model.Ref.variant` on that switch. Model and
 /// effort travel together: a model switch without an effort runs the
 /// server default variant.
-#[derive(Debug)]
-struct ConfigureModelRequest {
-    model: Option<String>,
-    effort: Option<String>,
-}
-
 /// The requested configure model and/or effort. Unknown fields refuse the
 /// whole command; a missing or malformed member is `invalid`. A null
 /// effort is absent; a null or empty model is invalid when present.
-fn parse_configure_model(args: &Value) -> Result<ConfigureModelRequest> {
+fn parse_configure_model(args: &Value) -> Result<eliot_core::ConfigureCommandArgs> {
     let args = args
         .as_object()
         .ok_or_else(|| Error::new("invalid", "OpenCode configure args must be a JSON object"))?;
@@ -4368,7 +4362,7 @@ fn parse_configure_model(args: &Value) -> Result<ConfigureModelRequest> {
             "OpenCode configure requires a model and/or an effort",
         ));
     }
-    Ok(ConfigureModelRequest { model, effort })
+    Ok(eliot_core::ConfigureCommandArgs { model, effort })
 }
 
 /// Project live `GET /api/model` entries with a usable provider/model pair.

@@ -7,8 +7,8 @@ use std::{
 
 use eliot_core::{Error, FailureOrigin, InjectPoint, Result};
 use eliot_plugin::{
-    AgentCommandParams, AgentSnapshotParams, AgentStartParams, AgentStopParams, MAX_FRAME_BYTES,
-    MAX_TEXT_BYTES, PeerClient,
+    AgentCommandParams, AgentCommandVerb, AgentSnapshotParams, AgentStartParams, AgentStopParams,
+    MAX_FRAME_BYTES, MAX_TEXT_BYTES, PeerClient,
     event_actor::wait_for_status,
     session::{
         ModelSelection, interrupt_settlement_outcome, native_no_write, register_native_process,
@@ -515,15 +515,15 @@ impl Session {
     }
 
     pub async fn command(&mut self, params: AgentCommandParams) -> Result<Value> {
-        match params.verb.as_str() {
-            "send" => self.send(params).await,
-            "configure" => self.configure(params).await,
-            "steer" => Err(Error::new(
+        match &params.verb {
+            AgentCommandVerb::Send => self.send(params).await,
+            AgentCommandVerb::Configure => self.configure(params).await,
+            AgentCommandVerb::Steer => Err(Error::new(
                 "internal",
                 "Antigravity steer must use the deferred host response path",
             )),
-            "interrupt" => self.interrupt(params).await,
-            "approve" | "deny" => self.reply_request(params).await,
+            AgentCommandVerb::Interrupt => self.interrupt(params).await,
+            AgentCommandVerb::Approve | AgentCommandVerb::Deny => self.reply_request(params).await,
             _ => Err(Error::new(
                 "unsupported",
                 "Antigravity supports send, configure, steer, interrupt, approve and deny; inject and answer are unsupported",
@@ -575,7 +575,7 @@ impl Session {
                 &params.command_id,
                 request_id,
                 turn_id,
-                &params.verb,
+                params.verb.as_str(),
                 &params.args,
                 &native,
             )
@@ -752,9 +752,7 @@ impl Session {
             ));
         }
         let text = params
-            .args
-            .get("text")
-            .and_then(Value::as_str)
+            .input_text()
             .ok_or_else(|| Error::new("invalid", "Antigravity send requires args.text"))?;
         if text.len() > MAX_TEXT_BYTES {
             return Err(Error::new(
@@ -854,9 +852,7 @@ impl Session {
                 Error::new("stale_turn", "Antigravity steer requires a captured turn")
             })?;
         let text = params
-            .args
-            .get("text")
-            .and_then(Value::as_str)
+            .input_text()
             .ok_or_else(|| Error::new("invalid", "Antigravity steer requires args.text"))?;
         if text.len() > MAX_TEXT_BYTES {
             return Err(Error::new(

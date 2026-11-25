@@ -28,9 +28,9 @@ use eliot_core::{
     McpPolicy, NativeStoreBinding, Result, SecretPolicy,
 };
 use eliot_plugin::{
-    AgentCommandParams, AgentSnapshotParams, AgentStartParams, AgentStopParams, DiscoverParams,
-    InitializeParams, MAX_EVENT_BYTES, MAX_TEXT_BYTES, ObserverAttachParams, ObserverDetachParams,
-    ObserverSnapshotParams, Peer, PeerClient, PluginManifest, RpcRequest,
+    AgentCommandParams, AgentCommandVerb, AgentSnapshotParams, AgentStartParams, AgentStopParams,
+    DiscoverParams, InitializeParams, MAX_EVENT_BYTES, MAX_TEXT_BYTES, ObserverAttachParams,
+    ObserverDetachParams, ObserverSnapshotParams, Peer, PeerClient, PluginManifest, RpcRequest,
     protocol::{ProfileStoreParams, stream_sources},
     resume::ResumePreflight,
     session::{
@@ -662,9 +662,11 @@ impl CodexPlugin {
             self.session.is_some() || self.failed_start.is_some() || self.observer.is_some();
         let snapshot =
             eliot_plugin::session::model_catalogue_profile(raw, occupied, "codex", "Codex", false)?;
+        let route = CodexRoute::from_profile(snapshot)?;
         let (launch, secrets, metadata_secrets) = self.reader_launch(snapshot, &json!({}))?;
         let entries = crate::discovery::list_models(
             launch,
+            &route,
             &metadata_secrets,
             &secrets,
             tokio::time::Instant::now() + crate::discovery::READ_TIMEOUT,
@@ -1826,33 +1828,15 @@ impl CodexPlugin {
             }
         }
 
-        let config = client
-            .call(
-                "config/read",
-                json!({
-                    "cwd": workspace.to_string_lossy(),
-                    "includeLayers": false,
-                }),
-                Instant::now() + RPC_TIMEOUT,
-            )
-            .await
-            .map_err(|error| {
-                // Only prerequisite reads ran; no thread or input was dispatched.
-                pre_dispatch_read_error(
-                    error,
-                    "profile_error",
-                    "Codex config/read could not verify the per-process route",
-                )
-            })?;
-        let effective_config = config.get("config").ok_or_else(|| {
-            Error::new(
-                "profile_error",
-                "Codex config/read omitted effective config",
-            )
-        })?;
         context
             .route
-            .verify_config(effective_config, context.metadata_secrets)?;
+            .verify_effective_config(
+                client,
+                workspace,
+                context.metadata_secrets,
+                Instant::now() + RPC_TIMEOUT,
+            )
+            .await?;
 
         // Requested vs observed MCP surface is read after thread dispatch
         // (see `read_mcp_status`): the installed `mcpServerStatus/list`
@@ -2017,13 +2001,15 @@ impl CodexPlugin {
             &params.command_id,
             "Codex",
         )?;
-        match params.verb.as_str() {
-            "send" => self.send_command(params).await,
-            "compact" => self.compact_command(params).await,
-            "steer" => self.steer(params).await,
-            "inject" => self.inject_active_turn(params).await,
-            "interrupt" => self.interrupt(params).await,
-            "approve" | "deny" | "answer" => self.reply_request(params).await,
+        match &params.verb {
+            AgentCommandVerb::Send => self.send_command(params).await,
+            AgentCommandVerb::Compact => self.compact_command(params).await,
+            AgentCommandVerb::Steer => self.steer(params).await,
+            AgentCommandVerb::Inject => self.inject_active_turn(params).await,
+            AgentCommandVerb::Interrupt => self.interrupt(params).await,
+            AgentCommandVerb::Approve | AgentCommandVerb::Deny | AgentCommandVerb::Answer => {
+                self.reply_request(params).await
+            }
             _ => Err(Error::new(
                 "unsupported",
                 "Codex plugin command verb is not implemented",
@@ -2406,9 +2392,7 @@ impl CodexPlugin {
             ));
         }
         let text = params
-            .args
-            .get("text")
-            .and_then(Value::as_str)
+            .input_text()
             .ok_or_else(|| Error::new("invalid", "Codex send requires args.text"))?;
         if text.len() > MAX_TEXT_BYTES {
             return Err(Error::new("frame_too_large", "Codex input exceeds 512 KiB"));
@@ -2572,11 +2556,9 @@ impl CodexPlugin {
             .filter(|value| !value.trim().is_empty())
             .ok_or_else(|| Error::new("stale_turn", "turn/steer requires a captured turn id"))?;
         let text = params
-            .args
-            .get("text")
-            .and_then(Value::as_str)
+            .input_text()
             .ok_or_else(|| Error::new("invalid", "Codex steer requires args.text"))?;
-        if params.verb != "inject" && text.len() > MAX_TEXT_BYTES {
+        if params.verb != AgentCommandVerb::Inject && text.len() > MAX_TEXT_BYTES {
             return Ok(rejected_control("Codex steer input exceeds 512 KiB"));
         }
         if session.secrets.iter().any(|secret| text.contains(secret)) {
@@ -2776,7 +2758,7 @@ impl CodexPlugin {
                 params.command_id.clone(),
                 request_id.to_owned(),
                 turn_id.to_owned(),
-                params.verb.clone(),
+                params.verb.as_str().to_owned(),
                 params.args.clone(),
             )
             .await

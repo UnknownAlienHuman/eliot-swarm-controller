@@ -19,7 +19,7 @@ pub fn discovery() -> InstallDiscovery {
         exe_stems: &["opencode"],
         strategy: InstallStrategy::FirstExisting,
         cli_identity: None,
-        capability_probe: None,
+        version_identity: None,
         allow_script_wrapper: false,
         ide_hint_subpath: None,
         timeout_label: None,

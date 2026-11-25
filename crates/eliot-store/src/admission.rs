@@ -395,8 +395,8 @@ pub(super) fn admit_send_member(
             ),
         ));
     }
-    let text = required_string(&request.args, "text")?;
-    check_input(&text)?;
+    let text = core::CommandText::required(&request.args)?.text;
+    check_input(text)?;
     if request.args.get("context_items").is_some() {
         return Err(Error::new(
             "invalid",
@@ -485,13 +485,7 @@ pub(super) fn admit_stop_member(
     events: &mut Vec<Event>,
 ) -> Result<()> {
     let agent_num = parse_agent_id(&agent.id)?;
-    if request
-        .args
-        .get("force")
-        .is_some_and(|value| !value.is_boolean())
-    {
-        return Err(Error::new("invalid", "stop force must be a boolean"));
-    }
+    core::StopCommandArgs::read(&request.args)?;
     check_rpc_frame(
         "agent.stop",
         &json!({
@@ -847,15 +841,10 @@ fn admit_launch_tx(
     if let Some(parent) = parent_link.as_ref() {
         hierarchy::check_child_fanout(tx, parent, limits)?;
     }
-    let chat = request
-        .args
-        .get("chat")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    let provider_probe_scope = request
-        .args
-        .get(core::PROVIDER_PROBE_LAUNCH_ARG)
-        .and_then(Value::as_str);
+    use eliot_core::api::LaunchCommandArgs;
+    let launch = LaunchCommandArgs::read(&request.args)?;
+    let chat = launch.chat.unwrap_or(false);
+    let provider_probe_scope = launch.provider_probe.as_deref();
     let provider_probe = provider_probe_scope.is_some();
     if request.args.get(core::PROVIDER_PROBE_LAUNCH_ARG).is_some() && !provider_probe {
         return Err(Error::new(
@@ -867,31 +856,34 @@ fn admit_launch_tx(
     // A switch that continues a projectless source keeps the blank source
     // namespace on B. Only the switch worker sets this flag after
     // preparation; callers cannot forge it through `reject_launch_derived_keys`.
-    let switch_blank_scope = request
-        .args
-        .get(core::api::SWITCH_BLANK_SCOPE_ARG)
-        .is_some_and(|flag| flag == &Value::Bool(true));
+    let switch_blank_scope = launch.switch_blank_scope == Some(true);
     let scope = match parent_link.as_ref() {
         Some(parent) => parent.project_scope.clone(),
         None if principal == "owner" && (chat || switch_blank_scope) => String::new(),
-        None => required_string(&request.args, "project")?,
+        None => LaunchCommandArgs::required_text(launch.project.as_deref(), "project")?.to_owned(),
     };
     let project = match parent_link.as_ref() {
         Some(parent) => parent.project.clone(),
         None if chat => scope.clone(),
-        None => {
-            optional_string(&request.args, "registered_project")?.unwrap_or_else(|| scope.clone())
-        }
+        None => LaunchCommandArgs::optional_text(
+            launch.registered_project.as_deref(),
+            &request.args,
+            "registered_project",
+        )?
+        .map(str::to_owned)
+        .unwrap_or_else(|| scope.clone()),
     };
     let project_scope = (scope != project).then_some(&scope);
-    let harness = required_string(&request.args, "harness")?;
+    let harness =
+        LaunchCommandArgs::required_text(launch.harness.as_deref(), "harness")?.to_owned();
     if !eliot_core::api::is_supported_harness(&harness) {
         return Err(Error::new(
             "unsupported",
             format!("unsupported launch harness {harness}"),
         ));
     }
-    let profile = required_string(&request.args, "profile")?;
+    let profile =
+        LaunchCommandArgs::required_text(launch.profile.as_deref(), "profile")?.to_owned();
     let profile_snapshot = match request.args.get("profile_snapshot") {
         Some(Value::Object(_)) => request.args["profile_snapshot"].clone(),
         Some(_) => {
@@ -921,7 +913,12 @@ fn admit_launch_tx(
                 .filter(|parent| parent.launched_by_agent);
             let registered = match agent_parent {
                 Some(parent) => Some(parent.project.clone()),
-                None => optional_string(&request.args, "registered_project")?,
+                None => LaunchCommandArgs::optional_text(
+                    launch.registered_project.as_deref(),
+                    &request.args,
+                    "registered_project",
+                )?
+                .map(str::to_owned),
             };
             let registration = registered
                 .as_deref()
@@ -972,7 +969,9 @@ fn admit_launch_tx(
             }
             input.worktree_path.clone()
         }
-        None => required_string(&request.args, "workspace")?,
+        None => {
+            LaunchCommandArgs::required_text(launch.workspace.as_deref(), "workspace")?.to_owned()
+        }
     };
     if preparation.is_some() && workspace::load_workspace_by_path(tx, &workspace)?.is_some() {
         return Err(Error::new(
@@ -991,8 +990,8 @@ fn admit_launch_tx(
             "use args.text for the linked launch input",
         ));
     }
-    let text = optional_string(&request.args, "text")?;
-    if let Some(text) = &text {
+    let text = LaunchCommandArgs::optional_text(launch.text.as_deref(), &request.args, "text")?;
+    if let Some(text) = text {
         require_nonempty(text, "args.text")?;
         check_input(text)?;
     }
@@ -1025,8 +1024,8 @@ fn admit_launch_tx(
             ));
         }
     };
-    let policy_opt_out_reason = optional_string(&request.args, "no_policy")?;
-    let policy_opt_out_reason = policy_opt_out_reason.as_deref();
+    let policy_opt_out_reason =
+        LaunchCommandArgs::optional_text(launch.no_policy.as_deref(), &request.args, "no_policy")?;
     if let Some(reason) = policy_opt_out_reason
         && !core::api::valid_project_policy_opt_out_reason(reason)
     {
@@ -1100,9 +1099,7 @@ fn admit_launch_tx(
             params![path.to_string_lossy(), agent_num]
         ));
     }
-    if let Some(choice) = request.args.get("profile_choice") {
-        let choice: core::RoutingDecision = serde_json::from_value(choice.clone())
-            .map_err(|_| Error::new("invalid", "invalid routing decision"))?;
+    if let Some(choice) = &launch.profile_choice {
         if choice.profile.as_deref() != Some(profile.as_str()) {
             return Err(Error::new(
                 "invalid",
@@ -1111,7 +1108,7 @@ fn admit_launch_tx(
         }
         db!(tx.execute(
             "UPDATE agents SET profile_choice=?1 WHERE id=?2",
-            params![encode_json(&choice)?, agent_num]
+            params![encode_json(choice)?, agent_num]
         ));
     }
     let project_check_default = request.args.get(core::PROJECT_CHECK_GOAL_ARG).is_some()
@@ -1162,7 +1159,7 @@ fn admit_launch_tx(
             || !chat
             || parent_num.is_some()
             || preparation.is_some()
-            || text.as_deref() != Some(core::PROVIDER_PROBE_PROMPT)
+            || text != Some(core::PROVIDER_PROBE_PROMPT)
             || provider_probe_scope != Some(scope.as_str())
             || request
                 .args
@@ -1229,10 +1226,10 @@ fn admit_launch_tx(
         )?);
     }
     let mut accepted_data = json!({"command_id": request.id, "verb": "launch"});
-    if request.args["owner_override"] == true && principal == "owner" {
+    if launch.owner_override == Some(true) && principal == "owner" {
         accepted_data["admission_mode"] = json!("owner_override");
     } else if let Some(mode @ ("arbitrated" | "arbitrated_direct")) =
-        request.args["admission_mode"].as_str()
+        launch.admission_mode.as_deref()
     {
         accepted_data["admission_mode"] = json!(mode);
     }
@@ -1258,7 +1255,7 @@ fn admit_launch_tx(
             principal,
             &request.id,
             (agent_num, 1),
-            &text,
+            text,
             probe_linked_send,
             now,
         )?;
@@ -1611,14 +1608,27 @@ fn admit_resume_tx(
                 "continuation Resume requires the Owner and exact generation",
             ));
         }
-        let stop = required_string(&request.args, core::CONTINUE_FROM_STOP_ARG)?;
-        handoff::continuation_stop_turn_tx(tx, &agent.id, agent.generation, &stop)?;
-        (
-            Some(text.to_owned()),
-            json!({(core::CONTINUE_FROM_STOP_ARG): stop}),
-        )
+        let args = core::ResumeContinuationArgs::read(&request.args)?;
+        if args.continue_from_stop.trim().is_empty() {
+            return Err(Error::new(
+                "invalid",
+                "continue_from_stop must be a non-empty string",
+            ));
+        }
+        handoff::continuation_stop_turn_tx(
+            tx,
+            &agent.id,
+            agent.generation,
+            args.continue_from_stop,
+        )?;
+        (Some(text.to_owned()), json!(args))
     } else {
-        (optional_string(&request.args, "text")?, json!({}))
+        (
+            core::ResumeCommandArgs::read(&request.args)?
+                .text
+                .map(str::to_owned),
+            json!({}),
+        )
     };
     if let Some(text) = &text {
         require_nonempty(text, "args.text")?;
@@ -2059,8 +2069,8 @@ pub(super) fn admit_control_tx(
         }
     };
     if request.verb == "steer" {
-        let text = required_string(&request.args, "text")?;
-        check_input(&text)?;
+        let text = core::CommandText::required(&request.args)?.text;
+        check_input(text)?;
         provider_holds::require_unheld_tx(tx, &agent)?;
         // A safe-point steer waits durably for a hook, so a turn that cannot
         // take it is refused here. Direct-RPC steers settle from their plugin.
@@ -2084,7 +2094,7 @@ pub(super) fn admit_control_tx(
                 &agent,
                 principal,
                 &request.id,
-                &text,
+                text,
             )?;
         }
     }
@@ -2360,12 +2370,13 @@ fn submit_tx_mode(
     let implicit_resume = prepare_implicit_resume_send_tx(tx, &mut request)?;
 
     let mut events = Vec::new();
-    let linked = match request.verb.as_str() {
-        "attach" | "detach" => {
+    use eliot_core::CommandVerb::*;
+    let linked = match request.kind() {
+        Attach | Detach => {
             observer::admit(tx, principal, &request, &payload_digest, now, &mut events)?;
             None
         }
-        "run" => admit_run_tx(
+        Run => admit_run_tx(
             tx,
             principal,
             &request,
@@ -2374,7 +2385,7 @@ fn submit_tx_mode(
             now,
             &mut events,
         )?,
-        "git.fetch" => admit_git_fetch_tx(
+        GitFetch => admit_git_fetch_tx(
             tx,
             principal,
             &request,
@@ -2383,7 +2394,7 @@ fn submit_tx_mode(
             now,
             &mut events,
         )?,
-        "git.integrate" => admit_git_integrate_tx(
+        GitIntegrate => admit_git_integrate_tx(
             tx,
             principal,
             &request,
@@ -2392,7 +2403,7 @@ fn submit_tx_mode(
             now,
             &mut events,
         )?,
-        "git.publish" => admit_git_publish_tx(
+        GitPublish => admit_git_publish_tx(
             tx,
             principal,
             &request,
@@ -2401,7 +2412,7 @@ fn submit_tx_mode(
             now,
             &mut events,
         )?,
-        "notify" | "emit" | "attention.emit" => {
+        Notify | Emit | AttentionEmit => {
             let binding_error = if request.verb == "attention.emit" {
                 "attention.emit is a targetless command without Agent bindings"
             } else {
@@ -2422,7 +2433,7 @@ fn submit_tx_mode(
             }
             admit_targetless_tx(tx, principal, &request, &payload_digest, now, &mut events)?
         }
-        "mail.send" | "var.set" => admit_rule_action_tx(
+        MailSend | VarSet => admit_rule_action_tx(
             tx,
             principal,
             &request,
@@ -2432,7 +2443,7 @@ fn submit_tx_mode(
             derived_rule,
             &mut events,
         )?,
-        "inject" => {
+        Inject => {
             events.push(context::admit_tx(
                 tx,
                 principal,
@@ -2443,7 +2454,7 @@ fn submit_tx_mode(
             )?);
             None
         }
-        "launch" => admit_launch_tx(
+        Launch => admit_launch_tx(
             tx,
             principal,
             &request,
@@ -2454,7 +2465,7 @@ fn submit_tx_mode(
             linked_switch_launch,
             &mut events,
         )?,
-        "send" | "stop" => {
+        Send | Stop => {
             let result =
                 admit_send_stop_tx(tx, principal, &request, &payload_digest, now, &mut events);
             retain_owner_control_refusal(
@@ -2468,7 +2479,7 @@ fn submit_tx_mode(
             )?;
             None
         }
-        "worktree.remove" => {
+        WorktreeRemove => {
             admit_worktree_remove_tx(
                 tx,
                 principal,
@@ -2480,7 +2491,7 @@ fn submit_tx_mode(
             )?;
             None
         }
-        "resume" => admit_resume_tx(
+        Resume => admit_resume_tx(
             tx,
             principal,
             &request,
@@ -2499,15 +2510,15 @@ fn submit_tx_mode(
                 error
             }
         })?,
-        "configure" => {
+        Configure => {
             admit_configure_tx(tx, principal, &request, &payload_digest, now, &mut events)?;
             None
         }
-        "compact" => {
+        Compact => {
             admit_compact_tx(tx, principal, &request, &payload_digest, now, &mut events)?;
             None
         }
-        "steer" | "interrupt" | "approve" | "deny" | "answer" => {
+        Steer | Interrupt | Approve | Deny | Answer => {
             let result = admit_control_tx(
                 tx,
                 principal,
@@ -2531,7 +2542,7 @@ fn submit_tx_mode(
         verb => {
             return Err(Error::new(
                 "unsupported",
-                format!("Store does not admit the {verb} verb"),
+                format!("Store does not admit the {} verb", verb.as_str()),
             ));
         }
     };

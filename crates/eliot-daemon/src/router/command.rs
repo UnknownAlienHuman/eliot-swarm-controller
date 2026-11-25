@@ -1402,18 +1402,8 @@ impl Router {
         command: &Command,
         input: eliot_store::SendInput,
     ) -> Option<Result<(Agent, PendingCommand)>> {
-        if !matches!(
-            command.verb.as_str(),
-            "send"
-                | "steer"
-                | "interrupt"
-                | "approve"
-                | "deny"
-                | "answer"
-                | "inject"
-                | "configure"
-                | "compact"
-        ) {
+        let verb = command.kind();
+        if !verb.is_native_control() {
             return None;
         }
         let agent = match command
@@ -1429,7 +1419,7 @@ impl Router {
                 )));
             }
         };
-        if command.verb == "configure"
+        if verb == eliot_core::CommandVerb::Configure
             && !configure_uses_native_session(&agent.harness, &command.args)
         {
             return None;
@@ -1438,7 +1428,7 @@ impl Router {
         if let Some(text) = input.text_with_mail {
             command.args["text"] = Value::String(text);
         }
-        if command.verb == "inject" {
+        if verb == eliot_core::CommandVerb::Inject {
             let Some(text) = command.args.get("text").and_then(Value::as_str) else {
                 return Some(Err(Error::new("invalid", "context delivery requires text")));
             };

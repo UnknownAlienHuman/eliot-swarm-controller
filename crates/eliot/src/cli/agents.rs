@@ -20,7 +20,10 @@ use eliot_core::api::{
     HarnessQuotaRequest, HarnessQuotaResponse, MAX_SWARM_WAIT_TARGETS, SwarmDigestRequest,
     SwarmDigestResponse, SwarmWaitRequest, SwarmWaitResponse, WaitTurnRef,
 };
-use eliot_core::{InjectArgs, InjectPoint, SubmitCommand};
+use eliot_core::{
+    CommandText, ConfigureCommandArgs, InjectArgs, InjectPoint, ResumeCommandArgs, StopCommandArgs,
+    SubmitCommand,
+};
 use serde_json::Value;
 use serde_json::json;
 use std::{
@@ -380,58 +383,27 @@ pub(crate) async fn run_launch(
     let no_policy = validate_no_policy(no_policy)?;
     let goal = parse_goal_json(goal_json)?;
     let deadline = wait_deadline(timeout_seconds)?;
-    let mut args = json!({});
-    if let Some(workspace) = workspace {
-        args["workspace"] = json!(workspace.to_string_lossy());
-    }
-    if chat {
-        args["chat"] = json!(true);
-    }
-    if let Some(profile) = profile {
-        args["profile"] = Value::String(profile);
-    }
-    if let Some(role) = role {
-        args["role"] = Value::String(role);
-    }
-    if let Some(harness) = harness {
-        args["harness"] = Value::String(harness);
-    }
-    if let Some(model) = model {
-        args["model"] = Value::String(model);
-    }
-    if let Some(effort) = effort {
-        args["effort"] = Value::String(effort);
-    }
-    if let Some(auth) = auth {
-        args["auth"] = Value::String(auth);
-    }
-    if let Some(access) = access {
-        args["access"] = Value::String(access);
-    }
-    if let Some(cmd) = cmd {
-        args["cmd"] = Value::String(cmd);
-    }
-    if let Some(worktree) = worktree {
-        args["worktree"] = Value::String(worktree);
-    }
-    if let Some(base) = base {
-        args["base"] = Value::String(base);
-    }
-    if let Some(parent) = parent {
-        args["parent"] = Value::String(parent);
-    }
-    if let Some(prompt) = &prompt {
-        args["text"] = Value::String(prompt.clone());
-    }
-    if !sources.is_empty() {
-        args["sources"] = json!(sources);
-    }
-    if let Some(goal) = goal {
-        args["goal"] = Value::Object(goal);
-    }
-    if let Some(reason) = no_policy {
-        args["no_policy"] = Value::String(reason);
-    }
+    let args = json!(eliot_core::api::LaunchCommandArgs {
+        workspace: workspace.map(|path| path.to_string_lossy().into_owned()),
+        chat: chat.then_some(true),
+        profile,
+        role,
+        harness,
+        model,
+        effort,
+        auth,
+        access,
+        cmd,
+        worktree,
+        base,
+        parent,
+        text: prompt.clone(),
+        sources,
+        goal,
+        no_policy,
+        owner_override: owner_override.then_some(true),
+        ..Default::default()
+    });
     if queue {
         let request = eliot_core::api::LaunchQueueRequest {
             id: mutation_id(id)?,
@@ -448,9 +420,6 @@ pub(crate) async fn run_launch(
         let rejected = receipt.state == eliot_core::api::LaunchIntentState::Rejected;
         print_value(&json!(receipt), json_output);
         return Ok(u8::from(rejected));
-    }
-    if owner_override {
-        args["owner_override"] = json!(true);
     }
     let params = submit_request(id, None, "launch", args)?;
     let submitted = submit_command(&data_dir, &params).await?;
@@ -542,7 +511,7 @@ pub(crate) async fn run_send(
     } else {
         None
     };
-    let mut args = json!({ "text": text });
+    let mut args = json!(CommandText { text: &text });
     if !sources.is_empty() {
         args["sources"] = json!(sources);
     }
@@ -589,10 +558,9 @@ pub(crate) async fn run_resume(
     } else {
         None
     };
-    let mut args = json!({});
-    if let Some(prompt) = &prompt {
-        args["text"] = Value::String(prompt.clone());
-    }
+    let args = json!(ResumeCommandArgs {
+        text: prompt.as_deref(),
+    });
     let mut params = submit_request(id, Some(agent), "resume", args)?;
     params.expected_generation = generation;
     let submitted = submit_command(&data_dir, &params).await?;
@@ -640,7 +608,7 @@ pub(crate) async fn run_steer(
     validate_text(Some(&text))?;
     let (generation, turn, capture) =
         resolve_exact_turn_target(&data_dir, "steer", &agent, generation, turn).await?;
-    let mut params = submit_request(id, Some(agent), "steer", json!({ "text": text }))?;
+    let mut params = submit_request(id, Some(agent), "steer", json!(CommandText { text: &text }))?;
     params.expected_generation = generation;
     params.expected_turn_id = turn;
     submit_exact_turn_command(&data_dir, &params, json_output, capture.as_ref()).await
@@ -801,7 +769,11 @@ pub(crate) async fn run_stop(
     json_output: bool,
     id: Option<String>,
 ) -> Result<u8, Failure> {
-    let mut params = submit_request(id, Some(agent), "stop", json!({ "force": force }))?;
+    let args = StopCommandArgs {
+        force: Some(force),
+        ..Default::default()
+    };
+    let mut params = submit_request(id, Some(agent), "stop", json!(args))?;
     if tree {
         params.selector = params.target.take().map(|agent| format!("tree:{agent}"));
     } else {
@@ -827,14 +799,8 @@ pub(crate) async fn run_configure(
             "configure requires --model and/or --effort",
         ));
     }
-    let mut args = serde_json::Map::new();
-    if let Some(model) = model {
-        args.insert("model".to_owned(), Value::String(model));
-    }
-    if let Some(effort) = effort {
-        args.insert("effort".to_owned(), Value::String(effort));
-    }
-    let mut params = submit_request(id, Some(agent), "configure", Value::Object(args))?;
+    let args = ConfigureCommandArgs { model, effort };
+    let mut params = submit_request(id, Some(agent), "configure", json!(args))?;
     params.expected_generation = generation;
     submit_and_print(&data_dir, &params, json_output).await
 }

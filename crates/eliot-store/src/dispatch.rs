@@ -740,7 +740,7 @@ fn dispatch_stop_tx(
             params![turn_id, id],
         ));
     }
-    if command.command.args.get("force").and_then(Value::as_bool) != Some(true)
+    if core::StopCommandArgs::retained(&command.command.args).force != Some(true)
         && has_in_flight_stop_tx(tx, agent_num, agent.generation)?
     {
         return Err(Error::new(
@@ -1189,8 +1189,10 @@ impl Store {
             request
                 .expected_turn_id
                 .clone_from(&interrupt.command.turn_id);
-            request.args =
-                json!({"force": true, "interrupt_runtime_unavailable": runtime_unavailable});
+            request.args = json!(core::StopCommandArgs {
+                force: Some(true),
+                interrupt_runtime_unavailable: Some(runtime_unavailable),
+            });
             let mut events = Vec::new();
             admission::admit_stop_member(
                 &tx,
@@ -1246,7 +1248,7 @@ impl Store {
             };
             if stop.command.verb != "stop"
                 || stop.state != CommandState::Dispatched
-                || stop.command.args.get("force").and_then(Value::as_bool) == Some(true)
+                || core::StopCommandArgs::retained(&stop.command.args).force == Some(true)
             {
                 return Err(Error::new(
                     "bad_state",

@@ -10,6 +10,35 @@ const COOLDOWN_MS: i64 = 5 * 60 * 1000;
 const CLAIM_TIMEOUT_MS: i64 = 15 * 1000;
 
 impl Store {
+    /// Stable login identity for reusing catalogue metadata across daemon runs.
+    pub fn catalogue_auth_fingerprint(&self) -> Result<String> {
+        self.ensure_committed_reads()?;
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT harness, revision, phase, first_seen, attempt, signed_out, resolved
+                 FROM harness_auth ORDER BY harness",
+            )
+            .map_err(sql_error)?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, bool>(5)?,
+                    row.get::<_, bool>(6)?,
+                ))
+            })
+            .map_err(sql_error)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(sql_error)?;
+        let digest = canonical::digest_serializable(&rows)?;
+        Ok(digest.iter().map(|byte| format!("{byte:02x}")).collect())
+    }
+
     pub(super) fn migrate_auth_login(&mut self, version: i64) -> Result<()> {
         let tx = self.connection.transaction().map_err(sql_error)?;
         tx.execute_batch(

@@ -103,19 +103,16 @@ pub(super) fn prepare_profile(
     // no default), and the effective server-selected model is read back.
     // A resume running under an inherited `configure` overlay realigns to
     // the overlay's effective values instead of the frozen snapshot.
-    let requested_model: Option<String> = params
-        .model_override
-        .clone()
-        .filter(|value| !value.trim().is_empty())
-        .or_else(|| {
-            profile
-                .get("model")
-                .and_then(Value::as_str)
-                .filter(|value| !value.trim().is_empty())
-                .map(str::to_owned)
-        });
+
     // Overlay effort belongs to turn/start, including after resume.
-    let requested_effort = optional_profile_text(profile, "effort", "Muse")?;
+    let eliot_plugin::session::FrozenLaunchModel {
+        model: requested_model,
+        effort: requested_effort,
+    } = eliot_plugin::session::FrozenLaunchModel::read(
+        profile,
+        params.model_override.as_deref(),
+        "Muse",
+    )?;
     if let Some(effort) = requested_effort.as_deref()
         && !is_reasoning_effort_tier(effort)
     {

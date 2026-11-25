@@ -434,12 +434,14 @@ pub struct InitializeParams {
     pub config: Value,
 }
 
+pub use eliot_core::CommandVerb as AgentCommandVerb;
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AgentCommandParams {
     pub agent_id: String,
     pub generation: i64,
     pub command_id: String,
-    pub verb: String,
+    pub verb: AgentCommandVerb,
     /// Daemon-authorized Owner interrupt of this controlled native session.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub owner_control: bool,
@@ -464,6 +466,12 @@ pub struct AgentCommandParams {
     /// overrides above apply, so the plugin can echo it in its response.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub config_revision: Option<i64>,
+}
+
+impl AgentCommandParams {
+    pub fn input_text(&self) -> Option<&str> {
+        Some(eliot_core::CommandText::read(&self.args)?.text)
+    }
 }
 
 /// Plugin-initiated system-context callback on the authenticated instance channel.

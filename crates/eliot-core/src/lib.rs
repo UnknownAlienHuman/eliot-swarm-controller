@@ -48,10 +48,11 @@ pub use background_wake::{
 };
 pub use canonical::{canonical_json_sha256, is_lowercase_hex};
 pub use command::{
-    classify_dispatched_error, command_transition_allowed, handoff_brief_resolution_allowed,
-    is_attachment_verb, is_coordination_verb, is_deterministic_pre_admission_rejection,
-    is_request_reply_verb, is_start_verb, is_user_event_verb, validate_command_id,
-    workspace_preparation_transition_allowed,
+    CommandText, CommandVerb, ConfigureCommandArgs, ResumeCommandArgs, ResumeContinuationArgs,
+    StopCommandArgs, classify_dispatched_error, command_transition_allowed,
+    handoff_brief_resolution_allowed, is_attachment_verb, is_coordination_verb,
+    is_deterministic_pre_admission_rejection, is_request_reply_verb, is_start_verb,
+    is_user_event_verb, validate_command_id, workspace_preparation_transition_allowed,
 };
 pub use context::{
     ContextEditPath, ContextItem, ContextNoteCounters, ContextOutcome, ContextWaitRequest,
@@ -852,6 +853,10 @@ pub struct Command {
 }
 
 impl Command {
+    pub fn kind(&self) -> CommandVerb {
+        self.verb.as_str().into()
+    }
+
     pub fn is_owner_interrupt(&self) -> bool {
         self.principal == "owner" && self.verb == "interrupt"
     }
@@ -1467,6 +1472,12 @@ pub struct SubmitCommand {
     #[serde(skip)]
     #[schemars(skip)]
     pub trusted_review_labels: Option<context::TrustedReviewLabels>,
+}
+
+impl SubmitCommand {
+    pub fn kind(&self) -> CommandVerb {
+        self.verb.as_str().into()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

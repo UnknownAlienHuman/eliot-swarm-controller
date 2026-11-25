@@ -2,12 +2,14 @@
 //!
 //! Route credentials are referenced by environment-variable name and captured
 //! only into the runtime redaction policies.
+use crate::native::NativeClient;
 use eliot_core::{Error, Result, RouteBinding, SecretPolicy};
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::{
     ffi::{OsStr, OsString},
     path::Path,
 };
+use tokio::time::Instant;
 
 pub(super) const CHATGPT_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
 
@@ -283,8 +285,45 @@ impl CodexRoute {
         variables.retain(|(key, _)| !env_name_matches(key, name));
     }
 
-    /// Check the flattened effective config returned by `config/read`.
-    pub(super) fn verify_config(&self, config: &Value, metadata_secrets: &[String]) -> Result<()> {
+    /// Verify the effective route in the cwd the native operation will use.
+    /// No thread or input is dispatched before this check.
+    pub(super) async fn verify_effective_config(
+        &self,
+        client: &NativeClient,
+        cwd: &Path,
+        metadata_secrets: &[String],
+        deadline: Instant,
+    ) -> Result<()> {
+        let response = client
+            .call(
+                "config/read",
+                json!({"cwd": cwd.to_string_lossy(), "includeLayers": false}),
+                deadline,
+            )
+            .await
+            .map_err(|error| {
+                error
+                    .with_code("profile_error")
+                    .with_message("Codex config/read could not verify the per-process route")
+            })?;
+        let config = response
+            .get("config")
+            .ok_or_else(|| route_error("Codex config/read omitted effective config"))?;
+        self.verify_config(config, metadata_secrets)
+    }
+
+    fn verify_config(&self, config: &Value, metadata_secrets: &[String]) -> Result<()> {
+        // Codex selects a static catalogue before either the built-in provider
+        // catalogue or the frozen named route's model_catalog_url.
+        if config
+            .get("model_catalog_json")
+            .is_some_and(|value| !value.is_null())
+        {
+            return Err(route_error(
+                "Codex model_catalog_json overrides the frozen route's catalogue source",
+            )
+            .with_where("plugin.codex.route.model_catalog_json"));
+        }
         if SecretPolicy::new(metadata_secrets.iter().map(String::as_str)).contains_value(config) {
             return Err(route_error(
                 "Codex effective config contains a configured credential",

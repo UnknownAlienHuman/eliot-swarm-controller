@@ -528,6 +528,34 @@ pub fn optional_profile_text(
     }
 }
 
+/// Model and effort selected from a frozen startup profile. A retained model
+/// overlay wins on resume. Effort continues to come from the frozen profile
+/// for adapters that apply overlay effort per turn.
+pub struct FrozenLaunchModel {
+    pub model: Option<String>,
+    pub effort: Option<String>,
+}
+
+impl FrozenLaunchModel {
+    pub fn read(
+        profile: &Map<String, Value>,
+        model_override: Option<&str>,
+        harness: &str,
+    ) -> Result<Self> {
+        let model = model_override
+            .filter(|model| !model.trim().is_empty())
+            .or_else(|| {
+                profile
+                    .get("model")
+                    .and_then(Value::as_str)
+                    .filter(|model| !model.trim().is_empty())
+            })
+            .map(str::to_owned);
+        let effort = optional_profile_text(profile, "effort", harness)?;
+        Ok(Self { model, effort })
+    }
+}
+
 /// Split the exact provider/model profile form at its first slash. OpenCode
 /// v2.2.7 Model.Ref.parse keeps later slashes in the model id; its separate
 /// `#variant` syntax is not mapped by the current Eliot profile path.

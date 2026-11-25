@@ -15,6 +15,7 @@ use crate::{
             NativeThreadListResponse,
         },
     },
+    route::CodexRoute,
 };
 use eliot_core::api::harness::{
     QuotaEvidence, QuotaWindowBounds, QuotaWindowFacts, TieredQuotaWindows,
@@ -403,14 +404,19 @@ pub(crate) async fn collect_model_pages(
 /// sends input, or performs inference.
 pub(crate) async fn list_models(
     launch: NativeLaunch,
+    route: &CodexRoute,
     metadata_secrets: &[String],
     diagnostic_secrets: &[String],
     deadline: Instant,
 ) -> Result<Vec<NativeModelEntry>> {
+    let cwd = launch.cwd.clone();
     let (mut probe, drainer, _initialized) =
         start_initialized_reader(launch, metadata_secrets, diagnostic_secrets, deadline).await?;
     let probe_result: Result<Vec<NativeModelEntry>> = async {
         let client = probe.client();
+        route
+            .verify_effective_config(&client, &cwd, metadata_secrets, deadline)
+            .await?;
         let (entries, _) = collect_model_pages(
             &client,
             READ_TIMEOUT,

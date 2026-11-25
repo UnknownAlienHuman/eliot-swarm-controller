@@ -544,10 +544,10 @@ pub(crate) struct LaunchArgs {
     #[arg(long, value_name = "JSON_OBJECT")]
     pub(crate) goal_json: Option<String>,
     /// Enqueue durable launch intent and return its receipt immediately.
-    #[arg(long, conflicts_with_all = ["wait", "owner_override"])]
+    #[arg(long, conflicts_with = "wait")]
     pub(crate) queue: bool,
     /// Explicitly mark a direct Owner launch outside fair arbitration.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "queue")]
     pub(crate) owner_override: bool,
     #[arg(long)]
     pub(crate) wait: bool,

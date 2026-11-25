@@ -4,7 +4,8 @@
 
 use eliot_core as core;
 use eliot_plugin::install::{
-    InstallDiscovery, InstallProbe, InstallStrategy, find_on_path, is_script_wrapper, local_roots,
+    InstallDiscovery, InstallIdentity, InstallStrategy, find_on_path, is_script_wrapper,
+    local_roots,
 };
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -26,10 +27,9 @@ pub fn discovery() -> InstallDiscovery {
         exe_stems: &["agy"],
         strategy: InstallStrategy::FirstExisting,
         cli_identity: Some(CLI_STEM),
-        capability_probe: Some(InstallProbe {
-            args: &["acp", "--help"],
-            verify_executable: has_cli_module,
-            refusal: "executable did not establish Antigravity CLI ACP capability",
+        version_identity: Some(InstallIdentity {
+            matches_file: matches_cli_image,
+            refusal: "executable did not establish Antigravity CLI identity and version",
         }),
         allow_script_wrapper: false,
         ide_hint_subpath: Some(IDE_HINT_SUBPATH),
@@ -43,40 +43,109 @@ pub fn discovery() -> InstallDiscovery {
     }
 }
 
-/// The CLI has no passive capability receipt. Its Go module distinguishes
-/// the native payload from an IDE copied to a file named `agy` before execution.
-fn has_cli_module(program: &Path, deadline: Instant) -> bool {
-    use std::io::Read;
-    const MODULE: &[u8] = b"google-antigravity/antigravity-cli";
-    let Ok(mut file) = std::fs::File::open(program) else {
+fn matches_cli_image(program: &Path, deadline: Instant) -> bool {
+    verify_cli_image(program, deadline).is_some()
+}
+
+/// Verify the installed console image without running it. Some Windows vendor
+/// builds omit the Go module record, so authenticate the publisher there.
+fn verify_cli_image(program: &Path, deadline: Instant) -> Option<()> {
+    use object::{BinaryFormat, Object, ObjectSection, ReadRef, SectionFlags, read::ReadCache};
+    let file = std::fs::File::open(program).ok()?;
+    if file.metadata().ok()?.len() > 512 * 1024 * 1024 || Instant::now() >= deadline {
+        return None;
+    }
+    let cache = ReadCache::new(&file);
+    let image = object::File::parse(&cache).ok()?;
+    #[cfg(windows)]
+    if !is_windows_console(&image) {
+        return None;
+    }
+    let section = match image.format() {
+        BinaryFormat::Elf => image.section_by_name(".go.buildinfo"),
+        BinaryFormat::MachO => image.section_by_name("__go_buildinfo"),
+        // Go places its PE build info in the first initialized read/write section.
+        BinaryFormat::Pe => image.sections().find(|section| {
+            let expected = object::pe::IMAGE_SCN_CNT_INITIALIZED_DATA
+                | object::pe::IMAGE_SCN_MEM_READ
+                | object::pe::IMAGE_SCN_MEM_WRITE;
+            matches!(section.flags(), SectionFlags::Coff { characteristics }
+                if characteristics & !object::pe::IMAGE_SCN_ALIGN_32BYTES == expected)
+                && section.address() != 0
+                && section.size() != 0
+        }),
+        _ => None,
+    }?;
+    let (offset, size) = section.file_range()?;
+    // Bound the record read even when PE places it alongside other data.
+    let bytes = (&cache).read_bytes_at(offset, size.min(1024 * 1024)).ok()?;
+    let header = bytes
+        .as_chunks::<16>()
+        .0
+        .iter()
+        .position(|chunk| chunk.starts_with(b"\xff Go buildinf:"))?
+        * 16;
+    if *bytes.get(header + 15)? & 0x02 == 0 || Instant::now() >= deadline {
+        return None;
+    }
+    let (version, rest) = take_go_build_string(bytes.get(header + 32..)?)?;
+    let (module, _) = take_go_build_string(rest)?;
+    if !version.starts_with(b"go")
+        || !(matches_main_module(module) || cfg!(windows) && module.is_empty())
+        || Instant::now() >= deadline
+    {
+        return None;
+    }
+    #[cfg(windows)]
+    if !eliot_plugin::install::authenticode_signer_matches(
+        &file,
+        program,
+        "Google LLC",
+        "Google LLC",
+    ) {
+        return None;
+    }
+    (Instant::now() < deadline).then_some(())
+}
+
+#[cfg(windows)]
+fn is_windows_console<'data>(image: &object::File<'data, impl object::ReadRef<'data>>) -> bool {
+    use object::read::pe::{ImageNtHeaders, ImageOptionalHeader};
+    let subsystem = match image {
+        object::File::Pe32(pe) => pe.nt_headers().optional_header().subsystem(),
+        object::File::Pe64(pe) => pe.nt_headers().optional_header().subsystem(),
+        _ => return false,
+    };
+    subsystem == object::pe::IMAGE_SUBSYSTEM_WINDOWS_CUI
+}
+
+fn matches_main_module(module: &[u8]) -> bool {
+    // Go's cmd/go/internal/modload frames the tab-separated module records.
+    let Some(module) = module
+        .strip_prefix(b"\x30\x77\xaf\x0c\x92\x74\x08\x02\x41\xe1\xc1\x07\xe6\xd6\x18\xe6")
+        .and_then(|record| {
+            record.strip_suffix(b"\xf9\x32\x43\x31\x86\x18\x20\x72\x00\x82\x42\x10\x41\x16\xd8\xf2")
+        })
+    else {
         return false;
     };
-    if !file
-        .metadata()
-        .is_ok_and(|metadata| metadata.len() <= 512 * 1024 * 1024)
-    {
-        return false;
-    }
-    let mut bytes = vec![0; 64 * 1024];
-    let mut carry = 0;
-    while Instant::now() < deadline {
-        let Ok(read) = file.read(&mut bytes[carry..]) else {
-            return false;
-        };
-        if read == 0 {
-            return false;
+    module.split(|byte| *byte == b'\n').any(|line| {
+        line.strip_prefix(b"mod\t")
+            .and_then(|record| record.split(|byte| *byte == b'\t').next())
+            == Some(b"google-antigravity/antigravity-cli")
+    })
+}
+
+fn take_go_build_string(input: &[u8]) -> Option<(&[u8], &[u8])> {
+    let mut len = 0;
+    // The caller caps the whole buffer to 1 MiB, so four base-128 bytes suffice.
+    for (index, &byte) in input.iter().take(4).enumerate() {
+        len |= usize::from(byte & 0x7f) << (index * 7);
+        if byte < 0x80 {
+            return input.get(index + 1..)?.split_at_checked(len);
         }
-        let end = carry + read;
-        if bytes[..end]
-            .windows(MODULE.len())
-            .any(|window| window == MODULE)
-        {
-            return true;
-        }
-        carry = (MODULE.len() - 1).min(end);
-        bytes.copy_within(end - carry..end, 0);
     }
-    false
+    None
 }
 
 pub(crate) fn candidate_paths() -> core::Result<Vec<PathBuf>> {

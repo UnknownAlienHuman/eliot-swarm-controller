@@ -27,8 +27,8 @@ use eliot_core::{
     StderrSnapshot,
 };
 use eliot_plugin::{
-    AgentCommandParams, AgentSnapshotParams, AgentStartParams, AgentStopParams, InitializeParams,
-    MAX_TEXT_BYTES, Peer, PeerClient, PluginManifest, RpcRequest,
+    AgentCommandParams, AgentCommandVerb, AgentSnapshotParams, AgentStartParams, AgentStopParams,
+    InitializeParams, MAX_TEXT_BYTES, Peer, PeerClient, PluginManifest, RpcRequest,
     protocol::stream_sources,
     resume::ResumePreflight,
     session::{
@@ -973,13 +973,15 @@ impl MusePlugin {
             &params.command_id,
             "Muse",
         )?;
-        match params.verb.as_str() {
-            "send" => self.send_command(params, deadline).await,
-            "configure" => self.configure_command(params).await,
-            "steer" => self.steer_command(params).await,
-            "inject" => self.inject_active_turn(params).await,
-            "interrupt" => self.interrupt_command(params).await,
-            "approve" | "deny" | "answer" => self.reply_request(params).await,
+        match &params.verb {
+            AgentCommandVerb::Send => self.send_command(params, deadline).await,
+            AgentCommandVerb::Configure => self.configure_command(params).await,
+            AgentCommandVerb::Steer => self.steer_command(params).await,
+            AgentCommandVerb::Inject => self.inject_active_turn(params).await,
+            AgentCommandVerb::Interrupt => self.interrupt_command(params).await,
+            AgentCommandVerb::Approve | AgentCommandVerb::Deny | AgentCommandVerb::Answer => {
+                self.reply_request(params).await
+            }
             _ => Err(Error::new(
                 "unsupported",
                 "Muse plugin command verb is not implemented",
@@ -1272,9 +1274,7 @@ impl MusePlugin {
             ));
         }
         let text = params
-            .args
-            .get("text")
-            .and_then(Value::as_str)
+            .input_text()
             .ok_or_else(|| Error::new("invalid", "Muse send requires args.text"))?;
         if text.len() > MAX_TEXT_BYTES {
             return Err(Error::new("frame_too_large", "Muse input exceeds 512 KiB"));
@@ -1627,11 +1627,9 @@ impl MusePlugin {
             .filter(|value| !value.trim().is_empty())
             .ok_or_else(|| Error::new("stale_turn", "turn/steer requires a captured turn id"))?;
         let text = params
-            .args
-            .get("text")
-            .and_then(Value::as_str)
+            .input_text()
             .ok_or_else(|| Error::new("invalid", "Muse steer requires args.text"))?;
-        if params.verb != "inject" && text.len() > MAX_TEXT_BYTES {
+        if params.verb != AgentCommandVerb::Inject && text.len() > MAX_TEXT_BYTES {
             return Ok(rejected_control("Muse steer input exceeds 512 KiB"));
         }
         if session.secrets.iter().any(|secret| text.contains(secret)) {
@@ -1979,7 +1977,7 @@ impl MusePlugin {
                 params.command_id.clone(),
                 request_id.to_owned(),
                 turn_id.to_owned(),
-                params.verb.clone(),
+                params.verb.as_str().to_owned(),
                 params.args.clone(),
             )
             .await
@@ -2236,13 +2234,7 @@ async fn discard_failed_start(session: &mut AgentSession, error: Error) -> Error
 /// A `configure` model and/or effort request. Admission already gated the
 /// fields against `ConfigureSupport`; this re-checks shape so a malformed
 /// dispatch refuses before any native write.
-#[derive(Debug)]
-struct ConfigureRequest {
-    model: Option<String>,
-    effort: Option<String>,
-}
-
-fn parse_configure_request(args: &Value) -> Result<ConfigureRequest> {
+fn parse_configure_request(args: &Value) -> Result<eliot_core::ConfigureCommandArgs> {
     let model = args
         .get("model")
         .and_then(Value::as_str)
@@ -2266,7 +2258,7 @@ fn parse_configure_request(args: &Value) -> Result<ConfigureRequest> {
             "Muse configure needs a model or an effort",
         ));
     }
-    Ok(ConfigureRequest { model, effort })
+    Ok(eliot_core::ConfigureCommandArgs { model, effort })
 }
 
 impl MusePlugin {

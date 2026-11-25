@@ -23,7 +23,7 @@ use eliot_plugin::install::{
 use eliot_plugin::session::split_provider_model;
 use eliot_plugin::sync::LockExt;
 use serde_json::{Value, json};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 pub(crate) const ADHOC_PROFILE_PREFIX: &str = "adhoc-";
 
@@ -861,10 +861,10 @@ fn verify_reader(
         InstallStrategy::MetadataVersion(read) => read(Path::new(&cmd)),
         _ => probe_optional_native_version(&cmd, Some(&decl), deadline)?,
     };
-    if let Some(probe) = decl.capability_probe
+    if let Some(identity) = decl.version_identity
         && version.is_none()
     {
-        return Err(core::Error::new("unsupported", probe.refusal));
+        return Err(core::Error::new("unsupported", identity.refusal));
     }
     Ok((cmd, version))
 }
@@ -917,7 +917,7 @@ pub(crate) fn harness_installation(harness: &str, deadline: Instant) -> Value {
     read().unwrap_or_else(|error| installation_error(harness, error))
 }
 
-#[derive(PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, serde::Serialize)]
 pub(crate) struct InstallationFingerprint {
     executables: Vec<VersionKey>,
     metadata_version: Option<String>,
@@ -971,7 +971,7 @@ const VERSION_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(30
 /// Bound on memoized executable identities.
 const VERSION_CACHE_MAX: usize = 64;
 
-#[derive(Clone, Hash, PartialEq, Eq)]
+#[derive(Clone, Hash, PartialEq, Eq, serde::Serialize)]
 pub(crate) struct VersionKey {
     program: String,
     modified: Option<std::time::SystemTime>,
@@ -998,7 +998,7 @@ impl VersionKey {
             modified: metadata.modified().ok(),
             size: metadata.len(),
             adapter_verification: verify
-                .filter(|decl| decl.capability_probe.is_some())
+                .filter(|decl| decl.version_identity.is_some())
                 .map(|decl| decl.name),
         })
     }
@@ -1058,7 +1058,7 @@ fn probe_native_version(
     };
     let result = probe_version_uncached(program, verify, deadline);
     // A caller that used up its own budget should not suppress a later probe.
-    // The capability and version commands' own timeouts still back off.
+    // The version command's own timeout still backs off.
     let caller_timed_out = result
         .as_ref()
         .is_err_and(|error| caller_discovery_timed_out(error, deadline));
@@ -1145,22 +1145,11 @@ fn probe_version_uncached(
     verify: Option<&InstallDiscovery>,
     deadline: Instant,
 ) -> VersionResult {
-    let capability = verify.and_then(|decl| decl.capability_probe);
-    if let Some(probe) = capability {
-        let verified = (probe.verify_executable)(Path::new(program), deadline);
+    let identity = verify.and_then(|decl| decl.version_identity);
+    if let Some(identity) = identity {
+        let verified = (identity.matches_file)(Path::new(program), deadline);
         discovery_remaining(deadline)?;
         if !verified {
-            return Ok(None);
-        }
-        let help = native_capture(
-            program,
-            probe.args,
-            deadline.min(Instant::now() + VERSION_PROBE_TIMEOUT),
-        )?;
-        discovery_remaining(deadline)?;
-        // The adapter's passive identity check precedes the bounded
-        // subcommand. Help prose and option spelling do not gate it.
-        if !help.is_some_and(|capture| capture.status.success()) {
             return Ok(None);
         }
     }
@@ -1170,9 +1159,11 @@ fn probe_version_uncached(
         &[("method", "--version")],
         None,
     );
+    let cwd = version_probe_directory(Path::new(program))?;
     let bytes = native_capture(
         program,
         &["--version"],
+        Some(&cwd),
         deadline.min(Instant::now() + VERSION_PROBE_TIMEOUT),
     )?
     .filter(|capture| capture.status.success() && capture.stdout_complete)
@@ -1182,9 +1173,26 @@ fn probe_version_uncached(
         let text = std::str::from_utf8(bytes).ok()?.lines().next()?.trim();
         (!text.is_empty()
             && text.len() <= 256
-            && (capability.is_none() || parse_cli_version(text).is_some()))
+            && (identity.is_none() || parse_cli_version(text).is_some()))
         .then(|| text.to_owned())
     }))
+}
+
+fn version_probe_directory(program: &Path) -> core::Result<PathBuf> {
+    if let Some(directory) = program.parent().filter(|directory| directory.is_absolute()) {
+        return Ok(directory.to_owned());
+    }
+    #[cfg(windows)]
+    let directory = std::env::var_os("SystemRoot")
+        .map(PathBuf::from)
+        .filter(|root| root.is_absolute())
+        .map(|root| root.join("System32"))
+        .ok_or_else(|| {
+            core::Error::new("platform_io", "Windows system directory is unavailable")
+        })?;
+    #[cfg(not(windows))]
+    let directory = PathBuf::from("/");
+    Ok(directory)
 }
 
 /// Bridge synchronous installation/profile resolution to the same bounded
@@ -1192,7 +1200,7 @@ fn probe_version_uncached(
 /// both inside a Tokio runtime and during synchronous configuration loading.
 /// No process handle, pipe reader or runtime survives this call.
 fn native_read(program: &str, args: &[&str], deadline: Instant) -> Option<Vec<u8>> {
-    native_capture(program, args, deadline)
+    native_capture(program, args, None, deadline)
         .ok()
         .flatten()
         .map(|capture| capture.stdout)
@@ -1205,6 +1213,7 @@ fn native_read(program: &str, args: &[&str], deadline: Instant) -> Option<Vec<u8
 fn native_capture(
     program: &str,
     args: &[&str],
+    cwd: Option<&Path>,
     deadline: Instant,
 ) -> core::Result<Option<crate::scripts::process::ProcessCapture>> {
     use crate::scripts::process::{ProcessFailure, ProcessOutcome, run_owned_process};
@@ -1234,6 +1243,9 @@ fn native_capture(
                         .args(args)
                         .env_clear()
                         .envs(crate::router::minimal_plugin_environment());
+                    if let Some(cwd) = cwd {
+                        command.current_dir(cwd);
+                    }
                     let (_cancel, cancellation) = tokio::sync::watch::channel(false);
                     match run_owned_process(
                         command,

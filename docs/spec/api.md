@@ -524,7 +524,7 @@ command id frozen at claim. The settled event's persisted `kind` is exactly
 | `profile.list` | owner-only sanitized configured-profile summaries with launch-time resolvability |
 | `harness.list/models/quota` | owner-only installed harness inventory with versions, per-harness read-only native catalogues and provider-supported quota readback; no model turn or inference |
 | `auth.login` | Owner-local request to queue or reopen one native harness sign-in. The typed response reports `queued`, `open`, `cooldown` or `unknown` and contains no credentials. |
-| `models.catalog` | Owner-only bounded, paginated search across installed harness catalogues. The [canonical response](../../crates/eliot-core/src/api/harness.rs) includes freshness and per-harness failures. Availability requires affirmative fresh native quota and complete hold readback. An `after` cursor from a replaced listing returns `invalid` and tells the caller to restart from the first page. The [catalogue owner](../../crates/eliot-daemon/src/router/catalog.rs) handles background discovery and page availability. |
+| `models.catalog` | Owner-only bounded, paginated search across installed harness catalogues. The [canonical response](../../crates/eliot-core/src/api/harness.rs) includes freshness and per-harness failures. Availability requires affirmative fresh native quota and complete hold readback. An unknown `after` cursor or a cursor whose listing is unavailable returns `invalid` and tells the caller to restart from the first page. A continuation never triggers discovery for a missing page. A first page can use private last-good metadata when its settings, installation, route and durable login identity still match. Restored metadata is stale and carries no cached quota. Refresh remains asynchronous. The [catalogue owner](../../crates/eliot-daemon/src/router/catalog.rs) handles background discovery and page availability. |
 | `models.catalog.watch` | Owner-only wait for a changed aggregate revision. A 20-second wait with no change returns a null revision. This read uses the settled in-memory revision and creates no discovery demand. |
 | `script.list/read/save` | Owner-only scripts under approved Run roots: cursor/encoded-byte-bounded list (one root scan per page; continue through empty pages until `next_cursor` is absent), verified-handle bounded read, and serialized revision-guarded replacement. Complete secret-bearing entries are withheld; raw and decoded TOML/JSON keys/values are checked. Saves never execute; external-writer conflict limits and editor environment are specified in [automation](automation.md#script-editing). DTOs/budgets: [`script_edit.rs`](../../crates/eliot-core/src/api/script_edit.rs). |
 | `settings.read/save` | owner-only unified section read/save, including revisioned `owner_rules.text` and budget warnings, revision CAS, dry run, restart indication and bounded author history; see configuration |
@@ -1445,7 +1445,7 @@ policy. `args.no_policy` is a nonblank reason of at most 256 bytes without contr
 or invisible format characters. It skips both the policy Goal and the fast check and
 records `project.policy.opted_out` with the reason. Private chats have no registered
 execution project or policy. A same-project switch retains the opt-out reason.
-The same arguments reach direct and queued launch admission. Executable check
+Ordinary launch arguments reach direct and queued admission. Executable check
 overrides and escalation require Owner authority. A queued intent has no Agent or command until
 admitted. Exact retry
 returns the current intent. When admission succeeds, the receipt gives the
@@ -1463,9 +1463,9 @@ receives `capacity_unavailable` for that request alone, before creating a
 command, Agent, or reservation. Expiry while still waiting also gives a
 definite capacity refusal. An admission decision already in progress settles
 before the RPC replies. Use `--queue` for a durable intent and retry a lost
-reply with the same ID. An Owner can explicitly use
-`--owner-override` to bypass fair ordering while still checking every
-admission limit.
+reply with the same ID. An Owner can use `--owner-override` on a direct
+launch to bypass fair ordering while still checking every admission limit.
+`launch.enqueue` rejects `owner_override`.
 
 A manager uses `swarm project budget PROJECT --revision REV` with `--max-live`,
 `--priority`, `--pause` or `--resume` to apply an Owner-granted change to its current
@@ -1608,6 +1608,12 @@ generation at dispatch, so the response generation is not universally equal to
 `expected_generation`. Interactive calls may omit expectations; delayed automation
 supplies its captured expectations.
 
+Launch uses shared [typed selectors](../../crates/eliot-core/src/api/launch.rs)
+for preparation and Store admission. The existing `args` object is the
+wire and retained shape. Replay binds the original payload with its existing
+normalization and frozen fields, including key presence, and never hashes a
+reserialized projection of those selectors.
+
 For `git.fetch`, mutation-ID binding uses Core
 [`GitFetchDefinitionArgs::binding_args(timeout_ms)`](../../crates/eliot-core/src/api/git.rs#L43)
 or [`FrozenGitFetch::binding_args()`](../../crates/eliot-core/src/api/git.rs#L114): timeout
@@ -1628,12 +1634,13 @@ valid only for `send`. It is control metadata, never native input text or argume
 hold at dispatch before native I/O. Over-limit hierarchy admission reads `fanout_limit`
 (CLI exit 3) and persists nothing.
 
-The current `command.submit` request has no `wait_ms`, and the daemon does not expose an
-`agent.wait` method. CLI `--wait` follows command and turn readbacks with a bounded client
-deadline; timeout does not cancel the admitted command. `swarm.wait` below is the
-implemented bounded server wait over a frozen child command/turn set. Single-target
-server-side wait semantics further below are retained for a future API layer, not part
-of the current request shape.
+The `command.submit` request has no `wait_ms`. CLI `--wait` can span more than the
+30 seconds one `swarm.wait` call permits, so it waits in bounded server-side
+slices until its client deadline. `swarm.wait` can complete a bound entry from
+its terminal turn while the command row still awaits settlement. CLI commands
+that need that exact row read it back and wait again only while it is open.
+A timeout leaves the admitted work running. Explicit `swarm wait` uses one
+bounded RPC over the captured set.
 
 Submit the targetless `git.integrate` verb through `command.submit`. Its
 [`GitIntegrateDefinitionArgs`](../../crates/eliot-core/src/api/git_integrate.rs)

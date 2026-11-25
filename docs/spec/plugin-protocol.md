@@ -247,6 +247,10 @@ quota decisions, routing, and hold settlement.
 | `profile.store` (L3) | shared [`ProfileStoreParams`](../../crates/eliot-plugin/src/protocol.rs) | Return [`ProfileStoreResult`](../../crates/eliot-plugin/src/protocol.rs): the effective `NativeStoreBinding` and optional plugin-owned startup projection, using the caller's actual prepared workspace and one bounded, owned metadata reader. Store freezes both with the exact launch dispatch; success requires confirmed reader cleanup. It creates no model or thread, performs no native control and publishes no Agent events. This is outside the L1/L2 first-harness subset. |
 | `shutdown` | none | close owned paths, drain, exit; never kill an adopted service |
 
+The native command envelope carries the stable verb spelling. Host and adapter
+dispatch use the shared typed verb. The frozen launch model and effort share one
+projection for adapters that apply retained effort overrides at turn time.
+
 An ordinary stop attempts `agent.command` with `interrupt` for the captured
 active or uncertain turn under the stop's authority, then sends `agent.stop` to
 close the controlled session. For an Owner interrupt, the daemon sets
