@@ -36,7 +36,7 @@ use eliot_plugin::{
     session::{
         EVENT_DEADLINE, StreamSource, attach_final_text, attach_native_error, event_id,
         is_blank_native_text, native_terminal_inactivity, next_input_outcomes,
-        redact_request_details_for_commit, with_claimed_context,
+        with_claimed_context,
     },
     turn_readback::{HistoryMessage, HistoryPage, TurnHistory, read_turn_history},
 };
@@ -3165,7 +3165,7 @@ impl EventProcessor {
                 "OpenCode public request view could not be normalized",
             ));
         };
-        let committed = redact_request_details_for_commit(&public_details, &secrets);
+        let committed = secrets.redacted_values(public_details);
         let guard_commands = (pending.kind == "approval"
             && pending.details["action"].as_str().is_some_and(|action| {
                 action.eq_ignore_ascii_case("shell") || action.eq_ignore_ascii_case("bash")

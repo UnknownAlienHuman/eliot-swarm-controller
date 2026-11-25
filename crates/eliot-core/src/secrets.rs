@@ -110,16 +110,18 @@ impl SecretPolicy {
         }
     }
 
+    /// Prepare an owned display value before applying a caller's size bound.
+    pub fn redacted_values(&self, mut value: Value) -> Value {
+        self.redact_values(&mut value);
+        value
+    }
+
     /// Compare public offer values using the same text as their retained view.
     pub fn same_redacted_values(&self, left: &Value, right: &Value) -> bool {
         if left == right {
             return true;
         }
-        let mut left = left.clone();
-        let mut right = right.clone();
-        self.redact_values(&mut left);
-        self.redact_values(&mut right);
-        left == right
+        self.redacted_values(left.clone()) == self.redacted_values(right.clone())
     }
 
     /// Return safe output and the number of ORIGINAL bytes consumed. The caller

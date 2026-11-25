@@ -825,7 +825,7 @@ async fn put_events(
         .map_err(|_| invalid_batch())
         .and_then(|mut batch| {
             permission_refusal = apply_command_guard(&mut batch, guard_policy, credentials)?;
-            PreparedSourceBatch::new(batch, &SecretPolicy::new(credentials))
+            PreparedSourceBatch::new(batch, credentials)
         });
     let batch = match batch {
         Ok(batch) => batch,

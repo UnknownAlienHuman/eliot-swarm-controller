@@ -1630,22 +1630,6 @@ pub fn require_nonempty(value: &str, harness: &str, what: &str) -> Result<()> {
     Ok(())
 }
 
-/// Redact the free-text offer fields of a normalized public request view for
-/// the committed `request.opened` event: the approval `summary`, `questions`
-/// and approval `choices`. Keep the raw in-memory offer for native replies
-/// and use the shared redacted form when comparing display values.
-pub fn redact_request_details_for_commit(details: &Value, policy: &SecretPolicy) -> Value {
-    let mut redacted = details.clone();
-    if let Some(fields) = redacted.as_object_mut() {
-        for key in ["summary", "questions", "choices"] {
-            if let Some(field) = fields.get_mut(key) {
-                policy.redact_values(field);
-            }
-        }
-    }
-    redacted
-}
-
 /// Extract the command supplied by a Bash or PowerShell permission callback.
 pub fn shell_permission_command<'a>(tool: &str, input: Option<&'a Value>) -> Option<&'a str> {
     if tool.eq_ignore_ascii_case("bash") || tool.eq_ignore_ascii_case("powershell") {

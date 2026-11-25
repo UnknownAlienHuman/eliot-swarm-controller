@@ -571,6 +571,8 @@ and high-entropy values in named secret fields become
 `[REDACTED:<kind>:<original byte length>]`. The digest sees the marker and
 surrounding text. Ordinary Git SHAs and ULIDs remain intact. The Store accepts
 only prepared batches, including direct, observed, child and grouped intake.
+Store preparation always applies the shape detector. Producers supply only
+their scoped exact credentials for the same redaction pass.
 A credential in a batch binding, an immutable payload correlation or an object
 key rejects the batch with `secret_in_payload`. A credential in an event's
 `native_id` or `kind` refuses that field and writes a

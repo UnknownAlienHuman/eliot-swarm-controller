@@ -16,7 +16,9 @@ pub struct PreparedSourceBatch {
 }
 
 impl PreparedSourceBatch {
-    pub fn new(mut batch: SourceBatch, policy: &core::SecretPolicy) -> Result<Self> {
+    pub fn new(mut batch: SourceBatch, exact_secrets: &[String]) -> Result<Self> {
+        // Callers can add run-local exact values. Shape matching is built in.
+        let policy = core::SecretPolicy::new(exact_secrets);
         if [&batch.batch_id, &batch.agent_id, &batch.source]
             .into_iter()
             .chain(batch.cursor.iter())
@@ -45,7 +47,7 @@ impl PreparedSourceBatch {
                 refused.push(index);
                 continue;
             }
-            if protected_data_has_secret(&event.data, policy, false) {
+            if protected_data_has_secret(&event.data, &policy, false) {
                 return Err(secret_in_batch_binding());
             }
             if policy.redact_values(&mut event.data) {
