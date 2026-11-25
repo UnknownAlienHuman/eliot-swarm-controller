@@ -172,7 +172,10 @@ impl Router {
 
     pub(super) fn note_update_boot_refusal(&self, agent: &str, generation: i64, error: &Error) {
         let mut boot = self.inner.update_boot.lock_recover();
-        if boot.finished.is_some() {
+        if boot.finished.is_some()
+            || boot.pending.get(&(agent.to_owned(), generation)).copied()
+                != Some(UpdateStartState::Unknown)
+        {
             return;
         }
         let state = if error.origin == Some(FailureOrigin::Swarm)
@@ -255,7 +258,9 @@ impl Router {
     }
 
     pub(crate) fn finish_update_boot(&self, complete: bool) {
-        self.inner.update_boot.lock_recover().finished = Some(complete);
+        let mut boot = self.inner.update_boot.lock_recover();
+        boot.finished = Some(complete);
+        boot.pending.clear();
     }
 }
 
