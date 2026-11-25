@@ -579,7 +579,10 @@ async fn quiesce(
                     if !std::mem::take(&mut interrupt_on_deadline) {
                         return Err(Failure::new(
                             5,
-                            "admitted work did not finish before the update deadline",
+                            format!(
+                                "admitted work did not finish before the update deadline. {}",
+                                error.message
+                            ),
                         ));
                     }
                     deadline = Instant::now() + INTERRUPT_SETTLE_WAIT;

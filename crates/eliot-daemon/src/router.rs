@@ -6879,7 +6879,22 @@ impl Router {
                 || self.inference_workers_active()
                 || self.run_workers_active())
         {
-            return Err(Error::new("restart_busy", "admitted work is still running"));
+            let commands = store.restart_command_blockers(17)?;
+            let message = if commands.is_empty() {
+                "admitted work is still running".to_owned()
+            } else {
+                let mut blockers = commands
+                    .iter()
+                    .take(16)
+                    .map(|(id, verb, state)| format!("{verb} {id} ({state})"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                if commands.len() > 16 {
+                    blockers.push_str(", and more");
+                }
+                format!("commands still blocking restart: {blockers}")
+            };
+            return Err(Error::new("restart_busy", message));
         }
         let watchdog = if action == ShutdownMode::Restart {
             Some(self.prepare_restart_exit_watchdog()?)

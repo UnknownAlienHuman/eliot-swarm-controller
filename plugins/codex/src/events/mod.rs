@@ -64,6 +64,7 @@ pub(crate) struct EventStatus {
     pub batch_unknown: bool,
     pub source_unknown: bool,
     pub stopped: bool,
+    pub session_history_failure_at: Option<Instant>,
     pub compaction: Option<CompactionProgress>,
 }
 
@@ -77,6 +78,7 @@ pub(crate) struct CompactionProgress {
     pub item_started: bool,
     pub item_completed: bool,
     pub terminal_status: Option<String>,
+    pub history_missing_tool_output: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -582,6 +584,22 @@ impl EventProcessor {
                     self.handle_child_notification(&method, params).await;
                     return;
                 }
+                // Only a non-retrying error for the owned thread itself
+                // can corroborate a SEND without an exact native turn ID.
+                // Turn-scoped notices may belong to an earlier request.
+                if method == "error"
+                    && self.status.ready
+                    && self.status.thread_id.as_deref().is_some_and(|thread| {
+                        params["threadId"].as_str() == Some(thread)
+                            && params["turnId"].is_null()
+                            && params["willRetry"] == false
+                            && params["error"]["message"]
+                                .as_str()
+                                .is_some_and(crate::native::types::history_missing_tool_output)
+                    })
+                {
+                    self.status.session_history_failure_at = Some(Instant::now());
+                }
                 if self.should_buffer(&method, &params) {
                     self.buffer.push(
                         BufferedNativeFrame::Notification { method, params },
@@ -1055,6 +1073,10 @@ impl EventProcessor {
                     NativeTurnStatus::InProgress => "unknown",
                     NativeTurnStatus::Other => "unknown",
                 };
+                progress.history_missing_tool_output |= status == "failed"
+                    && notification.turn.error.as_ref().is_some_and(|error| {
+                        crate::native::types::history_missing_tool_output(&error.message)
+                    });
                 progress.terminal_status =
                     Some(
                         if status == "completed"
@@ -1066,6 +1088,22 @@ impl EventProcessor {
                         }
                         .to_owned(),
                     );
+            }
+            "error"
+                if serde_json::from_value::<NativeErrorNotification>(params.clone()).is_ok_and(
+                    |notification| {
+                        notification.will_retry == Some(false)
+                            && notification.error.as_ref().is_some_and(|error| {
+                                crate::native::types::history_missing_tool_output(&error.message)
+                            })
+                    },
+                ) =>
+            {
+                self.status
+                    .compaction
+                    .as_mut()
+                    .unwrap()
+                    .history_missing_tool_output = true;
             }
             _ => {}
         }
@@ -2105,6 +2143,9 @@ impl EventProcessor {
             self.pending_requests.remove(&request_id);
             self.transport_requests.remove(&key);
             self.remember_resolved_transport(key);
+        }
+        if notification.turn.status == NativeTurnStatus::Completed {
+            self.status.session_history_failure_at = None;
         }
         self.status.last_turn = Some(TurnFacts {
             command_id,

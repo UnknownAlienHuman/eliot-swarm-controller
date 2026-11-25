@@ -61,6 +61,11 @@ pub(crate) fn build(
         directive,
         now,
     } = input;
+    let include_uncertain_input_text = !crate::native_session_failure::is_broken(
+        tx,
+        parse_agent_id(&request.from)?,
+        request.from_generation,
+    )?;
     let record_command = facts.and_then(|facts| facts.task_command.as_deref());
     let typed = facts.and_then(|facts| facts.task_inputs.original.as_ref());
     let selected = task.map(|task| task.id.as_str()).or(record_command);
@@ -105,6 +110,12 @@ pub(crate) fn build(
     let (task_text, task_clipped) = if delivered_separately {
         (
             "(delivered once as a separate successor SEND)".to_owned(),
+            false,
+        )
+    } else if original_unknown && !include_uncertain_input_text {
+        (
+            "(unresolved original input; verify effects before continuing and never resend)"
+                .to_owned(),
             false,
         )
     } else if let Some(text) = text {
@@ -163,7 +174,15 @@ pub(crate) fn build(
     } else {
         ""
     };
-    let later = later_instructions(tx, request, selected, transferred, inputs, policy)?;
+    let later = later_instructions(
+        tx,
+        request,
+        selected,
+        transferred,
+        inputs,
+        policy,
+        include_uncertain_input_text,
+    )?;
     let mut history_note = if let Some(reference) =
         facts.and_then(|facts| facts.task_ref.as_deref())
     {
@@ -333,6 +352,7 @@ fn later_instructions(
     transferred: &[Command],
     inputs: Option<&TaskInputs>,
     policy: &core::SecretPolicy,
+    include_uncertain_input_text: bool,
 ) -> Result<LaterInstructions> {
     let mut out = LaterInstructions::default();
     let mut records = Vec::new();
@@ -356,7 +376,9 @@ fn later_instructions(
                 continue;
             }
             let mut rendered = instruction_label(record);
-            if record.state == CommandState::Applied || unresolved(record.state) {
+            if record.state == CommandState::Applied
+                || (include_uncertain_input_text && unresolved(record.state))
+            {
                 let (excerpt, clipped) =
                     bounded(&policy.redact_text(&record.text), MAX_INSTRUCTION_BYTES);
                 out.truncated |= clipped;
@@ -417,7 +439,9 @@ fn later_instructions(
             "[command={id}, principal={principal}, verb={verb}, source={}/{}, state={state}{caution}]",
             request.from, request.from_generation
         );
-        if matches!(state.as_str(), "applied" | "unknown" | "dispatched") {
+        if state == "applied"
+            || (include_uncertain_input_text && matches!(state.as_str(), "unknown" | "dispatched"))
+        {
             let text: String = row.get(4).map_err(sql_error)?;
             let (text, clipped) = bounded(&policy.redact_text(&text), MAX_INSTRUCTION_BYTES);
             out.truncated |= clipped;

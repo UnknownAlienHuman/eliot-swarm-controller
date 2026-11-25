@@ -119,6 +119,8 @@ pub enum HandoffReason {
     ProviderResponseWithheld,
     /// The source session was lost or failed.
     SessionLost,
+    /// An exact native result established that the retained session is broken.
+    SessionBroken,
 }
 
 impl HandoffReason {
@@ -129,6 +131,7 @@ impl HandoffReason {
             Self::ProviderHold => "provider_hold",
             Self::ProviderResponseWithheld => "provider_response_withheld",
             Self::SessionLost => "session_lost",
+            Self::SessionBroken => "session_broken",
         }
     }
 }

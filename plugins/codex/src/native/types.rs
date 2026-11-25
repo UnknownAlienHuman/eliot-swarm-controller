@@ -522,6 +522,20 @@ pub(crate) fn response_withheld_evidence_from_message(message: &str) -> Option<&
     (message.trim() == PROVIDER_RESPONSE_WITHHELD_MESSAGE).then_some("text_fallback")
 }
 
+pub(crate) fn history_missing_tool_output(message: &str) -> bool {
+    let Some(call) = message
+        .trim()
+        .strip_prefix("Custom tool call output is missing for call id ")
+    else {
+        return false;
+    };
+    let call = call.trim_end_matches('.');
+    (1..=256).contains(&call.len())
+        && call
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+}
+
 impl NativeTurnError {
     /// Match only the required `TurnError.message` value from Codex's native
     /// terminal envelope.

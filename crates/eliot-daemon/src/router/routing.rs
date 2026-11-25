@@ -533,8 +533,8 @@ impl Router {
         } else {
             automatic_fallback(routing)?
         };
-        let keep_source =
-            route.reason == HandoffReason::SessionLost && source.state == AgentState::Lost;
+        let keep_source = route.reason == HandoffReason::SessionBroken
+            || (route.reason == HandoffReason::SessionLost && source.state == AgentState::Lost);
         let tried: Vec<&str> = source
             .profile_choice
             .iter()
@@ -572,7 +572,9 @@ impl Router {
             .filter(|skip| skip.reason == RouteSkipReason::ProviderFailure)
             .cloned()
             .collect();
-        if route.reason != HandoffReason::SessionLost || source.state != AgentState::Lost {
+        if route.reason != HandoffReason::SessionBroken
+            && (route.reason != HandoffReason::SessionLost || source.state != AgentState::Lost)
+        {
             skipped.push(RouteSkip {
                 profile: source.profile.clone(),
                 reason: if route.reason == HandoffReason::ProviderResponseWithheld {
@@ -591,6 +593,9 @@ impl Router {
             ),
             HandoffReason::ProviderResponseWithheld => "Provider withheld the response".to_owned(),
             HandoffReason::SessionLost => format!("the {} session ended", source.profile),
+            HandoffReason::SessionBroken => {
+                format!("the {} session reported broken history", source.profile)
+            }
             HandoffReason::Routing | HandoffReason::Request => {
                 format!("the work moved from {}", source.profile)
             }

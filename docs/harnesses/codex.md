@@ -538,6 +538,17 @@ arguments/digests or replay input. See
 [profile binding](../spec/configuration.md#frozen-profile-and-route-binding) and the
 [shared binding type](../../crates/eliot-core/src/native_store.rs).
 
+### Broken native tool history
+
+For the owned thread, the specific native error `Custom tool call output is missing
+for call id …` establishes missing history when it is the correlated compaction or
+turn-start RPC refusal, the error of a failed bound compaction, or a non-retrying
+session-level `error` on the owned thread observed during a turn-start request with
+an unknown outcome. A successful turn clears the session-level observation.
+Swarm records the classification on that generation. A compact timeout
+by itself retains its unknown fence. Native history evidence does not settle an
+uncertain send, which remains in the source session and is named in the handoff brief.
+
 ### Terminal provider response-withheld signal
 
 Codex 0.167.1's native `TurnError` requires `message` and may include

@@ -241,6 +241,15 @@ fn read_inbox_snapshot<T>(path: &Path, read: impl FnOnce(&Connection) -> Result<
 }
 
 impl Store {
+    /// Return the retained rows closing the existing SEND outcome gate for a
+    /// queued send, for read-only diagnosis and Owner projections.
+    pub fn queued_send_gate_blockers(
+        &self,
+        command_id: &str,
+    ) -> Result<Vec<super::SendOutcomeGateBlocker>> {
+        super::queued_send_gate_blockers(&self.connection, command_id)
+    }
+
     /// Check that a sampled reason still names the current command before mailing its issuer.
     pub fn command_still_stuck(&self, subject: &str, reason: &str, now: i64) -> Result<bool> {
         Ok(

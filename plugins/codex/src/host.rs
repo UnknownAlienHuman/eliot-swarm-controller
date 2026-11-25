@@ -135,6 +135,27 @@ struct AgentSession {
     stop_command_id: Option<String>,
 }
 
+fn unknown_send_result(
+    session: &mut AgentSession,
+    request_started_at: Instant,
+    reason: &str,
+) -> Result<Value> {
+    session.phase = SessionPhase::Unknown;
+    if session
+        .events
+        .status()
+        .session_history_failure_at
+        .is_some_and(|failure| failure > request_started_at)
+    {
+        return Ok(json!({
+            "state": "unknown",
+            "reason": reason,
+            "native_session_failure": eliot_core::limits::NATIVE_HISTORY_MISSING_TOOL_OUTPUT,
+        }));
+    }
+    Err(Error::new("unknown", reason))
+}
+
 struct TargetEnvironment {
     variables: Vec<(OsString, OsString)>,
     secrets: Vec<String>,
@@ -2111,6 +2132,19 @@ impl CodexPlugin {
         {
             Ok(response) => response,
             Err(error)
+                if error.code == "native_rejected"
+                    && crate::native::types::history_missing_tool_output(&error.message) =>
+            {
+                session.phase = SessionPhase::Unknown;
+                return Ok(json!({
+                    "state": "rejected",
+                    "command_id": command_id,
+                    "reason": "Codex rejected compaction because its native tool history is incomplete",
+                    "compaction": {"completed": false},
+                    "native_session_failure": eliot_core::limits::NATIVE_HISTORY_MISSING_TOOL_OUTPUT,
+                }));
+            }
+            Err(error)
                 if matches!(
                     error.code.as_str(),
                     "native_not_dispatched" | "native_rejected" | "frame_too_large" | "busy"
@@ -2173,13 +2207,40 @@ impl CodexPlugin {
             Ok(progress) => progress,
             Err(_) => {
                 session.phase = SessionPhase::Unknown;
-                return Ok(json!({
+                let mut outcome = json!({
                     "state": "unknown",
                     "command_id": command_id,
                     "compaction": {"completed": false},
-                }));
+                });
+                if session
+                    .events
+                    .status()
+                    .compaction
+                    .is_some_and(|progress| progress.history_missing_tool_output)
+                {
+                    outcome["native_session_failure"] =
+                        json!(eliot_core::limits::NATIVE_HISTORY_MISSING_TOOL_OUTPUT);
+                }
+                return Ok(outcome);
             }
         };
+        if progress.history_missing_tool_output
+            && progress.terminal_status.as_deref() != Some("completed")
+        {
+            session.phase = SessionPhase::Unknown;
+            let state = if progress.terminal_status.as_deref() == Some("failed") {
+                "failed"
+            } else {
+                "unknown"
+            };
+            return Ok(json!({
+                "state": state,
+                "command_id": command_id,
+                "reason": "Codex reported incomplete native tool history during compaction",
+                "compaction": {"completed": false, "receipt_id": progress.turn_id},
+                "native_session_failure": eliot_core::limits::NATIVE_HISTORY_MISSING_TOOL_OUTPUT,
+            }));
+        }
         let Some(turn_id) = progress.turn_id.as_deref() else {
             session.phase = SessionPhase::Unknown;
             return Ok(json!({
@@ -2373,9 +2434,10 @@ impl CodexPlugin {
         );
         let encoded = serde_json::to_value(turn_params)
             .map_err(|_| Error::new("internal", "Codex turn/start params could not be encoded"))?;
+        let request_started_at = Instant::now();
         let response = session
             .native_client
-            .call("turn/start", encoded, Instant::now() + RPC_TIMEOUT)
+            .call("turn/start", encoded, request_started_at + RPC_TIMEOUT)
             .await;
         let response = match response {
             Ok(value) => value,
@@ -2386,6 +2448,14 @@ impl CodexPlugin {
                 }));
             }
             Err(error) if error.code == "native_rejected" => {
+                if crate::native::types::history_missing_tool_output(&error.message) {
+                    session.phase = SessionPhase::Unknown;
+                    return Ok(json!({
+                        "state": "rejected",
+                        "reason": "Codex rejected turn/start because its native tool history is incomplete",
+                        "native_session_failure": eliot_core::limits::NATIVE_HISTORY_MISSING_TOOL_OUTPUT,
+                    }));
+                }
                 return Ok(json!({"state": "rejected", "reason": "Codex rejected turn/start"}));
             }
             Err(error) if error.code == "frame_too_large" => {
@@ -2395,22 +2465,22 @@ impl CodexPlugin {
                 }));
             }
             Err(_) => {
-                session.phase = SessionPhase::Unknown;
-                return Err(Error::new(
-                    "unknown",
+                return unknown_send_result(
+                    session,
+                    request_started_at,
                     "Codex turn/start may have applied; the input will not be repeated",
-                ));
+                );
             }
         };
         let started: NativeTurnStartResponse =
             match serde_json::from_value::<NativeTurnStartResponse>(response) {
                 Ok(started) if !started.turn.id.trim().is_empty() => started,
                 _ => {
-                    session.phase = SessionPhase::Unknown;
-                    return Err(Error::new(
-                        "unknown",
+                    return unknown_send_result(
+                        session,
+                        request_started_at,
                         "Codex turn/start returned no exact turn identity",
-                    ));
+                    );
                 }
             };
         let turn_id = started.turn.id;

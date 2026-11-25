@@ -1693,6 +1693,10 @@ The daemon evaluates this every five seconds for root and child Agents outside c
   not finish, input is waiting or was refused by the hold, or a Goal is active;
 - a lost or failed session of this daemon's lifetime with the same kinds of owed work,
   20 seconds after the loss so native process-loss recovery can reopen it first.
+- an adapter-classified broken native session. The exact generation is fenced
+  at settlement. The ordinary switch stops and drains it before a fresh launch
+  in the same worktree. The brief identifies unknown input by its command ID
+  and effect status and omits its text. That input is excluded from transfers.
 - a failed Resume with a bound native `agent.start` refusal that proves no native
   subject was created. The daemon persists the exact refusal reason and location, then
   selects it immediately through the same owed-work and automatic-handoff path. Boot
@@ -1703,8 +1707,8 @@ The daemon evaluates this every five seconds for root and child Agents outside c
   for branch drift and the other Agent identity when known. Verify or restore the
   worktree before issuing a new Resume.
 
-Held and lost sessions use `handoff_fallback` in configured order. A lost session
-can reuse its profile if the fallback list names it. For a withheld response on a
+Held, lost and broken sessions use `handoff_fallback` in configured order. A lost
+or broken session can reuse its profile if the fallback list names it. For a withheld response on a
 role-routed Agent, `on_provider_failure = "next"` selects from the remaining presets
 in that role. An explicitly selected preset uses `handoff_fallback` when
 `auto_handoff` is enabled. The adapter declares which frozen account and
