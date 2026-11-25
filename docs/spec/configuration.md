@@ -2187,10 +2187,14 @@ workspaces or start a daemon.
 
 `[daemon].chats_root` is an optional absolute local root (at most 4096 bytes),
 defaulting to `<user home>/Eliot/chats`. `settings.read` exposes the effective
-root and `settings.save` accepts the same path unchanged. Readback, save and
-chat launch use the same filesystem validator. On Windows, ordinary and
-verbatim local drive paths use the same rooted component checks and protected
-directory comparison. Refusals identify the path problem, such as a relative
+root when the setting is absent, with the same value in `default_chats_root`.
+Sending both matching values back keeps the default implicit. Editing
+`chats_root` to a different value saves an explicit path. An explicit path is
+read back in its configured spelling. The display metadata is omitted from
+`config.toml`. Readback, save and chat launch use the same filesystem validator.
+Ordinary and verbatim Windows drive paths use the same rooted component checks.
+The data root is resolved before choosing a default so equivalent filesystem
+paths select the same chats root. Refusals identify the path problem, such as a relative
 path, link, file component, or protected-root overlap. The Owner may explicitly
 choose the canonical owner chat tree for a non-default data directory, such as
 a production controller. Derived defaults never resolve there. When

@@ -115,9 +115,8 @@ fn home_namespaced_chats_root(data_root: &Path) -> core::Result<std::path::PathB
                 "data dir needs an explicit disjoint daemon.chats_root",
             )
         })?;
-    let absolute = std::path::absolute(data_root).unwrap_or_else(|_| data_root.to_owned());
     let mut hash = 0xcbf29ce484222325_u64;
-    for byte in absolute.to_string_lossy().bytes() {
+    for byte in core::display_path(&data_root.to_string_lossy()).bytes() {
         hash ^= u64::from(byte);
         hash = hash.wrapping_mul(0x100000001b3);
     }
@@ -161,15 +160,23 @@ pub(crate) fn validate_chats_location(
     data_root: &Path,
     chats_root: Option<&str>,
 ) -> core::Result<PathBuf> {
+    let data_root = resolve_existing_prefix(data_root).map_err(|error| {
+        core::Error::new(
+            "profile_error",
+            format!("cannot resolve the daemon data root: {error}"),
+        )
+    })?;
     let owner_default = crate::platform::data_dir::default_data_dir()
-        .is_ok_and(|default| same_absolute_path(data_root, &default));
+        .ok()
+        .and_then(|default| resolve_existing_prefix(&default).ok())
+        .is_some_and(|default| path_comparison_key(&data_root) == path_comparison_key(&default));
     let explicit = chats_root.map(Path::new);
-    let mut protected = protected_paths(data_root);
+    let mut protected = protected_paths(&data_root);
     if !owner_default {
         let owner = owner_chats_root()?;
         // Only the explicit choice of the Owner's chat root waives this
         // protection. Configured harness and data roots stay protected.
-        if explicit.is_none_or(|root| !same_absolute_path(root, &owner)) {
+        if explicit.is_none_or(|root| !same_resolved_path(root, &owner)) {
             protected.push(owner);
         }
     }
@@ -179,16 +186,19 @@ pub(crate) fn validate_chats_location(
     if owner_default {
         return validate_chats_root(&owner_chats_root()?, &protected);
     }
-    if let Some(sibling) = sibling_chats_root(data_root)
+    if let Some(sibling) = sibling_chats_root(&data_root)
         && let Ok(root) = validate_chats_root(&sibling, &protected)
     {
         return Ok(root);
     }
-    validate_chats_root(&home_namespaced_chats_root(data_root)?, &protected)
+    validate_chats_root(&home_namespaced_chats_root(&data_root)?, &protected)
 }
 
-fn same_absolute_path(left: &Path, right: &Path) -> bool {
-    match (std::path::absolute(left), std::path::absolute(right)) {
+fn same_resolved_path(left: &Path, right: &Path) -> bool {
+    match (
+        resolve_existing_prefix(left),
+        resolve_existing_prefix(right),
+    ) {
         (Ok(left), Ok(right)) => path_comparison_key(&left) == path_comparison_key(&right),
         _ => false,
     }

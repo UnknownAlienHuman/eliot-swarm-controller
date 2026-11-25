@@ -688,7 +688,12 @@ pub(crate) fn read_snapshot(
                 }
             };
             match super::validate_chats_location(data_root, configured) {
-                Ok(root) => value["chats_root"] = serde_json::json!(root.to_string_lossy()),
+                Ok(root) if configured.is_none() => {
+                    let root = serde_json::json!(root.to_string_lossy());
+                    value["chats_root"] = root.clone();
+                    value[DEFAULT_CHATS_ROOT] = root;
+                }
+                Ok(_) => {}
                 Err(error) => {
                     add_section_error_issue(
                         &mut issues,
@@ -1276,6 +1281,15 @@ fn replacements(
     Ok(result)
 }
 
+const DEFAULT_CHATS_ROOT: &str = "default_chats_root";
+
+/// The displayed path which still represents the implicit default. An edit
+/// to chats_root that differs from it requests an explicit path.
+fn implicit_chats_root(value: &JsonValue) -> Option<&JsonValue> {
+    let default = value.get(DEFAULT_CHATS_ROOT)?;
+    (default.is_string() && value.get("chats_root") == Some(default)).then_some(default)
+}
+
 /// One section's replacement TOML; empty when the section is removed (an
 /// empty or default section reads as its default).
 fn section_source(
@@ -1296,6 +1310,21 @@ fn section_source(
         return Ok(String::new());
     }
     let mut normalized = value.clone();
+    if section == SettingsSection::Daemon {
+        let daemon = normalized.as_object_mut().expect("section object checked");
+        if daemon
+            .remove(DEFAULT_CHATS_ROOT)
+            .is_some_and(|value| !value.is_string())
+        {
+            return Err(core::Error::new(
+                "profile_error",
+                "daemon.default_chats_root must be a string",
+            ));
+        }
+        if implicit_chats_root(value).is_some() {
+            daemon.remove("chats_root");
+        }
+    }
     if section == SettingsSection::Projects {
         super::projects::canonicalize_project_settings(&mut normalized, true)?;
     }
@@ -1332,11 +1361,18 @@ fn section_source(
 /// (TOML has no null; an empty or default section reads as its default).
 /// An editor compares a read with this to tell its own save from another
 /// writer's (the stale-revision rule in `docs/spec/configuration.md`).
-/// `None` when `value` cannot be stored. The read also fills the daemon
-/// section's `chats_root`; this does not.
+/// `None` when `value` cannot be stored. Preserve the draft's default-root
+/// display metadata when the draft keeps that root implicit.
 pub fn stored_section(section: SettingsSection, value: &JsonValue) -> Option<JsonValue> {
     let source = section_source(section, value, true).ok()?;
-    section_json(&source, section_name(section)).ok()
+    let mut stored = section_json(&source, section_name(section)).ok()?;
+    if section == SettingsSection::Daemon
+        && let Some(default) = implicit_chats_root(value)
+    {
+        stored["chats_root"] = default.clone();
+        stored[DEFAULT_CHATS_ROOT] = default.clone();
+    }
+    Some(stored)
 }
 
 fn validate_unselected_sections(
