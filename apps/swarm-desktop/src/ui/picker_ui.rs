@@ -222,7 +222,6 @@ impl DesktopApp {
         let open = self.launch.open == Some(Pop::TitleProject);
         self.popover_chip(
             controls::text_button()
-                .height(tokens::height::FIELD)
                 .automation_name(format!(
                     "Project: {label} ({})",
                     if open { "list open" } else { "choose" }

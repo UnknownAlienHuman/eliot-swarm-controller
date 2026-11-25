@@ -619,15 +619,8 @@ impl DesktopApp {
                 .vertical_alignment(VerticalAlignment::Center)
                 .into()
         } else {
-            Border::new()
-                .width(tokens::layout::USAGE_RING)
-                .height(tokens::layout::USAGE_RING)
-                .corner_radius(tokens::layout::USAGE_RING / 2.0)
-                .border_brush(ThemeBrush::CardStroke)
-                .border_thickness(Thickness::uniform(tokens::layout::USAGE_RING_STROKE))
-                .horizontal_alignment(HorizontalAlignment::Center)
-                .vertical_alignment(VerticalAlignment::Center)
-                .into()
+            // No reading applies: the Usage icon in the ring's place.
+            controls::icon(controls::glyph::USAGE)
         };
         let button = Button::new()
             .padding(Thickness::uniform(

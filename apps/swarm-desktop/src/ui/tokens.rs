@@ -39,8 +39,6 @@ pub mod height {
     pub const SEND_MENU: f64 = 32.0;
     /// The conversation header.
     pub const HEADER: f64 = 52.0;
-    /// A text field.
-    pub const FIELD: f64 = 32.0;
     /// A page's title row.
     pub const TITLE_ROW: f64 = 40.0;
     /// A status pill or file chip.

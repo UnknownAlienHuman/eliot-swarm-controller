@@ -1097,18 +1097,16 @@ pub enum RowMark {
     Failed,
 }
 
-/// The view of a row's state mark in its slot. `word` names the mark for a
-/// screen reader. A stopped row has no mark (`None` where a mark is
+/// The view of a row's state mark in its slot. `word` names the failed mark
+/// for a screen reader (the row's own name says the other states). A stopped row has no mark (`None` where a mark is
 /// optional).
 pub fn row_mark(mark: RowMark, word: &str) -> View {
-    let slot = |content: View| -> View {
+    let slot = |content: View| -> Border {
         Border::new()
             .width(layout::MARK_SLOT)
             .height(layout::MARK_SLOT)
             .vertical_alignment(VerticalAlignment::Center)
-            .automation_name(word)
             .content(content)
-            .into()
     };
     let dot = |size: f64| -> Ellipse {
         Ellipse::new()
@@ -1128,16 +1126,21 @@ pub fn row_mark(mark: RowMark, word: &str) -> View {
                 .horizontal_alignment(HorizontalAlignment::Center)
                 .vertical_alignment(VerticalAlignment::Center)
                 .into(),
-        ),
-        RowMark::Waiting => slot(dot(layout::DOT_WAIT).fill(ThemeBrush::Accent).into()),
+        )
+        .into(),
+        RowMark::Waiting => slot(dot(layout::DOT_WAIT).fill(ThemeBrush::Accent).into()).into(),
         RowMark::Idle => slot(
             dot(layout::DOT_IDLE)
                 .stroke(ThemeBrush::PrimaryText)
                 .stroke_thickness(layout::HAIRLINE)
                 .into(),
-        ),
-        RowMark::Queued => slot(icon(glyph::SCHEDULE)),
-        RowMark::Failed => slot(critical_icon(glyph::ERROR, icon_size::ROW)),
+        )
+        .into(),
+        RowMark::Queued => slot(icon(glyph::SCHEDULE)).into(),
+        // The failed icon carries the word for a screen reader.
+        RowMark::Failed => slot(critical_icon(glyph::ERROR, icon_size::ROW))
+            .automation_name(word)
+            .into(),
     }
 }
 

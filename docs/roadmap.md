@@ -1208,7 +1208,7 @@ of the explicitly selected release scope.
   - [ ] **M1 Fluent foundation.** Remove the global M3 overrides; native
     themes, shell and sidebar, title bar, one set of app layout constants;
     System, Light, Dark and Contrast work.
-    - [ ] **M1a Global Material layer removed.** No M3 colors, shapes,
+    - [x] **M1a Global Material layer removed.** No M3 colors, shapes,
       implicit styles, templates, fonts, ripple, shadows or palette engine;
       stock controls in their own states, the system UI font, Segoe Fluent
       Icons, System/Light/Dark through Reactor's window theme with legacy

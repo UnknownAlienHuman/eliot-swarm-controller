@@ -275,12 +275,13 @@ fn list_view(items: &[(usize, String, RichText)]) -> View {
                                 0.0,
                                 0.0,
                             ))
-                            .columns([
-                                GridLength::Pixel(tokens::layout::LIST_MARKER_WIDTH),
-                                GridLength::STAR,
-                            ])
+                            // At least the marker column; a longer marker
+                            // ("100.") widens its own row instead of clipping.
+                            .columns([GridLength::Auto, GridLength::STAR])
+                            .column_spacing(tokens::spacing::XS)
                             .children((
-                                crate::controls::body(marker.clone()),
+                                crate::controls::body(marker.clone())
+                                    .min_width(tokens::layout::LIST_MARKER_WIDTH),
                                 rich_block(text).grid_column(1),
                             )),
                     )

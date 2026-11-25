@@ -123,14 +123,8 @@ impl DesktopApp {
                 .min_height(tokens::layout::ROW_RING)
                 .vertical_alignment(VerticalAlignment::Center)
                 .into(),
-            None => Border::new()
-                .width(tokens::layout::ROW_RING)
-                .height(tokens::layout::ROW_RING)
-                .corner_radius(tokens::layout::ROW_RING / 2.0)
-                .border_brush(ThemeBrush::CardStroke)
-                .border_thickness(Thickness::uniform(tokens::layout::USAGE_RING_STROKE))
-                .vertical_alignment(VerticalAlignment::Center)
-                .into(),
+            // No limit read yet: the Usage icon in the ring's place.
+            None => controls::icon(controls::glyph::USAGE),
         };
         let spoken = if word.is_empty() {
             "Usage: limits not read yet".to_owned()
