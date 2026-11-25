@@ -33,8 +33,8 @@ pub struct TerminalHistory<A, T> {
     pub assistants: Vec<(usize, A)>,
 }
 
-/// A newer terminal proves completion only when its exact input is present.
-/// Any readback error or missing input leaves the turn unresolved.
+/// An exact input can bind a newer terminal in the same history segment.
+/// A different input, a missing input, or a readback error leaves the turn unresolved.
 pub async fn read_turn_history<A, T, PageRead>(
     harness: &str,
     input_id: &str,
@@ -65,6 +65,12 @@ where
                         terminal,
                         assistants,
                     }));
+                }
+                HistoryMessage::Input(_) => {
+                    return Err(Error::new(
+                        "unknown",
+                        format!("{harness} terminal readback crossed a different input"),
+                    ));
                 }
                 HistoryMessage::Assistant(message) => assistants.push((position, message)),
                 HistoryMessage::Terminal(message) if terminal.is_none() => {
