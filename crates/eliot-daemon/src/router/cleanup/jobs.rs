@@ -7,7 +7,7 @@ const APPLY: &str = "cleanup.apply";
 const APPLY_ALL: &str = "cleanup.apply_all";
 const OWNER: &str = "owner";
 
-struct CleanupWorker(Router);
+pub(super) struct CleanupWorker(Router);
 
 impl Drop for CleanupWorker {
     fn drop(&mut self) {
@@ -139,7 +139,7 @@ impl Router {
         encoded(self.read_cleanup_status(&store, &principal_name(principal), &request.id)?)
     }
 
-    fn check_cleanup_admission(&self) -> Result<()> {
+    pub(super) fn check_cleanup_admission(&self) -> Result<()> {
         if self.inner.mode.load(Ordering::SeqCst) != MODE_OPEN {
             return Err(Error::new("bad_state", "daemon admission is closed"));
         }
@@ -150,7 +150,7 @@ impl Router {
     }
 
     // Admission and worker registration both run behind the Store lock.
-    fn claim_cleanup_worker(&self, id: &str) -> CleanupWorker {
+    pub(super) fn claim_cleanup_worker(&self, id: &str) -> CleanupWorker {
         *self.inner.cleanup_worker.lock_recover() = Some(id.to_owned());
         CleanupWorker(self.clone())
     }

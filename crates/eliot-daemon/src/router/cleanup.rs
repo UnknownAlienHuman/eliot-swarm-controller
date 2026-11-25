@@ -2563,15 +2563,19 @@ impl Router {
             require_owner(principal)?;
         }
         let name = principal_name(principal);
-        let (plan, mut response) = {
+        // Both automatic callers reserve and hold the same apply slot as
+        // explicit jobs. The restart seal checks it under the Store lock.
+        let (_worker, plan, mut response) = {
             let mut store = self.inner.store.lock().await;
+            self.check_cleanup_admission()?;
             let (plan, mut response, is_new) =
                 store.begin_cleanup_apply(&name, &request, now_ms(), false)?;
             if !is_new {
                 return encoded(response);
             }
+            let worker = self.claim_cleanup_worker(&request.id);
             self.apply_project_registrations(&mut store, &request, &plan, &mut response)?;
-            (plan, response)
+            (worker, plan, response)
         };
         self.apply_cleanup_artifacts(
             &name,
