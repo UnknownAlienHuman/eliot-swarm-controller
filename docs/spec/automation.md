@@ -1784,6 +1784,11 @@ Setting a Goal while its Agent is stopped also marks it to continue on Agent
 resume. An explicit Owner pause clears that mark, and `goal.resume` requires
 the Agent to leave the stopped state. Startup reconciles retained active Goals
 on stopped Agents through the same stop pause.
+A failed launch or Resume pauses its active Eliot Goal with reason
+`agent_failed`, including a Goal reserved for an initial generation that
+never started. Startup repairs retained active Goals on Failed Agents.
+Setting a Goal on a Failed Agent also starts paused. A confirmed native
+Resume resumes the Goal through the same unresolved-work gates.
 
 Goal set, pause, clear and resume each take a required external mutation id
 (see Mutation ids in api.md); the DTO link in Core api/goals.rs is the only

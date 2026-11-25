@@ -3127,7 +3127,7 @@ impl Store {
         // Settle only the exact pre-Git creation cancellation after restart
         // has reconciled both dispatched commands and Agent custody.
         workspace::recover_workspace_cancellations(&tx, now, &mut events)?;
-        goals::pause_stopped_active_goals_tx(&tx, now, &mut events)?;
+        goals::pause_terminal_active_goals_tx(&tx, now, &mut events)?;
         commit_transaction(tx, &self.write_faulted)?;
         Ok(events)
     }
@@ -7420,6 +7420,7 @@ fn fail_unstarted_launch_tx(
             "initial launch Agent changed before failure settlement",
         ));
     }
+    goals::pause_for_failed_start_tx(tx, agent_num, 0, now, events)?;
     events.push(insert_daemon_event_for_command(
         tx,
         command_id,

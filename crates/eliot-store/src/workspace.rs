@@ -1759,8 +1759,11 @@ pub(super) fn settle_preparation_command(
                 CommandState::Cancelled => AgentState::Stopped,
                 _ => AgentState::Created,
             };
-            db!(tx.execute("UPDATE agents SET state = ?1, updated_at = ?2 WHERE id = ?3 AND generation = 0 AND state = 'created'",
+            let changed = db!(tx.execute("UPDATE agents SET state = ?1, updated_at = ?2 WHERE id = ?3 AND generation = 0 AND state = 'created'",
                 params![agent_state_name(next), now, parse_agent_id(&agent.id)?]));
+            if changed == 1 && next == AgentState::Failed {
+                goals::pause_for_failed_start_tx(tx, parse_agent_id(&agent.id)?, 0, now, events)?;
+            }
             if matches!(state, CommandState::Failed | CommandState::Cancelled) {
                 project_assignment::clear_failed_preparation(tx, &agent, &command.command.id)?;
             }

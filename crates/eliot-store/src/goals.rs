@@ -691,14 +691,50 @@ pub(super) fn pause_for_stop_tx(
     now: i64,
     events: &mut Vec<Event>,
 ) -> Result<()> {
+    pause_for_terminal_agent_tx(tx, agent_num, generation, AgentState::Stopped, now, events)
+}
+
+pub(super) fn pause_for_failed_start_tx(
+    tx: &Transaction<'_>,
+    agent_num: i64,
+    generation: i64,
+    now: i64,
+    events: &mut Vec<Event>,
+) -> Result<()> {
+    pause_for_terminal_agent_tx(tx, agent_num, generation, AgentState::Failed, now, events)
+}
+
+fn agent_goal_pause_reason(state: AgentState) -> Option<&'static str> {
+    match state {
+        AgentState::Stopped => Some("agent_stopped"),
+        AgentState::Failed => Some("agent_failed"),
+        _ => None,
+    }
+}
+
+fn pause_for_terminal_agent_tx(
+    tx: &Transaction<'_>,
+    agent_num: i64,
+    generation: i64,
+    state: AgentState,
+    now: i64,
+    events: &mut Vec<Event>,
+) -> Result<()> {
+    let Some(reason) = agent_goal_pause_reason(state) else {
+        return Ok(());
+    };
     let Some(mut row) = load_goal_row(tx, agent_num, "eliot")? else {
         return Ok(());
     };
-    if row.generation != generation || row.state.status != GoalStatus::Active {
+    // A Goal assigned during an initial launch already names generation 1
+    // while the pre-dispatch Agent can fail at generation 0.
+    let unstarted_launch = state == AgentState::Failed && generation == 0 && row.generation == 1;
+    if (row.generation != generation && !unstarted_launch) || row.state.status != GoalStatus::Active
+    {
         return Ok(());
     }
     row.state.status = GoalStatus::Paused;
-    row.state.paused_reason = Some("agent_stopped".to_owned());
+    row.state.paused_reason = Some(reason.to_owned());
     row.state.stop_paused = true;
     update_goal_state_tx(tx, agent_num, &row.mode, row.revision, &row.state, now)?;
     events.push(insert_daemon_event(
@@ -707,37 +743,42 @@ pub(super) fn pause_for_stop_tx(
         "goal.changed",
         "goal",
         Some(agent_num),
-        Some(generation),
-        json!({"status": "paused", "reason": "agent_stopped"}),
+        Some(row.generation),
+        json!({"status": "paused", "reason": reason}),
     )?);
     Ok(())
 }
 
-/// Restart reconciliation for Goals left active by a stop that predates
-/// stop-pausing: each active Eliot Goal on a Stopped Agent of its own
-/// generation takes the same stop pause. Manual pauses are untouched.
-pub(super) fn pause_stopped_active_goals_tx(
+/// Reconcile retained Goals that predate pauses at Agent stop or failure.
+pub(super) fn pause_terminal_active_goals_tx(
     tx: &Transaction<'_>,
     now: i64,
     events: &mut Vec<Event>,
 ) -> Result<()> {
-    let stopped: Vec<(i64, i64)> = {
+    let paused: Vec<(i64, i64, bool)> = {
         let mut statement = tx
             .prepare(
-                "SELECT g.agent, g.generation FROM goals g JOIN agents a ON a.id = g.agent
-                 WHERE g.mode = 'eliot' AND a.state = 'stopped'
-                   AND a.generation = g.generation
+                "SELECT g.agent, a.generation, a.state = 'failed'
+                 FROM goals g JOIN agents a ON a.id = g.agent
+                 WHERE g.mode = 'eliot' AND a.state IN ('stopped','failed')
+                   AND (a.generation = g.generation
+                     OR (a.state='failed' AND a.generation=0 AND g.generation=1))
                    AND json_extract(g.state, '$.status') = 'active'",
             )
             .map_err(sql_error)?;
         statement
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
             .map_err(sql_error)?
-            .collect::<rusqlite::Result<Vec<(i64, i64)>>>()
+            .collect::<rusqlite::Result<Vec<_>>>()
             .map_err(sql_error)?
     };
-    for (agent_num, generation) in stopped {
-        pause_for_stop_tx(tx, agent_num, generation, now, events)?;
+    for (agent_num, generation, failed) in paused {
+        let state = if failed {
+            AgentState::Failed
+        } else {
+            AgentState::Stopped
+        };
+        pause_for_terminal_agent_tx(tx, agent_num, generation, state, now, events)?;
     }
     Ok(())
 }
@@ -1841,13 +1882,13 @@ impl Store {
                 "goal definition exceeds 64 KiB",
             ));
         }
-        let stop_paused = agent_row.state == AgentState::Stopped;
+        let paused_reason = agent_goal_pause_reason(agent_row.state).map(ToOwned::to_owned);
+        let stop_paused = paused_reason.is_some();
         let status = if stop_paused {
             GoalStatus::Paused
         } else {
             GoalStatus::Active
         };
-        let paused_reason = stop_paused.then(|| "agent_stopped".to_owned());
         let turn_count = count_turns(&tx, agent_num, agent_row.generation)?;
         if let Some(row) = load_goal_row(&tx, agent_num, mode)? {
             if row.generation == agent_row.generation
@@ -2231,10 +2272,13 @@ impl Store {
                     "observe-only Agents take no Goals",
                 ));
             }
-            if agent_row.state == AgentState::Stopped {
+            if agent_goal_pause_reason(agent_row.state).is_some() {
                 return Err(Error::new(
                     "bad_state",
-                    "Agent is stopped; resume the Agent, which continues its Goal",
+                    format!(
+                        "Agent is {}; resume the Agent, which continues its Goal",
+                        agent_state_name(agent_row.state)
+                    ),
                 ));
             }
             if row.generation != agent_row.generation {
