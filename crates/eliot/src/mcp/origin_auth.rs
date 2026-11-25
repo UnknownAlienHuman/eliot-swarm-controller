@@ -15,7 +15,7 @@ use rmcp::transport::streamable_http_server::session::{
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
-    path::Path,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex as StdMutex},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -108,8 +108,13 @@ impl Drop for SessionLifetime {
 }
 
 pub(super) struct OriginAuth {
+    /// Private data directory; grant audiences are reloaded from it on every
+    /// verification so grant add and revoke apply without a restart. The
+    /// team issuer and owner audience tag are pinned at startup: changing
+    /// them still needs a restart.
+    data_dir: PathBuf,
     issuer: String,
-    audiences: Vec<String>,
+    owner_audience: String,
     client: reqwest::Client,
     keys: Mutex<Keys>,
     key_refresh: Mutex<()>,
@@ -204,9 +209,10 @@ impl OriginAuth {
         data_dir: &Path,
         sdk_sessions: Arc<LocalSessionManager>,
     ) -> Result<Self, String> {
-        let (issuer, _) = eliot_daemon::load_cloud_access_config(data_dir)
-            .map_err(|error| format!("{}: {}", error.code, error.message))?;
-        let audiences = eliot_daemon::load_cloud_access_audiences(data_dir)
+        // Validate team, owner audience and grant table at startup (same
+        // failure as before) but retain only the team binding: audiences are
+        // reloaded on every verification.
+        let (issuer, owner_audience, _) = eliot_daemon::load_cloud_access_snapshot(data_dir)
             .map_err(|error| format!("{}: {}", error.code, error.message))?;
         let client = reqwest::Client::builder()
             .https_only(true)
@@ -216,8 +222,9 @@ impl OriginAuth {
             .build()
             .map_err(|_| "origin verifier HTTP client unavailable")?;
         let auth = Self {
+            data_dir: data_dir.to_owned(),
             issuer,
-            audiences,
+            owner_audience,
             client,
             key_refresh: Mutex::new(()),
             keys: Mutex::new(Keys {
@@ -370,11 +377,22 @@ impl OriginAuth {
         {
             return Err(StatusCode::UNAUTHORIZED);
         }
-        let mut matches = claims.aud.iter().filter(|claim_audience| {
-            self.audiences
-                .iter()
-                .any(|allowed| allowed == *claim_audience)
-        });
+        // One config snapshot per verification: a newly added grant is
+        // accepted and a revoked grant is rejected before the next request
+        // without a restart, with no values paired across separate reads.
+        // Any load failure fails closed, as does a team or owner-audience
+        // change, which still needs a restart. No token or secret is logged
+        // or persisted here.
+        let (issuer, owner_audience, audiences) =
+            eliot_daemon::load_cloud_access_snapshot(&self.data_dir)
+                .map_err(|_| StatusCode::UNAUTHORIZED)?;
+        if issuer != self.issuer || owner_audience != self.owner_audience {
+            return Err(StatusCode::UNAUTHORIZED);
+        }
+        let mut matches = claims
+            .aud
+            .iter()
+            .filter(|claim_audience| audiences.iter().any(|allowed| allowed == *claim_audience));
         let selected = matches.next().cloned().ok_or(StatusCode::UNAUTHORIZED)?;
         if matches.next().is_some() {
             return Err(StatusCode::UNAUTHORIZED);
