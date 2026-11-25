@@ -165,6 +165,44 @@ impl Directory {
         Ok(file)
     }
 
+    /// Resolve an existing relative Git hint through the pinned root. Missing
+    /// paths and unusual spellings use the caller's ordinary normalization.
+    #[cfg(windows)]
+    pub(crate) fn canonical_edit_hint(&self, hint: &str) -> Result<Option<String>> {
+        let mut relative = PathBuf::new();
+        for component in Path::new(hint).components() {
+            match component {
+                Component::Normal(name) if name.to_str().is_some_and(|n| plain(n).is_ok()) => {
+                    relative.push(name);
+                }
+                Component::CurDir => {}
+                _ => return Ok(None),
+            }
+        }
+        if relative.as_os_str().is_empty() {
+            return Ok(None);
+        }
+        let file = match native::open_hint(self.handle(), relative.as_os_str()) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(_) => return Err(Error::new("unavailable", "hint path cannot be inspected")),
+        };
+        if crate::platform::is_reparse_point(&file.metadata().map_err(io)?) {
+            return Err(Error::new(
+                "unavailable",
+                "workspace path contains a symlink or reparse point",
+            ));
+        }
+        let resolved = eliot_plugin::file_final_path(&file).map_err(io)?;
+        let relative = resolved
+            .strip_prefix(&self.path)
+            .map_err(|_| Error::new("unavailable", "file-change hint escapes its worktree"))?;
+        let text = relative
+            .to_str()
+            .ok_or_else(|| Error::new("unavailable", "hint path is not UTF-8"))?;
+        Ok(Some(text.replace('\\', "/")))
+    }
+
     /// Create a new directory relative to the pinned parent. Never adopt an
     /// existing directory as an Agent ownership root.
     pub(crate) fn create_directory(&self, name: &str) -> Result<Self> {
@@ -736,6 +774,19 @@ mod native {
         open_mode(parent, name, directory, false, true)
     }
 
+    pub(super) fn open_hint(parent: &File, path: &OsStr) -> io::Result<File> {
+        // The full relative path is resolved by the kernel without reparsing
+        // any intermediate component. The caller checks the opened leaf.
+        open_relative(
+            parent,
+            path,
+            FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            FILE_OPEN,
+            FILE_SYNCHRONOUS_IO_NONALERT | FILE_OPEN_REPARSE_POINT,
+        )
+    }
+
     fn open_mode(
         parent: &File,
         name: &OsStr,
@@ -743,25 +794,9 @@ mod native {
         create: bool,
         cleanup: bool,
     ) -> io::Result<File> {
-        let mut wide: Vec<u16> = name.encode_wide().collect();
-        let length =
-            u16::try_from(wide.len() * 2).map_err(|_| io::Error::other("name too long"))?;
-        let mut string = UNICODE_STRING {
-            Length: length,
-            MaximumLength: length,
-            Buffer: wide.as_mut_ptr(),
-        };
-        let attributes = OBJECT_ATTRIBUTES {
-            Length: std::mem::size_of::<OBJECT_ATTRIBUTES>() as u32,
-            RootDirectory: parent.as_raw_handle(),
-            ObjectName: &mut string,
-            Attributes: OBJ_CASE_INSENSITIVE | OBJ_DONT_REPARSE,
-            SecurityDescriptor: std::ptr::null_mut(),
-            SecurityQualityOfService: std::ptr::null_mut(),
-        };
-        let mut handle = std::ptr::null_mut();
-        let mut status_block: IO_STATUS_BLOCK = unsafe { std::mem::zeroed() };
-        let access = if directory {
+        let access = if cleanup {
+            GENERIC_READ | DELETE | SYNCHRONIZE
+        } else if directory {
             FILE_READ_ATTRIBUTES | FILE_TRAVERSE | SYNCHRONIZE
         } else if create {
             GENERIC_READ | GENERIC_WRITE | DELETE | SYNCHRONIZE
@@ -785,28 +820,69 @@ mod native {
             } else {
                 FILE_NON_DIRECTORY_FILE
             };
+        open_relative(
+            parent,
+            name,
+            access,
+            share,
+            if create { FILE_CREATE } else { FILE_OPEN },
+            options,
+        )
+    }
+
+    fn open_relative(
+        parent: &File,
+        name: &OsStr,
+        access: u32,
+        share: u32,
+        disposition: u32,
+        options: u32,
+    ) -> io::Result<File> {
+        let mut wide: Vec<u16> = name.encode_wide().collect();
+        let length =
+            u16::try_from(wide.len() * 2).map_err(|_| io::Error::other("name too long"))?;
+        let mut string = UNICODE_STRING {
+            Length: length,
+            MaximumLength: length,
+            Buffer: wide.as_mut_ptr(),
+        };
+        let attributes = OBJECT_ATTRIBUTES {
+            Length: std::mem::size_of::<OBJECT_ATTRIBUTES>() as u32,
+            RootDirectory: parent.as_raw_handle(),
+            ObjectName: &mut string,
+            Attributes: OBJ_CASE_INSENSITIVE | OBJ_DONT_REPARSE,
+            SecurityDescriptor: std::ptr::null_mut(),
+            SecurityQualityOfService: std::ptr::null_mut(),
+        };
+        let mut handle = std::ptr::null_mut();
+        let mut status_block: IO_STATUS_BLOCK = unsafe { std::mem::zeroed() };
         // SAFETY: all buffers live through the synchronous call; returned handle
         // has one owner and is converted to File only on NT_SUCCESS.
         let status = unsafe {
             NtCreateFile(
                 &mut handle,
-                if cleanup {
-                    GENERIC_READ | DELETE | SYNCHRONIZE
-                } else {
-                    access
-                },
+                access,
                 &attributes,
                 &mut status_block,
                 std::ptr::null(),
                 FILE_ATTRIBUTE_NORMAL,
                 share,
-                if create { FILE_CREATE } else { FILE_OPEN },
+                disposition,
                 options,
                 std::ptr::null(),
                 0,
             )
         };
         if status < 0 {
+            use windows_sys::Win32::Foundation::{
+                STATUS_OBJECT_NAME_NOT_FOUND, STATUS_OBJECT_PATH_NOT_FOUND,
+            };
+            if matches!(
+                status,
+                STATUS_OBJECT_NAME_NOT_FOUND | STATUS_OBJECT_PATH_NOT_FOUND
+            ) {
+                return Err(io::Error::from(io::ErrorKind::NotFound));
+            }
             if status == windows_sys::Win32::Foundation::STATUS_SHARING_VIOLATION {
                 return Err(io::Error::from_raw_os_error(
                     windows_sys::Win32::Foundation::ERROR_SHARING_VIOLATION as i32,
