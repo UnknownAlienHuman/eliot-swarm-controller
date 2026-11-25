@@ -1220,6 +1220,9 @@ pub(crate) struct ChatGroupArgs {
     /// Match a case-sensitive substring and set its tag. Repeat up to 16 times.
     #[arg(long, required = true, value_name = "TAG=LITERAL", value_parser = parse_content_group_rule)]
     pub(crate) rule: Vec<eliot_core::api::ContentGroupRule>,
+    /// Allow replacing existing manual tags.
+    #[arg(long)]
+    pub(crate) replace_manual_tags: bool,
 }
 
 fn parse_content_group_rule(value: &str) -> Result<eliot_core::api::ContentGroupRule, String> {

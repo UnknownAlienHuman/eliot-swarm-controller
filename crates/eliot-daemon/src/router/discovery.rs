@@ -1091,7 +1091,7 @@ fn method_limits(name: &str) -> &'static str {
             "Owner only. Placement and tags only; execution scope is untouched. At most 16 Agents per call. Retry the same id for the retained readback."
         }
         "chat.group" => {
-            "Owner only. Match up to 16 case-sensitive literals on one completed retained turn. Supply the current organization link revision. No match leaves the link as read. Retry the same id for retained readback."
+            "Owner only. Match up to 16 case-sensitive literals on one completed retained turn. Supply the current organization link revision. Existing manual tags require replace_manual_tags. No match leaves the link as read. Retry the same id for retained readback."
         }
         "chat.organization" => {
             "Owner only. Ready grouped projection with event-watermark readback; no client-side Git discovery."

@@ -950,11 +950,22 @@ impl Store {
                     LinkRequest::Tag(request) => {
                         (current.project, encode_json(&request.tags)?, None)
                     }
-                    LinkRequest::Group(request) => (
-                        current.project,
-                        encode_json(&content_tags(&tx, num, request)?)?,
-                        Some(encode_json(&request.source)?),
-                    ),
+                    LinkRequest::Group(request) => {
+                        if !request.replace_manual_tags
+                            && current.content_source.is_none()
+                            && !decode_tags(&current.tags)?.is_empty()
+                        {
+                            return Err(Error::new(
+                                "manual_tags",
+                                "content grouping requires replace_manual_tags to replace manual tags",
+                            ));
+                        }
+                        (
+                            current.project,
+                            encode_json(&content_tags(&tx, num, request)?)?,
+                            Some(encode_json(&request.source)?),
+                        )
+                    }
                 };
                 db!(tx.execute(
                     "INSERT INTO chat_organization(agent, project_link, tags, revision, content_source)

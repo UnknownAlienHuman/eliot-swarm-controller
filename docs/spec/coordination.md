@@ -620,16 +620,18 @@ exact source turn reference as optional overlay metadata.
   revision and source unchanged. The
   required `expected_revision` is compared with the current link revision
   (zero before its first write); a stale value returns `conflict` without a
-  change. Exact request-ID replay returns its original committed result.
+  change. Existing tags without a content source require the Owner to
+  explicitly authorize replacement, including after a manual correction.
+  Exact request-ID replay returns its original committed result.
   The grouping operation persists no copy of the turn text or rule literals,
   and makes no provider call or authority change.
 - The exact `content_source` is present in `chat.organization` members and in
   each mutation's returned link. An Opus UI can expose `Group by content` as
   an explicit Owner action: select a completed retained turn, enter literal
   rules, submit its observed `agent.list.organization_revision`, and render
-  the returned tags and source reference. On `no_match` keep the view; on
-  `conflict` reread the organization row before another attempt. The UI sends
-  no turn text to a provider.
+  the returned tags and source reference. On `no_match` keep the view. On
+  `conflict` reread the organization row. On `manual_tags` offer an explicit
+  replacement action using the observed revision.
 - The Owner continues a projectless chat through `swarm switch --project` and
   the existing switch/handoff path. A chat's placement, tags, and original
   execution scope stay attached to its original identity.

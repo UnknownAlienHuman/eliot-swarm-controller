@@ -729,10 +729,13 @@ unchanged. A missing source turn returns
 
 The required `expected_revision` is the observed link revision
 (`organization_revision` from `agent.list`, or 0 before the first organization
-write); a stale value returns `conflict` with no change. Grouping adds no copy
-of the turn text or rule literals to the overlay or write result. The
-`content_source` appears in `chat.organization` members and in the returned
-`OrgLinkView`; attach/detach preserve it and manual `chat.tag` clears it.
+write). A stale value returns `conflict` with no change. A link with nonempty
+tags and no `content_source` returns `manual_tags` with no change. To replace
+those tags explicitly, send `replace_manual_tags: true` or pass
+`--replace-manual-tags` on the CLI, along with the current revision.
+Grouping adds no copy of turn text or rule literals to the overlay or write
+result. The `content_source` appears in `chat.organization` members and in the
+returned `OrgLinkView`. Attach and detach preserve it. Manual `chat.tag` clears it.
 
 Every mutation carries an id: exact replay returns its committed result before
 current-state checks, and reuse with a different binding or payload returns
@@ -747,7 +750,7 @@ router publishes it after commit. Rename stays the desktop
 `[desktop] display_names` presentation preference and archive stays
 `agent.archive`. Errors include `invalid`, `not_found`, `not_allowed`,
 `conflict`, `bad_state`, `unavailable`, `content_unavailable`, `no_match`,
-`id_conflict`, `source_integrity` and mutation binding/age errors.
+`manual_tags`, `id_conflict`, `source_integrity` and mutation binding/age errors.
 
 ### Authenticated method discovery
 
@@ -3885,7 +3888,7 @@ swarm chat organization [--project P] [--after P] [--archived]
 swarm chat attach CHAT... --project P
 swarm chat detach CHAT...
 swarm chat tag AGENT... [--tag TAG]... [--revision REV]...
-swarm chat group AGENT --generation N --turn-id ID --revision REV --rule TAG=LITERAL [--rule TAG=LITERAL ...]
+swarm chat group AGENT --generation N --turn-id ID --revision REV --rule TAG=LITERAL [--rule TAG=LITERAL ...] [--replace-manual-tags]
 swarm provider holds [--after SCOPE] [--limit N]
 swarm provider clear-hold SCOPE --corrective-evidence credentials_updated|configuration_updated|owner_verified [--expected-probe-command ID]
 swarm project assignment claim PROJECT [AGENT --generation N --revision REVISION]

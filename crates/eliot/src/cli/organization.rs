@@ -122,12 +122,14 @@ pub(super) async fn run_chat(
             turn_id,
             revision,
             rule,
+            replace_manual_tags,
         }) => {
             let request = ChatGroupRequest {
                 id: mutation_id(id)?,
                 source: WaitTurnRef::new(agent, generation, turn_id),
                 expected_revision: revision,
                 rules: rule,
+                replace_manual_tags,
             };
             request.validate().map_err(Failure::for_mutation)?;
             let response: ChatOrganizationMutationResponse =

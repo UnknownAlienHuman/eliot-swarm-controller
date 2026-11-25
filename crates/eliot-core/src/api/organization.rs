@@ -680,6 +680,9 @@ pub struct ChatGroupRequest {
     pub source: WaitTurnRef,
     pub expected_revision: i64,
     pub rules: Vec<ContentGroupRule>,
+    /// Allow replacing existing tags that have no content source.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub replace_manual_tags: bool,
 }
 
 impl ChatGroupRequest {
@@ -725,7 +728,6 @@ impl ChatGroupRequest {
                 "content grouping response binding differs",
             ));
         };
-        let mut rules = self.rules.iter();
         if reply.id != self.id
             || link.content_source.as_ref() != Some(&self.source)
             || Some(link.revision) != self.expected_revision.checked_add(1)
@@ -733,7 +735,7 @@ impl ChatGroupRequest {
             || !link
                 .tags
                 .iter()
-                .all(|tag| rules.any(|rule| rule.tag == *tag))
+                .all(|tag| self.rules.iter().any(|rule| rule.tag == *tag))
         {
             return Err(Error::new(
                 "unknown",
