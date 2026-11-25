@@ -16,7 +16,6 @@ use crate::monitor::group;
 fn n(value: u64) -> String {
     group(i64::try_from(value).unwrap_or(i64::MAX))
 }
-use crate::theme::winui::Palette;
 use crate::ui::tokens;
 use crate::views::Shared;
 
@@ -300,7 +299,6 @@ pub struct AutonomyInput {
     pub report: Report,
     /// A read is running (the shown numbers stay until it lands).
     pub reading: bool,
-    pub palette: Palette,
     /// Show or hide the lines by source.
     pub toggle: Callback<()>,
     /// Choose the window: 7 days (true) or 24 hours.
@@ -323,7 +321,6 @@ impl Component for Autonomy {
     }
 
     fn view(&self, input: &AutonomyInput, _context: &mut ViewContext<Self>) -> View {
-        let palette = input.palette;
         let window = if input.week {
             "the last 7 days"
         } else {
@@ -345,12 +342,12 @@ impl Component for Autonomy {
                 // only when its template is applied.
                 KeyedView::new(
                     format!("{text}:{selected}"),
-                    crate::m3::segment(palette, selected)
+                    crate::controls::segment(selected)
                         .automation_name(format!("Autonomy for {text}"))
                         .on_click(move || {
                             choose.call(week);
                         })
-                        .content(crate::m3::segment_label(text)),
+                        .content(crate::controls::segment_label(text)),
                 )
             })
             .collect();
@@ -364,35 +361,35 @@ impl Component for Autonomy {
             ])
             .column_spacing(tokens::spacing::SM)
             .children((
-                crate::m3::muted("Autonomy", tokens::page::HEADING)
+                crate::controls::text("Autonomy", tokens::page::HEADING)
                     .automation_heading_level(AutomationHeadingLevel::Level2)
                     .vertical_alignment(VerticalAlignment::Center),
-                crate::m3::secondary(updated)
+                crate::controls::secondary(updated)
                     .grid_column(1)
                     .vertical_alignment(VerticalAlignment::Center),
-                crate::m3::icon_button(palette)
+                crate::controls::icon_button()
                     .grid_column(2)
                     .is_enabled(!input.reading)
                     .automation_name("Refresh autonomy")
                     .on_click(move || {
                         refresh.call(());
                     })
-                    .content(crate::m3::icon(crate::m3::glyph::REFRESH)),
+                    .content(crate::controls::icon(crate::controls::glyph::REFRESH)),
                 Border::new()
                     .grid_column(3)
                     .vertical_alignment(VerticalAlignment::Center)
-                    .content(crate::m3::segmented(palette, segments)),
+                    .content(crate::controls::segmented(segments)),
             ));
         let mut parts: Vec<KeyedView> = vec![KeyedView::new("head", head)];
         match &input.report {
             Report::Reading => parts.push(KeyedView::new(
                 "reading",
-                crate::m3::secondary("Reading autonomy…"),
+                crate::controls::secondary("Reading autonomy…"),
             )),
             Report::Failed(error) => parts.push(KeyedView::new(
                 "failed",
-                crate::m3::secondary(format!("Autonomy could not be read: {error}"))
-                    .foreground(palette.attention())
+                crate::controls::secondary(format!("Autonomy could not be read: {error}"))
+                    .foreground(ThemeBrush::SystemCritical)
                     .text_wrapping(TextWrapping::Wrap)
                     .is_text_selection_enabled(true),
             )),
@@ -409,8 +406,9 @@ impl Component for Autonomy {
                                 .grid_column(index as i32)
                                 .automation_name(format!("{label}: {value}"))
                                 .children((
-                                    crate::m3::text(value.clone(), tokens::page::STAT),
-                                    crate::m3::secondary(*label).text_wrapping(TextWrapping::Wrap),
+                                    crate::controls::text(value.clone(), tokens::page::STAT),
+                                    crate::controls::secondary(*label)
+                                        .text_wrapping(TextWrapping::Wrap),
                                 )),
                         )
                     })
@@ -437,10 +435,10 @@ impl Component for Autonomy {
                         .columns([GridLength::STAR, GridLength::Auto])
                         .column_spacing(tokens::spacing::SM)
                         .children((
-                            crate::m3::secondary(complete)
+                            crate::controls::secondary(complete)
                                 .text_wrapping(TextWrapping::Wrap)
                                 .vertical_alignment(VerticalAlignment::Center),
-                            crate::m3::text_button(palette)
+                            crate::controls::text_button()
                                 .grid_column(1)
                                 .automation_name(if input.open {
                                     "Hide the lines by source"
@@ -450,7 +448,7 @@ impl Component for Autonomy {
                                 .on_click(move || {
                                     toggle.call(());
                                 })
-                                .content(crate::m3::label(if input.open {
+                                .content(crate::controls::label(if input.open {
                                     "Hide sources"
                                 } else {
                                     "Show sources"
@@ -461,14 +459,14 @@ impl Component for Autonomy {
                     parts.extend(
                         read.lines
                             .iter()
-                            .map(|line| KeyedView::new(line.title, line_view(line, palette))),
+                            .map(|line| KeyedView::new(line.title, line_view(line))),
                     );
                 }
             }
         }
         Border::new()
-            .background(palette.tonal())
-            .border_brush(palette.outline())
+            .background(ThemeBrush::CardBackground)
+            .border_brush(ThemeBrush::CardStroke)
             .border_thickness(Thickness::uniform(tokens::layout::HAIRLINE))
             .corner_radius(tokens::radius::CONTAINER)
             .padding(Thickness::xy(
@@ -486,7 +484,7 @@ impl Component for Autonomy {
 
 /// One source: its title and coverage, its numbers, then its source (and
 /// the coverage reason when it is not complete).
-fn line_view(line: &Line, palette: Palette) -> View {
+fn line_view(line: &Line) -> View {
     let mut said = vec![line.title.to_owned(), line.coverage.as_str().to_owned()];
     said.extend(line.values.iter().cloned());
     let values: Vec<KeyedView> = line
@@ -496,14 +494,14 @@ fn line_view(line: &Line, palette: Palette) -> View {
         .map(|(index, value)| {
             KeyedView::new(
                 index,
-                crate::m3::body(value.clone())
+                crate::controls::body(value.clone())
                     .text_wrapping(TextWrapping::Wrap)
                     .is_text_selection_enabled(true),
             )
         })
         .collect();
     let reason: Option<View> = line.reason.as_ref().map(|reason| {
-        crate::m3::secondary(format!("{}: {reason}", line.coverage.as_str()))
+        crate::controls::secondary(format!("{}: {reason}", line.coverage.as_str()))
             .text_wrapping(TextWrapping::Wrap)
             .is_text_selection_enabled(true)
             .into()
@@ -517,12 +515,12 @@ fn line_view(line: &Line, palette: Palette) -> View {
                     .columns([GridLength::STAR, GridLength::Auto])
                     .column_spacing(tokens::spacing::SM)
                     .children((
-                        crate::m3::text(line.title, tokens::text::LABEL)
+                        crate::controls::text(line.title, tokens::text::LABEL)
                             .vertical_alignment(VerticalAlignment::Center)
                             .text_trimming(TextTrimming::CharacterEllipsis),
                         Border::new()
                             .grid_column(1)
-                            .content(crate::m3::badge(palette, line.coverage.as_str())),
+                            .content(crate::controls::badge(line.coverage.as_str())),
                     ))
                     .into(),
             ),
@@ -534,7 +532,7 @@ fn line_view(line: &Line, palette: Palette) -> View {
             ),
             reason,
             Some(
-                crate::m3::secondary(format!("Source: {}", line.source))
+                crate::controls::secondary(format!("Source: {}", line.source))
                     .text_wrapping(TextWrapping::Wrap)
                     .into(),
             ),

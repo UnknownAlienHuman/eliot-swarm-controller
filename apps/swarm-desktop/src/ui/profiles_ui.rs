@@ -5,7 +5,6 @@
 //! [`super::settings_ui`].
 
 use super::*;
-use crate::theme::winui::Palette;
 
 #[derive(Clone, Debug)]
 pub(super) enum ProfilesMsg {
@@ -391,19 +390,14 @@ impl DesktopApp {
     /// dropdowns (width, outline, chevron) naming its model; while open, it
     /// carries the composer's catalogue picker filtered to its harness as
     /// its flyout, under the field.
-    fn preset_model_control(
-        &self,
-        name: &str,
-        context: &mut ViewContext<Self>,
-        palette: Palette,
-    ) -> Option<View> {
+    fn preset_model_control(&self, name: &str, context: &mut ViewContext<Self>) -> Option<View> {
         let harness = self.preset_harness(name)?;
         let model = match profiles::field(&self.editor.draft, name, "model") {
             profiles::Field::Simple(model) => Some(model),
             profiles::Field::Absent => None,
             profiles::Field::Complex => {
                 return Some(
-                    m3::secondary("Complex value: edit it as TOML")
+                    controls::secondary("Complex value: edit it as TOML")
                         .vertical_alignment(VerticalAlignment::Center)
                         .into(),
                 );
@@ -424,7 +418,7 @@ impl DesktopApp {
                     .preset_target()
                     .is_some_and(|(preset, _)| preset == name)
             });
-        let field = m3::field_button(palette)
+        let field = controls::field_button()
             .automation_name(format!(
                 "Profile Model: {label} ({})",
                 if open.is_some() {
@@ -440,15 +434,14 @@ impl DesktopApp {
             ))));
         Some(self.anchored_popover(
             field,
-            m3::field_button_content(&label),
+            controls::field_button_content(&label),
             open,
             FlyoutPlacement::BottomEdgeAlignedLeft,
             context,
-            palette,
         ))
     }
 
-    pub(super) fn profiles_view(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
+    pub(super) fn profiles_view(&self, context: &mut ViewContext<Self>) -> View {
         let list = self.launch.profile_list.as_ref();
         let selected = self
             .editor
@@ -461,7 +454,7 @@ impl DesktopApp {
             .unwrap_or_default();
         let model = selected
             .as_deref()
-            .and_then(|name| self.preset_model_control(name, context, palette));
+            .and_then(|name| self.preset_model_control(name, context));
         let count = fields.len();
         let harness = selected
             .as_deref()
@@ -541,7 +534,7 @@ impl DesktopApp {
                 .callback(|index| Message::Profiles(ProfilesMsg::NewHarnessPicked(index))),
             create: context.message(Message::Profiles(ProfilesMsg::CreateRequested)),
         };
-        config_view::profiles_screen(data, actions, palette)
+        config_view::profiles_screen(data, actions)
     }
 
     /// The selected preset's Subagents section from the draft: the other

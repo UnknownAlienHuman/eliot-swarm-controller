@@ -358,7 +358,6 @@ impl DesktopApp {
     pub(in crate::ui) fn daemon_confirmation(
         &self,
         context: &mut ViewContext<Self>,
-        palette: Palette,
     ) -> ContentDialog {
         let (lines, deletes) =
             daemon_changes(&self.settings.base(Section::Daemon), &self.settings.daemon);
@@ -368,25 +367,24 @@ impl DesktopApp {
             .map(|(index, line)| {
                 KeyedView::new(
                     index,
-                    m3::body(format!("• {line}")).text_wrapping(TextWrapping::Wrap),
+                    controls::body(format!("• {line}")).text_wrapping(TextWrapping::Wrap),
                 )
             })
             .collect();
         if rows.is_empty() {
             rows.push(KeyedView::new(
                 "none",
-                m3::body("Nothing changed on this page.").text_wrapping(TextWrapping::Wrap),
+                controls::body("Nothing changed on this page.").text_wrapping(TextWrapping::Wrap),
             ));
         }
         let save = if deletes {
-            m3::destructive(palette)
+            controls::destructive()
         } else {
-            m3::filled(palette)
+            controls::filled()
         };
         super::super::dialog_ui::surface(
             context,
             self.dialog.epoch,
-            palette,
             if deletes {
                 "Save and delete older history?".to_owned()
             } else {
@@ -397,13 +395,13 @@ impl DesktopApp {
                 .keyed_children(rows)
                 .into(),
             super::super::dialog_ui::actions(
-                m3::text_button(palette)
+                controls::text_button()
                     .element_ref(&self.dialog.close)
                     .automation_name("Cancel")
                     .on_click(
                         context.message(Message::Settings(SettingsMsg::DaemonConfirmed(false))),
                     )
-                    .content(m3::label("Cancel"))
+                    .content(controls::label("Cancel"))
                     .into(),
                 View::from(
                     save.element_ref(&self.dialog.primary)
@@ -412,7 +410,7 @@ impl DesktopApp {
                         .on_click(
                             context.message(Message::Settings(SettingsMsg::DaemonConfirmed(true))),
                         )
-                        .content(m3::label("Save")),
+                        .content(controls::label("Save")),
                 ),
             ),
             tokens::layout::DIALOG_WIDTH,
@@ -420,31 +418,26 @@ impl DesktopApp {
     }
 
     /// Owner rules: the text every agent receives at its start.
-    pub(super) fn owner_rules_page(
-        &self,
-        context: &mut ViewContext<Self>,
-        palette: Palette,
-    ) -> View {
+    pub(super) fn owner_rules_page(&self, context: &mut ViewContext<Self>) -> View {
         let text = model::owner_rules_text(&self.settings.owner_rules);
         let bytes = text.len();
         let dirty = self.settings.dirty(Page::OwnerRules);
         StackPanel::new()
             .spacing(tokens::spacing::SM)
             .children((
-                m3::card_title("Rules for every agent"),
-                m3::settings_card(
-                    palette,
+                controls::card_title("Rules for every agent"),
+                controls::settings_card(
                     vec![KeyedView::new(
                         "text",
                         StackPanel::new()
                             .spacing(tokens::spacing::SM)
                             .margin(Thickness::xy(0.0, tokens::spacing::INSET))
                             .children((
-                                m3::secondary(
+                                controls::secondary(
                                     "Each new task receives this text at its start; a running task keeps the text it started with.",
                                 )
                                 .text_wrapping(TextWrapping::Wrap),
-                                m3::field()
+                                controls::field()
                                     .text(text)
                                     .accepts_return(true)
                                     .text_wrapping(TextWrapping::Wrap)
@@ -455,7 +448,7 @@ impl DesktopApp {
                                     .on_text_changed(crate::views::text_edits(context.callback(|text| {
                                         Message::Settings(SettingsMsg::OwnerRulesText(text))
                                     }))),
-                                m3::secondary(if bytes > 8 * 1024 {
+                                controls::secondary(if bytes > 8 * 1024 {
                                     format!("{bytes} bytes: longer than 8 KiB, which agents read slowly.")
                                 } else {
                                     format!("{bytes} bytes")
@@ -463,19 +456,19 @@ impl DesktopApp {
                             )),
                     )],
                 ),
-                self.save_bar(Page::OwnerRules, dirty, context, palette),
+                self.save_bar(Page::OwnerRules, dirty, context),
             )).into()
     }
 
     /// Attention: the daemon's reactions by kind, each on by default; the
     /// wait before reporting and the opt-in steps.
-    pub(super) fn attention_page(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
+    pub(super) fn attention_page(&self, context: &mut ViewContext<Self>) -> View {
         let daemon = &self.settings.daemon;
         let mut rows: Vec<KeyedView> = Vec::new();
         for kind in &ATTENTION {
             rows.push(KeyedView::new(
                 kind.enabled,
-                m3::setting_row(
+                controls::setting_row(
                     kind.title,
                     kind.sentence,
                     daemon_switch(context, daemon, kind.enabled, true, kind.title),
@@ -484,7 +477,7 @@ impl DesktopApp {
             if let Some(threshold) = kind.threshold {
                 rows.push(KeyedView::new(
                     threshold,
-                    m3::setting_row(
+                    controls::setting_row(
                         &format!("{}: wait", kind.title),
                         "Seconds without it before Swarm reacts; at least 900. Empty uses the default.",
                         daemon_number(
@@ -500,7 +493,7 @@ impl DesktopApp {
             if let Some((pointer, title, sentence)) = kind.step {
                 rows.push(KeyedView::new(
                     pointer,
-                    m3::setting_row(
+                    controls::setting_row(
                         title,
                         sentence,
                         daemon_switch(context, daemon, pointer, false, title),
@@ -511,15 +504,16 @@ impl DesktopApp {
         StackPanel::new()
             .spacing(tokens::spacing::SM)
             .children((
-                m3::card_title("Reactions"),
-                m3::settings_card(palette, rows),
-                m3::secondary("The daemon applies a change at its next start. Save asks first.")
-                    .text_wrapping(TextWrapping::Wrap),
+                controls::card_title("Reactions"),
+                controls::settings_card(rows),
+                controls::secondary(
+                    "The daemon applies a change at its next start. Save asks first.",
+                )
+                .text_wrapping(TextWrapping::Wrap),
                 self.save_bar(
                     Page::Attention,
                     self.settings.dirty(Page::Attention),
                     context,
-                    palette,
                 ),
             ))
             .into()
@@ -527,7 +521,7 @@ impl DesktopApp {
 
     /// Accounts & proxies: what the settings hold, by name; they are
     /// edited in the settings file.
-    pub(super) fn accounts_page(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
+    pub(super) fn accounts_page(&self, context: &mut ViewContext<Self>) -> View {
         let list = |section: Section, what: &str| -> Vec<KeyedView> {
             let value = self.settings.base(section);
             let entries: Vec<(String, String)> = value
@@ -569,38 +563,38 @@ impl DesktopApp {
             if entries.is_empty() {
                 return vec![KeyedView::new(
                     "none",
-                    m3::setting_row(&format!("No {what}"), "None is configured.", None),
+                    controls::setting_row(&format!("No {what}"), "None is configured.", None),
                 )];
             }
             entries
                 .into_iter()
                 .map(|(name, words)| {
-                    KeyedView::new(name.clone(), m3::setting_row(&name, &words, None))
+                    KeyedView::new(name.clone(), controls::setting_row(&name, &words, None))
                 })
                 .collect()
         };
         StackPanel::new()
             .spacing(tokens::spacing::SM)
             .children((
-                m3::card_title("Accounts"),
-                m3::settings_card(palette, list(Section::Accounts, "accounts")),
-                m3::card_title("Proxies"),
-                m3::settings_card(palette, list(Section::Proxies, "proxies")),
-                m3::text_button(palette)
+                controls::card_title("Accounts"),
+                controls::settings_card(list(Section::Accounts, "accounts")),
+                controls::card_title("Proxies"),
+                controls::settings_card(list(Section::Proxies, "proxies")),
+                controls::text_button()
                     .horizontal_alignment(HorizontalAlignment::Left)
                     .automation_name("Edit in Settings file & history")
                     .on_click(
                         context
                             .message(Message::Settings(SettingsMsg::PageSelected(Page::Advanced))),
                     )
-                    .content(m3::label("Edit in Settings file & history")),
+                    .content(controls::label("Edit in Settings file & history")),
             ))
             .into()
     }
 
     /// Daemon: what a restart does, how much the log says, where chats
     /// work.
-    pub(super) fn daemon_page(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
+    pub(super) fn daemon_page(&self, context: &mut ViewContext<Self>) -> View {
         const RESTART: &[(&str, &str)] = RESTART_CHOICES;
         const LOG: &[(&str, &str)] = LOG_CHOICES;
         let daemon = &self.settings.daemon;
@@ -608,13 +602,12 @@ impl DesktopApp {
         StackPanel::new()
             .spacing(tokens::spacing::SM)
             .children((
-                m3::card_title("Swarm"),
-                m3::settings_card(
-                    palette,
+                controls::card_title("Swarm"),
+                controls::settings_card(
                     vec![
                         KeyedView::new(
                             "restart",
-                            m3::setting_row(
+                            controls::setting_row(
                                 "On restart",
                                 "Continue resumes interrupted work after a restart; Hold leaves it for you.",
                                 daemon_choice(context, daemon, "/on_restart", RESTART, "On restart"),
@@ -622,7 +615,7 @@ impl DesktopApp {
                         ),
                         KeyedView::new(
                             "log",
-                            m3::setting_row(
+                            controls::setting_row(
                                 "Log level",
                                 "Debug writes everything to daemon.log; it applies at once.",
                                 daemon_choice(context, daemon, "/log_level", LOG, "Log level"),
@@ -630,10 +623,10 @@ impl DesktopApp {
                         ),
                         KeyedView::new(
                             "chats",
-                            m3::setting_row(
+                            controls::setting_row(
                                 "Chats folder",
                                 "Where chats without a project work; empty uses the data folder.",
-                                View::from(m3::field()
+                                View::from(controls::field()
                                     .width(tokens::page::SETTINGS_CONTROL)
                                     .text(chats)
                                     .placeholder_text("Default")
@@ -648,16 +641,16 @@ impl DesktopApp {
                         ),
                     ],
                 ),
-                m3::secondary(
+                controls::secondary(
                     "On restart and the chats folder apply at the next start. Save asks first.",
                 )
                 .text_wrapping(TextWrapping::Wrap),
-                self.save_bar(Page::Daemon, self.settings.dirty(Page::Daemon), context, palette),
+                self.save_bar(Page::Daemon, self.settings.dirty(Page::Daemon), context),
             )).into()
     }
 
     /// Retention: how long the store keeps events, commands and mail.
-    pub(super) fn retention_page(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
+    pub(super) fn retention_page(&self, context: &mut ViewContext<Self>) -> View {
         let daemon = &self.settings.daemon;
         let windows: [(&'static str, &str, &str); 5] = [
             (
@@ -691,7 +684,7 @@ impl DesktopApp {
             .map(|(pointer, title, sentence)| {
                 KeyedView::new(
                     pointer,
-                    m3::setting_row(
+                    controls::setting_row(
                         title,
                         sentence,
                         daemon_number(context, daemon, pointer, 1.0, title),
@@ -701,7 +694,7 @@ impl DesktopApp {
             .collect();
         rows.push(KeyedView::new(
             "compact",
-            m3::setting_row(
+            controls::setting_row(
                 "Compact at start",
                 "Reclaim the store's free space when Swarm starts (needs about twice its size free).",
                 daemon_switch(
@@ -714,9 +707,9 @@ impl DesktopApp {
             ),
         ));
         StackPanel::new().spacing(tokens::spacing::SM).children((
-            m3::card_title("History"),
-            m3::settings_card(palette, rows),
-            m3::secondary(
+            controls::card_title("History"),
+            controls::settings_card(rows),
+            controls::secondary(
                 "Retention windows apply at once; a shorter one deletes older history. Save asks first.",
             )
             .text_wrapping(TextWrapping::Wrap),
@@ -724,7 +717,6 @@ impl DesktopApp {
                 Page::Retention,
                 self.settings.dirty(Page::Retention),
                 context,
-                palette,
             ),
         )).into()
     }

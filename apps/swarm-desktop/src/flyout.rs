@@ -19,12 +19,12 @@
 //!   every show.
 //! - [`MenuDress`] gives a menu what Reactor's text-only `MenuItem` cannot:
 //!   an accessible name on the `MenuFlyout` (its presenter reads it) and,
-//!   per item, a `FontIcon` with the item's glyph (the implicit `FontIcon`
-//!   style gives it the symbol font), the danger tint and, where the item
-//!   shows more than its label (the current tags), its display text.
+//!   per item, a `FontIcon` with the item's glyph (Segoe Fluent Icons, the
+//!   system symbol font) and, where the item shows more than its label
+//!   (the current tags), its display text.
 //!
 //! The button is found by its automation id under the window's content
-//! root (`crate::motion::find`). Reactor replaces a `MenuFlyout` when its
+//! root (`crate::elements::find`). Reactor replaces a `MenuFlyout` when its
 //! items change and creates a `Flyout` when one is attached, so every call
 //! reads the button's current `Flyout`. The calls run on the UI thread
 //! after the render that attached the flyout committed; each one reports
@@ -38,11 +38,8 @@
 //! `IVector<MenuFlyoutItemBase>` slots 6 `GetAt` and 7 `get_Size`;
 //! `IMenuFlyoutItem` slots 6 `get_Text`, 12 `get_Icon` and 13 `put_Icon`;
 //! `IMenuFlyoutSubItem` slots 6 `get_Items`, 7 `get_Text`, 9 `get_Icon` and
-//! 10 `put_Icon`; `IControl` slot 25 `put_Foreground`; `IFontIconFactory`
-//! slot 6 `CreateInstance`; `IFontIcon` slot 7 `put_Glyph`; `IIconElement`
-//! slot 7 `put_Foreground`; `ISolidColorBrushFactory` slot 6
-//! `CreateInstanceWithColor`; `IAutomationPropertiesStatics` slot 32
-//! `SetName`.
+//! 10 `put_Icon`; `IFontIconFactory` slot 6 `CreateInstance`; `IFontIcon`
+//! slot 7 `put_Glyph`; `IAutomationPropertiesStatics` slot 32 `SetName`.
 #![allow(
     unsafe_code,
     reason = "Opening and closing WinUI flyouts requires their native interfaces."
@@ -190,15 +187,6 @@ const _: () = {
 };
 
 #[repr(C)]
-struct ControlVtbl {
-    base: InspectableSlots,
-    _6_24: [usize; 19],
-    /// 25 `put_Foreground(Brush)`.
-    put_foreground: Setter,
-}
-const _: () = assert!(offset_of!(ControlVtbl, put_foreground) == 25 * SLOT);
-
-#[repr(C)]
 struct FontIconVtbl {
     base: InspectableSlots,
     _6: usize,
@@ -214,33 +202,6 @@ struct FontIconFactoryVtbl {
     create: unsafe extern "system" fn(Raw, Raw, *mut Raw, *mut Raw) -> HRESULT,
 }
 const _: () = assert!(offset_of!(FontIconFactoryVtbl, create) == 6 * SLOT);
-
-#[repr(C)]
-struct IconElementVtbl {
-    base: InspectableSlots,
-    _6: usize,
-    /// 7 `put_Foreground(Brush)`.
-    put_foreground: Setter,
-}
-const _: () = assert!(offset_of!(IconElementVtbl, put_foreground) == 7 * SLOT);
-
-/// `Windows.UI.Color`.
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct Color {
-    a: u8,
-    r: u8,
-    g: u8,
-    b: u8,
-}
-
-#[repr(C)]
-struct SolidColorBrushFactoryVtbl {
-    base: InspectableSlots,
-    /// 6 `CreateInstanceWithColor(Color)`.
-    create: unsafe extern "system" fn(Raw, Color, *mut Raw) -> HRESULT,
-}
-const _: () = assert!(offset_of!(SolidColorBrushFactoryVtbl, create) == 6 * SLOT);
 
 #[repr(C)]
 struct AutomationNameVtbl {
@@ -288,11 +249,6 @@ winrt_interface!(
     ParameterVtbl,
     GUID::from_u128(0xe7beaee7_160e_50f7_8789_d63463f979fa)
 );
-winrt_interface!(
-    IBrush,
-    ParameterVtbl,
-    GUID::from_u128(0x2de3cb83_1329_5679_88f8_c822bc5442cb)
-);
 // `IVector<MenuFlyoutItemBase>`: a parameterized id.
 winrt_interface!(
     ItemVector,
@@ -314,11 +270,6 @@ winrt_interface!(
     GUID::from_u128(0x6b0688c1_47b0_53b5_b6f9_5ec5d6623b84)
 );
 winrt_interface!(
-    IControl,
-    ControlVtbl,
-    GUID::from_u128(0x857d6e8a_d45a_5c69_a99c_bf6a5c54fb38)
-);
-winrt_interface!(
     IFontIcon,
     FontIconVtbl,
     GUID::from_u128(0x6eba5ed9_d233_5f5e_91a8_f5134292658a)
@@ -330,13 +281,8 @@ winrt_interface!(
 );
 winrt_interface!(
     IIconElement,
-    IconElementVtbl,
+    ParameterVtbl,
     GUID::from_u128(0x18f69350_279e_50ea_8d23_138e717ed939)
-);
-winrt_interface!(
-    ISolidColorBrushFactory,
-    SolidColorBrushFactoryVtbl,
-    GUID::from_u128(0x7b559384_4daa_54f4_91ef_33a23fd816ca)
 );
 winrt_interface!(
     IAutomationPropertiesStatics,
@@ -345,7 +291,6 @@ winrt_interface!(
 );
 
 runtime_class!(FontIcon, "Microsoft.UI.Xaml.Controls.FontIcon");
-runtime_class!(SolidColorBrush, "Microsoft.UI.Xaml.Media.SolidColorBrush");
 runtime_class!(
     AutomationProperties,
     "Microsoft.UI.Xaml.Automation.AutomationProperties"
@@ -400,14 +345,12 @@ pub fn show(anchor: &str, epoch: u64) -> Result<(), String> {
     Ok(())
 }
 
-/// One menu item's look: the item labelled `label` shows `glyph`, in the
-/// danger color when `danger`, and `display` in place of its label when
-/// given (display only: its click still reports `label`).
+/// One menu item's look: the item labelled `label` shows `glyph`, and
+/// `display` in place of its label when given (display only: its click still reports `label`).
 pub struct MenuLook {
     pub label: &'static str,
     pub display: Option<String>,
     pub glyph: &'static str,
-    pub danger: bool,
 }
 
 impl MenuLook {
@@ -424,9 +367,6 @@ pub struct MenuDress<'a> {
     pub name: &'a str,
     /// The items' looks, matched by their text (unique in one menu).
     pub items: &'a [MenuLook],
-    /// The danger color (red, green, blue); none under High Contrast,
-    /// where the system colors apply.
-    pub danger: Option<(u8, u8, u8)>,
 }
 
 /// Open the `MenuFlyout` of the button with automation id `anchor` at
@@ -445,7 +385,7 @@ pub fn show_menu_at(
     if let Err(error) = dress_menu(&menu, &flyout, dress) {
         crate::startup::note(&format!("menu not dressed: {error}"));
     }
-    let root: IUIElement = crate::motion::root()
+    let root: IUIElement = crate::elements::root()
         .ok_or("no content root yet")?
         .cast()
         .map_err(|error| error.to_string())?;
@@ -482,7 +422,7 @@ fn is_open(flyout: &IFlyoutBase) -> bool {
 
 /// The button with automation id `anchor` and its current flyout.
 fn anchored(anchor: &str) -> Result<(IButton, IFlyoutBase), String> {
-    let button: IButton = crate::motion::find(anchor)
+    let button: IButton = crate::elements::find(anchor)
         .ok_or_else(|| format!("{anchor} not found"))?
         .cast()
         .map_err(|error| format!("{anchor} is no button: {error}"))?;
@@ -495,7 +435,7 @@ fn anchored(anchor: &str) -> Result<(IButton, IFlyoutBase), String> {
 }
 
 /// The accessible name of `flyout` (its presenter reads the owner's name)
-/// and each item's icon and danger tint.
+/// and each item's icon.
 fn dress_menu(
     menu: &IMenuFlyout,
     flyout: &IFlyoutBase,
@@ -507,21 +447,13 @@ fn dress_menu(
     // SAFETY: slot 32 of IAutomationPropertiesStatics is
     // SetName(DependencyObject, String); the handle is borrowed for the call.
     unsafe { (statics.vtable().set_name)(statics.as_raw(), target.as_raw(), abi(&name)) }.ok()?;
-    let danger = dress
-        .danger
-        .map(|(r, g, b)| solid_brush(Color { a: 255, r, g, b }))
-        .transpose()?;
     // SAFETY: slot 6 of IMenuFlyout is get_Items.
     let items = unsafe { item_vector(menu.as_raw(), menu.vtable().items) }?;
-    dress_items(&items, dress, danger.as_ref())
+    dress_items(&items, dress)
 }
 
 /// Dress `items` and every submenu under them.
-fn dress_items(
-    items: &ItemVector,
-    dress: &MenuDress<'_>,
-    danger: Option<&IBrush>,
-) -> windows_core::Result<()> {
+fn dress_items(items: &ItemVector, dress: &MenuDress<'_>) -> windows_core::Result<()> {
     let mut size = 0u32;
     // SAFETY: slot 7 of IVector is get_Size.
     unsafe { (items.vtable().size)(items.as_raw(), &mut size) }.ok()?;
@@ -543,16 +475,9 @@ fn dress_items(
                     let display = HSTRING::from(display);
                     unsafe { (item.vtable().put_text)(item.as_raw(), abi(&display)) }.ok()?;
                 }
-                let danger = danger.filter(|_| look.danger);
                 if unsafe { get(&item, item.vtable().icon) }.is_err() {
-                    let icon = font_icon(look.glyph, danger)?;
+                    let icon = font_icon(look.glyph)?;
                     unsafe { (item.vtable().put_icon)(item.as_raw(), icon.as_raw()) }.ok()?;
-                }
-                if let Some(brush) = danger {
-                    let control: IControl = item.cast()?;
-                    // SAFETY: slot 25 of IControl is put_Foreground.
-                    unsafe { (control.vtable().put_foreground)(control.as_raw(), brush.as_raw()) }
-                        .ok()?;
                 }
             }
         } else if let Ok(sub) = item.cast::<IMenuFlyoutSubItem>() {
@@ -562,19 +487,18 @@ fn dress_items(
             if let Some(look) = dress.items.iter().find(|look| look.shows(&text))
                 && unsafe { get(&sub, sub.vtable().icon) }.is_err()
             {
-                let icon = font_icon(look.glyph, None)?;
+                let icon = font_icon(look.glyph)?;
                 unsafe { (sub.vtable().put_icon)(sub.as_raw(), icon.as_raw()) }.ok()?;
             }
             let nested = unsafe { item_vector(sub.as_raw(), sub.vtable().items) }?;
-            dress_items(&nested, dress, danger)?;
+            dress_items(&nested, dress)?;
         }
     }
     Ok(())
 }
 
-/// A `FontIcon` showing `glyph` (the implicit style gives it the symbol
-/// font), in `foreground` when given.
-fn font_icon(glyph: &str, foreground: Option<&IBrush>) -> windows_core::Result<IIconElement> {
+/// A `FontIcon` showing `glyph` in the system symbol font.
+fn font_icon(glyph: &str) -> windows_core::Result<IIconElement> {
     let factory = windows_core::factory::<FontIcon, IFontIconFactory>()?;
     let mut out = std::ptr::null_mut();
     // SAFETY: slot 6 of IFontIconFactory is CreateInstance(outer, inner);
@@ -597,26 +521,7 @@ fn font_icon(glyph: &str, foreground: Option<&IBrush>) -> windows_core::Result<I
     let glyph = HSTRING::from(glyph);
     // SAFETY: slot 7 of IFontIcon is put_Glyph; the handle is borrowed.
     unsafe { (icon.vtable().put_glyph)(icon.as_raw(), abi(&glyph)) }.ok()?;
-    let element: IIconElement = icon.cast()?;
-    if let Some(brush) = foreground {
-        // SAFETY: slot 7 of IIconElement is put_Foreground.
-        unsafe { (element.vtable().put_foreground)(element.as_raw(), brush.as_raw()) }.ok()?;
-    }
-    Ok(element)
-}
-
-/// A `SolidColorBrush` of `color`, as the `Brush` parameter takes it.
-fn solid_brush(color: Color) -> windows_core::Result<IBrush> {
-    let factory = windows_core::factory::<SolidColorBrush, ISolidColorBrushFactory>()?;
-    let mut out = std::ptr::null_mut();
-    // SAFETY: slot 6 of ISolidColorBrushFactory is CreateInstanceWithColor;
-    // it returns one owned brush.
-    unsafe { (factory.vtable().create)(factory.as_raw(), color, &mut out) }.ok()?;
-    if out.is_null() {
-        return Err(windows_core::Error::empty());
-    }
-    // SAFETY: as above.
-    unsafe { IInspectable::from_raw(out) }.cast()
+    icon.cast()
 }
 
 /// Call an `Items` getter, which returns the `IVector<MenuFlyoutItemBase>`

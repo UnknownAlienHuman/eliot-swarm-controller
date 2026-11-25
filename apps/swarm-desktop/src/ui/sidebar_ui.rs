@@ -10,14 +10,12 @@
 use super::menu_ui::{Action, Target};
 use super::*;
 use crate::nav::Row;
-use crate::theme::winui::Palette;
 
 /// The sidebar's input: everything it draws, compared by value. Ages and
 /// work lines are read at the window's render to the minute, so an
 /// unchanged list compares equal.
 #[derive(Clone, PartialEq)]
 pub(super) struct SidebarInput {
-    pub(super) palette: Palette,
     pub(super) can_back: bool,
     pub(super) can_forward: bool,
     /// The Settings page shown, if any (its nav row is selected).
@@ -163,16 +161,12 @@ impl Component for Sidebar {
     /// archived, Usage and Settings. Every row is a 32-DIP pill; a row's
     /// actions show on hover, keyboard focus or selection.
     fn view(&self, input: &SidebarInput, context: &mut ViewContext<Self>) -> View {
-        let palette = input.palette;
         let gap = tokens::spacing::ROW_GAP;
         let header = title_row(input, context);
 
         // The nav rows. A selectable row is keyed by its selection: WinUI
         // reads a button's colors only when its template is applied.
-        let mut nav: Vec<KeyedView> = vec![KeyedView::new(
-            "new-task",
-            new_task_button(palette, context),
-        )];
+        let mut nav: Vec<KeyedView> = vec![KeyedView::new("new-task", new_task_button(context))];
         nav.push(match &input.search {
             Some(search) => {
                 KeyedView::new(
@@ -194,44 +188,44 @@ impl Component for Sidebar {
                                 )))
                                 .automation_name("Search tasks")
                                 .height(tokens::height::CONTROL),
-                            m3::icon_button(palette)
+                            controls::icon_button()
                                 .grid_column(1)
                                 .automation_name("Close search")
                                 .on_click(
                                     context.message(Message::Shell(ShellMsg::SearchToggled(false))),
                                 )
-                                .content(m3::icon(m3::glyph::CLOSE)),
+                                .content(controls::icon(controls::glyph::CLOSE)),
                         )),
                 )
             }
             None => KeyedView::new(
                 "search",
-                m3::row(palette, false)
+                controls::row(false)
                     .automation_name("Search tasks (Ctrl+K)")
                     .on_click(context.message(Message::Shell(ShellMsg::SearchToggled(true))))
-                    .content(m3::sidebar_row(
-                        m3::icon(m3::glyph::SEARCH),
+                    .content(controls::sidebar_row(
+                        controls::icon(controls::glyph::SEARCH),
                         "Search",
                         false,
                         0.0,
                         false,
                         None,
-                        View::from(m3::trailing("Ctrl+K", false)),
+                        View::from(controls::trailing("Ctrl+K")),
                     )),
             ),
         });
-        nav.push(inbox_row(&input.inbox, context, palette));
-        nav.push(agents_row(&input.agents, context, palette));
+        nav.push(inbox_row(&input.inbox, context));
+        nav.push(agents_row(&input.agents, context));
         let automations = input.place == Some(super::page_ui::Place::Automations);
         nav.push(KeyedView::new(
             format!("automations:{automations}"),
-            m3::row(palette, automations)
+            controls::row(automations)
                 .automation_name("Automations")
                 .on_click(context.message(Message::Shell(ShellMsg::PlaceOpened(
                     super::page_ui::Place::Automations,
                 ))))
-                .content(m3::sidebar_row(
-                    m3::nav_icon(m3::glyph::AUTOMATION, automations),
+                .content(controls::sidebar_row(
+                    controls::icon(controls::glyph::AUTOMATION),
                     "Automations",
                     automations,
                     0.0,
@@ -253,7 +247,7 @@ impl Component for Sidebar {
         for error in &input.errors {
             items.push(KeyedView::new(
                 format!("organization-error:{error}"),
-                nested_note(error, 0, Some(palette.attention())),
+                nested_note(error, 0, Some(ThemeBrush::SystemCritical)),
             ));
         }
         if let Some(empty) = input.empty {
@@ -274,7 +268,7 @@ impl Component for Sidebar {
         for place in chats {
             items.push(KeyedView::new(
                 "chats-label",
-                m3::section_label_row("Chats", None),
+                controls::section_label_row("Chats", None),
             ));
             place_rows(place, input, context, &mut items);
         }
@@ -288,16 +282,16 @@ impl Component for Sidebar {
             };
             items.push(KeyedView::new(
                 format!("more:{filtered}"),
-                m3::sub_row(palette, false)
+                controls::sub_row(false)
                     .is_enabled(*enabled)
                     .on_click(context.message(Message::Shell(message)))
-                    .content(m3::sidebar_row(
+                    .content(controls::sidebar_row(
                         mark_spacer(),
                         label,
                         false,
                         0.0,
                         false,
-                        Some(palette.variant()),
+                        None,
                         None,
                     )),
             ));
@@ -313,21 +307,21 @@ impl Component for Sidebar {
         let footer = Border::new()
             .grid_row(3)
             .margin(Thickness::new(0.0, gap, 0.0, 0.0))
-            .border_brush(palette.outline())
+            .border_brush(ThemeBrush::CardStroke)
             .border_thickness(Thickness::new(0.0, tokens::layout::HAIRLINE, 0.0, 0.0))
             .padding(Thickness::new(0.0, tokens::spacing::SM, 0.0, 0.0))
             .content(StackPanel::new().spacing(gap).keyed_children(vec![
                 KeyedView::new(
                     format!("archived:{show_archived}"),
-                    m3::row(palette, show_archived)
+                    controls::row(show_archived)
                         .automation_name(if show_archived {
                             "Hide archived (showing archived)"
                         } else {
                             "Show archived"
                         })
                         .on_click(context.message(Message::Menu(MenuMsg::ArchivedToggled)))
-                        .content(m3::sidebar_row(
-                            m3::nav_icon(m3::glyph::INVENTORY, show_archived),
+                        .content(controls::sidebar_row(
+                            controls::icon(controls::glyph::INVENTORY),
                             if show_archived {
                                 "Hide archived"
                             } else {
@@ -343,11 +337,11 @@ impl Component for Sidebar {
                 KeyedView::new("usage", input.usage.clone()),
                 KeyedView::new(
                     "settings",
-                    m3::row(palette, false)
+                    controls::row(false)
                         .automation_name("Settings (Ctrl+,)")
                         .on_click(context.message(Message::Shell(ShellMsg::SettingsOpened)))
-                        .content(m3::sidebar_row(
-                            m3::icon(m3::glyph::SETTINGS),
+                        .content(controls::sidebar_row(
+                            controls::icon(controls::glyph::SETTINGS),
                             "Settings",
                             false,
                             0.0,
@@ -372,10 +366,8 @@ impl Component for Sidebar {
 }
 
 /// The title row (`.brandrow`): the brand mark and "Eliot Swarm" as one
-/// Home button (the mark takes its `primary-text` content color, the name
-/// stays `on-surface`), then Back, Forward and Hide sidebar.
+/// Home button, then Back, Forward and Hide sidebar.
 fn title_row(input: &SidebarInput, context: &mut ViewContext<Sidebar>) -> View {
-    let palette = input.palette;
     // The design's 8 between the buttons leaves "Eliot Swarm" too little of
     // the 248-DIP row; they keep the half step.
     let gap = tokens::spacing::SM;
@@ -390,12 +382,8 @@ fn title_row(input: &SidebarInput, context: &mut ViewContext<Sidebar>) -> View {
             tokens::spacing::XS - tokens::spacing::ROW,
             0.0,
         ))
-        .children((
-            m3::shape(crate::brand::SHAPE_MARK, tokens::layout::MARK),
-            m3::text("Eliot Swarm", tokens::text::TITLE)
-                .foreground(palette.text())
-                .vertical_alignment(VerticalAlignment::Center),
-        ));
+        .children((controls::text("Eliot Swarm", tokens::text::TITLE)
+            .vertical_alignment(VerticalAlignment::Center),));
     Grid::new()
         .height(tokens::height::TITLE_ROW)
         .margin(Thickness::new(0.0, 0.0, tokens::spacing::XS, 0.0))
@@ -407,42 +395,42 @@ fn title_row(input: &SidebarInput, context: &mut ViewContext<Sidebar>) -> View {
         ])
         .column_spacing(buttons_gap)
         .children((
-            m3::text_button(palette)
+            controls::text_button()
                 .horizontal_alignment(HorizontalAlignment::Left)
                 .automation_name("Eliot Swarm: home")
                 .on_click(context.message(Message::Shell(ShellMsg::NewTask)))
                 .content(home)
                 .tooltip("Home"),
-            m3::icon_button(palette)
+            controls::icon_button()
                 .grid_column(1)
                 .is_enabled(input.can_back)
                 .automation_name("Back (Alt+Left)")
                 .on_click(context.message(Message::Shell(ShellMsg::Back)))
-                .content(m3::icon(m3::glyph::BACK))
+                .content(controls::icon(controls::glyph::BACK))
                 .tooltip("Back"),
-            m3::icon_button(palette)
+            controls::icon_button()
                 .grid_column(2)
                 .is_enabled(input.can_forward)
                 .automation_name("Forward (Alt+Right)")
                 .on_click(context.message(Message::Shell(ShellMsg::Forward)))
-                .content(m3::icon(m3::glyph::FORWARD))
+                .content(controls::icon(controls::glyph::FORWARD))
                 .tooltip("Forward"),
-            m3::icon_button(palette)
+            controls::icon_button()
                 .grid_column(3)
                 .automation_name("Hide sidebar (Ctrl+B)")
                 .on_click(context.message(Message::Shell(ShellMsg::SidebarToggled)))
-                .content(m3::icon(m3::glyph::HIDE_SIDEBAR))
+                .content(controls::icon(controls::glyph::HIDE_SIDEBAR))
                 .tooltip("Hide sidebar"),
         ))
         .into()
 }
 
-/// New task (`.newtask`): `primary-container`, 40 DIPs, the `add` icon,
+/// New task (`.newtask`): 40 DIPs, the `add` icon,
 /// the label emphasized, Ctrl+N at the shortcut opacity at its end, 16
 /// DIPs in.
-fn new_task_button(palette: Palette, context: &mut ViewContext<Sidebar>) -> View {
+fn new_task_button(context: &mut ViewContext<Sidebar>) -> View {
     let inset = tokens::spacing::MD - tokens::spacing::INSET;
-    m3::new_task_button(palette)
+    controls::new_task_button()
         .automation_name("New task (Ctrl+N)")
         .on_click(context.message(Message::Shell(ShellMsg::NewTask)))
         .content(
@@ -451,11 +439,11 @@ fn new_task_button(palette: Palette, context: &mut ViewContext<Sidebar>) -> View
                 .columns([GridLength::Auto, GridLength::STAR, GridLength::Auto])
                 .column_spacing(tokens::spacing::ROW)
                 .children((
-                    m3::icon(m3::glyph::NEW_TASK),
-                    m3::text("New task", tokens::text::EMPHASIZED)
+                    controls::icon(controls::glyph::NEW_TASK),
+                    controls::text("New task", tokens::text::EMPHASIZED)
                         .grid_column(1)
                         .vertical_alignment(VerticalAlignment::Center),
-                    m3::text("Ctrl+N", tokens::text::TRAILING)
+                    controls::text("Ctrl+N", tokens::text::TRAILING)
                         .grid_column(2)
                         .opacity(tokens::state::SHORTCUT)
                         .vertical_alignment(VerticalAlignment::Center),
@@ -468,7 +456,6 @@ fn new_task_button(palette: Palette, context: &mut ViewContext<Sidebar>) -> View
 /// project (+) and the bulk actions over every project (…); while a
 /// search lists matches, "Matching tasks" and no actions.
 fn projects_label(input: &SidebarInput, context: &mut ViewContext<Sidebar>) -> KeyedView {
-    let palette = input.palette;
     let filtered = input.filtered;
     let caption = if filtered {
         "Matching tasks"
@@ -490,14 +477,14 @@ fn projects_label(input: &SidebarInput, context: &mut ViewContext<Sidebar>) -> K
             StackPanel::new()
                 .orientation(Orientation::Horizontal)
                 .children((
-                    m3::icon_button(palette)
+                    controls::icon_button()
                         .automation_name("Add project")
                         .on_click(context.message(Message::Shell(ShellMsg::AddProject)))
-                        .content(m3::icon(m3::glyph::NEW_TASK))
+                        .content(controls::icon(controls::glyph::NEW_TASK))
                         .tooltip("Add project"),
-                    m3::icon_button(palette)
+                    controls::icon_button()
                         .automation_name("Actions for all projects")
-                        .content(m3::icon(m3::glyph::MORE))
+                        .content(controls::icon(controls::glyph::MORE))
                         .menu(Menu::new(
                             items,
                             // Capture-free: one identity across renders.
@@ -513,7 +500,7 @@ fn projects_label(input: &SidebarInput, context: &mut ViewContext<Sidebar>) -> K
         caption_key.clone(),
         hover_area(
             caption_key,
-            m3::section_label_row(caption, actions),
+            controls::section_label_row(caption, actions),
             context,
         ),
     )
@@ -527,7 +514,7 @@ fn place_rows(
     context: &mut ViewContext<Sidebar>,
     items: &mut Vec<KeyedView>,
 ) {
-    let (section, palette) = (&place.section, input.palette);
+    let section = &place.section;
     if place.tasks.is_empty() && section.waits.is_empty() {
         items.push(KeyedView::new(
             format!("empty:{}", section.key),
@@ -550,7 +537,7 @@ fn place_rows(
     for (index, line) in section.waits.iter().enumerate() {
         items.push(KeyedView::new(
             format!("wait:{}:{index}:{line}", section.key),
-            queued_row(line, palette),
+            queued_row(line),
         ));
     }
     if section.older > 0 {
@@ -561,18 +548,18 @@ fn place_rows(
         };
         items.push(KeyedView::new(
             format!("older:{}:{}", section.key, section.older_shown),
-            m3::sub_row(palette, false)
+            controls::sub_row(false)
                 .automation_name(format!("{label} in {}", section.name))
                 .on_click(
                     context.message(Message::Shell(ShellMsg::OlderToggled(section.key.clone()))),
                 )
-                .content(m3::sidebar_row(
+                .content(controls::sidebar_row(
                     mark_spacer(),
                     &label,
                     false,
                     0.0,
                     false,
-                    Some(palette.variant()),
+                    None,
                     None,
                 )),
         ));
@@ -586,23 +573,23 @@ fn mark_spacer() -> View {
 }
 
 /// A queued launch or automation wait: the `schedule` icon, what waits,
-/// "Queued", all in the variant tone (a row with no action, so a disabled
+/// "Queued", all muted (a row with no action, so a disabled
 /// one); the reason and who can lift it in its tooltip and name.
-fn queued_row(line: &str, palette: Palette) -> View {
+fn queued_row(line: &str) -> View {
     let (what, _) = line.split_once(": ").unwrap_or((line, ""));
     Border::new()
         .content(
-            m3::row(palette, false)
+            controls::row(false)
                 .is_enabled(false)
                 .automation_name(line)
-                .content(m3::sidebar_row(
-                    m3::row_mark(palette, m3::RowMark::Queued, "Queued"),
+                .content(controls::sidebar_row(
+                    controls::row_mark(controls::RowMark::Queued, "Queued"),
                     what,
                     false,
                     0.0,
                     false,
                     None,
-                    View::from(m3::trailing("Queued", false)),
+                    View::from(controls::trailing("Queued")),
                 )),
         )
         .tooltip(line)
@@ -620,7 +607,7 @@ fn place_item(
         |renaming| matches!(&renaming.target, Target::Project { key, .. } if *key == section.key),
     );
     let row = match renaming {
-        Some(renaming) => rename_row(renaming, 0.0, context, input.palette),
+        Some(renaming) => rename_row(renaming, 0.0, context),
         None => with_menu(
             place_row(place, input, context),
             Target::Project {
@@ -654,7 +641,7 @@ fn place_item(
 /// the tasks working now on the right; a registered folder that is gone
 /// says "missing" with a one-click Remove; "…" opens the project menu.
 fn place_row(place: &PlaceEntry, input: &SidebarInput, context: &mut ViewContext<Sidebar>) -> View {
-    let (section, palette, filtered) = (&place.section, input.palette, input.filtered);
+    let (section, filtered) = (&place.section, input.filtered);
     let name = place.name.as_str();
     let selected = place.selected;
     // The full place, for the tooltip and the accessible name.
@@ -688,7 +675,7 @@ fn place_row(place: &PlaceEntry, input: &SidebarInput, context: &mut ViewContext
         if over {
             actions.push(KeyedView::new(
                 "remove",
-                m3::icon_button(palette)
+                controls::icon_button()
                     .is_enabled(place.registered.is_some() && input.bulk_idle)
                     .automation_name(format!("Remove missing {kind} {name}"))
                     .on_click(context.message(Message::Bulk(BulkMsg::Start(
@@ -699,13 +686,13 @@ fn place_row(place: &PlaceEntry, input: &SidebarInput, context: &mut ViewContext
                         },
                         name.to_owned(),
                     ))))
-                    .content(m3::icon(m3::glyph::DELETE)),
+                    .content(controls::icon(controls::glyph::DELETE)),
             ));
         }
     } else if over {
         actions.push(KeyedView::new(
             "more",
-            m3::icon_button(palette)
+            controls::icon_button()
                 .automation_id(format!(
                     "{}project:{}",
                     super::menu_ui::MORE_ID_PREFIX,
@@ -721,7 +708,7 @@ fn place_row(place: &PlaceEntry, input: &SidebarInput, context: &mut ViewContext
                         collapsed: section.collapsed,
                     }))),
                 )
-                .content(m3::icon(m3::glyph::MORE))
+                .content(controls::icon(controls::glyph::MORE))
                 .tooltip("Project actions"),
         ));
     }
@@ -733,12 +720,12 @@ fn place_row(place: &PlaceEntry, input: &SidebarInput, context: &mut ViewContext
         )
     } else if section.missing {
         Some(
-            m3::trailing("missing", selected)
-                .foreground(palette.attention())
+            controls::trailing("missing")
+                .foreground(ThemeBrush::SystemCritical)
                 .into(),
         )
     } else if section.running > 0 {
-        Some(m3::trailing(section.running.to_string(), selected).into())
+        Some(controls::trailing(section.running.to_string()).into())
     } else {
         None
     };
@@ -746,7 +733,7 @@ fn place_row(place: &PlaceEntry, input: &SidebarInput, context: &mut ViewContext
     // one checkout folds instead.
     let toggle = Message::Shell(ShellMsg::ProjectToggled(section.key.clone()));
     let opens = place.opens;
-    let row = m3::row(palette, selected)
+    let row = controls::row(selected)
         .automation_name(if opens {
             format!("Open {spoken}")
         } else {
@@ -761,7 +748,7 @@ fn place_row(place: &PlaceEntry, input: &SidebarInput, context: &mut ViewContext
         } else {
             toggle.clone()
         }))
-        .content(m3::sidebar_row(
+        .content(controls::sidebar_row(
             View::from(Border::new().width(tokens::icon::ROW)),
             &label,
             selected,
@@ -772,12 +759,7 @@ fn place_row(place: &PlaceEntry, input: &SidebarInput, context: &mut ViewContext
         ))
         .tooltip(full);
     // The chevron is the row's icon: its own button, centred on it.
-    let chevron = m3::icon_button(palette)
-        .resource_overrides(if selected {
-            palette.row(true)
-        } else {
-            palette.icon_button()
-        })
+    let chevron = controls::icon_button()
         .is_enabled(!filtered)
         .horizontal_alignment(HorizontalAlignment::Left)
         .margin(Thickness::new(
@@ -795,10 +777,10 @@ fn place_row(place: &PlaceEntry, input: &SidebarInput, context: &mut ViewContext
             }
         ))
         .on_click(context.message(toggle))
-        .content(m3::icon(if section.collapsed {
-            m3::glyph::CHEVRON_RIGHT
+        .content(controls::icon(if section.collapsed {
+            controls::glyph::CHEVRON_RIGHT
         } else {
-            m3::glyph::CHEVRON_DOWN
+            controls::glyph::CHEVRON_DOWN
         }));
     let mut cells = vec![
         KeyedView::new("row", row),
@@ -831,7 +813,6 @@ fn task_item(
             renaming,
             row.depth as f64 * tokens::layout::KID_INDENT,
             context,
-            input.palette,
         ),
         None => with_menu(
             agent_row(task, input, context),
@@ -854,43 +835,42 @@ fn task_item(
 }
 
 /// A task's mark, its one word for the row's end (attention first) and
-/// whether its title takes the variant tone (stopped), as the brand book's
-/// status table says.
-fn task_look(task: &TaskEntry) -> (Option<m3::RowMark>, Option<&'static str>, bool) {
+/// whether its title is muted (stopped).
+fn task_look(task: &TaskEntry) -> (Option<controls::RowMark>, Option<&'static str>) {
     use eliot_core::AgentState;
     let agent = &task.row.agent;
     let held = agent.status_line.as_deref().is_some_and(|line| {
         line.starts_with("Provider hold") || line.starts_with("Waiting for the provider")
     });
     if let Some((word, _)) = task.reported {
-        return (Some(m3::RowMark::Waiting), Some(word), false);
+        return (Some(controls::RowMark::Waiting), Some(word));
     }
     match agent.state {
         AgentState::Created | AgentState::Starting | AgentState::Busy if held => {
-            (Some(m3::RowMark::Waiting), Some("Provider hold"), false)
+            (Some(controls::RowMark::Waiting), Some("Provider hold"))
         }
         AgentState::Created | AgentState::Starting | AgentState::Busy => {
-            (Some(m3::RowMark::Working), None, false)
+            (Some(controls::RowMark::Working), None)
         }
-        _ if held => (Some(m3::RowMark::Waiting), Some("Provider hold"), false),
-        AgentState::Waiting => (Some(m3::RowMark::Waiting), Some("Waiting"), false),
-        AgentState::Idle => (Some(m3::RowMark::Idle), None, false),
-        AgentState::Failed => (Some(m3::RowMark::Failed), Some("Failed"), false),
-        AgentState::Lost => (Some(m3::RowMark::Failed), Some("Lost"), false),
-        AgentState::Unknown => (Some(m3::RowMark::Failed), Some("Unknown"), false),
-        AgentState::Stopped => (None, None, true),
+        _ if held => (Some(controls::RowMark::Waiting), Some("Provider hold")),
+        AgentState::Waiting => (Some(controls::RowMark::Waiting), Some("Waiting")),
+        AgentState::Idle => (Some(controls::RowMark::Idle), None),
+        AgentState::Failed => (Some(controls::RowMark::Failed), Some("Failed")),
+        AgentState::Lost => (Some(controls::RowMark::Failed), Some("Lost")),
+        AgentState::Unknown => (Some(controls::RowMark::Failed), Some("Unknown")),
+        AgentState::Stopped => (None, None),
     }
 }
 
 /// A task row (`.row`): its state mark, its title and, at the end, one
 /// attention word, else its `+N −M`, else its age; workers indent one step
-/// under their manager, their title at the kid size in the variant tone.
+/// under their manager, their title at the kid size.
 /// Hovering (or keyboard focus, or the open task) shows the workers'
 /// chevron and "…" in place of the end. The tooltip carries the work line
 /// or the Monitor's report; the accessible name says "Harness · model" in
 /// full.
 fn agent_row(task: &TaskEntry, input: &SidebarInput, context: &mut ViewContext<Sidebar>) -> View {
-    let (row, palette, selected) = (&task.row, input.palette, task.selected);
+    let (row, selected) = (&task.row, task.selected);
     let agent = &row.agent;
     let title = task.label.as_str();
     let runs = crate::picker::harness_model_label(&agent.harness, agent.model.as_deref());
@@ -919,7 +899,7 @@ fn agent_row(task: &TaskEntry, input: &SidebarInput, context: &mut ViewContext<S
     } else if let Some((_, words)) = &task.work {
         name.push_str(&format!(", {words}"));
     }
-    let (mark, word, quiet) = task_look(task);
+    let (mark, word) = task_look(task);
     let diff = agent
         .work
         .as_deref()
@@ -930,15 +910,15 @@ fn agent_row(task: &TaskEntry, input: &SidebarInput, context: &mut ViewContext<S
         });
     let end: View = match (word, diff) {
         (Some(word), _) => {
-            let block = m3::trailing(word, selected);
-            if mark == Some(m3::RowMark::Failed) && !selected {
-                block.foreground(palette.attention()).into()
+            let block = controls::trailing(word);
+            if mark == Some(controls::RowMark::Failed) && !selected {
+                block.foreground(ThemeBrush::SystemCritical).into()
             } else {
                 block.into()
             }
         }
-        (None, Some((add, del))) => m3::diff_counts(add, del, selected),
-        (None, None) => m3::trailing(task.age.clone(), selected).into(),
+        (None, Some((add, del))) => controls::diff_counts(add, del),
+        (None, None) => controls::trailing(task.age.clone()).into(),
     };
     let hover_key = format!("agent:{}", agent.id);
     let over = selected || shows_actions(input, &hover_key);
@@ -946,7 +926,7 @@ fn agent_row(task: &TaskEntry, input: &SidebarInput, context: &mut ViewContext<S
     if over && row.expandable() {
         actions.push(KeyedView::new(
             "workers",
-            m3::icon_button(palette)
+            controls::icon_button()
                 .automation_name(if row.expanded {
                     format!("Collapse workers of {title}")
                 } else {
@@ -959,10 +939,10 @@ fn agent_row(task: &TaskEntry, input: &SidebarInput, context: &mut ViewContext<S
                     agent.id.clone(),
                     !row.expanded,
                 ))))
-                .content(m3::icon(if row.expanded {
-                    m3::glyph::CHEVRON_DOWN
+                .content(controls::icon(if row.expanded {
+                    controls::glyph::CHEVRON_DOWN
                 } else {
-                    m3::glyph::CHEVRON_RIGHT
+                    controls::glyph::CHEVRON_RIGHT
                 })),
         ));
     }
@@ -973,7 +953,7 @@ fn agent_row(task: &TaskEntry, input: &SidebarInput, context: &mut ViewContext<S
     if over {
         actions.push(KeyedView::new(
             "more",
-            m3::icon_button(palette)
+            controls::icon_button()
                 .automation_id(format!(
                     "{}agent:{}",
                     super::menu_ui::MORE_ID_PREFIX,
@@ -983,7 +963,7 @@ fn agent_row(task: &TaskEntry, input: &SidebarInput, context: &mut ViewContext<S
                 .on_click(
                     context.message(Message::Menu(MenuMsg::Opened(Target::Agent(agent.clone())))),
                 )
-                .content(m3::icon(m3::glyph::MORE))
+                .content(controls::icon(controls::glyph::MORE))
                 .tooltip("Task actions"),
         ));
     }
@@ -995,18 +975,17 @@ fn agent_row(task: &TaskEntry, input: &SidebarInput, context: &mut ViewContext<S
         end
     };
     let kid = row.depth > 0;
-    let tone = (!selected && (quiet || kid)).then(|| palette.variant());
-    let leading = mark.map(|mark| m3::row_mark(palette, mark, word.unwrap_or("Failed")));
-    let row_button = m3::sub_row(palette, selected)
+    let leading = mark.map(|mark| controls::row_mark(mark, word.unwrap_or("Failed")));
+    let row_button = controls::sub_row(selected)
         .automation_name(name)
         .on_click(context.message(Message::Shell(ShellMsg::AgentOpened(agent.clone()))))
-        .content(m3::sidebar_row(
+        .content(controls::sidebar_row(
             leading,
             title,
             selected,
             row.depth as f64 * tokens::layout::KID_INDENT,
             kid,
-            tone,
+            None,
             end,
         ));
     let row_button: View = match line {
@@ -1018,15 +997,11 @@ fn agent_row(task: &TaskEntry, input: &SidebarInput, context: &mut ViewContext<S
 
 /// The Inbox row: the `inbox` icon, "Inbox" and the count badge; it opens
 /// the Inbox pane. Its name carries the per-kind counts.
-fn inbox_row(
-    inbox: &InboxEntry,
-    context: &mut ViewContext<Sidebar>,
-    palette: Palette,
-) -> KeyedView {
+fn inbox_row(inbox: &InboxEntry, context: &mut ViewContext<Sidebar>) -> KeyedView {
     let open = inbox.open;
     KeyedView::new(
         format!("inbox:{open}"),
-        m3::row(palette, open)
+        controls::row(open)
             .automation_name(format!(
                 "Inbox: {} ({})",
                 inbox.counts,
@@ -1035,14 +1010,14 @@ fn inbox_row(
             .on_click(context.message(Message::Shell(ShellMsg::PlaceOpened(
                 super::page_ui::Place::Inbox,
             ))))
-            .content(m3::sidebar_row(
-                m3::nav_icon(m3::glyph::INBOX, open),
+            .content(controls::sidebar_row(
+                controls::icon(controls::glyph::INBOX),
                 "Inbox",
                 open,
                 0.0,
                 false,
                 None,
-                (inbox.total > 0).then(|| m3::count_badge(palette, inbox.total)),
+                (inbox.total > 0).then(|| controls::count_badge(inbox.total)),
             ))
             .tooltip(inbox.counts.clone()),
     )
@@ -1051,15 +1026,11 @@ fn inbox_row(
 /// The Agents row: the `hub` icon, "Agents" and the fleet's line ("3
 /// working", as on main: the most urgent two counts); it opens the fleet
 /// view (the Monitor pane). Its name carries every count.
-fn agents_row(
-    agents: &AgentsEntry,
-    context: &mut ViewContext<Sidebar>,
-    palette: Palette,
-) -> KeyedView {
+fn agents_row(agents: &AgentsEntry, context: &mut ViewContext<Sidebar>) -> KeyedView {
     let open = agents.open;
     KeyedView::new(
         format!("agents:{open}"),
-        m3::row(palette, open)
+        controls::row(open)
             .automation_name(format!(
                 "Agents: {} ({})",
                 agents.summary,
@@ -1068,15 +1039,15 @@ fn agents_row(
             .on_click(context.message(Message::Shell(ShellMsg::PlaceOpened(
                 super::page_ui::Place::Agents,
             ))))
-            .content(m3::sidebar_row(
-                m3::nav_icon(m3::glyph::HUB, open),
+            .content(controls::sidebar_row(
+                controls::icon(controls::glyph::HUB),
                 "Agents",
                 open,
                 0.0,
                 false,
                 None,
                 View::from(
-                    m3::trailing(agents.line.clone(), open)
+                    controls::trailing(agents.line.clone())
                         .text_trimming(TextTrimming::CharacterEllipsis),
                 ),
             ))
@@ -1086,14 +1057,9 @@ fn agents_row(
 
 /// The inline rename editor in place of a row's title, or the tag editor
 /// for [`Target::Tags`].
-fn rename_row(
-    renaming: &Renaming,
-    indent: f64,
-    context: &mut ViewContext<Sidebar>,
-    palette: Palette,
-) -> View {
+fn rename_row(renaming: &Renaming, indent: f64, context: &mut ViewContext<Sidebar>) -> View {
     if matches!(renaming.target, Target::Tags(_)) {
-        return tags_row(renaming, indent, context, palette);
+        return tags_row(renaming, indent, context);
     }
     let (placeholder, field, save, cancel) = ("Name", "Rename", "Save name", "Cancel rename");
     Grid::new()
@@ -1106,7 +1072,7 @@ fn rename_row(
         .columns([GridLength::STAR, GridLength::Auto, GridLength::Auto])
         .column_spacing(tokens::spacing::XS)
         .children((
-            m3::field()
+            controls::field()
                 .element_ref(&renaming.field)
                 .text(renaming.typed.clone())
                 .placeholder_text(placeholder)
@@ -1114,20 +1080,20 @@ fn rename_row(
                 .on_text_changed(crate::views::text_edits(
                     context.callback(|text| Message::Menu(MenuMsg::RenameChanged(text))),
                 )),
-            m3::icon_button(palette)
+            controls::icon_button()
                 .grid_column(1)
                 .width(tokens::height::CONTROL)
                 .height(tokens::height::CONTROL)
                 .automation_name(save)
                 .on_click(context.message(Message::Menu(MenuMsg::RenameCommitted)))
-                .content(m3::icon(m3::glyph::CHECK)),
-            m3::icon_button(palette)
+                .content(controls::icon(controls::glyph::CHECK)),
+            controls::icon_button()
                 .grid_column(2)
                 .width(tokens::height::CONTROL)
                 .height(tokens::height::CONTROL)
                 .automation_name(cancel)
                 .on_click(context.message(Message::Menu(MenuMsg::RenameCancelled)))
-                .content(m3::icon(m3::glyph::CLOSE)),
+                .content(controls::icon(controls::glyph::CLOSE)),
         ))
         .into()
 }
@@ -1136,12 +1102,7 @@ fn rename_row(
 /// with its remove button, an empty field for a new tag, then Save and
 /// Cancel (Enter saves through the window's keyboard hook). Nothing is
 /// split, so every existing tag round-trips as it is.
-fn tags_row(
-    renaming: &Renaming,
-    indent: f64,
-    context: &mut ViewContext<Sidebar>,
-    palette: Palette,
-) -> View {
+fn tags_row(renaming: &Renaming, indent: f64, context: &mut ViewContext<Sidebar>) -> View {
     let fields = &renaming.tags;
     let blank = String::new();
     let mut rows: Vec<KeyedView> = fields
@@ -1150,7 +1111,7 @@ fn tags_row(
         .enumerate()
         .map(|(index, tag)| {
             let new = index == fields.len();
-            let mut field = m3::field()
+            let mut field = controls::field()
                 .text(tag.clone())
                 .placeholder_text(if new { "New tag" } else { "Tag" })
                 .automation_name(if new {
@@ -1168,13 +1129,13 @@ fn tags_row(
                 None
             } else {
                 Some(
-                    m3::icon_button(palette)
+                    controls::icon_button()
                         .grid_column(1)
                         .width(tokens::height::CONTROL)
                         .height(tokens::height::CONTROL)
                         .automation_name(format!("Remove tag {}", index + 1))
                         .on_click(context.message(Message::Menu(MenuMsg::TagRemoved(index))))
-                        .content(m3::icon(m3::glyph::CLOSE))
+                        .content(controls::icon(controls::glyph::CLOSE))
                         .into(),
                 )
             };
@@ -1194,18 +1155,18 @@ fn tags_row(
             .horizontal_alignment(HorizontalAlignment::Right)
             .spacing(tokens::spacing::XS)
             .children((
-                m3::icon_button(palette)
+                controls::icon_button()
                     .width(tokens::height::CONTROL)
                     .height(tokens::height::CONTROL)
                     .automation_name("Save tags")
                     .on_click(context.message(Message::Menu(MenuMsg::RenameCommitted)))
-                    .content(m3::icon(m3::glyph::CHECK)),
-                m3::icon_button(palette)
+                    .content(controls::icon(controls::glyph::CHECK)),
+                controls::icon_button()
                     .width(tokens::height::CONTROL)
                     .height(tokens::height::CONTROL)
                     .automation_name("Cancel tags")
                     .on_click(context.message(Message::Menu(MenuMsg::RenameCancelled)))
-                    .content(m3::icon(m3::glyph::CLOSE)),
+                    .content(controls::icon(controls::glyph::CLOSE)),
             )),
     ));
     StackPanel::new()
@@ -1247,11 +1208,11 @@ fn shows_actions(input: &SidebarInput, key: &str) -> bool {
     input.hovered.as_deref() == Some(key) || input.focused.as_deref() == Some(key)
 }
 
-/// A row's pointer area; its automation id lets `crate::motion` find the
+/// A row's pointer area; its automation id lets `crate::elements` find the
 /// row that holds keyboard focus.
 fn hover_area(key: String, view: impl Into<View>, context: &mut ViewContext<Sidebar>) -> View {
     Border::new()
-        .automation_id(format!("{}{key}", crate::motion::ROW_ID_PREFIX))
+        .automation_id(format!("{}{key}", crate::elements::ROW_ID_PREFIX))
         .on_pointer_entered(context.callback(move |_: PointerEventInfo| {
             Message::Menu(MenuMsg::Hovered(Some(key.clone())))
         }))
@@ -1280,8 +1241,8 @@ fn row_with_actions(row: impl Into<View>, actions: Vec<KeyedView>) -> View {
 
 /// A quiet caption under a project (a queued launch's wait, "No tasks
 /// yet"): where a task's title would start, `depth` steps in.
-fn nested_note(text: &str, depth: usize, tone: Option<Brush>) -> View {
-    let note = m3::secondary(text.to_owned())
+fn nested_note(text: &str, depth: usize, tone: Option<ThemeBrush>) -> View {
+    let note = controls::secondary(text.to_owned())
         .text_wrapping(TextWrapping::Wrap)
         .vertical_alignment(VerticalAlignment::Center);
     let note = match tone {

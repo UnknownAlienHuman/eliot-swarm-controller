@@ -218,7 +218,7 @@ pub(super) struct LaunchState {
     /// after the render that attaches it to its chip.
     pub(super) show_after: u64,
     /// The chip whose popover a pointer press just closed (light dismiss),
-    /// that press's number (`crate::motion::last_press`) and when.
+    /// that press's number (`crate::elements::last_press`) and when.
     pub(super) dismissed: Option<(u8, u64, std::time::Instant)>,
     /// Files attached in the composer, for the composer they were attached
     /// in (`NEW_TASK` or the open Agent's id).
@@ -617,7 +617,7 @@ impl DesktopApp {
                     .is_some_and(|(chip, press, at)| {
                         self.launch.open.is_none()
                             && chip == chip_of(pop)
-                            && press == crate::motion::presses()
+                            && press == crate::elements::presses()
                             && at.elapsed().as_millis() < DISMISS_PRESS_MS
                     })
                 {
@@ -663,7 +663,7 @@ impl DesktopApp {
                 // A press that just came closed it: remember which one. A
                 // close with no press behind it (a switch to another
                 // window, Esc in WinUI) swallows nothing.
-                let (press, age) = crate::motion::last_press();
+                let (press, age) = crate::elements::last_press();
                 self.launch.dismissed = (u128::from(age) < DISMISS_PRESS_MS)
                     .then(|| (chip_of(open), press, std::time::Instant::now()));
                 let preset = self.launch.preset.is_some();

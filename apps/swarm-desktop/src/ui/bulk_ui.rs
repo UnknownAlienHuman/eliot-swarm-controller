@@ -16,7 +16,6 @@
 //! only: folders, files, branches and native store files stay.
 
 use super::*;
-use crate::theme::winui::Palette;
 use eliot_core::api::{
     ArtifactKind, CleanupApplyRequest, CleanupApplyResponse, CleanupPlanRequest, CleanupScope,
 };
@@ -878,7 +877,6 @@ impl DesktopApp {
         &self,
         dialog: &BulkDialog,
         context: &mut ViewContext<Self>,
-        palette: Palette,
     ) -> ContentDialog {
         let count = dialog.plan.items.len();
         // Projects are named in the list; tasks say where they are.
@@ -919,7 +917,7 @@ impl DesktopApp {
                             .is_indeterminate(true)
                             .width(tokens::layout::RING)
                             .height(tokens::layout::RING),
-                        m3::secondary("Reading every task and project…"),
+                        controls::secondary("Reading every task and project…"),
                     ))
                     .into(),
             ),
@@ -927,7 +925,7 @@ impl DesktopApp {
                 for (index, item) in dialog.plan.items.iter().take(LISTED).enumerate() {
                     line(
                         format!("item:{index}"),
-                        m3::body(format!("• {}", item.name))
+                        controls::body(format!("• {}", item.name))
                             .text_trimming(TextTrimming::CharacterEllipsis)
                             .into(),
                     );
@@ -935,13 +933,13 @@ impl DesktopApp {
                 if count > LISTED {
                     line(
                         "more".to_owned(),
-                        m3::secondary(format!("and {} more", count - LISTED)).into(),
+                        controls::secondary(format!("and {} more", count - LISTED)).into(),
                     );
                 }
                 if count > 0 {
                     line(
                     "what".to_owned(),
-                    m3::secondary(match dialog.op {
+                    controls::secondary(match dialog.op {
                         BulkOp::RemoveProjects => {
                             "Swarm removes these project registrations. Their checkouts, workspace files, branches and task records stay. You can add a checkout again in Settings › Projects."
                         }
@@ -967,7 +965,7 @@ impl DesktopApp {
                             .is_indeterminate(true)
                             .width(tokens::layout::RING)
                             .height(tokens::layout::RING),
-                        m3::secondary(if stopping {
+                        controls::secondary(if stopping {
                             "Stopping after this one…"
                         } else {
                             "Each one is checked by Swarm as it goes."
@@ -983,7 +981,7 @@ impl DesktopApp {
                     .count();
                 line(
                     "summary".to_owned(),
-                    m3::text(
+                    controls::text(
                         format!("{} {}.", dialog.op.done(), dialog.op.noun(done)),
                         tokens::text::HEADER,
                     )
@@ -998,7 +996,7 @@ impl DesktopApp {
                 for (index, name) in names.iter().take(LISTED).enumerate() {
                     line(
                         format!("done:{index}"),
-                        m3::body(format!("• {name}"))
+                        controls::body(format!("• {name}"))
                             .text_trimming(TextTrimming::CharacterEllipsis)
                             .into(),
                     );
@@ -1006,14 +1004,14 @@ impl DesktopApp {
                 if names.len() > LISTED {
                     line(
                         "done-more".to_owned(),
-                        m3::secondary(format!("and {} more", names.len() - LISTED)).into(),
+                        controls::secondary(format!("and {} more", names.len() - LISTED)).into(),
                     );
                 }
                 let left = count.saturating_sub(dialog.outcomes.len());
                 if left > 0 && dialog.error.is_none() && dialog.op != BulkOp::RemoveProjects {
                     line(
                         "left".to_owned(),
-                        m3::secondary(format!(
+                        controls::secondary(format!(
                             "Stopped before the other {}.",
                             eliot_core::count_words(left as u64, "one", "ones")
                         ))
@@ -1031,8 +1029,8 @@ impl DesktopApp {
                         };
                         line(
                             format!("refused:{index}"),
-                            m3::body(words)
-                                .foreground(palette.attention())
+                            controls::body(words)
+                                .foreground(ThemeBrush::SystemCritical)
                                 .text_wrapping(TextWrapping::Wrap)
                                 .is_text_selection_enabled(true)
                                 .into(),
@@ -1044,8 +1042,8 @@ impl DesktopApp {
         if let Some(error) = &dialog.error {
             line(
                 "error".to_owned(),
-                m3::body(error.clone())
-                    .foreground(palette.attention())
+                controls::body(error.clone())
+                    .foreground(ThemeBrush::SystemCritical)
                     .text_wrapping(TextWrapping::Wrap)
                     .is_text_selection_enabled(true)
                     .into(),
@@ -1054,12 +1052,12 @@ impl DesktopApp {
         if !dialog.plan.kept.is_empty() && dialog.phase != Phase::Reading {
             line(
                 "kept-title".to_owned(),
-                m3::text("Kept", tokens::text::HEADER).into(),
+                controls::text("Kept", tokens::text::HEADER).into(),
             );
             for (index, kept) in dialog.plan.kept.iter().enumerate() {
                 line(
                     format!("kept:{index}"),
-                    m3::secondary(kept.clone())
+                    controls::secondary(kept.clone())
                         .text_wrapping(TextWrapping::Wrap)
                         .into(),
                 );
@@ -1075,7 +1073,7 @@ impl DesktopApp {
             Phase::Done => BulkMsg::Closed,
             _ => BulkMsg::Confirmed(false),
         };
-        let close = m3::text_button(palette)
+        let close = controls::text_button()
             .element_ref(&self.dialog.close)
             .is_enabled(
                 !matches!(dialog.phase, Phase::Running { stopping: true })
@@ -1084,15 +1082,15 @@ impl DesktopApp {
             )
             .automation_name(format!("{close_label} {}", dialog.op.verb().to_lowercase()))
             .on_click(context.message(Message::Bulk(close_message)))
-            .content(m3::label(close_label));
+            .content(controls::label(close_label));
         let primary: Option<View> = if dialog.phase == Phase::Confirm && count > 0 {
             let label = format!("{} {}", dialog.op.verb(), dialog.op.noun(count));
             Some(
-                m3::destructive(palette)
+                controls::destructive()
                     .element_ref(&self.dialog.primary)
                     .automation_name(format!("Confirm: {label}"))
                     .on_click(context.message(Message::Bulk(BulkMsg::Confirmed(true))))
-                    .content(m3::label(&label))
+                    .content(controls::label(&label))
                     .into(),
             )
         } else {
@@ -1101,7 +1099,6 @@ impl DesktopApp {
         super::dialog_ui::surface(
             context,
             self.dialog.epoch,
-            palette,
             title,
             StackPanel::new()
                 .spacing(tokens::spacing::XS)

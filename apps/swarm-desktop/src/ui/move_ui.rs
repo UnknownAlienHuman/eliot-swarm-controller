@@ -7,14 +7,13 @@
 //! every page up to a bound), not the sidebar's single page, and says
 //! when it left some unread.
 //!
-//! The picker uses the shared M3 dialog and native modal focus host.
+//! The picker uses the shared dialog and native modal focus host.
 //! The move is the existing `swarm.reparent` with both
 //! generations bound at the click; the daemon's checks decide, and a
 //! refusal stays in the picker in words. An uncertain reply keeps the
 //! ledger entry, so Move again sends the same mutation id.
 
 use super::*;
-use crate::theme::winui::Palette;
 
 #[derive(Clone, Debug)]
 pub(super) enum MoveMsg {
@@ -219,7 +218,6 @@ impl DesktopApp {
         &self,
         dialog: &MoveDialog,
         context: &mut ViewContext<Self>,
-        palette: Palette,
     ) -> ContentDialog {
         let title = self.agent_label(&dialog.agent);
         let (candidates, unread): (&[UiAgent], usize) = match &dialog.search {
@@ -272,7 +270,7 @@ impl DesktopApp {
                 }
                 KeyedView::new(
                     format!("{}:{selected}", agent.id),
-                    m3::row(palette, selected)
+                    controls::row(selected)
                         .height(tokens::height::TWO_LINE_ROW)
                         .min_height(tokens::height::TWO_LINE_ROW)
                         .automation_name(format!("{label}, {note}"))
@@ -281,8 +279,9 @@ impl DesktopApp {
                             StackPanel::new()
                                 .vertical_alignment(VerticalAlignment::Center)
                                 .children((
-                                    m3::body(label).text_trimming(TextTrimming::CharacterEllipsis),
-                                    m3::secondary(note)
+                                    controls::body(label)
+                                        .text_trimming(TextTrimming::CharacterEllipsis),
+                                    controls::secondary(note)
                                         .text_trimming(TextTrimming::CharacterEllipsis),
                                 )),
                         ),
@@ -291,29 +290,30 @@ impl DesktopApp {
             .collect();
         let list: View = match &dialog.search {
             Search::Reading => {
-                m3::secondary(format!("Reading running or ready tasks {}…", scope.read())).into()
+                controls::secondary(format!("Reading running or ready tasks {}…", scope.read()))
+                    .into()
             }
-            Search::Failed(error) => m3::body(format!(
+            Search::Failed(error) => controls::body(format!(
                 "Could not read the tasks {}: {error}",
                 scope.read()
             ))
-            .foreground(palette.attention())
+            .foreground(ThemeBrush::SystemCritical)
             .text_wrapping(TextWrapping::Wrap)
             .is_text_selection_enabled(true)
             .into(),
-            Search::Read(_) if eligible.is_empty() && unread == 0 => m3::secondary(format!(
+            Search::Read(_) if eligible.is_empty() && unread == 0 => controls::secondary(format!(
                 "No other {} is running or ready, so there is none to move it under.",
                 scope.offered()
             ))
             .text_wrapping(TextWrapping::Wrap)
             .into(),
             Search::Read(_) if eligible.is_empty() => {
-                m3::secondary("None of the tasks read can take it.")
+                controls::secondary("None of the tasks read can take it.")
                     .text_wrapping(TextWrapping::Wrap)
                     .into()
             }
             Search::Read(_) if rows.is_empty() => {
-                m3::secondary(format!("No task matches “{}”.", dialog.query.trim()))
+                controls::secondary(format!("No task matches “{}”.", dialog.query.trim()))
                     .text_wrapping(TextWrapping::Wrap)
                     .into()
             }
@@ -327,20 +327,20 @@ impl DesktopApp {
         // The search is bounded: say what it left unread.
         let incomplete: Option<View> =
             reparent::unread_words(dialog.agent.scope(), candidates.len(), unread).map(|words| {
-                m3::secondary(words)
+                controls::secondary(words)
                     .text_wrapping(TextWrapping::Wrap)
                     .into()
             });
         let summary: Option<View> = match (&dialog.error, picked) {
             (Some(error), _) => Some(
-                m3::body(error.clone())
-                    .foreground(palette.attention())
+                controls::body(error.clone())
+                    .foreground(ThemeBrush::SystemCritical)
                     .text_wrapping(TextWrapping::Wrap)
                     .is_text_selection_enabled(true)
                     .into(),
             ),
             (None, Some(parent)) => Some(
-                m3::secondary(format!(
+                controls::secondary(format!(
                     "“{title}” will work under “{}”. Its own workers move with it.",
                     self.agent_label(parent)
                 ))
@@ -350,7 +350,7 @@ impl DesktopApp {
             (None, None) => None,
         };
         let confirm: View = match picked {
-            Some(parent) => m3::filled(palette)
+            Some(parent) => controls::filled()
                 .element_ref(&self.dialog.primary)
                 .is_enabled(!self.submitting())
                 .automation_name(format!("Move under: {}", self.agent_label(parent)))
@@ -362,29 +362,28 @@ impl DesktopApp {
                         parent_generation: parent.generation,
                     },
                 ))))
-                .content(m3::label(if self.submitting() {
+                .content(controls::label(if self.submitting() {
                     "Moving…"
                 } else {
                     "Move"
                 }))
                 .into(),
-            None => m3::filled(palette)
+            None => controls::filled()
                 .is_enabled(false)
                 .automation_name("Move (pick a task first)")
-                .content(m3::label("Move"))
+                .content(controls::label("Move"))
                 .into(),
         };
         let heading = format!("Move “{title}” under another task");
         super::dialog_ui::surface(
             context,
             self.dialog.epoch,
-            palette,
             heading,
             StackPanel::new()
                 .spacing(tokens::spacing::MD)
                 .keyed_children(crate::views::slots([
                     Some(
-                        m3::secondary(format!(
+                        controls::secondary(format!(
                             "Pick a running or ready {}. Its workers move with it.",
                             scope.offered()
                         ))
@@ -392,7 +391,7 @@ impl DesktopApp {
                         .into(),
                     ),
                     Some(
-                        m3::field()
+                        controls::field()
                             .text(dialog.query.clone())
                             .placeholder_text("Search tasks")
                             .automation_name("Search tasks to move under")
@@ -407,11 +406,11 @@ impl DesktopApp {
                 ]))
                 .into(),
             super::dialog_ui::actions(
-                m3::text_button(palette)
+                controls::text_button()
                     .element_ref(&self.dialog.close)
                     .automation_name("Cancel move")
                     .on_click(context.message(Message::Move(MoveMsg::Closed)))
-                    .content(m3::label("Cancel"))
+                    .content(controls::label("Cancel"))
                     .into(),
                 confirm,
             ),

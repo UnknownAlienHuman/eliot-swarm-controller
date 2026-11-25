@@ -14,7 +14,6 @@ use crate::monitor::{
     self, DetailRead, GRAPH_BARS, Monitor, MonitorRow, bytes_label, cpu_time_label, group,
     state_words, tokens_label,
 };
-use crate::theme::winui::Palette;
 use crate::ui::tokens;
 use crate::views::MaybeContent;
 
@@ -102,7 +101,7 @@ pub fn project_instruction_lines(reply: &AgentGetResponse) -> Option<Vec<String>
 /// A note: secondary size, wrapped and selectable (callers lower its
 /// emphasis where it is supporting text).
 fn small(text: impl Into<String>) -> TextBlock {
-    crate::m3::text(text, tokens::text::CAPTION)
+    crate::controls::text(text, tokens::text::CAPTION)
         .text_wrapping(TextWrapping::Wrap)
         .is_text_selection_enabled(true)
 }
@@ -191,7 +190,6 @@ fn chart_card(
     scale: String,
     note: String,
     bar: Brush,
-    palette: Palette,
 ) -> View {
     // The newest sample sits at the right edge; a short history leaves the
     // older columns empty instead of bunching at the left.
@@ -211,7 +209,7 @@ fn chart_card(
                 None => Border::new()
                     .height(tokens::layout::PLOT_STUB)
                     .opacity(tokens::state::PLOT_STUB_OPACITY)
-                    .background(palette.outline()),
+                    .background(ThemeBrush::CardStroke),
             };
             KeyedView::new(
                 index,
@@ -227,15 +225,14 @@ fn chart_card(
             Grid::new()
                 .columns([GridLength::STAR, GridLength::Auto])
                 .children((
-                    crate::m3::muted(title, tokens::text::CAPTION)
+                    crate::controls::text(title, tokens::text::CAPTION)
                         .vertical_alignment(VerticalAlignment::Bottom),
-                    crate::m3::text(latest, tokens::text::HEADER).grid_column(1),
+                    crate::controls::text(latest, tokens::text::HEADER).grid_column(1),
                 )),
-            // The plot well in the surface color: one tonal step from the card
-            // in both schemes (the highest container nearly matched the light
-            // card).
+            // The plot well on the window's base: one step from the card in
+            // every theme.
             Border::new()
-                .background(palette.surface())
+                .background(ThemeBrush::SolidBackground)
                 .corner_radius(tokens::radius::CONTAINER)
                 .padding(Thickness::uniform(tokens::spacing::SM))
                 .content(
@@ -244,7 +241,7 @@ fn chart_card(
                         .columns((0..GRAPH_BARS).map(|_| GridLength::STAR))
                         .keyed_children(bars),
                 ),
-            small(format!("{scale} · {note}")).foreground(palette.muted()),
+            small(format!("{scale} · {note}")),
         ))
         .into()
 }
@@ -440,16 +437,13 @@ pub fn usage_lines(read: &DetailRead) -> Vec<String> {
 }
 
 /// The CPU and memory charts of `id`, with the sampling note.
-pub fn resource_views(monitor: &Monitor, id: &str, palette: Palette) -> Vec<KeyedView> {
+pub fn resource_views(monitor: &Monitor, id: &str) -> Vec<KeyedView> {
     let mut views: Vec<KeyedView> = Vec::new();
     let row = monitor.row(id);
     // An Agent that ended with every process exited has nothing to sample:
     // one line says so.
     if row.is_some_and(|row| row.ended() && row.obs.live_processes() == 0) {
-        views.push(KeyedView::new(
-            "ended",
-            small("No live process.").foreground(palette.muted()),
-        ));
+        views.push(KeyedView::new("ended", small("No live process.")));
         return views;
     }
     if let Some(row) = row {
@@ -467,10 +461,7 @@ pub fn resource_views(monitor: &Monitor, id: &str, palette: Palette) -> Vec<Keye
         .collect::<Vec<_>>()
         .join(" · ");
         views.push(KeyedView::new("now", small(now)));
-        views.push(KeyedView::new(
-            "fresh",
-            small(row.obs.freshness()).foreground(palette.muted()),
-        ));
+        views.push(KeyedView::new("fresh", small(row.obs.freshness())));
     }
     match monitor.series.get(id) {
         Some(series) if !series.points().is_empty() => {
@@ -499,8 +490,7 @@ pub fn resource_views(monitor: &Monitor, id: &str, palette: Palette) -> Vec<Keye
                     cpu_scale,
                     format!("scale 0–{cpu_scale}%"),
                     cpu_note,
-                    palette.primary(),
-                    palette,
+                    ThemeBrush::Accent.into(),
                 ),
             ));
             let rss_values: Vec<Option<f64>> = recent
@@ -517,8 +507,7 @@ pub fn resource_views(monitor: &Monitor, id: &str, palette: Palette) -> Vec<Keye
                     rss_scale,
                     format!("scale 0–{}", bytes_label(Some(rss_scale as u64))),
                     "sum over the Agent's sampled processes, not host memory share".to_owned(),
-                    palette.primary(),
-                    palette,
+                    ThemeBrush::Accent.into(),
                 ),
             ));
             views.push(KeyedView::new(
@@ -527,15 +516,14 @@ pub fn resource_views(monitor: &Monitor, id: &str, palette: Palette) -> Vec<Keye
                     "{} kept while this panel is open (at most {}).",
                     eliot_core::count_words(series.points().len() as u64, "sample", "samples"),
                     monitor::RING_CAPACITY
-                ))
-                .foreground(palette.muted()),
+                )),
             ));
         }
         // The freshness line already says nothing was sampled.
         _ if row.is_some() => {}
         _ => views.push(KeyedView::new(
             "no-series",
-            small("No process samples yet.").foreground(palette.muted()),
+            small("No process samples yet."),
         )),
     }
     views
@@ -567,7 +555,7 @@ pub struct RowEntry {
     pub model: String,
     /// What it does now, why it ended, or what it needs.
     pub activity: String,
-    /// The activity is an attention report (the warning mark, `tertiary`).
+    /// The activity is an attention report (the warning mark).
     pub attention: bool,
     pub cpu: String,
     pub memory: String,
@@ -591,7 +579,6 @@ pub struct RowEntry {
 #[derive(Clone, PartialEq)]
 pub struct MonitorListInput {
     pub entries: Vec<MonitorEntry>,
-    pub palette: Palette,
     /// Open a row's conversation and details.
     pub open: Callback<String>,
     /// Resume a row (its Agent and the generation shown).
@@ -617,7 +604,7 @@ impl Component for MonitorList {
     }
 
     fn view(&self, input: &MonitorListInput, _context: &mut ViewContext<Self>) -> View {
-        let mut entries: Vec<KeyedView> = vec![KeyedView::new("head", head_row(input.palette))];
+        let mut entries: Vec<KeyedView> = vec![KeyedView::new("head", head_row())];
         entries.extend(input.entries.iter().map(|entry| entry_view(entry, input)));
         StackPanel::new().keyed_children(entries).into()
     }
@@ -644,9 +631,9 @@ fn outer_columns() -> [GridLength; 3] {
     ]
 }
 
-/// A number cell (CPU, Memory): right-aligned, the variant tone.
+/// A number cell (CPU, Memory): right-aligned, muted.
 fn number(text: &str, column: i32) -> View {
-    crate::m3::muted(text.to_owned(), tokens::text::BODY)
+    crate::controls::text(text.to_owned(), tokens::text::BODY)
         .grid_column(column)
         .horizontal_alignment(HorizontalAlignment::Right)
         .vertical_alignment(VerticalAlignment::Center)
@@ -655,9 +642,9 @@ fn number(text: &str, column: i32) -> View {
 
 /// The header row (`.trow.head`): the column names in `label-medium`, a
 /// hairline under them.
-fn head_row(palette: Palette) -> View {
+fn head_row() -> View {
     let label = |text: &str, column: i32, right: bool| -> View {
-        crate::m3::muted(text.to_owned(), tokens::text::LABEL)
+        crate::controls::text(text.to_owned(), tokens::text::LABEL)
             .grid_column(column)
             .horizontal_alignment(if right {
                 HorizontalAlignment::Right
@@ -669,7 +656,7 @@ fn head_row(palette: Palette) -> View {
     };
     Border::new()
         .height(tokens::height::CONTROL)
-        .border_brush(palette.outline())
+        .border_brush(ThemeBrush::CardStroke)
         .border_thickness(Thickness::new(0.0, 0.0, 0.0, tokens::layout::HAIRLINE))
         .automation_name("Columns: Task, Model, Activity, CPU, Memory")
         .content(
@@ -701,7 +688,6 @@ fn head_row(palette: Palette) -> View {
 /// state mark, title and project; model; activity; CPU; memory), which
 /// opens its conversation, then Resume or Stop.
 fn fleet_row(entry: &RowEntry, input: &MonitorListInput) -> View {
-    let palette = input.palette;
     let row = &entry.row;
     let mut task: Vec<KeyedView> = vec![
         KeyedView::new(
@@ -709,20 +695,14 @@ fn fleet_row(entry: &RowEntry, input: &MonitorListInput) -> View {
             Border::new()
                 .vertical_alignment(VerticalAlignment::Center)
                 .maybe_content(crate::ui::page_ui::agent_mark(
-                    palette,
                     row.state,
                     row.status_line.as_deref(),
                 )),
         ),
         KeyedView::new(
             "title",
-            crate::m3::text(entry.title.clone(), tokens::page::HEADING)
+            crate::controls::text(entry.title.clone(), tokens::page::HEADING)
                 .grid_column(1)
-                .foreground(if row.state == eliot_core::AgentState::Stopped {
-                    palette.muted()
-                } else {
-                    palette.text()
-                })
                 .vertical_alignment(VerticalAlignment::Center)
                 .text_trimming(TextTrimming::CharacterEllipsis),
         ),
@@ -734,23 +714,23 @@ fn fleet_row(entry: &RowEntry, input: &MonitorListInput) -> View {
                 .grid_column(2)
                 .horizontal_alignment(HorizontalAlignment::Left)
                 .vertical_alignment(VerticalAlignment::Center)
-                .content(crate::m3::badge(palette, "observed")),
+                .content(crate::controls::badge("observed")),
         ));
     } else if !entry.project.is_empty() {
         task.push(KeyedView::new(
             "project",
-            crate::m3::secondary(entry.project.clone())
+            crate::controls::secondary(entry.project.clone())
                 .grid_column(2)
                 .vertical_alignment(VerticalAlignment::Center)
                 .text_trimming(TextTrimming::CharacterEllipsis),
         ));
     }
-    let activity = crate::m3::text(entry.activity.clone(), tokens::text::BODY)
+    let activity = crate::controls::text(entry.activity.clone(), tokens::text::BODY)
         .grid_column(2)
         .vertical_alignment(VerticalAlignment::Center)
         .text_trimming(TextTrimming::CharacterEllipsis);
     let activity = if entry.attention {
-        activity.foreground(palette.waiting())
+        activity.foreground(ThemeBrush::AccentText)
     } else {
         activity
     };
@@ -772,7 +752,7 @@ fn fleet_row(entry: &RowEntry, input: &MonitorListInput) -> View {
                 .columns([GridLength::Auto, GridLength::Star(2.0), GridLength::STAR])
                 .column_spacing(tokens::spacing::SM)
                 .keyed_children(task),
-            crate::m3::secondary(entry.model.clone())
+            crate::controls::secondary(entry.model.clone())
                 .grid_column(1)
                 .vertical_alignment(VerticalAlignment::Center)
                 .text_trimming(TextTrimming::CharacterEllipsis),
@@ -790,7 +770,7 @@ fn fleet_row(entry: &RowEntry, input: &MonitorListInput) -> View {
         entry.activity,
         entry.words
     );
-    let button = crate::m3::row(palette, entry.selected)
+    let button = crate::controls::row(entry.selected)
         .grid_column(1)
         .automation_name(name.clone())
         .on_click(move || {
@@ -800,7 +780,7 @@ fn fleet_row(entry: &RowEntry, input: &MonitorListInput) -> View {
         .tooltip(name);
     let chevron: Option<View> = entry.children.map(|open| {
         let (children, id) = (input.children.clone(), row.id.clone());
-        crate::m3::icon_button(palette)
+        crate::controls::icon_button()
             .automation_name(format!(
                 "{} the workers of {}",
                 if open { "Hide" } else { "Show" },
@@ -809,29 +789,29 @@ fn fleet_row(entry: &RowEntry, input: &MonitorListInput) -> View {
             .on_click(move || {
                 children.call(id.clone());
             })
-            .content(crate::m3::small_icon(if open {
-                crate::m3::glyph::CHEVRON_DOWN
+            .content(crate::controls::small_icon(if open {
+                crate::controls::glyph::CHEVRON_DOWN
             } else {
-                crate::m3::glyph::CHEVRON_RIGHT
+                crate::controls::glyph::CHEVRON_RIGHT
             }))
             .into()
     });
     let action: Option<View> = if let Some(enabled) = entry.resume {
         let (resume, id, generation) = (input.resume.clone(), row.id.clone(), row.generation);
         Some(
-            crate::m3::icon_button(palette)
+            crate::controls::icon_button()
                 .is_enabled(enabled)
                 .automation_name(format!("Resume {} (run {generation})", entry.title))
                 .on_click(move || {
                     resume.call((id.clone(), generation));
                 })
-                .content(crate::m3::icon(crate::m3::glyph::RESUME))
+                .content(crate::controls::icon(crate::controls::glyph::RESUME))
                 .into(),
         )
     } else if let Some(state) = entry.stop {
         let (stop, id, generation) = (input.stop.clone(), row.id.clone(), row.generation);
         Some(
-            crate::m3::icon_button(palette)
+            crate::controls::icon_button()
                 .is_enabled(state == StopButton::Ready)
                 .automation_name(match state {
                     StopButton::Stopping => format!("Stopping {}", entry.title),
@@ -840,7 +820,7 @@ fn fleet_row(entry: &RowEntry, input: &MonitorListInput) -> View {
                 .on_click(move || {
                     stop.call((id.clone(), generation));
                 })
-                .content(crate::m3::icon(crate::m3::glyph::STOP_CIRCLE))
+                .content(crate::controls::icon(crate::controls::glyph::STOP_CIRCLE))
                 .into(),
         )
     } else {
@@ -861,8 +841,8 @@ fn fleet_row(entry: &RowEntry, input: &MonitorListInput) -> View {
     ));
     if entry.attention {
         Border::new()
-            .corner_radius(tokens::radius::PILL)
-            .background(palette.status_chip(crate::theme::StatusTone::Attention).0)
+            .corner_radius(tokens::radius::CONTROL)
+            .background(ThemeBrush::CardBackground)
             .content(grid)
             .into()
     } else {
@@ -871,7 +851,6 @@ fn fleet_row(entry: &RowEntry, input: &MonitorListInput) -> View {
 }
 
 fn entry_view(entry: &MonitorEntry, input: &MonitorListInput) -> KeyedView {
-    let palette = input.palette;
     match entry {
         MonitorEntry::Section(key, label) => KeyedView::new(
             key.clone(),
@@ -879,24 +858,24 @@ fn entry_view(entry: &MonitorEntry, input: &MonitorListInput) -> KeyedView {
                 .height(tokens::height::CONTROL)
                 .padding(Thickness::xy(tokens::spacing::SM, 0.0))
                 .content(
-                    crate::m3::muted(label.clone(), tokens::text::LABEL)
+                    crate::controls::text(label.clone(), tokens::text::LABEL)
                         .automation_heading_level(AutomationHeadingLevel::Level3)
                         .vertical_alignment(VerticalAlignment::Center),
                 ),
         ),
         MonitorEntry::Stopped(label, open) => KeyedView::new(
             format!("section:stopped:{open}"),
-            crate::m3::sub_row(palette, false)
+            crate::controls::sub_row(false)
                 .automation_name(format!(
                     "{label} ({})",
                     if *open { "shown" } else { "hidden" }
                 ))
                 .on_click(input.stopped.clone())
-                .content(crate::m3::row_content(
+                .content(crate::controls::row_content(
                     Some(if *open {
-                        crate::m3::glyph::CHEVRON_DOWN
+                        crate::controls::glyph::CHEVRON_DOWN
                     } else {
-                        crate::m3::glyph::CHEVRON_RIGHT
+                        crate::controls::glyph::CHEVRON_RIGHT
                     }),
                     label,
                     "",
@@ -911,7 +890,7 @@ fn entry_view(entry: &MonitorEntry, input: &MonitorListInput) -> KeyedView {
             "none",
             Border::new()
                 .padding(Thickness::uniform(tokens::spacing::SM))
-                .content(crate::m3::secondary(text.clone())),
+                .content(crate::controls::secondary(text.clone())),
         ),
     }
 }

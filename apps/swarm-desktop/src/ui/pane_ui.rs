@@ -23,7 +23,6 @@ use eliot_core::api::{
 
 use super::*;
 use crate::monitor::MonitorRow;
-use crate::theme::winui::Palette;
 
 /// What Changes compares (`.group` Compare).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -676,26 +675,26 @@ impl DesktopApp {
     }
 
     /// The pane: its tab strip over the open tab.
-    pub(super) fn pane_view(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
+    pub(super) fn pane_view(&self, context: &mut ViewContext<Self>) -> View {
         let body: Option<View> = match self.panel {
-            Panel::Changes => Some(self.changes_view(context, palette)),
-            Panel::Agents => Some(self.tree_view(context, palette)),
-            Panel::Details => self.details_view(context, palette),
-            Panel::Terminal => Some(self.terminal_view(context, palette)),
+            Panel::Changes => Some(self.changes_view(context)),
+            Panel::Agents => Some(self.tree_view(context)),
+            Panel::Details => self.details_view(context),
+            Panel::Terminal => Some(self.terminal_view(context)),
             Panel::Closed => None,
         };
         Grid::new()
             .rows([GridLength::Auto, GridLength::STAR])
             .children((
-                self.tab_strip(context, palette),
+                self.tab_strip(context),
                 Border::new().grid_row(1).maybe_content(body),
             ))
             .into()
     }
 
     /// The strip (`.tabs`): the four tabs, then Wide and Full view, over an
-    /// `outline-variant` hairline.
-    fn tab_strip(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
+    /// a hairline.
+    fn tab_strip(&self, context: &mut ViewContext<Self>) -> View {
         let mut cells: Vec<KeyedView> = Vec::new();
         let mut columns = Vec::new();
         for panel in Panel::TABS {
@@ -713,7 +712,7 @@ impl DesktopApp {
                         0.0,
                         0.0,
                     ))
-                    .background(palette.primary())
+                    .background(ThemeBrush::Accent)
                     .into()
             });
             cells.push(KeyedView::new(
@@ -723,7 +722,7 @@ impl DesktopApp {
                     .keyed_children(crate::views::slots([
                         Some(
                             Button::new()
-                                .resource_overrides(palette.tab(selected))
+                                .style(ButtonStyle::Subtle)
                                 .height(tokens::height::CONTROL)
                                 .min_height(tokens::height::CONTROL)
                                 .automation_name(if selected {
@@ -733,7 +732,7 @@ impl DesktopApp {
                                 })
                                 .on_click(context.message(Message::Pane(PaneMsg::Tab(panel))))
                                 .content(
-                                    m3::text(panel.label(), tokens::text::BUTTON)
+                                    controls::text(panel.label(), tokens::text::BUTTON)
                                         .margin(Thickness::xy(
                                             tokens::spacing::TEXT_INSET - tokens::spacing::ROW,
                                             0.0,
@@ -754,26 +753,24 @@ impl DesktopApp {
         let at = cells.len() as i32 + 1;
         cells.push(KeyedView::new(
             format!("wide:{wide}"),
-            m3::icon_button(palette)
+            controls::toggle_icon_button(wide)
                 .grid_column(at)
-                .resource_overrides(palette.toggle(wide))
                 .automation_name(if wide { "Wide pane (on)" } else { "Wide pane" })
                 .on_click(context.message(Message::Pane(PaneMsg::Wide)))
-                .content(m3::icon(m3::glyph::WIDTH))
+                .content(controls::icon(controls::glyph::WIDTH))
                 .tooltip("Wide pane"),
         ));
         cells.push(KeyedView::new(
             format!("full:{full}"),
-            m3::icon_button(palette)
+            controls::toggle_icon_button(full)
                 .grid_column(at + 1)
-                .resource_overrides(palette.toggle(full))
                 .automation_name(if full { "Full view (on)" } else { "Full view" })
                 .on_click(context.message(Message::Pane(PaneMsg::Full)))
-                .content(m3::icon(m3::glyph::FULL_VIEW))
+                .content(controls::icon(controls::glyph::FULL_VIEW))
                 .tooltip(if full { "Leave Full view" } else { "Full view" }),
         ));
         Border::new()
-            .border_brush(palette.outline())
+            .border_brush(ThemeBrush::CardStroke)
             .border_thickness(Thickness::new(0.0, 0.0, 0.0, tokens::layout::HAIRLINE))
             .padding(Thickness::xy(tokens::spacing::SM, 0.0))
             .content(
@@ -803,7 +800,7 @@ impl DesktopApp {
     /// Changes (skeleton 5.4, `Decision.dc.html`): Compare and Refresh;
     /// the diff view and Filter files; the summary; the review digest; the
     /// files; the selected file's actions; Merge and check.
-    fn changes_view(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
+    fn changes_view(&self, context: &mut ViewContext<Self>) -> View {
         let changes = &self.pane.changes;
         let open = self.selected_agent_id();
         let read = changes.read.as_deref().filter(|_| changes.agent == open);
@@ -825,17 +822,14 @@ impl DesktopApp {
         items.push(KeyedView::new(
             "compare",
             toolbar(
-                vec![KeyedView::new(
-                    "group",
-                    super::page_ui::choice(palette, &compare),
-                )],
+                vec![KeyedView::new("group", super::page_ui::choice(&compare))],
                 vec![KeyedView::new(
                     "refresh",
-                    m3::icon_button(palette)
+                    controls::icon_button()
                         .is_enabled(!changes.reading)
                         .automation_name("Refresh changes")
                         .on_click(context.message(Message::Pane(PaneMsg::Refresh)))
-                        .content(m3::icon(m3::glyph::REFRESH))
+                        .content(controls::icon(controls::glyph::REFRESH))
                         .tooltip(read_at),
                 )],
             ),
@@ -848,10 +842,10 @@ impl DesktopApp {
             .map(|(label, selected)| {
                 KeyedView::new(
                     label,
-                    m3::segment(palette, selected)
+                    controls::segment(selected)
                         .is_enabled(false)
                         .automation_name(format!("{label}: {no_diff}"))
-                        .content(m3::segment_label(label)),
+                        .content(controls::segment_label(label)),
                 )
             })
             .collect();
@@ -869,17 +863,17 @@ impl DesktopApp {
                     KeyedView::new(
                         "group",
                         Border::new()
-                            .content(m3::segmented(palette, view_group))
+                            .content(controls::segmented(view_group))
                             .tooltip(no_diff),
                     ),
                     KeyedView::new(
                         "wrap",
                         Border::new()
                             .content(
-                                m3::icon_button(palette)
+                                controls::icon_button()
                                     .is_enabled(false)
                                     .automation_name(format!("Word wrap: {no_diff}"))
-                                    .content(m3::icon(m3::glyph::WRAP)),
+                                    .content(controls::icon(controls::glyph::WRAP)),
                             )
                             .tooltip(no_diff),
                     ),
@@ -889,8 +883,8 @@ impl DesktopApp {
                     Border::new()
                         .width(tokens::layout::FILTER_WIDTH)
                         .height(tokens::height::CONTROL)
-                        .corner_radius(tokens::radius::FIELD)
-                        .border_brush(palette.border())
+                        .corner_radius(tokens::radius::CONTROL)
+                        .border_brush(ThemeBrush::CardStroke)
                         .border_thickness(Thickness::uniform(tokens::layout::HAIRLINE))
                         .padding(Thickness::new(tokens::spacing::ROW, 0.0, 0.0, 0.0))
                         .content(
@@ -899,7 +893,7 @@ impl DesktopApp {
                                 .children((
                                     Border::new()
                                         .vertical_alignment(VerticalAlignment::Center)
-                                        .content(m3::small_icon(m3::glyph::FILTER)),
+                                        .content(controls::small_icon(controls::glyph::FILTER)),
                                     filter
                                         .grid_column(1)
                                         .background(Brush::Solid(Color::transparent()))
@@ -946,7 +940,6 @@ impl DesktopApp {
             items.push(KeyedView::new(
                 "failed",
                 super::page_ui::read_failed(
-                    palette,
                     format!("Couldn't read changes: {why}"),
                     "Retry",
                     !changes.reading,
@@ -974,7 +967,6 @@ impl DesktopApp {
         items.push(KeyedView::new(
             format!("summary:{:?}", changes.source),
             summary_line(
-                palette,
                 changes.source,
                 files.as_ref().ok().map(Vec::len),
                 git.and_then(|git| git.line_counts.as_ref())
@@ -990,7 +982,7 @@ impl DesktopApp {
         {
             items.push(KeyedView::new(
                 "git-error",
-                super::page_ui::error_line(palette, format!("Git status not read: {error}")),
+                super::page_ui::error_line(format!("Git status not read: {error}")),
             ));
         }
         if let Err(error) = &read.digest
@@ -998,16 +990,13 @@ impl DesktopApp {
         {
             items.push(KeyedView::new(
                 "digest-error",
-                super::page_ui::error_line(palette, format!("Review digest not read: {error}")),
+                super::page_ui::error_line(format!("Review digest not read: {error}")),
             ));
         }
         // The digest reads the branch's patch against its base: it goes
         // with Branch, not with the other sources' narrower scopes.
         if let Some(digest) = digest.filter(|_| changes.source == Source::Branch) {
-            items.push(KeyedView::new(
-                "digest",
-                self.digest_card(digest, context, palette),
-            ));
+            items.push(KeyedView::new("digest", self.digest_card(digest, context)));
         }
 
         match files {
@@ -1035,7 +1024,7 @@ impl DesktopApp {
                     let selected = changes.selected.as_deref() == Some(path.as_str());
                     rows.push(KeyedView::new(
                         format!("file:{path}:{selected}"),
-                        file_row(palette, path, state, selected, context),
+                        file_row(path, state, selected, context),
                     ));
                 }
                 if shown.is_empty() {
@@ -1058,12 +1047,12 @@ impl DesktopApp {
                 {
                     items.push(KeyedView::new(
                         format!("selected:{path}"),
-                        selected_file(palette, path, context),
+                        selected_file(path, context),
                     ));
                 }
             }
         }
-        items.push(KeyedView::new("merge", self.merge_view(context, palette)));
+        items.push(KeyedView::new("merge", self.merge_view(context)));
         self.pane_body("Changes", items)
     }
 
@@ -1170,7 +1159,6 @@ impl DesktopApp {
         &self,
         digest: &AgentPatchDigestResponse,
         context: &mut ViewContext<Self>,
-        palette: Palette,
     ) -> View {
         let open = self.pane.changes.open;
         let mut chips: Vec<KeyedView> = Vec::new();
@@ -1183,16 +1171,15 @@ impl DesktopApp {
             let words = group.words(count);
             chips.push(KeyedView::new(
                 format!("{group:?}:{selected}"),
-                m3::chip(palette)
-                    .resource_overrides(super::page_ui::selected_chip(palette, selected))
+                controls::segment(selected)
                     .automation_name(if selected {
                         format!("{words} (paths shown)")
                     } else {
                         format!("{words}: show the paths")
                     })
                     .on_click(context.message(Message::Pane(PaneMsg::DigestGroup(group))))
-                    .content(m3::chip_content(
-                        selected.then_some(m3::glyph::CHECK),
+                    .content(controls::chip_content(
+                        selected.then_some(controls::glyph::CHECK),
                         &words,
                         false,
                         tokens::layout::PROJECT_CHIP_WIDTH,
@@ -1201,13 +1188,13 @@ impl DesktopApp {
         }
         let mut parts: Vec<KeyedView> = vec![KeyedView::new(
             "head",
-            m3::text("Review digest", tokens::text::SMALL_TITLE)
+            controls::text("Review digest", tokens::text::SMALL_TITLE)
                 .automation_heading_level(AutomationHeadingLevel::Level3),
         )];
         if chips.is_empty() {
             parts.push(KeyedView::new(
                 "none",
-                m3::secondary("Nothing stands out in this patch."),
+                controls::secondary("Nothing stands out in this patch."),
             ));
         } else {
             let per_row = if self.pane.wide || self.pane.full {
@@ -1225,7 +1212,7 @@ impl DesktopApp {
             if !entries.is_empty() {
                 parts.push(KeyedView::new(
                     format!("paths:{group:?}"),
-                    m3::body(
+                    controls::body(
                         entries
                             .iter()
                             .map(|entry| {
@@ -1254,9 +1241,9 @@ impl DesktopApp {
         }
         parts.push(KeyedView::new(
             "caption",
-            m3::secondary(caption).text_wrapping(TextWrapping::Wrap),
+            controls::secondary(caption).text_wrapping(TextWrapping::Wrap),
         ));
-        m3::card_high(palette)
+        controls::card()
             .padding(Thickness::xy(tokens::spacing::MD, tokens::spacing::INSET))
             .content(
                 StackPanel::new()
@@ -1268,7 +1255,7 @@ impl DesktopApp {
 
     /// Merge and check (`git.integrate`): the button, its question, the
     /// running state and the result card.
-    fn merge_view(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
+    fn merge_view(&self, context: &mut ViewContext<Self>) -> View {
         let open = self.selected_agent_id().unwrap_or_default();
         let request = self.merge_request();
         match &self.pane.changes.merge {
@@ -1283,26 +1270,26 @@ impl DesktopApp {
                         )
                     },
                 );
-                m3::card_high(palette)
+                controls::card()
                     .content(StackPanel::new().spacing(tokens::spacing::SM).children((
-                        m3::body(what).text_wrapping(TextWrapping::Wrap),
+                        controls::body(what).text_wrapping(TextWrapping::Wrap),
                         toolbar(
                             vec![],
                             vec![
                                 KeyedView::new(
                                     "cancel",
-                                    m3::text_button(palette)
+                                    controls::text_button()
                                         .automation_name("Cancel merge and check")
                                         .on_click(
                                             context.message(Message::Pane(PaneMsg::MergeAnswered(
                                                 false,
                                             ))),
                                         )
-                                        .content(m3::label("Cancel")),
+                                        .content(controls::label("Cancel")),
                                 ),
                                 KeyedView::new(
                                     "go",
-                                    m3::filled(palette)
+                                    controls::filled()
                                         .is_enabled(request.is_ok())
                                         .automation_name("Merge and check")
                                         .on_click(
@@ -1310,14 +1297,14 @@ impl DesktopApp {
                                                 true,
                                             ))),
                                         )
-                                        .content(m3::label("Merge and check")),
+                                        .content(controls::label("Merge and check")),
                                 ),
                             ],
                         ),
                     )))
                     .into()
             }
-            Merge::Running(agent) if *agent == open => m3::card_high(palette)
+            Merge::Running(agent) if *agent == open => controls::card()
                 .content(
                     StackPanel::new()
                         .orientation(Orientation::Horizontal)
@@ -1328,13 +1315,13 @@ impl DesktopApp {
                                 .width(tokens::layout::LOADER_SMALL)
                                 .height(tokens::layout::LOADER_SMALL)
                                 .vertical_alignment(VerticalAlignment::Center),
-                            m3::body("Merging and running the project check…"),
+                            controls::body("Merging and running the project check…"),
                         )),
                 )
                 .into(),
-            Merge::Done(agent, result) if *agent == open => merge_result(palette, result, context),
+            Merge::Done(agent, result) if *agent == open => merge_result(result, context),
             _ => {
-                let button = m3::tonal(palette)
+                let button = controls::tonal()
                     .is_enabled(request.is_ok())
                     .automation_name(match &request {
                         Ok(_) => "Merge and check…".to_owned(),
@@ -1350,8 +1337,8 @@ impl DesktopApp {
                                 0.0,
                             ))
                             .children((
-                                m3::small_icon(m3::glyph::MERGE),
-                                m3::text("Merge and check…", tokens::text::BUTTON)
+                                controls::small_icon(controls::glyph::MERGE),
+                                controls::text("Merge and check…", tokens::text::BUTTON)
                                     .vertical_alignment(VerticalAlignment::Center),
                             )),
                     );
@@ -1367,7 +1354,7 @@ impl DesktopApp {
     /// Agents (skeleton 5.5, component 49): this task's manager and its
     /// workers nested, each with its state, name, model, activity and
     /// +/-; Open, Stop Agent and Hand off. Native subagents are observed.
-    fn tree_view(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
+    fn tree_view(&self, context: &mut ViewContext<Self>) -> View {
         let tree = &self.monitor.data.tree;
         let root = self.tree_root();
         let mut items: Vec<KeyedView> = Vec::new();
@@ -1385,7 +1372,7 @@ impl DesktopApp {
             toolbar(
                 vec![KeyedView::new(
                     "count",
-                    m3::secondary(if current && tree.read {
+                    controls::secondary(if current && tree.read {
                         eliot_core::count_words(workers as u64, "worker", "workers")
                     } else {
                         String::new()
@@ -1394,10 +1381,10 @@ impl DesktopApp {
                 )],
                 vec![KeyedView::new(
                     "refresh",
-                    m3::icon_button(palette)
+                    controls::icon_button()
                         .automation_name("Refresh Agents")
                         .on_click(context.message(Message::Pane(PaneMsg::Refresh)))
-                        .content(m3::icon(m3::glyph::REFRESH))
+                        .content(controls::icon(controls::glyph::REFRESH))
                         .tooltip(
                             tree.read_at_ms
                                 .filter(|_| current)
@@ -1418,7 +1405,6 @@ impl DesktopApp {
             items.push(KeyedView::new(
                 "failed",
                 super::page_ui::read_failed(
-                    palette,
                     format!("Couldn't read this task's Agents: {error}"),
                     "Retry",
                     true,
@@ -1441,7 +1427,6 @@ impl DesktopApp {
                 selected.as_deref(),
                 one_line,
                 context,
-                palette,
                 &mut rows,
             );
         } else {
@@ -1459,7 +1444,6 @@ impl DesktopApp {
                     selected.as_deref(),
                     one_line,
                     context,
-                    palette,
                     &mut rows,
                 );
             }
@@ -1499,7 +1483,6 @@ impl DesktopApp {
         selected: Option<&str>,
         one_line: bool,
         context: &mut ViewContext<Self>,
-        palette: Palette,
         rows: &mut Vec<KeyedView>,
     ) {
         let tree = &self.monitor.data.tree;
@@ -1513,7 +1496,6 @@ impl DesktopApp {
         rows.push(KeyedView::new(
             format!("row:{}:{}:{folded}", row.id, entry.selected),
             tree_row(
-                palette,
                 &entry,
                 depth,
                 (!children.is_empty()).then_some(!folded),
@@ -1523,16 +1505,7 @@ impl DesktopApp {
         ));
         if !folded && depth < 6 {
             for child in children {
-                self.tree_rows(
-                    child,
-                    depth + 1,
-                    now,
-                    selected,
-                    one_line,
-                    context,
-                    palette,
-                    rows,
-                );
+                self.tree_rows(child, depth + 1, now, selected, one_line, context, rows);
             }
         }
     }
@@ -1540,7 +1513,7 @@ impl DesktopApp {
     /// Terminal (skeleton 5.6): the worktree with Open in Windows Terminal,
     /// and the Agent's processes, read-only. No embedded terminal until
     /// that dependency is decided (skeleton 9.3).
-    fn terminal_view(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
+    fn terminal_view(&self, context: &mut ViewContext<Self>) -> View {
         let terminal = &self.pane.terminal;
         let open = self.selected_agent_id();
         let mut items: Vec<KeyedView> = Vec::new();
@@ -1559,13 +1532,13 @@ impl DesktopApp {
                         .children((
                             Border::new()
                                 .vertical_alignment(VerticalAlignment::Center)
-                                .content(m3::muted_icon(m3::glyph::FOLDER)),
-                            m3::body(shown.clone())
+                                .content(controls::muted_icon(controls::glyph::FOLDER)),
+                            controls::body(shown.clone())
                                 .grid_column(1)
                                 .vertical_alignment(VerticalAlignment::Center)
                                 .text_trimming(TextTrimming::CharacterEllipsis)
                                 .is_text_selection_enabled(true),
-                            m3::tonal(palette)
+                            controls::tonal()
                                 .grid_column(2)
                                 .automation_name(format!("Open {shown} in Windows Terminal"))
                                 .on_click(context.message(Message::Pane(PaneMsg::OpenTerminal)))
@@ -1578,8 +1551,8 @@ impl DesktopApp {
                                             0.0,
                                         ))
                                         .children((
-                                            m3::small_icon(m3::glyph::TERMINAL),
-                                            m3::text(
+                                            controls::small_icon(controls::glyph::TERMINAL),
+                                            controls::text(
                                                 "Open in Windows Terminal",
                                                 tokens::text::BUTTON,
                                             )
@@ -1593,7 +1566,7 @@ impl DesktopApp {
         if let Some(note) = &terminal.note {
             items.push(KeyedView::new(
                 "note",
-                super::page_ui::error_line(palette, note.clone()),
+                super::page_ui::error_line(note.clone()),
             ));
         }
         items.push(KeyedView::new(
@@ -1601,17 +1574,17 @@ impl DesktopApp {
             toolbar(
                 vec![KeyedView::new(
                     "title",
-                    m3::text("Agent processes", tokens::text::SMALL_TITLE)
+                    controls::text("Agent processes", tokens::text::SMALL_TITLE)
                         .automation_heading_level(AutomationHeadingLevel::Level3)
                         .vertical_alignment(VerticalAlignment::Center),
                 )],
                 vec![KeyedView::new(
                     "refresh",
-                    m3::icon_button(palette)
+                    controls::icon_button()
                         .is_enabled(!terminal.reading)
                         .automation_name("Refresh Agent processes")
                         .on_click(context.message(Message::Pane(PaneMsg::Refresh)))
-                        .content(m3::icon(m3::glyph::REFRESH))
+                        .content(controls::icon(controls::glyph::REFRESH))
                         .tooltip("Refresh"),
                 )],
             ),
@@ -1622,7 +1595,6 @@ impl DesktopApp {
             Some(Err(error)) => items.push(KeyedView::new(
                 "failed",
                 super::page_ui::read_failed(
-                    palette,
                     format!("Couldn't read the processes: {error}"),
                     "Retry",
                     !terminal.reading,
@@ -1659,7 +1631,7 @@ impl DesktopApp {
                     .collect();
                 items.push(KeyedView::new(
                     "processes",
-                    m3::card_high(palette).content(
+                    controls::card().content(
                         StackPanel::new()
                             .spacing(tokens::spacing::XS)
                             .keyed_children(rows),
@@ -1686,10 +1658,9 @@ impl DesktopApp {
         title: &str,
         body: Vec<KeyedView>,
         context: &mut ViewContext<Self>,
-        palette: Palette,
     ) -> View {
         let open = self.pane.section_open(key);
-        let head = m3::row(palette, false)
+        let head = controls::row(false)
             .automation_name(format!(
                 "{title} ({})",
                 if open { "expanded" } else { "collapsed" }
@@ -1699,16 +1670,16 @@ impl DesktopApp {
                 Grid::new()
                     .columns([GridLength::STAR, GridLength::Auto])
                     .children((
-                        m3::text(title.to_owned(), tokens::text::SMALL_TITLE)
+                        controls::text(title.to_owned(), tokens::text::SMALL_TITLE)
                             .automation_heading_level(AutomationHeadingLevel::Level3)
                             .vertical_alignment(VerticalAlignment::Center),
                         Border::new()
                             .grid_column(1)
                             .vertical_alignment(VerticalAlignment::Center)
-                            .content(m3::muted_icon(if open {
-                                m3::glyph::CHEVRON_UP
+                            .content(controls::muted_icon(if open {
+                                controls::glyph::CHEVRON_UP
                             } else {
-                                m3::glyph::CHEVRON_DOWN
+                                controls::glyph::CHEVRON_DOWN
                             })),
                     )),
             );
@@ -1716,7 +1687,7 @@ impl DesktopApp {
         if open {
             parts.extend(body);
         }
-        m3::card_high(palette)
+        controls::card()
             .padding(Thickness::new(
                 tokens::spacing::SM,
                 tokens::spacing::XS,
@@ -1742,7 +1713,6 @@ impl DesktopApp {
         &self,
         goal: &eliot_core::api::GoalView,
         context: &mut ViewContext<Self>,
-        palette: Palette,
     ) -> Vec<KeyedView> {
         use eliot_core::api::GoalStatus;
         let busy = self.pane.goal_busy;
@@ -1750,11 +1720,11 @@ impl DesktopApp {
             |control: client::GoalControl, context: &mut ViewContext<Self>| -> KeyedView {
                 KeyedView::new(
                     control.label(),
-                    m3::text_button(palette)
+                    controls::text_button()
                         .is_enabled(!busy)
                         .automation_name(format!("{} goal", control.label()))
                         .on_click(context.message(Message::Pane(PaneMsg::Goal(control))))
-                        .content(m3::label(control.label())),
+                        .content(controls::label(control.label())),
                 )
             };
         let unavailable = |label: &str, why: &str| -> KeyedView {
@@ -1762,10 +1732,10 @@ impl DesktopApp {
                 label.to_owned(),
                 Border::new()
                     .content(
-                        m3::text_button(palette)
+                        controls::text_button()
                             .is_enabled(false)
                             .automation_name(format!("{label}: {why}"))
-                            .content(m3::label(label)),
+                            .content(controls::label(label)),
                     )
                     .tooltip(why),
             )
@@ -1792,7 +1762,7 @@ impl DesktopApp {
         if let Some(note) = &self.pane.goal_note {
             rows.push(KeyedView::new(
                 "note",
-                super::page_ui::error_line(palette, note.clone()),
+                super::page_ui::error_line(note.clone()),
             ));
         }
         rows
@@ -1879,7 +1849,6 @@ fn relative_path(root: &str, path: &str) -> String {
 /// {base}", with Partial when the read was cut. Counts the daemon does not
 /// give for a source are left out, never shown as zero.
 fn summary_line(
-    palette: Palette,
     source: Source,
     files: Option<usize>,
     lines: Option<(u64, u64)>,
@@ -1902,24 +1871,24 @@ fn summary_line(
             eliot_core::count_words(count as u64, "file", "files")
         ),
     };
-    parts.push(KeyedView::new("files", m3::secondary(files_words)));
+    parts.push(KeyedView::new("files", controls::secondary(files_words)));
     if source == Source::Branch
         && let Some((add, del)) = lines
     {
-        parts.push(KeyedView::new("lines", m3::diff_counts(add, del, false)));
+        parts.push(KeyedView::new("lines", controls::diff_counts(add, del)));
     }
     if let Some(ahead) = ahead {
         let base = base.map_or_else(String::new, |base| format!(" of {base}"));
         parts.push(KeyedView::new(
             "ahead",
-            m3::secondary(format!(
+            controls::secondary(format!(
                 "\u{b7} {} ahead{base}",
                 eliot_core::count_words(ahead, "commit", "commits")
             )),
         ));
     }
     if partial {
-        parts.push(KeyedView::new("partial", m3::badge(palette, "Partial")));
+        parts.push(KeyedView::new("partial", controls::badge("Partial")));
     }
     StackPanel::new()
         .orientation(Orientation::Horizontal)
@@ -1932,7 +1901,6 @@ fn summary_line(
 /// bright and the folder quiet, its state word; selected on the
 /// selection role.
 fn file_row(
-    palette: Palette,
     path: &str,
     state: &str,
     selected: bool,
@@ -1943,16 +1911,11 @@ fn file_row(
         None => ("", path),
     };
     let glyph = match state {
-        "Added" | "Untracked" => m3::glyph::NEW_FILE,
-        "Deleted" => m3::glyph::DELETE,
-        _ => m3::glyph::EDIT,
+        "Added" | "Untracked" => controls::glyph::NEW_FILE,
+        "Deleted" => controls::glyph::DELETE,
+        _ => controls::glyph::EDIT,
     };
-    let quiet = if selected {
-        palette.on_selected()
-    } else {
-        palette.muted()
-    };
-    m3::row(palette, selected)
+    controls::row(selected)
         .automation_name(format!(
             "{path}, {state}{}",
             if selected { ", selected" } else { "" }
@@ -1970,19 +1933,17 @@ fn file_row(
                 .children((
                     Border::new()
                         .vertical_alignment(VerticalAlignment::Center)
-                        .content(m3::small_icon(glyph)),
-                    m3::text(name.to_owned(), tokens::text::BUTTON)
+                        .content(controls::small_icon(glyph)),
+                    controls::text(name.to_owned(), tokens::text::BUTTON)
                         .grid_column(1)
                         .vertical_alignment(VerticalAlignment::Center)
                         .text_trimming(TextTrimming::CharacterEllipsis),
-                    m3::text(folder.to_owned(), tokens::text::BODY)
+                    controls::text(folder.to_owned(), tokens::text::BODY)
                         .grid_column(2)
-                        .foreground(quiet)
                         .vertical_alignment(VerticalAlignment::Center)
                         .text_trimming(TextTrimming::CharacterEllipsis),
-                    m3::text(state.to_owned(), tokens::text::CAPTION)
+                    controls::text(state.to_owned(), tokens::text::CAPTION)
                         .grid_column(3)
-                        .foreground(quiet)
                         .vertical_alignment(VerticalAlignment::Center),
                 )),
         )
@@ -1991,32 +1952,32 @@ fn file_row(
 
 /// The selected file: Open in editor and Copy path, and why its diff is
 /// not shown.
-fn selected_file(palette: Palette, path: &str, context: &mut ViewContext<DesktopApp>) -> View {
-    m3::card_high(palette)
+fn selected_file(path: &str, context: &mut ViewContext<DesktopApp>) -> View {
+    controls::card()
         .content(
             StackPanel::new().spacing(tokens::spacing::SM).children((
-                m3::body(path.to_owned())
+                controls::body(path.to_owned())
                     .text_trimming(TextTrimming::CharacterEllipsis)
                     .is_text_selection_enabled(true),
-                m3::secondary(
+                controls::secondary(
                     "Swarm cannot show this file's diff yet: the daemon gives the changed files and line totals, not the diff text.",
                 )
                 .text_wrapping(TextWrapping::Wrap),
                 toolbar(vec![
                     KeyedView::new(
                         "open",
-                        m3::outlined(palette)
+                        controls::outlined()
                             .automation_name(format!("Open {path} in its editor"))
                             .on_click(context.message(Message::Pane(PaneMsg::OpenFile(path.to_owned()))))
-                            .content(m3::icon_label(m3::glyph::EXTERNAL, "Open in editor"))
+                            .content(controls::icon_label(controls::glyph::EXTERNAL, "Open in editor"))
                             .tooltip("Open with its default app"),
                     ),
                     KeyedView::new(
                         "copy",
-                        m3::text_button(palette)
+                        controls::text_button()
                             .automation_name(format!("Copy the path {path}"))
                             .on_click(context.message(Message::Pane(PaneMsg::CopyPath(path.to_owned()))))
-                            .content(m3::icon_label(m3::glyph::COPY, "Copy path")),
+                            .content(controls::icon_label(controls::glyph::COPY, "Copy path")),
                     ),
                     ], vec![
                 ]),
@@ -2027,7 +1988,6 @@ fn selected_file(palette: Palette, path: &str, context: &mut ViewContext<Desktop
 /// Merge and check's result card: merged and checked, conflicting paths,
 /// a failed check, or why it did not run.
 fn merge_result(
-    palette: Palette,
     result: &Result<eliot_core::Command, String>,
     context: &mut ViewContext<DesktopApp>,
 ) -> View {
@@ -2101,26 +2061,26 @@ fn merge_result(
             },
         },
     };
-    let title_view = m3::text(title.clone(), tokens::text::SMALL_TITLE);
+    let title_view = controls::text(title.clone(), tokens::text::SMALL_TITLE);
     let title_view = if failed {
-        title_view.foreground(palette.attention())
+        title_view.foreground(ThemeBrush::SystemCritical)
     } else {
         title_view
     };
-    m3::card_high(palette)
+    controls::card()
         .content(
             StackPanel::new().spacing(tokens::spacing::XS).children((
                 Grid::new()
                     .columns([GridLength::STAR, GridLength::Auto])
                     .children((
                         title_view.vertical_alignment(VerticalAlignment::Center),
-                        m3::icon_button(palette)
+                        controls::icon_button()
                             .grid_column(1)
                             .automation_name("Dismiss the merge result")
                             .on_click(context.message(Message::Pane(PaneMsg::MergeDismissed)))
-                            .content(m3::icon(m3::glyph::CLOSE)),
+                            .content(controls::icon(controls::glyph::CLOSE)),
                     )),
-                m3::body(lines.join("\n"))
+                controls::body(lines.join("\n"))
                     .text_wrapping(TextWrapping::Wrap)
                     .is_text_selection_enabled(true)
                     .automation_name(format!("{title}: {}", lines.join(" "))),
@@ -2134,7 +2094,6 @@ fn merge_result(
 /// +/-), which opens its conversation, then Stop Agent and Hand off. In
 /// the Normal width the model and activity take a second line.
 fn tree_row(
-    palette: Palette,
     entry: &monitor_view::RowEntry,
     depth: usize,
     children: Option<bool>,
@@ -2146,21 +2105,20 @@ fn tree_row(
         .work
         .as_ref()
         .and_then(|work| work.insertions.zip(work.deletions))
-        .map(|(add, del)| m3::diff_counts(add, del, entry.selected));
+        .map(|(add, del)| controls::diff_counts(add, del));
     let mut name: Vec<KeyedView> = vec![
         KeyedView::new(
             "mark",
             Border::new()
                 .vertical_alignment(VerticalAlignment::Center)
                 .maybe_content(super::page_ui::agent_mark(
-                    palette,
                     row.state,
                     row.status_line.as_deref(),
                 )),
         ),
         KeyedView::new(
             "title",
-            m3::text(entry.title.clone(), tokens::text::BODY)
+            controls::text(entry.title.clone(), tokens::text::BODY)
                 .grid_column(1)
                 .vertical_alignment(VerticalAlignment::Center)
                 .text_trimming(TextTrimming::CharacterEllipsis),
@@ -2172,21 +2130,20 @@ fn tree_row(
             Border::new()
                 .grid_column(2)
                 .vertical_alignment(VerticalAlignment::Center)
-                .content(m3::badge(palette, "observed")),
+                .content(controls::badge("observed")),
         ));
     }
-    let model = m3::text(entry.model.clone(), tokens::text::CAPTION)
-        .foreground(palette.muted())
+    let model = controls::text(entry.model.clone(), tokens::text::CAPTION)
         .vertical_alignment(VerticalAlignment::Center)
         .text_trimming(TextTrimming::CharacterEllipsis);
-    let activity = m3::text(entry.activity.clone(), tokens::text::CAPTION)
-        .foreground(if entry.attention {
-            palette.waiting()
-        } else {
-            palette.muted()
-        })
+    let activity = controls::text(entry.activity.clone(), tokens::text::CAPTION)
         .vertical_alignment(VerticalAlignment::Center)
         .text_trimming(TextTrimming::CharacterEllipsis);
+    let activity = if entry.attention {
+        activity.foreground(ThemeBrush::AccentText)
+    } else {
+        activity
+    };
     let name_grid = Grid::new()
         .columns([GridLength::Auto, GridLength::STAR, GridLength::Auto])
         .column_spacing(tokens::spacing::SM)
@@ -2250,7 +2207,7 @@ fn tree_row(
     } else {
         tokens::height::TWO_LINE_ROW
     };
-    let button = m3::row(palette, entry.selected)
+    let button = controls::row(entry.selected)
         .grid_column(1)
         .height(height)
         .min_height(height)
@@ -2259,22 +2216,22 @@ fn tree_row(
         .content(content)
         .tooltip(words.clone());
     let chevron: Option<View> = children.map(|open| {
-        m3::icon_button(palette)
+        controls::icon_button()
             .automation_name(format!(
                 "{} the workers of {}",
                 if open { "Hide" } else { "Show" },
                 entry.title
             ))
             .on_click(context.message(Message::Pane(PaneMsg::TreeFold(row.id.clone()))))
-            .content(m3::small_icon(if open {
-                m3::glyph::CHEVRON_DOWN
+            .content(controls::small_icon(if open {
+                controls::glyph::CHEVRON_DOWN
             } else {
-                m3::glyph::CHEVRON_RIGHT
+                controls::glyph::CHEVRON_RIGHT
             }))
             .into()
     });
     let stop: Option<View> = entry.stop.map(|state| {
-        m3::icon_button(palette)
+        controls::icon_button()
             .is_enabled(state == monitor_view::StopButton::Ready)
             .automation_name(match state {
                 monitor_view::StopButton::Stopping => format!("Stopping {}", entry.title),
@@ -2284,20 +2241,20 @@ fn tree_row(
                 row.id.clone(),
                 row.generation,
             ))))
-            .content(m3::icon(m3::glyph::STOP_CIRCLE))
+            .content(controls::icon(controls::glyph::STOP_CIRCLE))
             .tooltip("Stop Agent")
     });
     let handoff: Option<View> = if entry.observed {
         None
     } else {
         Some(
-            m3::icon_button(palette)
+            controls::icon_button()
                 .automation_name(format!("Hand off {}", entry.title))
                 .on_click(context.message(Message::Pane(PaneMsg::TreeHandoff(
                     row.id.clone(),
                     row.generation,
                 ))))
-                .content(m3::icon(m3::glyph::FORWARD))
+                .content(controls::icon(controls::glyph::FORWARD))
                 .tooltip("Hand off or switch model"),
         )
     };

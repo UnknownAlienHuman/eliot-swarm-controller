@@ -1,13 +1,11 @@
 //! The pages in the main card (`screens.css` `.page`, the canvas boards
 //! Project, Inbox, Agents, Automations and Settings): one centred column
-//! with the page padding, a `headline-medium` title row, `title-small`
-//! section headings, panels on `surface-container-low` with an
-//! `outline-variant` hairline, key-value lines, stats and filter chips.
-//! Sizes and type come from [`tokens::page`]; colors from the theme's
-//! roles. The pages share these pieces, so a board's part is drawn once.
+//! with the page padding, a title row, section headings, panels with a
+//! hairline, key-value lines, stats and filter chips.
+//! Sizes and type come from [`tokens::page`]; colors from WinUI's control
+//! styles. The pages share these pieces, so a board's part is drawn once.
 
 use super::*;
-use crate::theme::winui::Palette;
 use eliot_core::AgentState;
 
 /// Where a page leads, for the sidebar's places and Back/Forward.
@@ -53,9 +51,9 @@ pub(super) fn page(name: &str, width: Option<f64>, items: Vec<KeyedView>) -> Vie
         .into()
 }
 
-/// A page's title (`headline-medium`).
+/// A page's title.
 pub(super) fn title(value: impl Into<String>) -> TextBlock {
-    m3::text(value, tokens::page::TITLE)
+    controls::text(value, tokens::page::TITLE)
         .automation_heading_level(AutomationHeadingLevel::Level1)
         .vertical_alignment(VerticalAlignment::Center)
         .text_trimming(TextTrimming::CharacterEllipsis)
@@ -81,10 +79,9 @@ pub(super) fn toolbar(lead: impl Into<View>, actions: Vec<KeyedView>) -> View {
         .into()
 }
 
-/// A section heading on a page or in a panel (`title-small`, the variant
-/// tone).
+/// A section heading on a page or in a panel.
 pub(super) fn heading(value: impl Into<String>) -> TextBlock {
-    m3::muted(value, tokens::page::HEADING)
+    controls::text(value, tokens::page::HEADING)
         .automation_heading_level(AutomationHeadingLevel::Level2)
         .vertical_alignment(VerticalAlignment::Center)
 }
@@ -96,13 +93,12 @@ pub(super) fn group_heading(value: impl Into<String>) -> View {
         .into()
 }
 
-/// A panel (`.panel`): `surface-container-low`, an `outline-variant`
-/// hairline, the medium corner, 12/16 inside, its parts 8 DIPs apart
+/// A panel (`.panel`): a hairline, the medium corner, 12/16 inside, its parts 8 DIPs apart
 /// (`gap` overrides it).
-pub(super) fn panel(palette: Palette, gap: f64, children: Vec<KeyedView>) -> View {
+pub(super) fn panel(gap: f64, children: Vec<KeyedView>) -> View {
     Border::new()
-        .background(palette.tonal())
-        .border_brush(palette.outline())
+        .background(ThemeBrush::CardBackground)
+        .border_brush(ThemeBrush::CardStroke)
         .border_thickness(Thickness::uniform(tokens::layout::HAIRLINE))
         .corner_radius(tokens::radius::CONTAINER)
         .padding(Thickness::xy(
@@ -132,7 +128,7 @@ pub(super) fn panel_head(value: &str, action: Option<View>) -> View {
         .into()
 }
 
-/// A key-value line (`.kv`): the key in the variant tone in its column,
+/// A key-value line (`.kv`): the key muted in its column,
 /// the value after it.
 pub(super) fn kv(key: &str, value: impl Into<View>) -> View {
     Grid::new()
@@ -142,7 +138,7 @@ pub(super) fn kv(key: &str, value: impl Into<View>) -> View {
         ])
         .column_spacing(tokens::spacing::SM)
         .children((
-            m3::muted(key.to_owned(), tokens::text::BODY),
+            controls::text(key.to_owned(), tokens::text::BODY),
             Border::new().grid_column(1).content(value),
         ))
         .into()
@@ -152,7 +148,7 @@ pub(super) fn kv(key: &str, value: impl Into<View>) -> View {
 pub(super) fn kv_text(key: &str, value: impl Into<String>) -> View {
     kv(
         key,
-        m3::body(value)
+        controls::body(value)
             .text_wrapping(TextWrapping::Wrap)
             .is_text_selection_enabled(true),
     )
@@ -165,8 +161,8 @@ pub(super) fn stat(value: impl Into<String>, label: &str, tip: Option<String>) -
     let body = StackPanel::new()
         .automation_name(format!("{label}: {value}"))
         .children((
-            m3::text(value, tokens::page::STAT),
-            m3::secondary(label.to_owned()).text_wrapping(TextWrapping::Wrap),
+            controls::text(value, tokens::page::STAT),
+            controls::secondary(label.to_owned()).text_wrapping(TextWrapping::Wrap),
         ));
     match tip {
         Some(tip) => body.tooltip(tip),
@@ -175,12 +171,8 @@ pub(super) fn stat(value: impl Into<String>, label: &str, tip: Option<String>) -
 }
 
 /// A stat in its own panel (the Agents summary).
-pub(super) fn stat_panel(palette: Palette, stat: View) -> View {
-    panel(
-        palette,
-        tokens::spacing::SM,
-        vec![KeyedView::new("stat", stat)],
-    )
+pub(super) fn stat_panel(stat: View) -> View {
+    panel(tokens::spacing::SM, vec![KeyedView::new("stat", stat)])
 }
 
 /// Equal columns of `views`, 16 DIPs apart (`.grid3`, `.grid4`).
@@ -225,9 +217,8 @@ pub(super) fn columns(left: Vec<KeyedView>, left_gap: f64, right: Vec<KeyedView>
 }
 
 /// A filter chip with its count (`.chip`, "Working 3"): selected, it
-/// fills with `secondary-container` and shows the check.
+/// fills with the accent and shows the check.
 pub(super) fn filter_chip(
-    palette: Palette,
     label: &str,
     count: Option<usize>,
     selected: bool,
@@ -237,16 +228,15 @@ pub(super) fn filter_chip(
         Some(count) => format!("{label} {count}"),
         None => label.to_owned(),
     };
-    let glyph = selected.then_some(m3::glyph::CHECK);
-    m3::chip(palette)
-        .resource_overrides(selected_chip(palette, selected))
+    let glyph = selected.then_some(controls::glyph::CHECK);
+    controls::segment(selected)
         .automation_name(if selected {
             format!("{text} (shown)")
         } else {
             format!("Show {text}")
         })
         .on_click(on_click)
-        .content(m3::chip_content(
+        .content(controls::chip_content(
             glyph,
             &text,
             false,
@@ -287,20 +277,9 @@ pub(super) fn chip_rows(chips: Vec<KeyedView>, per_row: usize) -> View {
         .into()
 }
 
-/// An age or count at a row's end (`.age`, `label-small`, the variant
-/// tone).
+/// An age or count at a row's end (`.age`, muted).
 pub(super) fn age(value: impl Into<String>) -> TextBlock {
-    m3::muted(value, tokens::page::AGE).vertical_alignment(VerticalAlignment::Center)
-}
-
-/// A chip's colors: selected, `secondary-container` without the outline;
-/// at rest, the outlined chip.
-pub(super) fn selected_chip(palette: Palette, selected: bool) -> ResourceOverrides {
-    if selected {
-        palette.segment(true)
-    } else {
-        palette.chip()
-    }
+    controls::text(value, tokens::page::AGE).vertical_alignment(VerticalAlignment::Center)
 }
 
 /// Whether an Agent's status line says its provider holds it (the
@@ -313,48 +292,47 @@ pub(crate) fn held(status_line: Option<&str>) -> bool {
 
 /// An Agent's mark in a page row: a provider hold waits (the waiting dot),
 /// else its state's mark ([`state_mark`]).
-pub(crate) fn agent_mark(
-    palette: Palette,
-    state: AgentState,
-    status_line: Option<&str>,
-) -> Option<View> {
+pub(crate) fn agent_mark(state: AgentState, status_line: Option<&str>) -> Option<View> {
     if held(status_line) {
-        Some(m3::row_mark(palette, m3::RowMark::Waiting, "Provider hold"))
+        Some(controls::row_mark(
+            controls::RowMark::Waiting,
+            "Provider hold",
+        ))
     } else {
-        state_mark(palette, state)
+        state_mark(state)
     }
 }
 
-/// An Agent's state mark in a page row (brand book, Color, status in
-/// rows), the sidebar's marks: the loader while it works, the waiting and
-/// idle dots, the error icon, none when stopped.
-pub(crate) fn state_mark(palette: Palette, state: AgentState) -> Option<View> {
+/// An Agent's state mark in a page row, the sidebar's marks: the loader
+/// while it works, the waiting and idle dots, the error icon, none when
+/// stopped.
+pub(crate) fn state_mark(state: AgentState) -> Option<View> {
     let (mark, word) = match state {
         AgentState::Created | AgentState::Starting | AgentState::Busy => {
-            (Some(m3::RowMark::Working), "Working")
+            (Some(controls::RowMark::Working), "Working")
         }
-        AgentState::Waiting => (Some(m3::RowMark::Waiting), "Waiting for you"),
-        AgentState::Idle => (Some(m3::RowMark::Idle), "Ready"),
-        AgentState::Failed => (Some(m3::RowMark::Failed), "Failed"),
-        AgentState::Lost => (Some(m3::RowMark::Failed), "Lost"),
-        AgentState::Unknown => (Some(m3::RowMark::Failed), "Unknown"),
+        AgentState::Waiting => (Some(controls::RowMark::Waiting), "Waiting for you"),
+        AgentState::Idle => (Some(controls::RowMark::Idle), "Ready"),
+        AgentState::Failed => (Some(controls::RowMark::Failed), "Failed"),
+        AgentState::Lost => (Some(controls::RowMark::Failed), "Lost"),
+        AgentState::Unknown => (Some(controls::RowMark::Failed), "Unknown"),
         AgentState::Stopped => (None, "Stopped"),
     };
-    mark.map(|mark| m3::row_mark(palette, mark, word))
+    mark.map(|mark| controls::row_mark(mark, word))
 }
 
-/// A row's text (`.item .tx`): the title in `title-small` and one
-/// supporting line in `body-small`, both trimmed to the row.
+/// A row's text (`.item .tx`): the title and one supporting line, both
+/// trimmed to the row.
 pub(super) fn two_lines(title: &str, line: &str) -> View {
     let mut parts: Vec<KeyedView> = vec![KeyedView::new(
         "title",
-        m3::text(title.to_owned(), tokens::page::HEADING)
+        controls::text(title.to_owned(), tokens::page::HEADING)
             .text_trimming(TextTrimming::CharacterEllipsis),
     )];
     if !line.is_empty() {
         parts.push(KeyedView::new(
             "line",
-            m3::secondary(line.to_owned()).text_trimming(TextTrimming::CharacterEllipsis),
+            controls::secondary(line.to_owned()).text_trimming(TextTrimming::CharacterEllipsis),
         ));
     }
     StackPanel::new()
@@ -364,9 +342,9 @@ pub(super) fn two_lines(title: &str, line: &str) -> View {
 }
 
 /// A line of text in the error color (a failed read, a refusal).
-pub(super) fn error_line(palette: Palette, value: impl Into<String>) -> View {
-    m3::text(value, tokens::text::CAPTION)
-        .foreground(palette.attention())
+pub(super) fn error_line(value: impl Into<String>) -> View {
+    controls::text(value, tokens::text::CAPTION)
+        .foreground(ThemeBrush::SystemCritical)
         .text_wrapping(TextWrapping::Wrap)
         .is_text_selection_enabled(true)
         .into()
@@ -374,7 +352,6 @@ pub(super) fn error_line(palette: Palette, value: impl Into<String>) -> View {
 
 /// A failed read with its retry (`Retry`, `Read again`).
 pub(super) fn read_failed(
-    palette: Palette,
     text: impl Into<String>,
     retry: &str,
     enabled: bool,
@@ -384,43 +361,42 @@ pub(super) fn read_failed(
     StackPanel::new()
         .spacing(tokens::spacing::XS)
         .children((
-            error_line(palette, text),
-            m3::outlined(palette)
+            error_line(text),
+            controls::outlined()
                 .horizontal_alignment(HorizontalAlignment::Left)
                 .is_enabled(enabled)
                 .automation_name(retry)
                 .on_click(on_click)
-                .content(m3::label(retry)),
+                .content(controls::label(retry)),
         ))
         .into()
 }
 
-/// A page's empty state or reading line: one sentence in the variant
-/// tone.
+/// A page's empty state or reading line: one muted sentence.
 pub(super) fn quiet(value: impl Into<String>) -> View {
-    m3::secondary(value)
+    controls::secondary(value)
         .text_wrapping(TextWrapping::Wrap)
         .into()
 }
 
 /// A segmented choice (`.group`: By state / By project, 24 hours /
 /// 7 days): one segment per label, the selected one filled.
-pub(super) fn choice(palette: Palette, labels: &[(&str, bool, Callback<()>)]) -> View {
+pub(super) fn choice(labels: &[(&str, bool, Callback<()>)]) -> View {
     let segments: Vec<KeyedView> = labels
         .iter()
         .map(|(label, selected, click)| {
             KeyedView::new(
                 format!("{label}:{selected}"),
-                m3::segment(palette, *selected)
+                controls::segment(*selected)
                     .automation_name(if *selected {
                         format!("{label} (chosen)")
                     } else {
                         (*label).to_owned()
                     })
                     .on_click(click.clone())
-                    .content(m3::segment_label(label)),
+                    .content(controls::segment_label(label)),
             )
         })
         .collect();
-    m3::segmented(palette, segments)
+    controls::segmented(segments)
 }

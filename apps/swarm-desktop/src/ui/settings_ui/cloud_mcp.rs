@@ -1,7 +1,7 @@
 use super::*;
 
 impl DesktopApp {
-    pub(super) fn cloud_section(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
+    pub(super) fn cloud_section(&self, context: &mut ViewContext<Self>) -> View {
         let enabled = model::cloud_enabled(&self.settings.cloud);
         // An on/off setting is a switch (as General's), keyed by state.
         let switch = Grid::new().keyed_children(vec![KeyedView::new(
@@ -15,7 +15,7 @@ impl DesktopApp {
         )]);
         let mut rows: Vec<KeyedView> = vec![KeyedView::new(
             "enabled",
-            m3::setting_row(
+            controls::setting_row(
                 "Cloud MCP",
                 "Serve Swarm's MCP endpoint through a Cloudflare tunnel behind Cloudflare Access. The daemon applies a change at its next start.",
                 View::from(switch),
@@ -29,9 +29,9 @@ impl DesktopApp {
                     .map(|(index, (key, label))| {
                         KeyedView::new(
                             *key,
-                            m3::form_row(
+                            controls::form_row(
                                 label,
-                                m3::field()
+                                controls::field()
                                     .text(model::cloud_field(&self.settings.cloud, key))
                                     .automation_name(*label)
                                     .on_text_changed(crate::views::text_edits(context.callback(
@@ -46,6 +46,6 @@ impl DesktopApp {
                     }),
             );
         }
-        m3::settings_card(palette, rows)
+        controls::settings_card(rows)
     }
 }

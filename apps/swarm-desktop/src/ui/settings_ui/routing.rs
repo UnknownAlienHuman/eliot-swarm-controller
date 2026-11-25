@@ -1,14 +1,10 @@
 use super::*;
 
 impl DesktopApp {
-    pub(super) fn routing_section(
-        &self,
-        context: &mut ViewContext<Self>,
-        palette: Palette,
-    ) -> View {
+    pub(super) fn routing_section(&self, context: &mut ViewContext<Self>) -> View {
         let mut groups: Vec<KeyedView> = vec![KeyedView::new(
             "intro",
-            m3::secondary(
+            controls::secondary(
                 "When a task starts on Auto, Swarm tries the role's profiles in order and runs the first one that is installed, not on hold, not out of quota and within capacity. The choice and the skipped profiles are recorded on the task.",
             )
             .text_wrapping(TextWrapping::Wrap),
@@ -31,7 +27,7 @@ impl DesktopApp {
             .join("\n");
             groups.push(KeyedView::new(
                 format!("now:{now}"),
-                m3::body(now)
+                controls::body(now)
                     .automation_name("What Auto picks now")
                     .text_wrapping(TextWrapping::Wrap),
             ));
@@ -59,26 +55,26 @@ impl DesktopApp {
                 let buttons = StackPanel::new()
                     .orientation(Orientation::Horizontal)
                     .children((
-                        m3::icon_button(palette)
+                        controls::icon_button()
                             .is_enabled(!first)
                             .automation_name(format!("Move {name} earlier in {role}"))
                             .on_click(context.message(Message::Settings(
                                 SettingsMsg::RoutingMoved(role.clone(), index, true),
                             )))
-                            .content(m3::icon(m3::glyph::ARROW_UP)),
-                        m3::icon_button(palette)
+                            .content(controls::icon(controls::glyph::ARROW_UP)),
+                        controls::icon_button()
                             .is_enabled(!last)
                             .automation_name(format!("Move {name} later in {role}"))
                             .on_click(context.message(Message::Settings(
                                 SettingsMsg::RoutingMoved(role.clone(), index, false),
                             )))
-                            .content(m3::icon(m3::glyph::ARROW_DOWN)),
-                        m3::icon_button(palette)
+                            .content(controls::icon(controls::glyph::ARROW_DOWN)),
+                        controls::icon_button()
                             .automation_name(format!("Remove {name} from {role}"))
                             .on_click(context.message(Message::Settings(
                                 SettingsMsg::RoutingRemoved(role.clone(), index),
                             )))
-                            .content(m3::icon(m3::glyph::CLOSE)),
+                            .content(controls::icon(controls::glyph::CLOSE)),
                     ));
                 rows.push(KeyedView::new(
                     format!("{role}:{index}:{name}:{first}:{last}"),
@@ -95,7 +91,7 @@ impl DesktopApp {
                         .min_height(tokens::height::FORM_ROW)
                         .keyed_children(vec![KeyedView::new(
                             key,
-                            m3::enum_width(ComboBox::new())
+                            controls::enum_width(ComboBox::new())
                                 .items_source(addable)
                                 .selected_index(None)
                                 .placeholder_text("Add a profile")
@@ -113,40 +109,37 @@ impl DesktopApp {
             groups.push(KeyedView::new(
                 format!("role:{role}"),
                 StackPanel::new().spacing(tokens::spacing::SM).children((
-                    m3::section_heading(headline, supporting, None),
-                    m3::settings_card(palette, rows),
+                    controls::section_heading(headline, supporting, None),
+                    controls::settings_card(rows),
                 )),
             ));
         }
         groups.push(KeyedView::new(
             "new-role",
-            m3::settings_card(
-                palette,
-                vec![KeyedView::new(
-                    "new-role",
-                    m3::form_row(
-                        "Another role",
-                        m3::field()
-                            .text(self.settings.new_role.clone())
-                            .placeholder_text("Role name, for example review")
-                            .automation_name("New role name")
-                            .on_text_changed(crate::views::text_edits(context.callback(|text| {
+            controls::settings_card(vec![KeyedView::new(
+                "new-role",
+                controls::form_row(
+                    "Another role",
+                    controls::field()
+                        .text(self.settings.new_role.clone())
+                        .placeholder_text("Role name, for example review")
+                        .automation_name("New role name")
+                        .on_text_changed(crate::views::text_edits(
+                            context.callback(|text| {
                                 Message::Settings(SettingsMsg::NewRoleChanged(text))
-                            })))
+                            }),
+                        ))
+                        .into(),
+                    Some(
+                        controls::outlined()
+                            .is_enabled(!self.settings.new_role.trim().is_empty())
+                            .automation_name("Add role")
+                            .on_click(context.message(Message::Settings(SettingsMsg::RoleAdded)))
+                            .content(controls::label("Add role"))
                             .into(),
-                        Some(
-                            m3::outlined(palette)
-                                .is_enabled(!self.settings.new_role.trim().is_empty())
-                                .automation_name("Add role")
-                                .on_click(
-                                    context.message(Message::Settings(SettingsMsg::RoleAdded)),
-                                )
-                                .content(m3::label("Add role"))
-                                .into(),
-                        ),
                     ),
-                )],
-            ),
+                ),
+            )]),
         ));
         StackPanel::new()
             .spacing(tokens::spacing::MD)
@@ -166,8 +159,8 @@ fn candidate_row(place: usize, name: &str, buttons: View) -> View {
             GridLength::Auto,
         ])
         .children((
-            m3::secondary(format!("{place}")).vertical_alignment(VerticalAlignment::Center),
-            m3::body(name.to_owned())
+            controls::secondary(format!("{place}")).vertical_alignment(VerticalAlignment::Center),
+            controls::body(name.to_owned())
                 .grid_column(1)
                 .vertical_alignment(VerticalAlignment::Center)
                 .text_trimming(TextTrimming::CharacterEllipsis),

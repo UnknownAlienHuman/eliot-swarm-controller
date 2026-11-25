@@ -1,5 +1,5 @@
 //! Glue for the Hand off / Switch dialog: its messages, background reads and
-//! submissions, and the shared M3 dialog view. The rules (send selection,
+//! submissions, and the shared dialog view. The rules (send selection,
 //! result facts, gate meanings, when "finish" applies) live in
 //! [`crate::handoff`].
 //!
@@ -679,7 +679,6 @@ impl DesktopApp {
     ///
     pub(super) fn handoff_dialog(&self, context: &mut ViewContext<Self>) -> Option<ContentDialog> {
         let state = &self.handoff;
-        let palette = self.palette();
         if !state.open {
             return None;
         }
@@ -698,12 +697,7 @@ impl DesktopApp {
         let mut sections: Vec<KeyedView> = Vec::new();
         let mut push = |key: &str, view: View| sections.push(KeyedView::new(key.to_owned(), view));
         if state.outcome.is_none() {
-            push(
-                "status",
-                small(state.status.clone())
-                    .foreground(palette.muted())
-                    .into(),
-            );
+            push("status", small(state.status.clone()).into());
         }
 
         let models = self.handoff_models();
@@ -726,7 +720,6 @@ impl DesktopApp {
             push(
                 "lead",
                 small("A brief from the original task goes to the destination. Claims, workers and the goal move with the work.")
-                    .foreground(palette.muted())
                     .into(),
             );
             let targets = self.handoff_targets();
@@ -762,15 +755,7 @@ impl DesktopApp {
                 };
                 push(
                     &format!("group-{index}:{on}"),
-                    option_row(
-                        title,
-                        supporting,
-                        on,
-                        can_act && available,
-                        index,
-                        context,
-                        palette,
-                    ),
+                    option_row(title, supporting, on, can_act && available, index, context),
                 );
                 if !on {
                     continue;
@@ -843,7 +828,7 @@ impl DesktopApp {
             let labelled = |label: &str, control: View| -> View {
                 StackPanel::new()
                     .spacing(tokens::spacing::XS)
-                    .children((small(label.to_owned()).foreground(palette.muted()), control))
+                    .children((small(label.to_owned()), control))
                     .into()
             };
             // The effort steps as segments (the effort popover's control):
@@ -865,7 +850,7 @@ impl DesktopApp {
                         let selected = state.effort == Some(index);
                         KeyedView::new(
                             format!("{index}:{effort}:{selected}"),
-                            m3::segment(palette, selected)
+                            controls::segment(selected)
                                 .is_enabled(can_act && harness.is_some())
                                 .automation_name(format!(
                                     "Ad-hoc effort: {name}{}",
@@ -874,7 +859,7 @@ impl DesktopApp {
                                 .on_click(context.message(Message::Handoff(
                                     HandoffMsg::EffortPicked(Some(index)),
                                 )))
-                                .content(m3::segment_label(label)),
+                                .content(controls::segment_label(label)),
                         )
                     })
                     .collect();
@@ -929,7 +914,7 @@ impl DesktopApp {
                     ),
                     KeyedView::new(
                         format!("effort:{}", efforts.join("\u{1f}")),
-                        labelled("Effort", m3::segmented(palette, effort_segments)),
+                        labelled("Effort", controls::segmented(effort_segments)),
                     ),
                 ])
                 .into();
@@ -952,7 +937,6 @@ impl DesktopApp {
                 push(
                     "catalog",
                     small(catalog_line)
-                        .foreground(palette.muted())
                         .margin(Thickness::new(RADIO_INDENT, 0.0, 0.0, 0.0))
                         .into(),
                 );
@@ -987,7 +971,6 @@ impl DesktopApp {
                 push(
                 "no-sends",
                 small("None are waiting in this run: the transfer carries context, claims, Goal and children only.")
-                    .foreground(palette.muted())
                     .into(),
             );
             } else {
@@ -998,7 +981,6 @@ impl DesktopApp {
                         eliot_core::api::MAX_HANDOFF_SENDS,
                         state.from
                     ))
-                    .foreground(palette.muted())
                     .into(),
                 );
             }
@@ -1038,7 +1020,7 @@ impl DesktopApp {
                         context.callback(|open| Message::Handoff(HandoffMsg::DetailsToggled(open))),
                     )
                     .header(small("Readback details (ids)"))
-                    .content(small(lines.join("\n")).foreground(palette.muted()))
+                    .content(small(lines.join("\n")))
                     .into(),
             );
         }
@@ -1071,11 +1053,11 @@ impl DesktopApp {
                 let mut add = |key: String, label: String, message: HandoffMsg| {
                     owner.push(KeyedView::new(
                         key,
-                        m3::text_button(palette)
+                        controls::text_button()
                             .is_enabled(!self.submitting())
                             .automation_name(label.clone())
                             .on_click(context.message(Message::Handoff(message)))
-                            .content(m3::label(&label)),
+                            .content(controls::label(&label)),
                     ));
                 };
                 if is_brief && child.state == CommandState::Unknown {
@@ -1109,7 +1091,7 @@ impl DesktopApp {
             if !owner.is_empty() {
                 push(
                     "reason",
-                    m3::field()
+                    controls::field()
                         .text(state.reason.clone())
                         .placeholder_text("Reason for an Owner assertion (required)")
                         .automation_name("Owner reason")
@@ -1174,45 +1156,49 @@ impl DesktopApp {
         let primary: Option<View> = match primary_message {
             _ if primary_label.is_empty() => None,
             Some(message) => Some(
-                m3::filled(palette)
+                controls::filled()
                     .element_ref(&self.dialog.primary)
                     .is_enabled(primary_enabled)
                     .on_click(context.message(Message::Handoff(message)))
                     .automation_name(primary_label.clone())
-                    .content(m3::text(primary_label, tokens::text::EMPHASIZED).margin(
-                        Thickness::xy(tokens::spacing::MD - tokens::spacing::ROW, 0.0),
-                    ))
+                    .content(
+                        controls::text(primary_label, tokens::text::EMPHASIZED).margin(
+                            Thickness::xy(tokens::spacing::MD - tokens::spacing::ROW, 0.0),
+                        ),
+                    )
                     .into(),
             ),
             None => Some(
-                m3::filled(palette)
+                controls::filled()
                     .is_enabled(false)
                     .automation_name(primary_label.clone())
-                    .content(m3::text(primary_label, tokens::text::EMPHASIZED).margin(
-                        Thickness::xy(tokens::spacing::MD - tokens::spacing::ROW, 0.0),
-                    ))
+                    .content(
+                        controls::text(primary_label, tokens::text::EMPHASIZED).margin(
+                            Thickness::xy(tokens::spacing::MD - tokens::spacing::ROW, 0.0),
+                        ),
+                    )
                     .into(),
             ),
         };
-        // The same Cancel/Close then primary order as every M3 dialog.
+        // The same Cancel/Close then primary order as every dialog.
         let close_label = if state.outcome.is_some() {
             "Close"
         } else {
             "Cancel"
         };
-        let close = m3::text_button(palette)
+        let close = controls::text_button()
             .element_ref(&self.dialog.close)
             .automation_name(close_label)
             .on_click(context.message(Message::Handoff(HandoffMsg::Closed)))
-            .content(m3::label(close_label));
-        // Definite refusals use the shared window palette's error role.
+            .content(controls::label(close_label));
+        // Definite refusals use the shared error styling.
         let summary = self.handoff_summary(harness, model, effort);
         let summary: View = match &state.refusal {
             Some(refusal) => StackPanel::new()
                 .spacing(tokens::spacing::XS)
                 .vertical_alignment(VerticalAlignment::Center)
                 .children((
-                    small(refusal.clone()).foreground(palette.attention()),
+                    small(refusal.clone()).foreground(ThemeBrush::SystemCritical),
                     small(summary),
                 ))
                 .into(),
@@ -1234,7 +1220,6 @@ impl DesktopApp {
         Some(super::dialog_ui::surface(
             context,
             self.dialog.epoch,
-            palette,
             "Hand off or switch model".to_owned(),
             StackPanel::new()
                 .spacing(tokens::spacing::XS)
@@ -1322,7 +1307,7 @@ impl DesktopApp {
 }
 
 /// One kind of destination (`.opt-row`): its radio, its title over one
-/// supporting line beside it; the chosen one on `secondary-container`.
+/// supporting line beside it; the chosen one is highlighted.
 fn option_row(
     title: &str,
     supporting: &str,
@@ -1330,11 +1315,10 @@ fn option_row(
     enabled: bool,
     group: u8,
     context: &mut ViewContext<DesktopApp>,
-    palette: crate::theme::winui::Palette,
 ) -> View {
     Border::new()
         .background(if on {
-            palette.selected()
+            Brush::Theme(ThemeBrush::CardBackground)
         } else {
             Brush::Solid(Color::transparent())
         })
@@ -1368,12 +1352,9 @@ fn option_row(
                         .grid_column(1)
                         .vertical_alignment(VerticalAlignment::Center)
                         .children((
-                            m3::body(title.to_owned()).foreground(if on {
-                                palette.on_selected()
-                            } else {
-                                palette.text()
-                            }),
-                            m3::secondary(supporting.to_owned()).text_wrapping(TextWrapping::Wrap),
+                            controls::body(title.to_owned()),
+                            controls::secondary(supporting.to_owned())
+                                .text_wrapping(TextWrapping::Wrap),
                         )),
                 )),
         )
@@ -1431,11 +1412,16 @@ fn child_preview(command: &Command) -> String {
 const RADIO_INDENT: f64 = tokens::icon::ROW + tokens::spacing::SM;
 
 fn heading(text: &str) -> TextBlock {
-    m3::section_title(text.to_owned()).margin(Thickness::new(0.0, tokens::spacing::SM, 0.0, 0.0))
+    controls::section_title(text.to_owned()).margin(Thickness::new(
+        0.0,
+        tokens::spacing::SM,
+        0.0,
+        0.0,
+    ))
 }
 
 fn small(text: impl Into<String>) -> TextBlock {
-    m3::body(text)
+    controls::body(text)
         .text_wrapping(TextWrapping::Wrap)
         .is_text_selection_enabled(true)
 }

@@ -1208,6 +1208,12 @@ of the explicitly selected release scope.
   - [ ] **M1 Fluent foundation.** Remove the global M3 overrides; native
     themes, shell and sidebar, title bar, one set of app layout constants;
     System, Light, Dark and Contrast work.
+    - [x] **M1a Global Material layer removed.** No M3 colors, shapes,
+      implicit styles, templates, fonts, ripple, shadows or palette engine;
+      stock controls in their own states, the system UI font, Segoe Fluent
+      Icons, System/Light/Dark through Reactor's window theme with legacy
+      palettes read as Light or Dark, and Reactor theme brushes for the few
+      accent or critical marks. The shell layout is M1b.
   - [ ] **M2 Main working path.** Home, conversation, composer, decisions,
     native menus and long history: launch, read, send, steer, stop and decide
     with draft, focus and scroll kept.

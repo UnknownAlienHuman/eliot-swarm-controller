@@ -22,8 +22,6 @@ mod transcript;
 use super::move_ui;
 use super::*;
 use crate::chat::InputFailure;
-use crate::theme::StatusTone;
-use crate::theme::winui::Palette;
 use transcript::starting_view;
 
 #[derive(Clone, Debug)]
@@ -1586,7 +1584,6 @@ impl DesktopApp {
         alert: Option<View>,
         composer: View,
         context: &mut ViewContext<Self>,
-        palette: Palette,
     ) -> View {
         const REVIEW: &str =
             "Review the open pull requests in this repository and summarize what needs attention.";
@@ -1606,59 +1603,49 @@ impl DesktopApp {
                     0.0,
                 ))
                 .children((
-                    m3::icon(glyph),
-                    m3::body(label.to_owned())
+                    controls::icon(glyph),
+                    controls::body(label.to_owned())
                         .vertical_alignment(VerticalAlignment::Center)
                         .max_width(tokens::layout::PROJECT_CHIP_WIDTH)
                         .text_trimming(TextTrimming::CharacterEllipsis),
                 ))
         };
-        let mut cards: Vec<KeyedView> =
-            vec![
-                KeyedView::new(
-                    "review",
-                    m3::suggestion_card(
-                        palette,
-                        m3::suggestion(palette)
-                            .automation_name("Review the open PRs")
-                            .on_click(context.message(Message::Chat(ChatMsg::ComposerChanged(
-                                REVIEW.to_owned(),
-                            ))))
-                            .content(card(m3::glyph::DIFF, "Review the open PRs")),
-                    ),
-                ),
-                KeyedView::new(
-                    "automation",
-                    m3::suggestion_card(
-                        palette,
-                        m3::suggestion(palette)
-                            .automation_name("Schedule an automation")
-                            .on_click(context.message(Message::Shell(ShellMsg::PlaceOpened(
-                                page_ui::Place::Automations,
-                            ))))
-                            .content(card(m3::glyph::SCHEDULE, "Schedule an automation")),
-                    ),
-                ),
-            ];
+        let mut cards: Vec<KeyedView> = vec![
+            KeyedView::new(
+                "review",
+                controls::suggestion()
+                    .automation_name("Review the open PRs")
+                    .on_click(
+                        context.message(Message::Chat(ChatMsg::ComposerChanged(REVIEW.to_owned()))),
+                    )
+                    .content(card(controls::glyph::DIFF, "Review the open PRs")),
+            ),
+            KeyedView::new(
+                "automation",
+                controls::suggestion()
+                    .automation_name("Schedule an automation")
+                    .on_click(context.message(Message::Shell(ShellMsg::PlaceOpened(
+                        page_ui::Place::Automations,
+                    ))))
+                    .content(card(controls::glyph::SCHEDULE, "Schedule an automation")),
+            ),
+        ];
         if let Some(agent) = last {
             let label = format!("Continue {}", self.agent_label(&agent));
             cards.push(KeyedView::new(
                 format!("continue:{}", agent.id),
-                m3::suggestion_card(
-                    palette,
-                    m3::suggestion(palette)
-                        .automation_name(label.clone())
-                        .on_click(context.message(Message::Shell(ShellMsg::AgentOpened(agent))))
-                        .content(card(m3::glyph::HISTORY, &label)),
-                ),
+                controls::suggestion()
+                    .automation_name(label.clone())
+                    .on_click(context.message(Message::Shell(ShellMsg::AgentOpened(agent))))
+                    .content(card(controls::glyph::HISTORY, &label)),
             ));
         }
         let title: View = if self.launch.chat {
-            m3::page_title("What would you like to chat about?")
+            controls::page_title("What would you like to chat about?")
                 .horizontal_alignment(HorizontalAlignment::Center)
                 .into()
         } else if self.launch.workspace.is_empty() {
-            m3::page_title("What should we build?")
+            controls::page_title("What should we build?")
                 .horizontal_alignment(HorizontalAlignment::Center)
                 .into()
         } else {
@@ -1671,10 +1658,11 @@ impl DesktopApp {
                 ))
                 .automation_heading_level(AutomationHeadingLevel::Level2)
                 .children((
-                    m3::text("What should we build in", tokens::text::HERO)
+                    controls::text("What should we build in", tokens::text::HERO)
                         .vertical_alignment(VerticalAlignment::Center),
-                    self.title_project(context, palette),
-                    m3::text("?", tokens::text::HERO).vertical_alignment(VerticalAlignment::Center),
+                    self.title_project(context),
+                    controls::text("?", tokens::text::HERO)
+                        .vertical_alignment(VerticalAlignment::Center),
                 ))
                 .into()
         };
@@ -1716,33 +1704,40 @@ impl DesktopApp {
     /// transcript removes its parts over later frames, as when another
     /// conversation opens (`views::Transcript`), instead of tearing them all
     /// down in one frame. Back to tasks builds it again from its end.
-    pub(super) fn chat_view(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
+    pub(super) fn chat_view(&self, context: &mut ViewContext<Self>) -> View {
         let column = self.reading_width();
         // The running seconds tick only while a conversation is on screen.
         views::clock::set_shown(
             self.main == Main::Conversation && self.selected_agent_id().is_some(),
         );
-        let transcript = self.transcript_view(column, context, palette);
+        let transcript = self.transcript_view(column, context);
         if self.main != Main::Conversation {
             let content = match self.main {
-                Main::Project => self.project_view(context, palette),
-                Main::Inbox => self.inbox_view(context, palette),
-                Main::Agents => self.monitor_view(context, palette),
-                Main::Automations => self.automations_page(context, palette),
-                Main::Conversation | Main::Settings => self.settings_view(context, palette),
+                Main::Project => self.project_view(context),
+                Main::Inbox => self.inbox_view(context),
+                Main::Agents => self.monitor_view(context),
+                Main::Automations => self.automations_page(context),
+                Main::Conversation | Main::Settings => self.settings_view(context),
             };
-            // Opaque over the transcript beneath; its corners follow the
-            // main card's (a Border does not clip its child).
+            // Opaque over the transcript beneath: the card's background on
+            // the window's base, so it reads as the card itself; its corners
+            // follow the main card's (a Border does not clip its child).
             let radius = tokens::layout::CARD_RADIUS;
+            let corners = if self.panel_shown() && self.main == Main::Project {
+                CornerRadius::new(radius, 0.0, 0.0, radius)
+            } else {
+                CornerRadius::uniform(radius)
+            };
             let page = Border::new()
                 .grid_row(1)
-                .background(palette.surface())
-                .corner_radius(if self.panel_shown() && self.main == Main::Project {
-                    CornerRadius::new(radius, 0.0, 0.0, radius)
-                } else {
-                    CornerRadius::uniform(radius)
-                })
-                .content(content);
+                .background(ThemeBrush::SolidBackground)
+                .corner_radius(corners)
+                .content(
+                    Border::new()
+                        .background(ThemeBrush::CardBackground)
+                        .corner_radius(corners)
+                        .content(content),
+                );
             return Grid::new()
                 .rows([
                     GridLength::Auto,
@@ -1763,7 +1758,7 @@ impl DesktopApp {
         let agent = self.selected_agent_id();
         let header: Option<View> = agent
             .as_deref()
-            .map(|agent| self.header_view(agent, context, palette));
+            .map(|agent| self.header_view(agent, context));
         // The transcript stays in place without an open Agent too, so the
         // conversation just left is removed over later frames, not at once
         // (`views::Transcript`); the start or Home screen covers it.
@@ -1773,15 +1768,15 @@ impl DesktopApp {
             // now, at once (no empty pause after Send).
             None if self.launch.starting.is_some() => {
                 let (text, label) = self.launch.starting.clone().unwrap_or_default();
-                Some(starting_view(&text, &label, column, palette))
+                Some(starting_view(&text, &label, column))
             }
             // Home is built below, around the notice and the composer.
             _ => None,
         };
-        let reconnect = self.reconnect_notice(column, palette);
+        let reconnect = self.reconnect_notice(column);
         let alert: Option<View> = match (&self.chat.confirm_force, &self.alert) {
             (Some((bound, title)), _) => {
-                Some(self.force_stop_banner(bound, title, column, context, palette))
+                Some(self.force_stop_banner(bound, title, column, context))
             }
             // A restart in progress says so once, over the reads it stalls.
             (None, _) if reconnect.is_some() => reconnect,
@@ -1793,7 +1788,7 @@ impl DesktopApp {
                     .is_some_and(|offer| &offer.alert == text)
                 {
                     Some(
-                        m3::text_button(palette)
+                        controls::text_button()
                             .grid_column(2)
                             .is_enabled(!self.submitting())
                             .automation_name("Queue it")
@@ -1814,8 +1809,8 @@ impl DesktopApp {
                         // Alerts are refusals, uncertain outcomes and failed
                         // reads: the attention surface and mark, the text in
                         // the body color so it stays easy to read.
-                        .background(palette.attention_container())
-                        .border_brush(palette.attention_outline())
+                        .background(ThemeBrush::SystemCriticalBackground)
+                        .border_brush(ThemeBrush::SystemCritical)
                         .border_thickness(Thickness::uniform(tokens::layout::HAIRLINE))
                         .corner_radius(tokens::radius::CONTAINER)
                         .padding(Thickness::new(
@@ -1837,17 +1832,15 @@ impl DesktopApp {
                                     Some(
                                         Border::new()
                                             .vertical_alignment(VerticalAlignment::Center)
-                                            .content(m3::status_mark(
-                                                palette,
-                                                crate::theme::StatusTone::Attention,
+                                            .content(controls::status_mark(
+                                                crate::controls::StatusTone::Attention,
                                                 tokens::layout::DOT,
                                             ))
                                             .into(),
                                     ),
                                     Some(
-                                        m3::body(text.clone())
+                                        controls::body(text.clone())
                                             .grid_column(1)
-                                            .foreground(palette.text())
                                             .vertical_alignment(VerticalAlignment::Center)
                                             .text_wrapping(TextWrapping::Wrap)
                                             .is_text_selection_enabled(true)
@@ -1855,7 +1848,7 @@ impl DesktopApp {
                                     ),
                                     queue,
                                     Some(
-                                        m3::icon_button(palette)
+                                        controls::icon_button()
                                             .grid_column(3)
                                             .automation_name("Dismiss")
                                             .on_click(
@@ -1863,7 +1856,7 @@ impl DesktopApp {
                                                     ShellMsg::AlertDismissed,
                                                 )),
                                             )
-                                            .content(m3::icon(m3::glyph::CLOSE))
+                                            .content(controls::icon(controls::glyph::CLOSE))
                                             .into(),
                                     ),
                                 ])),
@@ -1872,25 +1865,24 @@ impl DesktopApp {
                 )
             }
             (None, None) => self
-                .archived_notice(column, context, palette)
-                .or_else(|| self.loss_notice(column, context, palette)),
+                .archived_notice(column, context)
+                .or_else(|| self.loss_notice(column, context)),
         };
         // Waiting for the owner: the decision panel takes the composer's
         // place; otherwise the hold strip and the workers line sit above
         // the composer.
-        let composer = match self.decision_panel(column, context, palette) {
+        let composer = match self.decision_panel(column, context) {
             Some(panel) if !home => panel,
             _ => {
                 let above: Vec<KeyedView> = [
-                    self.hold_strip(context, palette)
-                        .map(|strip| ("strip", strip)),
-                    self.workers_line(palette).map(|line| ("workers", line)),
+                    self.hold_strip(context).map(|strip| ("strip", strip)),
+                    self.workers_line().map(|line| ("workers", line)),
                 ]
                 .into_iter()
                 .flatten()
                 .map(|(key, view)| KeyedView::new(key, view))
                 .collect();
-                let composer = self.composer_view(column, context, palette);
+                let composer = self.composer_view(column, context);
                 if home || above.is_empty() {
                     composer
                 } else {
@@ -1913,7 +1905,7 @@ impl DesktopApp {
         // Home: the question, the notice, the composer and the suggestions
         // in one column over the (empty) transcript.
         if home {
-            let home = self.home_view(alert, composer, context, palette);
+            let home = self.home_view(alert, composer, context);
             return Grid::new()
                 .rows([
                     GridLength::Auto,
@@ -1940,7 +1932,7 @@ impl DesktopApp {
         let live = Border::new()
             .grid_row(1)
             .vertical_alignment(VerticalAlignment::Top)
-            .maybe_content(self.live_line(context, palette));
+            .maybe_content(self.live_line(context));
         // Rows: the header, the transcript, (spare), (spare), the notice,
         // the composer or the decision panel (its popovers are flyouts).
         Grid::new()

@@ -6,7 +6,7 @@ impl DesktopApp {
     /// group that has something to remove, each item with its size and its
     /// keep or remove reason), Remove with one inline confirmation, then the
     /// result: removed, kept with why, and unknown.
-    fn cleanup_review(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
+    fn cleanup_review(&self, context: &mut ViewContext<Self>) -> View {
         let state = &self.settings;
         // A task title when Swarm knows one (else the item keeps its id).
         let title = |agent: &str| {
@@ -21,7 +21,7 @@ impl DesktopApp {
         if state.cleanup_busy {
             parts.push(KeyedView::new(
                 "busy",
-                m3::secondary(if state.cleanup_plan.is_some() {
+                controls::secondary(if state.cleanup_plan.is_some() {
                     "Removing the selected items…"
                 } else {
                     "Reviewing what can be removed…"
@@ -31,8 +31,8 @@ impl DesktopApp {
         if let Some(error) = &state.cleanup_error {
             parts.push(KeyedView::new(
                 format!("error:{error}"),
-                m3::body(error.clone())
-                    .foreground(palette.attention())
+                controls::body(error.clone())
+                    .foreground(ThemeBrush::SystemCritical)
                     .text_wrapping(TextWrapping::Wrap)
                     .is_text_selection_enabled(true),
             ));
@@ -47,7 +47,7 @@ impl DesktopApp {
                 });
             parts.push(KeyedView::new(
                 "disk-usage",
-                m3::secondary(usage)
+                controls::secondary(usage)
                     .text_wrapping(TextWrapping::Wrap)
                     .is_text_selection_enabled(true),
             ));
@@ -59,9 +59,9 @@ impl DesktopApp {
                 .enumerate()
                 .map(|(index, line)| {
                     let text = if index == 0 {
-                        m3::text(line.clone(), tokens::text::HEADER)
+                        controls::text(line.clone(), tokens::text::HEADER)
                     } else {
-                        m3::body(line.clone())
+                        controls::body(line.clone())
                     };
                     KeyedView::new(
                         format!("result:{index}"),
@@ -72,13 +72,11 @@ impl DesktopApp {
                 .collect();
             parts.push(KeyedView::new(
                 "result",
-                m3::card_high(palette)
-                    .automation_name("Cleanup result")
-                    .content(
-                        StackPanel::new()
-                            .spacing(tokens::spacing::XS)
-                            .keyed_children(rows),
-                    ),
+                controls::card().automation_name("Cleanup result").content(
+                    StackPanel::new()
+                        .spacing(tokens::spacing::XS)
+                        .keyed_children(rows),
+                ),
             ));
         }
         if let Some(plan) = &state.cleanup_plan {
@@ -86,7 +84,7 @@ impl DesktopApp {
             if groups.is_empty() {
                 parts.push(KeyedView::new(
                     "empty",
-                    m3::secondary("No cleanup items on this page.")
+                    controls::secondary("No cleanup items on this page.")
                         .text_wrapping(TextWrapping::Wrap),
                 ));
             }
@@ -114,13 +112,13 @@ impl DesktopApp {
                                 Message::Settings(SettingsMsg::CleanupGroupToggled(group, on))
                             },
                         )))
-                        .content(m3::text(
+                        .content(controls::text(
                             format!("{} · {summary}", group.title()),
                             tokens::text::HEADER,
                         ))
                         .into()
                 } else {
-                    m3::text(
+                    controls::text(
                         format!("{} · {summary}", group.title()),
                         tokens::text::HEADER,
                     )
@@ -131,7 +129,7 @@ impl DesktopApp {
                 let expanded = state.cleanup_open.contains(&group);
                 rows.push(KeyedView::new(
                     format!("expand:{expanded}"),
-                    m3::sub_row(palette, false)
+                    controls::sub_row(false)
                         .automation_name(format!(
                             "{} items ({})",
                             group.title(),
@@ -140,11 +138,11 @@ impl DesktopApp {
                         .on_click(
                             context.message(Message::Settings(SettingsMsg::CleanupExpanded(group))),
                         )
-                        .content(m3::icon_label(
+                        .content(controls::icon_label(
                             if expanded {
-                                m3::glyph::CHEVRON_DOWN
+                                controls::glyph::CHEVRON_DOWN
                             } else {
-                                m3::glyph::CHEVRON_RIGHT
+                                controls::glyph::CHEVRON_RIGHT
                             },
                             "Review items",
                         )),
@@ -164,8 +162,8 @@ impl DesktopApp {
                             | ArtifactKind::ProjectRegistration
                     );
                     let lines = StackPanel::new().children((
-                        m3::body(name.clone()).text_trimming(TextTrimming::CharacterEllipsis),
-                        m3::secondary(line)
+                        controls::body(name.clone()).text_trimming(TextTrimming::CharacterEllipsis),
+                        controls::secondary(line)
                             .text_wrapping(TextWrapping::Wrap)
                             .is_text_selection_enabled(!on_disk),
                     ));
@@ -174,12 +172,11 @@ impl DesktopApp {
                         let reveal_item = format!("cleanup:{}", item.artifact.id);
                         StackPanel::new().keyed_children(crate::views::slots([
                             Some(super::super::reveal::path_item(
-                                palette,
                                 &name,
                                 lines.into(),
                                 self.reveal_item_message(context, &reveal_item, path),
                             )),
-                            self.reveal_note(&reveal_item, palette),
+                            self.reveal_note(&reveal_item),
                         ]))
                     } else {
                         lines
@@ -195,7 +192,7 @@ impl DesktopApp {
                     let label = format!("{} kept", kept_items.len());
                     details.push(KeyedView::new(
                         format!("kept:{open}"),
-                        m3::sub_row(palette, false)
+                        controls::sub_row(false)
                             .automation_name(format!(
                                 "{label} in {} ({})",
                                 group.title(),
@@ -206,11 +203,11 @@ impl DesktopApp {
                                     SettingsMsg::CleanupKeptToggled(group),
                                 )),
                             )
-                            .content(m3::row_content(
+                            .content(controls::row_content(
                                 Some(if open {
-                                    m3::glyph::CHEVRON_DOWN
+                                    controls::glyph::CHEVRON_DOWN
                                 } else {
-                                    m3::glyph::CHEVRON_RIGHT
+                                    controls::glyph::CHEVRON_RIGHT
                                 }),
                                 &label,
                                 "",
@@ -236,7 +233,7 @@ impl DesktopApp {
                 }
                 parts.push(KeyedView::new(
                     format!("group:{group:?}"),
-                    m3::card_high(palette).content(
+                    controls::card().content(
                         StackPanel::new()
                             .spacing(tokens::spacing::SM)
                             .keyed_children(rows),
@@ -246,7 +243,7 @@ impl DesktopApp {
             if plan.truncated && plan.continuation.is_none() {
                 parts.push(KeyedView::new(
                     "truncated",
-                    m3::secondary(
+                    controls::secondary(
                         "The review stopped at its bound; review again after this cleanup for the rest.",
                     )
                     .text_wrapping(TextWrapping::Wrap),
@@ -260,7 +257,7 @@ impl DesktopApp {
         if let Some(continuation) = page.and_then(|plan| plan.continuation.clone()) {
             parts.push(KeyedView::new(
                 "next-page",
-                m3::outlined(palette)
+                controls::outlined()
                     .automation_name("Next cleanup page")
                     .is_enabled(!state.cleanup_busy)
                     .on_click(
@@ -268,7 +265,7 @@ impl DesktopApp {
                             continuation,
                         )))),
                     )
-                    .content(m3::label("Next page")),
+                    .content(controls::label("Next page")),
             ));
         }
         StackPanel::new()
@@ -278,11 +275,7 @@ impl DesktopApp {
     }
 
     /// Kept outside the page scroller: selection and Remove never scroll away.
-    pub(super) fn cleanup_actions(
-        &self,
-        context: &mut ViewContext<Self>,
-        palette: Palette,
-    ) -> Option<View> {
+    pub(super) fn cleanup_actions(&self, context: &mut ViewContext<Self>) -> Option<View> {
         let state = &self.settings;
         let Some(plan) = &state.cleanup_plan else {
             return None;
@@ -311,21 +304,21 @@ impl DesktopApp {
         if groups.iter().any(|view| view.removable > 0) {
             parts.push(KeyedView::new(
                 format!("all-safe:{all_safe}"),
-                m3::outlined(palette)
+                controls::outlined()
                     .automation_name("Select all safe items")
                     .is_enabled(!state.cleanup_busy && !all_safe)
                     .on_click(context.message(Message::Settings(SettingsMsg::CleanupSelectAll)))
-                    .content(m3::label("Select all safe")),
+                    .content(controls::label("Select all safe")),
             ));
         }
         if !groups.is_empty() {
             parts.push(KeyedView::new(
                 "apply",
-                m3::destructive(palette)
+                controls::destructive()
                     .automation_name(format!("Remove selected: {what}"))
                     .is_enabled(!state.cleanup_busy && !selected.is_empty())
                     .on_click(context.message(Message::Settings(SettingsMsg::CleanupApply)))
-                    .content(m3::label(&if selected.is_empty() {
+                    .content(controls::label(&if selected.is_empty() {
                         "Nothing selected".to_owned()
                     } else {
                         format!("Remove {what}")
@@ -333,7 +326,7 @@ impl DesktopApp {
             ));
         }
         Some(
-            m3::card_high(palette)
+            controls::card()
                 .maybe_width(self.settings_column_width())
                 .horizontal_alignment(HorizontalAlignment::Center)
                 .margin(Thickness::uniform(tokens::spacing::SM))
@@ -351,20 +344,19 @@ impl DesktopApp {
     pub(in crate::ui) fn cleanup_confirmation(
         &self,
         context: &mut ViewContext<Self>,
-        palette: Palette,
     ) -> Option<ContentDialog> {
         let Some(plan) = &self.settings.cleanup_plan else {
             return None;
         };
         let selected = crate::worktrees::selected_artifacts(plan, &self.settings.cleanup_unchecked);
-        Some(super::super::dialog_ui::surface(context, self.dialog.epoch, palette, "Remove selected items?".to_owned(),
-            m3::body(format!("Remove {}? This cannot be undone. Kept items stay; Swarm checks each item again before removing it.",
+        Some(super::super::dialog_ui::surface(context, self.dialog.epoch, "Remove selected items?".to_owned(),
+            controls::body(format!("Remove {}? This cannot be undone. Kept items stay; Swarm checks each item again before removing it.",
                 eliot_core::count_words(selected.len() as u64, "item", "items"))).text_wrapping(TextWrapping::Wrap).into(),
             super::super::dialog_ui::actions(
-                m3::text_button(palette).element_ref(&self.dialog.close).automation_name("Cancel cleanup")
-                    .on_click(context.message(Message::Settings(SettingsMsg::CleanupConfirmed(false)))).content(m3::label("Cancel")).into(),
-                View::from(m3::destructive(palette).element_ref(&self.dialog.primary).is_enabled(!self.settings.cleanup_busy && !selected.is_empty()).automation_name("Confirm Remove")
-                    .on_click(context.message(Message::Settings(SettingsMsg::CleanupConfirmed(true)))).content(m3::label("Remove")))), tokens::layout::DIALOG_WIDTH))
+                controls::text_button().element_ref(&self.dialog.close).automation_name("Cancel cleanup")
+                    .on_click(context.message(Message::Settings(SettingsMsg::CleanupConfirmed(false)))).content(controls::label("Cancel")).into(),
+                View::from(controls::destructive().element_ref(&self.dialog.primary).is_enabled(!self.settings.cleanup_busy && !selected.is_empty()).automation_name("Confirm Remove")
+                    .on_click(context.message(Message::Settings(SettingsMsg::CleanupConfirmed(true)))).content(controls::label("Remove")))), tokens::layout::DIALOG_WIDTH))
     }
 
     /// Worktrees & cleanup (Codex's Worktrees page as the pattern): where
@@ -372,43 +364,36 @@ impl DesktopApp {
     /// reviewed by kind, then `cleanup.apply` of the checked groups after
     /// one confirmation), and the worktrees it manages, by project (the
     /// daemon's `workspace.list`, every page).
-    pub(super) fn worktrees_page(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
+    pub(super) fn worktrees_page(&self, context: &mut ViewContext<Self>) -> View {
         let root = self
             .data_dir
             .as_ref()
             .map(|dir| dir.join("worktrees").to_string_lossy().into_owned())
             .unwrap_or_default();
-        let settings = m3::settings_card(
-            palette,
-            vec![
-                KeyedView::new(
-                    "root",
-                    self.path_row(context, palette, "Worktree root", "", &root),
-                ),
-                KeyedView::new(
-                    "cleanup",
-                    m3::setting_row(
-                        "Clean up finished work",
-                        "Review what Swarm can remove for finished tasks, by kind, with sizes and reasons. Nothing is removed until you confirm.",
-                        View::from(
-                            m3::outlined(palette)
-                                .automation_name("Review cleanup")
-                                .is_enabled(!self.settings.cleanup_busy)
-                                .on_click(
-                                    context
-                                        .message(Message::Settings(SettingsMsg::CleanupPlan(None))),
-                                )
-                                .content(m3::label(if self.settings.cleanup_plan.is_some() {
-                                    "Review again"
-                                } else {
-                                    "Review…"
-                                })),
-                        ),
+        let settings = controls::settings_card(vec![
+            KeyedView::new("root", self.path_row(context, "Worktree root", "", &root)),
+            KeyedView::new(
+                "cleanup",
+                controls::setting_row(
+                    "Clean up finished work",
+                    "Review what Swarm can remove for finished tasks, by kind, with sizes and reasons. Nothing is removed until you confirm.",
+                    View::from(
+                        controls::outlined()
+                            .automation_name("Review cleanup")
+                            .is_enabled(!self.settings.cleanup_busy)
+                            .on_click(
+                                context.message(Message::Settings(SettingsMsg::CleanupPlan(None))),
+                            )
+                            .content(controls::label(if self.settings.cleanup_plan.is_some() {
+                                "Review again"
+                            } else {
+                                "Review…"
+                            })),
                     ),
                 ),
-            ],
-        );
-        let cleanup = self.cleanup_review(context, palette);
+            ),
+        ]);
+        let cleanup = self.cleanup_review(context);
         let mut groups: Vec<KeyedView> = Vec::new();
         let empty: &[eliot_core::api::ManagedWorkspaceView] = &[];
         let (rows, total, complete) = match &self.settings.worktrees {
@@ -416,11 +401,11 @@ impl DesktopApp {
             Some(Err(error)) => {
                 groups.push(KeyedView::new(
                     format!("error:{error}"),
-                    m3::body(format!(
+                    controls::body(format!(
                         "Managed worktrees could not be read: {}",
                         crate::state::plain_error(error)
                     ))
-                    .foreground(palette.attention())
+                    .foreground(ThemeBrush::SystemCritical)
                     .text_wrapping(TextWrapping::Wrap)
                     .is_text_selection_enabled(true),
                 ));
@@ -443,7 +428,7 @@ impl DesktopApp {
         if matches!(self.settings.worktrees, Some(Ok(_))) && managed.is_empty() {
             groups.push(KeyedView::new(
                 "none",
-                m3::secondary(
+                controls::secondary(
                     "No managed worktrees yet. A task started with swarm launch --worktree BRANCH gets one here.",
                 )
                 .text_wrapping(TextWrapping::Wrap),
@@ -465,19 +450,19 @@ impl DesktopApp {
                     );
                     KeyedView::new(
                         format!("{}:{detail}", worktree.path),
-                        self.path_row(context, palette, &name, &detail, &worktree.path),
+                        self.path_row(context, &name, &detail, &worktree.path),
                     )
                 })
                 .collect();
             groups.push(KeyedView::new(
                 format!("project:{project}"),
                 StackPanel::new().spacing(tokens::spacing::SM).children((
-                    m3::section_heading(
+                    controls::section_heading(
                         &project,
                         &eliot_core::count_words(worktrees.len() as u64, "worktree", "worktrees"),
                         None,
                     ),
-                    m3::settings_card(palette, rows),
+                    controls::settings_card(rows),
                 )),
             ));
         }
@@ -485,21 +470,21 @@ impl DesktopApp {
             .spacing(tokens::spacing::MD)
             .children((
                 StackPanel::new().spacing(tokens::spacing::SM).children((
-                    m3::card_title("Creation and cleanup"),
+                    controls::card_title("Creation and cleanup"),
                     settings,
                     cleanup,
                 )),
-                m3::section_heading(
+                controls::section_heading(
                     "Managed worktrees",
                     &heading,
                     Some(
-                        m3::text_button(palette)
+                        controls::text_button()
                             .is_enabled(!self.settings.worktrees_loading)
                             .automation_name("Read managed worktrees again")
                             .on_click(
                                 context.message(Message::Settings(SettingsMsg::WorktreesRefresh)),
                             )
-                            .content(m3::label("Refresh"))
+                            .content(controls::label("Refresh"))
                             .into(),
                     ),
                 ),

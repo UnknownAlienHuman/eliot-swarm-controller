@@ -7,11 +7,7 @@
 //! which turns the line break it typed into the composer into Send
 //! (Reactor 0.100.0 has no key events on `TextBox`; Shift+Enter keeps the
 //! line break). The same channel carries `crate::flyout`'s closed flyouts
-//! to the window, and a change of High Contrast or animation effects: a
-//! hook on the messages sent to the window's thread hears Windows announce
-//! a changed setting (`WM_SETTINGCHANGE`, `WM_SYSCOLORCHANGE`,
-//! `WM_THEMECHANGED`; `CallWndProc` for `WH_CALLWNDPROC`), so nothing
-//! polls for them.
+//! to the window.
 //!
 //! Reactor 0.100.0 has no key events, and its `KeyAccelerator` keys are R,
 //! Enter and the number pad only; WinUI's own `KeyboardAccelerator` needs
@@ -45,11 +41,10 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     VK_RIGHT, VK_SHIFT, VK_TAB, VK_UP,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CWPSTRUCT, CallNextHookEx, GetCursorPos, GetForegroundWindow, GetWindowThreadProcessId,
-    HC_ACTION, MSG, MSLLHOOKSTRUCT, PM_REMOVE, SetWindowsHookExW, WH_CALLWNDPROC, WH_GETMESSAGE,
-    WH_KEYBOARD, WH_MOUSE_LL, WM_LBUTTONDOWN, WM_MBUTTONDOWN, WM_NCLBUTTONDOWN, WM_POINTERDOWN,
-    WM_RBUTTONDOWN, WM_SETTINGCHANGE, WM_SYSCOLORCHANGE, WM_THEMECHANGED, WM_XBUTTONDOWN,
-    WindowFromPoint, XBUTTON1, XBUTTON2,
+    CallNextHookEx, GetCursorPos, GetForegroundWindow, GetWindowThreadProcessId, HC_ACTION, MSG,
+    MSLLHOOKSTRUCT, PM_REMOVE, SetWindowsHookExW, WH_GETMESSAGE, WH_KEYBOARD, WH_MOUSE_LL,
+    WM_LBUTTONDOWN, WM_MBUTTONDOWN, WM_NCLBUTTONDOWN, WM_POINTERDOWN, WM_RBUTTONDOWN,
+    WM_XBUTTONDOWN, WindowFromPoint, XBUTTON1, XBUTTON2,
 };
 
 /// A key of an open popover.
@@ -92,11 +87,11 @@ pub enum Shortcut {
     /// the input epoch at the press (see [`last_input`]) and the press's
     /// number (see [`enter_presses`]).
     Enter(u64, u64),
-    /// Keyboard focus moved (`crate::motion::resolve_focused_row` says
+    /// Keyboard focus moved (`crate::elements::resolve_focused_row` says
     /// whether a sidebar row holds it).
     FocusMoved,
     /// Shift+F10 or the context-menu key on the focused sidebar row
-    /// (`crate::motion::focused_row_anchor` says where).
+    /// (`crate::elements::focused_row_anchor` says where).
     RowMenu,
     /// The window became the foreground window while keyboard focus was
     /// held (`crate::window_place::held_focus_ready`).
@@ -106,12 +101,6 @@ pub enum Shortcut {
     /// A panic was stopped at a native boundary for the first time this
     /// session (`crate::startup::caught_panic`): the window says so.
     Panicked,
-    /// Windows changed High Contrast or animation effects: the new
-    /// readings (`crate::accessibility`).
-    Accessibility {
-        high_contrast: bool,
-        animations: bool,
-    },
 }
 
 /// Which popover is open: none, the model picker (all popover keys), a
@@ -156,9 +145,6 @@ static ENTER_PRESSES: AtomicU64 = AtomicU64::new(0);
 /// when [`take_plain_enter`] consumes it), and when it was pressed.
 static PLAIN_ENTER: AtomicU8 = AtomicU8::new(0);
 static PLAIN_ENTER_MS: AtomicU64 = AtomicU64::new(0);
-/// The last High Contrast (bit 0) and animation effects (bit 1) readings
-/// the window was told of.
-static ACCESSIBILITY: AtomicU8 = AtomicU8::new(0);
 /// How long a plain Enter may take to reach the composer's text change.
 const PLAIN_ENTER_MS_MAX: u64 = 1_500;
 /// The step of a press of the mouse's back (X1) or forward (X2) button:
@@ -247,18 +233,11 @@ pub fn install() -> Result<Receiver<Shortcut>, String> {
         .map_err(|_| "keyboard shortcuts are already installed".to_owned())?;
     // SAFETY: both procedures have the HOOKPROC signature; a null module
     // with the current thread's id installs thread-local hooks.
-    ACCESSIBILITY.store(accessibility_now().0, Ordering::SeqCst);
-    let (keys, messages, sent) = unsafe {
+    let (keys, messages) = unsafe {
         let thread = GetCurrentThreadId();
         (
             SetWindowsHookExW(WH_KEYBOARD, Some(keyboard), std::ptr::null_mut(), thread),
             SetWindowsHookExW(WH_GETMESSAGE, Some(messages), std::ptr::null_mut(), thread),
-            SetWindowsHookExW(
-                WH_CALLWNDPROC,
-                Some(sent_messages),
-                std::ptr::null_mut(),
-                thread,
-            ),
         )
     };
     // WinUI 3 takes mouse input outside the thread's message queue (the
@@ -276,7 +255,7 @@ pub fn install() -> Result<Receiver<Shortcut>, String> {
             0,
         )
     };
-    if keys.is_null() || messages.is_null() || sent.is_null() || side.is_null() {
+    if keys.is_null() || messages.is_null() || side.is_null() {
         return Err(format!(
             "keyboard shortcuts not installed: {}",
             std::io::Error::last_os_error()
@@ -357,12 +336,12 @@ fn popover_key(popover: u8, key: u16, ctrl: bool, shift: bool, alt: bool) -> Opt
     }
 }
 
-/// Keyboard focus moved (`crate::motion`).
+/// Keyboard focus moved (`crate::elements`).
 pub fn focus_moved() {
     send(Shortcut::FocusMoved);
 }
 
-/// Whether a sidebar row holds keyboard focus now (`crate::motion`).
+/// Whether a sidebar row holds keyboard focus now (`crate::elements`).
 pub fn set_row_focused(inside: bool) {
     ROW_FOCUSED.store(u8::from(inside), Ordering::SeqCst);
 }
@@ -510,62 +489,6 @@ unsafe extern "system" fn messages(code: i32, wparam: WPARAM, lparam: LPARAM) ->
         crate::startup::caught_panic("the message hook", &*panic);
     }
     next_hook(code, wparam, lparam)
-}
-
-/// `CallWndProc`: a message sent to one of the thread's windows; `lparam`
-/// points to its `CWPSTRUCT`. Passed on unchanged.
-unsafe extern "system" fn sent_messages(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-    let _boundary = crate::startup::native_boundary();
-    if let Err(panic) = std::panic::catch_unwind(|| sent_seen(code, lparam)) {
-        crate::startup::caught_panic("the settings hook", &*panic);
-    }
-    next_hook(code, wparam, lparam)
-}
-
-/// High Contrast and animation effects now, packed as [`ACCESSIBILITY`]
-/// keeps them, and unpacked.
-fn accessibility_now() -> (u8, bool, bool) {
-    let high_contrast = crate::accessibility::high_contrast_on();
-    let animations = crate::accessibility::animations_on();
-    (
-        u8::from(high_contrast) | (u8::from(animations) << 1),
-        high_contrast,
-        animations,
-    )
-}
-
-/// Read High Contrast and animation effects now and keep them as the
-/// settings hook's last reading: the one place the window's state and the
-/// hook's comparison both come from, so a reading the window takes itself
-/// (a scheme change) never leaves the hook comparing against a stale value.
-pub fn read_accessibility() -> (bool, bool) {
-    let (packed, high_contrast, animations) = accessibility_now();
-    ACCESSIBILITY.store(packed, Ordering::SeqCst);
-    (high_contrast, animations)
-}
-
-/// The settings hook's work: when Windows announces a changed setting or
-/// colors, read the two settings the window follows and tell it of a
-/// change, once.
-fn sent_seen(code: i32, lparam: LPARAM) {
-    if code != HC_ACTION as i32 || lparam == 0 {
-        return;
-    }
-    // SAFETY: for HC_ACTION the system passes a valid CWPSTRUCT pointer.
-    let message = unsafe { (*(lparam as *const CWPSTRUCT)).message };
-    if !matches!(
-        message,
-        WM_SETTINGCHANGE | WM_SYSCOLORCHANGE | WM_THEMECHANGED
-    ) {
-        return;
-    }
-    let (packed, high_contrast, animations) = accessibility_now();
-    if ACCESSIBILITY.swap(packed, Ordering::SeqCst) != packed {
-        send(Shortcut::Accessibility {
-            high_contrast,
-            animations,
-        });
-    }
 }
 
 /// The message hook's work: note a pointer press in this module's atomics.

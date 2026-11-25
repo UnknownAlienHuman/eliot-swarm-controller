@@ -20,7 +20,7 @@ impl DesktopApp {
     /// now, then each installed harness's limits as two-line rows (the
     /// limit and when it refreshes) with the share left and its ring.
     /// Storage and retention live in Advanced.
-    pub(super) fn usage_page(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
+    pub(super) fn usage_page(&self, context: &mut ViewContext<Self>) -> View {
         let loaded = self.nav.agents.len();
         let (tokens_today, reporting) = self.tokens_today();
         let fleet = self.settings.fleet.as_ref();
@@ -44,27 +44,24 @@ impl DesktopApp {
             ),
             _ => format!("Totals of {} active today", agents(reporting)),
         };
-        let totals = m3::settings_card(
-            palette,
-            vec![
-                KeyedView::new(
-                    format!("running:{running_value}:{running_note}"),
-                    m3::setting_row(
-                        "Running Agents",
-                        &running_note,
-                        View::from(m3::body(running_value)),
-                    ),
+        let totals = controls::settings_card(vec![
+            KeyedView::new(
+                format!("running:{running_value}:{running_note}"),
+                controls::setting_row(
+                    "Running Agents",
+                    &running_note,
+                    View::from(controls::body(running_value)),
                 ),
-                KeyedView::new(
-                    format!("tokens:{tokens_today}:{coverage}"),
-                    m3::setting_row(
-                        "Tokens today",
-                        &coverage,
-                        View::from(m3::body(group_digits(tokens_today))),
-                    ),
+            ),
+            KeyedView::new(
+                format!("tokens:{tokens_today}:{coverage}"),
+                controls::setting_row(
+                    "Tokens today",
+                    &coverage,
+                    View::from(controls::body(group_digits(tokens_today))),
                 ),
-            ],
-        );
+            ),
+        ]);
         let catalog = self
             .launch
             .catalog
@@ -105,11 +102,11 @@ impl DesktopApp {
             let rows = match (entry, read) {
                 (Some(entry), _) if !entry.installed => vec![KeyedView::new(
                     "not-installed",
-                    m3::setting_row("Not installed", "", None),
+                    controls::setting_row("Not installed", "", None),
                 )],
                 (_, None) if self.settings.quotas_loading > 0 => vec![KeyedView::new(
                     "reading",
-                    m3::setting_row("Reading limits…", "", None),
+                    controls::setting_row("Reading limits…", "", None),
                 )],
                 (_, None) => unknown_limits(""),
                 (_, Some(Err(error))) => unknown_limits(&crate::state::plain_error(error)),
@@ -131,10 +128,10 @@ impl DesktopApp {
                                 let note = crate::quota::sentence(&window.resets_in(now));
                                 KeyedView::new(
                                     format!("{index}:{title}:{note}:{}", window.remaining),
-                                    m3::setting_row(
+                                    controls::setting_row(
                                         &title,
                                         &note,
-                                        limit_value(palette, window.remaining),
+                                        limit_value(window.remaining),
                                     ),
                                 )
                             })
@@ -150,10 +147,11 @@ impl DesktopApp {
                         .spacing(tokens::spacing::SM)
                         .margin(Thickness::new(0.0, tokens::spacing::SM, 0.0, 0.0))
                         .children((
-                            m3::section_title(title),
-                            m3::secondary(metadata).vertical_alignment(VerticalAlignment::Center),
+                            controls::section_title(title),
+                            controls::secondary(metadata)
+                                .vertical_alignment(VerticalAlignment::Center),
                         )),
-                    m3::settings_card(palette, rows),
+                    controls::settings_card(rows),
                 )),
             ));
         }
@@ -161,11 +159,11 @@ impl DesktopApp {
             .spacing(tokens::spacing::MD)
             .children((
                 StackPanel::new().spacing(tokens::spacing::SM).children((
-                    m3::section_heading(
+                    controls::section_heading(
                         "Swarm",
                         "",
                         Some(
-                            m3::text_button(palette)
+                            controls::text_button()
                                 .is_enabled(
                                     self.settings.quotas_loading == 0
                                         && !self.settings.fleet_loading,
@@ -174,7 +172,7 @@ impl DesktopApp {
                                 .on_click(
                                     context.message(Message::Settings(SettingsMsg::UsageRefresh)),
                                 )
-                                .content(m3::label("Refresh"))
+                                .content(controls::label("Refresh"))
                                 .into(),
                         ),
                     ),
@@ -198,7 +196,11 @@ impl DesktopApp {
             ),
             Some(Ok(fleet)) => retention_lines(fleet.retention.as_ref()),
         };
-        m3::setting_row("Storage and history", &note, View::from(m3::body(value)))
+        controls::setting_row(
+            "Storage and history",
+            &note,
+            View::from(controls::body(value)),
+        )
     }
 }
 
@@ -210,19 +212,23 @@ fn agents(count: usize) -> String {
 fn unknown_limits(note: &str) -> Vec<KeyedView> {
     vec![KeyedView::new(
         format!("unknown:{note}"),
-        m3::setting_row("Quota unknown", note, None),
+        controls::setting_row("Quota unknown", note, None),
     )]
 }
 
 /// A limit's share left and its status ring.
-fn limit_value(palette: Palette, remaining: i64) -> View {
-    let status = palette.quota_status(remaining);
+fn limit_value(remaining: i64) -> View {
+    let status = if (remaining as f64) < controls::QUOTA_LOW {
+        ThemeBrush::SystemCritical
+    } else {
+        ThemeBrush::Accent
+    };
     StackPanel::new()
         .orientation(Orientation::Horizontal)
         .spacing(tokens::spacing::SM)
         .children((
-            m3::body(format!("{remaining}%")).vertical_alignment(VerticalAlignment::Center),
-            m3::status_ring(status),
+            controls::body(format!("{remaining}%")).vertical_alignment(VerticalAlignment::Center),
+            controls::status_ring(status),
         ))
         .into()
 }

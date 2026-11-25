@@ -12,7 +12,6 @@
 //! shows the daemon's own failure and the owner's choices.
 
 use super::*;
-use crate::theme::winui::Palette;
 
 /// Restart attempts before the failure view. The pauses before attempts
 /// 2 to 5 grow as [`live::backoff_ms`]: 1, 2, 4 and 8 s.
@@ -466,7 +465,7 @@ impl DesktopApp {
     }
 
     /// The restart in progress, above the composer: calm, not an alert.
-    pub(super) fn reconnect_notice(&self, column: Option<f64>, palette: Palette) -> Option<View> {
+    pub(super) fn reconnect_notice(&self, column: Option<f64>) -> Option<View> {
         let (attempt, reason) = self.link.restarting.as_ref()?;
         let text = format!("Swarm stopped. Reconnecting… attempt {attempt} of {RESTART_ATTEMPTS}");
         let reason = reason.clone().unwrap_or_default();
@@ -477,7 +476,7 @@ impl DesktopApp {
                 .max_width(tokens::layout::READING_WIDTH)
                 .horizontal_alignment(HorizontalAlignment::Center)
                 .margin(Thickness::new(0.0, tokens::spacing::SM, 0.0, 0.0))
-                .background(palette.tonal())
+                .background(ThemeBrush::CardBackground)
                 .corner_radius(tokens::radius::CONTAINER)
                 .padding(Thickness::xy(tokens::spacing::MD, tokens::spacing::SM))
                 .automation_name(if reason.is_empty() {
@@ -490,15 +489,14 @@ impl DesktopApp {
                         .columns([GridLength::Auto, GridLength::Auto, GridLength::STAR])
                         .column_spacing(tokens::spacing::SM)
                         .children((
-                            m3::status_mark(
-                                palette,
-                                crate::theme::StatusTone::Pending,
+                            controls::status_mark(
+                                crate::controls::StatusTone::Pending,
                                 tokens::layout::DOT,
                             ),
-                            m3::body(text)
+                            controls::body(text)
                                 .grid_column(1)
                                 .vertical_alignment(VerticalAlignment::Center),
-                            m3::secondary(reason)
+                            controls::secondary(reason)
                                 .grid_column(2)
                                 .vertical_alignment(VerticalAlignment::Center)
                                 .text_trimming(TextTrimming::CharacterEllipsis),
@@ -516,11 +514,7 @@ impl DesktopApp {
     /// settings, Open config.toml, Open log and Open data folder, and the
     /// data-directory choices. The sidebar beside it keeps its last list,
     /// dimmed (`shell_view`).
-    pub(super) fn startup_error_view(
-        &self,
-        context: &mut ViewContext<Self>,
-        palette: Palette,
-    ) -> View {
+    pub(super) fn startup_error_view(&self, context: &mut ViewContext<Self>) -> View {
         let stopped = self.link.stopped;
         let reason = self
             .startup_error
@@ -555,8 +549,8 @@ impl DesktopApp {
                     0.0,
                 ))
                 .children((
-                    m3::icon(glyph),
-                    m3::text(label.to_owned(), tokens::text::BUTTON)
+                    controls::icon(glyph),
+                    controls::text(label.to_owned(), tokens::text::BUTTON)
                         .vertical_alignment(VerticalAlignment::Center),
                 ))
                 .into()
@@ -567,42 +561,42 @@ impl DesktopApp {
                 .horizontal_alignment(HorizontalAlignment::Center)
                 .spacing(tokens::spacing::SM)
                 .children((
-                    m3::outlined(palette)
+                    controls::outlined()
                         .automation_name("Retry: check whether Swarm runs again")
                         .on_click(shell(ShellMsg::RecheckLink))
-                        .content(with_icon(m3::glyph::REFRESH, "Retry")),
-                    m3::filled(palette)
+                        .content(with_icon(controls::glyph::REFRESH, "Retry")),
+                    controls::filled()
                         .automation_name("Start Swarm")
                         .on_click(shell(ShellMsg::RetryStartup))
-                        .content(with_icon(m3::glyph::RESUME, "Start Swarm")),
+                        .content(with_icon(controls::glyph::RESUME, "Start Swarm")),
                 ))
                 .into()
         } else if self.link.gave_up {
             // Swarm ran and stopped: starting it is the main action.
-            m3::filled(palette)
+            controls::filled()
                 .horizontal_alignment(HorizontalAlignment::Center)
                 .automation_name("Start Swarm: start it again on this data directory")
                 .on_click(shell(ShellMsg::RetryStartup))
-                .content(with_icon(m3::glyph::RESUME, "Start Swarm"))
+                .content(with_icon(controls::glyph::RESUME, "Start Swarm"))
                 .into()
         } else {
-            m3::filled(palette)
+            controls::filled()
                 .horizontal_alignment(HorizontalAlignment::Center)
                 .automation_name("Retry: start Swarm again on this data directory")
                 .on_click(shell(ShellMsg::RetryStartup))
-                .content(with_icon(m3::glyph::REFRESH, "Retry"))
+                .content(with_icon(controls::glyph::REFRESH, "Retry"))
                 .into()
         };
         let text_action = |name: &str, msg: ShellMsg| -> View {
-            m3::text_button(palette)
+            controls::text_button()
                 .automation_name(name)
                 .on_click(shell(msg))
-                .content(m3::label(name))
+                .content(controls::label(name))
                 .into()
         };
         let notice: Option<View> = self.alert.as_ref().map(|text| {
-            m3::body(text.clone())
-                .foreground(palette.attention())
+            controls::body(text.clone())
+                .foreground(ThemeBrush::SystemCritical)
                 .horizontal_alignment(HorizontalAlignment::Center)
                 .text_wrapping(TextWrapping::Wrap)
                 .is_text_selection_enabled(true)
@@ -623,30 +617,14 @@ impl DesktopApp {
                     .spacing(tokens::spacing::MD)
                     .keyed_children(crate::views::slots([
                         Some(
-                            Border::new()
-                                .horizontal_alignment(HorizontalAlignment::Center)
-                                .content(m3::carrier(
-                                    palette,
-                                    |s| s.primary,
-                                    "Eliot Swarm",
-                                    tokens::layout::MARK_LARGE,
-                                    m3::shape(
-                                        crate::brand::SHAPE_CLOVER,
-                                        tokens::layout::MARK_LARGE,
-                                    ),
-                                ))
-                                .into(),
-                        ),
-                        Some(
-                            m3::text(title, tokens::text::PAGE)
+                            controls::text(title, tokens::text::PAGE)
                                 .automation_heading_level(AutomationHeadingLevel::Level1)
                                 .horizontal_alignment(HorizontalAlignment::Center)
                                 .text_wrapping(TextWrapping::Wrap)
                                 .into(),
                         ),
                         Some(
-                            m3::body(sentence)
-                                .foreground(palette.muted())
+                            controls::body(sentence)
                                 .horizontal_alignment(HorizontalAlignment::Center)
                                 .text_wrapping(TextWrapping::Wrap)
                                 .is_text_selection_enabled(true)
@@ -662,10 +640,10 @@ impl DesktopApp {
                                     text_action("Repair settings", ShellMsg::RepairSettings),
                                     text_action("Open config.toml", ShellMsg::OpenStartupConfig),
                                     text_action("Open log", ShellMsg::OpenStartupLog),
-                                    m3::text_button(palette)
+                                    controls::text_button()
                                         .automation_name(format!("Open data folder: {data_dir}"))
                                         .on_click(shell(ShellMsg::OpenDataFolder))
-                                        .content(m3::label("Open data folder")),
+                                        .content(controls::label("Open data folder")),
                                 ))
                                 .into(),
                         ),
@@ -693,11 +671,7 @@ impl DesktopApp {
     }
 
     /// Confirm the last choice: a new, empty data directory.
-    pub(super) fn fresh_confirmation(
-        &self,
-        context: &mut ViewContext<Self>,
-        palette: Palette,
-    ) -> ContentDialog {
+    pub(super) fn fresh_confirmation(&self, context: &mut ViewContext<Self>) -> ContentDialog {
         let current = self
             .data_dir
             .as_ref()
@@ -705,9 +679,8 @@ impl DesktopApp {
         super::dialog_ui::surface(
             context,
             self.dialog.epoch,
-            palette,
             "Start over in a new empty data directory?".to_owned(),
-            m3::secondary(format!(
+            controls::secondary(format!(
                 "Swarm creates a new private data directory with no chats, Agents or settings \
                  and starts there. {current} stays as it is; use “Use another data directory…” \
                  to return to it. The new directory is remembered once Swarm runs in it."
@@ -715,18 +688,18 @@ impl DesktopApp {
             .text_wrapping(TextWrapping::Wrap)
             .into(),
             super::dialog_ui::actions(
-                m3::text_button(palette)
+                controls::text_button()
                     .element_ref(&self.dialog.close)
                     .automation_name("Cancel")
                     .on_click(context.message(Message::Shell(ShellMsg::FreshConfirmed(false))))
-                    .content(m3::label("Cancel"))
+                    .content(controls::label("Cancel"))
                     .into(),
                 View::from(
-                    m3::filled(palette)
+                    controls::filled()
                         .element_ref(&self.dialog.primary)
                         .automation_name("Create empty data directory")
                         .on_click(context.message(Message::Shell(ShellMsg::FreshConfirmed(true))))
-                        .content(m3::label("Create and start")),
+                        .content(controls::label("Create and start")),
                 ),
             ),
             tokens::layout::DIALOG_WIDTH,

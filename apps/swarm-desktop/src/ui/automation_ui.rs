@@ -273,8 +273,8 @@ impl CardState {
     }
 
     /// The tone of the status dot.
-    pub(super) fn tone(&self) -> crate::theme::StatusTone {
-        use crate::theme::StatusTone;
+    pub(super) fn tone(&self) -> crate::controls::StatusTone {
+        use crate::controls::StatusTone;
         match self {
             Self::Running => StatusTone::Active,
             Self::Failed(_) => StatusTone::Failed,

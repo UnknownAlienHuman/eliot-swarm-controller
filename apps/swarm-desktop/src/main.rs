@@ -18,9 +18,7 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
 #[cfg(windows)]
-mod accessibility;
-#[cfg(windows)]
-mod app_resources;
+mod app_window;
 #[cfg(windows)]
 mod autonomy_view;
 #[cfg(windows)]
@@ -30,21 +28,17 @@ mod config_view;
 #[cfg(windows)]
 mod configure;
 #[cfg(windows)]
+mod controls;
+#[cfg(windows)]
+mod elements;
+#[cfg(windows)]
 mod file_dialog;
 #[cfg(windows)]
 mod flyout;
 #[cfg(windows)]
-mod fonts;
-#[cfg(windows)]
-mod m3;
-#[cfg(windows)]
 mod monitor_view;
 #[cfg(windows)]
-mod motion;
-#[cfg(windows)]
 mod reparent;
-#[cfg(windows)]
-mod shadow;
 #[cfg(windows)]
 mod shortcuts;
 #[cfg(windows)]
@@ -62,11 +56,6 @@ mod winrt;
 
 #[cfg_attr(not(windows), allow(dead_code, reason = "used only by the Windows UI"))]
 mod attachments;
-#[allow(
-    dead_code,
-    reason = "the brand book defines tokens the desktop does not use yet"
-)]
-mod brand;
 #[cfg_attr(not(windows), allow(dead_code, reason = "used only by the Windows UI"))]
 mod chat;
 #[cfg_attr(not(windows), allow(dead_code, reason = "used only by the Windows UI"))]
@@ -101,8 +90,6 @@ mod settings;
 mod settings_model;
 #[cfg_attr(not(windows), allow(dead_code, reason = "used only by the Windows UI"))]
 mod state;
-#[cfg_attr(not(windows), allow(dead_code, reason = "used only by the Windows UI"))]
-mod theme;
 #[cfg_attr(not(windows), allow(dead_code, reason = "used only by the Windows UI"))]
 #[path = "ui/tokens.rs"]
 mod tokens;

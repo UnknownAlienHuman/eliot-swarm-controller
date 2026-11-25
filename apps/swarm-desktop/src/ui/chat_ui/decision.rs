@@ -295,7 +295,6 @@ impl DesktopApp {
         &self,
         column: Option<f64>,
         context: &mut ViewContext<Self>,
-        palette: Palette,
     ) -> Option<View> {
         let items = self.decisions();
         if items.is_empty() {
@@ -315,13 +314,13 @@ impl DesktopApp {
             Some(turn) if !detail.observe_only => {
                 let agent = self.selected_agent_id().unwrap_or_default();
                 Some(
-                    m3::text_button(palette)
+                    controls::text_button()
                         .is_enabled(enabled)
                         .automation_name("Stop turn")
                         .on_click(context.message(Message::Chat(ChatMsg::InterruptRequested(
                             BoundAction::turn_control(&agent, detail.generation, turn),
                         ))))
-                        .content(m3::label("Stop turn"))
+                        .content(controls::label("Stop turn"))
                         .into(),
                 )
             }
@@ -330,7 +329,7 @@ impl DesktopApp {
         let snooze =
             |item: Option<&OwnerInboxItem>, context: &mut ViewContext<Self>| -> Option<View> {
                 item.map(|item| {
-                    m3::icon_button(palette)
+                    controls::icon_button()
                         .is_enabled(enabled)
                         .automation_name("Snooze")
                         .on_click(context.message(Message::Chat(ChatMsg::OwnerDecide(
@@ -342,7 +341,7 @@ impl DesktopApp {
                             "snooze".to_owned(),
                             "Snooze".to_owned(),
                         ))))
-                        .content(m3::icon(m3::glyph::SNOOZE))
+                        .content(controls::icon(controls::glyph::SNOOZE))
                         .tooltip("Snooze")
                 })
             };
@@ -405,16 +404,15 @@ impl DesktopApp {
                     ),
                     KeyedView::new(
                         "deny",
-                        m3::outlined_small(palette)
+                        controls::outlined_small()
                             .grid_column(3)
                             .is_enabled(enabled)
                             .automation_name(deny_label.clone())
                             .on_click(context.message(deny_message))
-                            .content(m3::label(&deny_label)),
+                            .content(controls::label(&deny_label)),
                     ),
                 ]);
                 let split = split_action(
-                    palette,
                     enabled,
                     &approve_label,
                     context.message(approve),
@@ -426,7 +424,7 @@ impl DesktopApp {
                     Border::new().grid_column(4).content(split),
                 ));
                 (
-                    m3::glyph::TERMINAL,
+                    controls::glyph::TERMINAL,
                     format!("Approval \u{b7} {harness}{count}"),
                     question,
                     subject,
@@ -443,13 +441,13 @@ impl DesktopApp {
                     .map(|question| {
                         KeyedView::new(
                             question.id.clone(),
-                            self.question_view(&key, question, context, palette),
+                            self.question_view(&key, question, context),
                         )
                     })
                     .collect();
                 let body: Option<View> = if secret {
                     Some(
-                        m3::body("Answer this question in the agent's own application.")
+                        controls::body("Answer this question in the agent's own application.")
                             .text_wrapping(TextWrapping::Wrap)
                             .into(),
                     )
@@ -465,14 +463,14 @@ impl DesktopApp {
                     None
                 } else {
                     Some(
-                        m3::filled(palette)
+                        controls::filled()
                             .grid_column(4)
                             .is_enabled(enabled && can_answer(request, &self.chat.answers))
                             .automation_name("Answer")
                             .on_click(context.message(Message::Chat(ChatMsg::AnswerRequested(
                                 (*request).clone(),
                             ))))
-                            .content(m3::label("Answer"))
+                            .content(controls::label("Answer"))
                             .into(),
                     )
                 };
@@ -485,7 +483,7 @@ impl DesktopApp {
                             .keyed_children(crate::views::slots([
                                 stop,
                                 Some(
-                                    m3::text_button(palette)
+                                    controls::text_button()
                                         .is_enabled(enabled)
                                         .automation_name("Cancel request")
                                         .on_click(context.message(Message::Chat(
@@ -495,7 +493,7 @@ impl DesktopApp {
                                                 None,
                                             ),
                                         )))
-                                        .content(m3::label("Cancel request"))
+                                        .content(controls::label("Cancel request"))
                                         .into(),
                                 ),
                             ])),
@@ -510,7 +508,7 @@ impl DesktopApp {
                 ];
                 actions.extend(answer.map(|answer| KeyedView::new("answer", answer)));
                 (
-                    m3::glyph::INFO,
+                    controls::glyph::INFO,
                     format!(
                         "{} \u{b7} {harness}{count}",
                         if secret {
@@ -556,9 +554,9 @@ impl DesktopApp {
                         words.clone(),
                     )));
                     let button = if Some(choice) == recommended.as_deref() {
-                        m3::filled(palette)
+                        controls::filled()
                     } else {
-                        m3::outlined_small(palette)
+                        controls::outlined_small()
                     };
                     buttons.push(KeyedView::new(
                         choice.to_owned(),
@@ -566,10 +564,10 @@ impl DesktopApp {
                             .is_enabled(enabled && reason_ready)
                             .automation_name(format!("Resolve as {words}"))
                             .on_click(decide)
-                            .content(m3::label(&words)),
+                            .content(controls::label(&words)),
                     ));
                 }
-                let body = m3::field()
+                let body = controls::field()
                     .text(self.chat.decide_reason.clone())
                     .placeholder_text("Why (required)")
                     .automation_name("Reason for the outcome")
@@ -604,7 +602,7 @@ impl DesktopApp {
                     "This command's outcome is unknown"
                 };
                 (
-                    m3::glyph::ERROR,
+                    controls::glyph::ERROR,
                     format!(
                         "{} \u{b7} {harness}{count}",
                         if item.kind == OwnerInboxKind::UnknownTurn {
@@ -629,16 +627,16 @@ impl DesktopApp {
                     .grid_column(2)
                     .orientation(Orientation::Horizontal)
                     .children((
-                        m3::icon_button(palette)
+                        controls::icon_button()
                             .is_enabled(at > 0)
                             .automation_name("Previous request")
                             .on_click(context.message(Message::Chat(ChatMsg::DecisionStep(-1))))
-                            .content(m3::icon(m3::glyph::CHEVRON_LEFT)),
-                        m3::icon_button(palette)
+                            .content(controls::icon(controls::glyph::CHEVRON_LEFT)),
+                        controls::icon_button()
                             .is_enabled(at + 1 < items.len())
                             .automation_name("Next request")
                             .on_click(context.message(Message::Chat(ChatMsg::DecisionStep(1))))
-                            .content(m3::icon(m3::glyph::CHEVRON_RIGHT)),
+                            .content(controls::icon(controls::glyph::CHEVRON_RIGHT)),
                     ))
                     .into(),
             )
@@ -650,17 +648,11 @@ impl DesktopApp {
             .columns([GridLength::Auto, GridLength::STAR, GridLength::Auto])
             .column_spacing(tokens::spacing::CHIP_GAP)
             .keyed_children(crate::views::slots([
-                Some(m3::carrier(
-                    palette,
-                    |s| s.tertiary,
-                    "",
-                    tokens::icon::CHEVRON,
-                    m3::xs_icon(glyph),
-                )),
+                Some(controls::xs_icon(glyph)),
                 Some(
-                    m3::text(kind.clone(), tokens::text::LABEL)
+                    controls::text(kind.clone(), tokens::text::LABEL)
                         .grid_column(1)
-                        .foreground(palette.tertiary())
+                        .foreground(ThemeBrush::AccentText)
                         .vertical_alignment(VerticalAlignment::Center)
                         .text_trimming(TextTrimming::CharacterEllipsis)
                         .into(),
@@ -672,13 +664,13 @@ impl DesktopApp {
         } else {
             Some(
                 Border::new()
-                    .background(palette.code())
-                    .border_brush(palette.outline())
+                    .background(ThemeBrush::CardBackground)
+                    .border_brush(ThemeBrush::CardStroke)
                     .border_thickness(Thickness::uniform(tokens::layout::HAIRLINE))
                     .corner_radius(tokens::radius::CONTAINER)
                     .padding(Thickness::xy(tokens::spacing::INSET, tokens::spacing::SM))
                     .content(
-                        m3::body(subject)
+                        controls::body(subject)
                             .font_size(tokens::text::KID_SIZE)
                             .text_wrapping(TextWrapping::Wrap)
                             .is_text_selection_enabled(true),
@@ -687,10 +679,10 @@ impl DesktopApp {
             )
         };
         let card = Border::new()
-            .background(palette.composer())
-            .border_brush(palette.tertiary())
+            .background(ThemeBrush::CardBackground)
+            .border_brush(ThemeBrush::Accent)
             .border_thickness(Thickness::uniform(tokens::layout::DECISION_OUTLINE))
-            .corner_radius(tokens::radius::COMPOSER)
+            .corner_radius(tokens::radius::CONTAINER)
             .padding(Thickness::new(
                 tokens::layout::DECISION_LEADING,
                 tokens::spacing::SM,
@@ -704,7 +696,7 @@ impl DesktopApp {
                     .keyed_children(crate::views::slots([
                         Some(kind_line.into()),
                         Some(
-                            m3::body(question)
+                            controls::body(question)
                                 .text_wrapping(TextWrapping::Wrap)
                                 .is_text_selection_enabled(true)
                                 .into(),
@@ -753,7 +745,6 @@ impl DesktopApp {
         request: &str,
         question: &eliot_core::requests::Question,
         context: &mut ViewContext<Self>,
-        palette: Palette,
     ) -> View {
         let values = self
             .chat
@@ -773,29 +764,29 @@ impl DesktopApp {
             None
         } else {
             Some(
-                m3::text_button(palette)
+                controls::text_button()
                     .horizontal_alignment(HorizontalAlignment::Left)
                     .on_click(context.message(Message::Chat(ChatMsg::AnswerChanged(
                         request.clone(),
                         id.clone(),
                         Vec::new(),
                     ))))
-                    .content(m3::label("Leave unanswered"))
+                    .content(controls::label("Leave unanswered"))
                     .into(),
             )
         };
         let control: View = match question.kind {
             _ if question.is_secret => {
-                m3::body("Answer this question in the agent's own application.").into()
+                controls::body("Answer this question in the agent's own application.").into()
             }
-            QuestionKind::Resource => m3::body(
+            QuestionKind::Resource => controls::body(
                 "This step needs action in the agent's own application. You can cancel this request here.",
             )
             .text_wrapping(TextWrapping::Wrap)
             .into(),
             QuestionKind::Number | QuestionKind::Text => {
                 let before = values.first().cloned().unwrap_or_default();
-                m3::field()
+                controls::field()
                     .text(before.clone())
                     .placeholder_text(if question.kind == QuestionKind::Number {
                         "Enter a number"
@@ -836,14 +827,14 @@ impl DesktopApp {
                         let on = selected.as_deref() == Some(option.as_str());
                         KeyedView::new(
                             format!("{option}:{on}"),
-                            m3::segment(palette, on)
+                            controls::segment(on)
                                 .automation_name(label.clone())
                                 .on_click(context.message(Message::Chat(ChatMsg::AnswerChanged(
                                     request.clone(),
                                     id.clone(),
                                     vec![option.clone()],
                                 ))))
-                                .content(m3::segment_label(label)),
+                                .content(controls::segment_label(label)),
                         )
                     })
                     .collect();
@@ -861,7 +852,7 @@ impl DesktopApp {
                         .spacing(tokens::spacing::SM)
                         .children((
                             chips,
-                            m3::field()
+                            controls::field()
                                 .text(before.clone())
                                 .placeholder_text("Other answer")
                                 .automation_name("Other answer")
@@ -909,7 +900,7 @@ impl DesktopApp {
                                         transcript::multiple_toggle(selected.clone(), &option_id, on),
                                     ))
                                 })))
-                                .content(m3::label(&option.label)),
+                                .content(controls::label(&option.label)),
                         )
                     })
                     .collect();
@@ -924,7 +915,7 @@ impl DesktopApp {
                         question.options.iter().map(|option| option.id.clone()).collect();
                     controls.push(KeyedView::new(
                         "free",
-                        m3::field()
+                        controls::field()
                             .text(other.clone())
                             .accepts_return(true)
                             .placeholder_text("Other answer")
@@ -948,7 +939,7 @@ impl DesktopApp {
         };
         let title: Option<View> = match question.title.as_deref().zip(question.prompt.as_deref()) {
             Some((title, _)) if !title.trim().is_empty() => Some(
-                m3::text(title.to_owned(), tokens::text::BUTTON)
+                controls::text(title.to_owned(), tokens::text::BUTTON)
                     .text_wrapping(TextWrapping::Wrap)
                     .into(),
             ),
@@ -960,7 +951,7 @@ impl DesktopApp {
                 title,
                 match question.prompt.as_deref() {
                     Some(prompt) if !prompt.trim().is_empty() => Some(
-                        m3::body(prompt.to_owned())
+                        controls::body(prompt.to_owned())
                             .text_wrapping(TextWrapping::Wrap)
                             .into(),
                     ),
@@ -972,16 +963,12 @@ impl DesktopApp {
             .into()
     }
 
-    /// The provider-hold strip above the composer (`AttentionStrip`,
-    /// `tertiary-container`): the hold in one line, then by its kind Wait
+    /// The provider-hold strip above the composer (`AttentionStrip`): the
+    /// hold in one line, then by its kind Wait
     /// and Switch model (a limit), Sign in (a sign-in), Pick another model
     /// (a removed or mismatched model), and the corrective choices in a
     /// menu, each with the daemon's evidence code.
-    pub(super) fn hold_strip(
-        &self,
-        context: &mut ViewContext<Self>,
-        palette: Palette,
-    ) -> Option<View> {
+    pub(super) fn hold_strip(&self, context: &mut ViewContext<Self>) -> Option<View> {
         use eliot_core::ProviderRestrictionKind as Kind;
         let agent = self.selected_agent_id()?;
         let detail = self.bound_detail().ok()?;
@@ -1027,34 +1014,33 @@ impl DesktopApp {
                     .orientation(Orientation::Horizontal)
                     .spacing(tokens::spacing::SM)
                     .children((
-                        m3::text_button(palette)
-                            .resource_overrides(palette.strip_button())
+                        controls::text_button()
                             .automation_name("Wait")
                             .on_click(context.message(Message::Chat(ChatMsg::HoldWait)))
-                            .content(m3::label("Wait")),
-                        m3::tonal(palette)
+                            .content(controls::label("Wait")),
+                        controls::tonal()
                             .is_enabled(enabled)
                             .automation_name("Switch model")
                             .on_click(context.message(Message::Chat(ChatMsg::AgentMenu(
                                 menu_ui::Action::Handoff,
                             ))))
-                            .content(m3::label("Switch model")),
+                            .content(controls::label("Switch model")),
                     ))
                     .into()
             }
-            Kind::Auth => m3::tonal(palette)
+            Kind::Auth => controls::tonal()
                 .is_enabled(enabled)
                 .automation_name(format!("Sign in to {harness}"))
                 .on_click(context.message(Message::Chat(ChatMsg::SignIn)))
-                .content(m3::label("Sign in"))
+                .content(controls::label("Sign in"))
                 .into(),
-            Kind::ModelRemoved | Kind::ModelMismatch => m3::tonal(palette)
+            Kind::ModelRemoved | Kind::ModelMismatch => controls::tonal()
                 .is_enabled(enabled)
                 .automation_name("Pick another model")
                 .on_click(
                     context.message(Message::Chat(ChatMsg::AgentMenu(menu_ui::Action::Handoff))),
                 )
-                .content(m3::label("Pick another model"))
+                .content(controls::label("Pick another model"))
                 .into(),
         };
         let items: Vec<MenuItem> = HOLD_CLEARS
@@ -1067,10 +1053,11 @@ impl DesktopApp {
                 }
             })
             .collect();
-        let (container, on) = palette.strip();
         Some(
             Border::new()
-                .background(container)
+                .background(ThemeBrush::CardBackground)
+                .border_brush(ThemeBrush::CardStroke)
+                .border_thickness(Thickness::uniform(tokens::layout::HAIRLINE))
                 .corner_radius(tokens::radius::CONTAINER)
                 .padding(Thickness::new(
                     tokens::spacing::INSET,
@@ -1089,37 +1076,28 @@ impl DesktopApp {
                         ])
                         .column_spacing(tokens::spacing::ROW)
                         .children((
-                            m3::carrier(
-                                palette,
-                                |s| s.on_tertiary_container,
-                                "",
-                                tokens::icon::ROW,
-                                m3::icon(m3::glyph::HOLD),
-                            ),
+                            controls::icon(controls::glyph::HOLD),
                             StackPanel::new()
                                 .grid_column(1)
                                 .orientation(Orientation::Horizontal)
                                 .spacing(tokens::spacing::XS)
                                 .vertical_alignment(VerticalAlignment::Center)
                                 .children((
-                                    m3::text(lead, tokens::text::BUTTON).foreground(on),
-                                    m3::body(rest)
-                                        .foreground(on)
-                                        .text_trimming(TextTrimming::CharacterEllipsis),
+                                    controls::text(lead, tokens::text::BUTTON),
+                                    controls::body(rest).text_trimming(TextTrimming::CharacterEllipsis),
                                 )),
                             Border::new()
                                 .grid_column(2)
                                 .vertical_alignment(VerticalAlignment::Center)
                                 .content(primary),
-                            m3::icon_button(palette)
-                                .resource_overrides(palette.strip_button())
+                            controls::icon_button()
                                 .grid_column(3)
                                 .automation_name(if scope {
                                     "Other options: I've signed in, I've fixed the settings, Clear anyway"
                                 } else {
                                     "Other options (the hold's scope is not read yet)"
                                 })
-                                .content(m3::icon(m3::glyph::MORE_VERTICAL))
+                                .content(controls::icon(controls::glyph::MORE_VERTICAL))
                                 .menu(Menu::new(
                                     items,
                                     crate::views::menu_keys(context.callback(|label: String| {
@@ -1138,7 +1116,7 @@ impl DesktopApp {
 
     /// The workers line above a manager's composer: "2 workers running ·
     /// 1 waiting for you" (its `nav` rows).
-    pub(super) fn workers_line(&self, palette: Palette) -> Option<View> {
+    pub(super) fn workers_line(&self) -> Option<View> {
         let agent = self.selected_agent_id()?;
         let kids: Vec<&UiAgent> = self
             .nav
@@ -1186,9 +1164,8 @@ impl DesktopApp {
                         .spacing(tokens::spacing::SM)
                         .vertical_alignment(VerticalAlignment::Center)
                         .children((
-                            m3::muted_icon(m3::glyph::HUB),
-                            m3::text(words, tokens::text::LABEL)
-                                .foreground(palette.muted())
+                            controls::muted_icon(controls::glyph::HUB),
+                            controls::text(words, tokens::text::LABEL)
                                 .vertical_alignment(VerticalAlignment::Center),
                         )),
                 )
@@ -1201,11 +1178,7 @@ impl DesktopApp {
     /// reconnects in a row it says Swarm is not answering and offers Start
     /// Swarm (the startup path on this data directory, which starts a
     /// daemon only when none answers); the feed keeps retrying meanwhile.
-    pub(super) fn live_line(
-        &self,
-        context: &mut ViewContext<Self>,
-        palette: Palette,
-    ) -> Option<View> {
+    pub(super) fn live_line(&self, context: &mut ViewContext<Self>) -> Option<View> {
         let start = self.chat.live.offers_start();
         let (words, retry) = match &self.chat.live {
             LiveStatus::Stale(_) => ("Catching up…".to_owned(), false),
@@ -1225,25 +1198,25 @@ impl DesktopApp {
                 .automation_name(words.clone())
                 .keyed_children(crate::views::slots([
                     Some(
-                        m3::secondary(words)
+                        controls::secondary(words)
                             .vertical_alignment(VerticalAlignment::Center)
                             .text_trimming(TextTrimming::CharacterEllipsis)
                             .into(),
                     ),
                     if retry {
                         Some(
-                            m3::text_button(palette)
+                            controls::text_button()
                                 .automation_name("Retry live updates")
                                 .on_click(context.message(Message::Chat(ChatMsg::LiveRetry)))
-                                .content(m3::label("Retry"))
+                                .content(controls::label("Retry"))
                                 .into(),
                         )
                     } else if start {
                         Some(
-                            m3::text_button(palette)
+                            controls::text_button()
                                 .automation_name("Start Swarm")
                                 .on_click(context.message(Message::Shell(ShellMsg::RetryStartup)))
-                                .content(m3::label("Start Swarm"))
+                                .content(controls::label("Start Swarm"))
                                 .into(),
                         )
                     } else {
@@ -1258,19 +1231,18 @@ impl DesktopApp {
 /// A filled split action (`SplitButton`): the main choice and, 2 DIPs after
 /// it, the menu of its variants (none: the main choice alone).
 fn split_action(
-    palette: Palette,
     enabled: bool,
     label: &str,
     click: Callback<()>,
     more: Vec<MenuItem>,
     context: &mut ViewContext<DesktopApp>,
 ) -> View {
-    let main = m3::filled(palette)
+    let main = controls::filled()
         .is_enabled(enabled)
         .automation_name(label)
         .on_click(click)
         .content(
-            m3::text(label.to_owned(), tokens::text::EMPHASIZED).margin(Thickness::xy(
+            controls::text(label.to_owned(), tokens::text::EMPHASIZED).margin(Thickness::xy(
                 tokens::spacing::MD - tokens::spacing::ROW,
                 0.0,
             )),
@@ -1279,12 +1251,12 @@ fn split_action(
         None
     } else {
         Some(
-            m3::icon_button(palette)
-                .resource_overrides(palette.filled())
+            controls::icon_button()
+                .style(ButtonStyle::Accent)
                 .width(tokens::layout::SPLIT_MENU)
                 .is_enabled(enabled)
                 .automation_name("Approval options")
-                .content(m3::icon(m3::glyph::CHEVRON_DOWN))
+                .content(controls::icon(controls::glyph::CHEVRON_DOWN))
                 .menu(Menu::new(
                     more,
                     // Capture-free: one identity across renders; the label

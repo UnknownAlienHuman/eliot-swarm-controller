@@ -1,10 +1,9 @@
-//! The one shell (`screens.css`): on the `surface-container` window
-//! ground, the sidebar (New task, the places Search, Inbox, Agents and
-//! Automations, the projects with their tasks and workers, Chats, then
-//! Show archived, Usage and Settings) and one raised `surface` card holding
-//! the main area (a conversation, a project page or Settings) and the
-//! optional right pane (the fleet view, the Inbox or the open Agent's
-//! details).
+//! The one shell (`screens.css`): on the window's base, the sidebar (New
+//! task, the places Search, Inbox, Agents and Automations, the projects
+//! with their tasks and workers, Chats, then Show archived, Usage and
+//! Settings) and one card holding the main area (a conversation, a project
+//! page or Settings) and the optional right pane (the fleet view, the Inbox
+//! or the open Agent's details).
 
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 
@@ -12,11 +11,10 @@ use super::sidebar_ui::{
     AgentsEntry, InboxEntry, PlaceEntry, Renaming, SearchField, SidebarInput, TaskEntry,
 };
 use super::*;
+use crate::controls::StatusTone;
 use crate::nav::{Branch, Checkout, Fleet, Row, Shown};
 use crate::settings::{Startup, ThemeChoice};
 use crate::shortcuts::{Input, Shortcut};
-use crate::theme::StatusTone;
-use crate::theme::winui::Palette;
 
 /// What the main area shows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -221,8 +219,6 @@ pub(super) enum ShellMsg {
     /// The Settings navigation's Back row: the conversation again.
     SettingsClosed,
     PanelToggled(Panel),
-    /// The window's actual Light/Dark scheme (Reactor `on_color_scheme`).
-    SchemeObserved(ColorScheme),
     /// The window's client size (Reactor `on_window_size`).
     WindowResized(WindowSize),
     ThemeChosen(ThemeChoice),
@@ -299,37 +295,13 @@ const ATTENTION_STATES: [eliot_core::AgentState; 6] = [
     eliot_core::AgentState::Unknown,
 ];
 
-/// WinUI's own templates and the title bar take the theme's polarity.
+/// The window's theme: WinUI's own controls, theme resources and the
+/// system title bar follow it; under High Contrast Windows' colors apply.
 fn window_theme(choice: ThemeChoice) -> WindowTheme {
     match choice {
         ThemeChoice::System => WindowTheme::System,
-        other if other.theme(false).dark() => WindowTheme::Dark,
-        _ => WindowTheme::Light,
-    }
-}
-
-/// The scheme the window actually shows, High Contrast, and whether
-/// Windows plays animations (the control templates' motion).
-pub(super) struct Appearance {
-    pub(super) dark: bool,
-    pub(super) high_contrast: bool,
-    pub(super) animations: bool,
-}
-
-impl Appearance {
-    pub(super) fn new() -> Self {
-        let (high_contrast, animations) = crate::shortcuts::read_accessibility();
-        Self {
-            dark: false,
-            high_contrast,
-            animations,
-        }
-    }
-
-    /// The palette of `choice` on this window (System follows its
-    /// observed Light/Dark scheme).
-    pub(super) fn palette(&self, choice: ThemeChoice) -> theme::winui::Palette {
-        theme::winui::Palette::new(choice.theme(self.dark), self.high_contrast)
+        ThemeChoice::Light => WindowTheme::Light,
+        ThemeChoice::Dark => WindowTheme::Dark,
     }
 }
 
@@ -482,9 +454,7 @@ impl DesktopApp {
                 Ok((discovered, read, acl_repaired)) => {
                     self.startup_error = None;
                     let restarted = self.link_ready(context);
-                    let before = self.palette();
                     self.prefs = crate::settings::Preferences::from_reply(&read);
-                    self.palette_changed(before, context);
                     self.nav.collapsed = self.prefs.collapsed.iter().cloned().collect();
                     self.launch_preferences_loaded();
                     self.seed_settings(read, context);
@@ -958,29 +928,10 @@ impl DesktopApp {
                 Panel::Closed => self.close_panel(),
                 panel => self.choose_panel(panel, context),
             },
-            ShellMsg::SchemeObserved(scheme) => {
-                let before = self.palette();
-                let contrast_before = self.appearance.high_contrast;
-                self.appearance.dark = scheme == ColorScheme::Dark;
-                // High Contrast (and animation effects) through the reading
-                // the settings hook keeps, so its next comparison starts
-                // from what the window shows and never sends a no-op, and
-                // through their one writer, which rebuilds on a change.
-                let (high_contrast, animations) = crate::shortcuts::read_accessibility();
-                self.accessibility_changed(high_contrast, animations, context);
-                // A Light/Dark change alone (a High Contrast change was
-                // rebuilt above).
-                if high_contrast == contrast_before {
-                    self.palette_changed(before, context);
-                }
-                // The first observation colors the title bar even when the
-                // palette is the starting one.
-                self.sync_title_bar();
-            }
             ShellMsg::WindowResized(size) => {
                 self.window_width = Some(size.width);
                 self.window_height = Some(size.height);
-                self.sync_title_bar();
+                self.sync_icon();
                 // A maximized size is not the size the window restores to.
                 if size.width >= 640.0 && size.height >= 480.0 && !crate::window_place::maximized()
                 {
@@ -992,14 +943,14 @@ impl DesktopApp {
                     }
                 }
             }
-            ShellMsg::ThemeChosen(theme) => {
-                let before = self.palette();
+            // The list reports the value it shows when it is built: only a
+            // change saves. WinUI redraws in the new theme by itself.
+            ShellMsg::ThemeChosen(theme) if theme != self.prefs.theme => {
                 self.prefs.theme = theme;
                 self.prefs_rev += 1;
                 self.save_preferences(context);
-                // A theme of the same polarity raises no scheme change.
-                self.palette_changed(before, context);
             }
+            ShellMsg::ThemeChosen(_) => {}
             // The list reports the value it shows when it is built: only a
             // change saves.
             ShellMsg::StartupChosen(startup) if startup != self.prefs.startup => {
@@ -1120,12 +1071,6 @@ impl DesktopApp {
                         self.launch_update(LaunchMsg::Closed(epoch), context);
                         self.menu_update(MenuMsg::Closed(epoch), context);
                     }
-                    // Windows changed High Contrast or animation effects:
-                    // before the dialog arm, as the window follows either way.
-                    Shortcut::Accessibility {
-                        high_contrast,
-                        animations,
-                    } => self.accessibility_changed(high_contrast, animations, context),
                     // Before the dialog arm: the notice shows either way.
                     Shortcut::Panicked => {
                         self.alert(
@@ -1164,13 +1109,13 @@ impl DesktopApp {
                     }
                     Shortcut::Popover(key) => self.launch_update(LaunchMsg::Key(key), context),
                     Shortcut::FocusMoved => {
-                        let row = crate::motion::resolve_focused_row();
+                        let row = crate::elements::resolve_focused_row();
                         if self.menu.focused != row {
                             self.menu.focused = row;
                         }
                     }
                     Shortcut::RowMenu => {
-                        if let Some((row, x, y)) = crate::motion::focused_row_anchor()
+                        if let Some((row, x, y)) = crate::elements::focused_row_anchor()
                             && let Some(target) = self.row_target(&row)
                         {
                             self.menu_update(MenuMsg::Requested(target, x, y, true), context);
@@ -1297,68 +1242,11 @@ impl DesktopApp {
         }
     }
 
-    /// Write the shown scheme's M3 roles at the application root (removed
-    /// under High Contrast), before the palette-keyed tree is rebuilt.
-    /// Rebuild with the new palette when it differs from `before`.
-    pub(super) fn palette_changed(
-        &mut self,
-        before: theme::winui::Palette,
-        context: &ComponentContext<Self>,
-    ) {
-        if self.palette() != before {
-            // The palette-keyed tree is rebuilt with new controls; what was
-            // typed stays in the model and is drawn into them (the search
-            // text at once, the multi-line editors after a re-prime).
-            self.apply_scheme();
-            self.reprime_fields(context);
-        }
-    }
-
-    /// Windows changed High Contrast or animation effects (Reactor 0.100.0
-    /// reports neither; `crate::shortcuts` hears Windows announce it, and a
-    /// scheme change reads them too). The one writer of both.
-    /// Either rebuilds the tree, keyed by both, with new controls that keep
-    /// what was typed.
-    fn accessibility_changed(
-        &mut self,
-        high_contrast: bool,
-        animations: bool,
-        context: &ComponentContext<Self>,
-    ) {
-        if high_contrast != self.appearance.high_contrast {
-            self.appearance.high_contrast = high_contrast;
-            self.apply_scheme();
-            self.reprime_fields(context);
-        }
-        if animations != self.appearance.animations {
-            // New templates, which only new controls take.
-            self.appearance.animations = animations;
-            if let Err(error) = crate::app_resources::apply_animations(animations) {
-                self.set_status(format!("WinUI motion not applied: {error}"));
-            }
-            self.reprime_fields(context);
-        }
-    }
-
-    fn apply_scheme(&mut self) {
-        if let Err(error) = crate::app_resources::apply_scheme(self.palette().roles()) {
-            self.set_status(format!("WinUI M3 resources not applied: {error}"));
-        }
-        self.sync_title_bar();
-    }
-
-    /// Color the title bar in the shown palette once the window exists and
-    /// whenever the palette changes (a runtime theme switch, High Contrast).
-    /// Until the window is shown the colors stay pending and the next scheme
-    /// or size observation tries again.
-    fn sync_title_bar(&mut self) {
-        let palette = self.palette();
-        if self.title_bar == Some(palette) {
-            return;
-        }
-        match crate::app_resources::apply_title_bar(palette.roles()) {
-            Ok(()) => self.title_bar = Some(palette),
-            Err(error) => self.set_status(format!("Title bar colors not applied: {error}")),
+    /// Give the window its icon once it is shown; until then the next size
+    /// observation tries again.
+    fn sync_icon(&mut self) {
+        if !self.icon_set {
+            self.icon_set = crate::app_window::set_icon();
         }
     }
 
@@ -2456,36 +2344,28 @@ impl DesktopApp {
                 )
                 .theme(window_theme(self.prefs.theme)),
         );
-        context.on_color_scheme(
-            context.callback(|scheme| Message::Shell(ShellMsg::SchemeObserved(scheme))),
-        );
         context
             .on_window_size(context.callback(|size| Message::Shell(ShellMsg::WindowResized(size))));
-        let palette = self.palette();
-        m3::set_palette(palette);
 
         let main: View = match self.main {
             main if main != Main::Settings && self.link_view_shown() => {
-                self.startup_error_view(context, palette)
+                self.startup_error_view(context)
             }
             // Settings and the pages are drawn in the conversation's
             // place, which keeps its transcript (see `chat_view`).
-            _ => self.chat_view(context, palette),
+            _ => self.chat_view(context),
         };
         // Settings always shows its navigation; tasks may hide the sidebar
         // to its rail.
         let rail = self.rail_shown();
-        // The main card (`screens.css` `.card-main`): `surface` at the
-        // extra-large corner, lifted to `elevation-1`, 8 DIPs from the
-        // window's top, right and bottom edges, beside the sidebar on the
-        // `surface-container` ground. The page or conversation and the
-        // right pane sit inside it.
+        // The main card: a card surface on the window's base, 8 DIPs from
+        // the window's top, right and bottom edges, beside the sidebar. The
+        // page or conversation and the right pane sit inside it.
         let radius = tokens::layout::CARD_RADIUS;
         let mut card_columns = vec![GridLength::STAR];
-        // The pane (`.pane-r`): `surface-container-low` behind an
-        // `outline-variant` hairline, at its Normal or Wide width beside
-        // the main area, over it in a narrow window, or the whole card in
-        // Full view (the conversation is then not drawn).
+        // The pane: behind a hairline at its Normal or Wide width beside
+        // the main area, over it on the opaque base in a narrow window, or
+        // the whole card in Full view (the conversation is then not drawn).
         let full = self.panel_shown() && self.pane.full;
         let main: Option<View> = if full { None } else { Some(main) };
         let panel: Option<View> = if !self.panel_shown() {
@@ -2493,9 +2373,8 @@ impl DesktopApp {
         } else {
             Some(if full {
                 Border::new()
-                    .background(palette.pane())
                     .corner_radius(radius)
-                    .content(self.panel_view(context, palette))
+                    .content(self.panel_view(context))
                     .into()
             } else if self.pane_overlays() {
                 Border::new()
@@ -2506,40 +2385,35 @@ impl DesktopApp {
                         ),
                     )
                     .horizontal_alignment(HorizontalAlignment::Right)
-                    .background(palette.pane())
+                    .background(ThemeBrush::SolidBackground)
                     .corner_radius(CornerRadius::new(0.0, radius, radius, 0.0))
-                    .border_brush(palette.outline())
+                    .border_brush(ThemeBrush::CardStroke)
                     .border_thickness(Thickness::new(tokens::layout::HAIRLINE, 0.0, 0.0, 0.0))
-                    .content(self.panel_view(context, palette))
+                    .content(self.panel_view(context))
                     .into()
             } else {
                 card_columns.push(GridLength::Pixel(self.pane_width()));
                 Border::new()
                     .grid_column(1)
-                    .background(palette.pane())
                     .corner_radius(CornerRadius::new(0.0, radius, radius, 0.0))
-                    .border_brush(palette.outline())
+                    .border_brush(ThemeBrush::CardStroke)
                     .border_thickness(Thickness::new(tokens::layout::HAIRLINE, 0.0, 0.0, 0.0))
-                    .content(self.panel_view(context, palette))
+                    .content(self.panel_view(context))
                     .into()
             })
         };
-        // Its `elevation-1` is a real shadow on the composition host
-        // (`crate::shadow`), as the composer's; the true-black themes ring
-        // it.
-        self.card_shadow.set_layers(m3::elevation_layers(palette));
-        let card = m3::lifted(
-            palette,
-            &self.card_shadow,
-            radius,
-            Grid::new().grid_column(1).margin(Thickness::new(
+        let card: View = Grid::new()
+            .grid_column(1)
+            .margin(Thickness::new(
                 0.0,
                 tokens::layout::CARD_GAP,
                 tokens::layout::CARD_GAP,
                 tokens::layout::CARD_GAP,
-            )),
-            Border::new()
-                .background(palette.surface())
+            ))
+            .children((Border::new()
+                .background(ThemeBrush::CardBackground)
+                .border_brush(ThemeBrush::CardStroke)
+                .border_thickness(Thickness::uniform(tokens::layout::HAIRLINE))
                 .corner_radius(radius)
                 .content(
                     Grid::new()
@@ -2551,15 +2425,15 @@ impl DesktopApp {
                             ),
                             panel,
                         ])),
-                ),
-        );
+                ),))
+            .into();
         // Settings replaces the sidebar with its own navigation. While the
         // daemon screen shows, the sidebar keeps the last list it had,
         // dimmed, and takes no pointer input.
         let side: View = match self.main {
-            Main::Settings => self.settings_nav(context, palette),
-            _ if rail => self.rail_view(context, palette),
-            _ => View::component::<sidebar_ui::Sidebar>(self.sidebar_input(context, palette)),
+            Main::Settings => self.settings_nav(context),
+            _ if rail => self.rail_view(context),
+            _ => View::component::<sidebar_ui::Sidebar>(self.sidebar_input(context)),
         };
         let side: View = if self.link_view_shown() && self.main != Main::Settings {
             Grid::new()
@@ -2575,7 +2449,7 @@ impl DesktopApp {
             side
         };
         let columns_grid = Grid::new()
-            .background(palette.sidebar())
+            .background(ThemeBrush::SolidBackground)
             .columns([
                 GridLength::Pixel(if rail {
                     RAIL_WIDTH
@@ -2592,49 +2466,27 @@ impl DesktopApp {
         let overlay: Option<ContentDialog> = if self.handoff.open {
             self.handoff_dialog(context)
         } else if self.settings.cleanup_confirm {
-            self.cleanup_confirmation(context, palette)
+            self.cleanup_confirmation(context)
         } else if let Some(dialog) = &self.bulk {
-            Some(self.bulk_dialog(dialog, context, palette))
+            Some(self.bulk_dialog(dialog, context))
         } else if self.link.confirm_fresh {
-            Some(self.fresh_confirmation(context, palette))
+            Some(self.fresh_confirmation(context))
         } else if self.inbox.confirm.is_some() {
-            self.inbox_confirmation(context, palette)
+            self.inbox_confirmation(context)
         } else if self.settings.daemon_confirm.is_some() {
-            Some(self.daemon_confirmation(context, palette))
+            Some(self.daemon_confirmation(context))
         } else {
-            Some(self.task_dialog(context, palette))
+            Some(self.task_dialog(context))
         };
         let window = Grid::new().children((
             columns_grid,
             self.menu_anchor(context),
-            self.attach_anchor(context, palette),
+            self.attach_anchor(context),
         ));
-        let window: View = match overlay {
+        match overlay {
             Some(dialog) => window.content_dialog(dialog),
             None => window.into(),
-        };
-        // Reactor updates a Button's resource overrides in place, but WinUI
-        // resolves a template's ThemeResource values only when the template
-        // is applied or the theme changes, and the theme change arrives before
-        // the new palette. Keying the tree by palette rebuilds the native
-        // controls on a scheme switch (rare) so every button takes the new
-        // overrides; all view state is model-bound and is redrawn as it was.
-        // Animation effects key it too: their templates are new styles.
-        let palette_key = format!(
-            "{}:{}",
-            palette.roles().map_or_else(
-                || "high-contrast".to_owned(),
-                |roles| format!("{:?}", roles.theme)
-            ),
-            if self.appearance.animations {
-                "motion"
-            } else {
-                "still"
-            },
-        );
-        Grid::new()
-            .keyed_children(vec![KeyedView::new(palette_key, window)])
-            .into()
+        }
     }
 
     /// The sidebar's sections now: a search's matches flat in their
@@ -2690,7 +2542,7 @@ impl DesktopApp {
     /// draws them): the projects with their tasks nested inside them, a
     /// search's matches flat in their projects, the owner's names, the
     /// Monitor's reports and each row's age and work line, read now.
-    fn sidebar_input(&self, context: &mut ViewContext<Self>, palette: Palette) -> SidebarInput {
+    fn sidebar_input(&self, context: &mut ViewContext<Self>) -> SidebarInput {
         let fleet = Fleet::of(&self.nav.agents, |agent| self.reported(agent).is_some());
         let query = self.nav.search.query.trim().to_owned();
         let checkouts = self.checkouts();
@@ -2771,7 +2623,6 @@ impl DesktopApp {
             )
         };
         SidebarInput {
-            palette,
             can_back: self.nav.history.can_back(),
             can_forward: self.nav.history.can_forward(),
             page: (self.main == Main::Settings).then_some(self.settings_page),
@@ -2823,7 +2674,7 @@ impl DesktopApp {
                 total: self.inbox.total(),
                 open: self.main == Main::Inbox,
             },
-            usage: self.usage_row(context, palette),
+            usage: self.usage_row(context),
             renaming: self.menu.renaming.as_ref().map(|(target, typed)| Renaming {
                 target: target.clone(),
                 typed: typed.clone(),
@@ -2872,7 +2723,7 @@ impl DesktopApp {
     /// The hidden sidebar's rail: show the sidebar, New task, then at the
     /// bottom Agents (the fleet view, with the fleet's most urgent dot) and
     /// Settings.
-    fn rail_view(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
+    fn rail_view(&self, context: &mut ViewContext<Self>) -> View {
         let pad = SIDEBAR_PADDING;
         let fleet = Fleet::of(&self.nav.agents, |agent| self.reported(agent).is_some());
         let summary = fleet.summary(self.nav.agents_total, self.nav.archived);
@@ -2894,15 +2745,15 @@ impl DesktopApp {
                     tokens::spacing::ROW_GAP,
                     0.0,
                 ))
-                .content(m3::status_mark(palette, tone, tokens::layout::DOT))
+                .content(controls::status_mark(tone, tokens::layout::DOT))
                 .into()
         });
         let button = |glyph: &str, name: String, message: Message| {
-            m3::icon_button(palette)
+            controls::icon_button()
                 .height(tokens::height::CONTROL)
                 .automation_name(name)
                 .on_click(context.message(message))
-                .content(m3::icon(glyph))
+                .content(controls::icon(glyph))
         };
         let top = StackPanel::new()
             .margin(Thickness::new(
@@ -2914,12 +2765,12 @@ impl DesktopApp {
             .spacing(tokens::spacing::ROW_GAP)
             .children((
                 button(
-                    m3::glyph::SHOW_SIDEBAR,
+                    controls::glyph::SHOW_SIDEBAR,
                     "Show sidebar".to_owned(),
                     Message::Shell(ShellMsg::SidebarToggled),
                 ),
                 button(
-                    m3::glyph::NEW_TASK,
+                    controls::glyph::NEW_TASK,
                     "New task (Ctrl+N)".to_owned(),
                     Message::Shell(ShellMsg::NewTask),
                 ),
@@ -2939,7 +2790,7 @@ impl DesktopApp {
                 Grid::new().keyed_children(crate::views::slots([
                     Some(
                         button(
-                            m3::glyph::HUB,
+                            controls::glyph::HUB,
                             format!(
                                 "Agents: {summary} ({})",
                                 if open { "open" } else { "closed" }
@@ -2951,7 +2802,7 @@ impl DesktopApp {
                     dot,
                 ])),
                 button(
-                    m3::glyph::SETTINGS,
+                    controls::glyph::SETTINGS,
                     "Settings".to_owned(),
                     Message::Shell(ShellMsg::SettingsOpened),
                 ),
@@ -2965,20 +2816,21 @@ impl DesktopApp {
     /// Settings in the sidebar's place (the Codex settings navigation), on
     /// the sidebar's rows: a Back row, the pill search field that finds
     /// settings across the pages, then the pages under section labels.
-    fn settings_nav(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
+    fn settings_nav(&self, context: &mut ViewContext<Self>) -> View {
         let pad = SIDEBAR_PADDING;
         let top = StackPanel::new()
             .margin(Thickness::new(pad, tokens::spacing::SM, pad, 0.0))
             .spacing(tokens::spacing::SM)
             .children((
-                m3::row(palette, false)
+                controls::row(false)
                     .automation_name("Back to tasks")
                     .on_click(context.message(Message::Shell(ShellMsg::SettingsClosed)))
-                    .content(m3::nav_content(m3::glyph::BACK, "Back to tasks", "")),
-                // On the sidebar the field takes the container tone (the
-                // tonal one would vanish into it).
-                m3::search_field(
-                    palette.container(),
+                    .content(controls::nav_content(
+                        controls::glyph::BACK,
+                        "Back to tasks",
+                        "",
+                    )),
+                controls::search_field(
                     TextBox::new()
                         .text(self.settings.query.clone())
                         .placeholder_text("Search settings")
@@ -2988,7 +2840,7 @@ impl DesktopApp {
                         )),
                 ),
             ));
-        let rows = self.settings_rows(context, palette);
+        let rows = self.settings_rows(context);
         Grid::new()
             .rows([GridLength::Auto, GridLength::STAR])
             .children((
@@ -3025,8 +2877,8 @@ impl DesktopApp {
     }
 
     /// The right pane: its tabs over the open tab.
-    fn panel_view(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
-        self.pane_view(context, palette)
+    fn panel_view(&self, context: &mut ViewContext<Self>) -> View {
+        self.pane_view(context)
     }
 }
 

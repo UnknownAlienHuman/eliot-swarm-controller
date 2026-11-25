@@ -10,7 +10,6 @@
 
 use super::menu_ui::{MenuMsg, Target as MenuTarget};
 use super::*;
-use crate::theme::winui::Palette;
 use eliot_core::AgentState;
 
 /// Task rows per page of one state group.
@@ -326,7 +325,7 @@ impl DesktopApp {
 
     /// The page, as its own component: a window render that changes none of
     /// what it shows leaves it as it is.
-    pub(super) fn project_view(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
+    pub(super) fn project_view(&self, context: &mut ViewContext<Self>) -> View {
         let state = &self.project;
         let registered = self
             .nav
@@ -531,7 +530,7 @@ impl DesktopApp {
         // This project's automations: its rules and the brief queues that
         // start tasks in its checkout.
         let key = nav::path_key(&state.checkout);
-        let cards: Vec<(String, crate::theme::StatusTone)> = self
+        let cards: Vec<(String, crate::controls::StatusTone)> = self
             .automation_cards()
             .into_iter()
             .filter(|card| {
@@ -572,7 +571,6 @@ impl DesktopApp {
         });
         let target = self.row_target(&format!("project:{}", state.key));
         View::component::<ProjectView>(ProjectInput {
-            palette,
             width: self.page_width(tokens::page::WIDTH),
             name: self.place_title(&state.checkout),
             checkout: state.checkout.clone(),
@@ -763,7 +761,6 @@ struct WhoView {
 /// What the project page shows, read by the window.
 #[derive(Clone, PartialEq)]
 pub(super) struct ProjectInput {
-    palette: Palette,
     /// The page column's width.
     width: Option<f64>,
     name: String,
@@ -782,7 +779,7 @@ pub(super) struct ProjectInput {
     check: Option<CheckView>,
     usage: Option<String>,
     capacity: Option<CapacityView>,
-    automations: Vec<(String, crate::theme::StatusTone)>,
+    automations: Vec<(String, crate::controls::StatusTone)>,
     who: Option<Fallible<WhoView>>,
     send: Callback<Message>,
 }
@@ -810,21 +807,20 @@ impl Component for ProjectView {
     }
 
     fn view(&self, input: &ProjectInput, context: &mut ViewContext<Self>) -> View {
-        let palette = input.palette;
         let mut actions: Vec<KeyedView> = vec![KeyedView::new(
             format!("new:{}", input.can_launch),
-            m3::filled(palette)
+            controls::filled()
                 .is_enabled(input.can_launch)
                 .automation_name(format!("New task in {}", input.name))
                 .on_click(context.message(Message::Shell(ShellMsg::ProjectPicked(
                     input.checkout.clone(),
                 ))))
-                .content(m3::icon_label(m3::glyph::NEW_TASK, "New task")),
+                .content(controls::icon_label(controls::glyph::NEW_TASK, "New task")),
         )];
         if let Some(target) = &input.target {
             actions.push(KeyedView::new(
                 "more",
-                m3::icon_button(palette)
+                controls::icon_button()
                     .automation_id(format!(
                         "{}project:{}",
                         super::menu_ui::MORE_ID_PREFIX,
@@ -832,7 +828,7 @@ impl Component for ProjectView {
                     ))
                     .automation_name(format!("Project actions for {}", input.name))
                     .on_click(context.message(Message::Menu(MenuMsg::Opened(target.clone()))))
-                    .content(m3::icon(m3::glyph::MORE))
+                    .content(controls::icon(controls::glyph::MORE))
                     .tooltip("Project actions"),
             ));
         }
@@ -844,11 +840,11 @@ impl Component for ProjectView {
                     .orientation(Orientation::Horizontal)
                     .spacing(tokens::spacing::XS)
                     .children((
-                        m3::secondary(format!("{path} ·"))
+                        controls::secondary(format!("{path} ·"))
                             .vertical_alignment(VerticalAlignment::Center)
                             .text_trimming(TextTrimming::CharacterEllipsis),
-                        m3::text_button(palette)
-                            .height(tokens::text::CAPTION.line_height)
+                        controls::text_button()
+                            .height(tokens::text::CAPTION.size + tokens::spacing::SM)
                             .min_height(0.0)
                             .margin(Thickness::new(
                                 -tokens::spacing::ROW,
@@ -861,7 +857,7 @@ impl Component for ProjectView {
                                 input.name.clone(),
                                 input.checkout.clone(),
                             )))
-                            .content(m3::text("Open folder", tokens::text::CAPTION)),
+                            .content(controls::text("Open folder", tokens::text::CAPTION)),
                     )),
             ));
         let mut items = vec![KeyedView::new("header", page_ui::toolbar(heading, actions))];
@@ -869,7 +865,6 @@ impl Component for ProjectView {
             items.push(KeyedView::new(
                 "missing",
                 page_ui::read_failed(
-                    palette,
                     "Folder not found: the checkout is gone from disk.",
                     "Remove",
                     true,
@@ -878,15 +873,15 @@ impl Component for ProjectView {
             ));
         }
         let left = vec![
-            KeyedView::new("manager", manager_panel(input, context, palette)),
-            KeyedView::new("tasks", tasks_panel(input, context, palette)),
-            KeyedView::new("check", check_panel(input, context, palette)),
+            KeyedView::new("manager", manager_panel(input, context)),
+            KeyedView::new("tasks", tasks_panel(input, context)),
+            KeyedView::new("check", check_panel(input, context)),
         ];
         let right = vec![
-            KeyedView::new("who", who_panel(input, palette)),
-            KeyedView::new("worktrees", worktrees_panel(input, context, palette)),
-            KeyedView::new("capacity", capacity_panel(input, context, palette)),
-            KeyedView::new("automations", automations_panel(input, context, palette)),
+            KeyedView::new("who", who_panel(input)),
+            KeyedView::new("worktrees", worktrees_panel(input, context)),
+            KeyedView::new("capacity", capacity_panel(input, context)),
+            KeyedView::new("automations", automations_panel(input, context)),
         ];
         items.push(KeyedView::new(
             "columns",
@@ -898,12 +893,7 @@ impl Component for ProjectView {
 
 /// A row of the Tasks panel (`.item`): the state mark, the title and its
 /// line, the age or +/− at the end; it opens the conversation.
-fn task_row(
-    line: &TaskLine,
-    group: &str,
-    context: &mut ViewContext<ProjectView>,
-    palette: Palette,
-) -> View {
+fn task_row(line: &TaskLine, group: &str, context: &mut ViewContext<ProjectView>) -> View {
     let agent = &line.agent;
     let waiting = matches!(agent.state, AgentState::Waiting);
     let content = Grid::new()
@@ -913,7 +903,6 @@ fn task_row(
             Border::new()
                 .vertical_alignment(VerticalAlignment::Center)
                 .maybe_content(page_ui::agent_mark(
-                    palette,
                     agent.state,
                     agent.status_line.as_deref(),
                 )),
@@ -922,14 +911,14 @@ fn task_row(
                 .content(page_ui::two_lines(&line.title, &line.line)),
             page_ui::age(line.trailing.clone()).grid_column(2),
         ));
-    let row = m3::row(palette, false)
+    let row = controls::row(false)
         .min_height(tokens::height::TWO_LINE_ROW)
         .automation_name(format!("Open {}, {group}", line.title))
         .on_click(context.message(Message::Shell(ShellMsg::AgentOpened(agent.clone()))))
         .content(content);
     if waiting {
         Border::new()
-            .background(palette.tonal())
+            .background(ThemeBrush::CardBackground)
             .corner_radius(tokens::radius::CONTAINER)
             .content(row)
             .into()
@@ -944,7 +933,7 @@ fn group_label(text: String, action: Option<View>) -> View {
         .min_height(tokens::height::CONTROL)
         .columns([GridLength::STAR, GridLength::Auto])
         .children((
-            m3::muted(text, tokens::text::LABEL)
+            controls::text(text, tokens::text::LABEL)
                 .margin(Thickness::new(tokens::spacing::XS, 0.0, 0.0, 0.0))
                 .vertical_alignment(VerticalAlignment::Center),
             crate::views::MaybeContent::maybe_content(Border::new().grid_column(1), action),
@@ -952,11 +941,7 @@ fn group_label(text: String, action: Option<View>) -> View {
         .into()
 }
 
-fn tasks_panel(
-    input: &ProjectInput,
-    context: &mut ViewContext<ProjectView>,
-    palette: Palette,
-) -> View {
+fn tasks_panel(input: &ProjectInput, context: &mut ViewContext<ProjectView>) -> View {
     let mut rows: Vec<KeyedView> = vec![KeyedView::new("head", page_ui::panel_head("Tasks", None))];
     let mut any = false;
     for group in &input.groups {
@@ -973,13 +958,13 @@ fn tasks_panel(
         let finished = group.group == Group::Finished;
         let open = !finished || input.finished_open;
         let action: Option<View> = finished.then(|| {
-            m3::text_button(palette)
+            controls::text_button()
                 .automation_name(format!(
                     "{} finished tasks",
                     if open { "Hide" } else { "Show" }
                 ))
                 .on_click(context.message(Message::Project(ProjectMsg::FinishedToggled)))
-                .content(m3::label(if open { "Hide" } else { "Show" }))
+                .content(controls::label(if open { "Hide" } else { "Show" }))
                 .into()
         });
         rows.push(KeyedView::new(
@@ -999,7 +984,6 @@ fn tasks_panel(
             rows.push(KeyedView::new(
                 format!("error:{title}"),
                 page_ui::read_failed(
-                    palette,
                     format!("Not read: {error}"),
                     "Retry",
                     true,
@@ -1010,7 +994,7 @@ fn tasks_panel(
         for line in &group.rows {
             rows.push(KeyedView::new(
                 line.agent.id.clone(),
-                task_row(line, title, context, palette),
+                task_row(line, title, context),
             ));
         }
         for (index, wait) in queued.iter().enumerate() {
@@ -1024,8 +1008,8 @@ fn tasks_panel(
                     .children((
                         Border::new()
                             .vertical_alignment(VerticalAlignment::Center)
-                            .content(m3::row_mark(palette, m3::RowMark::Queued, "Queued")),
-                        m3::secondary(wait.clone())
+                            .content(controls::row_mark(controls::RowMark::Queued, "Queued")),
+                        controls::secondary(wait.clone())
                             .grid_column(1)
                             .vertical_alignment(VerticalAlignment::Center)
                             .text_wrapping(TextWrapping::Wrap),
@@ -1035,11 +1019,11 @@ fn tasks_panel(
         if group.more {
             rows.push(KeyedView::new(
                 format!("more:{title}"),
-                m3::text_button(palette)
+                controls::text_button()
                     .horizontal_alignment(HorizontalAlignment::Left)
                     .automation_name(format!("Show more {title}"))
                     .on_click(context.message(Message::Project(ProjectMsg::More(group.group))))
-                    .content(m3::label("Show more")),
+                    .content(controls::label("Show more")),
             ));
         }
     }
@@ -1049,14 +1033,10 @@ fn tasks_panel(
             page_ui::quiet("No tasks in the last 24 h"),
         ));
     }
-    page_ui::panel(palette, tokens::spacing::ROW_GAP, rows)
+    page_ui::panel(tokens::spacing::ROW_GAP, rows)
 }
 
-fn manager_panel(
-    input: &ProjectInput,
-    context: &mut ViewContext<ProjectView>,
-    palette: Palette,
-) -> View {
+fn manager_panel(input: &ProjectInput, context: &mut ViewContext<ProjectView>) -> View {
     let mut rows: Vec<KeyedView> =
         vec![KeyedView::new("head", page_ui::panel_head("Manager", None))];
     match &input.manager {
@@ -1070,13 +1050,13 @@ fn manager_panel(
                         .children((
                             Border::new()
                                 .vertical_alignment(VerticalAlignment::Center)
-                                .maybe_content(page_ui::state_mark(palette, line.state)),
+                                .maybe_content(page_ui::state_mark(line.state)),
                             Border::new()
                                 .grid_column(1)
                                 .content(page_ui::two_lines(&line.title, &line.words)),
                         ));
                     let agent: View = match &line.agent {
-                        Some(agent) => m3::row(palette, false)
+                        Some(agent) => controls::row(false)
                             .min_height(tokens::height::TWO_LINE_ROW)
                             .automation_name(format!("Open the manager {}", line.title))
                             .on_click(
@@ -1110,8 +1090,7 @@ fn manager_panel(
                 rows.push(KeyedView::new(
                     "transfer",
                     strip(
-                        palette,
-                        m3::glyph::MOVE,
+                        controls::glyph::MOVE,
                         &format!("Handing over the project (transfer {transfer})"),
                         None,
                     ),
@@ -1123,8 +1102,7 @@ fn manager_panel(
                 rows.push(KeyedView::new(
                     format!("competing:{open}"),
                     strip(
-                        palette,
-                        m3::glyph::GROUP,
+                        controls::glyph::GROUP,
                         &format!(
                             "{} compete{} with the manager",
                             eliot_core::count_words(
@@ -1135,7 +1113,7 @@ fn manager_panel(
                             if count == 1 { "s" } else { "" }
                         ),
                         Some(
-                            m3::text_button(palette)
+                            controls::text_button()
                                 .automation_name(if open {
                                     "Hide the competing tasks"
                                 } else {
@@ -1144,7 +1122,7 @@ fn manager_panel(
                                 .on_click(
                                     context.message(Message::Project(ProjectMsg::CompetingToggled)),
                                 )
-                                .content(m3::label(if open { "Hide" } else { "Show" }))
+                                .content(controls::label(if open { "Hide" } else { "Show" }))
                                 .into(),
                         ),
                     ),
@@ -1152,22 +1130,23 @@ fn manager_panel(
                 if open {
                     rows.push(KeyedView::new(
                         "competing-list",
-                        m3::secondary(manager.competing.join(", "))
+                        controls::secondary(manager.competing.join(", "))
                             .text_wrapping(TextWrapping::Wrap),
                     ));
                 }
             }
         }
     }
-    page_ui::panel(palette, tokens::spacing::SM, rows)
+    page_ui::panel(tokens::spacing::SM, rows)
 }
 
-/// An attention strip (`.strip`) inside a panel: `tertiary-container`, an
-/// icon, one line and an optional action.
-fn strip(palette: Palette, glyph: &str, text: &str, action: Option<View>) -> View {
-    let (fill, on) = palette.badge();
+/// An attention strip inside a panel: a card surface, an icon, one line
+/// and an optional action.
+fn strip(glyph: &str, text: &str, action: Option<View>) -> View {
     Border::new()
-        .background(fill)
+        .background(ThemeBrush::CardBackground)
+        .border_brush(ThemeBrush::CardStroke)
+        .border_thickness(Thickness::uniform(tokens::layout::HAIRLINE))
         .corner_radius(tokens::radius::CONTAINER)
         .min_height(tokens::height::CONTROL + tokens::spacing::SM)
         .padding(Thickness::new(
@@ -1181,16 +1160,9 @@ fn strip(palette: Palette, glyph: &str, text: &str, action: Option<View>) -> Vie
                 .columns([GridLength::Auto, GridLength::STAR, GridLength::Auto])
                 .column_spacing(tokens::spacing::SM)
                 .children((
-                    m3::carrier(
-                        palette,
-                        |scheme| scheme.on_tertiary_container,
-                        "",
-                        tokens::icon::ROW,
-                        m3::small_icon(glyph),
-                    ),
-                    m3::text(text.to_owned(), tokens::text::BODY)
+                    controls::small_icon(glyph),
+                    controls::text(text.to_owned(), tokens::text::BODY)
                         .grid_column(1)
-                        .foreground(on)
                         .vertical_alignment(VerticalAlignment::Center)
                         .text_wrapping(TextWrapping::Wrap),
                     crate::views::MaybeContent::maybe_content(
@@ -1204,15 +1176,11 @@ fn strip(palette: Palette, glyph: &str, text: &str, action: Option<View>) -> Vie
         .into()
 }
 
-fn check_panel(
-    input: &ProjectInput,
-    context: &mut ViewContext<ProjectView>,
-    palette: Palette,
-) -> View {
-    let edit: View = m3::text_button(palette)
+fn check_panel(input: &ProjectInput, context: &mut ViewContext<ProjectView>) -> View {
+    let edit: View = controls::text_button()
         .automation_name("Edit project check")
         .on_click(context.message(Message::Project(ProjectMsg::EditCheck)))
-        .content(m3::label("Edit"))
+        .content(controls::label("Edit"))
         .into();
     let mut rows = vec![KeyedView::new(
         "head",
@@ -1238,10 +1206,10 @@ fn check_panel(
     if let Some(usage) = &input.usage {
         rows.push(KeyedView::new("usage", page_ui::quiet(usage.clone())));
     }
-    page_ui::panel(palette, tokens::spacing::SM, rows)
+    page_ui::panel(tokens::spacing::SM, rows)
 }
 
-fn who_panel(input: &ProjectInput, palette: Palette) -> View {
+fn who_panel(input: &ProjectInput) -> View {
     let mut rows = vec![KeyedView::new(
         "head",
         page_ui::panel_head("Who works where", None),
@@ -1250,7 +1218,7 @@ fn who_panel(input: &ProjectInput, palette: Palette) -> View {
         None => rows.push(KeyedView::new("reading", page_ui::quiet("Reading…"))),
         Some(Err(error)) => rows.push(KeyedView::new(
             "error",
-            page_ui::error_line(palette, format!("Not read: {error}")),
+            page_ui::error_line(format!("Not read: {error}")),
         )),
         Some(Ok(who)) => {
             if who.workers.is_empty() && who.shared.is_empty() {
@@ -1266,23 +1234,20 @@ fn who_panel(input: &ProjectInput, palette: Palette) -> View {
                         .columns([GridLength::STAR, GridLength::Auto])
                         .column_spacing(tokens::spacing::SM)
                         .children((
-                            m3::text(worker.title.clone(), tokens::page::HEADING)
+                            controls::text(worker.title.clone(), tokens::page::HEADING)
                                 .text_trimming(TextTrimming::CharacterEllipsis),
-                            m3::secondary(worker.place.clone()).grid_column(1),
+                            controls::secondary(worker.place.clone()).grid_column(1),
                         )),
                 )];
                 for (line_index, line) in worker.lines.iter().enumerate() {
                     parts.push(KeyedView::new(
                         line_index,
-                        m3::secondary(line.clone())
+                        controls::secondary(line.clone())
                             .text_wrapping(TextWrapping::Wrap)
                             .is_text_selection_enabled(true),
                     ));
                 }
-                rows.push(KeyedView::new(
-                    format!("worker:{index}"),
-                    who_entry(palette, parts),
-                ));
+                rows.push(KeyedView::new(format!("worker:{index}"), who_entry(parts)));
             }
             for (index, shared) in who.shared.iter().enumerate() {
                 let mut parts: Vec<KeyedView> = vec![KeyedView::new(
@@ -1291,26 +1256,23 @@ fn who_panel(input: &ProjectInput, palette: Palette) -> View {
                         .columns([GridLength::STAR, GridLength::Auto])
                         .column_spacing(tokens::spacing::SM)
                         .children((
-                            m3::text("Shared checkout", tokens::page::HEADING),
-                            m3::secondary(format!("{} Agents", shared.count)).grid_column(1),
+                            controls::text("Shared checkout", tokens::page::HEADING),
+                            controls::secondary(format!("{} Agents", shared.count)).grid_column(1),
                         )),
                 )];
                 parts.push(KeyedView::new(
                     "agents",
-                    m3::secondary(format!("{} · {}", shared.agents, shared.folder))
+                    controls::secondary(format!("{} · {}", shared.agents, shared.folder))
                         .text_wrapping(TextWrapping::Wrap),
                 ));
                 if !shared.files.is_empty() {
                     parts.push(KeyedView::new(
                         "files",
-                        m3::secondary(format!("Not committed: {}", shared.files))
+                        controls::secondary(format!("Not committed: {}", shared.files))
                             .text_wrapping(TextWrapping::Wrap),
                     ));
                 }
-                rows.push(KeyedView::new(
-                    format!("shared:{index}"),
-                    who_entry(palette, parts),
-                ));
+                rows.push(KeyedView::new(format!("shared:{index}"), who_entry(parts)));
             }
             if who.truncated {
                 rows.push(KeyedView::new(
@@ -1324,13 +1286,13 @@ fn who_panel(input: &ProjectInput, palette: Palette) -> View {
             ));
         }
     }
-    page_ui::panel(palette, tokens::spacing::SM, rows)
+    page_ui::panel(tokens::spacing::SM, rows)
 }
 
 /// One entry of Who works where (`.who`): a hairline under it.
-fn who_entry(palette: Palette, parts: Vec<KeyedView>) -> View {
+fn who_entry(parts: Vec<KeyedView>) -> View {
     Border::new()
-        .border_brush(palette.outline())
+        .border_brush(ThemeBrush::CardStroke)
         .border_thickness(Thickness::new(0.0, 0.0, 0.0, tokens::layout::HAIRLINE))
         .padding(Thickness::xy(0.0, tokens::spacing::CHIP_GAP))
         .content(
@@ -1341,11 +1303,7 @@ fn who_entry(palette: Palette, parts: Vec<KeyedView>) -> View {
         .into()
 }
 
-fn worktrees_panel(
-    input: &ProjectInput,
-    context: &mut ViewContext<ProjectView>,
-    palette: Palette,
-) -> View {
+fn worktrees_panel(input: &ProjectInput, context: &mut ViewContext<ProjectView>) -> View {
     let mut rows = vec![KeyedView::new(
         "head",
         page_ui::panel_head("Branches & worktrees", None),
@@ -1364,7 +1322,7 @@ fn worktrees_panel(
         };
         rows.push(KeyedView::new(
             line.path.clone(),
-            m3::row(palette, false)
+            controls::row(false)
                 .min_height(tokens::height::TWO_LINE_ROW)
                 .automation_name(format!("Open folder of {}: {}", line.branch, line.folder))
                 .on_click(context.message(Message::Reveal(line.branch.clone(), line.path.clone())))
@@ -1379,31 +1337,28 @@ fn worktrees_panel(
                                 ])
                                 .column_spacing(tokens::spacing::SM)
                                 .children((
-                                    m3::body(line.branch.clone())
+                                    controls::body(line.branch.clone())
                                         .text_trimming(TextTrimming::CharacterEllipsis),
-                                    m3::secondary(line.state.clone())
+                                    controls::secondary(line.state.clone())
                                         .grid_column(1)
                                         .horizontal_alignment(HorizontalAlignment::Right)
                                         .text_trimming(TextTrimming::CharacterEllipsis),
                                 )),
-                            m3::secondary(caption).text_trimming(TextTrimming::CharacterEllipsis),
+                            controls::secondary(caption)
+                                .text_trimming(TextTrimming::CharacterEllipsis),
                         )),
                 )
                 .tooltip("Open in Explorer"),
         ));
     }
-    page_ui::panel(palette, tokens::spacing::ROW_GAP, rows)
+    page_ui::panel(tokens::spacing::ROW_GAP, rows)
 }
 
-fn capacity_panel(
-    input: &ProjectInput,
-    context: &mut ViewContext<ProjectView>,
-    palette: Palette,
-) -> View {
-    let edit: View = m3::text_button(palette)
+fn capacity_panel(input: &ProjectInput, context: &mut ViewContext<ProjectView>) -> View {
+    let edit: View = controls::text_button()
         .automation_name("Edit capacity in config.toml")
         .on_click(context.message(Message::Settings(SettingsMsg::OpenConfig)))
-        .content(m3::link_content("Edit"))
+        .content(controls::link_content("Edit"))
         .tooltip("Capacity is set in config.toml ([capacity])");
     let mut rows = vec![KeyedView::new(
         "head",
@@ -1430,25 +1385,21 @@ fn capacity_panel(
                 let share = capacity.usage as f64 * 100.0 / limit as f64;
                 rows.push(KeyedView::new(
                     format!("meter:{}", share.round()),
-                    m3::meter(palette, share, false),
+                    controls::meter(share, false),
                 ));
             }
         }
     }
-    page_ui::panel(palette, tokens::spacing::SM, rows)
+    page_ui::panel(tokens::spacing::SM, rows)
 }
 
-fn automations_panel(
-    input: &ProjectInput,
-    context: &mut ViewContext<ProjectView>,
-    palette: Palette,
-) -> View {
-    let manage: View = m3::text_button(palette)
+fn automations_panel(input: &ProjectInput, context: &mut ViewContext<ProjectView>) -> View {
+    let manage: View = controls::text_button()
         .automation_name("Manage automations")
         .on_click(context.message(Message::Shell(ShellMsg::PlaceOpened(
             super::page_ui::Place::Automations,
         ))))
-        .content(m3::label("Manage"))
+        .content(controls::label("Manage"))
         .into();
     let running = input
         .automations
@@ -1461,7 +1412,7 @@ fn automations_panel(
         .filter(|(_, tone)| {
             matches!(
                 tone,
-                crate::theme::StatusTone::Attention | crate::theme::StatusTone::Failed
+                crate::controls::StatusTone::Attention | crate::controls::StatusTone::Failed
             )
         })
         .count();
@@ -1480,11 +1431,10 @@ fn automations_panel(
         }
     };
     page_ui::panel(
-        palette,
         tokens::spacing::SM,
         vec![
             KeyedView::new("head", page_ui::panel_head("Automations", Some(manage))),
-            KeyedView::new(format!("summary:{summary}"), m3::body(summary)),
+            KeyedView::new(format!("summary:{summary}"), controls::body(summary)),
         ],
     )
 }

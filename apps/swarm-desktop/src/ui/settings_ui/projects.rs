@@ -16,7 +16,6 @@ fn policy_list(
     (entry, add): (&str, &str),
     name: &str,
     context: &mut ViewContext<DesktopApp>,
-    palette: Palette,
 ) -> View {
     let entries = fields.list(list);
     let blank = String::new();
@@ -26,7 +25,7 @@ fn policy_list(
         .enumerate()
         .map(|(index, text)| {
             let new = index == entries.len();
-            let field = m3::field()
+            let field = controls::field()
                 .text(text.clone())
                 .placeholder_text(if new { add } else { entry })
                 .automation_name(if new {
@@ -41,13 +40,13 @@ fn policy_list(
                 None
             } else {
                 Some(
-                    m3::icon_button(palette)
+                    controls::icon_button()
                         .grid_column(1)
                         .width(tokens::height::CONTROL)
                         .height(tokens::height::CONTROL)
                         .automation_name(format!("{name}: remove {entry} {}", index + 1))
                         .on_click(context.message(edit(PolicyEdit::Remove(list, index))))
-                        .content(m3::icon(m3::glyph::CLOSE))
+                        .content(controls::icon(controls::glyph::CLOSE))
                         .into(),
                 )
             };
@@ -73,11 +72,7 @@ impl DesktopApp {
     /// its ID), with a check box for the bulk actions above the list
     /// (Select all, Remove selected, Remove unused); a row opens its
     /// editor (folder, rule profiles and actions, Remove project).
-    pub(super) fn projects_section(
-        &self,
-        context: &mut ViewContext<Self>,
-        palette: Palette,
-    ) -> View {
+    pub(super) fn projects_section(&self, context: &mut ViewContext<Self>) -> View {
         let drafts = &self.settings.projects;
         let profiles = self.known_profiles();
         let checkouts = self.checkouts();
@@ -142,24 +137,24 @@ impl DesktopApp {
                                             ))
                                         }),
                                     )),
-                                m3::row(palette, open)
+                                controls::row(open)
                                     .grid_column(1)
                                     .automation_name(format!("Project {name}: {note}"))
                                     .on_click(context.message(Message::Settings(
                                         SettingsMsg::ProjectOpened(id.clone()),
                                     )))
-                                    .content(m3::row_content(
+                                    .content(controls::row_content(
                                         Some(if name.contains(" › ") {
-                                            m3::glyph::WORKTREE
+                                            controls::glyph::WORKTREE
                                         } else {
-                                            m3::glyph::FOLDER
+                                            controls::glyph::FOLDER
                                         }),
                                         &name,
                                         &note,
                                         if missing {
                                             Some(
-                                                m3::secondary("missing")
-                                                    .foreground(palette.attention())
+                                                controls::secondary("missing")
+                                                    .foreground(ThemeBrush::SystemCritical)
                                                     .vertical_alignment(VerticalAlignment::Center)
                                                     .into(),
                                             )
@@ -171,14 +166,13 @@ impl DesktopApp {
                                     .grid_column(2)
                                     .vertical_alignment(VerticalAlignment::Center)
                                     .content(super::super::reveal::path_button(
-                                        palette,
                                         &name,
                                         self.reveal_item_message(context, &checkout_item, &path),
                                     )),
                             ))
                             .into(),
                     ),
-                    self.reveal_note(&checkout_item, palette),
+                    self.reveal_note(&checkout_item),
                 ])),
             ));
             if !open {
@@ -206,7 +200,7 @@ impl DesktopApp {
                                     ))
                                 },
                             )))
-                            .content(m3::body(profile.clone())),
+                            .content(controls::body(profile.clone())),
                     )
                 })
                 .collect();
@@ -215,9 +209,9 @@ impl DesktopApp {
             let editor = StackPanel::new()
                 .margin(Thickness::uniform(tokens::spacing::SM))
                 .keyed_children(crate::views::slots([
-                    Some(m3::form_row(
+                    Some(controls::form_row(
                         "Checkout folder",
-                        m3::field()
+                        controls::field()
                             .text(nav::display_path(&path))
                             .automation_name(format!("Checkout folder of {name}"))
                             .on_text_changed(crate::views::text_edits(context.callback(
@@ -230,13 +224,12 @@ impl DesktopApp {
                             )))
                             .into(),
                         Some(super::super::reveal::path_button(
-                            palette,
                             &name,
                             self.reveal_item_message(context, &editor_item, &path),
                         )),
                     )),
-                    self.reveal_note(&editor_item, palette),
-                    Some(m3::form_row(
+                    self.reveal_note(&editor_item),
+                    Some(controls::form_row(
                         "Rule profiles",
                         StackPanel::new()
                             .orientation(Orientation::Horizontal)
@@ -245,9 +238,9 @@ impl DesktopApp {
                             .into(),
                         None,
                     )),
-                    Some(m3::form_row(
+                    Some(controls::form_row(
                         "Rule actions",
-                        m3::field()
+                        controls::field()
                             .text(model::project_actions(drafts, &id))
                             .placeholder_text("For example send, stop, git.fetch")
                             .automation_name(format!("Rule actions of {name}"))
@@ -262,9 +255,9 @@ impl DesktopApp {
                             .into(),
                         None,
                     )),
-                    self.policy_editor(&id, &name, context, palette),
+                    self.policy_editor(&id, &name, context),
                     Some(
-                        m3::destructive(palette)
+                        controls::destructive()
                             .margin(Thickness::new(
                                 tokens::layout::FIELD_INDENT,
                                 tokens::spacing::XS,
@@ -275,7 +268,7 @@ impl DesktopApp {
                             .on_click(context.message(Message::Settings(
                                 SettingsMsg::ProjectRemoved(id.clone()),
                             )))
-                            .content(m3::label("Remove project"))
+                            .content(controls::label("Remove project"))
                             .into(),
                     ),
                 ]));
@@ -284,7 +277,7 @@ impl DesktopApp {
         if rows.is_empty() {
             rows.push(KeyedView::new(
                 "none",
-                m3::secondary(
+                controls::secondary(
                     "No projects yet. Opening Swarm in a Git checkout registers it here.",
                 )
                 .text_wrapping(TextWrapping::Wrap)
@@ -303,7 +296,7 @@ impl DesktopApp {
             .orientation(Orientation::Horizontal)
             .spacing(tokens::spacing::SM)
             .children((
-                m3::text_button(palette)
+                controls::text_button()
                     .is_enabled(!ids.is_empty())
                     .automation_name(if all {
                         "Clear the selection"
@@ -313,12 +306,12 @@ impl DesktopApp {
                     .on_click(
                         context.message(Message::Settings(SettingsMsg::ProjectsSelectAll(!all))),
                     )
-                    .content(m3::label(if all {
+                    .content(controls::label(if all {
                         "Clear selection"
                     } else {
                         "Select all"
                     })),
-                m3::outlined(palette)
+                controls::outlined()
                     .is_enabled(idle && !ids.is_empty())
                     .automation_name("Remove unused projects")
                     .on_click(context.message(Message::Bulk(BulkMsg::Start(
@@ -326,8 +319,8 @@ impl DesktopApp {
                         Pick::Unused,
                         "all projects".to_owned(),
                     ))))
-                    .content(m3::label("Remove unused…")),
-                m3::destructive(palette)
+                    .content(controls::label("Remove unused…")),
+                controls::destructive()
                     .is_enabled(idle && !selected.is_empty())
                     .automation_name(remove_label.clone())
                     .on_click(context.message(Message::Bulk(BulkMsg::Start(
@@ -335,36 +328,34 @@ impl DesktopApp {
                         Pick::Selected(selected.clone()),
                         "the selection".to_owned(),
                     ))))
-                    .content(m3::label(&remove_label)),
+                    .content(controls::label(&remove_label)),
             ));
-        let add = m3::settings_card(
-            palette,
-            vec![KeyedView::new(
-                "browse",
-                m3::setting_row(
-                    "Checkout folder",
-                    "Choose a folder to add and save the project.",
-                    View::from(
-                        m3::filled(palette)
-                            .automation_name("Browse to add a project")
-                            .is_enabled(!self.settings.busy())
-                            .on_click(
-                                context.message(Message::Settings(SettingsMsg::ProjectBrowse)),
-                            )
-                            .content(m3::icon_label(m3::glyph::OPEN_FOLDER, "Browse…")),
-                    ),
+        let add = controls::settings_card(vec![KeyedView::new(
+            "browse",
+            controls::setting_row(
+                "Checkout folder",
+                "Choose a folder to add and save the project.",
+                View::from(
+                    controls::filled()
+                        .automation_name("Browse to add a project")
+                        .is_enabled(!self.settings.busy())
+                        .on_click(context.message(Message::Settings(SettingsMsg::ProjectBrowse)))
+                        .content(controls::icon_label(
+                            controls::glyph::OPEN_FOLDER,
+                            "Browse…",
+                        )),
                 ),
-            )],
-        );
+            ),
+        )]);
         StackPanel::new()
             .spacing(tokens::spacing::MD)
             .children((
                 StackPanel::new()
                     .spacing(tokens::spacing::SM)
-                    .children((bulk, m3::list(palette, rows))),
+                    .children((bulk, controls::list(rows))),
                 StackPanel::new()
                     .spacing(tokens::spacing::SM)
-                    .children((m3::section_heading("Add a project", "", None), add)),
+                    .children((controls::section_heading("Add a project", "", None), add)),
             ))
             .into()
     }
@@ -375,13 +366,7 @@ impl DesktopApp {
     /// store without saving), the store's message when it refuses, and how
     /// many of the last day's launches took the policy, with the newest
     /// opt-outs and their reasons (`project.list` `policy_usage`).
-    fn policy_editor(
-        &self,
-        id: &str,
-        name: &str,
-        context: &mut ViewContext<Self>,
-        palette: Palette,
-    ) -> Option<View> {
+    fn policy_editor(&self, id: &str, name: &str, context: &mut ViewContext<Self>) -> Option<View> {
         let policy = self
             .settings
             .policy
@@ -392,24 +377,24 @@ impl DesktopApp {
         let dirty = policy.dirty();
         let saving = policy.saving && busy;
         let number = |text: &str| {
-            m3::field()
+            controls::field()
                 .text(text)
                 .width(tokens::layout::NUMBER_WIDTH)
                 .horizontal_alignment(HorizontalAlignment::Left)
         };
         let note: Option<View> = match &policy.note {
             Some(note) => {
-                let text = m3::secondary(note.text.clone())
+                let text = controls::secondary(note.text.clone())
                     .text_wrapping(TextWrapping::Wrap)
                     .is_text_selection_enabled(true)
                     .automation_name(format!("Policy status: {}", note.text));
                 if note.error {
-                    Some(text.foreground(palette.attention()).into())
+                    Some(text.foreground(ThemeBrush::SystemCritical).into())
                 } else {
                     Some(text.into())
                 }
             }
-            None if dirty => Some(m3::secondary("Unsaved changes.").into()),
+            None if dirty => Some(controls::secondary("Unsaved changes.").into()),
             None => None,
         };
         let now = crate::handoff::now_ms();
@@ -442,19 +427,19 @@ impl DesktopApp {
                 );
                 KeyedView::new(
                     opt_out.agent.clone(),
-                    m3::secondary(line.clone())
+                    controls::secondary(line.clone())
                         .text_wrapping(TextWrapping::Wrap)
                         .is_text_selection_enabled(true)
                         .automation_name(format!("Opted out: {line}")),
                 )
             })
             .collect();
-        let field_row = |label: &str, control: View| m3::form_row(label, control, None);
+        let field_row = |label: &str, control: View| controls::form_row(label, control, None);
         Some(StackPanel::new()
             .spacing(tokens::spacing::XS)
             .margin(Thickness::new(0.0, tokens::spacing::SM, 0.0, 0.0))
             .children((
-                m3::section_heading(
+                controls::section_heading(
                     "Launch policy",
                     "The check and limits Swarm applies to every Agent launched in this project.",
                     None,
@@ -467,7 +452,6 @@ impl DesktopApp {
                         ("Argument", "Add an argument"),
                         &format!("Policy check command of {name}"),
                         context,
-                        palette,
                     ),
                 ),
                 field_row(
@@ -486,7 +470,7 @@ impl DesktopApp {
                         .on_is_checked_changed(crate::views::check_changes(
                             context.callback(|on: bool| edit(PolicyEdit::AtTurnEnd(on))),
                         ))
-                        .content(m3::body("Run the check when a turn ends")).into(),
+                        .content(controls::body("Run the check when a turn ends")).into(),
                 ),
                 field_row(
                     "Timeout retry",
@@ -498,7 +482,7 @@ impl DesktopApp {
                         .on_is_checked_changed(crate::views::check_changes(
                             context.callback(|on: bool| edit(PolicyEdit::RetrySafe(on))),
                         ))
-                        .content(m3::body("Safe to repeat after a timeout")).into(),
+                        .content(controls::body("Safe to repeat after a timeout")).into(),
                 ),
                 field_row(
                     "Rounds",
@@ -535,7 +519,6 @@ impl DesktopApp {
                         ("Glob", "Add a project-relative glob"),
                         &format!("Policy scope of {name}"),
                         context,
-                        palette,
                     ),
                 ),
                 field_row(
@@ -546,7 +529,6 @@ impl DesktopApp {
                         ("Glob", "Add a protected glob"),
                         &format!("Policy check inputs of {name}"),
                         context,
-                        palette,
                     ),
                 ),
                 StackPanel::new()
@@ -559,27 +541,27 @@ impl DesktopApp {
                         0.0,
                     ))
                     .children((
-                        m3::filled(palette)
+                        controls::filled()
                             .is_enabled(dirty && !busy)
                             .automation_name(format!("Save the launch policy of {name}"))
                             .on_click(
                                 context.message(Message::Settings(SettingsMsg::PolicySave(false))),
                             )
-                            .content(m3::label(if saving { "Saving…" } else { "Save policy" })),
-                        m3::outlined(palette)
+                            .content(controls::label(if saving { "Saving…" } else { "Save policy" })),
+                        controls::outlined()
                             .is_enabled(!busy)
                             .automation_name(format!("Validate the launch policy of {name}"))
                             .on_click(
                                 context.message(Message::Settings(SettingsMsg::PolicySave(true))),
                             )
-                            .content(m3::label("Validate")),
-                        m3::text_button(palette)
+                            .content(controls::label("Validate")),
+                        controls::text_button()
                             .is_enabled(dirty && !busy)
                             .automation_name(format!("Discard policy changes of {name}"))
                             .on_click(
                                 context.message(Message::Settings(SettingsMsg::PolicyDiscard)),
                             )
-                            .content(m3::label("Discard")),
+                            .content(controls::label("Discard")),
                     )),
                 Border::new()
                     .margin(Thickness::new(tokens::layout::FIELD_INDENT, 0.0, 0.0, 0.0))
@@ -593,7 +575,7 @@ impl DesktopApp {
                     ))
                     .content(
                         StackPanel::new().spacing(tokens::spacing::XS).children((
-                            m3::body(counter.clone())
+                            controls::body(counter.clone())
                                 .text_wrapping(TextWrapping::Wrap)
                                 .automation_name(format!("Policy use: {counter}")),
                             StackPanel::new()
