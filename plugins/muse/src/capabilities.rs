@@ -13,6 +13,7 @@ use serde_json::Value;
 
 pub fn declaration() -> HarnessCapabilities {
     HarnessCapabilities {
+        catalogue_provider: eliot_core::api::harness::CatalogueProvider::Fixed("meta"),
         instruction_inventory: crate::instructions::INSTRUCTION_INVENTORY,
         model_login_source: Some(eliot_core::api::harness::ModelLoginSource::Files {
             root_env: "XDG_CONFIG_HOME",
@@ -75,7 +76,7 @@ pub fn declaration() -> HarnessCapabilities {
         launch_default_policy: LaunchDefaultPolicy::OmitForServerDefault,
         guard_refusal_point: Some(InjectPoint::ActiveTurn),
         guard_refusal_choice_error: Some("Muse guarded request offers multiple refusal options"),
-        allowed_configure_efforts: Some(&eliot_core::api::MUSE_REASONING_EFFORT_TIERS),
+        allowed_configure_efforts: Some(&crate::native::types::REASONING_EFFORT_TIERS),
         configure_session_mode: ConfigureSessionMode::WhenModelPresent,
         configure_requires_idle_turn: true,
         configure_carries_previous_overlay: true,

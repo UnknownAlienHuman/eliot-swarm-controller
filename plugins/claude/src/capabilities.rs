@@ -13,6 +13,7 @@ use serde_json::Value;
 
 pub fn declaration() -> HarnessCapabilities {
     HarnessCapabilities {
+        catalogue_provider: eliot_core::api::harness::CatalogueProvider::Fixed("anthropic"),
         instruction_inventory: crate::instructions::INSTRUCTION_INVENTORY,
         model_login_source: Some(eliot_core::api::harness::ModelLoginSource::Files {
             root_env: "CLAUDE_CONFIG_DIR",
@@ -95,7 +96,7 @@ pub fn declaration() -> HarnessCapabilities {
         configure_requires_idle_turn: true,
         executable_stems: &["claude"],
         version_prefixes: &["claude-code", "claude"],
-        legacy_result_status: true,
+        legacy_result_status: Some(legacy_result_outcome),
         input_token_accounting: InputTokenAccounting::ExcludesCacheWrites,
         ..HarnessCapabilities::default()
     }
@@ -137,5 +138,25 @@ fn native_access_bounds(snapshot: &Value) -> Option<NativeAccessBounds> {
         // The CLI default can come from settings outside the frozen profile.
         None => Some((1, 3)),
         Some(_) => None,
+    }
+}
+
+fn legacy_result_outcome(status: Option<&str>) -> eliot_core::TurnOutcome {
+    use eliot_core::TurnOutcome;
+    match status.map(str::trim) {
+        Some("success" | "completed") => TurnOutcome::Success,
+        Some("cancelled" | "interrupted") => TurnOutcome::Interrupted,
+        Some("error" | "failed" | "failure") => TurnOutcome::Failure,
+        Some(reason)
+            if {
+                let lower = reason.to_lowercase();
+                ["api_error", "error", "failed", "failure"]
+                    .iter()
+                    .any(|prefix| lower.starts_with(prefix))
+            } =>
+        {
+            TurnOutcome::Failure
+        }
+        _ => TurnOutcome::Unknown,
     }
 }

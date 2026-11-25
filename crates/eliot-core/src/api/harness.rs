@@ -341,6 +341,7 @@ pub struct HarnessCapabilities {
     pub models_workspace_preview: bool,
     /// Published native aliases used when a verified live catalogue is unavailable.
     pub documented_models: Option<DocumentedModelCatalog>,
+    pub catalogue_provider: CatalogueProvider,
     pub model_catalogue_presentation: Option<ModelCataloguePresentation>,
     pub model_reader: ModelReaderOptions,
     pub model_login_source: Option<ModelLoginSource>,
@@ -389,7 +390,7 @@ pub struct HarnessCapabilities {
     /// Product prefixes stripped when normalizing `--version` strings.
     pub version_prefixes: &'static [&'static str],
     /// Retained turn status can be a native print result subtype.
-    pub legacy_result_status: bool,
+    pub legacy_result_status: Option<fn(Option<&str>) -> crate::TurnOutcome>,
     /// Interpretation of retained input counts before normalization.
     pub input_token_accounting: InputTokenAccounting,
     /// Native output and reasoning counts are disjoint.
@@ -960,11 +961,6 @@ impl ConfigureSupport {
         }
     }
 }
-
-/// Muse stable schema's closed reasoning effort vocabulary.
-pub const MUSE_REASONING_EFFORT_TIERS: [&str; 8] = [
-    "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra",
-];
 
 /// Whether a dispatched `configure` must switch the live native session
 /// through the owned plugin with native proof before the Router stores
@@ -1653,30 +1649,37 @@ impl ModelsCatalogResponse {
     }
 }
 
-/// Provider display label for a model catalogue ID, also used by the desktop
-/// without loading the adapter registry.
+/// Adapter rule for model IDs without a nonempty provider prefix.
+#[derive(Clone, Copy, Debug, Default)]
+pub enum CatalogueProvider {
+    #[default]
+    Harness,
+    Fixed(&'static str),
+    ModelFamily,
+    ModelPrefix,
+}
+
+/// Provider display label for a model catalogue ID.
 pub fn catalog_provider(harness: &str, id: &str) -> String {
-    if let Some((provider, _)) = id.split_once('/')
-        && !provider.trim().is_empty()
-    {
+    let prefix = id.split_once('/').map(|(provider, _)| provider);
+    if let Some(provider) = prefix.filter(|provider| !provider.trim().is_empty()) {
         return provider.to_owned();
     }
-    match harness {
-        "codex" => "openai".to_owned(),
-        "claude" => "anthropic".to_owned(),
-        "muse" => "meta".to_owned(),
-        "antigravity" => id
+    let strategy = BUILTIN_CAPABILITIES
+        .get()
+        .and_then(|_| HarnessCapabilities::for_harness(harness))
+        .map_or(CatalogueProvider::Harness, |caps| caps.catalogue_provider);
+    match strategy {
+        CatalogueProvider::Harness => harness,
+        CatalogueProvider::Fixed(provider) => provider,
+        CatalogueProvider::ModelFamily => id
             .split(['-', '_'])
             .next()
             .filter(|family| !family.trim().is_empty())
-            .unwrap_or(harness)
-            .to_owned(),
-        "opencode" => id
-            .split_once('/')
-            .map(|(provider, _)| provider.to_owned())
-            .unwrap_or_else(|| harness.to_owned()),
-        _ => harness.to_owned(),
+            .unwrap_or(harness),
+        CatalogueProvider::ModelPrefix => prefix.unwrap_or(harness),
     }
+    .to_owned()
 }
 
 /// Cursor for one catalogue entry: `harness:id`.

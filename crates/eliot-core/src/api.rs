@@ -161,10 +161,10 @@ pub use harness::{
     HarnessCapabilities, HarnessEntry, HarnessListRequest, HarnessListResponse, HarnessModelEntry,
     HarnessModelsRequest, HarnessModelsResponse, HarnessQuotaRequest, HarnessQuotaResponse,
     InputTokenAccounting, MAX_HARNESS_CREDENTIAL_BYTES, MAX_HARNESS_PROFILE_BYTES,
-    MAX_HARNESS_QUOTA_NOTE_BYTES, MAX_HARNESS_SCOPE_BYTES, MUSE_REASONING_EFFORT_TIERS,
-    ModelsCatalogEntry, ModelsCatalogFailure, ModelsCatalogRequest, ModelsCatalogResponse,
-    SUPPORTED_HARNESSES, catalog_cursor, catalog_matches, catalog_provider,
-    configure_uses_native_session, is_supported_harness, register_harness_capabilities,
+    MAX_HARNESS_QUOTA_NOTE_BYTES, MAX_HARNESS_SCOPE_BYTES, ModelsCatalogEntry,
+    ModelsCatalogFailure, ModelsCatalogRequest, ModelsCatalogResponse, SUPPORTED_HARNESSES,
+    catalog_cursor, catalog_matches, catalog_provider, configure_uses_native_session,
+    is_supported_harness, register_harness_capabilities,
 };
 pub use hierarchy::{
     DEFAULT_MAX_CHILDREN_PER_AGENT, DEFAULT_MAX_DEPTH, DEFAULT_MAX_SELECTOR_TARGETS,

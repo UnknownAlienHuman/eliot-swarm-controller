@@ -12,6 +12,7 @@ use eliot_plugin::capabilities::{adhoc_launch, quota_readback};
 
 pub fn declaration() -> HarnessCapabilities {
     HarnessCapabilities {
+        catalogue_provider: eliot_core::api::harness::CatalogueProvider::ModelPrefix,
         instruction_inventory: crate::instructions::INSTRUCTION_INVENTORY,
         model_login_source: Some(eliot_core::api::harness::ModelLoginSource::Files {
             root_env: "XDG_DATA_HOME",

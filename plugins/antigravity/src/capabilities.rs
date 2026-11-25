@@ -12,6 +12,7 @@ use serde_json::Value;
 
 pub fn declaration() -> HarnessCapabilities {
     HarnessCapabilities {
+        catalogue_provider: eliot_core::api::harness::CatalogueProvider::ModelFamily,
         instruction_inventory: crate::instructions::INSTRUCTION_INVENTORY,
         #[cfg(windows)]
         model_login_source: Some(eliot_core::api::harness::ModelLoginSource::Keyring(|| {

@@ -61,6 +61,7 @@ pub(super) fn is_route_selector_env_name(name: &str) -> bool {
 
 pub fn declaration() -> HarnessCapabilities {
     HarnessCapabilities {
+        catalogue_provider: eliot_core::api::harness::CatalogueProvider::Fixed("openai"),
         instruction_inventory: crate::instructions::INSTRUCTION_INVENTORY,
         model_login_source: Some(eliot_core::api::harness::ModelLoginSource::Files {
             root_env: "CODEX_HOME",

@@ -909,36 +909,14 @@ impl TurnOutcome {
         }
     }
 
-    /// Harness-aware classification for rows written before canonical
-    /// outcomes existed, using the stored harness and that adapter's
-    /// recognized native reasons. Claude rows carry the raw terminal reason
-    /// (`success`/`completed` -> success; `cancelled`/`interrupted` ->
-    /// interrupted; `error`/`failed`/`failure` and the `api_error*` family
-    /// -> failure). Every other harness carries the normalized lifecycle
-    /// status and uses [`Self::classify_legacy_status`]. Anything else is
-    /// unknown, never success.
+    /// Decode a retained native result using its adapter's historical vocabulary.
     pub fn classify_legacy_status_for_harness(harness: &str, status: Option<&str>) -> Self {
-        if !api::HarnessCapabilities::of(harness).legacy_result_status {
-            return Self::classify_legacy_status(status);
-        }
-        match status.map(str::trim) {
-            Some("success") | Some("completed") => Self::Success,
-            Some("cancelled") | Some("interrupted") => Self::Interrupted,
-            Some("error") | Some("failed") | Some("failure") => Self::Failure,
-            Some(reason) => {
-                let lower = reason.to_lowercase();
-                if lower.starts_with("api_error")
-                    || lower.starts_with("error")
-                    || lower.starts_with("failed")
-                    || lower.starts_with("failure")
-                {
-                    Self::Failure
-                } else {
-                    Self::Unknown
-                }
-            }
-            None => Self::Unknown,
-        }
+        api::HarnessCapabilities::of(harness)
+            .legacy_result_status
+            .map_or_else(
+                || Self::classify_legacy_status(status),
+                |decode| decode(status),
+            )
     }
 }
 
