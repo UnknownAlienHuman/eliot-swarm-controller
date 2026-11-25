@@ -46,6 +46,16 @@ struct PreparedVarSet {
     payload_digest: Vec<u8>,
 }
 
+/// The retained digest includes null optional fields and the resolved scope.
+#[derive(serde::Serialize)]
+struct VarSetDigest<'a> {
+    scope: &'a str,
+    key: &'a str,
+    value: &'a Value,
+    expect_version: Option<i64>,
+    note: Option<&'a str>,
+}
+
 fn retained_write_binding(
     connection: &rusqlite::Connection,
     principal: &str,
@@ -721,17 +731,17 @@ impl Store {
                 "variable value exceeds the 16 KiB bound",
             ));
         }
-        let semantic_payload = json!({
-            "scope": encoded_scope,
-            "key": request.key,
-            "value": request.value,
-            "expect_version": request.expect_version,
-            "note": request.note,
-        });
+        let payload_digest = canonical::digest_serializable(&VarSetDigest {
+            scope: &encoded_scope,
+            key: &request.key,
+            value: &request.value,
+            expect_version: request.expect_version,
+            note: request.note.as_deref(),
+        })?;
         Ok(PreparedVarSet {
             encoded_scope,
             encoded_value,
-            payload_digest: canonical::digest(&semantic_payload)?,
+            payload_digest,
         })
     }
 
@@ -763,7 +773,7 @@ impl Store {
         else {
             return Ok(None);
         };
-        let value = serde_json::from_value::<VarSetResponse>(decode_json(&retained)?)
+        let value = serde_json::from_str::<VarSetResponse>(&retained)
             .map_err(|error| Error::new("internal", error.to_string()))?;
         request.validate_response(&value)?;
         Ok(Some(Change {
@@ -1520,7 +1530,7 @@ impl Store {
             payload_digest,
             "variable write id is bound to another principal, method, or payload",
         )? {
-            let value = serde_json::from_value::<VarSetResponse>(decode_json(&retained)?)
+            let value = serde_json::from_str::<VarSetResponse>(&retained)
                 .map_err(|error| Error::new("internal", error.to_string()))?;
             request.validate_response(&value)?;
             return Ok(Change {
@@ -1775,28 +1785,18 @@ impl Store {
                 now
             ],
         ));
-        let input = DaemonEventInput::new(
-            now,
-            "var.changed",
-            "coordination",
-            None,
-            None,
-            json!({
-                "scope": encoded_scope,
-                "key": key,
-                "version": version,
-                "set_by": principal,
-            }),
-        );
-        let event = match command_id {
-            Some(id) => insert_daemon_event_for_command(tx, id, input)?,
-            None => insert_daemon_event_input(tx, input)?,
-        };
         let response = VarSetResponse {
             scope: encoded_scope.to_owned(),
             key: key.to_owned(),
             version,
             set_by: principal.to_owned(),
+        };
+        let data = serde_json::to_value(&response)
+            .map_err(|error| Error::new("invalid", error.to_string()))?;
+        let input = DaemonEventInput::new(now, "var.changed", "coordination", None, None, data);
+        let event = match command_id {
+            Some(id) => insert_daemon_event_for_command(tx, id, input)?,
+            None => insert_daemon_event_input(tx, input)?,
         };
         Ok((response, event))
     }

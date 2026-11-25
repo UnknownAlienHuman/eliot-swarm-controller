@@ -15,3 +15,10 @@ pub(crate) fn digest(value: &Value) -> eliot_core::Result<Vec<u8>> {
         .map(|digest| digest.to_vec())
         .map_err(|err| eliot_core::Error::new("invalid", err.to_string()))
 }
+
+/// Canonicalize a typed semantic payload through the same JSON representation.
+pub(crate) fn digest_serializable(value: &impl serde::Serialize) -> eliot_core::Result<Vec<u8>> {
+    let value = serde_json::to_value(value)
+        .map_err(|error| eliot_core::Error::new("invalid", error.to_string()))?;
+    digest(&value)
+}

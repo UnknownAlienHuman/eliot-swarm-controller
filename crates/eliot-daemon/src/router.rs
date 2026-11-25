@@ -7381,12 +7381,8 @@ impl EventFilter {
                 .as_ref()
                 .is_some_and(|agent| self.agents.contains(agent))
             || (event.agent.is_none()
-                && event.kind == "var.changed"
-                && event
-                    .data
-                    .get("scope")
-                    .and_then(Value::as_str)
-                    .is_some_and(|scope| self.var_scopes.contains(scope))))
+                && coordination::changed_var(event)
+                    .is_some_and(|change| self.var_scopes.contains(&change.scope))))
             && (self.kinds.is_empty() || self.kinds.contains(&event.kind))
             && (self.sources.is_empty() || self.sources.contains(&event.source))
     }
