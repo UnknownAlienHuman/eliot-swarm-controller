@@ -21,6 +21,7 @@ const PROJECT_WATCH_CHECKOUTS: usize = 256;
 #[derive(Default)]
 pub(crate) struct ProjectReadCache {
     entries: Mutex<HashMap<String, Arc<ProjectObservation>>>,
+    request_failures: Mutex<HashMap<String, Error>>,
     wake: Arc<tokio::sync::Notify>,
 }
 
@@ -101,15 +102,14 @@ impl ProjectReadCache {
                         .iter()
                         .map(|registration| registration.checkout.clone())
                         .collect();
-                    let (origin, checkouts) = match git.get_or_init(WorkspaceGit::new) {
-                        Ok(git) => {
-                            git.read_project_for_request(&common, paths, deadline, reporter)
-                                .await
-                        }
-                        Err(error) => {
-                            reporter.project_read_failed(&common, error);
-                            (None, Vec::new())
-                        }
+                    let (origin, checkouts, request_failure) =
+                        match git.get_or_init(WorkspaceGit::new) {
+                            Ok(git) => git.read_project_for_request(&common, paths, deadline).await,
+                            Err(error) => (None, Vec::new(), Some(error.clone())),
+                        };
+                    match request_failure {
+                        Some(error) => self.report_request_failure(&common, &error, reporter),
+                        None => self.clear_request_failure(&common),
                     };
                     let mut group = group;
                     for registration in &mut group {
@@ -149,6 +149,9 @@ impl ProjectReadCache {
         if !retired.is_empty() {
             tokio::task::spawn_blocking(move || drop(retired));
         }
+        self.request_failures
+            .lock_recover()
+            .retain(|key, _| registrations.contains_key(key));
     }
 
     async fn verified(&self, common: &str, registrations: &[String]) -> bool {
@@ -193,6 +196,27 @@ impl ProjectReadCache {
             );
         }
         reporter.project_read_failed(&common, &error);
+    }
+
+    /// Log a request-path live Git read failure only on transition, mirroring
+    /// [`Self::record_fallback`]. Legacy callers and opted-in polls in
+    /// fallback otherwise log the same failure on every poll.
+    fn report_request_failure(&self, common: &str, error: &Error, reporter: &WorkerReporter) {
+        {
+            let mut failures = self.request_failures.lock_recover();
+            if let Some(previous) = failures.get(common)
+                && previous.code == error.code
+                && previous.message == error.message
+            {
+                return;
+            }
+            failures.insert(common.to_owned(), error.clone());
+        }
+        reporter.project_read_failed(common, error);
+    }
+
+    fn clear_request_failure(&self, common: &str) {
+        self.request_failures.lock_recover().remove(common);
     }
 
     fn record_unverified(&self, common: String, reporter: &WorkerReporter) {
@@ -534,27 +558,32 @@ impl WorkspaceGit {
         common: &str,
         paths: Vec<String>,
         deadline: Instant,
-        reporter: &WorkerReporter,
-    ) -> (Option<String>, Vec<ProjectCheckoutView>) {
+    ) -> (Option<String>, Vec<ProjectCheckoutView>, Option<Error>) {
         match tokio::time::timeout_at(deadline, self.read_project(common, paths, None, deadline))
             .await
         {
             Ok((origin, checkouts, complete)) => {
                 if !complete {
-                    reporter.project_read_failed(
-                        common,
-                        &problem("unavailable", "live project Git read could not verify the complete checkout inventory"),
-                    );
+                    (
+                        origin,
+                        checkouts,
+                        Some(problem(
+                            "unavailable",
+                            "live project Git read could not verify the complete checkout inventory",
+                        )),
+                    )
+                } else {
+                    (origin, checkouts, None)
                 }
-                (origin, checkouts)
             }
-            Err(_) => {
-                reporter.project_read_failed(
-                    common,
-                    &problem("unavailable", "live project Git read exceeded its deadline"),
-                );
-                (None, Vec::new())
-            }
+            Err(_) => (
+                None,
+                Vec::new(),
+                Some(problem(
+                    "unavailable",
+                    "live project Git read exceeded its deadline",
+                )),
+            ),
         }
     }
 
