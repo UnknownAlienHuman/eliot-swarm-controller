@@ -355,6 +355,7 @@ impl DesktopApp {
         self.chat.live = LiveStatus::Loading;
         self.chat.confirm_force = None;
         self.chat.goal = None;
+        self.chat.goal_error = None;
         self.chat.decisions = None;
         self.chat.decisions_facts = None;
         self.chat.decisions_error = None;

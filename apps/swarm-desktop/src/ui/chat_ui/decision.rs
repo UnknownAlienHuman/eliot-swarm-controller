@@ -213,11 +213,18 @@ impl DesktopApp {
     /// Read the open Agent's goal (`goal.get`) into `chat.goal`, which the
     /// header, Details and the Goal dialog show: with every detail read,
     /// when the Goal dialog opens, and when the inbox's counts change (a
-    /// goal that blocks after the turn's last event sends no other one).
-    pub(in crate::ui) fn read_goal(&self, context: &ComponentContext<Self>) {
+    /// goal that blocks after the turn's last event sends no other one),
+    /// and after every goal action. One read is in flight at a time; a
+    /// request during it reads once more after its reply.
+    pub(in crate::ui) fn read_goal(&mut self, context: &ComponentContext<Self>) {
+        if self.chat.goal_reading {
+            self.chat.goal_again = true;
+            return;
+        }
         let (Some(agent), Ok(data_dir)) = (self.selected_agent_id(), self.data_dir.clone()) else {
             return;
         };
+        self.chat.goal_reading = true;
         let _task = context.spawn_background(move |_| {
             let read = client::block_on(client::goal_get(&data_dir, &agent))
                 .map(|goal| goal.map(Box::new))

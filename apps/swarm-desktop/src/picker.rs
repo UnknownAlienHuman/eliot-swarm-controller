@@ -49,6 +49,18 @@ impl Availability {
         }
     }
 
+    /// A row the catalogue does not list (Claude's CLI default, a typed or
+    /// remembered id): a hold read for the harness's own account scope
+    /// covers it too; quota is per model, so it is never Ready.
+    fn unlisted(reply: Option<&ModelsCatalogResponse>, harness: &str) -> Self {
+        let held = reply.is_some_and(|reply| {
+            reply.models.iter().any(|model| {
+                model.harness == harness && model.profile.is_none() && model.availability == HELD
+            })
+        });
+        if held { Self::Held } else { Self::Unknown }
+    }
+
     /// The row's own label for it.
     pub fn label(self) -> Option<&'static str> {
         match self {
@@ -723,6 +735,7 @@ fn claude_rows(
         item.hidden = !visible(inputs, model);
         rows.push(Row::Choice(item));
     }
+    let unlisted = Availability::unlisted(Some(reply), code);
     let item = |key: String, model: Option<String>, title: String, detail: String| {
         let effort = row_effort(inputs, &key, code, model.as_deref(), None, None);
         Item {
@@ -744,7 +757,7 @@ fn claude_rows(
             disabled: None,
             hidden: false,
             provider: provider_label("anthropic"),
-            availability: Availability::Unknown,
+            availability: unlisted,
         }
     };
     if named {
@@ -843,7 +856,7 @@ fn remembered_item(
                     &known.harness,
                     &known.model,
                 )),
-                availability: Availability::Unknown,
+                availability: Availability::unlisted(reply, &known.harness),
             }
         }
     };

@@ -337,7 +337,7 @@ impl DesktopApp {
                 }
             }
             GoalMsg::Control(control) => self.goal_call(Step::Control(control), None, context),
-            GoalMsg::Done(agent, step, result) => self.goal_done(agent, step, *result),
+            GoalMsg::Done(agent, step, result) => self.goal_done(agent, step, *result, context),
         }
     }
 
@@ -382,9 +382,16 @@ impl DesktopApp {
         request: Option<GoalSetRequest>,
         context: &ComponentContext<Self>,
     ) {
-        let Ok(data_dir) = self.data_dir.clone() else {
-            return;
+        let data_dir = match self.data_dir.clone() {
+            Ok(data_dir) => data_dir,
+            Err(error) => {
+                if let Some(open) = self.goal.open.as_mut() {
+                    open.error = Some(format!("{} was not sent: {error}", step.label()));
+                }
+                return;
+            }
         };
+        // The controls are disabled while a call is in flight.
         let Some(open) = self.goal.open.as_mut().filter(|open| open.busy.is_none()) else {
             return;
         };
@@ -413,8 +420,17 @@ impl DesktopApp {
 
     /// A goal call settled: the goal the daemon left becomes the open
     /// conversation's (the header and Details show it); a confirmed save
-    /// closes the dialog, a refusal stays in it.
-    fn goal_done(&mut self, agent: String, step: Step, result: MutationResult<GoalView>) {
+    /// closes the dialog, a refusal stays in it. The goal is read again
+    /// either way: a read begun before the call is dropped, and an
+    /// unconfirmed call shows what the daemon holds.
+    fn goal_done(
+        &mut self,
+        agent: String,
+        step: Step,
+        result: MutationResult<GoalView>,
+        context: &ComponentContext<Self>,
+    ) {
+        let open_agent = self.selected_agent_id().as_deref() == Some(agent.as_str());
         let open = self
             .goal
             .open
@@ -429,8 +445,9 @@ impl DesktopApp {
                         self.goal.open = None;
                     }
                 }
-                if self.selected_agent_id().as_deref() == Some(agent.as_str()) {
+                if open_agent {
                     self.chat.goal = Some((agent, Some(goal)));
+                    self.chat.goal_error = None;
                 }
             }
             Err(error) => {
@@ -452,6 +469,9 @@ impl DesktopApp {
                 }
             }
         }
+        if open_agent {
+            self.read_goal(context);
+        }
     }
 
     /// The Goal dialog: its context line, the fields, the error and the
@@ -462,13 +482,26 @@ impl DesktopApp {
         let current = goal.flatten();
         let draft = open.draft.clone().unwrap_or_else(|| Draft::of(current));
         let busy = open.busy.is_some();
-        let context_line = match goal {
-            None => "Reading the goal…".to_owned(),
-            Some(None) => {
+        let read_error = self
+            .chat
+            .goal_error
+            .as_ref()
+            .filter(|(id, _)| *id == open.agent)
+            .map(|(_, error)| error.as_str());
+        // Unknown until a read succeeds: a failed read never reads as "no
+        // goal", so Save cannot replace a goal it did not see.
+        let context_line = match (goal, read_error) {
+            (None, Some(error)) => format!("The goal could not be read: {error}"),
+            (None, None) => "Reading the goal…".to_owned(),
+            (Some(None), None) => {
                 "No goal yet. Swarm runs the task in rounds until the check passes or a limit is reached."
                     .to_owned()
             }
-            Some(Some(goal)) => status_words(goal),
+            (Some(None), Some(error)) => format!("No goal when last read. Not read again: {error}"),
+            (Some(Some(goal)), None) => status_words(goal),
+            (Some(Some(goal)), Some(error)) => {
+                format!("{} Not read again: {error}", status_words(goal))
+            }
         };
         let number = |header: &str, value: Option<f64>, message: fn(Option<f64>) -> GoalMsg| {
             NumberBox::new()
