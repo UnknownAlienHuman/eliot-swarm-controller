@@ -1256,14 +1256,12 @@ async fn check_after_edit(
                     failure = Some(format_failure("fast check", exit_code, &output, &policy));
                 } else {
                     fast_check_exit = Some(0);
-                    if let (Some(fingerprint), Some(observed)) =
-                        (before_check, checked_fingerprint.as_ref())
-                    {
-                        check_changed_worktree = &fingerprint != observed;
+                    if let Some(observed) = checked_fingerprint.as_ref() {
+                        check_changed_worktree = &before_check != observed;
                         if !check_changed_worktree {
                             passed = Some(ProjectCheckPass {
                                 check: check.clone(),
-                                fingerprint,
+                                fingerprint: before_check,
                             });
                         }
                     }
