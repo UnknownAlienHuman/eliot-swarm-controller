@@ -9,6 +9,15 @@ fn bounded(text: &str, limit: usize) -> (String, bool) {
     (format!("{}{MARKER}", &text[..end]), true)
 }
 
+fn bounded_instruction(text: &str, limit: usize, reference: &str) -> (String, bool) {
+    if text.len() <= limit {
+        return (text.to_owned(), false);
+    }
+    let marker = format!("\n[TRUNCATED: full retained input at {reference}]");
+    let end = text.floor_char_boundary(limit.saturating_sub(marker.len()));
+    (format!("{}{marker}", &text[..end]), true)
+}
+
 /// Inputs that vary by transfer kind.
 #[derive(Clone, Copy)]
 pub(crate) struct BriefInput<'a> {
@@ -67,6 +76,8 @@ pub(crate) fn build(
     } = input;
     let record_command = facts.and_then(|facts| facts.task_command.as_deref());
     let typed = facts.and_then(|facts| facts.task_inputs.original.as_ref());
+    let original_missing = facts.is_some_and(|facts| facts.original_task_missing);
+    let task = task.filter(|_| !original_missing);
     let selected = task.map(|task| task.id.as_str()).or(record_command);
     let prior_brief = task
         .map(|task| {
@@ -118,21 +129,16 @@ pub(crate) fn build(
     } else if prior_brief {
         "(previous handoff is retained history; verify effects before continuing)".to_owned()
     } else {
-        "(no original task text retained)".to_owned()
+        "(no original task binding or text retained; continue from the available instructions and Git facts)".to_owned()
     };
     let task_note = facts
         .filter(|_| uses_record && !original_unknown && !delivered_separately)
         .and_then(|facts| facts.task_note.as_deref())
         .unwrap_or_default();
-    if task_text.len().saturating_add(task_note.len()) > MAX_HANDOFF_TASK_BYTES {
-        return Err(Error::new(
-            "frame_too_large",
-            "the mandatory task and saved sources exceed the handoff input budget",
-        ));
-    }
     let inputs = facts.and_then(|facts| facts.task_ref.as_ref().map(|_| &facts.task_inputs));
-    let history_incomplete =
-        (prior_brief && !uses_record) || inputs.is_some_and(|inputs| inputs.history_incomplete);
+    let history_incomplete = original_missing
+        || (prior_brief && !uses_record)
+        || inputs.is_some_and(|inputs| inputs.history_incomplete);
     let history_unknown = has_unverified_instructions(tx, &request.from)?
         || inputs.is_some_and(|inputs| {
             inputs.history_unresolved
@@ -154,7 +160,7 @@ pub(crate) fn build(
     } else {
         ""
     };
-    let (priority, priority_ids, priority_clipped) = priority_instructions(
+    let priority = priority_instructions(
         tx,
         request,
         exact_id,
@@ -163,13 +169,10 @@ pub(crate) fn build(
         policy,
         directive.is_some(),
     )?;
-    let mandatory_len = task_text.len() + task_note.len() + priority.len();
-    if mandatory_len > MAX_HANDOFF_TASK_BYTES {
-        return Err(Error::new(
-            "frame_too_large",
-            "the task, saved sources and latest retained instructions exceed the handoff input budget",
-        ));
-    }
+    let priority_ids: Vec<_> = priority
+        .iter()
+        .map(|item| item.instruction.command_id.as_str())
+        .collect();
     let later = later_instructions(tx, request, exact_id, inputs, policy, input, &priority_ids)?;
     let mut history_note = if let Some(reference) =
         facts.and_then(|facts| facts.task_ref.as_deref())
@@ -199,7 +202,7 @@ pub(crate) fn build(
     let git = policy.redact_text(git);
     let saved_context = saved_context.map(|text| policy.redact_text(text));
     let (store, store_clipped) = bounded(
-        &store_facts(tx, request, last_turn.as_ref(), now)?,
+        &policy.redact_text(&store_facts(tx, request, last_turn.as_ref(), now)?),
         12 * 1024,
     );
     let header = directive.unwrap_or("Handoff brief: context only. Await the separate successor SENDs before executing queued work.");
@@ -214,8 +217,21 @@ pub(crate) fn build(
         .map_or_else(String::new, |input| {
             format!("\nOriginal task provenance: {}", instruction_label(input))
         });
-    let mut budget = (MAX_TEXT_BYTES - mandatory_len) / 4;
+    let mut budget = MAX_HANDOFF_TASK_BYTES / 2;
     loop {
+        let (task_text, task_clipped) = bounded_instruction(&task_text, budget, &command_ref);
+        let (priority, priority_clipped) = render_priority(&priority, budget);
+        let sources_omitted = task_note.len() > budget;
+        let source_marker;
+        let task_note = if sources_omitted {
+            let reference = facts
+                .and_then(|facts| facts.task_ref.as_deref())
+                .unwrap_or("task record");
+            source_marker = format!("\n[TRUNCATED: saved sources at {reference}:sources/]");
+            source_marker.as_str()
+        } else {
+            task_note
+        };
         let (git, git_clipped) = bounded(&git, budget);
         let git = core::fence_untrusted_text(&git);
         let (instructions, omitted) = later.render(budget);
@@ -237,7 +253,10 @@ pub(crate) fn build(
         if validate_frame(request, &text).is_ok() {
             return Ok(BuiltBrief {
                 text,
-                truncated: priority_clipped
+                truncated: task_clipped
+                    || priority_clipped
+                    || sources_omitted
+                    || facts.is_some_and(|facts| facts.task_sources_truncated)
                     || git_clipped
                     || store_clipped
                     || context_clipped
@@ -251,8 +270,9 @@ pub(crate) fn build(
                 history_incomplete,
                 saved_sources: facts
                     .filter(|_| {
-                        !task_note.is_empty()
-                            || (uses_record && !original_unknown && !delivered_separately)
+                        !sources_omitted
+                            && (!task_note.is_empty()
+                                || (uses_record && !original_unknown && !delivered_separately))
                     })
                     .and_then(|facts| facts.saved_sources),
             });
@@ -344,6 +364,32 @@ fn prior_brief_command(tx: &Connection, request: &HandoffRequest) -> Result<Opti
 
 /// Keep the newest accepted instruction, an interrupted input, and trusted
 /// pending review evidence ahead of the optional history and patch excerpts.
+struct PriorityInstruction {
+    heading: &'static str,
+    instruction: TaskInstruction,
+    delivery: &'static str,
+    limit: usize,
+}
+
+fn render_priority(items: &[PriorityInstruction], budget: usize) -> (String, bool) {
+    let mut rendered = String::new();
+    let mut truncated = false;
+    for item in items {
+        let label = instruction_label(&item.instruction);
+        rendered.push_str(&format!("\n\n{}: {label}{}", item.heading, item.delivery));
+        if item.instruction.text.is_empty() {
+            continue;
+        }
+        let reference = format!("command.get id={}", item.instruction.command_id);
+        let (text, clipped) =
+            bounded_instruction(&item.instruction.text, budget.min(item.limit), &reference);
+        rendered.push('\n');
+        rendered.push_str(&core::fence_untrusted_text(&text));
+        truncated |= clipped;
+    }
+    (rendered, truncated)
+}
+
 fn priority_instructions(
     tx: &Connection,
     request: &HandoffRequest,
@@ -352,12 +398,9 @@ fn priority_instructions(
     principal: Option<&str>,
     policy: &core::SecretPolicy,
     continues_task: bool,
-) -> Result<(String, Vec<String>, bool)> {
-    let mut rendered = String::new();
-    let mut included = Vec::new();
-    let mut truncated = false;
+) -> Result<Vec<PriorityInstruction>> {
+    let mut items: Vec<PriorityInstruction> = Vec::new();
     let agent_num = parse_agent_id(&request.from)?;
-    let self_prefix = format!("agent:{}:", request.from);
     let mut statement = tx.prepare_cached(
         "SELECT c.id FROM commands c LEFT JOIN commands p ON p.id=c.parent_command
          WHERE c.target=?1 AND c.generation=?2 AND c.id IS NOT ?3
@@ -365,26 +408,24 @@ fn priority_instructions(
            AND c.verb IN ('send','steer','inject') AND json_type(c.args,'$.text')='text'
            AND c.link_kind IS NOT 'handoff'
            AND json_type(p.args,'$.continue_from_stop') IS NOT 'text'
-           AND (?6=2 OR NOT EXISTS (
+           AND (?5=2 OR NOT EXISTS (
                SELECT 1 FROM commands o WHERE o.id=?3 AND o.target=c.target
                  AND o.generation=c.generation AND (c.created_at,c.rowid)<(o.created_at,o.rowid)))
            AND NOT EXISTS (SELECT 1 FROM restart_resume_intents r
                            WHERE r.command_id=c.parent_command AND r.continuation_brief)
-           AND ((?6<>2 AND (c.principal='owner' OR
-                           (c.principal GLOB 'agent:a[0-9]*:*' AND substr(c.principal,1,length(?5))<>?5))
+           AND ((?5<>2 AND (c.principal='owner' OR
+                           c.principal GLOB ('agent:a' || (SELECT parent FROM agents WHERE id=c.target) || ':*'))
                  AND c.link_kind IS NOT 'rule_action' AND json_extract(c.cause,'$.rule') IS NULL
                  AND json_extract(p.cause,'$.rule') IS NULL
                  AND NOT EXISTS (SELECT 1 FROM writes w WHERE w.method='goal.round'
                                  AND json_extract(w.result,'$.continuation_id')=c.id))
-             OR (?6=2 AND json_type(c.args,'$._trusted_review_labels')='object'))
-           AND ((?6=0 AND (c.state IN ('accepted','queued','applied')
-                           OR (c.state='cancelled' AND json_extract(c.outcome,'$.reason')
-                               IN ('generation_stopped','generation_lost'))))
-             OR (?6=1 AND c.state='applied' AND EXISTS (
+             OR (?5=2 AND json_type(c.args,'$._trusted_review_labels')='object'))
+           AND ((?5=0 AND c.state IN ('accepted','queued','applied'))
+             OR (?5=1 AND c.state='applied' AND EXISTS (
                  SELECT 1 FROM turns t WHERE t.agent=c.target AND t.generation=c.generation
                    AND t.turn_id=c.turn_id AND (t.state<>'completed' OR t.outcome IS NOT 'success')))
-             OR (?6=2 AND c.state IN ('accepted','queued'))
-             OR (?6=3 AND c.state IN ('dispatched','unknown')))
+             OR (?5=2 AND c.state IN ('accepted','queued'))
+             OR (?5=3 AND c.state IN ('dispatched','unknown')))
          ORDER BY c.created_at DESC,c.rowid DESC LIMIT 1",
     ).map_err(sql_error)?;
     for (kind, heading) in [
@@ -400,38 +441,25 @@ fn priority_instructions(
                     request.from_generation,
                     original,
                     principal,
-                    self_prefix,
                     kind
                 ],
                 |row| row.get(0),
             )
             .optional()
             .map_err(sql_error)?;
-        let Some(id) = id.filter(|id| !included.contains(id)) else {
+        let Some(id) = id.filter(|id| !items.iter().any(|item| item.instruction.command_id == *id))
+        else {
             continue;
         };
         let command = load_command(tx, &id)?
             .ok_or_else(|| Error::new("source_integrity", "retained handoff input disappeared"))?;
-        if kind == 3 {
-            let instruction =
-                TaskInstruction::from_command(&command, String::new()).ok_or_else(|| {
-                    Error::new("source_integrity", "unresolved handoff input has no source")
-                })?;
-            rendered.push_str(&format!(
-                "\n\n{heading}: {}",
-                instruction_label(&instruction)
-            ));
-            included.push(id);
-            continue;
-        }
-        let text = input_before_owner_rules(&command)
-            .ok_or_else(|| Error::new("source_integrity", "retained handoff input has no text"))?;
-        let mut text = policy.redact_text(text);
-        if kind == 2 {
-            let (excerpt, clipped) = bounded(&text, 8 * 1024);
-            text = excerpt;
-            truncated |= clipped;
-        }
+        let text = if kind == 3 {
+            String::new()
+        } else {
+            policy.redact_text(input_before_owner_rules(&command).ok_or_else(|| {
+                Error::new("source_integrity", "retained handoff input has no text")
+            })?)
+        };
         let instruction = TaskInstruction::from_command(&command, text).ok_or_else(|| {
             Error::new("source_integrity", "retained handoff input has no source")
         })?;
@@ -439,10 +467,7 @@ fn priority_instructions(
             "\nA separate successor SEND will deliver this input. Wait for that SEND before acting on it."
         } else if continues_task
             && kind == 0
-            && matches!(
-                command.state,
-                CommandState::Accepted | CommandState::Queued | CommandState::Cancelled
-            )
+            && matches!(command.state, CommandState::Accepted | CommandState::Queued)
             && command.verb == "inject"
             && command.args["point"] == "next_input"
         {
@@ -450,14 +475,14 @@ fn priority_instructions(
         } else {
             ""
         };
-        rendered.push_str(&format!(
-            "\n\n{heading}: {}{delivery}\n{}",
-            instruction_label(&instruction),
-            core::fence_untrusted_text(&instruction.text)
-        ));
-        included.push(id);
+        items.push(PriorityInstruction {
+            heading,
+            instruction,
+            delivery,
+            limit: if kind == 2 { 8 * 1024 } else { usize::MAX },
+        });
     }
-    Ok((rendered, included, truncated))
+    Ok(items)
 }
 
 fn later_instructions(
@@ -467,7 +492,7 @@ fn later_instructions(
     inputs: Option<&TaskInputs>,
     policy: &core::SecretPolicy,
     input: BriefInput<'_>,
-    priority: &[String],
+    priority: &[&str],
 ) -> Result<LaterInstructions> {
     let BriefInput {
         transferred,
@@ -488,8 +513,10 @@ fn later_instructions(
             // Older records did not identify the sources in this aggregate.
             .max(inputs.compacted_omissions);
         for record in inputs.corrections.iter().rev() {
-            if input_principal.is_some_and(|principal| principal != record.principal)
-                || priority.contains(&record.command_id)
+            if record.principal != "owner"
+                || record.state == CommandState::Cancelled
+                || input_principal.is_some_and(|principal| principal != record.principal)
+                || priority.contains(&record.command_id.as_str())
                 || transferred.iter().any(|send| send.id == record.command_id)
             {
                 continue;
@@ -517,8 +544,9 @@ fn later_instructions(
            AND c.id IS NOT ?3 AND c.verb IN ('send','steer','inject')
            AND (?4 = 0 OR c.principal <> 'owner')
            AND (?5 IS NULL OR c.principal = ?5)
-           AND c.principal NOT LIKE 'swarm_note:%'
-           AND c.state <> 'rejected'
+           AND (c.principal='owner'
+             OR c.principal GLOB ('agent:a' || (SELECT parent FROM agents WHERE id=c.target) || ':*'))
+           AND c.state NOT IN ('rejected','cancelled')
            AND NOT (c.link_kind IS 'handoff' AND c.ordinal = 0)
            AND NOT EXISTS (SELECT 1 FROM commands p WHERE p.id=c.parent_command
                            AND json_type(p.args,'$.continue_from_stop')='text')
@@ -551,7 +579,7 @@ fn later_instructions(
             counted = true;
         }
         let id: String = row.get(0).map_err(sql_error)?;
-        if priority.contains(&id)
+        if priority.contains(&id.as_str())
             || transferred.iter().any(|send| send.id == id)
             || inputs.is_some_and(|inputs| {
                 inputs

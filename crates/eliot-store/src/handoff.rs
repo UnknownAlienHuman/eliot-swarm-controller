@@ -14,6 +14,8 @@ pub const AGENT_HANDED_OFF: &str = "agent.handed_off";
 /// What the Router read from Git and the file system for one brief.
 #[derive(Clone, Debug, Default)]
 pub struct BriefFacts {
+    pub original_task_missing: bool,
+    pub task_sources_truncated: bool,
     pub git_summary: Option<String>,
     pub git: Option<String>,
     /// Exact original SEND bound to the task record read for this brief.
@@ -135,9 +137,7 @@ impl Store {
             task_command: facts.task_command.clone().unwrap_or_default(),
             commands: Vec::new(),
         };
-        let task = request
-            .task_command
-            .is_empty()
+        let task = (request.task_command.is_empty() && !facts.original_task_missing)
             .then(|| {
                 tx.query_row(
                     "SELECT start_command_id FROM turns

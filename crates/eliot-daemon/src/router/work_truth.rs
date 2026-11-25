@@ -711,12 +711,22 @@ impl Router {
         if !records_work(source) {
             return Ok(BriefFacts::default());
         }
-        let task_command = self.inner.store.lock().await.handoff_task_command(
+        let binding = self.inner.store.lock().await.handoff_task_command(
             &source.id,
             source.generation,
             task_command,
         )?;
-        self.ensure_work_task(&source.id, source.generation, task_command.as_deref())
+        let task_command = match &binding {
+            eliot_store::HandoffTaskBinding::Keep => None,
+            eliot_store::HandoffTaskBinding::Select(id) => Some(id.as_str()),
+            eliot_store::HandoffTaskBinding::MissingOriginal => {
+                return Ok(BriefFacts {
+                    original_task_missing: true,
+                    ..BriefFacts::default()
+                });
+            }
+        };
+        self.ensure_work_task(&source.id, source.generation, task_command)
             .await?;
         let (reference, command) = {
             let store = self.inner.store.lock().await;

@@ -1,6 +1,12 @@
 //! Where an Agent's work is recorded in Git. The daemon writes the Git objects;
 //! Store keeps the latest fact per generation and the event history.
 use super::*;
+
+pub enum HandoffTaskBinding {
+    Keep,
+    Select(String),
+    MissingOriginal,
+}
 use eliot_core::api::{
     AgentHandoffView, AgentWorkTruthView, CheckpointRestoreRequest, CheckpointRestoreResponse,
     GitCheckpointState, GitCheckpointView, GitCheckpointWithheld, HandoffReason, SendTransfer,
@@ -1194,16 +1200,18 @@ impl Store {
         agent: &str,
         generation: i64,
         requested: Option<&str>,
-    ) -> Result<Option<String>> {
+    ) -> Result<HandoffTaskBinding> {
         let selected = self.work_task_command(agent, generation)?;
         let command = requested
             .filter(|id| !id.is_empty())
             .or(selected.as_deref());
         let Some(id) = command else {
-            return Ok(None);
+            return Ok(HandoffTaskBinding::Keep);
         };
         if !result_page::is_restart_continuation_send(&self.connection, id)? {
-            return Ok(requested.map(str::to_owned));
+            return Ok(requested
+                .map(|id| HandoffTaskBinding::Select(id.to_owned()))
+                .unwrap_or(HandoffTaskBinding::Keep));
         }
         let previous = self
             .connection
@@ -1221,15 +1229,13 @@ impl Store {
             )
             .optional()
             .map_err(sql_error)?;
-        previous.map(Some).ok_or_else(|| {
-            Error::new(
-                "unavailable",
-                "original task is unavailable behind a generated restart continuation",
-            )
-        })
+        Ok(previous.map_or(
+            HandoffTaskBinding::MissingOriginal,
+            HandoffTaskBinding::Select,
+        ))
     }
 
-    /// Capture bounded Owner and manager inputs in Store admission order.
+    /// Capture bounded Owner corrections in Store admission order.
     /// The Git task record keeps them after command retention or another switch.
     pub fn task_corrections(
         &self,
@@ -1248,11 +1254,9 @@ impl Store {
             .prepare(
                 "SELECT c.id, COUNT(*) OVER (), c.created_at, c.rowid FROM commands c
              LEFT JOIN commands parent ON parent.id = c.parent_command
-             WHERE c.target = ?1 AND c.generation = ?2
-               AND (c.principal='owner' OR (c.principal GLOB 'agent:a[0-9]*:*'
-                    AND substr(c.principal,1,length(?5))<>?5))
+             WHERE c.target = ?1 AND c.generation = ?2 AND c.principal='owner'
                AND c.id <> ?3 AND c.verb IN ('send', 'steer', 'inject')
-               AND c.state <> 'rejected'
+               AND c.state NOT IN ('rejected','cancelled')
                AND c.link_kind IS NOT 'handoff' AND c.link_kind IS NOT 'rule_action'
                AND json_type(parent.args,'$.continue_from_stop') IS NOT 'text'
                AND NOT EXISTS (SELECT 1 FROM restart_resume_intents r
@@ -1270,13 +1274,7 @@ impl Store {
             .map_err(sql_error)?;
         let rows = statement
             .query_map(
-                params![
-                    parse_agent_id(agent)?,
-                    generation,
-                    task,
-                    LIMIT + 1,
-                    format!("agent:{agent}:"),
-                ],
+                params![parse_agent_id(agent)?, generation, task, LIMIT + 1],
                 |row| {
                     Ok((
                         row.get::<_, String>(0)?,

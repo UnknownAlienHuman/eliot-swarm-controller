@@ -1230,19 +1230,19 @@ handoff leaves children in place. Validation failure rolls back the transfer.
 
 The first successor input is one bounded handoff brief, admitted as ordinary `send`
 to B's exact generation. The selected Git task record supplies the original text
-and standing constraints after redaction. Retained Owner and manager
-instructions record their
+and standing constraints after redaction. Owner corrections in the Git task
+record include their
 source Agent and generation, command ID, principal, verb and delivery state.
 The task binding carries these inputs through subsequent switches. The brief
 quotes a bounded selection and reports known omissions, clipped text and
 unverified coverage in its result. The exact retained corrections remain in
 the private Git task record at `instructions.json`. At each handoff Swarm
 refreshes delivery states from matching retained Store commands. The brief
-includes the latest accepted instruction, with its body and delivery state,
+includes the latest accepted instruction from the Owner or the source's own
+manager, with its body and delivery state,
 and any distinct delivered instruction whose turn is unfinished. If a separate
-successor SEND will deliver an item, its copy in the brief is context. A switch
-or restart brief carries the accepted next-input instruction when its native
-delivery is unavailable because the source generation ended. Unknown
+successor SEND will deliver an item, its copy in the brief is context.
+Cancelled inputs are excluded from pending instructions. Unknown
 or dispatched inputs appear by ID and never include their text. Pending trusted
 review findings are quoted with their provenance within the review excerpt
 budget. A legacy record can show unavailable delivery evidence separately from
@@ -1433,9 +1433,11 @@ transfer against current A and B.
 
 Before dispatching the source stop, Owner and automatic switches update the Git
 task record and freeze the rendered successor input. They size the exact text and
-encoded frame with room for the widest destination identity. Saved bodies are
-mandatory for pointer tasks. A sizing or record preparation failure refuses before
-either native effect. A successful brief reports the count of saved sources it
+encoded frame with room for the widest destination identity. Oversize text is
+truncated with an explicit marker and a pointer to its full retained command
+or Git source. If a legacy generated restart note has no retained original task
+binding, the brief says so and carries the best retained instructions and
+current Git facts. A successful brief reports the count of saved sources it
 delivered in full. H2 consumes the frozen text after it revalidates the task
 binding and custody. The post-stop source checkpoint updates the Store's work
 truth independently of the brief.

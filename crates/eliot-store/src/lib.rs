@@ -326,7 +326,7 @@ mod work_truth;
 pub use work_truth::{
     CheckpointRestoreAdmission, CheckpointRestoreIntent, CheckpointRestoreWriterObservation,
     CheckpointRetentionGeneration, GIT_CHECKPOINT, GitCheckpointBasis, GitCheckpointInput,
-    GitCheckpointIntent, GitCheckpointReservation, JournalTurn,
+    GitCheckpointIntent, GitCheckpointReservation, HandoffTaskBinding, JournalTurn,
 };
 mod turn_recovery;
 pub(crate) mod usage;

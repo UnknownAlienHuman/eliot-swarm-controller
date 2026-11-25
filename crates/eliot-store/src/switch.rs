@@ -1226,7 +1226,7 @@ impl Store {
         let provider = retained.provider_failure.is_some();
         let resume_goal = !provider && request.launch.project.is_none();
         let binding = facts.task_command.clone().zip(facts.task_ref.clone());
-        let brief = if provider && binding.is_none() {
+        let brief = if provider && binding.is_none() && !facts.original_task_missing {
             let task = handoff::source_task(&tx, &source, &request.task_command, None)?
                 .ok_or_else(|| Error::new("source_integrity", "provider retry input is missing"))?;
             if policy.contains_value(&task.args) {
