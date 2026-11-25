@@ -1759,7 +1759,7 @@ impl Store {
             let matches = {
                 let mut statement = tx
                     .prepare(
-                        "SELECT g.generation, g.revision, g.updated_at FROM goal_markers g
+                        "SELECT g.generation, g.revision, g.custody_closed FROM goal_markers g
                      JOIN agents a ON a.id=g.agent
                      WHERE g.agent=?1 AND g.mode='eliot' AND g.generation<a.generation
                        AND g.state='unknown' AND g.round_key_kind=?2 AND g.round_key=?3
@@ -1774,7 +1774,7 @@ impl Store {
                             Ok((
                                 row.get::<_, i64>(0)?,
                                 row.get::<_, i64>(1)?,
-                                row.get::<_, i64>(2)?,
+                                row.get::<_, bool>(2)?,
                             ))
                         },
                     )
@@ -1782,7 +1782,7 @@ impl Store {
                     .collect::<rusqlite::Result<Vec<_>>>()
                     .map_err(sql_error)?
             };
-            let [(generation, revision, updated_at)] = matches.as_slice() else {
+            let [(generation, revision, custody_closed)] = matches.as_slice() else {
                 return Err(if matches.is_empty() {
                     Error::new(
                         "not_found",
@@ -1795,42 +1795,43 @@ impl Store {
                     )
                 });
             };
+            // The retained assertion's id and bound round survive timestamp
+            // changes to the marker. Native closure is tracked by the marker.
             let prior = tx
                 .query_row(
-                    "SELECT seq, kind, json_extract(data,'$.id')
+                    "SELECT seq, json_extract(data,'$.id')
                  FROM events INDEXED BY events_agent
-                 WHERE agent=?1 AND generation=?2 AND ts=?3 AND source='daemon'
-                   AND (kind='goal.check_custody_closed'
-                     OR (kind='goal.check_custody_asserted' AND json_extract(data,'$.principal')='owner'))
+                 WHERE agent=?1 AND generation=?2 AND source='daemon'
+                   AND kind='goal.check_custody_asserted' AND json_extract(data,'$.principal')='owner'
                    AND json_extract(data,'$.mode')='eliot'
-                   AND json_extract(data,'$.revision')=?4 AND json_extract(data,'$.round_key')=?5
-                 ORDER BY seq DESC LIMIT 1",
-                    params![agent, generation, updated_at, revision, request.round],
-                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, Option<String>>(2)?)),
+                   AND json_extract(data,'$.revision')=?3 AND json_extract(data,'$.round_key')=?4
+                 ORDER BY seq LIMIT 1",
+                    params![agent, generation, revision, request.round],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?)),
                 )
                 .optional()
                 .map_err(sql_error)?;
-            if let Some((event_seq, closure_kind, id)) = prior {
-                if closure_kind == "goal.check_custody_asserted" {
-                    let id = id.ok_or_else(|| {
-                        Error::new("source_integrity", "Goal assertion lacks its write id")
-                    })?;
-                    validate_ulid(&id)?;
-                    let value = GoalRoundCloseResponse {
-                        id,
-                        agent: request.agent.clone(),
-                        round: request.round.clone(),
-                        generation: *generation,
-                        revision: *revision,
-                        event_seq,
-                    };
-                    retain_goal_result(&tx, &request.id, OWNER, METHOD, &digest, &value, now)?;
-                    commit_transaction(tx, &self.write_faulted)?;
-                    return Ok(Change {
-                        value,
-                        events: Vec::new(),
-                    });
-                }
+            if let Some((event_seq, id)) = prior {
+                let id = id.ok_or_else(|| {
+                    Error::new("source_integrity", "Goal assertion lacks its write id")
+                })?;
+                validate_ulid(&id)?;
+                let value = GoalRoundCloseResponse {
+                    id,
+                    agent: request.agent.clone(),
+                    round: request.round.clone(),
+                    generation: *generation,
+                    revision: *revision,
+                    event_seq,
+                };
+                retain_goal_result(&tx, &request.id, OWNER, METHOD, &digest, &value, now)?;
+                commit_transaction(tx, &self.write_faulted)?;
+                return Ok(Change {
+                    value,
+                    events: Vec::new(),
+                });
+            }
+            if *custody_closed {
                 return Err(Error::new(
                     "bad_state",
                     "Goal round custody is already closed",
