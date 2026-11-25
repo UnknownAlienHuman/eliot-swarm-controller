@@ -48,6 +48,8 @@ pub struct RuleDefinition {
     once_per: Option<String>,
     #[serde(default, skip_serializing_if = "is_false")]
     pub allow_self: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    review: bool,
     #[serde(
         default = "default_catch_up",
         skip_serializing_if = "is_default_catch_up"
@@ -243,6 +245,10 @@ impl RuleDefinition {
             Some(ActionDefinition::Agent(AgentActionDefinition::Launch(launch)))
                 if launch.include_patch_digest
         )
+    }
+
+    pub(super) fn is_review(&self) -> bool {
+        self.review
     }
 }
 
@@ -1816,6 +1822,12 @@ fn validate_rule(rule: &mut RuleDefinition) -> Result<(), Error> {
         ));
     }
     let action = &rule.actions[0];
+    if rule.review && !rule.includes_patch_digest() {
+        return Err(Error::invalid_field(
+            "review",
+            "launch with include_patch_digest",
+        ));
+    }
     if let ActionDefinition::Agent(AgentActionDefinition::Launch(launch)) = action
         && launch.include_patch_digest
     {

@@ -138,9 +138,10 @@ canonical definitions and membership in the reconciled source for owner screens.
 Rules-file enablement comes from the rule file. Assignment enablement comes from
 the settings key below. The daemon alone sets `paused_reason` (the backlog policy below).
 
-Required keys are `id`, `on`, `do`; optional keys are `enabled`, `limit`, `catch_up` and
-`allow_self`. `catch_up` configures timer-slot recovery; committed-history catch-up is an
-explicit owner request described below. Unknown keys and duplicate ids are errors. A
+Required keys are `id`, `on`, `do`; optional keys are `enabled`, `limit`, `catch_up`,
+`allow_self` and `review`. `catch_up` configures timer-slot recovery; committed-history catch-up is an
+explicit owner request described below. `review = true` marks an independent-review
+rule and requires a launch with `include_patch_digest = true`. Unknown keys and duplicate ids are errors. A
 project rule cannot widen project, command, credential or route authority.
 
 ## Project registration and rule authority
@@ -649,7 +650,7 @@ and fingerprint before live admission and dispatch. This launch form requires li
 event processing. The binding is to the observed tree
 at those points. A reviewer reads the author's worktree, which can change during review.
 
-For launches with `include_patch_digest = true`, Swarm reads the latest native
+For rules with `review = true`, Swarm reads the latest native
 model observation, or the retained effective model, for the exact successful
 author turn and selects the first eligible named
 profile in lexical order. Project rules select only from the current registration's
@@ -663,7 +664,7 @@ are skipped. The normal launch path freezes the profile and rechecks independenc
 before admission. Missing author evidence or no eligible reviewer records a
 refusal without launching a reviewer.
 
-The recipe sets `include_patch_digest = true`. The daemon builds the existing
+The recipe sets `review = true` and `include_patch_digest = true`. The daemon builds the existing
 `agent.patch_digest` summary under the rule's Owner or project authority, using the
 trigger's exact Agent generation, workspace, base and worktree fingerprint. If that
 snapshot is no longer current or cannot be bound, the rule does not launch. A digest
@@ -838,7 +839,8 @@ An event launch with `require_worktree = true` and review text can set
 `include_patch_digest = true` on `turn.completed` or `project.worktree.check.passed`.
 Project rules can attach a digest for an author from their registered project.
 The digest uses the triggering worktree fingerprint, and the launch follows the
-existing live-only worktree guard.
+existing live-only worktree guard. Only `review = true` selects an independent
+reviewer; a digest-only rule follows the normal project or Owner submission path.
 Optional `goal` is a partial Goal object and `no_policy` is a nonblank, one-line reason
 of at most 256 bytes with no control characters. Both are literal and map to the
 ordinary launch's `args.goal` and `args.no_policy`; `goal` fields override policy
