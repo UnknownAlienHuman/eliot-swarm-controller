@@ -14,6 +14,7 @@ use std::{
 
 const MAX_CHECKOUTS: usize = 1_000;
 const CHECKOUT_READBACK_BYTES: usize = 900 * 1024;
+const MAX_UNVERIFIED_PROJECT_READS: u8 = 3;
 #[cfg(any(windows, target_os = "linux"))]
 const PROJECT_WATCH_CHECKOUTS: usize = 256;
 
@@ -25,6 +26,7 @@ pub(crate) struct ProjectReadCache {
 
 enum ProjectObservation {
     Current(CachedProjectReadback),
+    Pending(u8),
     Fallback(Error),
 }
 
@@ -49,6 +51,7 @@ impl ProjectReadCache {
         single: bool,
         include_git_state: bool,
         force_fallback: bool,
+        reporter: &WorkerReporter,
     ) {
         let mut groups = BTreeMap::<String, Vec<&mut ProjectRegistrationView>>::new();
         for registration in &mut *registrations {
@@ -94,22 +97,19 @@ impl ProjectReadCache {
                         self.wake.notify_one();
                         return;
                     }
-                    let (origin, checkouts) = if Instant::now() < deadline
-                        && let Some(git) = git.get_or_init(|| WorkspaceGit::new().ok())
-                    {
-                        let paths = group
-                            .iter()
-                            .map(|registration| registration.checkout.clone())
-                            .collect();
-                        tokio::time::timeout_at(
-                            deadline,
-                            git.read_project(&common, paths, None, deadline),
-                        )
-                        .await
-                        .map(|(origin, checkouts, _)| (origin, checkouts))
-                        .unwrap_or_default()
-                    } else {
-                        (None, Vec::new())
+                    let paths = group
+                        .iter()
+                        .map(|registration| registration.checkout.clone())
+                        .collect();
+                    let (origin, checkouts) = match git.get_or_init(WorkspaceGit::new) {
+                        Ok(git) => {
+                            git.read_project_for_request(&common, paths, deadline, reporter)
+                                .await
+                        }
+                        Err(error) => {
+                            reporter.project_read_failed(&common, error);
+                            (None, Vec::new())
+                        }
                     };
                     let mut group = group;
                     for registration in &mut group {
@@ -188,11 +188,34 @@ impl ProjectReadCache {
                 return;
             }
             entries.insert(
-                common,
+                common.clone(),
                 Arc::new(ProjectObservation::Fallback(error.clone())),
             );
         }
-        reporter.observation_failed("git_sampler", &error);
+        reporter.project_read_failed(&common, &error);
+    }
+
+    fn record_unverified(&self, common: String, reporter: &WorkerReporter) {
+        {
+            let mut entries = self.entries.lock_recover();
+            let count = match entries.get(&common).map(Arc::as_ref) {
+                Some(ProjectObservation::Fallback(_)) => return,
+                Some(ProjectObservation::Pending(count)) => count + 1,
+                _ => 1,
+            };
+            if count < MAX_UNVERIFIED_PROJECT_READS {
+                entries.insert(common, Arc::new(ProjectObservation::Pending(count)));
+                return;
+            }
+        }
+        self.record_fallback(
+            common,
+            problem(
+                "unavailable",
+                "project Git checkout revision changed during three consecutive observations",
+            ),
+            reporter,
+        );
     }
 }
 
@@ -463,7 +486,7 @@ impl WorkspaceGit {
         cache: &ProjectReadCache,
         registrations: &[ProjectRegistrationView],
         reporter: &WorkerReporter,
-    ) -> Result<()> {
+    ) {
         let mut groups = BTreeMap::<String, Vec<String>>::new();
         for registration in registrations {
             groups
@@ -472,10 +495,7 @@ impl WorkspaceGit {
                 .push(registration.checkout.clone());
         }
         cache.retain(&groups);
-        if groups.is_empty() {
-            return Ok(());
-        }
-        let git = Self::new()?;
+        let git = OnceLock::new();
         stream::iter(groups)
             .for_each_concurrent(4, |(common, paths)| {
                 let git = &git;
@@ -484,9 +504,16 @@ impl WorkspaceGit {
                         return;
                     }
                     let previous = cache.take_current(&common);
-                    let result = git
-                        .observe_project(&common, paths, &cache.wake, previous)
-                        .await;
+                    let result = match git.get_or_init(Self::new) {
+                        Ok(git) => {
+                            git.observe_project(&common, paths, &cache.wake, previous)
+                                .await
+                        }
+                        Err(error) => {
+                            tokio::task::spawn_blocking(move || drop(previous));
+                            Err(error.clone())
+                        }
+                    };
                     match result {
                         Ok(Some(readback)) => {
                             cache
@@ -494,13 +521,41 @@ impl WorkspaceGit {
                                 .lock_recover()
                                 .insert(common, Arc::new(ProjectObservation::Current(readback)));
                         }
-                        Ok(None) => {}
+                        Ok(None) => cache.record_unverified(common, reporter),
                         Err(error) => cache.record_fallback(common, error, reporter),
                     }
                 }
             })
             .await;
-        Ok(())
+    }
+
+    async fn read_project_for_request(
+        &self,
+        common: &str,
+        paths: Vec<String>,
+        deadline: Instant,
+        reporter: &WorkerReporter,
+    ) -> (Option<String>, Vec<ProjectCheckoutView>) {
+        match tokio::time::timeout_at(deadline, self.read_project(common, paths, None, deadline))
+            .await
+        {
+            Ok((origin, checkouts, complete)) => {
+                if !complete {
+                    reporter.project_read_failed(
+                        common,
+                        &problem("unavailable", "live project Git read could not verify the complete checkout inventory"),
+                    );
+                }
+                (origin, checkouts)
+            }
+            Err(_) => {
+                reporter.project_read_failed(
+                    common,
+                    &problem("unavailable", "live project Git read exceeded its deadline"),
+                );
+                (None, Vec::new())
+            }
+        }
     }
 
     async fn observe_project(

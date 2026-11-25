@@ -1322,11 +1322,18 @@ impl Monitoring {
         registrations: &mut [eliot_core::api::ProjectRegistrationView],
         single: bool,
         include_git_state: bool,
+        reporter: &crate::daemon::workers::WorkerReporter,
     ) {
         let unavailable = self.inner.git_unavailable.lock_recover().is_some();
         self.inner
             .project_readbacks
-            .apply(registrations, single, include_git_state, unavailable)
+            .apply(
+                registrations,
+                single,
+                include_git_state,
+                unavailable,
+                reporter,
+            )
             .await;
     }
 
@@ -1376,7 +1383,8 @@ impl Monitoring {
                     &registrations,
                     &reporter,
                 )
-                .await
+                .await;
+                Ok::<_, Error>(())
             };
             tokio::select! {
                 result = refresh => result?,

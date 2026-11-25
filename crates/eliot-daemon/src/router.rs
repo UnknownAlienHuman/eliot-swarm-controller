@@ -4513,9 +4513,7 @@ impl Router {
             registration
         };
         let mut registrations = [registration];
-        self.inner
-            .monitoring
-            .project_readbacks(&mut registrations, true, request.include_git_state)
+        self.project_git_readbacks(&mut registrations, true, request.include_git_state)
             .await;
         display_project_registration(&mut registrations[0]);
         let [registration] = registrations;
@@ -4542,9 +4540,7 @@ impl Router {
             }
             registrations
         };
-        self.inner
-            .monitoring
-            .project_readbacks(&mut registrations, false, request.include_git_state)
+        self.project_git_readbacks(&mut registrations, false, request.include_git_state)
             .await;
         for registration in &mut registrations {
             display_project_registration(registration);
@@ -4554,6 +4550,22 @@ impl Router {
         }
         serde_json::to_value(registrations)
             .map_err(|_| Error::new("internal", "project registrations could not be encoded"))
+    }
+
+    async fn project_git_readbacks(
+        &self,
+        registrations: &mut [ProjectRegistrationView],
+        single: bool,
+        include_git_state: bool,
+    ) {
+        let reporter = crate::daemon::workers::WorkerReporter::new(
+            self.clone(),
+            self.secret_policy_snapshot(),
+        );
+        self.inner
+            .monitoring
+            .project_readbacks(registrations, single, include_git_state, &reporter)
+            .await;
     }
 
     /// Owner page of the worktrees Swarm manages, from the retained
