@@ -675,12 +675,22 @@ impl DesktopApp {
                     .decisions
                     .as_ref()
                     .map(|(_, _, at)| crate::monitor::clock(*at));
+                // The technical identity stays folded until asked for.
+                let details_key = format!("details:{}", item.subject);
                 let body = StackPanel::new()
                     .spacing(tokens::spacing::SM)
                     .keyed_children(crate::views::slots([
                         read_at.map(|at| controls::secondary(format!("Checked {at}")).into()),
                         Some(reason.into()),
-                        Some(details_view(&item.subject, item.detail.as_deref())),
+                        Some(details_view(
+                            &item.subject,
+                            item.detail.as_deref(),
+                            self.chat.expanded.contains(&details_key),
+                            context.message(Message::Chat(ChatMsg::ToolsToggled(
+                                details_key.clone(),
+                                !self.chat.expanded.contains(&details_key),
+                            ))),
+                        )),
                     ]));
                 let check = controls::text_button()
                     .is_enabled(enabled)
@@ -1443,19 +1453,36 @@ impl DesktopApp {
 }
 
 /// The request's technical identity, folded under Details (§10.1).
-fn details_view(subject: &str, detail: Option<&str>) -> View {
-    let text = match detail {
-        Some(detail) => format!("{subject}\n{detail}"),
-        None => subject.to_owned(),
-    };
-    Expander::new()
-        .horizontal_content_alignment(HorizontalAlignment::Stretch)
-        .header(controls::label("Details"))
-        .content(
-            controls::body(text)
-                .font_size(tokens::text::KID_SIZE)
-                .text_wrapping(TextWrapping::Wrap)
-                .is_text_selection_enabled(true),
-        )
+fn details_view(subject: &str, detail: Option<&str>, open: bool, toggle: Callback<()>) -> View {
+    let text: Option<View> = open.then(|| {
+        controls::body(match detail {
+            Some(detail) => format!("{subject}\n{detail}"),
+            None => subject.to_owned(),
+        })
+        .font_size(tokens::text::KID_SIZE)
+        .text_wrapping(TextWrapping::Wrap)
+        .is_text_selection_enabled(true)
+        .into()
+    });
+    StackPanel::new()
+        .spacing(tokens::spacing::XS)
+        .keyed_children(crate::views::slots([
+            Some(
+                controls::text_button()
+                    .horizontal_alignment(HorizontalAlignment::Left)
+                    .automation_name(if open { "Hide details" } else { "Details" })
+                    .on_click(toggle)
+                    .content(controls::icon_label(
+                        if open {
+                            controls::glyph::CHEVRON_UP
+                        } else {
+                            controls::glyph::CHEVRON_DOWN
+                        },
+                        "Details",
+                    ))
+                    .into(),
+            ),
+            text,
+        ]))
         .into()
 }

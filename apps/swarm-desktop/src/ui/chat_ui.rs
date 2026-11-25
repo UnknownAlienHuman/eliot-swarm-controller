@@ -754,6 +754,10 @@ impl DesktopApp {
                 }
             }
             ChatMsg::LoadOlderRequested => {
+                // The pressed button leaves the tree once every page is in;
+                // focus WinUI moved from it would land on the oldest turn and
+                // bring it into view instead of the text being read.
+                self.take_focus(FocusTarget::Composer);
                 self.chat.depth = self.chat.depth.older();
                 self.set_status("Loading older retained history…");
                 self.start_snapshot(context);
