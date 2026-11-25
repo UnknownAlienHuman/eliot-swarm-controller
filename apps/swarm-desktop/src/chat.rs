@@ -1728,9 +1728,9 @@ impl Conversation {
                 Vec::new(),
             ));
         }
-        // The head line: "Worked for 4m 12s · ran 6 commands, edited 3
-        // files"; while the turn runs, its start (the view counts the time)
-        // and what the running step does.
+        // The head line: "Worked for 4m 12s · 8 commands · 3 files
+        // changed"; while the turn runs, its start (the view counts the
+        // time) and what the running step does.
         if running || !activity.is_empty() {
             let elapsed = turn
                 .started_ms
@@ -2208,27 +2208,24 @@ impl LogTally {
         }
     }
 
-    /// "ran 6 commands, edited 3 files, read 9 files": counts the steps
-    /// prove. Files are counted only where the steps name them; otherwise
-    /// the calls are ("made 2 edits").
+    /// "8 commands · 3 files changed · 9 files read": the counts the steps
+    /// prove, one short counter each. Files are counted only where the
+    /// steps name them; otherwise the calls are ("2 edits").
     fn words(&self) -> String {
         let mut parts = Vec::new();
         if self.commands > 0 {
-            parts.push(format!(
-                "ran {}",
-                count(self.commands, "command", "commands")
-            ));
+            parts.push(count(self.commands, "command", "commands"));
         }
         if self.edits > 0 {
             parts.push(if self.edits_without_paths == 0 {
-                format!("edited {}", count(self.edit_paths.len(), "file", "files"))
+                count(self.edit_paths.len(), "file changed", "files changed")
             } else {
-                format!("made {}", count(self.edits, "edit", "edits"))
+                count(self.edits, "edit", "edits")
             });
         }
         if self.reads > 0 {
             parts.push(if self.reads_without_paths == 0 {
-                format!("read {}", count(self.read_paths.len(), "file", "files"))
+                count(self.read_paths.len(), "file read", "files read")
             } else {
                 count(self.reads, "read", "reads")
             });
@@ -2240,18 +2237,15 @@ impl LogTally {
             parts.push(count(self.web, "web lookup", "web lookups"));
         }
         if self.workers > 0 {
-            parts.push(format!(
-                "started {}",
-                count(self.workers, "worker", "workers")
-            ));
+            parts.push(count(self.workers, "worker", "workers"));
         }
         if self.plans > 0 {
-            parts.push("updated the plan".to_owned());
+            parts.push("plan updated".to_owned());
         }
         if self.tools > 0 {
             parts.push(count(self.tools, "other tool", "other tools"));
         }
-        parts.join(", ")
+        parts.join(" \u{b7} ")
     }
 }
 

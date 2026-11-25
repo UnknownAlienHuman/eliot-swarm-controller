@@ -1235,6 +1235,22 @@ of the explicitly selected release scope.
   - [ ] **M2 Main working path.** Home, conversation, composer, decisions,
     native menus and long history: launch, read, send, steer, stop and decide
     with draft, focus and scroll kept.
+    - [ ] **M2a Home, header, status marks, composer, turn blocks.** The
+      §9.1 header (title in the star cell over project · branch, a readable
+      state and the Goal when there is one; Changes, Agents, Details and
+      More as same-height stock buttons, the pane commands checked while
+      their tab is open, secondary ones in More at the narrowest main
+      area); §4.2 static status marks with no progress ring in rows and at
+      most one activity indicator per region; the §9.4 composer with Send,
+      Steer, Stop turn and Resume named in words, the pending ring on the
+      action being confirmed, one bar height and the parameters on their
+      own line in a narrow main area; §8.1–8.2 Home (the question, the
+      selected project or its stated state, the composer, three quick
+      actions that send nothing); §9.1 turn blocks (the owner's message at
+      the right sized to its text, the finished work log one collapsed
+      line of duration and confirmed counters, the running one open on its
+      last five steps, the answer and changed files without a card); the
+      project poll alerts once per failing streak.
   - [ ] **M3 Context and projects.** Real diff, Agents, Details and Terminal,
     project assignment and transfer, fleet and Inbox.
   - [ ] **M4 Management.** Settings, model, routing and auth, Automations and

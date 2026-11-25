@@ -31,12 +31,8 @@ pub mod height {
     pub const SUB_ROW: f64 = CONTROL;
     /// A chip.
     pub const CHIP: f64 = 32.0;
-    /// The composer's main action.
-    pub const FAB: f64 = 40.0;
     /// The New task button.
     pub const NEW_TASK: f64 = 40.0;
-    /// The composer's menu beside its main action.
-    pub const SEND_MENU: f64 = 32.0;
     /// The conversation header.
     pub const HEADER: f64 = 52.0;
     /// A page's title row.
@@ -272,8 +268,6 @@ pub mod layout {
     pub const CHECK_COLUMN: f64 = 16.0;
     /// A quota ring (Models & Usage).
     pub const RING: f64 = 16.0;
-    /// The composer's usage ring.
-    pub const USAGE_RING: f64 = 22.0;
     /// A quota ring's stroke.
     pub const USAGE_RING_STROKE: f64 = 2.0;
 }

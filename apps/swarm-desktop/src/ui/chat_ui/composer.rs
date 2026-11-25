@@ -114,6 +114,18 @@ impl DesktopApp {
                 },
                 (None, _) => Primary::Start,
             };
+        // The command this composer sent is still being confirmed: its
+        // action shows the pending ring (§9.4) until the reply settles it.
+        let pending = self.in_flight_key.as_deref().is_some_and(|key| {
+            let mut fields = key.split(':');
+            match (fields.next(), agent.as_deref()) {
+                (Some("launch" | "enqueue"), None) => true,
+                (Some("send" | "steer" | "interrupt" | "resume"), Some(agent)) => {
+                    fields.next() == Some(agent)
+                }
+                _ => false,
+            }
+        });
         View::component::<Composer>(ComposerInput {
             drafts: views::Shared(Rc::clone(&self.chat.drafts)),
             version: self.chat.drafts.borrow().version(),
@@ -152,7 +164,9 @@ impl DesktopApp {
                 .filter(|detail| !home && !detail.observe_only && !resumable(detail))
                 .map(|detail| detail.generation),
             primary,
-            enabled: !self.submitting(),
+            enabled: !self.submitting() && !(home && self.launch_folder_missing()),
+            pending,
+            stacked: self.narrow_main(),
             agent,
             send: context.forward(),
         })
@@ -539,7 +553,7 @@ impl DesktopApp {
     }
 
     /// Codex's usage indicator beside Send: the tightest quota window of
-    /// the composer's harness as a small ring and the share left; it opens
+    /// the composer's harness, the share left in words; it opens
     /// the usage popover as its flyout (without its tooltip meanwhile: a
     /// flyout's chip takes none). The attention color only for a
     /// real reading under the threshold on the account the task runs on; a
@@ -571,29 +585,20 @@ impl DesktopApp {
                 format!("Not known whether {label} limits apply here"),
             ),
         };
+        // The share left in words beside the Usage icon (a static mark, no
+        // ring); the icon alone when no reading applies, its tooltip says
+        // why.
         let ring: View = if applies {
-            // WinUI's own determinate ring: its accent arc and track.
-            ProgressRing::new()
-                .is_indeterminate(false)
-                .minimum(0.0)
-                .maximum(100.0)
-                .value(remaining)
-                .width(tokens::layout::USAGE_RING)
-                .height(tokens::layout::USAGE_RING)
-                .horizontal_alignment(HorizontalAlignment::Center)
-                .vertical_alignment(VerticalAlignment::Center)
-                .into()
+            controls::command_content(
+                controls::glyph::USAGE,
+                &format!("{}% left", window.remaining),
+                false,
+            )
         } else {
-            // No reading applies: the Usage icon in the ring's place.
             controls::icon(controls::glyph::USAGE)
         };
-        let button = Button::new()
-            .padding(Thickness::uniform(
-                (tokens::height::CONTROL - tokens::layout::USAGE_RING) / 2.0,
-            ))
+        let button = controls::bar_button(false)
             .style(ButtonStyle::Subtle)
-            .width(tokens::height::CONTROL)
-            .height(tokens::height::CONTROL)
             .automation_name(format!(
                 "Usage: {label}, {note} ({})",
                 if open { "open" } else { "show limits" }
@@ -626,10 +631,10 @@ impl DesktopApp {
         )
     }
 
-    /// The context ring beside the main action (`.ring`): how full the
-    /// session's context is, as the harness reports it ("Context 34%",
-    /// used and window in its tooltip); a click opens Details. Nothing
-    /// when the harness reports no context fill.
+    /// The context fill beside the main action: how full the session's
+    /// context is, as the harness reports it ("Context 34%", used and window
+    /// in its tooltip); a click opens Details. Nothing when the harness
+    /// reports no context fill.
     fn context_ring(&self, context: &mut ViewContext<Self>) -> Option<View> {
         let (used, window) = self.bound_detail().ok().and_then(|detail| detail.context)?;
         let share = (used as f64 / window as f64 * 100.0).clamp(0.0, 100.0);
@@ -639,30 +644,15 @@ impl DesktopApp {
             used / 1_000,
             window / 1_000
         );
+        // The fill in words ("Context 34%"), no ring.
         Some(
-            Button::new()
-                .padding(Thickness::uniform(
-                    (tokens::height::CONTROL - tokens::layout::USAGE_RING) / 2.0,
-                ))
+            controls::bar_button(false)
                 .style(ButtonStyle::Subtle)
-                .width(tokens::height::CONTROL)
-                .height(tokens::height::CONTROL)
-                .vertical_alignment(VerticalAlignment::Center)
                 .automation_name(format!("{words} (open Details)"))
                 .on_click(
                     context.message(Message::Monitor(MonitorMsg::PanelChosen(Panel::Details))),
                 )
-                .content(
-                    ProgressRing::new()
-                        .is_indeterminate(false)
-                        .minimum(0.0)
-                        .maximum(100.0)
-                        .value(share)
-                        .width(tokens::layout::USAGE_RING)
-                        .height(tokens::layout::USAGE_RING)
-                        .horizontal_alignment(HorizontalAlignment::Center)
-                        .vertical_alignment(VerticalAlignment::Center),
-                )
+                .content(controls::label(&format!("Context {}%", share.round())))
                 .tooltip(words),
         )
     }
@@ -782,6 +772,12 @@ pub(in crate::ui) struct ComposerInput {
     primary: Primary,
     /// No submission is in flight.
     enabled: bool,
+    /// This composer's own command is being confirmed: its action carries
+    /// the pending ring.
+    pending: bool,
+    /// The main area is narrow: the parameters take their own line and the
+    /// action its own, at the right.
+    stacked: bool,
     send: Callback<Message>,
 }
 
@@ -902,7 +898,7 @@ impl Component for Composer {
                 running: Some(_), ..
             } if !blank => Some(
                 controls::secondary("Enter to steer")
-                    .grid_column(1)
+                    .grid_column(if input.stacked { 0 } else { 1 })
                     .horizontal_alignment(HorizontalAlignment::Right)
                     .vertical_alignment(VerticalAlignment::Center)
                     .text_trimming(TextTrimming::CharacterEllipsis)
@@ -916,24 +912,41 @@ impl Component for Composer {
         } else {
             GridLength::Auto
         };
-        let bottom = Grid::new()
-            .columns([GridLength::Star(3.0), hint_cell, GridLength::Auto])
-            .column_spacing(tokens::spacing::SM)
-            .keyed_children(crate::views::slots([
-                Some(
-                    Border::new()
-                        .vertical_alignment(VerticalAlignment::Center)
-                        .content(chips)
-                        .into(),
-                ),
-                hint,
-                Some(
-                    Border::new()
-                        .grid_column(2)
-                        .content(composer_actions(input, blank, context))
-                        .into(),
-                ),
-            ]));
+        let actions = composer_actions(input, blank, context);
+        // One line of parameters and the action (§8.1); in a narrow main
+        // area the parameters keep their line and the action takes the
+        // next, at the right, so neither trims away.
+        let bottom: View = if input.stacked {
+            StackPanel::new()
+                .spacing(tokens::spacing::SM)
+                .children((
+                    chips,
+                    Grid::new()
+                        .columns([hint_cell, GridLength::Auto])
+                        .column_spacing(tokens::spacing::SM)
+                        .horizontal_alignment(HorizontalAlignment::Right)
+                        .keyed_children(crate::views::slots([
+                            hint.map(|hint| Border::new().content(hint).into()),
+                            Some(Border::new().grid_column(1).content(actions).into()),
+                        ])),
+                ))
+                .into()
+        } else {
+            Grid::new()
+                .columns([GridLength::Star(3.0), hint_cell, GridLength::Auto])
+                .column_spacing(tokens::spacing::SM)
+                .keyed_children(crate::views::slots([
+                    Some(
+                        Border::new()
+                            .vertical_alignment(VerticalAlignment::Center)
+                            .content(chips)
+                            .into(),
+                    ),
+                    hint,
+                    Some(Border::new().grid_column(2).content(actions).into()),
+                ]))
+                .into()
+        };
         // Home (`Main.dc.html`): the field first, then one bar (+, the
         // project, place, model and access chips, Start task); a folder
         // outside the projects takes its field above. Attached files as
@@ -950,7 +963,14 @@ impl Component for Composer {
             ));
         }
         rows.push(KeyedView::new("field", field));
-        rows.push(KeyedView::new("bottom", bottom));
+        rows.push(KeyedView::new(
+            if input.stacked {
+                "bottom:stacked"
+            } else {
+                "bottom"
+            },
+            bottom,
+        ));
         // Home's composer stretches across the home column; a
         // conversation's takes the reading column.
         let card = Border::new().grid_row(5);
@@ -973,76 +993,103 @@ impl Component for Composer {
     }
 }
 
-/// The composer's main action (`ComposerAction`), as in Codex: Send;
-/// while a turn runs, Stop turn (it interrupts that turn) with an empty
-/// field and Steer with text; Resume for a stopped Agent, with the message
-/// when there is one. An unresolved submission shows Retry instead,
-/// resubmitting its saved identity. Each is bound by the window from the
-/// detail on screen. Beside it, 2 DIPs apart, the ▾ with Add as a note.
+/// The composer's main action (`ComposerAction`, §9.4), named in words:
+/// Send; while a turn runs, Stop turn (it interrupts that turn) with an
+/// empty field and Steer with text; Resume for a stopped Agent, Resume with
+/// message when there is text. An unresolved submission shows Retry
+/// instead, resubmitting its saved identity. Each is bound by the window
+/// from the detail on screen. Beside it the ▾ with Add as a note; usage
+/// and context before them. Every command is one bar height.
 fn composer_actions(
     input: &ComposerInput,
     draft_blank: bool,
     context: &mut ViewContext<Composer>,
 ) -> View {
     let enabled = input.enabled;
+    let pending = input.pending;
+    // Send, Steer, Stop turn and Resume say what they do in words (§9.4),
+    // at the bar's height; the one being confirmed holds the pending ring.
     let primary: View = match &input.primary {
-        Primary::Retry(agent) => controls::filled()
+        Primary::Retry(agent) => controls::bar_button(true)
             .is_enabled(enabled)
             .automation_name("Retry (Enter)")
             .on_click(context.message(Message::Chat(ChatMsg::RetryPending(agent.clone()))))
-            .content(controls::label("Retry"))
+            .content(controls::command_content(
+                controls::glyph::REFRESH,
+                "Retry",
+                pending,
+            ))
             .tooltip("Retry with the same id"),
-        Primary::Resume(agent, generation) => controls::resume_button()
-            .is_enabled(enabled)
-            .automation_name(if draft_blank {
-                "Resume (Enter)"
-            } else {
-                "Resume with this message (Enter)"
-            })
-            .on_click(context.message(Message::Chat(ChatMsg::DraftRequested(
-                DraftAction::Resume {
-                    agent: agent.clone(),
-                    generation: *generation,
-                },
-            ))))
-            .content(controls::icon(controls::glyph::RESUME))
-            .tooltip(if draft_blank {
+        Primary::Resume(agent, generation) => {
+            let words = if draft_blank {
                 "Resume"
             } else {
-                "Resume with this message"
-            }),
-        Primary::ReadingResume => controls::resume_button()
+                "Resume with message"
+            };
+            controls::bar_button(false)
+                .is_enabled(enabled)
+                .automation_name(format!("{words} (Enter)"))
+                .on_click(context.message(Message::Chat(ChatMsg::DraftRequested(
+                    DraftAction::Resume {
+                        agent: agent.clone(),
+                        generation: *generation,
+                    },
+                ))))
+                .content(controls::command_content(
+                    controls::glyph::RESUME,
+                    words,
+                    pending,
+                ))
+                .into()
+        }
+        Primary::ReadingResume => controls::bar_button(false)
             .is_enabled(false)
             .automation_name("Resume")
-            .content(controls::icon(controls::glyph::RESUME))
+            .content(controls::command_content(
+                controls::glyph::RESUME,
+                "Resume",
+                false,
+            ))
             .into(),
-        Primary::ReadingRunning => controls::stop_button()
+        Primary::ReadingRunning => controls::bar_button(false)
             .is_enabled(false)
             .automation_name("Stop turn")
-            .content(controls::stop_mark())
+            .content(controls::command_content(
+                controls::glyph::STOP,
+                "Stop turn",
+                false,
+            ))
             .into(),
         Primary::Turn {
             agent,
             running,
             held,
         } => match running {
-            Some(bound) if draft_blank => controls::stop_button()
+            Some(bound) if draft_blank => controls::bar_button(false)
                 .is_enabled(enabled)
                 .automation_name("Stop turn")
                 .on_click(
                     context.message(Message::Chat(ChatMsg::InterruptRequested(bound.clone()))),
                 )
-                .content(controls::stop_mark())
-                .tooltip("Stop turn"),
-            Some(bound) => controls::steer_button()
+                .content(controls::command_content(
+                    controls::glyph::STOP,
+                    "Stop turn",
+                    pending,
+                ))
+                .into(),
+            Some(bound) => controls::bar_button(true)
                 .is_enabled(enabled)
                 .automation_name("Steer the running turn (Enter)")
                 .on_click(context.message(Message::Chat(ChatMsg::DraftRequested(
                     DraftAction::Steer(bound.clone()),
                 ))))
-                .content(controls::icon(controls::glyph::STEER))
-                .tooltip("Steer"),
-            None => controls::send_button()
+                .content(controls::command_content(
+                    controls::glyph::STEER,
+                    "Steer",
+                    pending,
+                ))
+                .into(),
+            None => controls::bar_button(true)
                 .is_enabled(enabled && !draft_blank && !held)
                 .automation_name(if *held {
                     "Send: closed during the provider hold"
@@ -1054,14 +1101,18 @@ fn composer_actions(
                         agent: agent.clone(),
                     },
                 ))))
-                .content(controls::send_icon())
+                .content(controls::command_content(
+                    controls::glyph::ARROW_UP,
+                    "Send",
+                    pending,
+                ))
                 .tooltip(if *held {
                     "Closed during the provider hold"
                 } else {
                     "Send"
                 }),
         },
-        Primary::Start => start_split(enabled, draft_blank, context),
+        Primary::Start => start_split(enabled, draft_blank, pending, context),
     };
     // The ▾ beside the action (an open Agent): Add as a note, the text
     // into the Agent's context at its next safe point without a new turn.
@@ -1074,13 +1125,23 @@ fn composer_actions(
             } else {
                 MenuItem::disabled(NOTE_LABEL, NOTE_LABEL)
             };
-            // The ▾ takes its action's style: accent beside Send.
-            let accent = matches!(primary, Primary::Turn { running: None, .. });
+            // The ▾ takes its action's style: accent beside Send, Steer and
+            // Retry.
+            let accent = matches!(
+                primary,
+                Primary::Turn { running: None, .. } | Primary::Retry(_)
+            ) || (matches!(
+                primary,
+                Primary::Turn {
+                    running: Some(_),
+                    ..
+                }
+            ) && !draft_blank);
             Some(
                 controls::send_menu_button(accent)
                     .is_enabled(ready)
                     .automation_name("More send options: Add as a note")
-                    .content(controls::small_icon(controls::glyph::CHEVRON_DOWN))
+                    .content(controls::icon(controls::glyph::CHEVRON_DOWN))
                     .menu(Menu::new(
                         vec![item],
                         // Capture-free: one identity across renders.
@@ -1112,25 +1173,20 @@ fn composer_actions(
     let action = vec![KeyedView::new(format!("action:{kind}"), primary)];
     StackPanel::new()
         .orientation(Orientation::Horizontal)
-        .spacing(tokens::spacing::ROW)
+        .spacing(tokens::spacing::SM)
         .keyed_children(crate::views::slots([
             input.usage.clone(),
             Some(
                 StackPanel::new()
                     .orientation(Orientation::Horizontal)
-                    .spacing(tokens::spacing::ROW_GAP)
-                    .vertical_alignment(VerticalAlignment::Center)
+                    .spacing(tokens::spacing::XS)
                     .children((
-                        Grid::new()
-                            .vertical_alignment(VerticalAlignment::Center)
-                            .keyed_children(action),
-                        Grid::new()
-                            .vertical_alignment(VerticalAlignment::Center)
-                            .keyed_children(
-                                note.map(|note| KeyedView::new(format!("note:{kind}"), note))
-                                    .into_iter()
-                                    .collect::<Vec<_>>(),
-                            ),
+                        Grid::new().keyed_children(action),
+                        Grid::new().keyed_children(
+                            note.map(|note| KeyedView::new(format!("note:{kind}"), note))
+                                .into_iter()
+                                .collect::<Vec<_>>(),
+                        ),
                     ))
                     .into(),
             ),
@@ -1176,12 +1232,16 @@ fn attachment_chips(files: &[String], context: &mut ViewContext<Composer>) -> Vi
         .into()
 }
 
-/// Home's split Start task (`Main.dc.html`, the SplitButton component):
-/// the filled action (the up arrow and "Start task", emphasized) and, 2
-/// DIPs after it, its 34-DIP menu: Queue it (the task as a queued intent)
-/// and Attach an existing session…, which the desktop does not have yet
-/// (disabled, the reason in its label).
-fn start_split(enabled: bool, draft_blank: bool, context: &mut ViewContext<Composer>) -> View {
+/// Home's Start task: the accent action (the up arrow and "Start task", the
+/// pending ring while the launch is confirmed) and beside it its ▾ menu:
+/// Queue it (the task as a queued intent) and Attach an existing session…,
+/// which the desktop does not have yet (disabled, the reason in its label).
+fn start_split(
+    enabled: bool,
+    draft_blank: bool,
+    pending: bool,
+    context: &mut ViewContext<Composer>,
+) -> View {
     use super::menu_ui::{Action, Entry};
     let ready = enabled && !draft_blank;
     let items = vec![
@@ -1197,32 +1257,18 @@ fn start_split(enabled: bool, draft_blank: bool, context: &mut ViewContext<Compo
     debug_assert!(super::menu_ui::offers(&offered, Action::QueueLaunch));
     StackPanel::new()
         .orientation(Orientation::Horizontal)
-        .spacing(tokens::spacing::ROW_GAP)
-        .vertical_alignment(VerticalAlignment::Center)
+        .spacing(tokens::spacing::XS)
         .children((
-            controls::filled()
+            controls::bar_button(true)
                 .is_enabled(ready)
                 .automation_name("Start task (Enter)")
                 .on_click(context.message(Message::Launch(LaunchMsg::LaunchRequested)))
-                .content(
-                    StackPanel::new()
-                        .orientation(Orientation::Horizontal)
-                        .spacing(tokens::spacing::SM)
-                        .margin(Thickness::new(
-                            tokens::spacing::MD - tokens::spacing::ROW,
-                            0.0,
-                            tokens::spacing::TEXT_INSET - tokens::spacing::ROW,
-                            0.0,
-                        ))
-                        .children((
-                            controls::icon(controls::glyph::ARROW_UP),
-                            controls::text("Start task", tokens::text::EMPHASIZED)
-                                .vertical_alignment(VerticalAlignment::Center),
-                        )),
-                ),
-            controls::icon_button()
-                .style(ButtonStyle::Accent)
-                .width(tokens::layout::SPLIT_MENU)
+                .content(controls::command_content(
+                    controls::glyph::ARROW_UP,
+                    "Start task",
+                    pending,
+                )),
+            controls::send_menu_button(true)
                 .is_enabled(ready)
                 .automation_name("More start options")
                 .content(controls::icon(controls::glyph::CHEVRON_DOWN))

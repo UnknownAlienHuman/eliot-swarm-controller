@@ -49,9 +49,6 @@ pub(super) enum Pop {
     Effort,
     /// The usage ring's popover: the tightest limits and Manage usage.
     Usage,
-    /// The Home question's project name: the same project list as the
-    /// composer's project chip, under the title.
-    TitleProject,
     /// The sidebar's Usage row: every harness's limits, the holds and
     /// Open usage settings (`Hold.dc.html`).
     Quotas,
@@ -1006,7 +1003,7 @@ impl DesktopApp {
                 self.launch.access_highlight = Some(self.launch.access());
                 crate::shortcuts::set_popover(HookPopover::List);
             }
-            Pop::Project | Pop::TitleProject => {
+            Pop::Project => {
                 self.launch.project_query.clear();
                 self.launch.highlight = Some(
                     self.selected_project()
@@ -1241,7 +1238,7 @@ impl DesktopApp {
                     _ => {}
                 }
             }
-            Pop::Project | Pop::TitleProject => {
+            Pop::Project => {
                 let rows = self.project_rows();
                 let at = self
                     .launch
@@ -1311,7 +1308,7 @@ impl DesktopApp {
     fn focus_field(&mut self, tries: u8, context: &ComponentContext<Self>) {
         if !matches!(
             self.launch.open,
-            Some(Pop::Model | Pop::Manage | Pop::Project | Pop::TitleProject)
+            Some(Pop::Model | Pop::Manage | Pop::Project)
         ) {
             return;
         }
@@ -2009,7 +2006,6 @@ fn chip_of(pop: Pop) -> u8 {
         Pop::Access => 1,
         Pop::Project => 2,
         Pop::Usage => 3,
-        Pop::TitleProject => 4,
         Pop::Quotas => 5,
     }
 }

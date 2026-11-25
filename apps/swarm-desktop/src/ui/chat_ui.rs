@@ -1572,13 +1572,15 @@ impl DesktopApp {
         });
     }
 
-    /// The Home screen (`Main.dc.html`): one centred column at the Home
-    /// width, 168 DIPs below the card's top, its parts 28 DIPs apart: the
-    /// question in `title-large` ("What should we build in {project ▾}?",
-    /// the project name a menu button), a refusal notice when there is one,
-    /// the composer, then three suggestion cards: Review the open PRs
-    /// (fills the composer), Schedule an automation, and Continue {the last
-    /// task} when there is one.
+    /// The Home screen (§8.1): one centred column at the Home width, its
+    /// parts apart by the Home gap: the question ("What should we build?",
+    /// Title), the selected project on the line under it (or the §8.2
+    /// state that stands in its place: no projects, a missing folder), a
+    /// refusal notice when there is one, the composer (Project, Workspace,
+    /// Model, Access, Start task), then at most three quick actions, none
+    /// of which sends anything: Review the open PRs (fills the composer),
+    /// Schedule an automation, and Continue {the last task} when there is
+    /// one. No hero, no metric cards.
     fn home_view(
         &self,
         alert: Option<View>,
@@ -1643,31 +1645,52 @@ impl DesktopApp {
                     .content(card(controls::glyph::HISTORY, &label)),
             ));
         }
-        let title: View = if self.launch.chat {
-            controls::page_title("What would you like to chat about?")
-                .horizontal_alignment(HorizontalAlignment::Center)
-                .into()
-        } else if self.launch.workspace.is_empty() {
-            controls::page_title("What should we build?")
-                .horizontal_alignment(HorizontalAlignment::Center)
-                .into()
+        let title: View = controls::page_title(if self.launch.chat {
+            "What would you like to chat about?"
         } else {
-            StackPanel::new()
-                .orientation(Orientation::Horizontal)
+            "What should we build?"
+        })
+        .horizontal_alignment(HorizontalAlignment::Center)
+        .text_wrapping(TextWrapping::Wrap)
+        .into();
+        // The selected project under the question, or the §8.2 state that
+        // stands in its place, in its stated words.
+        let place: Option<View> = if self.launch.chat {
+            None
+        } else if self.nav.projects.is_empty() && self.launch.workspace.is_empty() {
+            Some(
+                controls::body("Add a project or start a chat.")
+                    .horizontal_alignment(HorizontalAlignment::Center)
+                    .text_wrapping(TextWrapping::Wrap)
+                    .into(),
+            )
+        } else if self.launch_folder_missing() {
+            Some(
+                controls::body(
+                    "Project folder not found. Choose another project, or fix its registration in Settings \u{203a} Projects.",
+                )
+                .foreground(ThemeBrush::SystemCritical)
                 .horizontal_alignment(HorizontalAlignment::Center)
-                .automation_name(format!(
-                    "What should we build in {}?",
-                    self.launch_project_label()
-                ))
-                .automation_heading_level(AutomationHeadingLevel::Level2)
-                .children((
-                    controls::text("What should we build in", tokens::text::HERO)
-                        .vertical_alignment(VerticalAlignment::Center),
-                    self.title_project(context),
-                    controls::text("?", tokens::text::HERO)
-                        .vertical_alignment(VerticalAlignment::Center),
-                ))
-                .into()
+                .text_wrapping(TextWrapping::Wrap)
+                .into(),
+            )
+        } else {
+            let label = self.launch_project_label();
+            Some(
+                Border::new()
+                    .horizontal_alignment(HorizontalAlignment::Center)
+                    .automation_name(format!("Project: {label}"))
+                    .content(controls::row_grid(
+                        Some(controls::icon(controls::glyph::OPEN_FOLDER)),
+                        controls::body(label)
+                            .vertical_alignment(VerticalAlignment::Center)
+                            .text_trimming(TextTrimming::CharacterEllipsis)
+                            .into(),
+                        None,
+                        tokens::spacing::SM,
+                    ))
+                    .into(),
+            )
         };
         // The title names the project by its origin: the last known while
         // its Git metadata refreshes, and it says so.
@@ -1690,8 +1713,16 @@ impl DesktopApp {
                         )
                         .spacing(tokens::spacing::HOME_GROUP_GAP)
                         .keyed_children(crate::views::slots([
-                            Some(title),
-                            refreshing,
+                            Some(
+                                StackPanel::new()
+                                    .spacing(tokens::spacing::SM)
+                                    .keyed_children(crate::views::slots([
+                                        Some(title),
+                                        place,
+                                        refreshing,
+                                    ]))
+                                    .into(),
+                            ),
                             alert,
                             Some(composer),
                             Some(

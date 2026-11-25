@@ -25,7 +25,8 @@ const DEFAULT_EFFORT: &str = "Default effort";
 const MANAGE_GROUP_ROWS: usize = 150;
 
 impl DesktopApp {
-    /// The new task's project, as its chip and the Home title name it.
+    /// The new task's project, as its chip and the Home line under the
+    /// title name it.
     pub(super) fn launch_project_label(&self) -> String {
         if self.launch.chat {
             "No project (chat)".to_owned()
@@ -34,6 +35,17 @@ impl DesktopApp {
         } else {
             self.place_title(&self.launch.workspace)
         }
+    }
+
+    /// The new task's project is registered but its folder is provably gone
+    /// (§8.2): Home says so and Start stays closed, so a task never starts
+    /// in some other folder.
+    pub(super) fn launch_folder_missing(&self) -> bool {
+        !self.launch.chat
+            && self.nav.projects.iter().any(|project| {
+                project.missing
+                    && nav::path_key(&project.workspace) == nav::path_key(&self.launch.workspace)
+            })
     }
 
     /// The new task's folder field, above the composer's field, for a
@@ -80,17 +92,6 @@ impl DesktopApp {
         )
     }
 
-    /// A Home chip's label: none below the Wide size class (§6.2), where
-    /// the chips show their icons (their names and tooltips keep the
-    /// words) so the bar fits beside Start task.
-    fn home_chip_label<'a>(&self, label: &'a str) -> &'a str {
-        if self.layout.class < super::split_ui::SizeClass::Wide {
-            ""
-        } else {
-            label
-        }
-    }
-
     /// Where the new task works (the design's place chip): "New worktree"
     /// or "Work locally"; a click switches between them where the folder
     /// lets it choose, and a project that starts each task in its own
@@ -102,7 +103,7 @@ impl DesktopApp {
                 controls::fixed_chip(
                     false,
                     Some(controls::glyph::WORKTREE),
-                    self.home_chip_label("New worktree"),
+                    "New worktree",
                     "New worktree: this project starts each task in its own worktree",
                 )
                 .tooltip("This project starts each task in its own worktree."),
@@ -117,7 +118,7 @@ impl DesktopApp {
                     .on_click(context.callback(|()| Message::Launch(LaunchMsg::WorktreeToggled)))
                     .content(controls::chip_content(
                         Some(controls::glyph::WORKTREE),
-                        self.home_chip_label(if on { "New worktree" } else { "Work locally" }),
+                        if on { "New worktree" } else { "Work locally" },
                         false,
                     ))
                     .tooltip(if on {
@@ -147,11 +148,7 @@ impl DesktopApp {
                     self.launch.choice.chip_name(auto_profile)
                 ))
                 .on_click(context.callback(|()| Message::Launch(LaunchMsg::Toggle(Pop::Model)))),
-            controls::chip_content(
-                Some(controls::glyph::MODEL),
-                self.home_chip_label(&label),
-                false,
-            ),
+            controls::chip_content(Some(controls::glyph::MODEL), &label, false),
             &[Pop::Model, Pop::Manage],
             FlyoutPlacement::TopEdgeAlignedLeft,
             context,
@@ -180,7 +177,7 @@ impl DesktopApp {
                                 })),
                             controls::chip_content(
                                 Some(access_glyph(access)),
-                                self.home_chip_label(access.label()),
+                                access.label(),
                                 false,
                             ),
                             &[Pop::Access],
@@ -207,7 +204,7 @@ impl DesktopApp {
                 controls::fixed_chip(
                     full,
                     Some(controls::glyph::SHIELD),
-                    self.home_chip_label(&label),
+                    &label,
                     &format!("Access: {label}, set by the preset"),
                 )
                 .tooltip("Set by the preset.")
@@ -224,42 +221,6 @@ impl DesktopApp {
             .into_iter()
             .flatten()
             .collect(),
-        )
-    }
-
-    /// The Home question's project name (`Main.dc.html`'s title button): a
-    /// text button in the title's type with its chevron; it opens the same
-    /// project list as the composer's chip, under itself.
-    pub(super) fn title_project(&self, context: &mut ViewContext<Self>) -> View {
-        let label = self.launch_project_label();
-        let open = self.launch.open == Some(Pop::TitleProject);
-        self.popover_chip(
-            controls::text_button()
-                .automation_name(format!(
-                    "Project: {label} ({})",
-                    if open { "list open" } else { "choose" }
-                ))
-                .on_click(
-                    context.callback(|()| Message::Launch(LaunchMsg::Toggle(Pop::TitleProject))),
-                ),
-            StackPanel::new()
-                .orientation(Orientation::Horizontal)
-                .spacing(tokens::spacing::XS)
-                .margin(Thickness::xy(
-                    tokens::spacing::SM - tokens::spacing::ROW,
-                    0.0,
-                ))
-                .children((
-                    controls::text(label, tokens::text::HERO)
-                        .vertical_alignment(VerticalAlignment::Center)
-                        .max_width(tokens::layout::PROJECT_CHIP_WIDTH)
-                        .text_trimming(TextTrimming::CharacterEllipsis),
-                    controls::icon(controls::glyph::CHEVRON_DOWN),
-                ))
-                .into(),
-            &[Pop::TitleProject],
-            FlyoutPlacement::Bottom,
-            context,
         )
     }
 
@@ -301,7 +262,7 @@ impl DesktopApp {
             Pop::Model => Some(self.model_popover(context)),
             Pop::Manage => Some(self.manage_popover(context)),
             Pop::Access => Some(self.access_popover(context)),
-            Pop::Project | Pop::TitleProject => Some(self.project_popover(context)),
+            Pop::Project => Some(self.project_popover(context)),
             Pop::Quotas => Some(self.quotas_popover(context)),
             Pop::Effort => self.effort_popover(context),
             Pop::Usage => self.usage_popover(context),
