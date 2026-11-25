@@ -616,6 +616,12 @@ struct GoalStatePersist {
     stop_paused: bool,
 }
 
+enum GoalStateChange<'a> {
+    Pause(Option<&'a str>),
+    Clear,
+    Resume,
+}
+
 struct GoalRow {
     agent_num: i64,
     mode: String,
@@ -1341,10 +1347,14 @@ impl Store {
         reason: Option<&str>,
         now: i64,
     ) -> Result<GoalView> {
-        self.ensure_writer_healthy()?;
-        let result = self.goal_pause_inner(agent, mode, id, principal, reason, now);
-        self.fault_on_persistence_error(&result);
-        result
+        self.goal_state_change(
+            agent,
+            mode,
+            id,
+            principal,
+            GoalStateChange::Pause(reason),
+            now,
+        )
     }
 
     pub fn goal_clear(
@@ -1355,10 +1365,7 @@ impl Store {
         principal: &str,
         now: i64,
     ) -> Result<GoalView> {
-        self.ensure_writer_healthy()?;
-        let result = self.goal_clear_inner(agent, mode, id, principal, now);
-        self.fault_on_persistence_error(&result);
-        result
+        self.goal_state_change(agent, mode, id, principal, GoalStateChange::Clear, now)
     }
 
     pub fn goal_resume(
@@ -1369,10 +1376,7 @@ impl Store {
         principal: &str,
         now: i64,
     ) -> Result<GoalView> {
-        self.ensure_writer_healthy()?;
-        let result = self.goal_resume_inner(agent, mode, id, principal, now);
-        self.fault_on_persistence_error(&result);
-        result
+        self.goal_state_change(agent, mode, id, principal, GoalStateChange::Resume, now)
     }
 
     /// Whether an active native-mode Goal owns the Agent. The automatic
@@ -2083,238 +2087,174 @@ impl Store {
         commit_transaction(tx, &self.write_faulted)
     }
 
-    fn goal_pause_inner(
+    fn goal_state_change(
         &mut self,
         agent: &str,
         mode: &str,
         id: &str,
         principal: &str,
-        reason: Option<&str>,
+        change: GoalStateChange<'_>,
         now: i64,
     ) -> Result<GoalView> {
-        require_eliot_mode(mode)?;
-        if let Some(reason) = reason
-            && (reason.trim().is_empty() || reason.len() > MAX_GOAL_OBSERVATION_BYTES)
-        {
-            return Err(Error::new(
-                "invalid",
-                "goal pause reason must be nonempty and at most 4 KiB",
-            ));
-        }
-        let payload_digest = canonical::digest(&json!({
-            "agent": agent,
-            "mode": mode,
-            "reason": reason,
-        }))?;
-        let goal_holder = self.goal_holder.clone();
-        let tx = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(sql_error)?;
-        if let Some(view) = replay_goal_write(&tx, id, principal, "goal.pause", &payload_digest)? {
-            commit_transaction(tx, &self.write_faulted)?;
-            return Ok(view);
-        }
-        validate_id_age(id, now)?;
-        let agent_num = parse_agent_id(agent)?;
-        let Some(row) = load_goal_row(&tx, agent_num, mode)? else {
-            return Err(Error::new("not_found", "goal was not found"));
-        };
-        if row.state.status != GoalStatus::Paused && row.state.status != GoalStatus::Active {
-            return Err(Error::new(
-                "bad_state",
-                format!("goal is {} and cannot pause", row.state.status.as_str()),
-            ));
-        }
-        // A stop-paused Goal becomes a manual pause, so it stops auto-continuing.
-        let view = if row.state.status == GoalStatus::Paused && !row.state.stop_paused {
-            goal_view_on(&tx, &goal_holder, row)?
-        } else {
-            let mut state = row.state;
-            state.status = GoalStatus::Paused;
-            state.paused_reason = reason.map(ToOwned::to_owned);
-            state.stop_paused = false;
-            update_goal_state_tx(&tx, agent_num, mode, row.revision, &state, now)?;
-            let updated = load_goal_row(&tx, agent_num, mode)?
-                .ok_or_else(|| Error::new("internal", "goal disappeared after pause"))?;
-            goal_view_on(&tx, &goal_holder, updated)?
-        };
-        retain_goal_result(
-            &tx,
-            id,
-            principal,
-            "goal.pause",
-            &payload_digest,
-            &view,
-            now,
-        )?;
-        commit_transaction(tx, &self.write_faulted)?;
-        Ok(view)
+        self.ensure_writer_healthy()?;
+        let result = self.goal_state_change_inner(agent, mode, id, principal, change, now);
+        self.fault_on_persistence_error(&result);
+        result
     }
 
-    fn goal_clear_inner(
+    fn goal_state_change_inner(
         &mut self,
         agent: &str,
         mode: &str,
         id: &str,
         principal: &str,
+        change: GoalStateChange<'_>,
         now: i64,
     ) -> Result<GoalView> {
         require_eliot_mode(mode)?;
-        let payload_digest = canonical::digest(&json!({
-            "agent": agent,
-            "mode": mode,
-        }))?;
+        let (method, verb, payload) = match change {
+            GoalStateChange::Pause(reason) => {
+                if let Some(reason) = reason
+                    && (reason.trim().is_empty() || reason.len() > MAX_GOAL_OBSERVATION_BYTES)
+                {
+                    return Err(Error::new(
+                        "invalid",
+                        "goal pause reason must be nonempty and at most 4 KiB",
+                    ));
+                }
+                (
+                    "goal.pause",
+                    "pause",
+                    json!({"agent": agent, "mode": mode, "reason": reason}),
+                )
+            }
+            GoalStateChange::Clear => {
+                ("goal.clear", "clear", json!({"agent": agent, "mode": mode}))
+            }
+            GoalStateChange::Resume => (
+                "goal.resume",
+                "resume",
+                json!({"agent": agent, "mode": mode}),
+            ),
+        };
+        let payload_digest = canonical::digest(&payload)?;
         let goal_holder = self.goal_holder.clone();
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(sql_error)?;
-        if let Some(view) = replay_goal_write(&tx, id, principal, "goal.clear", &payload_digest)? {
+        if let Some(view) = replay_goal_write(&tx, id, principal, method, &payload_digest)? {
             commit_transaction(tx, &self.write_faulted)?;
             return Ok(view);
         }
         validate_id_age(id, now)?;
         let agent_num = parse_agent_id(agent)?;
-        let Some(row) = load_goal_row(&tx, agent_num, mode)? else {
+        let Some(mut row) = load_goal_row(&tx, agent_num, mode)? else {
             return Err(Error::new("not_found", "goal was not found"));
         };
-        db!(tx.execute(
-            "DELETE FROM goal_markers
-             WHERE agent = ?1 AND mode = ?2 AND generation = ?3 AND custody_closed = 1",
-            params![agent_num, mode, row.generation],
-        ));
-        let view = if row.state.status == GoalStatus::Cleared
-            && row.state.round_reset_revision.is_some()
-        {
-            goal_view_on(&tx, &goal_holder, row)?
-        } else {
-            let state = GoalStatePersist {
-                transferred_turns: row.state.transferred_turns,
-                unverified_completion_rounds: 0,
-                await_first_turn: row.state.await_first_turn,
-                project_default: row.state.project_default,
-                status: GoalStatus::Cleared,
-                paused_reason: None,
-                blocked_reason: None,
-                round_reset_revision: Some(row.revision),
-                counters: row.state.counters,
-                cadence_anchor_ms: row.state.cadence_anchor_ms,
-                last_committed_slot: row.state.last_committed_slot,
-                last_continuation_command_id: None,
-                assignment_cause: row.state.assignment_cause.clone(),
-                scope_base: row.state.scope_base.clone(),
-                cost_base: row.state.cost_base.clone(),
-                stop_paused: false,
-            };
-            update_goal_state_tx(&tx, agent_num, mode, row.revision, &state, now)?;
-            let updated = load_goal_row(&tx, agent_num, mode)?
-                .ok_or_else(|| Error::new("internal", "goal disappeared after clear"))?;
-            goal_view_on(&tx, &goal_holder, updated)?
+        let changed = match change {
+            GoalStateChange::Pause(reason) => {
+                if row.state.status != GoalStatus::Paused && row.state.status != GoalStatus::Active
+                {
+                    return Err(Error::new(
+                        "bad_state",
+                        format!("goal is {} and cannot pause", row.state.status.as_str()),
+                    ));
+                }
+                // A stop-paused Goal becomes a manual pause, so it stops auto-continuing.
+                if row.state.status == GoalStatus::Paused && !row.state.stop_paused {
+                    false
+                } else {
+                    let state = &mut row.state;
+                    state.status = GoalStatus::Paused;
+                    state.paused_reason = reason.map(ToOwned::to_owned);
+                    state.stop_paused = false;
+                    true
+                }
+            }
+            GoalStateChange::Clear => {
+                db!(tx.execute(
+                    "DELETE FROM goal_markers
+                     WHERE agent = ?1 AND mode = ?2 AND generation = ?3 AND custody_closed = 1",
+                    params![agent_num, mode, row.generation],
+                ));
+                if row.state.status == GoalStatus::Cleared
+                    && row.state.round_reset_revision.is_some()
+                {
+                    false
+                } else {
+                    let state = &mut row.state;
+                    state.status = GoalStatus::Cleared;
+                    state.unverified_completion_rounds = 0;
+                    state.paused_reason = None;
+                    state.blocked_reason = None;
+                    state.round_reset_revision = Some(row.revision);
+                    state.last_continuation_command_id = None;
+                    state.stop_paused = false;
+                    true
+                }
+            }
+            GoalStateChange::Resume => {
+                if row.state.status == GoalStatus::Active {
+                    false
+                } else {
+                    if row.state.status != GoalStatus::Paused {
+                        return Err(Error::new(
+                            "bad_state",
+                            format!(
+                                "goal is {} and resumes only via set",
+                                row.state.status.as_str()
+                            ),
+                        ));
+                    }
+                    let agent_row = load_agent_by_num(&tx, agent_num)?
+                        .ok_or_else(|| Error::new("not_found", "goal Agent was not found"))?;
+                    if agent_row.observe_only {
+                        return Err(Error::new(
+                            "not_allowed",
+                            "observe-only Agents take no Goals",
+                        ));
+                    }
+                    if agent_goal_pause_reason(agent_row.state).is_some() {
+                        return Err(Error::new(
+                            "bad_state",
+                            format!(
+                                "Agent is {}; resume the Agent, which continues its Goal",
+                                agent_state_name(agent_row.state)
+                            ),
+                        ));
+                    }
+                    if row.generation != agent_row.generation {
+                        return Err(Error::new(
+                            "stale_generation",
+                            "goal binds a past Agent generation; set a new goal",
+                        ));
+                    }
+                    if row.state.paused_reason.as_deref() == Some(RESTART_GOAL_WORK_UNRESOLVED)
+                        && (super::has_unknown_gate(&tx, agent_num)?
+                            || has_unresolved_goal_round(&tx, agent_num, &row.mode)?)
+                    {
+                        return Err(Error::new(
+                            "bad_state",
+                            "settle prior Agent work before resuming this Goal",
+                        ));
+                    }
+                    let state = &mut row.state;
+                    state.status = GoalStatus::Active;
+                    state.unverified_completion_rounds = 0;
+                    state.paused_reason = None;
+                    state.stop_paused = false;
+                    true
+                }
+            }
         };
-        retain_goal_result(
-            &tx,
-            id,
-            principal,
-            "goal.clear",
-            &payload_digest,
-            &view,
-            now,
-        )?;
-        commit_transaction(tx, &self.write_faulted)?;
-        Ok(view)
-    }
-
-    fn goal_resume_inner(
-        &mut self,
-        agent: &str,
-        mode: &str,
-        id: &str,
-        principal: &str,
-        now: i64,
-    ) -> Result<GoalView> {
-        require_eliot_mode(mode)?;
-        let payload_digest = canonical::digest(&json!({
-            "agent": agent,
-            "mode": mode,
-        }))?;
-        let goal_holder = self.goal_holder.clone();
-        let tx = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(sql_error)?;
-        if let Some(view) = replay_goal_write(&tx, id, principal, "goal.resume", &payload_digest)? {
-            commit_transaction(tx, &self.write_faulted)?;
-            return Ok(view);
+        if changed {
+            update_goal_state_tx(&tx, agent_num, mode, row.revision, &row.state, now)?;
+            row = load_goal_row(&tx, agent_num, mode)?
+                .ok_or_else(|| Error::new("internal", format!("goal disappeared after {verb}")))?;
         }
-        validate_id_age(id, now)?;
-        let agent_num = parse_agent_id(agent)?;
-        let Some(row) = load_goal_row(&tx, agent_num, mode)? else {
-            return Err(Error::new("not_found", "goal was not found"));
-        };
-        let view = if row.state.status == GoalStatus::Active {
-            goal_view_on(&tx, &goal_holder, row)?
-        } else {
-            if row.state.status != GoalStatus::Paused {
-                return Err(Error::new(
-                    "bad_state",
-                    format!(
-                        "goal is {} and resumes only via set",
-                        row.state.status.as_str()
-                    ),
-                ));
-            }
-            let agent_row = load_agent_by_num(&tx, agent_num)?
-                .ok_or_else(|| Error::new("not_found", "goal Agent was not found"))?;
-            if agent_row.observe_only {
-                return Err(Error::new(
-                    "not_allowed",
-                    "observe-only Agents take no Goals",
-                ));
-            }
-            if agent_goal_pause_reason(agent_row.state).is_some() {
-                return Err(Error::new(
-                    "bad_state",
-                    format!(
-                        "Agent is {}; resume the Agent, which continues its Goal",
-                        agent_state_name(agent_row.state)
-                    ),
-                ));
-            }
-            if row.generation != agent_row.generation {
-                return Err(Error::new(
-                    "stale_generation",
-                    "goal binds a past Agent generation; set a new goal",
-                ));
-            }
-            if row.state.paused_reason.as_deref() == Some(RESTART_GOAL_WORK_UNRESOLVED)
-                && (super::has_unknown_gate(&tx, agent_num)?
-                    || has_unresolved_goal_round(&tx, agent_num, &row.mode)?)
-            {
-                return Err(Error::new(
-                    "bad_state",
-                    "settle prior Agent work before resuming this Goal",
-                ));
-            }
-            let mut state = row.state;
-            state.status = GoalStatus::Active;
-            state.unverified_completion_rounds = 0;
-            state.paused_reason = None;
-            state.stop_paused = false;
-            update_goal_state_tx(&tx, agent_num, mode, row.revision, &state, now)?;
-            let updated = load_goal_row(&tx, agent_num, mode)?
-                .ok_or_else(|| Error::new("internal", "goal disappeared after resume"))?;
-            goal_view_on(&tx, &goal_holder, updated)?
-        };
-        retain_goal_result(
-            &tx,
-            id,
-            principal,
-            "goal.resume",
-            &payload_digest,
-            &view,
-            now,
-        )?;
+        let view = goal_view_on(&tx, &goal_holder, row)?;
+        retain_goal_result(&tx, id, principal, method, &payload_digest, &view, now)?;
         commit_transaction(tx, &self.write_faulted)?;
         Ok(view)
     }
