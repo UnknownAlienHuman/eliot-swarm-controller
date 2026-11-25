@@ -345,7 +345,9 @@ async fn run_with_update(
             Some(&error),
         );
     }
-    let outcome = run_owned(
+    // Keep the supervision future out of the parent startup futures while
+    // synchronous Store migrations are using the main thread's stack.
+    let outcome = Box::pin(run_owned(
         &data_dir,
         &daemon_lock,
         Arc::clone(&policy),
@@ -353,7 +355,7 @@ async fn run_with_update(
         daemon_config,
         removed,
         agent_mcp_url,
-    )
+    ))
     .await;
     logging::record(
         &policy,
