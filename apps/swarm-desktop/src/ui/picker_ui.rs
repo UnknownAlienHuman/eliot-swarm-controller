@@ -209,18 +209,30 @@ impl DesktopApp {
                 .tooltip("Set by the preset.")
             }
         };
-        // The design: project, place, model, access, 6 DIPs apart.
-        controls::chip_row(
-            [
-                Some(self.project_chip(context)),
-                self.place_chip(context),
-                Some(model),
-                Some(access),
-            ]
-            .into_iter()
-            .flatten()
-            .collect(),
-        )
+        // The design: project, place, model, access, 6 DIPs apart, on
+        // their own line; a narrow main area wraps them two to a line
+        // (Reactor 0.101 has no wrap panel), so no chip is cut.
+        let chips: Vec<View> = [
+            Some(self.project_chip(context)),
+            self.place_chip(context),
+            Some(model),
+            Some(access),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        if self.narrow_main() {
+            page_ui::chip_rows(
+                chips
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, chip)| KeyedView::new(index, chip))
+                    .collect(),
+                2,
+            )
+        } else {
+            controls::chip_row(chips)
+        }
     }
 
     /// `chip`, which opens `pops`: while one of them is open (and not for a

@@ -73,6 +73,10 @@ pub const CHAT_KINDS: &[&str] = &[
     "command.applied",
     // A steer the turn did not take (it ended before a safe point).
     "command.rejected",
+    // The daemon changed the Agent's Goal (a round's outcome, a pause on
+    // stop or a block): the header and the Goal dialog read it again.
+    "goal.round",
+    "goal.changed",
     // A mail delivery to the Agent (bodyless): an inline mail notice's
     // text is redacted in its command, so its mails are read by delivery.
     "mail.delivered",
@@ -1174,7 +1178,8 @@ impl Conversation {
                 // sidebar row and its menu) reads it again, a loss or stop
                 // included (k113: a lost Agent offers Resume, not Delete).
                 "request.opened" | "request.closed" | "request.resolved" | "agent.failed"
-                | "agent.lost" | "agent.stopped" | "session.ready" | "session.ended" => {
+                | "agent.lost" | "agent.stopped" | "session.ready" | "session.ended"
+                | "goal.round" | "goal.changed" => {
                     invalidation.detail |= generation == self.coverage.generation;
                 }
                 _ => {}

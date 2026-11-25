@@ -482,12 +482,15 @@ impl DesktopApp {
         let current = goal.flatten();
         let draft = open.draft.clone().unwrap_or_else(|| Draft::of(current));
         let busy = open.busy.is_some();
+        // While no daemon answers, no read runs: the goal shown is not
+        // confirmed, as after a failed read.
         let read_error = self
             .chat
             .goal_error
             .as_ref()
             .filter(|(id, _)| *id == open.agent)
-            .map(|(_, error)| error.as_str());
+            .map(|(_, error)| error.as_str())
+            .or_else(|| self.daemon_down().then_some("Swarm is not running"));
         // Unknown until a read succeeds: a failed read never reads as "no
         // goal", so Save cannot replace a goal it did not see.
         let context_line = match (goal, read_error) {

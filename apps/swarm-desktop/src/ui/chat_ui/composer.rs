@@ -930,6 +930,12 @@ impl Component for Composer {
                     .clone()
                     .map(|chips| Border::new().grid_column(1).content(chips).into()),
             ]));
+        // Home's parameters always take their own line (§8.1): its four
+        // chips do not fit beside Start task; a narrow main area wraps
+        // them further (`composer_chips`). A conversation's one chip
+        // shares the bar until the main area is narrow.
+        let home = input.agent.is_none();
+        let stacked = input.stacked || home;
         // The hint before the ring and the action, while Enter steers: the
         // lowest-priority cell, it trims away first.
         let hint: Option<View> = match &input.primary {
@@ -937,7 +943,7 @@ impl Component for Composer {
                 running: Some(_), ..
             } if !blank => Some(
                 controls::secondary("Enter to steer")
-                    .grid_column(if input.stacked { 0 } else { 1 })
+                    .grid_column(if stacked { 0 } else { 1 })
                     .horizontal_alignment(HorizontalAlignment::Right)
                     .vertical_alignment(VerticalAlignment::Center)
                     .text_trimming(TextTrimming::CharacterEllipsis)
@@ -952,10 +958,10 @@ impl Component for Composer {
             GridLength::Auto
         };
         let actions = composer_actions(input, blank, context);
-        // One line of parameters and the action (§8.1); in a narrow main
-        // area the parameters keep their line and the action takes the
-        // next, at the right, so neither trims away.
-        let bottom: View = if input.stacked {
+        // One line of parameters and the action (§8.1); stacked, the
+        // parameters keep their line and the action takes the next, at the
+        // right, so neither trims away.
+        let bottom: View = if stacked {
             StackPanel::new()
                 .spacing(tokens::spacing::SM)
                 .children((
@@ -986,11 +992,10 @@ impl Component for Composer {
                 ]))
                 .into()
         };
-        // Home (`Main.dc.html`): the field first, then one bar (+, the
-        // project, place, model and access chips, Start task); a folder
-        // outside the projects takes its field above. Attached files as
-        // chips over the field.
-        let home = input.agent.is_none();
+        // Home (`Main.dc.html`): the field first, then + and the project,
+        // place, model and access chips, then Start task; a folder outside
+        // the projects takes its field above. Attached files as chips over
+        // the field.
         let mut rows: Vec<KeyedView> = Vec::new();
         if let Some(folder) = &input.folder {
             rows.push(KeyedView::new("folder", folder.clone()));
@@ -1003,11 +1008,7 @@ impl Component for Composer {
         }
         rows.push(KeyedView::new("field", field));
         rows.push(KeyedView::new(
-            if input.stacked {
-                "bottom:stacked"
-            } else {
-                "bottom"
-            },
+            if stacked { "bottom:stacked" } else { "bottom" },
             bottom,
         ));
         // Home's composer stretches across the home column; a

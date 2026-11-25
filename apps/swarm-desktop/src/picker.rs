@@ -209,21 +209,21 @@ pub enum Choice {
 
 impl Choice {
     /// The model chip's short words, as the conversation's chip says them
-    /// (`haiku · low`): the short model and effort, or the preset's name;
-    /// the harness and full words are its accessible name
-    /// ([`Self::chip_name`]).
+    /// (`haiku · low`): the short model and a chosen effort, or the
+    /// preset's name; the harness and full words are its accessible name
+    /// and tooltip ([`Self::chip_name`]).
     pub fn chip_label(&self, auto_profile: Option<&str>) -> String {
         match self {
             Self::Auto | Self::Preset(_) => {
                 self.chip_text(auto_profile, |effort| effort_label(effort).to_owned())
             }
-            Self::Model(pick) => format!(
-                "{} · {}",
-                pick.model.as_deref().map_or("default model", model_short),
-                pick.effort
-                    .as_deref()
-                    .map_or("default effort", effort_label)
-            ),
+            Self::Model(pick) => {
+                let model = pick.model.as_deref().map_or("default model", model_short);
+                match pick.effort.as_deref() {
+                    Some(effort) => format!("{model} · {}", effort_label(effort)),
+                    None => model.to_owned(),
+                }
+            }
         }
     }
 
