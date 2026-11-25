@@ -143,6 +143,13 @@ checked! {
     eliot_core::api::WhoRequest => eliot_core::api::WhoResponse, "who";
     eliot_core::api::SettingsReadRequest => eliot_core::api::SettingsReadResponse, "settings.read";
     eliot_core::api::SettingsSaveRequest => eliot_core::api::SettingsSaveResponse, "settings.save";
+    eliot_core::api::AgentGitRequest => eliot_core::api::AgentGitResponse, "agent.git";
+    eliot_core::api::AgentPatchDigestRequest => eliot_core::api::AgentPatchDigestResponse, "agent.patch_digest";
+    eliot_core::api::AgentProcessesRequest => eliot_core::api::AgentProcessesResponse, "agent.processes";
+    eliot_core::api::MailInboxRequest => eliot_core::api::MailInboxResponse, "mail.inbox";
+    eliot_core::api::GoalPauseRequest => eliot_core::api::GoalView, "goal.pause";
+    eliot_core::api::GoalResumeRequest => eliot_core::api::GoalView, "goal.resume";
+    eliot_core::api::GoalClearRequest => eliot_core::api::GoalView, "goal.clear";
 }
 
 /// The event reads check their reply against the cursor they read after.
@@ -1751,10 +1758,7 @@ pub async fn submit_stop(
 /// against the frozen base, and the complete line counts when probed.
 pub async fn agent_git(data_dir: &Path, id: &str) -> Result<eliot_core::api::AgentGitResponse> {
     let request = eliot_core::api::AgentGitRequest::new(id);
-    request.validate()?;
-    let reply: eliot_core::api::AgentGitResponse =
-        eliot_daemon::client_call_typed(data_dir, "agent.git", &request).await?;
-    request.validate_response(&reply)?;
+    let reply: eliot_core::api::AgentGitResponse = call(data_dir, &request).await?;
     Ok(reply)
 }
 
@@ -1768,10 +1772,7 @@ pub async fn patch_digest(
         id: id.to_owned(),
         generation: None,
     };
-    request.validate()?;
-    let reply: eliot_core::api::AgentPatchDigestResponse =
-        eliot_daemon::client_call_typed(data_dir, "agent.patch_digest", &request).await?;
-    request.validate_response(&reply)?;
+    let reply: eliot_core::api::AgentPatchDigestResponse = call(data_dir, &request).await?;
     Ok(reply)
 }
 
@@ -1782,10 +1783,7 @@ pub async fn agent_processes(
     id: &str,
 ) -> Result<eliot_core::api::AgentProcessesResponse> {
     let request = eliot_core::api::AgentProcessesRequest::new(id);
-    request.validate()?;
-    let reply: eliot_core::api::AgentProcessesResponse =
-        eliot_daemon::client_call_typed(data_dir, "agent.processes", &request).await?;
-    request.validate_response(&reply)?;
+    let reply: eliot_core::api::AgentProcessesResponse = call(data_dir, &request).await?;
     Ok(reply)
 }
 
@@ -1804,10 +1802,7 @@ pub async fn mail_inbox(
         thread: None,
         reply_to: None,
     };
-    request.validate()?;
-    let reply: eliot_core::api::MailInboxResponse =
-        eliot_daemon::client_call_typed(data_dir, "mail.inbox", &request).await?;
-    request.validate_response(&reply)?;
+    let reply: eliot_core::api::MailInboxResponse = call(data_dir, &request).await?;
     Ok(reply)
 }
 
@@ -1847,9 +1842,7 @@ pub async fn goal_control(
                 mode: GoalMode::Eliot,
                 reason: Some("Paused by the owner from Details.".to_owned()),
             };
-            request.validate()?;
-            let reply = eliot_daemon::client_call_typed(data_dir, "goal.pause", &request).await?;
-            request.validate_response(&reply)?;
+            let reply = call(data_dir, &request).await?;
             Ok(reply)
         }
         GoalControl::Resume => {
@@ -1858,9 +1851,7 @@ pub async fn goal_control(
                 agent,
                 mode: GoalMode::Eliot,
             };
-            request.validate()?;
-            let reply = eliot_daemon::client_call_typed(data_dir, "goal.resume", &request).await?;
-            request.validate_response(&reply)?;
+            let reply = call(data_dir, &request).await?;
             Ok(reply)
         }
         GoalControl::Clear => {
@@ -1869,9 +1860,7 @@ pub async fn goal_control(
                 agent,
                 mode: GoalMode::Eliot,
             };
-            request.validate()?;
-            let reply = eliot_daemon::client_call_typed(data_dir, "goal.clear", &request).await?;
-            request.validate_response(&reply)?;
+            let reply = call(data_dir, &request).await?;
             Ok(reply)
         }
     }
