@@ -1,8 +1,9 @@
 use super::*;
 use eliot_core::api::{
     ProjectAssignmentClaimRequest, ProjectAssignmentGetRequest, ProjectAssignmentLaunchRequest,
-    ProjectAssignmentReleaseRequest, ProjectTransferAction, ProjectTransferOutcome,
-    ProjectTransferRequest, ProjectTransferResult, discovery::decode_params,
+    ProjectAssignmentReleaseRequest, ProjectAssignmentUsageRequest, ProjectTransferAction,
+    ProjectTransferOutcome, ProjectTransferRequest, ProjectTransferResult,
+    discovery::decode_params,
 };
 use eliot_store::Store;
 
@@ -151,6 +152,24 @@ impl Router {
         self.signal_progress();
         self.signal_launch_arbitration();
         encode_assignment(change.value)
+    }
+
+    pub(super) async fn project_assignment_usage(
+        &self,
+        params: &Value,
+        principal: &Principal,
+    ) -> Result<Value> {
+        require_owner(principal)?;
+        let request: ProjectAssignmentUsageRequest = decode_params(params.clone())?;
+        let response = self
+            .inner
+            .store
+            .lock()
+            .await
+            .read_project_assignment_usage(&request)?;
+        request.validate_response(&response)?;
+        serde_json::to_value(response)
+            .map_err(|_| Error::new("internal", "project assignment usage could not be encoded"))
     }
 
     pub(super) async fn project_assignment_release(

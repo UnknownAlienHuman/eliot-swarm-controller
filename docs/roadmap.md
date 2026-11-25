@@ -229,6 +229,9 @@ Checked layers record delivered increments, not full crash/load qualification.
   and exact totals seek the retained membership index.
 - [x] **6. Project overview.** Read scoped workspace Git status and retained
   turn usage coverage with project and fleet totals in one Store snapshot.
+- [x] **7. Historical assignment usage.** Attribute command-bound turns to the
+  assignment at dispatch. Page retained turn usage by epoch and report
+  unattributed turns separately.
 
 ## L0 — Archive and smallest workspace
 

@@ -3,8 +3,9 @@ use super::support::{Failure, mutation_id, parse_goal_json, print_value, validat
 use eliot_core::api::{
     PROJECT_TRANSFER_METHOD, ProjectAssignment, ProjectAssignmentClaimRequest,
     ProjectAssignmentGetRequest, ProjectAssignmentLaunchRequest, ProjectAssignmentOutcome,
-    ProjectAssignmentReleaseRequest, ProjectAssignmentResult, ProjectManagerIdentity,
-    ProjectTransferAction, ProjectTransferOutcome, ProjectTransferRequest, ProjectTransferResult,
+    ProjectAssignmentReleaseRequest, ProjectAssignmentResult, ProjectAssignmentUsageRequest,
+    ProjectAssignmentUsageResponse, ProjectManagerIdentity, ProjectTransferAction,
+    ProjectTransferOutcome, ProjectTransferRequest, ProjectTransferResult,
 };
 use std::path::Path;
 
@@ -22,6 +23,27 @@ pub(super) async fn run(
                     .await
                     .map_err(Failure::for_read)?;
             print_value(&serde_json::json!(assignment), json_output);
+            return Ok(0);
+        }
+        ProjectAssignmentCommand::Usage {
+            project,
+            epoch,
+            after,
+        } => {
+            let request = ProjectAssignmentUsageRequest {
+                project,
+                epoch,
+                after,
+            };
+            request.validate().map_err(Failure::for_read)?;
+            let response: ProjectAssignmentUsageResponse =
+                eliot_daemon::client_call_typed(data_dir, "project.assignment.usage", &request)
+                    .await
+                    .map_err(Failure::for_read)?;
+            request
+                .validate_response(&response)
+                .map_err(Failure::for_read)?;
+            print_value(&serde_json::json!(response), json_output);
             return Ok(0);
         }
         ProjectAssignmentCommand::Claim {

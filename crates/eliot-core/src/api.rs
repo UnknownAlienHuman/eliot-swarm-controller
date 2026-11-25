@@ -282,11 +282,12 @@ pub use switch::{
 };
 pub use timers::{CatchUp, TimerGetRequest, TimerRunRequest, TimerSchedule, TimerStateView};
 pub use usage::{
-    FirstCallInput, MAX_FIRST_CALL_TURNS, MAX_NATIVE_CHILD_TURN_MARKERS, NativeChildTurnMarker,
-    PROFILE_FIRST_CALL_WINDOW, ProfileFirstCallInput, ProfileNativeChildUsage, SessionCostTotal,
-    SessionCumulativeTotals, SessionFacts, SessionTokenSubtotal, TurnCounterMissing,
-    TurnCounterTotals, TurnExpenditure, TurnScopeTotals, UsageRoleSummary, UsageRoleTotals,
-    UsageScopeView, UsageSummaryRequest, UsageSummaryResponse,
+    FirstCallInput, MAX_ASSIGNMENT_USAGE_PAGE, MAX_FIRST_CALL_TURNS, MAX_NATIVE_CHILD_TURN_MARKERS,
+    NativeChildTurnMarker, PROFILE_FIRST_CALL_WINDOW, ProfileFirstCallInput,
+    ProfileNativeChildUsage, ProjectAssignmentUsageRequest, ProjectAssignmentUsageResponse,
+    SessionCostTotal, SessionCumulativeTotals, SessionFacts, SessionTokenSubtotal,
+    TurnCounterMissing, TurnCounterTotals, TurnExpenditure, TurnScopeTotals, UsageRoleSummary,
+    UsageRoleTotals, UsageScopeView, UsageSummaryRequest, UsageSummaryResponse,
 };
 pub use waits::{
     MAX_SWARM_WAIT_MS, MAX_SWARM_WAIT_TARGETS, MAX_WAIT_FACTS_FRAME_BYTES,
