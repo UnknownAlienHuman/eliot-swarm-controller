@@ -75,6 +75,246 @@ where
         .block_on(future)
 }
 
+/// A request that carries its own checks both ways (`validate`, and
+/// `validate_response` for its reply), with its method and reply type:
+/// [`call`] runs both, so the mapping of a reply that fails them lives in
+/// one place ([`invalid_reply`]).
+pub trait Checked: serde::Serialize {
+    type Reply: serde::de::DeserializeOwned;
+    const METHOD: &'static str;
+    fn check(&self) -> Result<()>;
+    fn check_reply(&self, reply: &Self::Reply) -> Result<()>;
+}
+
+/// The requests the desktop sends through [`call`]: request type, reply
+/// type and method.
+macro_rules! checked {
+    ($($request:ty => $reply:ty, $method:literal;)*) => {$(
+        impl Checked for $request {
+            type Reply = $reply;
+            const METHOD: &'static str = $method;
+            fn check(&self) -> Result<()> {
+                self.validate()
+            }
+            fn check_reply(&self, reply: &$reply) -> Result<()> {
+                self.validate_response(reply)
+            }
+        }
+    )*};
+}
+
+checked! {
+    AgentListRequest => AgentListResponse, "agent.list";
+    AgentGetRequest => AgentGetResponse, "agent.get";
+    AgentResultRequest => AgentResultResponse, "agent.result";
+    DiagnoseRequest => DiagnoseResponse, "diagnose";
+    DaemonStatusRequest => DaemonStatusResponse, "daemon.status";
+    eliot_core::api::ProjectDiscoverRequest => eliot_core::api::ProjectDiscoverResponse, "project.discover";
+    eliot_core::api::MailReadRequest => eliot_core::api::MailDelivery, "mail.read";
+    CommandSubmitRequest => CommandSubmitResponse, "command.submit";
+    CommandGetRequest => Command, "command.get";
+    CommandChildrenRequest => CommandChildrenResponse, "command.children";
+    CommandResolveRequest => CommandResolveResponse, "command.resolve";
+    ChatOrganizationRequest => ChatOrganizationResponse, "chat.organization";
+    ChatAttachRequest => ChatOrganizationMutationResponse, "chat.attach";
+    ChatDetachRequest => ChatOrganizationMutationResponse, "chat.detach";
+    ChatTagRequest => ChatOrganizationMutationResponse, "chat.tag";
+    HandoffRequest => HandoffResponse, "swarm.handoff";
+    SwitchRequest => SwitchResponse, "swarm.switch";
+    HarnessModelsRequest => HarnessModelsResponse, "harness.models";
+    UsageSummaryRequest => UsageSummaryResponse, "usage.summary";
+    eliot_core::api::GoalGetRequest => eliot_core::api::GoalView, "goal.get";
+    eliot_core::api::WorkspaceListRequest => eliot_core::api::WorkspaceListResponse, "workspace.list";
+    eliot_core::api::RoutingPreviewRequest => eliot_core::api::RoutingPreviewResponse, "routing.preview";
+    eliot_core::api::harness::ModelsCatalogWatchRequest => eliot_core::api::harness::ModelsCatalogWatchResponse, "models.catalog.watch";
+    eliot_core::api::ModelsCatalogRequest => eliot_core::api::ModelsCatalogResponse, "models.catalog";
+    eliot_core::api::HarnessQuotaRequest => eliot_core::api::HarnessQuotaResponse, "harness.quota";
+    eliot_core::api::ProviderHoldsRequest => eliot_core::api::ProviderHoldsResponse, "provider.holds";
+    eliot_core::api::ProviderClearHoldRequest => eliot_core::api::ProviderClearHoldResponse, "provider.clear_hold";
+    eliot_core::api::ProfileListRequest => eliot_core::api::ProfileListResponse, "profile.list";
+    eliot_core::api::RuleListRequest => eliot_core::api::RuleListResponse, "rule.list";
+    eliot_core::api::RuleReadRequest => eliot_core::api::RuleReadResponse, "rule.read";
+    eliot_core::api::RuleSaveRequest => eliot_core::api::RuleSaveResponse, "rule.save";
+    eliot_core::api::RuleDeleteRequest => eliot_core::api::RuleDeleteResponse, "rule.delete";
+    eliot_core::api::ScriptListRequest => eliot_core::api::ScriptListResponse, "script.list";
+    eliot_core::api::ScriptReadRequest => eliot_core::api::ScriptReadResponse, "script.read";
+    eliot_core::api::ScriptSaveRequest => eliot_core::api::ScriptSaveResponse, "script.save";
+    eliot_core::api::TimerRunRequest => Command, "timer.run";
+    eliot_core::api::WhoRequest => eliot_core::api::WhoResponse, "who";
+    eliot_core::api::SettingsReadRequest => eliot_core::api::SettingsReadResponse, "settings.read";
+    eliot_core::api::SettingsSaveRequest => eliot_core::api::SettingsSaveResponse, "settings.save";
+    eliot_core::api::AgentGitRequest => eliot_core::api::AgentGitResponse, "agent.git";
+    eliot_core::api::AgentPatchDigestRequest => eliot_core::api::AgentPatchDigestResponse, "agent.patch_digest";
+    eliot_core::api::AgentProcessesRequest => eliot_core::api::AgentProcessesResponse, "agent.processes";
+    eliot_core::api::MailInboxRequest => eliot_core::api::MailInboxResponse, "mail.inbox";
+    eliot_core::api::GoalPauseRequest => eliot_core::api::GoalView, "goal.pause";
+    eliot_core::api::GoalResumeRequest => eliot_core::api::GoalView, "goal.resume";
+    eliot_core::api::GoalClearRequest => eliot_core::api::GoalView, "goal.clear";
+}
+
+/// The event reads check their reply against the cursor they read after.
+impl Checked for EventsBoundsRequest {
+    type Reply = EventsBoundsResponse;
+    const METHOD: &'static str = "events.bounds";
+    fn check(&self) -> Result<()> {
+        self.validate()
+    }
+    fn check_reply(&self, reply: &EventsBoundsResponse) -> Result<()> {
+        reply.validate()
+    }
+}
+
+impl Checked for EventsReadRequest {
+    type Reply = EventsReadResponse;
+    const METHOD: &'static str = "events.read";
+    fn check(&self) -> Result<()> {
+        self.validate()
+    }
+    fn check_reply(&self, reply: &EventsReadResponse) -> Result<()> {
+        reply.validate(self.after)
+    }
+}
+
+impl Checked for EventsSubscribeRequest {
+    type Reply = EventsSubscribeResponse;
+    const METHOD: &'static str = "events.subscribe";
+    fn check(&self) -> Result<()> {
+        self.validate()
+    }
+    fn check_reply(&self, reply: &EventsSubscribeResponse) -> Result<()> {
+        reply.validate(self.after)
+    }
+}
+
+/// One daemon call: the request's own check, the authenticated call, and
+/// the reply's check against the request. A reply that does not decode as
+/// its type or fails its check is [`invalid_reply`]; transport and daemon
+/// errors pass through as they are.
+pub async fn call<R: Checked>(data_dir: &Path, request: &R) -> Result<R::Reply> {
+    let raw = call_raw(data_dir, request).await?;
+    let reply: R::Reply = serde_json::from_value(raw)
+        .map_err(|error| invalid_reply(R::METHOD, &format!("its fields: {error}")))?;
+    request
+        .check_reply(&reply)
+        .map_err(|error| invalid_reply(R::METHOD, &error.message))?;
+    Ok(reply)
+}
+
+/// The request's own check and the call: the reply as the daemon sent it.
+async fn call_raw<R: Checked>(data_dir: &Path, request: &R) -> Result<Value> {
+    request.check()?;
+    let params = serde_json::to_value(request).map_err(|_| {
+        Error::new(
+            "invalid",
+            format!("{} request could not be encoded", R::METHOD),
+        )
+    })?;
+    eliot_daemon::client_call(data_dir, R::METHOD, params).await
+}
+
+/// A fleet row the row-by-row check changed: shown without its observation
+/// (`kept`) or left out, and why.
+#[derive(Clone, Debug)]
+pub struct RowNote {
+    pub id: String,
+    pub kept: bool,
+    pub text: String,
+}
+
+/// One `agent.list` page checked row by row, for the Monitor's fleet (#826):
+/// the page as a whole (its cursor and totals over the keys of every row
+/// sent, `validate_response_page` and `validate_response_state_totals`) must
+/// pass, but one row's fault does not discard the others. A row whose
+/// observation does not decode or does not belong (`validate_row` passes
+/// once the observation is set aside) is kept without it; a row that fails
+/// otherwise is left out. Each such row is named in the notes returned.
+pub async fn list_agents_by_row(
+    data_dir: &Path,
+    params: &AgentListRequest,
+) -> Result<(AgentListResponse, Vec<RowNote>)> {
+    let method = AgentListRequest::METHOD;
+    let mut raw = call_raw(data_dir, params).await?;
+    let mut notes = Vec::new();
+    let mut reply: AgentListResponse = match serde_json::from_value(raw.clone()) {
+        Ok(reply) => reply,
+        Err(_) => {
+            // A row whose observation does not decode loses it; the page
+            // is decoded again and anything else that does not decode
+            // still fails it.
+            if let Some(rows) = raw.get_mut("agents").and_then(Value::as_array_mut) {
+                for row in rows.iter_mut() {
+                    if serde_json::from_value::<eliot_core::api::AgentListRow>(row.clone()).is_err()
+                        && let Some(fields) = row.as_object_mut()
+                        && fields.remove("observation").is_some()
+                    {
+                        let id = fields.get("id").and_then(Value::as_str).unwrap_or("?");
+                        notes.push(RowNote {
+                            id: id.to_owned(),
+                            kept: true,
+                            text: format!("{id}: its observation did not decode"),
+                        });
+                    }
+                }
+            }
+            serde_json::from_value(raw)
+                .map_err(|error| invalid_reply(method, &format!("its fields: {error}")))?
+        }
+    };
+    let keys: Vec<(String, i64)> = reply
+        .agents
+        .iter()
+        .map(|row| (row.summary.id.clone(), row.summary.updated_at))
+        .collect();
+    params
+        .validate_response_page(&reply, &keys)
+        .and_then(|()| params.validate_response_state_totals(&reply))
+        .map_err(|error| invalid_reply(method, &error.message))?;
+    let mut kept = Vec::with_capacity(reply.agents.len());
+    for (index, mut row) in std::mem::take(&mut reply.agents).into_iter().enumerate() {
+        let Err(error) = params.validate_row(&row, index) else {
+            kept.push(row);
+            continue;
+        };
+        // The same check with the observation the row carries: when that
+        // passes, the observation was the row's only fault.
+        let without = AgentListRequest {
+            observations: row.observation.is_some(),
+            ..params.clone()
+        };
+        if without.validate_row(&row, index).is_ok() {
+            row.observation = None;
+            notes.push(RowNote {
+                id: row.summary.id.clone(),
+                kept: true,
+                text: format!(
+                    "{}: shown without its observation ({})",
+                    row.summary.id, error.message
+                ),
+            });
+            kept.push(row);
+        } else {
+            notes.push(RowNote {
+                id: row.summary.id.clone(),
+                kept: false,
+                text: format!("{}: left out ({})", row.summary.id, error.message),
+            });
+        }
+    }
+    reply.agents = kept;
+    Ok((reply, notes))
+}
+
+/// A daemon reply that does not match what was asked (`what`): its own code
+/// ([`crate::live::INVALID_REPLY`]), so a read shows it instead of retrying,
+/// and a mutation keeps its id (its outcome is unknown: a retry reads back
+/// instead of acting again, see [`crate::state::uncertain`]).
+pub fn invalid_reply(method: &str, what: &str) -> Error {
+    Error::new(
+        crate::live::INVALID_REPLY,
+        format!("Swarm's {method} reply did not match the request: {what}"),
+    )
+}
+
 fn check_text(text: &str) -> Result<()> {
     if text.trim().is_empty() {
         return Err(Error::new("invalid", "input text must not be blank"));
@@ -91,10 +331,7 @@ fn check_text(text: &str) -> Result<()> {
 /// One validated `agent.list` page. The response passes the canonical
 /// `validate_response` (row filters, cursor, totals), not only row checks.
 pub async fn list_agents(data_dir: &Path, params: &AgentListRequest) -> Result<AgentListResponse> {
-    params.validate()?;
-    let reply: AgentListResponse =
-        eliot_daemon::client_call_typed(data_dir, "agent.list", params).await?;
-    params.validate_response(&reply)?;
+    let reply: AgentListResponse = call(data_dir, params).await?;
     Ok(reply)
 }
 
@@ -266,19 +503,12 @@ pub async fn daemon_status(data_dir: &Path) -> Result<DaemonStatusResponse> {
             ..Default::default()
         },
     ] {
-        match eliot_daemon::client_call_typed(data_dir, "daemon.status", &request).await {
+        match call(data_dir, &request).await {
             Err(error) if lacks_disk_usage_freshness(&error) => {}
-            result => {
-                let response = result?;
-                request.validate_response(&response)?;
-                return Ok(response);
-            }
+            result => return result,
         }
     }
-    let request = DaemonStatusRequest::default();
-    let response = eliot_daemon::client_call_typed(data_dir, "daemon.status", &request).await?;
-    request.validate_response(&response)?;
-    Ok(response)
+    call(data_dir, &DaemonStatusRequest::default()).await
 }
 
 fn lacks_disk_usage_freshness(error: &Error) -> bool {
@@ -298,17 +528,14 @@ async fn typed_call<Req: serde::Serialize, Resp: serde::de::DeserializeOwned>(
         .map_err(|_| Error::new("internal", format!("{method} request could not be encoded")))?;
     let raw = eliot_daemon::client_call(data_dir, method, params).await?;
     serde_json::from_value(raw)
-        .map_err(|_| Error::new("unknown", format!("{method} returned a malformed result")))
+        .map_err(|error| invalid_reply(method, &format!("its fields: {error}")))
 }
 
 /// Full readback for one Agent: generation, active turn, pending requests,
 /// profile snapshot and effective settings.
 pub async fn get_agent(data_dir: &Path, id: &str) -> Result<AgentGetResponse> {
     let params = AgentGetRequest::new(id);
-    params.validate()?;
-    let reply: AgentGetResponse =
-        eliot_daemon::client_call_typed(data_dir, "agent.get", &params).await?;
-    params.validate_response(&reply)?;
+    let reply: AgentGetResponse = call(data_dir, &params).await?;
     Ok(reply)
 }
 
@@ -319,10 +546,7 @@ pub async fn diagnose(data_dir: &Path, target: &str) -> Result<DiagnoseResponse>
     let params = DiagnoseRequest {
         target: target.to_owned(),
     };
-    params.validate()?;
-    let reply: DiagnoseResponse =
-        eliot_daemon::client_call_typed(data_dir, "diagnose", &params).await?;
-    params.validate_response(&reply)?;
+    let reply: DiagnoseResponse = call(data_dir, &params).await?;
     Ok(reply)
 }
 
@@ -431,9 +655,7 @@ async fn agent_result_page(
     data_dir: &Path,
     params: &AgentResultRequest,
 ) -> Result<AgentResultResponse> {
-    params.validate()?;
-    let page = eliot_daemon::client_call_typed(data_dir, "agent.result", params).await?;
-    params.validate_response(&page)?;
+    let page = call(data_dir, params).await?;
     Ok(page)
 }
 
@@ -452,11 +674,7 @@ pub async fn events_bounds(data_dir: &Path, filter: &EventsFilter) -> Result<Eve
     let params = EventsBoundsRequest {
         filter: filter.clone(),
     };
-    params.validate()?;
-    let reply: EventsBoundsResponse =
-        eliot_daemon::client_call_typed(data_dir, "events.bounds", &params).await?;
-    reply.validate()?;
-    Ok(reply)
+    call(data_dir, &params).await
 }
 
 /// One validated `events.read` page strictly after `after`.
@@ -471,11 +689,7 @@ pub async fn events_read(
         limit,
         filter: filter.clone(),
     };
-    params.validate()?;
-    let reply: EventsReadResponse =
-        eliot_daemon::client_call_typed(data_dir, "events.read", &params).await?;
-    reply.validate(after)?;
-    Ok(reply)
+    call(data_dir, &params).await
 }
 
 /// Long-poll wake: limit 1 so the call returns on the first matching event
@@ -491,11 +705,7 @@ pub async fn events_wake(
         wait_ms: WAKE_WAIT_MS,
         filter: filter.clone(),
     };
-    params.validate()?;
-    let reply: EventsSubscribeResponse =
-        eliot_daemon::client_call_typed(data_dir, "events.subscribe", &params).await?;
-    reply.validate(after)?;
-    Ok(reply)
+    call(data_dir, &params).await
 }
 
 /// Long-poll for the first event after `after` matching `filter`, waiting
@@ -512,11 +722,7 @@ pub async fn events_wait(
         wait_ms,
         filter: filter.clone(),
     };
-    params.validate()?;
-    let reply: EventsSubscribeResponse =
-        eliot_daemon::client_call_typed(data_dir, "events.subscribe", &params).await?;
-    reply.validate(after)?;
-    Ok(reply)
+    call(data_dir, &params).await
 }
 
 /// Read `(from, through]` for the filter to the end. Events above `through`
@@ -682,10 +888,7 @@ pub async fn read_mail(
         agent: Some(agent.to_owned()),
         delivery_id: delivery.to_owned(),
     };
-    request.validate()?;
-    let read: eliot_core::api::MailDelivery =
-        eliot_daemon::client_call_typed(data_dir, "mail.read", &request).await?;
-    request.validate_response(&read)?;
+    let read: eliot_core::api::MailDelivery = call(data_dir, &request).await?;
     Ok(read)
 }
 
@@ -737,22 +940,8 @@ fn submit_request(
 }
 
 async fn submit(data_dir: &Path, request: &CommandSubmitRequest) -> Result<CommandSubmitResponse> {
-    request.validate()?;
-    let reply: CommandSubmitResponse =
-        eliot_daemon::client_call_typed(data_dir, "command.submit", request).await?;
-    request.validate_response(&reply).map_err(unverified)?;
+    let reply: CommandSubmitResponse = call(data_dir, request).await?;
     Ok(reply)
-}
-
-/// A mutation reply that arrived but fails its binding check proves
-/// nothing about what the daemon did: report it as an unknown outcome, so
-/// the action keeps its mutation id and a retry reads back instead of
-/// acting again.
-fn unverified(error: Error) -> Error {
-    Error::new(
-        "unknown",
-        format!("the daemon replied, but the reply failed its binding check ({error})"),
-    )
 }
 
 /// One retained command with its admitted args and state.
@@ -789,10 +978,7 @@ pub async fn sidebar_status(data_dir: &Path) -> Result<eliot_core::api::DaemonSi
                 if error.code == "unsupported"
                     && error.message.starts_with("Method unavailable.") =>
             {
-                let request = DaemonStatusRequest::default();
-                let status: DaemonStatusResponse =
-                    eliot_daemon::client_call_typed(data_dir, "daemon.status", &request).await?;
-                request.validate_response(&status)?;
+                let status = call(data_dir, &DaemonStatusRequest::default()).await?;
                 DaemonSidebarResponse {
                     owner_inbox: status.owner_inbox,
                     profile_command_issues: status.profile_command_issues,
@@ -858,10 +1044,7 @@ pub async fn auth_desktop_report(
 
 pub async fn read_command(data_dir: &Path, id: &str) -> Result<Command> {
     let params = CommandGetRequest::new(id);
-    params.validate()?;
-    let command: Command =
-        eliot_daemon::client_call_typed(data_dir, "command.get", &params).await?;
-    params.validate_response(&command)?;
+    let command: Command = call(data_dir, &params).await?;
     Ok(command)
 }
 
@@ -951,10 +1134,7 @@ pub async fn enqueue_launch(
     let reply: LaunchIntentView =
         eliot_daemon::client_call_typed(data_dir, "launch.enqueue", &request).await?;
     if reply.id != request.id {
-        return Err(unverified(Error::new(
-            "unknown",
-            "queued launch reply names another intent",
-        )));
+        return Err(invalid_reply("launch.enqueue", "it names another intent"));
     }
     Ok(reply)
 }
@@ -984,10 +1164,7 @@ pub async fn chat_organization(
             // reads every group as it is.
             query: None,
         };
-        request.validate()?;
-        let reply: ChatOrganizationResponse =
-            eliot_daemon::client_call_typed(data_dir, "chat.organization", &request).await?;
-        request.validate_response(&reply)?;
+        let reply: ChatOrganizationResponse = call(data_dir, &request).await?;
         groups.extend(reply.groups);
         watermark = watermark.min(reply.event_watermark);
         if !reply.groups_truncated {
@@ -1037,9 +1214,9 @@ pub async fn launch_intent(data_dir: &Path, id: &str) -> Result<LaunchIntentView
     let reply: LaunchIntentView =
         eliot_daemon::client_call_typed(data_dir, "launch.intent.get", &request).await?;
     if reply.id != request.id {
-        return Err(Error::new(
-            "unknown",
-            "launch intent reply names another intent",
+        return Err(invalid_reply(
+            "launch.intent.get",
+            "it names another intent",
         ));
     }
     Ok(reply)
@@ -1120,9 +1297,7 @@ pub async fn organize(
                 project,
                 expected_revision: Some(vec![revision]),
             };
-            request.validate()?;
-            let reply = eliot_daemon::client_call_typed(data_dir, "chat.attach", &request).await?;
-            request.validate_response(&reply).map_err(unverified)?;
+            let reply = call(data_dir, &request).await?;
             Ok(reply)
         }
         Organize::Detach { agent, revision } => {
@@ -1131,9 +1306,7 @@ pub async fn organize(
                 agents: vec![agent],
                 expected_revision: Some(vec![revision]),
             };
-            request.validate()?;
-            let reply = eliot_daemon::client_call_typed(data_dir, "chat.detach", &request).await?;
-            request.validate_response(&reply).map_err(unverified)?;
+            let reply = call(data_dir, &request).await?;
             Ok(reply)
         }
         Organize::Tag {
@@ -1147,9 +1320,7 @@ pub async fn organize(
                 tags,
                 expected_revision: Some(vec![revision]),
             };
-            request.validate()?;
-            let reply = eliot_daemon::client_call_typed(data_dir, "chat.tag", &request).await?;
-            request.validate_response(&reply).map_err(unverified)?;
+            let reply = call(data_dir, &request).await?;
             Ok(reply)
         }
     }
@@ -1239,10 +1410,7 @@ pub async fn submit_configure(
 /// The first page of a command's retained children.
 pub async fn command_children(data_dir: &Path, id: &str) -> Result<Vec<Command>> {
     let params = CommandChildrenRequest::new(id);
-    params.validate()?;
-    let reply: CommandChildrenResponse =
-        eliot_daemon::client_call_typed(data_dir, "command.children", &params).await?;
-    params.validate_response(&reply)?;
+    let reply: CommandChildrenResponse = call(data_dir, &params).await?;
     Ok(reply.children)
 }
 
@@ -1276,20 +1444,14 @@ pub async fn agent_sends(data_dir: &Path, agent: &str) -> Result<(Vec<Command>, 
 /// included) is also the readback: the daemon returns the committed result
 /// and the current brief gate, never a second transfer.
 pub async fn handoff(data_dir: &Path, request: &HandoffRequest) -> Result<HandoffResponse> {
-    request.validate()?;
-    let reply: HandoffResponse =
-        eliot_daemon::client_call_typed(data_dir, "swarm.handoff", request).await?;
-    request.validate_response(&reply).map_err(unverified)?;
+    let reply: HandoffResponse = call(data_dir, request).await?;
     Ok(reply)
 }
 
 /// Owner launch-plus-handoff. The first reply is the reservation; the same
 /// request again reads the components back and never launches another Agent.
 pub async fn switch(data_dir: &Path, request: &SwitchRequest) -> Result<SwitchResponse> {
-    request.validate()?;
-    let reply: SwitchResponse =
-        eliot_daemon::client_call_typed(data_dir, "swarm.switch", request).await?;
-    request.validate_response(&reply).map_err(unverified)?;
+    let reply: SwitchResponse = call(data_dir, request).await?;
     Ok(reply)
 }
 
@@ -1308,10 +1470,7 @@ pub async fn resolve_command(
         resolution,
         reason,
     };
-    request.validate()?;
-    let reply: CommandResolveResponse =
-        eliot_daemon::client_call_typed(data_dir, "command.resolve", &request).await?;
-    request.validate_response(&reply).map_err(unverified)?;
+    let reply: CommandResolveResponse = call(data_dir, &request).await?;
     Ok(reply)
 }
 
@@ -1329,10 +1488,7 @@ pub async fn cancel_command(
     let reply: CommandCancelResponse =
         eliot_daemon::client_call_typed(data_dir, "command.cancel", &request).await?;
     if reply.command_id != request.command_id {
-        return Err(unverified(Error::new(
-            "source_integrity",
-            "cancel reply names another command",
-        )));
+        return Err(invalid_reply("command.cancel", "it names another command"));
     }
     Ok(reply)
 }
@@ -1344,10 +1500,7 @@ pub async fn reparent(data_dir: &Path, request: &ReparentRequest) -> Result<Repa
     let reply: ReparentResponse =
         eliot_daemon::client_call_typed(data_dir, "swarm.reparent", request).await?;
     if reply.id != request.id {
-        return Err(unverified(Error::new(
-            "source_integrity",
-            "reparent reply names another mutation",
-        )));
+        return Err(invalid_reply("swarm.reparent", "it names another mutation"));
     }
     Ok(reply)
 }
@@ -1365,10 +1518,7 @@ pub async fn harness_models(
         agent: agent.map(str::to_owned),
         workspace: None,
     };
-    params.validate()?;
-    let reply: HarnessModelsResponse =
-        eliot_daemon::client_call_typed(data_dir, "harness.models", &params).await?;
-    params.validate_response(&reply)?;
+    let reply: HarnessModelsResponse = call(data_dir, &params).await?;
     Ok(reply)
 }
 
@@ -1561,10 +1711,7 @@ pub async fn usage_summary(data_dir: &Path, agent: &str) -> Result<UsageSummaryR
         project: None,
         root: None,
     };
-    params.validate()?;
-    let reply: UsageSummaryResponse =
-        eliot_daemon::client_call_typed(data_dir, "usage.summary", &params).await?;
-    params.validate_response(&reply)?;
+    let reply: UsageSummaryResponse = call(data_dir, &params).await?;
     Ok(reply)
 }
 
@@ -1601,16 +1748,8 @@ pub async fn goal_get(data_dir: &Path, agent: &str) -> Result<Option<eliot_core:
         agent: agent.to_owned(),
         mode: eliot_core::api::GoalMode::Eliot,
     };
-    request.validate()?;
-    match eliot_daemon::client_call_typed::<_, eliot_core::api::GoalView>(
-        data_dir, "goal.get", &request,
-    )
-    .await
-    {
-        Ok(reply) => {
-            request.validate_response(&reply)?;
-            Ok(Some(reply))
-        }
+    match call(data_dir, &request).await {
+        Ok(reply) => Ok(Some(reply)),
         Err(error) if error.code == "not_found" => Ok(None),
         Err(error) => Err(error),
     }
@@ -1640,10 +1779,7 @@ pub async fn submit_stop(
 /// against the frozen base, and the complete line counts when probed.
 pub async fn agent_git(data_dir: &Path, id: &str) -> Result<eliot_core::api::AgentGitResponse> {
     let request = eliot_core::api::AgentGitRequest::new(id);
-    request.validate()?;
-    let reply: eliot_core::api::AgentGitResponse =
-        eliot_daemon::client_call_typed(data_dir, "agent.git", &request).await?;
-    request.validate_response(&reply)?;
+    let reply: eliot_core::api::AgentGitResponse = call(data_dir, &request).await?;
     Ok(reply)
 }
 
@@ -1657,10 +1793,7 @@ pub async fn patch_digest(
         id: id.to_owned(),
         generation: None,
     };
-    request.validate()?;
-    let reply: eliot_core::api::AgentPatchDigestResponse =
-        eliot_daemon::client_call_typed(data_dir, "agent.patch_digest", &request).await?;
-    request.validate_response(&reply)?;
+    let reply: eliot_core::api::AgentPatchDigestResponse = call(data_dir, &request).await?;
     Ok(reply)
 }
 
@@ -1671,10 +1804,7 @@ pub async fn agent_processes(
     id: &str,
 ) -> Result<eliot_core::api::AgentProcessesResponse> {
     let request = eliot_core::api::AgentProcessesRequest::new(id);
-    request.validate()?;
-    let reply: eliot_core::api::AgentProcessesResponse =
-        eliot_daemon::client_call_typed(data_dir, "agent.processes", &request).await?;
-    request.validate_response(&reply)?;
+    let reply: eliot_core::api::AgentProcessesResponse = call(data_dir, &request).await?;
     Ok(reply)
 }
 
@@ -1693,10 +1823,7 @@ pub async fn mail_inbox(
         thread: None,
         reply_to: None,
     };
-    request.validate()?;
-    let reply: eliot_core::api::MailInboxResponse =
-        eliot_daemon::client_call_typed(data_dir, "mail.inbox", &request).await?;
-    request.validate_response(&reply)?;
+    let reply: eliot_core::api::MailInboxResponse = call(data_dir, &request).await?;
     Ok(reply)
 }
 
@@ -1736,9 +1863,7 @@ pub async fn goal_control(
                 mode: GoalMode::Eliot,
                 reason: Some("Paused by the owner from Details.".to_owned()),
             };
-            request.validate()?;
-            let reply = eliot_daemon::client_call_typed(data_dir, "goal.pause", &request).await?;
-            request.validate_response(&reply)?;
+            let reply = call(data_dir, &request).await?;
             Ok(reply)
         }
         GoalControl::Resume => {
@@ -1747,9 +1872,7 @@ pub async fn goal_control(
                 agent,
                 mode: GoalMode::Eliot,
             };
-            request.validate()?;
-            let reply = eliot_daemon::client_call_typed(data_dir, "goal.resume", &request).await?;
-            request.validate_response(&reply)?;
+            let reply = call(data_dir, &request).await?;
             Ok(reply)
         }
         GoalControl::Clear => {
@@ -1758,9 +1881,7 @@ pub async fn goal_control(
                 agent,
                 mode: GoalMode::Eliot,
             };
-            request.validate()?;
-            let reply = eliot_daemon::client_call_typed(data_dir, "goal.clear", &request).await?;
-            request.validate_response(&reply)?;
+            let reply = call(data_dir, &request).await?;
             Ok(reply)
         }
     }

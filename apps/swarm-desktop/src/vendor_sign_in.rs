@@ -22,6 +22,15 @@ const PROBE_INTERVAL: Duration = Duration::from_secs(10);
 const PROBE_TIMEOUT: Duration = Duration::from_secs(20);
 const MAX_STATUS_BYTES: u64 = 64 * 1024;
 
+/// No daemon answers (the window's daemon link is starting it, or shows
+/// the daemon screen): the poll asks nothing meanwhile.
+static DAEMON_DOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The window's daemon link says whether a daemon answers.
+pub(crate) fn set_daemon_down(down: bool) {
+    DAEMON_DOWN.store(down, std::sync::atomic::Ordering::Relaxed);
+}
+
 pub(crate) fn start() {
     if std::thread::Builder::new()
         .name("swarm-vendor-sign-in".to_owned())
@@ -76,6 +85,8 @@ async fn run() {
     let mut attempts = Vec::<Attempt>::new();
     let mut next_probe = HashMap::<(String, String), Instant>::new();
     let mut previous_data_dir = None;
+    // Failed polls in a row (no daemon answering): the next waits longer.
+    let mut pace = crate::live::Pace::default();
     loop {
         interval.tick().await;
         let mut index = 0;
@@ -86,6 +97,9 @@ async fn run() {
                 index += 1;
             }
         }
+        if DAEMON_DOWN.load(std::sync::atomic::Ordering::Relaxed) {
+            continue;
+        }
         let Ok(data_dir) = crate::client::data_dir() else {
             continue;
         };
@@ -95,8 +109,11 @@ async fn run() {
         }
         let pending = crate::client::auth_desktop_poll(&data_dir).await;
         let Ok(pending) = pending else {
+            let poll_ms = u64::try_from(POLL_INTERVAL.as_millis()).unwrap_or(u64::MAX);
+            interval.reset_after(Duration::from_millis(pace.fail(poll_ms)));
             continue;
         };
+        pace.reset();
         next_probe.retain(|(harness, revision), _| {
             pending
                 .pending

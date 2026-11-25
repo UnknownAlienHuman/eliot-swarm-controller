@@ -17,6 +17,10 @@ use crate::theme::winui::Palette;
 /// Restart attempts before the failure view. The pauses before attempts
 /// 2 to 5 grow as [`live::backoff_ms`]: 1, 2, 4 and 8 s.
 const RESTART_ATTEMPTS: u32 = 5;
+/// A restarted daemon that stops again sooner than this after it answered
+/// continues the same restart chain (the next attempt, its pause, the cap);
+/// one that stayed up this long failed anew and starts at attempt 1.
+const STABLE_UP: std::time::Duration = std::time::Duration::from_secs(60);
 /// A probe with no answer this soon leaves the daemon to its readers: it
 /// is busy, not gone.
 const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
@@ -55,7 +59,7 @@ pub(super) struct LinkState {
     /// Probes in a row that found the daemon running after a failed read,
     /// and the earliest next one: repeated failing reads ask it with the
     /// same growing pauses as every other retry.
-    strikes: u32,
+    pace: live::Pace,
     quiet_until: Option<std::time::Instant>,
     /// The start in flight: superseded starts are cancelled, and the
     /// window's close cancels it before it starts a daemon.
@@ -63,6 +67,11 @@ pub(super) struct LinkState {
     /// The data directory being started is the owner's new choice: it is
     /// remembered only once its daemon answers.
     candidate: bool,
+    /// The last restart that brought a daemon up: its attempt and when that
+    /// daemon answered. Kept across that success until the daemon stayed
+    /// up [`STABLE_UP`], so a daemon that dies right after each start keeps
+    /// backing off and stops at [`RESTART_ATTEMPTS`].
+    recent: Option<(u32, std::time::Instant)>,
     /// The confirmation of a new empty data directory is open.
     pub(super) confirm_fresh: bool,
 }
@@ -124,13 +133,27 @@ impl DesktopApp {
         self.spawn_probe(context);
     }
 
-    /// While its Owner keeps it stopped, the list's cadence asks whether a
-    /// daemon was started elsewhere (CLI, update) and reconnects to it.
-    /// Asking never starts one.
+    /// While its Owner keeps it stopped, or after a start found no daemon
+    /// answering (the restarts gave up, or the first start failed that
+    /// way), the list's cadence asks whether a daemon was started elsewhere
+    /// (CLI, update, another window) and reconnects to it. Asking never
+    /// starts one; a start that failed for another reason (its
+    /// configuration, its identity) waits for the owner's Retry.
     pub(super) fn link_watch(&mut self, context: &ComponentContext<Self>) {
-        if self.link.stopped && !self.link.probing {
+        if self.link_watched() && !self.link.probing {
             self.spawn_probe(context);
         }
+    }
+
+    /// The daemon screen asks whether a daemon runs again: after an Owner
+    /// stop, after the restarts gave up, or after a start found no daemon.
+    fn link_watched(&self) -> bool {
+        self.link.stopped
+            || self.link.gave_up
+            || self
+                .startup_error
+                .as_ref()
+                .is_some_and(|error| eliot_daemon::startup::retryable(&error.code))
     }
 
     fn spawn_probe(&mut self, context: &ComponentContext<Self>) {
@@ -155,8 +178,8 @@ impl DesktopApp {
     pub(super) fn link_probed(&mut self, probe: Probe, context: &ComponentContext<Self>) {
         self.link.probing = false;
         let held = self.link.held.take();
-        if self.link.stopped {
-            if probe == Probe::Running {
+        if self.link_view_shown() {
+            if probe == Probe::Running && self.link_watched() {
                 self.retry_startup(context);
             }
             return;
@@ -166,16 +189,38 @@ impl DesktopApp {
         }
         match probe {
             Probe::Running => {
-                self.link.strikes = self.link.strikes.saturating_add(1);
-                self.link.quiet_until = Some(
-                    std::time::Instant::now()
-                        + std::time::Duration::from_millis(live::backoff_ms(self.link.strikes)),
-                );
+                let pause = self.link.pace.fail(0);
+                self.link.quiet_until =
+                    Some(std::time::Instant::now() + std::time::Duration::from_millis(pause));
                 if let Some(text) = held {
                     self.alert(text);
                 }
             }
-            Probe::Gone => self.restart_daemon(1, None, context),
+            Probe::Gone => match self.link.recent.take() {
+                // It died again soon after a restart brought it up: the
+                // same chain goes on, or ends at the cap.
+                Some((attempt, up)) if up.elapsed() < STABLE_UP => {
+                    let reason = format!(
+                        "Swarm stopped again {} s after it started",
+                        up.elapsed().as_secs()
+                    );
+                    if attempt < RESTART_ATTEMPTS {
+                        self.restart_daemon(attempt + 1, Some(reason), context);
+                    } else {
+                        self.link.gave_up = true;
+                        // Shown as "Stopped: Swarm stopped again …".
+                        self.startup_error = Some(eliot_core::Error::new(
+                            "stopped",
+                            format!(
+                                "{reason}, the {RESTART_ATTEMPTS}th restart in a row. Its log \
+                                 may say why."
+                            ),
+                        ));
+                        self.park_reads("Swarm is not running", context);
+                    }
+                }
+                _ => self.restart_daemon(1, None, context),
+            },
             Probe::OwnerStopped => {
                 self.link.stopped = true;
                 self.set_status("Swarm was stopped by its owner.");
@@ -239,6 +284,12 @@ impl DesktopApp {
     /// remembered now. True when it was a restart.
     pub(super) fn link_ready(&mut self, context: &ComponentContext<Self>) -> bool {
         let link = std::mem::take(&mut self.link);
+        // A restart that worked is remembered until its daemon stays up
+        // (`STABLE_UP`); a chain still inside that window keeps its count.
+        self.link.recent = match link.restarting {
+            Some((attempt, _)) => Some((attempt, std::time::Instant::now())),
+            None => link.recent,
+        };
         if link.candidate
             && let Ok(root) = self.data_dir.clone()
         {
@@ -274,6 +325,14 @@ impl DesktopApp {
                 self.park_reads("Swarm is not running", context);
             }
         }
+    }
+
+    /// A read answered: failing reads after it ask whether the daemon runs
+    /// without the pause earlier failures built up. The restart chain's
+    /// memory (`recent`) is not reset here: only its stable window does.
+    pub(super) fn link_answered(&mut self) {
+        self.link.pace.reset();
+        self.link.quiet_until = None;
     }
 
     /// Retry, or Start after an Owner stop, on the current data directory
@@ -515,6 +574,13 @@ impl DesktopApp {
                         .on_click(shell(ShellMsg::RetryStartup))
                         .content(with_icon(m3::glyph::RESUME, "Start Swarm")),
                 ))
+        } else if self.link.gave_up {
+            // Swarm ran and stopped: starting it is the main action.
+            m3::filled(palette)
+                .horizontal_alignment(HorizontalAlignment::Center)
+                .automation_name("Start Swarm: start it again on this data directory")
+                .on_click(shell(ShellMsg::RetryStartup))
+                .content(with_icon(m3::glyph::RESUME, "Start Swarm"))
         } else {
             m3::filled(palette)
                 .horizontal_alignment(HorizontalAlignment::Center)

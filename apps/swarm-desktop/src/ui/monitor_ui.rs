@@ -70,7 +70,7 @@ pub(super) struct MonitorState {
     refresh_gate: Arc<tokio::sync::Mutex<()>>,
     refreshing: bool,
     /// Refreshes in a row that reported read errors: the next waits longer.
-    failures: u32,
+    pace: live::Pace,
     /// The Agent whose details (and usage) each refresh reads.
     pub(super) selected: Option<String>,
     /// Rows whose children are shown (collapsed by default).
@@ -98,7 +98,7 @@ pub(super) struct MonitorState {
     /// for (`None`: no tree planned).
     pub(super) tree_requested: Option<String>,
     /// When the last tree read started (or is planned to): the next waits
-    /// [`monitor::PERIOD_MS`] after it, as the Agents page's reads do.
+    /// [`monitor::LIST_PERIOD_MS`] after it, as the Agents page's reads do.
     tree_started_ms: Option<i64>,
 }
 
@@ -234,18 +234,35 @@ impl DesktopApp {
                         self.monitor.tree_started_ms = Some(snapshot.read_at_ms);
                     }
                     self.monitor.event_cursor = snapshot.event_cursor;
+                    let fleet = snapshot.fleet;
+                    let tree = snapshot.tree.is_some();
+                    // Any read of the refresh that failed (fleet, stopped,
+                    // attention, tree, Details, losses) asks whether the
+                    // daemon runs (itself paced) and waits longer before the
+                    // next, with the same growing pauses as every retry.
+                    let failed = snapshot.failed();
+                    let rows = monitor::sidebar_rows(&snapshot);
                     self.monitor.data.apply(*snapshot);
-                    // A refresh with errors asks whether the daemon runs
-                    // (itself paced) and waits longer before the next, with
-                    // the same growing pauses as every retry.
-                    let delay = if self.monitor.data.errors.is_empty() {
-                        self.monitor.failures = 0;
-                        monitor::PERIOD_MS
+                    if let Some(rows) = rows {
+                        // The fleet read stands in for the sidebar's own: a
+                        // clean one is a clean sidebar round too.
+                        self.nav.pace.reset();
+                        self.take_fleet_rows(rows);
+                    }
+                    // A refresh that read a list (the fleet, the task's tree)
+                    // comes again at the sidebar's cadence; Details alone at
+                    // the Monitor's.
+                    let period = if fleet || tree {
+                        monitor::LIST_PERIOD_MS
                     } else {
-                        self.monitor.failures = self.monitor.failures.saturating_add(1);
-                        self.link_suspect(context);
-                        live::backoff_ms(self.monitor.failures).max(monitor::PERIOD_MS)
+                        monitor::PERIOD_MS
                     };
+                    let delay = self.monitor.pace.next(!failed, period);
+                    if failed {
+                        self.link_suspect(context);
+                    } else {
+                        self.link_answered();
+                    }
                     // The next read waits on its own worker: a timer message
                     // would render the whole window for nothing.
                     self.read_monitor(delay, context);
@@ -497,13 +514,14 @@ impl DesktopApp {
             .selected
             .clone()
             .filter(|_| shown && self.panel == Panel::Details);
-        // A tree read starts at least PERIOD_MS after the last one, however
-        // it is asked for (an event, the tab, a selection, Refresh), as the
-        // Agents page's scheduled reads do; a scheduled delay counts.
+        // A tree read starts at least LIST_PERIOD_MS after the last one,
+        // however it is asked for (an event, the tab, a selection,
+        // Refresh), as the Agents page's scheduled reads do; a scheduled
+        // delay counts.
         let now = crate::handoff::now_ms();
         let spacing_ms = match (&tree, self.monitor.tree_started_ms) {
             (Some(_), Some(started)) => {
-                u64::try_from(started.saturating_add(monitor::PERIOD_MS as i64) - now)
+                u64::try_from(started.saturating_add(monitor::LIST_PERIOD_MS as i64) - now)
                     .unwrap_or(0)
                     .saturating_sub(delay_ms)
             }
@@ -584,8 +602,9 @@ impl DesktopApp {
                 if cancelled() {
                     return None;
                 }
-                if delay_ms > 0 && !woke {
-                    let wait = monitor::QUIET_PERIOD_MS.saturating_sub(delay_ms);
+                let wait = monitor::QUIET_PERIOD_MS.saturating_sub(delay_ms);
+                // A delay that already covers the quiet period reads now.
+                if delay_ms > 0 && !woke && wait > 0 {
                     // Wait from the tip read before the last read: an event
                     // committed since wakes it at once. Without a cursor, or
                     // when the wait fails, the quiet period passes instead.
@@ -942,6 +961,22 @@ impl DesktopApp {
                 page_ui::error_line(
                     palette,
                     format!("Some reads failed: {}", data.errors.join("; ")),
+                ),
+            ));
+        }
+        if !data.row_notes.is_empty() {
+            items.push(KeyedView::new(
+                "row-notes",
+                page_ui::error_line(
+                    palette,
+                    format!(
+                        "Some rows were not read whole: {}",
+                        data.row_notes
+                            .iter()
+                            .map(|note| note.text.as_str())
+                            .collect::<Vec<_>>()
+                            .join("; ")
+                    ),
                 ),
             ));
         }

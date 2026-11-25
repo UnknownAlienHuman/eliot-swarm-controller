@@ -90,10 +90,14 @@ pub async fn list_projects(data_dir: &Path) -> Result<Vec<ProjectRegistrationVie
     let value =
         eliot_daemon::client_call(data_dir, "project.list", Value::Object(Default::default()))
             .await?;
-    let registrations: Vec<ProjectRegistrationView> = serde_json::from_value(value)
-        .map_err(|_| Error::new("unknown", "project.list returned a malformed result"))?;
+    let registrations: Vec<ProjectRegistrationView> =
+        serde_json::from_value(value).map_err(|error| {
+            crate::client::invalid_reply("project.list", &format!("its fields: {error}"))
+        })?;
     for registration in &registrations {
-        registration.validate()?;
+        registration
+            .validate()
+            .map_err(|error| crate::client::invalid_reply("project.list", &error.message))?;
     }
     Ok(registrations)
 }
@@ -114,10 +118,7 @@ pub async fn managed_workspaces(
             after: after.clone(),
             limit: 1_000,
         };
-        params.validate()?;
-        let page: WorkspaceListResponse =
-            eliot_daemon::client_call_typed(data_dir, "workspace.list", &params).await?;
-        params.validate_response(&page)?;
+        let page: WorkspaceListResponse = crate::client::call(data_dir, &params).await?;
         total = page.total;
         let done = page.workspaces.is_empty() || !page.truncated;
         after = page.next.clone();
@@ -161,10 +162,7 @@ pub async fn fleet_totals(data_dir: &Path) -> Result<FleetTotals> {
     }
     let agents = count(None).await?;
     let request = DaemonStatusRequest::default();
-    request.validate()?;
-    let status: DaemonStatusResponse =
-        eliot_daemon::client_call_typed(data_dir, "daemon.status", &request).await?;
-    request.validate_response(&status)?;
+    let status: DaemonStatusResponse = crate::client::call(data_dir, &request).await?;
     Ok(FleetTotals {
         running,
         agents,
@@ -185,10 +183,7 @@ pub enum RuleWorker {
 pub async fn rule_worker(data_dir: &Path) -> Result<RuleWorker> {
     use eliot_core::api::WorkerTaskHealth;
     let request = DaemonStatusRequest::default();
-    request.validate()?;
-    let status: DaemonStatusResponse =
-        eliot_daemon::client_call_typed(data_dir, "daemon.status", &request).await?;
-    request.validate_response(&status)?;
+    let status: DaemonStatusResponse = crate::client::call(data_dir, &request).await?;
     Ok(status
         .automation_tasks
         .iter()
@@ -208,10 +203,7 @@ pub async fn rule_worker(data_dir: &Path) -> Result<RuleWorker> {
 /// (advisory: admission evaluates again).
 pub async fn routing_preview(data_dir: &Path, role: Option<String>) -> Result<RoutingDecision> {
     let params = RoutingPreviewRequest { role };
-    params.validate()?;
-    let reply: RoutingPreviewResponse =
-        eliot_daemon::client_call_typed(data_dir, "routing.preview", &params).await?;
-    params.validate_response(&reply)?;
+    let reply: RoutingPreviewResponse = crate::client::call(data_dir, &params).await?;
     Ok(reply.decision)
 }
 
@@ -245,9 +237,7 @@ pub async fn models_catalog_watch(
     revision: Option<String>,
 ) -> Result<ModelsCatalogWatchResponse> {
     let params = ModelsCatalogWatchRequest { revision };
-    params.validate()?;
-    let reply = eliot_daemon::client_call_typed(data_dir, "models.catalog.watch", &params).await?;
-    params.validate_response(&reply)?;
+    let reply = crate::client::call(data_dir, &params).await?;
     Ok(reply)
 }
 
@@ -260,10 +250,7 @@ async fn read_models_catalog(data_dir: &Path) -> Result<ModelsCatalogResponse> {
     let mut whole: Option<ModelsCatalogResponse> = None;
     let mut next = None;
     for _ in 0..CATALOG_MAX_PAGES {
-        request.validate()?;
-        let page: ModelsCatalogResponse =
-            eliot_daemon::client_call_typed(data_dir, "models.catalog", &request).await?;
-        request.validate_response(&page)?;
+        let page: ModelsCatalogResponse = crate::client::call(data_dir, &request).await?;
         next = page.next.clone();
         match whole.as_mut() {
             Some(whole) => {
@@ -298,20 +285,15 @@ pub async fn harness_quota(data_dir: &Path, harness: &str) -> Result<HarnessQuot
         harness: harness.to_owned(),
         profile: None,
     };
-    params.validate()?;
-    let reply: HarnessQuotaResponse =
-        eliot_daemon::client_call_typed(data_dir, "harness.quota", &params).await?;
-    params.validate_response(&reply)?;
+    let reply: HarnessQuotaResponse = crate::client::call(data_dir, &params).await?;
     Ok(reply)
 }
 
 /// The provider holds (`provider.holds`, owner-only), first page.
 pub async fn provider_holds(data_dir: &Path) -> Result<eliot_core::api::ProviderHoldsResponse> {
     let params = eliot_core::api::ProviderHoldsRequest::default();
-    params.validate()?;
     let reply: eliot_core::api::ProviderHoldsResponse =
-        eliot_daemon::client_call_typed(data_dir, "provider.holds", &params).await?;
-    params.validate_response(&reply)?;
+        crate::client::call(data_dir, &params).await?;
     Ok(reply)
 }
 
@@ -331,20 +313,15 @@ pub async fn provider_clear_hold(
         corrective_evidence: evidence,
         expected_probe_command: None,
     };
-    params.validate()?;
     let reply: eliot_core::api::ProviderClearHoldResponse =
-        eliot_daemon::client_call_typed(data_dir, "provider.clear_hold", &params).await?;
-    params.validate_response(&reply)?;
+        crate::client::call(data_dir, &params).await?;
     Ok(reply)
 }
 
 /// Sanitized configured-profile summaries for the launch picker.
 pub async fn list_profiles(data_dir: &Path) -> Result<ProfileListResponse> {
     let params = ProfileListRequest {};
-    params.validate()?;
-    let reply: ProfileListResponse =
-        eliot_daemon::client_call_typed(data_dir, "profile.list", &params).await?;
-    params.validate_response(&reply)?;
+    let reply: ProfileListResponse = crate::client::call(data_dir, &params).await?;
     Ok(reply)
 }
 
@@ -363,10 +340,7 @@ pub async fn list_rules(
             after: after.clone(),
             limit: 200,
         };
-        params.validate()?;
-        let reply: RuleListResponse =
-            eliot_daemon::client_call_typed(data_dir, "rule.list", &params).await?;
-        params.validate_response(&reply)?;
+        let reply: RuleListResponse = crate::client::call(data_dir, &params).await?;
         if reply.rules.is_empty() {
             return Ok((rules, false));
         }
@@ -384,10 +358,7 @@ pub async fn list_scripts(data_dir: &Path) -> Result<ScriptListResponse> {
     let mut params = ScriptListRequest::default();
     let mut roots: Vec<eliot_core::api::ScriptRootView> = Vec::new();
     loop {
-        params.validate()?;
-        let reply: ScriptListResponse =
-            eliot_daemon::client_call_typed(data_dir, "script.list", &params).await?;
-        params.validate_response(&reply)?;
+        let reply: ScriptListResponse = crate::client::call(data_dir, &params).await?;
         for root in reply.roots {
             if let Some(existing) = roots.iter_mut().find(|r| r.project == root.project) {
                 existing.entries.extend(root.entries);
@@ -414,10 +385,7 @@ pub async fn read_script(
     path: String,
 ) -> Result<ScriptReadResponse> {
     let params = ScriptReadRequest { project, path };
-    params.validate()?;
-    let reply: ScriptReadResponse =
-        eliot_daemon::client_call_typed(data_dir, "script.read", &params).await?;
-    params.validate_response(&reply)?;
+    let reply: ScriptReadResponse = crate::client::call(data_dir, &params).await?;
     Ok(reply)
 }
 
@@ -437,10 +405,7 @@ pub async fn save_script(
         content,
         dry_run,
     };
-    params.validate()?;
-    let reply: ScriptSaveResponse =
-        eliot_daemon::client_call_typed(data_dir, "script.save", &params).await?;
-    params.validate_response(&reply)?;
+    let reply: ScriptSaveResponse = crate::client::call(data_dir, &params).await?;
     Ok(reply)
 }
 
@@ -456,9 +421,7 @@ pub async fn run_timer(
         Some(project) => request.in_project(project),
         None => request,
     };
-    request.validate()?;
-    let reply: Command = eliot_daemon::client_call_typed(data_dir, "timer.run", &request).await?;
-    request.validate_response(&reply)?;
+    let reply: Command = crate::client::call(data_dir, &request).await?;
     Ok(reply)
 }
 
@@ -469,9 +432,7 @@ pub async fn read_rule_file(
     path: String,
 ) -> Result<eliot_core::api::RuleReadResponse> {
     let params = eliot_core::api::RuleReadRequest { project, path };
-    params.validate()?;
-    let reply = eliot_daemon::client_call_typed(data_dir, "rule.read", &params).await?;
-    params.validate_response(&reply)?;
+    let reply = crate::client::call(data_dir, &params).await?;
     Ok(reply)
 }
 
@@ -490,9 +451,7 @@ pub async fn save_rule_file(
         expected_revision,
         content,
     };
-    params.validate()?;
-    let reply = eliot_daemon::client_call_typed(data_dir, "rule.save", &params).await?;
-    params.validate_response(&reply)?;
+    let reply = crate::client::call(data_dir, &params).await?;
     Ok(reply)
 }
 
@@ -508,9 +467,7 @@ pub async fn delete_rule_file(
         path,
         expected_revision,
     };
-    params.validate()?;
-    let reply = eliot_daemon::client_call_typed(data_dir, "rule.delete", &params).await?;
-    params.validate_response(&reply)?;
+    let reply = crate::client::call(data_dir, &params).await?;
     Ok(reply)
 }
 
@@ -526,7 +483,9 @@ pub async fn rule_status(
     }
     params.validate()?;
     let reply = eliot_daemon::client_call_typed(data_dir, "rule.get", &params).await?;
-    params.validate_show_response(&reply)?;
+    params
+        .validate_show_response(&reply)
+        .map_err(|error| crate::client::invalid_reply("rule.get", &error.message))?;
     Ok(reply)
 }
 
@@ -537,8 +496,6 @@ pub async fn who(data_dir: &Path, project: String) -> Result<eliot_core::api::Wh
         project: Some(project),
         history: None,
     };
-    params.validate()?;
-    let reply = eliot_daemon::client_call_typed(data_dir, "who", &params).await?;
-    params.validate_response(&reply)?;
+    let reply = crate::client::call(data_dir, &params).await?;
     Ok(reply)
 }

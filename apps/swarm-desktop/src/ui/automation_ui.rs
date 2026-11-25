@@ -102,6 +102,9 @@ pub(super) struct AutomationState {
     pub(super) form: Option<AssignmentForm>,
     /// The last Run now per timer (its run key).
     pub(super) runs: HashMap<TimerKey, RunLine>,
+    /// Run now readbacks in a row that could not read the result: the next
+    /// waits longer.
+    readback_pace: live::Pace,
     /// The Scripts tab is shown.
     pub(super) scripts_tab: bool,
     /// The row whose editor shows (its card key).
@@ -978,32 +981,48 @@ impl DesktopApp {
                 }
             }
             AutomationMsg::RunReadback(key) => self.read_timer_run(key, false, context),
-            AutomationMsg::RunFinished(key, outcome) => match outcome {
-                RunOutcome::NoPendingRun => {
-                    self.automation.runs.remove(&key);
-                }
-                RunOutcome::Complete(line) => {
-                    self.automation.runs.insert(key, line);
-                    self.load_rules(context);
-                }
-                RunOutcome::Retry(line) => {
-                    self.automation.runs.insert(key, line);
-                }
-                RunOutcome::Readback(text) => {
-                    self.automation.runs.insert(
-                        key.clone(),
-                        RunLine {
-                            text,
-                            busy: true,
-                            error: true,
-                        },
-                    );
-                    let _task = context.spawn_background(move |cancel| {
-                        let _ = feed::backoff(3_000, &|| cancel.is_cancelled());
-                        Message::Automation(AutomationMsg::RunReadback(key))
-                    });
-                }
-            },
+            AutomationMsg::RunFinished(key, outcome) => {
+                let read = !matches!(outcome, RunOutcome::Readback(_));
+                let wait = self.automation.readback_pace.next(read, RUN_READBACK_MS);
+                self.run_finished(key, outcome, wait, context);
+            }
+        }
+    }
+
+    /// A Run now's outcome; a readback that failed reads again `wait` ms
+    /// later.
+    fn run_finished(
+        &mut self,
+        key: TimerKey,
+        outcome: RunOutcome,
+        wait: u64,
+        context: &ComponentContext<Self>,
+    ) {
+        match outcome {
+            RunOutcome::NoPendingRun => {
+                self.automation.runs.remove(&key);
+            }
+            RunOutcome::Complete(line) => {
+                self.automation.runs.insert(key, line);
+                self.load_rules(context);
+            }
+            RunOutcome::Retry(line) => {
+                self.automation.runs.insert(key, line);
+            }
+            RunOutcome::Readback(text) => {
+                self.automation.runs.insert(
+                    key.clone(),
+                    RunLine {
+                        text,
+                        busy: true,
+                        error: true,
+                    },
+                );
+                let _task = context.spawn_background(move |cancel| {
+                    let _ = feed::backoff(wait, &|| cancel.is_cancelled());
+                    Message::Automation(AutomationMsg::RunReadback(key))
+                });
+            }
         }
     }
 
@@ -1120,7 +1139,9 @@ fn timer_run_action(
     };
     let parent = if retained {
         match client::block_on(client::read_command(data_dir, &id)).and_then(|parent| {
-            request.validate_response(&parent)?;
+            request
+                .validate_response(&parent)
+                .map_err(|error| client::invalid_reply("timer.run", &error.message))?;
             Ok(parent)
         }) {
             Ok(parent) => Some(parent),
@@ -1315,6 +1336,9 @@ pub(super) const EVENTS: [(&str, &str); 7] = [
 ];
 
 /// The When choices after the named events.
+/// A Run now whose result was not read reads it again after this long
+/// (longer after repeated failures, see [`live::Pace`]).
+const RUN_READBACK_MS: u64 = 3_000;
 const OTHER_EVENT: &str = "Another event…";
 const EVERY: &str = "Every…";
 const CRON: &str = "On a schedule (cron)…";

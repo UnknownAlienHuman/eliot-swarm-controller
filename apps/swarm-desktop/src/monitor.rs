@@ -43,6 +43,10 @@ use crate::client::{self, MAX_CONCURRENT_READS};
 
 /// Refresh period while the monitor is open.
 pub const PERIOD_MS: u64 = 2_000;
+/// A refresh that reads a list (the fleet, the task's tree) starts at least
+/// this long after the last one: the sidebar's cadence, so the one list
+/// read that feeds both is never more frequent than the sidebar's own.
+pub const LIST_PERIOD_MS: u64 = 10_000;
 /// Without an event, the fleet (its CPU and memory samples) is read again
 /// after this long; an event reads it at once (no sooner than
 /// [`PERIOD_MS`] after the last read).
@@ -1090,6 +1094,32 @@ pub struct MonitorSnapshot {
     pub fleet: bool,
     /// The event cursor the next wait starts from.
     pub event_cursor: Option<i64>,
+    /// Fleet rows shown without their observation or left out, and why
+    /// (the other rows still update).
+    pub row_notes: Vec<client::RowNote>,
+}
+
+impl MonitorSnapshot {
+    /// Whether any read of this refresh failed: the fleet and its counts,
+    /// the stopped rows, the attention reports, the task's tree, the
+    /// Details (and their usage, diagnosis and mail when read this time)
+    /// or a loss diagnosis.
+    pub fn failed(&self) -> bool {
+        self.groups.iter().any(|(_, page)| page.is_err())
+            || self.counts.iter().any(|(_, count)| count.is_err())
+            || matches!(self.stopped, Some(Err(_)))
+            || matches!(self.attention, Some(Err(_)))
+            || matches!(self.tree, Some((_, Err(_))))
+            || self.losses.iter().any(|(_, summary)| summary.is_err())
+            || match &self.detail {
+                Some(Err(_)) => true,
+                Some(Ok(read)) => {
+                    read.fresh
+                        && (read.usage.is_err() || read.diagnosis.is_err() || read.mail.is_err())
+                }
+                None => false,
+            }
+    }
 }
 
 /// One monitor section: its top-level rows (each with its nested
@@ -1318,10 +1348,16 @@ pub struct Monitor {
     /// A live row left the live states: read the stopped rows next, so a
     /// just-stopped Agent does not vanish until the periodic read.
     pub stopped_due: bool,
+    /// The stopped rows were read at least once (a fleet with none reads
+    /// them on the cadence, not on every refresh).
+    pub stopped_read: bool,
     pub detail: Option<CachedDetail>,
     pub detail_errors: Vec<String>,
     pub read_at_ms: Option<i64>,
     pub errors: Vec<String>,
+    /// The last fleet read's rows shown without their observation or left
+    /// out, and why: said, not a failed read.
+    pub row_notes: Vec<client::RowNote>,
     pub refreshes: u64,
     /// The Agents tab's tree of the open task.
     pub tree: TreeRead,
@@ -1368,7 +1404,7 @@ impl TreeRead {
 impl Monitor {
     /// Whether the next refresh reads the stopped rows.
     pub fn wants_stopped(&self) -> bool {
-        self.stopped_due || self.refreshes.is_multiple_of(STOPPED_EVERY) || self.stopped.is_empty()
+        self.stopped_due || self.refreshes.is_multiple_of(STOPPED_EVERY) || !self.stopped_read
     }
 
     /// The open attention report of a row's current generation.
@@ -1544,6 +1580,7 @@ impl Monitor {
             Some(Ok(page)) => {
                 self.stopped = page.agents.iter().map(MonitorRow::from_list).collect();
                 self.stopped_due = false;
+                self.stopped_read = true;
             }
             Some(Err(error)) => self.errors.push(format!("stopped: {error}")),
             None => {}
@@ -1554,6 +1591,9 @@ impl Monitor {
             None => {}
         }
         self.take_fleet(&snapshot.groups, &snapshot.counts, snapshot.read_at_ms);
+        if snapshot.groups.iter().all(|(_, page)| page.is_ok()) {
+            self.row_notes = snapshot.row_notes;
+        }
         if let Some(detail) = snapshot.detail {
             self.take_detail(detail, snapshot.read_at_ms);
         }
@@ -1712,7 +1752,7 @@ fn id_order(a: &str, b: &str) -> std::cmp::Ordering {
 type ReadFuture<'a> = Pin<Box<dyn Future<Output = Read> + 'a>>;
 
 enum Read {
-    Fleet(Result<AgentListResponse, String>),
+    Fleet(Result<(AgentListResponse, Vec<client::RowNote>), String>),
     Stopped(Result<AgentListResponse, String>),
     Attention(Result<AttentionRead, String>),
     Detail(Box<Result<DetailRead, String>>),
@@ -1794,18 +1834,17 @@ fn fleet_request() -> AgentListRequest {
     }
 }
 
-/// Adapt one validated fleet page into the existing model input. Totals keep
-/// row/byte truncation visible even when an entire state's rows are outside
-/// the page. Stopped rows and attention retain their independent cadence.
-fn take_fleet(snapshot: &mut MonitorSnapshot, page: Result<AgentListResponse, String>) {
-    let page = page.and_then(|page| {
-        fleet_request()
-            .validate_response(&page)
-            .map_err(|error| error.to_string())?;
-        Ok(page)
-    });
+/// Adapt one fleet page, checked row by row ([`client::list_agents_by_row`]),
+/// into the existing model input. Totals keep row/byte truncation visible
+/// even when an entire state's rows are outside the page. Stopped rows and
+/// attention retain their independent cadence.
+fn take_fleet(
+    snapshot: &mut MonitorSnapshot,
+    page: Result<(AgentListResponse, Vec<client::RowNote>), String>,
+) {
     match page {
-        Ok(page) => {
+        Ok((page, notes)) => {
+            snapshot.row_notes = notes;
             let totals = page.state_totals.as_ref().expect("validated state totals");
             for state in ROW_STATES {
                 let agents: Vec<_> = page
@@ -1917,7 +1956,7 @@ pub async fn refresh(
                 return Read::Cancelled;
             }
             Read::Fleet(
-                client::list_agents(data_dir, &fleet_request())
+                client::list_agents_by_row(data_dir, &fleet_request())
                     .await
                     .map_err(|error| error.to_string()),
             )
@@ -2014,6 +2053,7 @@ pub async fn refresh(
         read_at_ms,
         fleet,
         event_cursor: None,
+        row_notes: Vec::new(),
     };
     if cancelled() || results.iter().any(|read| matches!(read, Read::Cancelled)) {
         return None;
@@ -2033,6 +2073,55 @@ pub async fn refresh(
         .groups
         .sort_by_key(|(state, _)| attention_rank(*state));
     Some(snapshot)
+}
+
+/// What one fleet read tells the sidebar: its rows (and the stopped rows
+/// read with it), the rows it left out, and the live states whose page it
+/// read whole (a listed Agent of such a state that is not among the rows
+/// has left it).
+#[derive(Clone, Debug)]
+pub struct SidebarRows {
+    pub rows: Vec<crate::nav::UiAgent>,
+    pub left_out: HashSet<String>,
+    pub whole: Vec<AgentState>,
+}
+
+/// The fleet read's rows for the sidebar, when every part of it was read.
+pub fn sidebar_rows(snapshot: &MonitorSnapshot) -> Option<SidebarRows> {
+    if !snapshot.fleet || snapshot.groups.iter().any(|(_, page)| page.is_err()) {
+        return None;
+    }
+    let stopped = match &snapshot.stopped {
+        Some(Ok(page)) => page.agents.as_slice(),
+        _ => &[],
+    };
+    Some(SidebarRows {
+        rows: snapshot
+            .groups
+            .iter()
+            .filter_map(|(_, page)| page.as_ref().ok())
+            .flat_map(|page| page.agents.iter())
+            .chain(stopped)
+            .map(|row| {
+                let mut agent = crate::nav::UiAgent::from_summary(&row.summary);
+                agent.chat = row.summary.chat;
+                agent.archived = row.summary.archived;
+                agent
+            })
+            .collect(),
+        left_out: snapshot
+            .row_notes
+            .iter()
+            .filter(|note| !note.kept)
+            .map(|note| note.id.clone())
+            .collect(),
+        whole: snapshot
+            .groups
+            .iter()
+            .filter(|(_, page)| page.as_ref().is_ok_and(|page| !page.truncated))
+            .map(|(state, _)| *state)
+            .collect(),
+    })
 }
 
 /// How old cached panel data must be before a panel says when it was

@@ -1298,11 +1298,15 @@ activity. No totals outside the caller's scope are exposed. Without `states`,
 `state_totals` is absent. Rows and counts are captured under the same Store
 lock; joined observations retain the generation checks below.
 
-The desktop sidebar requests `order: "recent"` and refreshes its head on every poll:
-the live and attention rows (`busy`, `starting`, `waiting`, plus the needs-attention
-states `waiting`, `failed`, `lost`, `unknown`) arrive on their own state-filtered page,
-and the first recent page is re-read and merged into the loaded history even after
-`Show more`. Older pages append, deduplicated by id, so a launch while the desktop is
+The desktop sidebar requests `order: "recent"` and makes one `agent.list` read per
+poll: normally the first recent page with every state named (so `state_totals`
+comes back), re-read and merged into the loaded history even after `Show more`.
+When an attention state's total moved and not all of them are on that page, the
+next poll reads the live and attention rows (`busy`, `starting`, `waiting`, plus
+the needs-attention states `waiting`, `failed`, `lost`, `unknown`) on their own
+state-filtered page instead; when the list's total moved, it reads the archived
+counts. While the Agents page shows, its fleet read (at most one per ten seconds)
+feeds the sidebar's rows instead of a second read. Older pages append, deduplicated by id, so a launch while the desktop is
 open appears without a manual refresh. The open Agent stays in place in its project
 section, never folded under (nor counted in) `Show N older`; one opened from a search
 beyond the loaded pages joins them, and the open row is kept when it ages out of the

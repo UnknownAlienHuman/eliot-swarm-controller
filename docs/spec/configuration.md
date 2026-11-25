@@ -166,21 +166,32 @@ endpoint) as `daemon_already_running` waits for the daemon that holds the root.
 An Owner `daemon.shutdown` (drain or force) writes the private `owner-stop` marker
 while the daemon still serves; the next daemon start clears it after taking the
 lock. After its first connection, a desktop read that fails asks `daemon.status`
-(repeated failing reads ask with growing pauses). When nothing answers and the
+(repeated failing reads ask with growing pauses). Every desktop retry and poll
+waits through one pace: the pause after a failure grows from 500 ms to 15 s, never
+below the loop's own period, and a success starts over; the sidebar's refresh also
+pauses while the window is minimized. When nothing answers and the
 marker is present, the desktop starts nothing: the main area says Swarm was stopped
 and offers Start, and the list's cadence asks `daemon.status` so a daemon started
 elsewhere is reconnected. When nothing answers and there is no marker, the daemon
 failed: the desktop runs its startup path again (it starts a daemon only when none
 is reachable). A restart is tried again only for `unavailable`, `platform_io`,
 `data_dir_unavailable` and `daemon_already_running`, at most five attempts with 1,
-2, 4 and 8 s pauses; a notice above the composer counts them and gives the previous
+2, 4 and 8 s pauses. A restarted daemon that stops again within 60 s of answering
+continues the same chain (the next attempt, its pause, the cap); only one that stayed
+up 60 s starts over at attempt 1; a notice above the composer counts them and gives the previous
 attempt's reason, and the polls and the open conversation wait and read again once
 the daemon answers. Closing the window cancels a start before it starts a daemon.
 Any other failure, the last attempt, or a failed first start shows the daemon's own
 reason and the choices in this order: Retry on the same data directory (the
-default), Repair settings, Open log, Open the data folder, Use another data
-directory (an existing private Swarm root) and, last, a new empty data directory
-after a confirmation. A chosen or new directory is started first and written to the
+default; named Start Swarm once the restarts gave up), Repair settings, Open log,
+Open the data folder, Use another data directory (an existing private Swarm root)
+and, last, a new empty data directory after a confirmation. While that screen
+shows after the restarts gave up, or after a start that found no daemon answering,
+the list's cadence asks
+`daemon.status` (never starting one) and reconnects to a daemon started elsewhere.
+After three failed reconnects in a row, the open conversation's live line says
+Swarm is not answering and offers Start Swarm, the same startup path on the same
+data directory; the feed keeps retrying meanwhile. A chosen or new directory is started first and written to the
 selected-root pointer only once its daemon answers. The desktop does not validate
 the daemon's configuration itself. `swarm-desktop --workspace PATH` opens and registers that checkout;
 without the flag it registers nothing: the folder it was started from never becomes

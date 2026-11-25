@@ -133,12 +133,9 @@ impl DesktopApp {
                 self.chat.live = LiveStatus::Stale(reason);
                 self.start_snapshot(context);
             }
-            Next::Backoff {
-                delay_ms,
-                attempt,
-                reason,
-            } => {
-                self.chat.failures = attempt;
+            Next::Backoff { reason } => {
+                let delay_ms = self.chat.pace.fail(0);
+                let attempt = self.chat.pace.failures();
                 // The daemon is being started again: its reply resumes the
                 // feed, and the notice counts its attempts.
                 if self.daemon_down() {
@@ -373,7 +370,7 @@ impl DesktopApp {
         self.chat.convo = Some(Conversation::new(&agent.id));
         self.chat.detail = None;
         self.chat.depth = Depth::default();
-        self.chat.failures = 0;
+        self.chat.pace.reset();
         self.chat.items = Rc::new(Vec::new());
         self.chat.live = LiveStatus::Loading;
         self.chat.confirm_force = None;

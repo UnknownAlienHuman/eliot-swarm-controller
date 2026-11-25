@@ -851,6 +851,9 @@ pub struct Conversation {
     local_notes: HashMap<String, String>,
     /// A local input that will not start: shown instead of its note.
     local_failures: HashMap<String, InputFailure>,
+    /// Why the last check of the waiting inputs could not read their
+    /// commands, shown under their notes until a check reads them.
+    wait_error: Option<String>,
     applied_seq: i64,
     coverage: Coverage,
     /// How each generation in the result window started.
@@ -1324,6 +1327,11 @@ impl Conversation {
         }
     }
 
+    /// The waiting inputs' last check failed with `error` (or read them).
+    pub fn set_wait_error(&mut self, error: Option<String>) {
+        self.wait_error = error;
+    }
+
     /// Drop a local input that was never admitted (a definite refusal).
     pub fn forget_local(&mut self, command: &str) {
         self.local.retain(|known| known != command);
@@ -1513,7 +1521,10 @@ impl Conversation {
                     PartKind::Working,
                     note.clone(),
                     note.clone(),
-                    Vec::new(),
+                    self.wait_error
+                        .iter()
+                        .map(|error| format!("Why it waits was not read: {error}"))
+                        .collect(),
                 ));
             }
             let revision = parts
