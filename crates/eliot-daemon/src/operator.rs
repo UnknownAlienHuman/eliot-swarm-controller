@@ -242,14 +242,14 @@ pub fn validate_stand_profiles(source: &[u8]) -> Result<()> {
     let format_error = || {
         Error::new(
             "invalid",
-            "stand profile file must contain a TOML [profiles] table and at most a [routing] table",
+            "stand profile file must contain a TOML [profiles] table and at most [proxies] and [routing] tables",
         )
     };
     let text = std::str::from_utf8(source).map_err(|_| format_error())?;
     let table = text.parse::<toml::Table>().map_err(|_| format_error())?;
-    let only_known = table
-        .iter()
-        .all(|(name, value)| matches!(name.as_str(), "profiles" | "routing") && value.is_table());
+    let only_known = table.iter().all(|(name, value)| {
+        matches!(name.as_str(), "profiles" | "proxies" | "routing") && value.is_table()
+    });
     if !only_known || !table.contains_key("profiles") {
         return Err(format_error());
     }
@@ -268,7 +268,15 @@ pub fn select_stand_profiles(source: &[u8], names: &[String]) -> Result<Vec<u8>>
     let Some(toml::Value::Table(mut profiles)) = settings.remove("profiles") else {
         return Err(invalid());
     };
+    // Adopted proxy tables carry only endpoints and the client-key environment
+    // name, never secret values, so referenced tables travel verbatim.
+    let proxies = match settings.remove("proxies") {
+        None => toml::Table::new(),
+        Some(toml::Value::Table(proxies)) => proxies,
+        Some(_) => return Err(invalid()),
+    };
     let mut selected = toml::Table::new();
+    let mut selected_proxies = toml::Table::new();
     for name in names {
         if selected.contains_key(name) {
             return Err(Error::new(
@@ -282,9 +290,24 @@ pub fn select_stand_profiles(source: &[u8], names: &[String]) -> Result<Vec<u8>>
                 format!("settings profile {name:?} was not found"),
             )
         })?;
+        if let Some(proxy) = profile.get("proxy").and_then(toml::Value::as_str)
+            && !selected_proxies.contains_key(proxy)
+        {
+            let entry = proxies.get(proxy).ok_or_else(|| {
+                Error::new(
+                    "not_found",
+                    format!("settings proxy {proxy:?} was not found"),
+                )
+            })?;
+            selected_proxies.insert(proxy.to_owned(), entry.clone());
+        }
         selected.insert(name.clone(), profile);
     }
-    let output = toml::Table::from_iter([("profiles".to_owned(), toml::Value::Table(selected))]);
+    let mut output =
+        toml::Table::from_iter([("profiles".to_owned(), toml::Value::Table(selected))]);
+    if !selected_proxies.is_empty() {
+        output.insert("proxies".to_owned(), toml::Value::Table(selected_proxies));
+    }
     toml::to_string(&output)
         .map(String::into_bytes)
         .map_err(|_| invalid())
