@@ -1325,6 +1325,9 @@ pub struct Monitor {
     /// A live row left the live states: read the stopped rows next, so a
     /// just-stopped Agent does not vanish until the periodic read.
     pub stopped_due: bool,
+    /// The stopped rows were read at least once (a fleet with none reads
+    /// them on the cadence, not on every refresh).
+    pub stopped_read: bool,
     pub detail: Option<CachedDetail>,
     pub detail_errors: Vec<String>,
     pub read_at_ms: Option<i64>,
@@ -1378,7 +1381,7 @@ impl TreeRead {
 impl Monitor {
     /// Whether the next refresh reads the stopped rows.
     pub fn wants_stopped(&self) -> bool {
-        self.stopped_due || self.refreshes.is_multiple_of(STOPPED_EVERY) || self.stopped.is_empty()
+        self.stopped_due || self.refreshes.is_multiple_of(STOPPED_EVERY) || !self.stopped_read
     }
 
     /// The open attention report of a row's current generation.
@@ -1554,6 +1557,7 @@ impl Monitor {
             Some(Ok(page)) => {
                 self.stopped = page.agents.iter().map(MonitorRow::from_list).collect();
                 self.stopped_due = false;
+                self.stopped_read = true;
             }
             Some(Err(error)) => self.errors.push(format!("stopped: {error}")),
             None => {}
