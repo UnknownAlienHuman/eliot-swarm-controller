@@ -570,24 +570,6 @@ fn submit_head_tx(
             "command id is already used by a completion digest",
         ));
     }
-    let reserved_switch_child: Option<(String, String)> = tx
-        .query_row(
-            "SELECT switch_command,kind FROM switch_child_id_reservations WHERE id=?1",
-            [&request.id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .optional()
-        .map_err(sql_error)?;
-    if let Some((switch_id, kind)) = reserved_switch_child
-        && !(linked_switch_launch
-            && kind == "launch"
-            && switch::switch_child_id_reserved(tx, &request.id, "launch", &switch_id)?)
-    {
-        return Err(Error::new(
-            "id_conflict",
-            "command id is reserved by a switch child",
-        ));
-    }
     if matches!(request.verb.as_str(), "launch" | "attach")
         && request
             .args

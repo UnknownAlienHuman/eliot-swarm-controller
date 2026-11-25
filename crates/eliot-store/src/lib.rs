@@ -384,6 +384,15 @@ fn decode_owner_rules_delivery(value: &str) -> Result<StoredOwnerRulesDelivery> 
 
 fn sql_error(error: rusqlite::Error) -> Error {
     if matches!(
+        &error,
+        rusqlite::Error::SqliteFailure(_, Some(message))
+            if message.as_str() == "switch_child_id_reserved"
+    ) {
+        Error::new(
+            "id_conflict",
+            "mutation id is reserved by an unsettled switch",
+        )
+    } else if matches!(
         error.sqlite_error_code(),
         Some(rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked)
     ) {

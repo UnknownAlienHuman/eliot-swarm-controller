@@ -1579,6 +1579,42 @@ impl Store {
                 });
             }
             let value = stored_result(&command.outcome)?;
+            if !switch_child_id_reserved(&tx, &value.launch_command, "launch", id)?
+                || !switch_child_id_reserved(&tx, &value.handoff_command, "handoff", id)?
+            {
+                let error = Error::new(
+                    "id_conflict",
+                    "legacy switch child id was already bound before reservation recovery",
+                );
+                let mut rejected = value;
+                rejected.error = Some(error.code.clone());
+                rejected.error_reason = Some(error.message.to_string());
+                rejected.state = CommandState::Rejected;
+                rejected.next_action.clear();
+                let outcome = serde_json::to_value(&rejected)
+                    .map_err(|_| Error::new("internal", "cannot encode switch result"))?;
+                let settled = Self::settle_command_tx(
+                    &tx,
+                    id,
+                    CommandState::Rejected,
+                    Some(outcome),
+                    now,
+                    false,
+                )?;
+                Self::settle_automatic_handoff_attempt_tx(
+                    &tx,
+                    id,
+                    CommandState::Rejected,
+                    now,
+                )?;
+                recovery::release_rejected_switch_fence_tx(&tx, &command, now)?;
+                events.extend(settled.events);
+                commit_transaction(tx, &self.write_faulted)?;
+                return Ok(Change {
+                    value: None,
+                    events,
+                });
+            }
             let RetainedSwitch {
                 request,
                 source_stop_command: _,
@@ -2060,6 +2096,7 @@ impl Store {
             super::work_truth::require_no_checkpoint_intent_tx(&tx, &agent)?;
             // Roll back the launch, worktree reservation and capacity together
             // on any refusal before commit. Git creation follows admission.
+            consume_switch_child_id(&tx, id, &request.id, "launch")?;
             let admission = admission::submit_switch_launch_tx(
                 &tx,
                 "owner",
@@ -2070,9 +2107,6 @@ impl Store {
                 self.hierarchy_limits,
                 self.capacity_policy.as_deref(),
             )?;
-            if admission.is_new {
-                consume_switch_child_id(&tx, id, &admission.command.id, "launch")?;
-            }
             let target_num =
                 parse_agent_id(admission.command.target.as_deref().ok_or_else(|| {
                     Error::new("source_integrity", "switch launch Agent is missing")
@@ -2235,7 +2269,6 @@ impl Store {
                         &destination.id,
                         destination.generation,
                     );
-                    consume_switch_child_id(&tx, id, &plan.handoff_command, "handoff")?;
                     let (source, _) =
                         source_tx(&tx, &request, self.hierarchy_limits, policy, true)?;
                     let manager = require_switch_project(&tx, &request, target_project.as_ref())?;
@@ -2303,6 +2336,7 @@ impl Store {
                     uncertain =
                         handoff::last_turn_uncertain(&tx, source_num, request.from_generation)?
                             || has_unknown_gate(&tx, source_num)?;
+                    consume_switch_child_id(&tx, id, &plan.handoff_command, "handoff")?;
                     let change = handoff::handoff_tx(
                         &tx,
                         "owner",
