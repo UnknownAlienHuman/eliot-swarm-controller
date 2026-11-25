@@ -178,7 +178,7 @@ pub(crate) fn build(
         facts.and_then(|facts| facts.task_ref.as_deref())
     {
         format!(
-            "\nRetained task instructions: private work-truth Git record {reference}:instructions.json."
+            "\nRetained task instructions: private work-truth Git record {reference}:instructions.json. For a task bound to your Agent generation, call task.list with your Agent and generation, then task.get with the retained task_command and section=manifest to find saved sections and coverage."
         )
     } else {
         String::new()
