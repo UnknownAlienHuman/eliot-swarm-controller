@@ -197,7 +197,8 @@ pub use monitor_views::{
     ObservationView, ProcessStatsView, StatsCoverage, WorkspaceObservation, WorkspaceView,
 };
 pub use mutations::{
-    CommandSubmitRequest, CommandSubmitResponse, DaemonShutdownRequest, DaemonShutdownResponse,
+    CommandSubmitRequest, CommandSubmitResponse, DaemonRestartStatusRequest,
+    DaemonRestartStatusResponse, DaemonShutdownRequest, DaemonShutdownResponse,
     MAX_UPDATE_DRAIN_SECS, ShutdownMode,
 };
 pub use native_pages::{

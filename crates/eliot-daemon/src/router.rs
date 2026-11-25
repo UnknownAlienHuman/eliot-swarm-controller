@@ -165,6 +165,7 @@ const MODE_DRAIN: u8 = 3;
 const MODE_FORCE: u8 = 4;
 const RESTART_LEASE: Duration = Duration::from_secs(120);
 const RESTART_DRAIN_GRACE: Duration = Duration::from_secs(60);
+const RESTART_WRITES_BUSY: &str = "an admitted mutation is still running";
 
 struct RestartLease {
     id: String,
@@ -185,6 +186,12 @@ impl RestartLease {
             lossless: drain_seconds.is_some(),
             expires: (now + RESTART_LEASE).min(deadline),
             deadline,
+        }
+    }
+
+    fn refresh(&mut self, now: tokio::time::Instant) {
+        if self.lossless && now < self.expires {
+            self.expires = (now + RESTART_LEASE).min(self.deadline);
         }
     }
 }
@@ -789,6 +796,14 @@ impl Router {
             "daemon.shutdown" => {
                 require_owner(&principal)?;
                 self.shutdown(&params, &principal).await
+            }
+            "daemon.restart_status" => {
+                require_owner(&principal)?;
+                let request: eliot_core::api::DaemonRestartStatusRequest =
+                    eliot_core::api::discovery::decode_params(params)?;
+                let response = self.restart_status(&request.restart_id)?;
+                serde_json::to_value(response)
+                    .map_err(|_| Error::new("internal", "restart status could not be encoded"))
             }
             #[cfg(debug_assertions)]
             crate::crash::DAEMON_PANIC_TEST_METHOD => {
@@ -7022,45 +7037,97 @@ impl Router {
             .map_err(|_| Error::new("internal", "shutdown result could not be encoded"))
     }
 
+    fn restart_status(
+        &self,
+        restart_id: &str,
+    ) -> Result<eliot_core::api::DaemonRestartStatusResponse> {
+        let lossless = {
+            let mut current = self.inner.restart_lease.lock_recover();
+            let now = tokio::time::Instant::now();
+            let lease = current
+                .as_mut()
+                .filter(|lease| {
+                    self.inner.mode.load(Ordering::SeqCst) == MODE_QUIESCE
+                        && lease.id == restart_id
+                        && now < lease.expires
+                })
+                .ok_or_else(|| {
+                    Error::new("bad_state", "the update admission fence is no longer held")
+                })?;
+            lease.refresh(now);
+            lease.lossless
+        };
+        // The readback is advisory. Probe the barrier without holding it
+        // across the Store check. The seal reacquires both and rechecks.
+        let blocker = if self.inner.restart_writes.try_write().is_err() {
+            Some(RESTART_WRITES_BUSY.to_owned())
+        } else if let Ok(store) = self.inner.store.try_lock() {
+            self.restart_blocker(&store, lossless)?
+        } else {
+            Some("an admitted Store operation is still running".to_owned())
+        };
+        Ok(eliot_core::api::DaemonRestartStatusResponse { blocker })
+    }
+
+    fn restart_blocker(
+        &self,
+        store: &eliot_store::Store,
+        lossless: bool,
+    ) -> Result<Option<String>> {
+        if self.inner.cleanup_worker.lock_recover().is_some() {
+            return Ok(Some("admitted cleanup is still running".to_owned()));
+        }
+        if !store.has_restart_work(lossless)?
+            && !self.inner.workspaces.has_owned_processes()
+            && !self.inference_workers_active()
+            && !self.run_workers_active()
+        {
+            return Ok(None);
+        }
+        let commands = store.restart_command_blockers(17)?;
+        if commands.is_empty() {
+            return Ok(Some("admitted work is still running".to_owned()));
+        }
+        let mut blockers = commands
+            .iter()
+            .take(16)
+            .map(|(id, verb, state)| format!("{verb} {id} ({state})"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        if commands.len() > 16 {
+            blockers.push_str(", and more");
+        }
+        Ok(Some(format!("commands still blocking restart: {blockers}")))
+    }
+
     async fn restart_shutdown(
         &self,
         request: DaemonShutdownRequest,
         principal: &Principal,
     ) -> Result<Value> {
-        // Every bound restart attempt is a heartbeat, including attempts
-        // that meet an in-flight mutation before acquiring the writer.
+        // Older updaters use bound restart attempts as their heartbeat.
         if request.mode == ShutdownMode::Restart
             && let Some(lease) = self.inner.restart_lease.lock_recover().as_mut()
-            && lease.lossless
             && request.restart_id.as_deref() == Some(lease.id.as_str())
         {
-            let now = tokio::time::Instant::now();
-            if now < lease.expires {
-                lease.expires = (now + RESTART_LEASE).min(lease.deadline);
-            }
+            lease.refresh(tokio::time::Instant::now());
         }
         // In-flight RPC mutations may write settings as well as the Store.
         // Keep the backup behind their completion boundary.
-        let _write_barrier =
-            if request.backup || request.drain_seconds.is_some() {
-                Some(self.inner.restart_writes.try_write().map_err(|_| {
-                    Error::new("restart_busy", "an admitted mutation is still running")
-                })?)
-            } else {
-                None
-            };
+        let _write_barrier = if request.backup || request.drain_seconds.is_some() {
+            Some(
+                self.inner
+                    .restart_writes
+                    .try_write()
+                    .map_err(|_| Error::new("restart_busy", RESTART_WRITES_BUSY))?,
+            )
+        } else {
+            None
+        };
         let mut store = self.inner.store.lock().await;
         let mut lease = self.inner.restart_lease.lock_recover();
         let mode = self.inner.mode.load(Ordering::SeqCst);
         let action = request.mode;
-        if (request.backup || action == ShutdownMode::Restart)
-            && self.inner.cleanup_worker.lock_recover().is_some()
-        {
-            return Err(Error::new(
-                "restart_busy",
-                "admitted cleanup is still running",
-            ));
-        }
         if action == ShutdownMode::PrepareRestart {
             if mode != MODE_OPEN
                 && !(mode == MODE_QUIESCE
@@ -7085,27 +7152,9 @@ impl Router {
         }
         let lossless = lease.as_ref().is_some_and(|lease| lease.lossless);
         if action == ShutdownMode::Restart
-            && (store.has_restart_work(lossless)?
-                || self.inner.workspaces.has_owned_processes()
-                || self.inference_workers_active()
-                || self.run_workers_active())
+            && let Some(blocker) = self.restart_blocker(&store, lossless)?
         {
-            let commands = store.restart_command_blockers(17)?;
-            let message = if commands.is_empty() {
-                "admitted work is still running".to_owned()
-            } else {
-                let mut blockers = commands
-                    .iter()
-                    .take(16)
-                    .map(|(id, verb, state)| format!("{verb} {id} ({state})"))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                if commands.len() > 16 {
-                    blockers.push_str(", and more");
-                }
-                format!("commands still blocking restart: {blockers}")
-            };
-            return Err(Error::new("restart_busy", message));
+            return Err(Error::new("restart_busy", blocker));
         }
         let watchdog = if action == ShutdownMode::Restart {
             Some(self.prepare_restart_exit_watchdog()?)
