@@ -100,7 +100,7 @@ use eliot_core::{
         EventsSubscribeRequest, EventsSubscribeResponse, FrozenGitPublish, GitFetchDefinitionArgs,
         GitPublishTrigger, GitView, HarnessCheckOutcome, HarnessDoctorRequest,
         HarnessDoctorResponse, HeavyAgentTotals, HeavyEpisodeView, HeavySummaryView,
-        MAX_OBSERVATION_PAGE_BYTES, MAX_SWARM_WAIT_MS, MAX_SWARM_WAIT_TARGETS,
+        LaunchCommandArgs, MAX_OBSERVATION_PAGE_BYTES, MAX_SWARM_WAIT_MS, MAX_SWARM_WAIT_TARGETS,
         MAX_WAIT_FINAL_TEXT_BYTES, MAX_WAIT_FRAME_BYTES, MaintenancePurgeLegacyAttentionRequest,
         MaintenancePurgeLegacyAttentionResponse, MaintenanceRunRequest, MaintenanceRunResponse,
         ObservationPage, ObservationQuery, ObservationView, ObserveHeavyRequest,
@@ -3630,7 +3630,8 @@ impl Router {
             self.freeze_project_command_guards(request).await?;
             return retained_preparation(&request.args);
         }
-        let profile = required_text(&request.args, "profile")?;
+        let launch = LaunchCommandArgs::read(&request.args);
+        let profile = LaunchCommandArgs::required_text(launch.profile.as_deref(), "profile")?;
         self.refresh_model_hold(profile, &request.args["profile_snapshot"])
             .await;
         // A switch that requests neither a workspace nor a branch keeps its
@@ -3647,7 +3648,10 @@ impl Router {
         }
         let mut registered_checkout = None;
         if resolve_project {
-            let workspace = std::path::Path::new(required_text(&request.args, "workspace")?);
+            let workspace = std::path::Path::new(LaunchCommandArgs::required_text(
+                launch.workspace.as_deref(),
+                "workspace",
+            )?);
             let registration = if matches!(principal, Principal::Owner) {
                 crate::bootstrap::discover_project(
                     &self.inner.data_root,
@@ -3672,10 +3676,9 @@ impl Router {
                 request.args["registered_project"] = json!(project.id);
                 registered_checkout = Some(project.checkout);
             }
-        } else if let Some(project) = request
-            .args
-            .get("registered_project")
-            .and_then(Value::as_str)
+        } else if let Some(project) = launch
+            .registered_project
+            .as_deref()
             .filter(|project| !project.trim().is_empty())
         {
             let store = self.inner.store.lock().await;
@@ -3688,20 +3691,12 @@ impl Router {
         // lands in the standard directory. A bare `--worktree` (an empty
         // value) or a top-level launch in a `worktree`-mode project generates
         // the standard branch instead. Agent children opt in explicitly.
-        let requested = request
-            .args
-            .get("worktree")
-            .and_then(Value::as_str)
-            .filter(|branch| !branch.is_empty())
-            .map(str::to_owned);
-        // A bare `--worktree` carries an empty value and still counts as an
-        // explicit preparation request: even a `shared` project prepares a
-        // standard worktree when the flag is present.
-        let explicit_worktree = request
-            .args
-            .get("worktree")
-            .and_then(Value::as_str)
-            .is_some();
+        let requested = launch
+            .worktree
+            .as_deref()
+            .filter(|branch| !branch.is_empty());
+        // A bare --worktree still requests preparation.
+        let explicit_worktree = launch.worktree.is_some();
         if !explicit_worktree
             && request.args.get("auto_worktree").is_none()
             && !self.auto_worktree_for_top_level(principal, request).await?
@@ -3732,11 +3727,12 @@ impl Router {
             .args
             .get("profile_snapshot")
             .ok_or_else(|| Error::new("internal", "launch profile was not frozen"))?;
-        let base = request.args.get("base").and_then(Value::as_str);
+        let base = launch.base.as_deref();
         // When launching or switching from a retained linked worktree of a
         // registered project, resolve the base commit from that worktree while
         // freezing the new worktree against the project's registered checkout.
-        let retained_workspace = required_text(&request.args, "workspace")?;
+        let retained_workspace =
+            LaunchCommandArgs::required_text(launch.workspace.as_deref(), "workspace")?;
         let child_worktree = matches!(principal, Principal::Agent { .. }) && explicit_worktree;
         if child_worktree && registered_checkout.is_none() {
             registered_checkout = self
@@ -3757,7 +3753,7 @@ impl Router {
             .workspaces
             .freeze_launch(
                 freeze_repo,
-                requested.as_deref(),
+                requested,
                 base,
                 base_repo,
                 child_worktree,
@@ -3901,6 +3897,8 @@ impl Router {
             return Ok(true);
         }
 
+        let launch = LaunchCommandArgs::read(&request.args);
+
         // Ad-hoc Owner launch: freeze a profile-equivalent snapshot from
         // built-in per-harness defaults plus flags. Agent principals keep
         // the profile and child_profiles rules; they cannot ad-hoc launch.
@@ -3911,63 +3909,36 @@ impl Router {
                     "ad-hoc launch requires the Owner principal",
                 ));
             }
-            let harness = request
-                .args
-                .get("harness")
-                .and_then(Value::as_str)
-                .ok_or_else(|| {
-                    Error::new("invalid", "launch harness must be a non-empty string")
-                })?;
+            let harness = launch.harness.as_deref().ok_or_else(|| {
+                Error::new("invalid", "launch harness must be a non-empty string")
+            })?;
             let harness = crate::adhoc::validate_adhoc_harness(harness)?;
-            let model = request
-                .args
-                .get("model")
-                .and_then(Value::as_str)
-                .map(str::to_owned);
-            let effort = request
-                .args
-                .get("effort")
-                .and_then(Value::as_str)
-                .map(str::to_owned);
-            if let Some(auth) = request.args.get("auth")
-                && !auth.is_string()
-            {
-                return Err(Error::new(
-                    "invalid",
+            let model = launch.model;
+            let effort = launch.effort;
+            for (field, parsed, message) in [
+                (
+                    "auth",
+                    &launch.auth,
                     "launch auth must be an integration selector string",
-                ));
-            }
-            let auth = request
-                .args
-                .get("auth")
-                .and_then(Value::as_str)
-                .map(str::to_owned);
-            if let Some(cmd) = request.args.get("cmd")
-                && !cmd.is_string()
-            {
-                return Err(Error::new(
-                    "invalid",
+                ),
+                (
+                    "cmd",
+                    &launch.cmd,
                     "launch cmd must be an executable path string",
-                ));
-            }
-            if let Some(access) = request.args.get("access")
-                && !access.is_string()
-            {
-                return Err(Error::new(
-                    "invalid",
+                ),
+                (
+                    "access",
+                    &launch.access,
                     "launch access must be ask, auto or full",
-                ));
+                ),
+            ] {
+                if parsed.is_none() && request.args.get(field).is_some() {
+                    return Err(Error::new("invalid", message));
+                }
             }
-            let access = request
-                .args
-                .get("access")
-                .and_then(Value::as_str)
-                .map(str::to_owned);
-            let explicit_cmd = request
-                .args
-                .get("cmd")
-                .and_then(Value::as_str)
-                .map(str::to_owned);
+            let auth = launch.auth;
+            let access = launch.access;
+            let explicit_cmd = launch.cmd;
             // An explicit `--cmd` pins the native executable (e.g. a Muse
             // binary version the launcher no longer marks current);
             // otherwise the installed executable is discovered on the
@@ -4073,10 +4044,9 @@ impl Router {
         let agent_child_snapshot = if matches!(principal, Principal::Agent { .. })
             && request.args.get("parent").is_some()
         {
-            let parent_id = request
-                .args
-                .get("parent")
-                .and_then(Value::as_str)
+            let parent_id = launch
+                .parent
+                .as_deref()
                 .ok_or_else(|| Error::new("invalid", "launch parent must be an Agent id"))?;
             let parent = {
                 let store = self.inner.store.lock().await;
@@ -4090,7 +4060,7 @@ impl Router {
                     "retained parent profile snapshot is malformed",
                 ));
             }
-            let requested = request.args.get("profile").and_then(Value::as_str);
+            let requested = launch.profile.as_deref();
             if requested.is_some_and(|name| name != parent.profile) {
                 let name =
                     requested.ok_or_else(|| Error::new("internal", "launch profile vanished"))?;
@@ -4145,11 +4115,9 @@ impl Router {
         let (profile_name, mut snapshot, harness, command_bound) = match agent_child_snapshot {
             Some((name, harness, snapshot, bound)) => (name, snapshot, harness, bound),
             None => {
-                let profile_name = match request.args.get("profile") {
-                    Some(Value::String(name)) => name.to_owned(),
-                    Some(_) => required_text(&request.args, "profile")?.to_owned(),
-                    None => required_text(&request.args, "profile")?.to_owned(),
-                };
+                let profile_name = launch
+                    .profile
+                    .ok_or_else(|| Error::new("invalid", "profile must be a non-empty string"))?;
                 let mut snapshot = self.resolve_profile_cached(&profile_name)?;
                 crate::config::capture_native_store_inputs(
                     &mut snapshot,
@@ -8465,9 +8433,11 @@ fn normalize_launch(request: &mut SubmitCommand, principal: &Principal) -> Resul
     }
     reject_launch_derived_keys(&request.args)?;
     project_checks::validate_launch_inputs(&request.args, matches!(principal, Principal::Owner))?;
-    if let Some(role) = request.args.get("role") {
-        let role = role
-            .as_str()
+    let launch = LaunchCommandArgs::read(&request.args);
+    if request.args.get("role").is_some() {
+        let role = launch
+            .role
+            .as_deref()
             .ok_or_else(|| Error::new("invalid", "launch role must be a name"))?;
         crate::config::validate_routing_role(role)?;
         if request.args.get("profile").is_some() || request.args.get("harness").is_some() {
@@ -8477,8 +8447,8 @@ fn normalize_launch(request: &mut SubmitCommand, principal: &Principal) -> Resul
             ));
         }
     }
-    if let Some(worktree) = request.args.get("worktree") {
-        let Some(branch) = worktree.as_str() else {
+    if request.args.get("worktree").is_some() {
+        let Some(branch) = launch.worktree.as_deref() else {
             return Err(Error::new("invalid", "worktree must name a new branch"));
         };
         // A bare `--worktree` carries an empty value and means "generate the
@@ -8489,17 +8459,17 @@ fn normalize_launch(request: &mut SubmitCommand, principal: &Principal) -> Resul
     } else if request.args.get("base").is_some() {
         return Err(Error::new("invalid", "base requires worktree"));
     }
-    if request
-        .args
-        .get("base")
-        .is_some_and(|base| base.as_str().is_none_or(|base| base.trim().is_empty()))
+    if request.args.get("base").is_some()
+        && launch
+            .base
+            .as_deref()
+            .is_none_or(|base| base.trim().is_empty())
     {
         return Err(Error::new("invalid", "base must be a nonempty local ref"));
     }
-    let workspace = request
-        .args
-        .get("workspace")
-        .and_then(Value::as_str)
+    let workspace = launch
+        .workspace
+        .as_deref()
         .filter(|workspace| !workspace.trim().is_empty())
         .ok_or_else(|| Error::new("invalid", "launch requires a workspace path"))?;
     let workspace = std::fs::canonicalize(workspace)
@@ -8522,8 +8492,12 @@ fn normalize_launch(request: &mut SubmitCommand, principal: &Principal) -> Resul
     // resolves their single configured routing.default candidate. Agent
     // children may also omit it to inherit the parent's frozen profile.
     // Ad-hoc Owner launch names a harness instead of a profile.
-    if let Some(harness) = args.get("harness") {
-        let Some(name) = harness.as_str().filter(|name| !name.trim().is_empty()) else {
+    if args.contains_key("harness") {
+        let Some(name) = launch
+            .harness
+            .as_deref()
+            .filter(|name| !name.trim().is_empty())
+        else {
             return Err(Error::new(
                 "invalid",
                 "launch harness must be a non-empty string",
@@ -8539,17 +8513,20 @@ fn normalize_launch(request: &mut SubmitCommand, principal: &Principal) -> Resul
         if args.get("parent").is_some() {
             return Err(Error::new("invalid", "ad-hoc launch cannot have a parent"));
         }
-        for field in ["model", "effort", "auth", "access"] {
-            if let Some(value) = args.get(field)
-                && value.as_str().is_none_or(|text| text.trim().is_empty())
-            {
+        for (field, value) in [
+            ("model", launch.model.as_deref()),
+            ("effort", launch.effort.as_deref()),
+            ("auth", launch.auth.as_deref()),
+            ("access", launch.access.as_deref()),
+        ] {
+            if args.contains_key(field) && value.is_none_or(|text| text.trim().is_empty()) {
                 return Err(Error::new(
                     "invalid",
                     format!("launch {field} must be a non-empty string"),
                 ));
             }
         }
-        if let Some(access) = args.get("access").and_then(Value::as_str) {
+        if let Some(access) = launch.access.as_deref() {
             eliot_core::api::harness::AdhocAccess::parse(access)?;
         }
     } else {
@@ -8571,20 +8548,22 @@ fn normalize_launch(request: &mut SubmitCommand, principal: &Principal) -> Resul
                 format!("launch {field} requires an ad-hoc harness or saved role profile"),
             ));
         }
-        if let Some(profile) = args.get("profile") {
-            let Some(name) = profile.as_str().filter(|name| !name.trim().is_empty()) else {
-                return Err(Error::new(
-                    "invalid",
-                    "launch profile must be a non-empty string",
-                ));
-            };
-            let _ = name;
+        if args.contains_key("profile")
+            && launch
+                .profile
+                .as_deref()
+                .is_none_or(|name| name.trim().is_empty())
+        {
+            return Err(Error::new(
+                "invalid",
+                "launch profile must be a non-empty string",
+            ));
         }
     }
     args.insert("workspace".to_owned(), Value::String(workspace.clone()));
     args.insert(
         "project".to_owned(),
-        Value::String(if args.get("chat") == Some(&Value::Bool(true)) {
+        Value::String(if launch.chat == Some(true) {
             String::new()
         } else {
             workspace

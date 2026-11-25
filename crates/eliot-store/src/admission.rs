@@ -841,15 +841,10 @@ fn admit_launch_tx(
     if let Some(parent) = parent_link.as_ref() {
         hierarchy::check_child_fanout(tx, parent, limits)?;
     }
-    let chat = request
-        .args
-        .get("chat")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    let provider_probe_scope = request
-        .args
-        .get(core::PROVIDER_PROBE_LAUNCH_ARG)
-        .and_then(Value::as_str);
+    use eliot_core::api::LaunchCommandArgs;
+    let launch = LaunchCommandArgs::read(&request.args);
+    let chat = launch.chat.unwrap_or(false);
+    let provider_probe_scope = launch.provider_probe.as_deref();
     let provider_probe = provider_probe_scope.is_some();
     if request.args.get(core::PROVIDER_PROBE_LAUNCH_ARG).is_some() && !provider_probe {
         return Err(Error::new(
@@ -861,31 +856,34 @@ fn admit_launch_tx(
     // A switch that continues a projectless source keeps the blank source
     // namespace on B. Only the switch worker sets this flag after
     // preparation; callers cannot forge it through `reject_launch_derived_keys`.
-    let switch_blank_scope = request
-        .args
-        .get(core::api::SWITCH_BLANK_SCOPE_ARG)
-        .is_some_and(|flag| flag == &Value::Bool(true));
+    let switch_blank_scope = launch.switch_blank_scope == Some(true);
     let scope = match parent_link.as_ref() {
         Some(parent) => parent.project_scope.clone(),
         None if principal == "owner" && (chat || switch_blank_scope) => String::new(),
-        None => required_string(&request.args, "project")?,
+        None => LaunchCommandArgs::required_text(launch.project.as_deref(), "project")?.to_owned(),
     };
     let project = match parent_link.as_ref() {
         Some(parent) => parent.project.clone(),
         None if chat => scope.clone(),
-        None => {
-            optional_string(&request.args, "registered_project")?.unwrap_or_else(|| scope.clone())
-        }
+        None => LaunchCommandArgs::optional_text(
+            launch.registered_project.as_deref(),
+            &request.args,
+            "registered_project",
+        )?
+        .map(str::to_owned)
+        .unwrap_or_else(|| scope.clone()),
     };
     let project_scope = (scope != project).then_some(&scope);
-    let harness = required_string(&request.args, "harness")?;
+    let harness =
+        LaunchCommandArgs::required_text(launch.harness.as_deref(), "harness")?.to_owned();
     if !eliot_core::api::is_supported_harness(&harness) {
         return Err(Error::new(
             "unsupported",
             format!("unsupported launch harness {harness}"),
         ));
     }
-    let profile = required_string(&request.args, "profile")?;
+    let profile =
+        LaunchCommandArgs::required_text(launch.profile.as_deref(), "profile")?.to_owned();
     let profile_snapshot = match request.args.get("profile_snapshot") {
         Some(Value::Object(_)) => request.args["profile_snapshot"].clone(),
         Some(_) => {
@@ -915,7 +913,12 @@ fn admit_launch_tx(
                 .filter(|parent| parent.launched_by_agent);
             let registered = match agent_parent {
                 Some(parent) => Some(parent.project.clone()),
-                None => optional_string(&request.args, "registered_project")?,
+                None => LaunchCommandArgs::optional_text(
+                    launch.registered_project.as_deref(),
+                    &request.args,
+                    "registered_project",
+                )?
+                .map(str::to_owned),
             };
             let registration = registered
                 .as_deref()
@@ -966,7 +969,9 @@ fn admit_launch_tx(
             }
             input.worktree_path.clone()
         }
-        None => required_string(&request.args, "workspace")?,
+        None => {
+            LaunchCommandArgs::required_text(launch.workspace.as_deref(), "workspace")?.to_owned()
+        }
     };
     if preparation.is_some() && workspace::load_workspace_by_path(tx, &workspace)?.is_some() {
         return Err(Error::new(
@@ -985,8 +990,8 @@ fn admit_launch_tx(
             "use args.text for the linked launch input",
         ));
     }
-    let text = optional_string(&request.args, "text")?;
-    if let Some(text) = &text {
+    let text = LaunchCommandArgs::optional_text(launch.text.as_deref(), &request.args, "text")?;
+    if let Some(text) = text {
         require_nonempty(text, "args.text")?;
         check_input(text)?;
     }
@@ -1019,8 +1024,8 @@ fn admit_launch_tx(
             ));
         }
     };
-    let policy_opt_out_reason = optional_string(&request.args, "no_policy")?;
-    let policy_opt_out_reason = policy_opt_out_reason.as_deref();
+    let policy_opt_out_reason =
+        LaunchCommandArgs::optional_text(launch.no_policy.as_deref(), &request.args, "no_policy")?;
     if let Some(reason) = policy_opt_out_reason
         && !core::api::valid_project_policy_opt_out_reason(reason)
     {
@@ -1094,9 +1099,11 @@ fn admit_launch_tx(
             params![path.to_string_lossy(), agent_num]
         ));
     }
-    if let Some(choice) = request.args.get("profile_choice") {
-        let choice: core::RoutingDecision = serde_json::from_value(choice.clone())
-            .map_err(|_| Error::new("invalid", "invalid routing decision"))?;
+    if request.args.get("profile_choice").is_some() {
+        let choice = launch
+            .profile_choice
+            .as_ref()
+            .ok_or_else(|| Error::new("invalid", "invalid routing decision"))?;
         if choice.profile.as_deref() != Some(profile.as_str()) {
             return Err(Error::new(
                 "invalid",
@@ -1105,7 +1112,7 @@ fn admit_launch_tx(
         }
         db!(tx.execute(
             "UPDATE agents SET profile_choice=?1 WHERE id=?2",
-            params![encode_json(&choice)?, agent_num]
+            params![encode_json(choice)?, agent_num]
         ));
     }
     let project_check_default = request.args.get(core::PROJECT_CHECK_GOAL_ARG).is_some()
@@ -1156,7 +1163,7 @@ fn admit_launch_tx(
             || !chat
             || parent_num.is_some()
             || preparation.is_some()
-            || text.as_deref() != Some(core::PROVIDER_PROBE_PROMPT)
+            || text != Some(core::PROVIDER_PROBE_PROMPT)
             || provider_probe_scope != Some(scope.as_str())
             || request
                 .args
@@ -1223,10 +1230,10 @@ fn admit_launch_tx(
         )?);
     }
     let mut accepted_data = json!({"command_id": request.id, "verb": "launch"});
-    if request.args["owner_override"] == true && principal == "owner" {
+    if launch.owner_override == Some(true) && principal == "owner" {
         accepted_data["admission_mode"] = json!("owner_override");
     } else if let Some(mode @ ("arbitrated" | "arbitrated_direct")) =
-        request.args["admission_mode"].as_str()
+        launch.admission_mode.as_deref()
     {
         accepted_data["admission_mode"] = json!(mode);
     }
@@ -1252,7 +1259,7 @@ fn admit_launch_tx(
             principal,
             &request.id,
             (agent_num, 1),
-            &text,
+            text,
             probe_linked_send,
             now,
         )?;

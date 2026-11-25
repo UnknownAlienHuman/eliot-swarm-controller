@@ -1608,6 +1608,12 @@ generation at dispatch, so the response generation is not universally equal to
 `expected_generation`. Interactive calls may omit expectations; delayed automation
 supplies its captured expectations.
 
+Launch uses shared [typed selectors](../../crates/eliot-core/src/api/launch.rs)
+for preparation and Store admission. The existing `args` object is the
+wire and retained shape. Replay binds the original payload with its existing
+normalization and frozen fields, including key presence, and never hashes a
+reserialized projection of those selectors.
+
 For `git.fetch`, mutation-ID binding uses Core
 [`GitFetchDefinitionArgs::binding_args(timeout_ms)`](../../crates/eliot-core/src/api/git.rs#L43)
 or [`FrozenGitFetch::binding_args()`](../../crates/eliot-core/src/api/git.rs#L114): timeout

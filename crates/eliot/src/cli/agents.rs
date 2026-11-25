@@ -383,58 +383,27 @@ pub(crate) async fn run_launch(
     let no_policy = validate_no_policy(no_policy)?;
     let goal = parse_goal_json(goal_json)?;
     let deadline = wait_deadline(timeout_seconds)?;
-    let mut args = json!({});
-    if let Some(workspace) = workspace {
-        args["workspace"] = json!(workspace.to_string_lossy());
-    }
-    if chat {
-        args["chat"] = json!(true);
-    }
-    if let Some(profile) = profile {
-        args["profile"] = Value::String(profile);
-    }
-    if let Some(role) = role {
-        args["role"] = Value::String(role);
-    }
-    if let Some(harness) = harness {
-        args["harness"] = Value::String(harness);
-    }
-    if let Some(model) = model {
-        args["model"] = Value::String(model);
-    }
-    if let Some(effort) = effort {
-        args["effort"] = Value::String(effort);
-    }
-    if let Some(auth) = auth {
-        args["auth"] = Value::String(auth);
-    }
-    if let Some(access) = access {
-        args["access"] = Value::String(access);
-    }
-    if let Some(cmd) = cmd {
-        args["cmd"] = Value::String(cmd);
-    }
-    if let Some(worktree) = worktree {
-        args["worktree"] = Value::String(worktree);
-    }
-    if let Some(base) = base {
-        args["base"] = Value::String(base);
-    }
-    if let Some(parent) = parent {
-        args["parent"] = Value::String(parent);
-    }
-    if let Some(prompt) = &prompt {
-        args["text"] = Value::String(prompt.clone());
-    }
-    if !sources.is_empty() {
-        args["sources"] = json!(sources);
-    }
-    if let Some(goal) = goal {
-        args["goal"] = Value::Object(goal);
-    }
-    if let Some(reason) = no_policy {
-        args["no_policy"] = Value::String(reason);
-    }
+    let args = json!(eliot_core::api::LaunchCommandArgs {
+        workspace: workspace.map(|path| path.to_string_lossy().into_owned()),
+        chat: chat.then_some(true),
+        profile,
+        role,
+        harness,
+        model,
+        effort,
+        auth,
+        access,
+        cmd,
+        worktree,
+        base,
+        parent,
+        text: prompt.clone(),
+        sources,
+        goal,
+        no_policy,
+        owner_override: (!queue && owner_override).then_some(true),
+        ..Default::default()
+    });
     if queue {
         let request = eliot_core::api::LaunchQueueRequest {
             id: mutation_id(id)?,
@@ -451,9 +420,6 @@ pub(crate) async fn run_launch(
         let rejected = receipt.state == eliot_core::api::LaunchIntentState::Rejected;
         print_value(&json!(receipt), json_output);
         return Ok(u8::from(rejected));
-    }
-    if owner_override {
-        args["owner_override"] = json!(true);
     }
     let params = submit_request(id, None, "launch", args)?;
     let submitted = submit_command(&data_dir, &params).await?;
