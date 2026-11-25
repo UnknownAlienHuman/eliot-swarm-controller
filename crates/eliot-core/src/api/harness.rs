@@ -200,7 +200,6 @@ pub type QuotaEvidenceReader = fn(&serde_json::Value, Option<&str>) -> Option<Qu
 pub type ProviderResponseRouteIdentity = fn(&serde_json::Value) -> Option<serde_json::Value>;
 pub type RouteClientKeyEnvSelector = fn(&str) -> bool;
 pub type QuotaUsageWindows = fn(&serde_json::Value, i64) -> Vec<QuotaWindowBounds>;
-pub type QuotaStreamOverlay = fn(&mut serde_json::Value, &QuotaObservation);
 
 type QuotaRouteRefusal = fn(&serde_json::Value, &serde_json::Value) -> Option<&'static str>;
 
@@ -214,8 +213,8 @@ pub struct NativeQuotaReadback {
     pub description: fn(&serde_json::Value) -> &'static str,
     pub unsupported_note: Option<&'static str>,
     pub route_refusal: Option<QuotaRouteRefusal>,
-    /// Refresh just the native windows of an existing verified readback.
-    pub stream_overlay: Option<QuotaStreamOverlay>,
+    /// This provider emits typed sparse window observations in native streams.
+    pub stream_observations: bool,
 }
 
 /// Native account scope and diagnostics for a reader with retained turn evidence.

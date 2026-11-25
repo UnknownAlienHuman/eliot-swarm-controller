@@ -253,6 +253,8 @@ impl Router {
                 Some(agent.profile_snapshot),
                 agent.profile,
                 std::time::Instant::now() + Duration::from_secs(25),
+                // Sparse Codex notifications cannot make a held quota available.
+                true,
             )
             .await?;
         let now = now_ms();

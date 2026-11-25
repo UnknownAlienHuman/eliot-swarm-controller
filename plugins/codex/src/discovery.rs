@@ -2068,34 +2068,6 @@ pub(crate) fn quota_observation(
     Some(observation)
 }
 
-pub(crate) fn overlay_quota_windows(
-    details: &mut Value,
-    observation: &eliot_core::api::harness::QuotaObservation,
-) {
-    let Some(rates) = details.get_mut("rateLimits").and_then(Value::as_object_mut) else {
-        return;
-    };
-    for window in &observation.windows {
-        let key = match window.label.as_str() {
-            "Primary" => "primary",
-            "Secondary" => "secondary",
-            _ => continue,
-        };
-        let entry = rates.entry(key.to_owned()).or_insert_with(|| json!({}));
-        let Some(fields) = entry.as_object_mut() else {
-            continue;
-        };
-        fields.insert("usedPercent".to_owned(), json!(window.used_percent));
-        if let Some(at) = window.resets_at_ms {
-            fields.insert("resetsAt".to_owned(), json!(at / 1_000));
-        }
-        if let Some(minutes) = window.window_duration_mins {
-            fields.insert("windowDurationMins".to_owned(), json!(minutes));
-        }
-    }
-    details["liveWindowsObservedAtMs"] = json!(observation.observed_at_ms);
-}
-
 pub(crate) fn quota_evidence(details: &Value, model: Option<&str>) -> Option<QuotaEvidence> {
     let rates = details
         .get("rateLimits")

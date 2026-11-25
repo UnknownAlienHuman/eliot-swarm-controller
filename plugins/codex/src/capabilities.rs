@@ -109,7 +109,7 @@ pub fn declaration() -> HarnessCapabilities {
         },
         quota_readback: Some(NativeQuotaReadback {
             method: "account/rateLimits/read",
-            stream_overlay: Some(crate::discovery::overlay_quota_windows),
+            stream_observations: true,
             unsupported_note: Some(
                 "Installed Codex app-server does not support account/rateLimits/read",
             ),

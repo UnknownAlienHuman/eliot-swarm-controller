@@ -731,7 +731,7 @@ impl Router {
             eliot_core::api::discovery::decode_params(params.clone())?;
         let (harness, snapshot, label) = self.resolve_quota_target(request, deadline).await?;
         let evidence = self
-            .quota_for_snapshot(harness, snapshot.clone(), label.clone(), deadline)
+            .quota_for_snapshot(harness, snapshot.clone(), label.clone(), deadline, false)
             .await?;
         let now = now_ms();
         let reserve_readback = snapshot.as_ref().map(|snapshot| {
@@ -776,7 +776,7 @@ impl Router {
         deadline: Instant,
     ) -> Result<catalog::ScopedQuota> {
         let (harness, snapshot, label) = self.resolve_quota_target(request, deadline).await?;
-        self.quota_for_snapshot(harness, snapshot, label, deadline)
+        self.quota_for_snapshot(harness, snapshot, label, deadline, false)
             .await
     }
 
@@ -806,6 +806,9 @@ impl Router {
         snapshot: Option<Value>,
         label: String,
         deadline: Instant,
+        // Hold release needs a native full read; do not mix in sparse stream
+        // observations or reuse a response that may already contain them.
+        force_full_read: bool,
     ) -> Result<catalog::ScopedQuota> {
         let request = eliot_core::api::HarnessQuotaRequest {
             harness: harness.clone(),
@@ -868,7 +871,8 @@ impl Router {
             )
         };
         let route_verified = cache_key.is_some();
-        if let Some(key) = &cache_key
+        if !force_full_read
+            && let Some(key) = &cache_key
             && let Some(mut hit) = self.cached_quota(key)
         {
             self.overlay_quota_observation(
@@ -992,12 +996,12 @@ impl Router {
         profile: &Value,
         deadline: Instant,
     ) -> Result<()> {
-        let Some(overlay) = HarnessCapabilities::of(&response.harness)
+        if !HarnessCapabilities::of(&response.harness)
             .quota_readback
-            .and_then(|readback| readback.stream_overlay)
-        else {
+            .is_some_and(|readback| readback.stream_observations)
+        {
             return Ok(());
-        };
+        }
         let (Some(identity), Some(since), Some(details)) =
             (identity, login.file_change_ms(), response.details.as_mut())
         else {
@@ -1028,10 +1032,41 @@ impl Router {
             // or its ordinary-usage authorization. Hold release still requires
             // the actual read to be newer than the hold.
             for observation in observations {
-                overlay(details, &observation);
+                overlay_quota_windows(details, &observation);
             }
         }
         Ok(())
+    }
+
+    /// Merge sparse typed stream observations into Codex's public quota detail
+    /// shape. The observation timestamp remains provenance only; the enclosing
+    /// response's full-read timestamp and native usage authorization are intact.
+    fn overlay_quota_windows(
+        details: &mut Value,
+        observation: &eliot_core::api::harness::QuotaObservation,
+    ) {
+        let Some(rates) = details.get_mut("rateLimits").and_then(Value::as_object_mut) else {
+            return;
+        };
+        for window in &observation.windows {
+            let key = match window.label.as_str() {
+                "Primary" => "primary",
+                "Secondary" => "secondary",
+                _ => continue,
+            };
+            let entry = rates.entry(key.to_owned()).or_insert_with(|| json!({}));
+            let Some(fields) = entry.as_object_mut() else {
+                continue;
+            };
+            fields.insert("usedPercent".to_owned(), json!(window.used_percent));
+            if let Some(at) = window.resets_at_ms {
+                fields.insert("resetsAt".to_owned(), json!(at / 1_000));
+            }
+            if let Some(minutes) = window.window_duration_mins {
+                fields.insert("windowDurationMins".to_owned(), json!(minutes));
+            }
+        }
+        details["liveWindowsObservedAtMs"] = json!(observation.observed_at_ms);
     }
 
     /// Page the installed harness catalogues for the current settings revision.
