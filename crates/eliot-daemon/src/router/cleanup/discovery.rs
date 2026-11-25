@@ -22,6 +22,7 @@ pub(super) struct OwnedRootResume {
     seq: i64,
     binding: String,
     walk: OwnedRootWalk,
+    expires: Instant,
     _expiry: oneshot::Sender<()>,
 }
 
@@ -93,7 +94,7 @@ impl Router {
                     {
                         Ok(Some(walk)) => {
                             page.owned_root_scan =
-                                Some(self.park_owned_scan(after, seq, binding, walk)?);
+                                Some(self.park_owned_scan(after, seq, binding, walk));
                             page.owned_backfill_after = Some(after);
                             issues.push(self.owned_scan_issue(
                                 &root,
@@ -134,22 +135,20 @@ impl Router {
         }
     }
 
-    fn park_owned_scan(
-        &self,
-        after: i64,
-        seq: i64,
-        binding: &str,
-        walk: OwnedRootWalk,
-    ) -> Result<String> {
+    fn park_owned_scan(&self, after: i64, seq: i64, binding: &str, walk: OwnedRootWalk) -> String {
         let id = ulid::Ulid::new().to_string();
         let (expiry, cancel) = oneshot::channel();
+        let expires = Instant::now() + OWNED_SCAN_TTL;
         {
             let mut state = self.inner.automatic_cleanup.lock_recover();
-            if state.owned_scans.len() >= MAX_OWNED_SCANS {
-                return Err(Error::new(
-                    "busy",
-                    "Too many incomplete owned artifact scans",
-                ));
+            if state.owned_scans.len() >= MAX_OWNED_SCANS
+                && let Some(oldest) = state
+                    .owned_scans
+                    .iter()
+                    .min_by_key(|(_, scan)| scan.expires)
+                    .map(|(id, _)| id.clone())
+            {
+                state.owned_scans.remove(&oldest);
             }
             state.owned_scans.insert(
                 id.clone(),
@@ -158,13 +157,13 @@ impl Router {
                     seq,
                     binding: binding.to_owned(),
                     walk,
+                    expires,
                     _expiry: expiry,
                 },
             );
         }
         let inner = Arc::downgrade(&self.inner);
         let parked = id.clone();
-        let expires = Instant::now() + OWNED_SCAN_TTL;
         drop(tokio::spawn(async move {
             if timeout_at(expires, cancel).await.is_err()
                 && let Some(inner) = inner.upgrade()
@@ -176,20 +175,34 @@ impl Router {
                     .remove(&parked);
             }
         }));
-        Ok(id)
+        id
     }
 
     pub(super) async fn discover_terminal_cargo_children(&self, root: &ArtifactView) -> Result<()> {
-        // The terminal hook takes one slice. Periodic inventory owns the
-        // continuation and discovers any remaining targets.
-        self.discover_owned_cleanup_children(
-            root,
-            true,
-            None,
-            Instant::now() + CLEANUP_BACKFILL_BUDGET,
-        )
-        .await
-        .map(|_| ())
+        // The terminal hook is opportunistic. Periodic inventory starts its
+        // own scan, with continuation, to cover anything beyond this slice.
+        if self
+            .discover_owned_cleanup_children(
+                root,
+                true,
+                None,
+                Instant::now() + CLEANUP_BACKFILL_BUDGET,
+            )
+            .await?
+            .is_some()
+        {
+            crate::logging::record(
+                &self.secret_policy_snapshot(),
+                "daemon.cleanup_discovery_incomplete",
+                &[
+                    ("agent", &root.agent),
+                    ("generation", &root.generation.to_string()),
+                    ("operation", "owned_root_scan_incomplete"),
+                ],
+                None,
+            );
+        }
+        Ok(())
     }
 
     async fn discover_owned_cleanup_children(
@@ -210,12 +223,21 @@ impl Router {
                 cursors: Vec::new(),
                 paused_identities: Vec::new(),
             });
-            let (candidates, finished) =
-                walk.advance(&path, &root, &daemon_root, cargo_only, deadline)?;
-            Ok::<_, Error>((candidates, (!finished).then_some(walk)))
+            let mut candidates = Vec::new();
+            let remaining = walk
+                .advance(
+                    &path,
+                    &root,
+                    &daemon_root,
+                    cargo_only,
+                    deadline,
+                    &mut candidates,
+                )
+                .map(|finished| (!finished).then_some(walk));
+            (candidates, remaining)
         })
         .await
-        .map_err(|_| Error::new("internal", "artifact discovery worker did not settle"))??;
+        .map_err(|_| Error::new("internal", "artifact discovery worker did not settle"))?;
         let mut store = self.inner.store.lock().await;
         for artifact in candidates {
             if !store.cleanup_agent_quiescent(&artifact)? {
@@ -229,7 +251,7 @@ impl Router {
                 Some(_) => {}
             }
         }
-        Ok(remaining)
+        remaining
     }
 
     fn verify_discovery_root(&self, root: &ArtifactView) -> Result<PathBuf> {
@@ -310,7 +332,8 @@ impl OwnedRootWalk {
         daemon_root: &Path,
         cargo_only: bool,
         deadline: Instant,
-    ) -> Result<(Vec<ArtifactView>, bool)> {
+        candidates: &mut Vec<ArtifactView>,
+    ) -> Result<bool> {
         if !self.path.starts_with(path) {
             return Err(stale_scan());
         }
@@ -335,7 +358,6 @@ impl OwnedRootWalk {
             self.cursors
                 .push(directory.entries().map_err(discovery_io)?);
         }
-        let mut candidates = Vec::new();
         let mut remaining = MAX_DISCOVERY_ENTRIES;
         while !self.cursors.is_empty() {
             if remaining == 0 || Instant::now() >= deadline {
@@ -345,7 +367,7 @@ impl OwnedRootWalk {
                 self.paused_identities = directory
                     .directory_identities(self.cursors.len())
                     .map_err(discovery_io)?;
-                return Ok((candidates, false));
+                return Ok(false);
             }
             let depth = self.cursors.len();
             let Some(entry) = self
@@ -429,7 +451,7 @@ impl OwnedRootWalk {
                 });
             }
         }
-        Ok((candidates, true))
+        Ok(true)
     }
 }
 

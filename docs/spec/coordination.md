@@ -50,8 +50,11 @@ with Agent, generation, path when available, and bounded reason and detail. It
 continues inventory for other entries. These diagnostics grant no cleanup authority.
 When owned-root discovery reaches 1,024 entries or its time budget, it reports
 `owned_root_scan_incomplete` and resumes inside the same root through the
-continuation. An expired cursor or changed directory identity requires a fresh
-plan.
+continuation. Resume state lives in memory. Expiry, eviction or a daemon restart
+requires a fresh plan that scans the root again. A changed directory identity
+also requires a fresh plan. Discovery retains candidates found before a scan
+error. Terminal cache release logs an incomplete root after its single slice.
+Periodic inventory scans that root independently and can continue across pages.
 Manual plans select `registered` rows. Settled rows (`removed`, `unknown`,
 `skipped(...)`) are attempt history read back from retained plans, and filtering
 them before the page cap keeps a settled prefix from starving later eligible
