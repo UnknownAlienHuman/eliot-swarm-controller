@@ -782,6 +782,7 @@ impl Store {
             remote,
             owner_process,
             direct_launch,
+            restart_send,
             ..
         } = context;
         if remote.is_some() || owner_process.is_some() {
@@ -800,6 +801,9 @@ impl Store {
             if let Some(pass) = direct_launch {
                 launch_queue::check_arbitrated_project(&tx, pass.project)?;
             }
+            if restart_send.is_some() {
+                restart_queue::validate_new_send(submission.request())?;
+            }
             let previous_command_rowid = remote.map(|_| latest_command_rowid(&tx)).transpose()?;
             let mut admission = admission::submit_tx(
                 &tx,
@@ -812,6 +816,9 @@ impl Store {
                 self.capacity_policy.as_deref(),
             )?;
             if admission.is_new {
+                if let Some(restart_id) = restart_send {
+                    restart_queue::park_new(&tx, restart_id, &admission.command.id)?;
+                }
                 if let Some(pass) = direct_launch {
                     let admitted_project = admission
                         .command
@@ -5427,6 +5434,8 @@ pub struct SubmissionContext<'a> {
     /// Internal admission provenance for a deferred launch.
     pub owner_automation: bool,
     pub direct_launch: Option<DirectLaunchArbitration<'a>>,
+    /// The Router's live lossless preparation, selected under the Store lock.
+    pub restart_send: Option<&'a str>,
 }
 
 #[derive(Clone, Copy)]

@@ -20,15 +20,60 @@ impl Store {
     }
 }
 
-pub(super) fn park(tx: &Transaction<'_>, restart_id: &str) -> Result<()> {
+fn parking_refusal() -> Error {
+    Error::new(
+        "daemon_update_in_progress",
+        "update can only park direct unbound SENDs to a live controlled native session",
+    )
+}
+
+pub(super) fn validate_new_send(request: &SubmitCommand) -> Result<()> {
+    if request.verb != "send"
+        || request.target.is_none()
+        || request.selector.is_some()
+        || request.expected_generation.is_some()
+        || request.expected_turn_id.is_some()
+        || request.request_id.is_some()
+        || request.probe
+        || request.args.get("notice_kind").is_some()
+    {
+        return Err(parking_refusal());
+    }
+    Ok(())
+}
+
+fn park_matching(tx: &Transaction<'_>, restart_id: &str, id: Option<&str>) -> Result<usize> {
+    let filter = if id.is_some() {
+        "AND commands.id = ?2"
+    } else {
+        ""
+    };
     let sql = format!(
         "INSERT INTO restart_deferred_sends(command_id, restart_id, native_scope, native_ref)
         SELECT commands.id, ?1, agent.native_scope, agent.native_ref FROM commands
         JOIN agents agent ON agent.id=commands.target AND agent.generation=commands.generation
-        WHERE {CAN_PARK}
+        WHERE {CAN_PARK} {filter}
         ON CONFLICT(command_id) DO NOTHING"
     );
-    tx.execute(&sql, [restart_id]).map_err(sql_error)?;
+    let mut statement = tx.prepare_cached(&sql).map_err(sql_error)?;
+    match id {
+        Some(id) => statement.execute(params![restart_id, id]),
+        None => statement.execute([restart_id]),
+    }
+    .map_err(sql_error)
+}
+
+pub(super) fn park(tx: &Transaction<'_>, restart_id: &str) -> Result<()> {
+    park_matching(tx, restart_id, None)?;
+    Ok(())
+}
+
+pub(super) fn park_new(tx: &Transaction<'_>, restart_id: &str, id: &str) -> Result<()> {
+    if park_matching(tx, restart_id, Some(id))? != 1 {
+        // Roll back admission with the custody check, including any implicit
+        // Resume expansion that would otherwise target a terminal session.
+        return Err(parking_refusal());
+    }
     Ok(())
 }
 

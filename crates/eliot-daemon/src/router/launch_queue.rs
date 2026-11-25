@@ -420,7 +420,7 @@ impl Router {
             request,
             principal,
             false,
-            false,
+            super::SubmissionScope::Verify,
             routing::LaunchRouting {
                 arbitrated: true,
                 owner_automation,
