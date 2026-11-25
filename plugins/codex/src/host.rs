@@ -366,8 +366,7 @@ fn validate_start_plan(
         mut secrets,
         mut metadata_secrets,
     } = target_environment(params.target_environment.as_ref(), profile.get("pass_env"))?;
-    let agent_mcp_url;
-    if !provider_probe {
+    let agent_mcp_url = if !provider_probe {
         let mcp_environment = eliot_plugin::session::agent_mcp_environment(
             params.mcp_environment.as_ref(),
             params.target_environment.as_ref(),
@@ -377,14 +376,14 @@ fn validate_start_plan(
             "Codex",
         )?;
         secrets.extend(mcp_environment.secrets);
-        agent_mcp_url = eliot_plugin::native_cli::shared_agent_mcp_url(
+        eliot_plugin::native_cli::shared_agent_mcp_url(
             params.agent_mcp_url.as_deref(),
             &environment,
         )?
-        .map(str::to_owned);
+        .map(str::to_owned)
     } else {
-        agent_mcp_url = None;
-    }
+        None
+    };
     if provider_probe {
         environment.retain(|(name, _)| {
             !name
