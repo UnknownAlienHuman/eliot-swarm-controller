@@ -620,6 +620,7 @@ impl Router {
             remote: remote.as_ref(),
             owner_process: owner_process.as_ref(),
             owner_automation: false,
+            direct_command_rpc: method == "command.submit",
             ..SubmissionContext::default()
         };
         let result = self
@@ -1851,7 +1852,11 @@ impl Router {
                         request,
                         principal,
                         false,
-                        SubmissionScope::DirectRpc,
+                        if context.direct_command_rpc {
+                            SubmissionScope::DirectRpc
+                        } else {
+                            SubmissionScope::Verified
+                        },
                         routing::LaunchRouting::default(),
                         false,
                     )
@@ -1881,10 +1886,6 @@ impl Router {
         } else {
             let mut store = self.inner.store.lock().await;
             let principal = principal_name(principal);
-            let context = SubmissionContext {
-                direct_command_rpc: true,
-                ..context
-            };
             let submitted =
                 self.admit_submission(&mut store, &principal, submission, workspace, context);
             match submitted {
