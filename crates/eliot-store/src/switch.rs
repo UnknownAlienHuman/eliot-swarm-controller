@@ -1081,10 +1081,7 @@ fn reserve_switch_tx(
         warning: None,
         next_action: "preparing_launch".into(),
     };
-    for (child_id, kind) in [
-        (value.launch_command.as_str(), "launch"),
-        (value.handoff_command.as_str(), "handoff"),
-    ] {
+    for child_id in [value.launch_command.as_str(), value.handoff_command.as_str()] {
         if command_binding(tx, child_id)?.is_some()
             || write_exists(tx, child_id)?
             || digest_id_bound(tx, child_id)?
