@@ -633,6 +633,17 @@ The launch rule matches a passed project check for the author turn, selects the
 recorded change size, and admits at most one review per fingerprint, up to two per
 Agent per trailing day and at least two hours apart. A project without a configured
 check can use the recipe's alternate successful `turn.completed` trigger.
+For a successful required-check completion, Store commits one durable review
+obligation with that exact completion. The obligation binds Agent, generation,
+turn, completion sequence and captured worktree fingerprint; it pins the source
+event until the obligation settles. Worker startup recovers only obligations
+whose checker has not started. Claiming the checker is durable before execution,
+so a restart after that point settles the attempt as unknown and never reruns it.
+An unavailable or changed worktree settles without a pass. A later completion
+does not replace an earlier obligation; each receipt remains bound to its own
+completion and fingerprint. Recovery defers a no-rule decision until the initial
+Owner and project rule inventories have loaded successfully; a temporary rule
+read failure leaves the obligation pending.
 `require_worktree = true` rechecks the exact captured Agent generation, workspace
 and fingerprint before live admission and dispatch. This launch form requires live
 event processing. The binding is to the observed tree
@@ -997,6 +1008,15 @@ Older native command events without a truncation flag count when the exact
 command is short enough to rule out truncation. Fact counters use later
 confirmed check, command or Git evidence where available. Without a confirming
 fact, correction remains unverified.
+
+Successful turn-end checks create durable completion obligations before the
+event is acknowledged. The daemon claims an obligation before running its
+checker only after acquiring the workspace permit. Shutdown while waiting for
+that permit leaves the obligation `not_started`; no durable claim has been made.
+Uncertain results settle as unknown without replay. Unknown outcomes appear in the Owner inbox as
+`project_check_outcome_unknown`, bound to the retained completion event. A
+rejected rule or project-registration read does not settle an obligation as
+stale; inventory readiness returns only after a successful reload.
 
 For [#881 item 2](https://github.com/UnknownAlienHuman/eliot-swarm-controller/issues/881),
 the next-input move at turn end substitutes for a Claude Stop hook. Pending

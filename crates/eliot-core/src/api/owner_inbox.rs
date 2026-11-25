@@ -24,10 +24,11 @@ pub enum OwnerInboxKind {
     /// Work that is not fully recorded in Git.
     WorkNotInGit,
     ArtifactCapacity,
+    ProjectCheck,
 }
 
 impl OwnerInboxKind {
-    pub const ALL: [Self; 13] = [
+    pub const ALL: [Self; 14] = [
         Self::HarnessRequest,
         Self::UnknownCommand,
         Self::UnknownTurn,
@@ -41,6 +42,7 @@ impl OwnerInboxKind {
         Self::Handoff,
         Self::WorkNotInGit,
         Self::ArtifactCapacity,
+        Self::ProjectCheck,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -58,6 +60,7 @@ impl OwnerInboxKind {
             Self::Handoff => "handoff",
             Self::WorkNotInGit => "work_not_in_git",
             Self::ArtifactCapacity => "artifact_capacity",
+            Self::ProjectCheck => "project_check",
         }
     }
 }

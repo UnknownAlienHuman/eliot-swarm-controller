@@ -928,6 +928,17 @@ fn event_prune_end(
         end = pinned - 1;
         blocker = Some("source");
     }
+    let first_project_check: Option<i64> = tx
+        .query_row(
+            "SELECT MIN(completion_seq) FROM project_check_obligations WHERE state != 'settled'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(sql_error)?;
+    if let Some(pinned) = first_project_check.filter(|pinned| *pinned - 1 < end) {
+        end = pinned - 1;
+        blocker = Some("project_check_obligation");
+    }
     // `source.gap` events carry no native_id, so the native pin never covers
     // them — yet the Git coverage check re-reads the retained gap event by
     // `gap_seq` while its boundary is still live. Keep every event at or

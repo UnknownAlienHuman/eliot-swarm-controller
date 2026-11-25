@@ -1,6 +1,6 @@
 use super::*;
 
-pub(super) const CURRENT_SCHEMA_VERSION: i64 = ORGANIZATION_MEMBERSHIP_INDEX_VERSION;
+pub(super) const CURRENT_SCHEMA_VERSION: i64 = PROJECT_CHECK_OBLIGATIONS_VERSION;
 const HARNESS_CHECK_SCHEMA_VERSION: i64 = 112;
 const WORK_TRUTH_VERSION: i64 = 113;
 const WORK_TRUTH_INTENT_VERSION: i64 = 114;
@@ -40,6 +40,7 @@ const SWITCH_CHILD_ID_RESERVATIONS_VERSION: i64 = 147;
 const WITHHELD_FRESH_SESSION_VERSION: i64 = 148;
 const ORGANIZATION_KEY_INDEX_VERSION: i64 = 149;
 const ORGANIZATION_MEMBERSHIP_INDEX_VERSION: i64 = 150;
+const PROJECT_CHECK_OBLIGATIONS_VERSION: i64 = 151;
 
 fn has_restart_continuation_brief_column(connection: &Connection) -> Result<bool> {
     connection
@@ -2779,6 +2780,26 @@ impl Store {
             self.migrate_sql(
                 &organization::membership_index_migration(),
                 Some(ORGANIZATION_MEMBERSHIP_INDEX_VERSION),
+            )?;
+        }
+        if current < PROJECT_CHECK_OBLIGATIONS_VERSION {
+            self.migrate_sql(
+                "CREATE TABLE project_check_obligations (
+                     completion_seq INTEGER PRIMARY KEY REFERENCES events(seq) ON DELETE CASCADE,
+                     agent INTEGER NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+                     generation INTEGER NOT NULL,
+                     turn_id TEXT NOT NULL,
+                     fingerprint TEXT NOT NULL,
+                     state TEXT NOT NULL CHECK(state IN ('not_started','checker_started','settled')),
+                     outcome TEXT CHECK(outcome IS NULL OR outcome IN ('passed','refused','unknown','stale')),
+                     created_at INTEGER NOT NULL,
+                     settled_at INTEGER,
+                     UNIQUE(agent,generation,completion_seq)
+                 ) WITHOUT ROWID;
+                 CREATE INDEX project_check_obligations_pending
+                   ON project_check_obligations(completion_seq)
+                   WHERE state='not_started';",
+                Some(PROJECT_CHECK_OBLIGATIONS_VERSION),
             )?;
         }
         Ok(())

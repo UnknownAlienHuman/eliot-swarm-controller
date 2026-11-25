@@ -547,7 +547,7 @@ async fn refresh_project_namespaces(
     policy: &SecretPolicy,
     namespaces: &mut Vec<ProjectRuleNamespace>,
     owner_config_notices: &mut ReloadNoticeContext,
-) -> Result<bool> {
+) -> Result<(bool, bool)> {
     let (revision, registrations) = match projects::load_registrations(data_root).await {
         Ok(snapshot) => snapshot,
         Err(error) => {
@@ -560,7 +560,7 @@ async fn refresh_project_namespaces(
             for namespace in namespaces.iter_mut() {
                 namespace.registration_current = false;
             }
-            return Ok(false);
+            return Ok((false, false));
         }
     };
     let inputs = registrations
@@ -582,7 +582,7 @@ async fn refresh_project_namespaces(
             for namespace in namespaces.iter_mut() {
                 namespace.registration_current = false;
             }
-            return Ok(false);
+            return Ok((false, false));
         }
     };
     let current_ids: HashSet<_> = views.iter().map(|view| view.id.clone()).collect();
@@ -594,6 +594,7 @@ async fn refresh_project_namespaces(
         }
         current
     });
+    let mut project_rules_ready = true;
 
     for view in views {
         let Some(registration) = registrations
@@ -615,6 +616,7 @@ async fn refresh_project_namespaces(
             {
                 Ok(namespace) => namespaces.push(namespace),
                 Err(error) => {
+                    project_rules_ready = false;
                     let log_ids = [
                         ("producer", "automation.project_rules"),
                         ("method", "project.rules.load"),
@@ -643,6 +645,7 @@ async fn refresh_project_namespaces(
         let loaded = match projects::load_project_rules(data_root, registration.clone()).await {
             Ok(loaded) => loaded,
             Err(error) => {
+                project_rules_ready = false;
                 let log_ids = [
                     ("producer", "automation.project_rules"),
                     ("method", "project.rules.reload"),
@@ -655,6 +658,7 @@ async fn refresh_project_namespaces(
         };
         if loaded.principal != namespace.principal || loaded.registration != namespace.registration
         {
+            project_rules_ready = false;
             namespace.registration_current = false;
             let error = Error::new(
                 "source_integrity",
@@ -689,6 +693,7 @@ async fn refresh_project_namespaces(
                 .any(|rule| rule.state.retiring_revision.is_some())
                 && namespace.notices.deferred.as_ref() == Some(&key))
         {
+            project_rules_ready = false;
             continue;
         }
         let update = {
@@ -709,9 +714,14 @@ async fn refresh_project_namespaces(
         };
         if let Some((updated, _deferred)) = update {
             namespace.rules = updated;
+            if _deferred {
+                project_rules_ready = false;
+            }
+        } else {
+            project_rules_ready = false;
         }
     }
-    Ok(true)
+    Ok((true, project_rules_ready))
 }
 
 fn reload_notice_key(inputs: &[RuleDefinitionInput]) -> Result<ReloadNoticeKey> {
@@ -1229,10 +1239,13 @@ async fn run_global_rules_inner(
     let mut last_applied_inputs = None;
     let mut recover_rule_children = true;
     let mut arbitrate_launches = true;
+    router.set_rule_inventory_ready(false);
+    let mut registrations_valid = false;
+    let mut project_rules_ready = false;
     match crate::config::load_automation_config(&data_root) {
         Ok(config) => {
             max_event_backlog = config.max_event_backlog;
-            let _ = refresh_project_namespaces(
+            (registrations_valid, project_rules_ready) = refresh_project_namespaces(
                 &router,
                 &data_root,
                 &policy,
@@ -1284,6 +1297,9 @@ async fn run_global_rules_inner(
                 }
             }
         }
+    }
+    if registrations_valid && project_rules_ready && last_applied_inputs.is_some() {
+        router.mark_rule_inventory_ready();
     }
     loop {
         if *shutdown.borrow() {
@@ -1515,6 +1531,7 @@ async fn run_global_rules_inner(
             continue;
         }
 
+        registrations_valid = false;
         match crate::config::load_automation_config(&data_root) {
             Ok(config) => {
                 max_event_backlog = config.max_event_backlog;
@@ -1535,7 +1552,7 @@ async fn run_global_rules_inner(
                         after
                     }));
                 }
-                let registrations_valid = refresh_project_namespaces(
+                (registrations_valid, project_rules_ready) = refresh_project_namespaces(
                     &router,
                     &data_root,
                     &policy,
@@ -1543,12 +1560,16 @@ async fn run_global_rules_inner(
                     &mut owner_config_notices,
                 )
                 .await?;
+                if !registrations_valid || !project_rules_ready {
+                    router.set_rule_inventory_ready(false);
+                }
                 if registrations_valid {
                     owner_config_notices.deferred = None;
                     owner_config_notices.rejected = None;
                 }
             }
             Err(error) => {
+                router.set_rule_inventory_ready(false);
                 cleanup_enabled = false;
                 terminal_cargo.clear();
                 cleanup_after = None;
@@ -1575,6 +1596,7 @@ async fn run_global_rules_inner(
         let snapshot = match reload::load(&data_root) {
             Ok(snapshot) => snapshot,
             Err(error) => {
+                router.set_rule_inventory_ready(false);
                 let log_ids = [
                     ("producer", "automation.rule_reload"),
                     ("method", "rules.reload"),
@@ -1586,12 +1608,14 @@ async fn run_global_rules_inner(
         };
         let snapshot_key = reload_notice_key(&snapshot.inputs)?;
         if notices.rejected.as_ref() == Some(&snapshot_key) {
+            router.set_rule_inventory_ready(false);
             continue;
         }
         if last_applied_inputs.as_ref() == Some(&snapshot.inputs) {
             router.install_rule_source_files("owner", &snapshot.source_files);
             notices.deferred = None;
             notices.rejected = None;
+            router.set_rule_inventory_ready(registrations_valid && project_rules_ready);
             continue;
         }
         let current_definitions = rules
@@ -1603,6 +1627,7 @@ async fn run_global_rules_inner(
             last_applied_inputs = Some(snapshot.inputs.clone());
             notices.deferred = None;
             notices.rejected = None;
+            router.set_rule_inventory_ready(registrations_valid && project_rules_ready);
             continue;
         }
         let retirement_pending = rules
@@ -1613,10 +1638,14 @@ async fn run_global_rules_inner(
         }
         let update =
             reload_owner_snapshot(&router, &policy, &mut notices, &snapshot, &rules).await?;
+        if notices.rejected.as_ref() == Some(&snapshot_key) {
+            router.set_rule_inventory_ready(false);
+        }
         if let Some((updated, deferred)) = update {
             rules = updated;
             if !deferred {
                 last_applied_inputs = Some(snapshot.inputs);
+                router.set_rule_inventory_ready(registrations_valid && project_rules_ready);
             }
         }
     }
