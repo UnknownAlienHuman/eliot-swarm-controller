@@ -35,6 +35,44 @@ pub(crate) struct Directory {
     pub(crate) path: PathBuf,
 }
 
+/// Resolve a cleanup directory with no links in its existing ancestry.
+/// Missing suffixes are retained so absence cannot waive path custody.
+pub(crate) fn canonical_cleanup_path(path: &Path) -> Result<PathBuf> {
+    if !path.is_absolute()
+        || path
+            .components()
+            .any(|part| matches!(part, Component::CurDir | Component::ParentDir))
+    {
+        return Err(refused());
+    }
+    for prefix in path.ancestors() {
+        match std::fs::symlink_metadata(prefix) {
+            Ok(_) => {
+                let _directory = Directory::open(prefix)?;
+                let resolved = std::fs::canonicalize(prefix).map_err(|_| refused())?;
+                let suffix = path.strip_prefix(prefix).map_err(|_| refused())?;
+                return Ok(resolved.join(suffix));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return Err(refused()),
+        }
+    }
+    Err(refused())
+}
+
+pub(crate) fn cleanup_path_in_root(path: &Path, root: &Path) -> Result<bool> {
+    let path_text = path.to_string_lossy();
+    let root_text = root.to_string_lossy();
+    let path_key = eliot_core::workspace_path_key(&path_text);
+    let root_key = eliot_core::workspace_path_key(&root_text);
+    if path_key == root_key || !Path::new(path_key.as_ref()).starts_with(root_key.as_ref()) {
+        return Ok(false);
+    }
+    let path = canonical_cleanup_path(path)?;
+    let root = canonical_cleanup_path(root)?;
+    Ok(path != root && path.starts_with(root))
+}
+
 #[cfg(unix)]
 const STAGED_FILE: &str = "data";
 

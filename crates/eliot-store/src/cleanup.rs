@@ -408,7 +408,43 @@ impl Store {
 
     /// Derive ownership from the retained generation's frozen workspace or
     /// profile, or from a recognized child of its exact durable artifact root.
-    pub fn record_known_artifact(&mut self, mut artifact: ArtifactView) -> Result<()> {
+    pub fn record_known_artifact(&mut self, artifact: ArtifactView) -> Result<()> {
+        self.record_artifact_custody(artifact, false)
+    }
+
+    /// Only use after this daemon exclusively created the directory. A read
+    /// or rediscovery of an existing path cannot establish this binding.
+    pub fn record_created_artifact(&mut self, artifact: ArtifactView) -> Result<()> {
+        self.record_artifact_custody(artifact, true)
+    }
+
+    pub fn artifact_registered_here(&self, artifact: &ArtifactView) -> Result<bool> {
+        self.ensure_committed_reads()?;
+        self.connection
+            .query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM artifacts a JOIN custody_binding b ON b.singleton=1
+                     WHERE a.id=?1 AND a.agent=?2 AND a.generation=?3 AND a.path=?4
+                       AND json_extract(a.body, '$.identity')=?5
+                       AND a.custody_namespace=b.namespace
+                 )",
+                params![
+                    artifact.id,
+                    parse_agent_id(&artifact.agent)?,
+                    artifact.generation,
+                    artifact.path,
+                    artifact.identity,
+                ],
+                |row| row.get(0),
+            )
+            .map_err(sql_error)
+    }
+
+    fn record_artifact_custody(
+        &mut self,
+        mut artifact: ArtifactView,
+        created_here: bool,
+    ) -> Result<()> {
         self.ensure_writer_healthy()?;
         let agent = self
             .get_agent(&artifact.agent)?
@@ -528,14 +564,17 @@ impl Store {
             })
             .map_err(sql_error)?;
         tx.execute(
-            "INSERT INTO artifacts(id,agent,generation,path,body,seq) VALUES (?1,?2,?3,?4,?5,?6)",
+            "INSERT INTO artifacts(id,agent,generation,path,body,seq,custody_namespace)
+             VALUES (?1,?2,?3,?4,?5,?6,
+                     CASE WHEN ?7 THEN (SELECT namespace FROM custody_binding WHERE singleton=1) END)",
             params![
                 artifact.id,
                 agent_num,
                 artifact.generation,
                 artifact.path,
                 encode_json(&artifact)?,
-                seq
+                seq,
+                created_here,
             ],
         )
         .map_err(sql_error)?;

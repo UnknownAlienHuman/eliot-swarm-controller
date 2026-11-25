@@ -14,6 +14,7 @@ mod child_completion;
 mod delete;
 mod discovery;
 mod jobs;
+mod ownership;
 mod projects;
 
 const CLEANUP_BACKFILL_BATCH: usize = 8;
@@ -622,7 +623,7 @@ impl Router {
             .store
             .lock()
             .await
-            .record_known_artifact(ArtifactView {
+            .record_created_artifact(ArtifactView {
                 id: ulid::Ulid::new().to_string(),
                 agent: agent.id,
                 generation: agent.generation,
@@ -679,7 +680,7 @@ impl Router {
             state: "ownership_root".to_owned(),
             git: None,
         };
-        store.record_known_artifact(root.clone())?;
+        store.record_created_artifact(root.clone())?;
         if store
             .agent_artifact_root(&agent.id, agent.generation)?
             .as_ref()
@@ -817,6 +818,9 @@ impl Router {
             .registered_branches(&agent.id, agent.generation)?;
         for row in retained {
             let Some(git) = row.git.clone() else { continue };
+            if self.require_cleanup_ownership(&row).await.is_err() {
+                continue;
+            }
             let probe = crate::git_monitor::GitProbe::new()?;
             let Ok(tip) = probe
                 .workspace_command(
@@ -857,6 +861,10 @@ impl Router {
         workspace: eliot_core::WorkspacePreparation,
         known: &mut Vec<ArtifactView>,
     ) -> Result<()> {
+        crate::workspaces::require_managed_cleanup_path(
+            &self.inner.data_root,
+            Path::new(&workspace.worktree_path),
+        )?;
         match std::fs::symlink_metadata(&workspace.worktree_path) {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 return Err(Error::new(
@@ -1030,22 +1038,9 @@ impl Router {
     }
 
     fn current_managed_worktree_path(&self, path: &str) -> Result<PathBuf> {
-        let data_root = std::fs::canonicalize(&self.inner.data_root)
-            .map_err(|_| Error::new("unavailable", "daemon root unavailable"))?;
-        let managed_root = std::fs::canonicalize(data_root.join("worktrees"))
-            .map_err(|_| Error::new("not_allowed", "managed worktree root unavailable"))?;
-        let path = std::fs::canonicalize(path)
-            .map_err(|_| Error::new("not_allowed", "managed worktree unavailable"))?;
-        if managed_root.parent() != Some(data_root.as_path())
-            || path == managed_root
-            || !path.starts_with(&managed_root)
-        {
-            return Err(Error::new(
-                "not_allowed",
-                "worktree is outside this daemon's managed root",
-            ));
-        }
-        Ok(path)
+        crate::workspaces::require_managed_cleanup_path(&self.inner.data_root, Path::new(path))?;
+        std::fs::canonicalize(path)
+            .map_err(|_| Error::new("not_allowed", "managed worktree unavailable"))
     }
 
     async fn checked_cleanup_artifact_path(
@@ -1639,6 +1634,11 @@ impl Router {
             {
                 break;
             }
+            if let Err(error) = self.require_cleanup_ownership(&candidate.artifact).await {
+                cleanup_plan_refusal(&mut candidate, bulk, error);
+                middle.push(candidate);
+                continue;
+            }
             let mut retention_reason = None;
             if let Some(retention_ms) = auto_cleanup_after_ms {
                 match self
@@ -2033,6 +2033,7 @@ impl Router {
         automatic: bool,
         observe_missing: bool,
     ) -> Result<Option<String>> {
+        self.require_cleanup_ownership(artifact).await?;
         if !cfg!(windows) {
             return Err(Error::new(
                 "unsupported",
@@ -2473,6 +2474,7 @@ impl Router {
         artifact: &ArtifactView,
         scan_budget: Duration,
     ) -> Result<(u64, bool)> {
+        self.require_cleanup_ownership(artifact).await?;
         if artifact.kind == ArtifactKind::NativeSession {
             // The archive itself runs at apply through the harness native
             // API; the plan verdict already gated harness and quiescence.
@@ -2761,6 +2763,7 @@ impl Router {
         automatic: bool,
     ) -> Result<CleanupRemoval> {
         let artifact = &item.artifact;
+        self.require_cleanup_ownership(artifact).await?;
         if artifact.kind == ArtifactKind::Branch {
             let git = artifact
                 .git
@@ -3931,6 +3934,10 @@ impl Router {
             verdict: "keep".to_owned(),
             reason: "retirement_preflight".to_owned(),
         };
+        if let Err(error) = self.require_cleanup_ownership(&candidate.artifact).await {
+            candidate.reason = error.code;
+            return candidate;
+        }
         if candidate.artifact.kind == ArtifactKind::Worktree {
             self.classify_worktree(&mut candidate, false, false, true)
                 .await;

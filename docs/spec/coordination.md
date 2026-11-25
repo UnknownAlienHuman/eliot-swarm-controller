@@ -108,7 +108,17 @@ plan/apply and `stand down` retain their independent root, registry, marker,
 owner-binding and #885 two-pass cleanup checks.
 
 Plans anchor the managed workspace identity and branch tip. Apply rechecks the
-same identity and exact local tip before mutation. A missing directory for
+same identity and exact local tip before mutation. Plan and apply independently
+verify path custody. Directories must be under this daemon's canonical artifact,
+plugin, implicit chat or managed worktree roots, or have a registration bound to
+this Store and data directory. A daemon-created external artifact root also
+binds its registered descendants. A copied ledger, a configured external root,
+and legacy external rows without that binding are insufficient evidence.
+Foreign directories and worktrees stay unselectable with
+`artifact_root_foreign` or `worktree_root_foreign`. Branch retirement uses its
+bound managed checkout for the same scope check, and native archive requires
+the local generation custody binding. Linked ancestors are refused.
+A missing local directory for
 a retained artifact can surface as `safe(already_absent)`. Apply confirms
 absence twice across the 15-second grace interval before settling
 `removed(already_absent)` with zero bytes, including when the directory was
