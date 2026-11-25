@@ -424,7 +424,11 @@ impl WorkspaceGit {
                             let mut complete = repositories.is_ok() && inventory.is_ok();
                             let inventory = inventory.unwrap_or_default();
                             complete &= watched.as_ref().is_none_or(|watched| {
-                                inventory.iter().all(|entry| {
+                                // The first Git record is the repository's
+                                // main checkout, which can be outside the
+                                // registration. Only main_checkout selects
+                                // it. All linked records must be watched.
+                                inventory.iter().skip(1).all(|entry| {
                                     entry.path.to_str().is_some_and(|path| {
                                         watched
                                             .checkout_roots
@@ -458,6 +462,13 @@ impl WorkspaceGit {
                                 .collect()
                                 .await;
                             complete &= checkouts.len() == expected;
+                            complete &= watched.as_ref().is_none_or(|watch| {
+                                checkouts.iter().all(|checkout| {
+                                    watch.checkout_roots.contains(
+                                        eliot_core::workspace_path_key(&checkout.path).as_ref(),
+                                    )
+                                })
+                            });
                             (checkouts, complete)
                         });
                     let cacheable = complete && origin.is_ok() && Instant::now() < deadline;
