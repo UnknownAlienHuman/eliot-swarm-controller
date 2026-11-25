@@ -3,6 +3,17 @@ use crate::{Error, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+/// Owner-configured identity binding for a remote manager.
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RemoteManagerGrant {
+    pub instance: String,
+    pub project: String,
+    pub audience: String,
+    pub subject: String,
+    pub revision: i64,
+}
+
 #[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RemoteIdentity {

@@ -376,6 +376,7 @@ struct RunWorkerHandle {
 #[derive(Clone)]
 enum Principal {
     Owner,
+    RemoteManager(eliot_core::RemoteManagerGrant),
     Swarm(&'static str),
     MemoryInference {
         client_id: String,
@@ -1962,6 +1963,16 @@ impl Router {
         principal: &Principal,
         context: SubmissionContext<'_>,
     ) -> Result<Value> {
+        if matches!(principal, Principal::RemoteManager(_))
+            && (!matches!(request.verb.as_str(), "send" | "interrupt" | "stop")
+                || request.selector.is_some()
+                || request.probe)
+        {
+            return Err(Error::new(
+                "not_allowed",
+                "remote managers may send, interrupt, or stop one Agent",
+            ));
+        }
         if request.verb == "git.integrate" {
             return self.submit_git_integrate(request, principal, context).await;
         }
@@ -3456,6 +3467,13 @@ impl Router {
         }
         let store = self.inner.store.lock().await;
         store.ensure_committed_reads()?;
+        if let Principal::RemoteManager(grant) = principal {
+            let target = request
+                .target
+                .as_deref()
+                .ok_or_else(|| Error::new("invalid", "remote command requires an Agent target"))?;
+            return store.require_remote_manager_member(grant, target);
+        }
         hierarchy::authorize_agent_submit_scope(&store, principal, request)
     }
 
@@ -5209,6 +5227,7 @@ impl Router {
             }
             Principal::Run { .. }
             | Principal::ProjectRule { .. }
+            | Principal::RemoteManager(_)
             | Principal::MemoryInference { .. }
             | Principal::Swarm(_) => {
                 return Err(Error::new(
@@ -6047,6 +6066,7 @@ impl Router {
                 }
                 Principal::Run { .. }
                 | Principal::ProjectRule { .. }
+                | Principal::RemoteManager(_)
                 | Principal::MemoryInference { .. }
                 | Principal::Swarm(_) => {
                     return Err(Error::new(
@@ -6131,10 +6151,13 @@ impl Router {
         let agent_caller = match principal {
             Principal::Owner => None,
             Principal::Agent { id, .. } => Some(id.clone()),
-            Principal::Run { .. } | Principal::MemoryInference { .. } | Principal::Swarm(_) => {
+            Principal::Run { .. }
+            | Principal::MemoryInference { .. }
+            | Principal::RemoteManager(_)
+            | Principal::Swarm(_) => {
                 return Err(Error::new(
                     "not_allowed",
-                    "Run credentials cannot list Agents",
+                    "this principal cannot list Agents",
                 ));
             }
             Principal::ProjectRule { .. } => {
@@ -6485,10 +6508,13 @@ impl Router {
         request.validate()?;
         match principal {
             Principal::Owner | Principal::Agent { .. } => {}
-            Principal::Run { .. } | Principal::MemoryInference { .. } | Principal::Swarm(_) => {
+            Principal::Run { .. }
+            | Principal::MemoryInference { .. }
+            | Principal::RemoteManager(_)
+            | Principal::Swarm(_) => {
                 return Err(Error::new(
                     "not_allowed",
-                    "Run credentials may call only command.get",
+                    "this principal cannot wait on tasks",
                 ));
             }
             Principal::ProjectRule { .. } => {
@@ -9607,6 +9633,7 @@ fn require_owner(principal: &Principal) -> Result<()> {
 fn diagnostic_principal(principal: &Principal) -> String {
     match principal {
         Principal::Owner => "owner".to_owned(),
+        Principal::RemoteManager(grant) => format!("remote:{}:{}", grant.instance, grant.revision),
         Principal::Swarm(name) => (*name).to_owned(),
         Principal::MemoryInference { client_id, .. } => format!("memory_inference:{client_id}"),
         Principal::Agent { id, generation } => format!("{id}#{generation}"),
@@ -9617,6 +9644,7 @@ fn diagnostic_principal(principal: &Principal) -> String {
 fn principal_name(principal: &Principal) -> String {
     match principal {
         Principal::Owner => "owner".to_owned(),
+        Principal::RemoteManager(grant) => format!("remote:{}:{}", grant.instance, grant.revision),
         Principal::Swarm(name) => (*name).to_owned(),
         Principal::MemoryInference { client_id, .. } => format!("memory_inference:{client_id}"),
         Principal::Agent { id, generation } => format!("agent:{id}:{generation}"),

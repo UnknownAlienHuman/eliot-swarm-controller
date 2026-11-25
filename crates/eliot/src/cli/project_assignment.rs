@@ -51,6 +51,8 @@ pub(super) async fn run(
             agent,
             generation,
             revision,
+            remote,
+            grant_revision,
         } => {
             let request = ProjectAssignmentClaimRequest {
                 expected_revision: revision,
@@ -58,7 +60,17 @@ pub(super) async fn run(
                 project,
                 manager: agent
                     .zip(generation)
-                    .map(|(agent, generation)| ProjectManagerIdentity::Local { agent, generation }),
+                    .map(|(agent, generation)| ProjectManagerIdentity::Local { agent, generation })
+                    .or_else(|| {
+                        remote
+                            .zip(grant_revision)
+                            .map(
+                                |(instance, grant_revision)| ProjectManagerIdentity::Remote {
+                                    instance,
+                                    grant_revision,
+                                },
+                            )
+                    }),
             };
             call(data_dir, "project.assignment.claim", &request).await?
         }
@@ -119,14 +131,26 @@ pub(super) async fn transfer(
             intent,
             destination,
             generation,
+            remote,
+            grant_revision,
             task_command,
             commands,
         } => ProjectTransferAction::Commit {
             intent,
-            destination: ProjectManagerIdentity::Local {
-                agent: destination,
-                generation,
-            },
+            destination: destination
+                .zip(generation)
+                .map(|(agent, generation)| ProjectManagerIdentity::Local { agent, generation })
+                .or_else(|| {
+                    remote
+                        .zip(grant_revision)
+                        .map(
+                            |(instance, grant_revision)| ProjectManagerIdentity::Remote {
+                                instance,
+                                grant_revision,
+                            },
+                        )
+                })
+                .ok_or_else(|| Failure::new(2, "transfer requires a destination manager"))?,
             task_command,
             commands,
         },

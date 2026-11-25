@@ -1004,6 +1004,17 @@ struct CloudMcpSettings {
     hostname: String,
     access_team_name: String,
     access_audience_tag: String,
+    #[serde(default)]
+    manager_grants: HashMap<String, RemoteManagerGrantSettings>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RemoteManagerGrantSettings {
+    project: String,
+    audience: String,
+    subject: String,
+    revision: i64,
 }
 
 /// Store-size threshold for the unbounded-retention advisory: `daemon.status`
@@ -2520,6 +2531,72 @@ pub fn load_cloud_access_config(data_root: &Path) -> core::Result<(String, Strin
         format!("https://{}.cloudflareaccess.com", config.access_team_name),
         config.access_audience_tag,
     ))
+}
+
+/// Load configured remote-manager identity grants from the owner config.
+pub fn load_remote_manager_grants(data_root: &Path) -> core::Result<Vec<core::RemoteManagerGrant>> {
+    let Some((config, _)) = read_config(data_root)? else {
+        return Ok(Vec::new());
+    };
+    let Some(settings) = config.cloud_mcp else {
+        return Ok(Vec::new());
+    };
+    parse_remote_manager_grants(settings)
+}
+
+/// Owner and manager audiences accepted by the HTTP Access verifier.
+pub fn load_cloud_access_audiences(data_root: &Path) -> core::Result<Vec<String>> {
+    let (_, owner_audience) = load_cloud_access_config(data_root)?;
+    let grants = load_remote_manager_grants(data_root)?;
+    Ok(std::iter::once(owner_audience)
+        .chain(grants.into_iter().map(|grant| grant.audience))
+        .collect())
+}
+
+fn parse_remote_manager_grants(
+    settings: CloudMcpSettings,
+) -> core::Result<Vec<core::RemoteManagerGrant>> {
+    let valid = |value: &str, max: usize| {
+        !value.is_empty()
+            && value.len() <= max
+            && value.trim() == value
+            && value.is_ascii()
+            && value.bytes().all(|byte| byte.is_ascii_graphic())
+    };
+    let valid_id = |value: &str| {
+        !value.is_empty()
+            && value.len() <= 128
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    };
+    let mut audiences = std::collections::HashSet::new();
+    for (instance, grant) in &settings.manager_grants {
+        if !valid_id(instance)
+            || !valid_id(&grant.project)
+            || !valid(&grant.subject, 512)
+            || !valid(&grant.audience, 256)
+            || grant.revision <= 0
+            || grant.audience == settings.access_audience_tag
+            || !audiences.insert(grant.audience.clone())
+        {
+            return Err(core::Error::new(
+                "profile_error",
+                "config.toml: cloud_mcp.manager_grants contains an invalid or duplicate grant",
+            ));
+        }
+    }
+    Ok(settings
+        .manager_grants
+        .into_iter()
+        .map(|(instance, grant)| core::RemoteManagerGrant {
+            instance,
+            project: grant.project,
+            audience: grant.audience,
+            subject: grant.subject,
+            revision: grant.revision,
+        })
+        .collect())
 }
 
 pub(crate) fn load_mail_config(data_root: &Path) -> core::Result<MailConfig> {

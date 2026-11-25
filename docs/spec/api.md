@@ -534,7 +534,7 @@ command id frozen at claim. The settled event's persisted `kind` is exactly
 | `models.catalog.watch` | Owner-only wait for a changed aggregate revision. A 20-second wait with no change returns a null revision. This read uses the settled in-memory revision and creates no discovery demand. |
 | `script.list/read/save` | Owner-only scripts under approved Run roots: cursor/encoded-byte-bounded list (one root scan per page; continue through empty pages until `next_cursor` is absent), verified-handle bounded read, and serialized revision-guarded replacement. Complete secret-bearing entries are withheld; raw and decoded TOML/JSON keys/values are checked. Saves never execute; external-writer conflict limits and editor environment are specified in [automation](automation.md#script-editing). DTOs/budgets: [`script_edit.rs`](../../crates/eliot-core/src/api/script_edit.rs). |
 | `settings.read/save` | owner-only unified section read/save, including revisioned `owner_rules.text` and budget warnings, revision CAS, dry run, restart indication and bounded author history; see configuration |
-| `project.transfer` | Owner-only transfer intent, optional replacement launch, atomic commit or cancellation with typed readback. See [Project transfer](coordination.md#project-transfer). |
+| `project.transfer` | Owner-only transfer intent, optional native replacement launch, atomic commit to a local manager or remote grant, or cancellation with typed readback. See [Project transfer](coordination.md#project-transfer). |
 | `project.assignment.usage` | Owner read of retained turn usage for a project assignment epoch or its unattributed turns. |
 | `project.assignment.get/claim/launch/release` | Current registered project manager, explicit adoption or manager launch, and revision-bound release through the ordinary command path. See [project manager assignments](#project-manager-assignments). |
 | `chat.organization` | owner-only grouped work projection by project assignment, manager, repository/worktree and ancestry, with event-watermark and per-group readback; no client repeats Git discovery or grouping. See [Chat organization](#chat-organization). |
@@ -571,8 +571,12 @@ latest record, including its current workspace and start command ID when present
 A confirmed preparation failure or cancellation leaves a vacant record. An
 unknown preparation reads as blocked, with the outcome on the start command.
 Owner release revokes that assignment at its epoch and retains the preparation
-receipt and unknown outcome. Remote assignment is
-unsupported. CLI callers use `swarm project assignment get|claim|launch|release`.
+receipt and unknown outcome. For a remote assignment, use
+`swarm project assignment claim PROJECT --remote INSTANCE --grant-revision N --revision REVISION`.
+The remote MCP caller supplies its exact configured remote identity and expected
+assignment revision. Assignment consumers can display the remote instance and
+grant revision from the typed manager identity. Native Agent counts use actual
+Agent rows.
 `ProjectAssignmentLaunchRequest` accepts optional `no_policy: String` and
 `goal: Map<String, Value>` fields with the same reason and field-by-field Goal
 semantics as ordinary launch. The CLI exposes them as `--no-policy REASON` and
@@ -588,6 +592,7 @@ managed worktree when it has an exact retained match. A scoped claim omits
 the manager to select the caller. The project action
 `project.assignment.claim` grants self-claim under the configured profile allowlist.
 For transfer, use `swarm project transfer <project> --revision <revision> begin|launch|commit|cancel`.
+For a remote destination, use `commit INTENT --remote INSTANCE --grant-revision N`.
 The request and readback use [ProjectTransferRequest and ProjectTransferResult](../../crates/eliot-core/src/api/project_transfer.rs).
 
 A managed manager launch always runs in a project worktree. Without an explicit

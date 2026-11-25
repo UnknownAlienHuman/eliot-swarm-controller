@@ -528,6 +528,10 @@ async fn initialize_runtime(
     logging::record(&policy, "daemon.store_opened", &[], None);
     let capacity_root = data_dir.path().to_path_buf();
     store.set_capacity_policy(move || crate::config::load_scope_limits(&capacity_root));
+    let remote_manager_root = data_dir.path().to_path_buf();
+    store.set_remote_manager_policy(move || {
+        crate::config::load_remote_manager_grants(&remote_manager_root)
+    });
     let store = Arc::new(crate::rpc_latency::StoreLock::new(store));
     // Settle crash-left pending settings history rows once at startup: reads
     // never reconcile, so this plus the save path cover every pending row.

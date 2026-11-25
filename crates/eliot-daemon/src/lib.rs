@@ -46,6 +46,7 @@ pub use config::desktop_window_in_bounds;
 pub use config::load_cloud_access_config;
 pub use config::recovery::{read_settings_for_repair, save_settings_for_repair};
 pub use config::settings::stored_section as stored_settings_section;
+pub use config::{load_cloud_access_audiences, load_remote_manager_grants};
 pub use daemon::{
     CallTimings, DaemonStartupFailure, MAX_RPC_FRAME_BYTES, StoreCompactionOutcome,
     StoreCompactionSpaceEstimate, client_call, client_call_measured, client_call_typed,

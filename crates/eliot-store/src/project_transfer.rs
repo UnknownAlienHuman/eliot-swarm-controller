@@ -49,7 +49,8 @@ pub(super) fn require_no_intent(conn: &Connection, project: &str) -> Result<()> 
 
 pub(super) fn require_deletable(tx: &Transaction<'_>, agent: &Agent) -> Result<()> {
     let assigned_or_staged: bool = db!(tx.query_row(
-        "SELECT EXISTS(SELECT 1 FROM project_transfers p JOIN project_assignments a ON p.project=a.project
+        "SELECT EXISTS(SELECT 1 FROM project_assignments WHERE project=?1 AND remote_anchor=?2)
+             OR EXISTS(SELECT 1 FROM project_transfers p JOIN project_assignments a ON p.project=a.project
                        LEFT JOIN commands c ON c.id=p.launch_command
                        WHERE p.project=?1 AND (a.manager=?2 OR c.target=?2))",
         params![agent.project, parse_agent_id(&agent.id)?], |row| row.get(0),
@@ -71,13 +72,34 @@ fn identity(agent: &Agent) -> ProjectManagerIdentity {
 }
 
 fn source(conn: &Connection, assignment: &ProjectAssignment) -> Result<Agent> {
-    let Some(ProjectManagerIdentity::Local { agent, generation }) = &assignment.manager else {
-        return Err(Error::new(
+    transfer_source(conn, assignment)?.ok_or_else(|| {
+        Error::new(
             "bad_state",
-            "project requires a current local manager",
-        ));
+            "transfer launch requires a retained native team",
+        )
+    })
+}
+
+fn transfer_source(conn: &Connection, assignment: &ProjectAssignment) -> Result<Option<Agent>> {
+    let current = match &assignment.manager {
+        Some(ProjectManagerIdentity::Local { agent, generation }) => {
+            exact_agent(conn, agent, *generation)?
+        }
+        Some(ProjectManagerIdentity::Remote { .. }) => {
+            let Some((anchor, generation)) =
+                remote_managers::team_anchor(conn, &assignment.project)?
+            else {
+                return Ok(None);
+            };
+            exact_agent(conn, &format_agent_id(anchor), generation)?
+        }
+        None => {
+            return Err(Error::new(
+                "bad_state",
+                "project requires a current manager",
+            ));
+        }
     };
-    let current = exact_agent(conn, agent, *generation)?;
     if current.parent.is_some()
         || current.root != current.id
         || current.project != assignment.project
@@ -87,7 +109,7 @@ fn source(conn: &Connection, assignment: &ProjectAssignment) -> Result<Agent> {
             "the assigned manager is no longer the project root",
         ));
     }
-    Ok(current)
+    Ok(Some(current))
 }
 
 fn exact_agent(conn: &Connection, id: &str, generation: i64) -> Result<Agent> {
@@ -162,6 +184,7 @@ impl Store {
             AssignmentWrite::new(&request.id, PROJECT_TRANSFER_METHOD, "owner", request, now)?;
         let limits = self.hierarchy_limits;
         let capacity_policy = self.capacity_policy.clone();
+        let remote_manager_policy = self.remote_manager_policy.clone();
         self.change_project_assignment(write, |tx| {
             if policy.contains_value(&payload) {
                 return Err(Error::new("secret_in_payload", "project transfer contains a known credential"));
@@ -186,9 +209,12 @@ impl Store {
             let mut events = Vec::new();
             match &request.action {
                 ProjectTransferAction::Begin { saved_context } => {
-                    let from = source(tx, &value.assignment)?;
+                    let from = transfer_source(tx, &value.assignment)?;
                     require_no_intent(tx, &request.project)?;
-                    if saved_context.is_some() && from.is_terminal() {
+                    if saved_context.is_some()
+                        && matches!(value.source, ProjectManagerIdentity::Local { .. })
+                        && from.as_ref().is_some_and(Agent::is_terminal)
+                    {
                         return Err(Error::new("bad_state", "record the continuation before stopping the source"));
                     }
                     db!(tx.execute(
@@ -197,7 +223,10 @@ impl Store {
                     ));
                     value.saved_context = saved_context.clone();
                     value.outcome = ProjectTransferOutcome::Draining;
-                    value.blockers = blockers(tx, &from, None, limits.max_selector_targets)?;
+                    if let Some(from) = from {
+                        value.blockers = blockers(tx, &from, None, limits.max_selector_targets)?;
+                    }
+                    append_remote_blocker(tx, &mut value)?;
                 }
                 ProjectTransferAction::Cancel { intent } => {
                     let transfer = required_intent(tx, &request.project, intent)?;
@@ -217,18 +246,37 @@ impl Store {
                     stage_launch(tx, limits, &from, &transfer, profile, launch, now, &mut value, &mut events, capacity_policy.as_deref())?;
                 }
                 ProjectTransferAction::Commit { intent, destination, task_command, commands } => {
-                    let from = source(tx, &value.assignment)?;
+                    let from = transfer_source(tx, &value.assignment)?;
                     let transfer = required_intent(tx, &request.project, intent)?;
                     value.intent = transfer.id;
                     value.launch_command = transfer.launch;
                     value.destination = Some(destination.clone());
                     value.saved_context = transfer.saved_context;
-                    let ProjectManagerIdentity::Local { agent, generation } = destination else {
-                        return Err(Error::new("unsupported", "remote project transfer"));
-                    };
+                    if value.source == *destination {
+                        return Err(Error::new("invalid", "transfer requires a different manager"));
+                    }
+                    append_remote_blocker(tx, &mut value)?;
+                    if let ProjectManagerIdentity::Remote { instance, grant_revision } = destination {
+                        let grant = remote_managers::configured_grant(remote_manager_policy.as_deref(), instance, *grant_revision, &request.project)?;
+                        if value.saved_context.is_some() || task_command.is_some() || !commands.is_empty() {
+                            return Err(Error::new("invalid", "remote destination has no native handoff recipient"));
+                        }
+                        finish_remote_transfer(tx, from.as_ref(), &grant, &mut value, limits, now, &mut events)?;
+                        annotate_owner_events(tx, &mut events, owner_process)?;
+                        return Ok((value, events));
+                    }
+                    let ProjectManagerIdentity::Local { agent, generation } = destination else { unreachable!() };
                     let to = exact_agent(tx, agent, *generation)?;
+                    let Some(from) = from else {
+                        if task_command.is_some() || !commands.is_empty() {
+                            return Err(Error::new("invalid", "native delivery requires a retained native source"));
+                        }
+                        finish_anchorless_transfer(tx, &to, &mut value, now, &mut events, capacity_policy.as_deref())?;
+                        annotate_owner_events(tx, &mut events, owner_process)?;
+                        return Ok((value, events));
+                    };
                     require_destination(tx, &from, &to)?;
-                    value.blockers = blockers(tx, &from, Some(&to), limits.max_selector_targets)?;
+                    value.blockers.extend(blockers(tx, &from, Some(&to), limits.max_selector_targets)?);
                     if let Some(launch) = replacement_occupies_workspace(tx, value.launch_command.as_deref())?
                         && (launch.state != CommandState::Applied || launch.target.as_deref() != Some(&to.id))
                     {
@@ -292,6 +340,168 @@ impl Store {
 
 fn delete_intent(tx: &Transaction<'_>, project: &str) -> Result<()> {
     db!(tx.execute("DELETE FROM project_transfers WHERE project=?1", [project]));
+    Ok(())
+}
+
+fn append_remote_blocker(tx: &Transaction<'_>, value: &mut ProjectTransferResult) -> Result<()> {
+    let ProjectManagerIdentity::Remote {
+        instance,
+        grant_revision,
+    } = &value.source
+    else {
+        return Ok(());
+    };
+    let command: Option<(String, String)> = tx
+        .query_row(
+            "SELECT id,state FROM commands WHERE principal=?1 AND state IN ('dispatched','unknown')
+         ORDER BY created_at,id LIMIT 1",
+            [format!("remote:{instance}:{grant_revision}")],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(sql_error)?;
+    if let Some((id, state)) = command {
+        value.blockers.push(blocker(
+            if state == "unknown" {
+                "unknown_effect"
+            } else {
+                "effect_in_flight"
+            },
+            Some(id),
+        ));
+    }
+    Ok(())
+}
+
+fn finish_remote_transfer(
+    tx: &Transaction<'_>,
+    from: Option<&Agent>,
+    grant: &core::RemoteManagerGrant,
+    value: &mut ProjectTransferResult,
+    limits: HierarchyLimits,
+    now: i64,
+    events: &mut Vec<Event>,
+) -> Result<()> {
+    if let Some(launch) = replacement_occupies_workspace(tx, value.launch_command.as_deref())? {
+        value
+            .blockers
+            .push(blocker("replacement_custody_open", Some(launch.id)));
+    }
+    let anchor = if let Some(from) = from {
+        value
+            .blockers
+            .extend(blockers(tx, from, None, limits.max_selector_targets)?);
+        if !source_custody_closed(tx, from)?
+            && !value
+                .blockers
+                .iter()
+                .any(|item| item.code == "source_custody_open")
+        {
+            value
+                .blockers
+                .push(blocker("source_custody_open", Some(from.id.clone())));
+        }
+        Some((parse_agent_id(&from.id)?, from.generation))
+    } else {
+        None
+    };
+    if !value.blockers.is_empty() {
+        return Ok(());
+    }
+    if let Some((agent, generation)) = anchor {
+        events.extend(capacity::release_owned_exit_event_tx(
+            tx,
+            agent,
+            generation,
+            "project_transfer",
+            now,
+        )?);
+    }
+    remote_managers::write_remote_assignment(tx, &value.assignment, grant, anchor)?;
+    finish_remote_endpoint(tx, value, now, events)
+}
+
+fn finish_anchorless_transfer(
+    tx: &Transaction<'_>,
+    to: &Agent,
+    value: &mut ProjectTransferResult,
+    now: i64,
+    events: &mut Vec<Event>,
+    capacity_policy: Option<&capacity::PolicyLoader>,
+) -> Result<()> {
+    let project = &value.assignment.project;
+    let registration = projects::project_registration_tx(tx, project)?
+        .ok_or_else(|| Error::new("not_found", "project registration was not found"))?;
+    if to.project != *project
+        || to.root != to.id
+        || to.parent.is_some()
+        || to.observe_only
+        || to.chat
+        || to.archived
+        || !registration.profiles.contains(&to.profile)
+        || value.saved_context.is_some()
+    {
+        return Err(Error::new(
+            "not_allowed",
+            "transfer requires an eligible native root in the registered project without native handoff input",
+        ));
+    }
+    let num = parse_agent_id(&to.id)?;
+    if to.state != AgentState::Idle
+        || to.active_turn.is_some()
+        || !send_gate_open(tx, num, to.generation)?
+    {
+        value
+            .blockers
+            .push(blocker("manager_not_quiescent", Some(to.id.clone())));
+    }
+    if !organization::retained_root_writers(tx, project, Some(num), 1)?.is_empty() {
+        value.blockers.push(blocker("legacy_project_writers", None));
+    }
+    if !value.blockers.is_empty() {
+        return Ok(());
+    }
+    capacity::require_reservation_tx(tx, num, to.generation)?;
+    let workspace = workspace::load_workspace(tx, num)?;
+    if let Some(workspace) = &workspace
+        && (workspace.phase != core::WorkspacePhase::Ready
+            || workspace.target_generation != to.generation
+            || to.workspace.as_deref() != Some(workspace.worktree_path.as_str())
+            || core::workspace_path_key(&workspace.repo_common_dir)
+                != core::workspace_path_key(&registration.repo_common_dir))
+    {
+        return Err(Error::new(
+            "bad_state",
+            "retained manager worktree is not ready in the registered repository",
+        ));
+    }
+    write_next_assignment(tx, &value.assignment, Some((num, to.generation)), None)?;
+    if let Some(workspace) = workspace {
+        project_assignment::bind_manager_workspace(tx, project, &workspace.worktree_path, false)?;
+    }
+    capacity::require_assignment_fits(tx, project, capacity_policy)?;
+    finish_remote_endpoint(tx, value, now, events)
+}
+
+fn finish_remote_endpoint(
+    tx: &Transaction<'_>,
+    value: &mut ProjectTransferResult,
+    now: i64,
+    events: &mut Vec<Event>,
+) -> Result<()> {
+    delete_intent(tx, &value.assignment.project)?;
+    value.assignment = read_assignment(tx, &value.assignment.project)?;
+    value.outcome = ProjectTransferOutcome::Transferred;
+    events.push(insert_daemon_event(
+        tx,
+        now,
+        "project.transferred",
+        "coordination",
+        None,
+        None,
+        json!({"id": value.id, "project": value.assignment.project, "epoch": value.assignment.epoch,
+            "source": value.source, "destination": value.destination}),
+    )?);
     Ok(())
 }
 

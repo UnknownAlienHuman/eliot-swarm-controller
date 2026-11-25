@@ -1331,6 +1331,18 @@ impl Store {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(sql_error)?;
         let command = load_dispatchable_tx(&tx, id)?;
+        if remote_managers::is_remote(&command.command.principal) {
+            let remote = command_cause_tx(&tx, id)?.and_then(|cause| cause.remote_call);
+            remote_managers::check_command(
+                &tx,
+                self.remote_manager_policy.as_deref(),
+                &command.command.principal,
+                &command.command.verb,
+                command.command.target.as_deref(),
+                command.command.generation,
+                remote.as_ref(),
+            )?;
+        }
         project_assignment::check_dispatch(&tx, &command)?;
         let mut events = Vec::new();
         if native_store.is_some() && command.command.verb != "launch" {

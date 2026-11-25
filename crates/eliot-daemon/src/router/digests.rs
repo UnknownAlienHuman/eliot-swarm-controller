@@ -199,10 +199,10 @@ impl Router {
                     "Run credentials may call only command.get",
                 ));
             }
-            Principal::ProjectRule { .. } => {
+            Principal::ProjectRule { .. } | Principal::RemoteManager(_) => {
                 return Err(Error::new(
                     "not_allowed",
-                    "project rule authority cannot register a digest",
+                    "this principal cannot register a digest",
                 ));
             }
             Principal::Swarm(_) => {

@@ -438,11 +438,23 @@ requires ordinary command rights. No message content is executed as a router ins
 ## Project manager assignment
 
 A registered project can have one current assignment. Its manager is a typed
-local Agent ID and generation or a future remote manager instance and grant
+local Agent ID and generation or a configured remote manager instance and grant
 revision. Store retains the current identity, monotonically increasing epoch,
 state and revision. Workspaces have independent preparation receipts and current
-[workspace bindings](monitoring.md#workspace-preparation). Remote grants require
-their own verified, project-scoped ingress identity and are unsupported in 2a.
+[workspace bindings](monitoring.md#workspace-preparation). A remote grant is
+bound to a verified Access audience and subject, one registered project, and
+its configured grant revision. The Owner or that grant may claim a vacant
+assignment at an explicit revision. A grant self-claim also needs the project's
+claim action. Competing native writers require an Owner transfer.
+
+A remote manager has no native generation or capacity reservation. It can
+read its team and send, interrupt, or stop one exact controlled generation
+when the project approves that action. Store rechecks the grant and current
+team during admission and dispatch. Its own command receipts remain readable
+under the same verified grant. Owner or project automation launches workers.
+If a native team was transferred to a remote manager, its actual native root
+and workspace remain the team anchor. A remote claim on a vacant project has
+no anchor and covers that project's controlled Agents.
 
 Claim and manager launch contend on the same Store transaction. The first wins
 and the competing caller receives the current record with a typed reason.
@@ -1126,10 +1138,19 @@ retained first input.
 ## Project transfer
 
 The Owner uses `project.transfer` to move a registered project's assignment to an
-exact local Agent generation. Each action has its own mutation ID and expected
+exact local Agent generation or an exact configured remote grant revision.
+Each action has its own mutation ID and expected
 assignment revision. Same-ID retry reads the retained result, including a wait
-or refusal. Use a fresh mutation ID to check a changed condition. Remote grants
-remain unsupported.
+or refusal. Use a fresh mutation ID to check a changed condition.
+
+The same intent fences a remote manager's new effects. In-flight or unknown
+remote commands block commit. Transfer to a remote grant with a native source
+requires proven exit and closed custody. It retains that native root as the
+team anchor and keeps its workers in place. Transfer from an anchored remote
+assignment to a local manager uses the native drain, workspace and reparent
+path. An unanchored remote assignment can transfer to an eligible idle local
+root when competing writers have been settled. Native handoff input requires
+a native recipient and a retained native source.
 
 - **Begin** retains an intent, keeps the assignment occupied and fences new A
   controls, queued launches and automated work addressed to A. Owner readback, replies,

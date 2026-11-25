@@ -1,6 +1,6 @@
 use super::*;
 
-pub(super) const CURRENT_SCHEMA_VERSION: i64 = ASSIGNMENT_USAGE_VERSION;
+pub(super) const CURRENT_SCHEMA_VERSION: i64 = REMOTE_MANAGERS_VERSION;
 const HARNESS_CHECK_SCHEMA_VERSION: i64 = 112;
 const WORK_TRUTH_VERSION: i64 = 113;
 const WORK_TRUTH_INTENT_VERSION: i64 = 114;
@@ -42,6 +42,7 @@ const ORGANIZATION_KEY_INDEX_VERSION: i64 = 149;
 const ORGANIZATION_MEMBERSHIP_INDEX_VERSION: i64 = 150;
 const PROJECT_CHECK_OBLIGATIONS_VERSION: i64 = 151;
 const ASSIGNMENT_USAGE_VERSION: i64 = 152;
+const REMOTE_MANAGERS_VERSION: i64 = 153;
 
 fn has_restart_continuation_brief_column(connection: &Connection) -> Result<bool> {
     connection
@@ -2814,6 +2815,14 @@ impl Store {
                  CREATE INDEX turns_unattributed_usage ON turns(agent, insertion_seq)
                      WHERE assignment_usage IS NULL;",
                 Some(ASSIGNMENT_USAGE_VERSION),
+            )?;
+        }
+        if current < REMOTE_MANAGERS_VERSION {
+            self.migrate_sql(
+                "ALTER TABLE project_assignments ADD COLUMN remote_manager TEXT;
+                 ALTER TABLE project_assignments ADD COLUMN remote_anchor INTEGER REFERENCES agents(id);
+                 ALTER TABLE project_assignments ADD COLUMN remote_anchor_generation INTEGER;",
+                Some(REMOTE_MANAGERS_VERSION),
             )?;
         }
         Ok(())

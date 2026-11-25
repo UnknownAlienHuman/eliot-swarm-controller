@@ -455,38 +455,51 @@ fn startup_blocks_release(conn: &Connection, assignment: &ProjectAssignment) -> 
 
 pub(super) fn read_assignment(conn: &Connection, project: &str) -> Result<ProjectAssignment> {
     let (num, generation, epoch, revision) = load_row(conn, project)?.unwrap_or((None, None, 0, 0));
-    let (workspace, start_command_id, state): (Option<String>, Option<String>, Option<String>) =
-        conn.query_row(
-            "SELECT a.workspace_path, a.start_command, c.state
+    let (workspace, start_command_id, state, remote): (
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    ) = conn
+        .query_row(
+            "SELECT a.workspace_path, a.start_command, c.state, a.remote_manager
              FROM project_assignments a LEFT JOIN commands c ON c.id=a.start_command
              WHERE a.project=?1",
             [project],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
         .optional()
         .map_err(sql_error)?
         .unwrap_or_default();
-    let (manager, state) = if let Some((num, generation)) = num.zip(generation) {
-        let state = match state.as_deref() {
-            Some("unknown") => ProjectAssignmentState::Blocked,
-            Some("accepted" | "queued" | "dispatched") => ProjectAssignmentState::Starting,
-            _ => match load_agent_by_num(conn, num)? {
-                Some(agent) if agent.generation == generation && manager_live(agent.state) => {
-                    ProjectAssignmentState::Active
-                }
-                _ => ProjectAssignmentState::Blocked,
-            },
+    let (manager, state) =
+        if let Some(remote) = remote {
+            (
+                Some(serde_json::from_str(&remote).map_err(|_| {
+                    Error::new("source_integrity", "stored remote manager is invalid")
+                })?),
+                ProjectAssignmentState::Active,
+            )
+        } else if let Some((num, generation)) = num.zip(generation) {
+            let state = match state.as_deref() {
+                Some("unknown") => ProjectAssignmentState::Blocked,
+                Some("accepted" | "queued" | "dispatched") => ProjectAssignmentState::Starting,
+                _ => match load_agent_by_num(conn, num)? {
+                    Some(agent) if agent.generation == generation && manager_live(agent.state) => {
+                        ProjectAssignmentState::Active
+                    }
+                    _ => ProjectAssignmentState::Blocked,
+                },
+            };
+            (
+                Some(ProjectManagerIdentity::Local {
+                    agent: format_agent_id(num),
+                    generation,
+                }),
+                state,
+            )
+        } else {
+            (None, ProjectAssignmentState::Vacant)
         };
-        (
-            Some(ProjectManagerIdentity::Local {
-                agent: format_agent_id(num),
-                generation,
-            }),
-            state,
-        )
-    } else {
-        (None, ProjectAssignmentState::Vacant)
-    };
     Ok(ProjectAssignment {
         project: project.to_owned(),
         manager,
@@ -515,6 +528,7 @@ pub(super) fn write_next_assignment(
          ON CONFLICT(project) DO UPDATE SET manager=excluded.manager,
              manager_generation=excluded.manager_generation, epoch=excluded.epoch,
              revision=excluded.revision, start_command=excluded.start_command,
+             remote_manager=NULL,remote_anchor=NULL,remote_anchor_generation=NULL,
              workspace_path=CASE WHEN excluded.manager IS NOT NULL THEN workspace_path END,
              workspace_adopted=CASE WHEN excluded.manager IS NULL THEN 0 ELSE workspace_adopted END",
         params![current.project,manager,generation,epoch,revision,start],
@@ -540,7 +554,7 @@ pub(super) fn clear_failed_preparation(
     Ok(())
 }
 
-fn next_epoch(epoch: i64) -> Result<i64> {
+pub(super) fn next_epoch(epoch: i64) -> Result<i64> {
     epoch
         .checked_add(1)
         .ok_or_else(|| Error::new("bad_state", "assignment sequence exhausted"))
@@ -551,7 +565,7 @@ fn next_epoch(epoch: i64) -> Result<i64> {
 /// with the assignment: a fresh manager launch overwrites it, release clears
 /// it, resume keeps it. A bound worktree is never removed; an adopted checkout
 /// additionally never becomes a cleanup artifact.
-fn bind_manager_workspace(
+pub(super) fn bind_manager_workspace(
     tx: &Transaction<'_>,
     project: &str,
     path: &str,
@@ -861,6 +875,21 @@ fn enforce_launch(
     target: Option<&Agent>,
     bindings: &[Binding],
 ) -> Result<()> {
+    if is_start_verb(verb)
+        && let Some(agent) = target
+        && let Some((anchor, _)) = remote_managers::team_anchor(conn, &agent.project)?
+    {
+        let anchor = format_agent_id(anchor);
+        if agent.id == anchor
+            || (agent.root != anchor
+                && !project_transfer::successor_launch(conn, principal, verb, id, args, agent)?)
+        {
+            return Err(Error::new(
+                "assignment_occupied",
+                "startup is outside the remote manager's retained team",
+            ));
+        }
+    }
     if is_start_verb(verb)
         && let Some(agent) = target
         && let Some(binding) = bindings

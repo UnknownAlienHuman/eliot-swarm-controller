@@ -553,6 +553,9 @@ pub(super) fn authorize_agent_read(
     id: &str,
     generation: Option<i64>,
 ) -> Result<()> {
+    if let Principal::RemoteManager(grant) = principal {
+        return store.require_remote_manager_member(grant, id);
+    }
     match authorize_agent_read_self(principal, id, generation) {
         Ok(()) => Ok(()),
         Err(error) => {
