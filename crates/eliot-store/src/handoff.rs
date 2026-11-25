@@ -14,6 +14,9 @@ pub const AGENT_HANDED_OFF: &str = "agent.handed_off";
 /// What the Router read from Git and the file system for one brief.
 #[derive(Clone, Debug, Default)]
 pub struct BriefFacts {
+    pub original_task_missing: bool,
+    pub task_sources_truncated: bool,
+    pub git_summary: Option<String>,
     pub git: Option<String>,
     /// Exact original SEND bound to the task record read for this brief.
     pub task_command: Option<String>,
@@ -112,6 +115,75 @@ pub struct HandoffAdmission {
 }
 
 impl Store {
+    /// Render the same bounded brief for an interrupted generation's linked
+    /// restart SEND. There is no transfer to another Agent.
+    pub fn prepare_restart_brief(
+        &self,
+        source: &Agent,
+        turn: Option<&str>,
+        resume_id: &str,
+        facts: &BriefFacts,
+        policy: &core::SecretPolicy,
+        now: i64,
+    ) -> Result<String> {
+        self.ensure_committed_reads()?;
+        let tx = self.connection.unchecked_transaction().map_err(sql_error)?;
+        let request = HandoffRequest {
+            id: format!("{resume_id}/send"),
+            from: source.id.clone(),
+            from_generation: source.generation,
+            to: source.id.clone(),
+            to_generation: i64::MAX,
+            task_command: facts.task_command.clone().unwrap_or_default(),
+            commands: Vec::new(),
+        };
+        let task = (request.task_command.is_empty() && !facts.original_task_missing)
+            .then(|| {
+                tx.query_row(
+                    "SELECT start_command_id FROM turns
+                     WHERE agent=?1 AND generation=?2 AND turn_id=?3",
+                    params![parse_agent_id(&source.id)?, source.generation, turn,],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .optional()
+                .map(|id| id.flatten())
+                .map_err(sql_error)
+            })
+            .transpose()?
+            .flatten()
+            .map(|id| load_command(&tx, &id))
+            .transpose()?
+            .flatten();
+        let directive =
+            core::format_restart_interrupted_turn_note_body(&source.id, source.generation, turn);
+        Ok(brief::build(
+            &tx,
+            &request,
+            task.as_ref(),
+            policy,
+            brief::BriefInput {
+                saved_context: None,
+                transferred: &[],
+                facts: Some(facts),
+                directive: Some(&directive),
+                input_principal: None,
+                restart: true,
+                now,
+            },
+        )?
+        .text)
+    }
+
+    pub fn continuation_stop_turn(
+        &self,
+        agent: &str,
+        generation: i64,
+        stop: &str,
+    ) -> Result<String> {
+        self.ensure_committed_reads()?;
+        continuation_stop_turn_tx(&self.connection, agent, generation, stop)
+    }
+
     pub fn handoff_history_unresolved(&self, agent: &str) -> Result<bool> {
         self.ensure_committed_reads()?;
         brief::has_unverified_instructions(&self.connection, agent)
@@ -416,6 +488,34 @@ impl Store {
         commit_transaction(tx, &self.write_faulted)?;
         Ok(Change { value, events })
     }
+}
+
+pub(super) fn continuation_stop_turn_tx(
+    tx: &Connection,
+    agent: &str,
+    generation: i64,
+    stop: &str,
+) -> Result<String> {
+    let record = load_command_record(tx, stop)?
+        .ok_or_else(|| Error::new("not_found", "continuation Stop is not retained"))?;
+    let command = record.command;
+    if command.verb == "stop"
+        && command.principal == "owner"
+        && command.state == CommandState::Applied
+        && command.target.as_deref() == Some(agent)
+        && command.generation == Some(generation)
+        && command.outcome.as_ref().is_some_and(|outcome| {
+            outcome["process_custody_exit_proven"] == true
+                && outcome["native_source_drain_proven"] == true
+        })
+        && let Some(turn) = record.expected_turn_id
+    {
+        return Ok(turn);
+    }
+    Err(Error::new(
+        "not_allowed",
+        "continuation requires an applied exact-turn Owner Stop with proven custody exit",
+    ))
 }
 
 /// Validate the retained source work before allocation and again in the transfer.
@@ -875,6 +975,8 @@ pub(super) fn handoff_tx(
                 transferred: &originals,
                 facts: Some(facts),
                 directive: None,
+                input_principal,
+                restart: false,
                 now,
             },
         )?,
@@ -897,6 +999,8 @@ pub(super) fn handoff_tx(
                 transferred: &originals,
                 facts: None,
                 directive: None,
+                input_principal,
+                restart: false,
                 now,
             },
         )?,

@@ -73,6 +73,13 @@ pub fn continue_after_restart(path: &Path) -> Result<bool> {
     Ok(crate::config::load_daemon_config(path)?.on_restart == crate::config::OnRestart::Continue)
 }
 
+pub fn supports_restart_continuation_brief(path: &Path) -> Result<bool> {
+    let data = DataDir::open_existing(path)?;
+    let store = data.path().join("eliot.db");
+    validate_private_file(&store)?;
+    Store::open_read_only(&store)?.supports_restart_continuation_brief()
+}
+
 /// Returns the issuing parent daemon data directory when running inside a
 /// managed Agent session with complete inherited credentials.
 pub fn inherited_agent_parent_data_dir() -> Option<PathBuf> {

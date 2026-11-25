@@ -16,7 +16,7 @@ use eliot_core::{Agent, AgentState, CommandState};
 use eliot_daemon::operator::{
     DaemonInfo, binary_sha256, continue_after_restart, copy_store_for_update_check, daemon_alive,
     discard_update_backup, lock_offline, lock_transition, replacement_data_dir,
-    restore_update_backup, running_binary, update_backup_path,
+    restore_update_backup, running_binary, supports_restart_continuation_brief, update_backup_path,
 };
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
@@ -773,9 +773,13 @@ async fn resume_interrupted(path: &Path, stopped: &[StoppedAgent]) -> (Vec<Value
     if stopped.is_empty() {
         return (Vec::new(), false);
     }
-    match continue_after_restart(path) {
-        Ok(true) => {}
-        Ok(false) => return hold_interrupted(stopped, "held by on_restart"),
+    let continuation_brief = match continue_after_restart(path).and_then(|allowed| {
+        allowed
+            .then(|| supports_restart_continuation_brief(path))
+            .transpose()
+    }) {
+        Ok(Some(supported)) => supported,
+        Ok(None) => return hold_interrupted(stopped, "held by on_restart"),
         Err(error) => {
             return (
                 stopped
@@ -785,7 +789,7 @@ async fn resume_interrupted(path: &Path, stopped: &[StoppedAgent]) -> (Vec<Value
                 true,
             );
         }
-    }
+    };
     let deadline = Instant::now() + RESUME_WAIT;
     let mut failed = BTreeSet::new();
     let mut results = Vec::new();
@@ -798,7 +802,12 @@ async fn resume_interrupted(path: &Path, stopped: &[StoppedAgent]) -> (Vec<Value
         {
             Err(Failure::new(1, "the interrupted parent did not resume"))
         } else {
-            match timeout_at(deadline, resume_stopped(path, candidate, deadline)).await {
+            match timeout_at(
+                deadline,
+                resume_stopped(path, candidate, continuation_brief, deadline),
+            )
+            .await
+            {
                 Ok(result) => result,
                 Err(_) => Err(Failure::timeout()),
             }
@@ -821,11 +830,12 @@ async fn resume_interrupted(path: &Path, stopped: &[StoppedAgent]) -> (Vec<Value
 async fn resume_stopped(
     path: &Path,
     candidate: &StoppedAgent,
+    continuation_brief: bool,
     deadline: Instant,
 ) -> Result<(), Failure> {
     let agent = &candidate.agent;
-    // The applied Stop proves custody closed. A pre-restart native stop
-    // carries a fresh continuation note for its captured turn.
+    // The daemon validates the applied Stop and renders the continuation
+    // from the retained task and exact stopped turn.
     let request = AgentGetRequest::new(&agent.id);
     let details: AgentGetResponse = eliot_daemon::client_call_typed(path, "agent.get", &request)
         .await
@@ -839,13 +849,17 @@ async fn resume_stopped(
             "the stopped generation changed before resume",
         ));
     }
-    let body = format!(
-        "The daemon update stopped {} while turn {} of generation {} was active. \
-         Read its retained outcome and reconcile the worktree (git status and git log on \
-         the task branch, plus the task card), then continue the task from the files as they are.",
-        agent.id, candidate.turn, agent.generation,
-    );
-    let args = json!({"text": eliot_core::swarm_note(&body, eliot_core::RESTART_PRINCIPAL)});
+    let args = if continuation_brief {
+        json!({(eliot_core::CONTINUE_FROM_STOP_ARG): candidate.stop_id})
+    } else {
+        // An older daemon recovered after cancellation or rollback only accepts text.
+        let body = eliot_core::format_restart_interrupted_turn_note_body(
+            &agent.id,
+            agent.generation,
+            Some(&candidate.turn),
+        );
+        json!({"text": eliot_core::swarm_note(&body, eliot_core::RESTART_PRINCIPAL)})
+    };
     let mut resume = submit_request(None, Some(agent.id.clone()), "resume", args)?;
     resume.expected_generation = Some(agent.generation);
     match submit_command(path, &resume).await {

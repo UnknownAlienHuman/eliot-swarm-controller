@@ -1,6 +1,6 @@
 use super::*;
 
-pub(super) const CURRENT_SCHEMA_VERSION: i64 = CHILD_CLEANUP_VERSION;
+pub(super) const CURRENT_SCHEMA_VERSION: i64 = RESTART_CONTINUATION_BRIEF_VERSION;
 const HARNESS_CHECK_SCHEMA_VERSION: i64 = 112;
 const WORK_TRUTH_VERSION: i64 = 113;
 const WORK_TRUTH_INTENT_VERSION: i64 = 114;
@@ -27,9 +27,25 @@ const ATTENTION_ENDPOINTS_CUSTODY_VERSION: i64 = 134;
 const PROJECT_OVERVIEW_GIT_VERSION: i64 = 135;
 const BROKEN_NATIVE_SESSION_VERSION: i64 = 136;
 const CHILD_CLEANUP_VERSION: i64 = 137;
+const RESTART_CONTINUATION_BRIEF_VERSION: i64 = 139;
+
+fn has_restart_continuation_brief_column(connection: &Connection) -> Result<bool> {
+    connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('restart_resume_intents')
+                           WHERE name='continuation_brief')",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(sql_error)
+}
 
 impl Store {
     pub const SCHEMA_VERSION: i64 = CURRENT_SCHEMA_VERSION;
+
+    pub fn supports_restart_continuation_brief(&self) -> Result<bool> {
+        has_restart_continuation_brief_column(&self.connection)
+    }
 
     pub(super) fn migrate(&mut self) -> Result<()> {
         self.connection
@@ -239,6 +255,37 @@ impl Store {
                      WHERE state = 'pending' OR (state = 'kept' AND notice_delivered = 0);
                  INSERT INTO schema_migrations(version) VALUES (137);"
             ).map_err(sql_error)?;
+            tx.commit().map_err(sql_error)?;
+        }
+        if current < RESTART_CONTINUATION_BRIEF_VERSION {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            if !has_restart_continuation_brief_column(&tx)? {
+                tx.execute_batch(
+                    "ALTER TABLE restart_resume_intents ADD COLUMN continuation_brief INTEGER NOT NULL
+                         DEFAULT 0 CHECK (continuation_brief IN (0, 1));",
+                )
+                .map_err(sql_error)?;
+            }
+            tx.execute_batch(
+                "UPDATE restart_resume_intents AS r SET continuation_brief=1
+                 WHERE continuation_brief=0 AND EXISTS (
+                   SELECT 1 FROM commands c JOIN events e
+                     ON e.agent=c.target AND e.generation=c.expected_generation
+                   WHERE c.id=r.command_id AND e.kind='agent.lost'
+                     AND json_extract(e.data,'$.reason')='daemon_restart'
+                     AND (json_type(e.data,'$.turn_id') IS 'text'
+                          OR json_extract(e.data,'$.previous_state') IN ('busy','waiting'))
+                 );",
+            )
+            .map_err(sql_error)?;
+            tx.execute(
+                "INSERT INTO schema_migrations(version) VALUES (?1)",
+                [RESTART_CONTINUATION_BRIEF_VERSION],
+            )
+            .map_err(sql_error)?;
             tx.commit().map_err(sql_error)?;
         }
         Ok(())

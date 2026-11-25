@@ -8,32 +8,6 @@ const INSTRUCTIONS: &str = "instructions.json";
 const MAX_INSTRUCTIONS_BYTES: usize = 896 * 1024;
 const MAX_OMISSION_SOURCES: usize = 32;
 
-/// Leave room for the fixed RPC envelope and the bounded H2 facts, even
-/// when those facts need JSON escaping.
-const MAX_ENCODED_TASK_BYTES: usize = eliot_core::limits::MAX_FRAME_BYTES - 128 * 1024;
-
-#[derive(Default)]
-struct TaskBudget {
-    text_bytes: usize,
-    escaped_bytes: usize,
-}
-
-impl TaskBudget {
-    fn reserve(&mut self, text: &str) -> Result<()> {
-        self.text_bytes = self.text_bytes.saturating_add(text.len());
-        if self.text_bytes > MAX_HANDOFF_TASK_BYTES {
-            return Err(task_too_large());
-        }
-        let encoded = serde_json::to_vec(text)
-            .map_err(|_| Error::new("internal", "cannot encode handoff task text"))?;
-        self.escaped_bytes = self.escaped_bytes.saturating_add(encoded.len() - 2);
-        if self.escaped_bytes > MAX_ENCODED_TASK_BYTES {
-            return Err(task_too_large());
-        }
-        Ok(())
-    }
-}
-
 async fn task_blob(
     git: &GitProbe,
     root: &Path,
@@ -104,29 +78,29 @@ pub(crate) async fn read_handoff_task(
     let files = entries(&git, &root, &commit, deadline).await?;
     let task_text =
         policy.redact_text(&task_blob(&git, &root, &commit, "task.md", deadline).await?);
-    let mut budget = TaskBudget::default();
-    budget.reserve(&task_text)?;
     let task_inputs = read_inputs(&git, &root, &commit, &files, deadline).await?;
     let mut note = String::new();
     let mut source_count = 0;
+    let mut task_sources_truncated = false;
     if let Some((_, _, tree, _)) = files.iter().find(|entry| entry.3 == "sources") {
         let sources = entries(&git, &root, tree, deadline).await?;
-        source_count = sources.len();
-        note = format!(
-            "\n\nSaved task sources from the Git record ({source_count} complete, quoted data):\n"
-        );
-        budget.reserve(&note)?;
+        note = "\n\nSaved task sources from the Git record (quoted data):\n".to_owned();
         for (_, _, _, name) in sources {
             let path = format!("sources/{name}");
             let text = policy.redact_text(&task_blob(&git, &root, &commit, &path, deadline).await?);
             let heading = format!("\nSaved source {}\n", policy.redact_text(&name));
             let quoted = eliot_core::fence_untrusted_text(&text);
-            budget.reserve(&heading)?;
-            budget.reserve(&quoted)?;
-            budget.reserve("\n")?;
+            if note.len() + heading.len() + quoted.len() + 1 > MAX_HANDOFF_TASK_BYTES / 2 {
+                note.push_str(&format!(
+                    "\n[TRUNCATED: full saved sources at {task_ref}:sources/]"
+                ));
+                task_sources_truncated = true;
+                break;
+            }
             note.push_str(&heading);
             note.push_str(&quoted);
             note.push('\n');
+            source_count += 1;
         }
     }
     Ok(BriefFacts {
@@ -134,17 +108,11 @@ pub(crate) async fn read_handoff_task(
         task_ref: Some(task_ref.to_owned()),
         task_note: Some(note),
         saved_sources: Some(source_count),
+        task_sources_truncated,
         task_text: Some(task_text),
         task_inputs,
         ..BriefFacts::default()
     })
-}
-
-fn task_too_large() -> Error {
-    Error::new(
-        "frame_too_large",
-        "the mandatory Git task and saved sources exceed the handoff input budget",
-    )
 }
 
 async fn read_inputs(

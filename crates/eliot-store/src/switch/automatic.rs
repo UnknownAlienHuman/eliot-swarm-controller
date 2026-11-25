@@ -786,6 +786,7 @@ fn owed_work(
                     && command.generation == Some(agent.generation)
                     && !command.principal.starts_with("swarm_note:")
                     && !handoff::is_brief_tx(connection, &id)?
+                    && !result_page::is_restart_continuation_send(connection, &id)?
             }
             None => binding.is_some(),
         };

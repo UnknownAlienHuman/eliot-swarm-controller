@@ -326,7 +326,7 @@ mod work_truth;
 pub use work_truth::{
     CheckpointRestoreAdmission, CheckpointRestoreIntent, CheckpointRestoreWriterObservation,
     CheckpointRetentionGeneration, GIT_CHECKPOINT, GitCheckpointBasis, GitCheckpointInput,
-    GitCheckpointIntent, GitCheckpointReservation, JournalTurn,
+    GitCheckpointIntent, GitCheckpointReservation, HandoffTaskBinding, JournalTurn,
 };
 mod turn_recovery;
 pub(crate) mod usage;
@@ -703,7 +703,12 @@ impl Store {
     /// carries no linked input, or only new linked text: a framed Swarm note
     /// or the exact initial launch input proven undispatched at restart. The
     /// latter is revalidated against its retained command in this transaction.
-    pub fn submit_restart_resume(&mut self, request: SubmitCommand, now: i64) -> Result<Admission> {
+    pub fn submit_restart_resume(
+        &mut self,
+        request: SubmitCommand,
+        continuation_brief: bool,
+        now: i64,
+    ) -> Result<Admission> {
         let promptless = request.args == json!({});
         let noted = request
             .args
@@ -717,6 +722,7 @@ impl Store {
             || request.probe
             || request.selector.is_some()
             || !(promptless || noted)
+            || (continuation_brief && !noted)
         {
             return Err(Error::new(
                 "invalid",
@@ -724,7 +730,7 @@ impl Store {
             ));
         }
         self.ensure_writer_healthy()?;
-        let result = self.submit_restart_resume_inner(request, now);
+        let result = self.submit_restart_resume_inner(request, continuation_brief, now);
         self.fault_on_persistence_error(&result);
         result
     }
@@ -965,6 +971,7 @@ impl Store {
     fn submit_restart_resume_inner(
         &mut self,
         request: SubmitCommand,
+        continuation_brief: bool,
         now: i64,
     ) -> Result<Admission> {
         let tx = self
@@ -974,6 +981,7 @@ impl Store {
         let mut admission = admission::submit_restart_resume_tx(
             &tx,
             request,
+            continuation_brief,
             now,
             self.hierarchy_limits,
             self.capacity_policy.as_deref(),
@@ -5372,6 +5380,7 @@ pub struct DirectLaunchArbitration<'a> {
 pub struct CommandSubmission {
     request: SubmitCommand,
     event: Option<core::api::UserEventCommand>,
+    continuation_text: Option<String>,
 }
 
 impl CommandSubmission {
@@ -5381,6 +5390,28 @@ impl CommandSubmission {
         Ok(Self {
             request,
             event: Some(event),
+            continuation_text: None,
+        })
+    }
+
+    pub fn resume_continuation(request: SubmitCommand, text: String) -> Result<Self> {
+        if request.verb != "resume"
+            || !request.args.as_object().is_some_and(|args| {
+                args.len() == 1
+                    && args
+                        .get(core::CONTINUE_FROM_STOP_ARG)
+                        .is_some_and(Value::is_string)
+            })
+        {
+            return Err(Error::new(
+                "invalid",
+                "continuation Resume requires an exact Stop command ID",
+            ));
+        }
+        Ok(Self {
+            request,
+            event: None,
+            continuation_text: Some(text),
         })
     }
 
@@ -5394,6 +5425,7 @@ impl From<SubmitCommand> for CommandSubmission {
         Self {
             request,
             event: None,
+            continuation_text: None,
         }
     }
 }

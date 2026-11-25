@@ -711,6 +711,21 @@ impl Router {
         if !records_work(source) {
             return Ok(BriefFacts::default());
         }
+        let binding = self.inner.store.lock().await.handoff_task_command(
+            &source.id,
+            source.generation,
+            task_command,
+        )?;
+        let task_command = match &binding {
+            eliot_store::HandoffTaskBinding::Keep => None,
+            eliot_store::HandoffTaskBinding::Select(id) => Some(id.as_str()),
+            eliot_store::HandoffTaskBinding::MissingOriginal => {
+                return Ok(BriefFacts {
+                    original_task_missing: true,
+                    ..BriefFacts::default()
+                });
+            }
+        };
         self.ensure_work_task(&source.id, source.generation, task_command)
             .await?;
         let (reference, command) = {
@@ -779,7 +794,7 @@ impl Router {
                     && origin.principal == "unverified"
                     && (origin.source != *agent || origin.generation != source.generation)
                 {
-                    let (prior, missing) = store.task_owner_corrections(
+                    let (prior, missing) = store.task_corrections(
                         &origin.source,
                         origin.generation,
                         &origin.command_id,
@@ -791,7 +806,7 @@ impl Router {
                     }
                 }
                 let (current, missing) =
-                    store.task_owner_corrections(agent, source.generation, command, &policy)?;
+                    store.task_corrections(agent, source.generation, command, &policy)?;
                 corrections.extend(current);
                 if let Some(missing) = missing {
                     omitted.insert(format!("{agent}/{}", source.generation), missing);
@@ -830,7 +845,7 @@ impl Router {
             )
         };
         let checkpoint = recorded.and_then(|view| view.checkpoint);
-        facts.git = match work_truth::handoff_facts(
+        match work_truth::handoff_facts(
             workspace,
             base.as_deref(),
             facts.task_ref.as_deref(),
@@ -839,13 +854,41 @@ impl Router {
         )
         .await
         {
-            Ok(facts) => Some(facts),
+            Ok((summary, detail)) => {
+                facts.git_summary = Some(summary);
+                facts.git = Some(detail);
+            }
             Err(error) => {
                 self.log_work_truth_error("daemon.handoff_facts_failed", &error);
-                None
             }
-        };
+        }
         Ok(facts)
+    }
+
+    pub(super) async fn continuation_brief(
+        &self,
+        agent: &str,
+        generation: i64,
+        turn: Option<&str>,
+        resume_id: &str,
+    ) -> Result<String> {
+        let source = self
+            .inner
+            .store
+            .lock()
+            .await
+            .get_agent(agent)?
+            .filter(|source| source.generation == generation)
+            .ok_or_else(|| Error::new("stale_generation", "restart source generation changed"))?;
+        let facts = self.prepare_handoff_facts(&source, None).await?;
+        self.inner.store.lock().await.prepare_restart_brief(
+            &source,
+            turn,
+            resume_id,
+            &facts,
+            &self.secret_policy_snapshot(),
+            now_ms(),
+        )
     }
 
     pub(super) async fn checkpoint_handoff_source(&self, source: &Agent) {

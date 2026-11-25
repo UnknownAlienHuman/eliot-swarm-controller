@@ -1230,23 +1230,31 @@ handoff leaves children in place. Validation failure rolls back the transfer.
 
 The first successor input is one bounded handoff brief, admitted as ordinary `send`
 to B's exact generation. The selected Git task record supplies the original text
-and ordered Owner corrections after redaction. Each correction records its
+and standing constraints after redaction. Owner corrections in the Git task
+record include their
 source Agent and generation, command ID, principal, verb and delivery state.
 The task binding carries these inputs through subsequent switches. The brief
 quotes a bounded selection and reports known omissions, clipped text and
 unverified coverage in its result. The exact retained corrections remain in
 the private Git task record at `instructions.json`. At each handoff Swarm
-refreshes delivery states from matching retained Store commands. Accepted,
-queued and cancelled inputs appear as undelivered provenance without their
-bodies. A legacy record can show unavailable delivery evidence separately from
+refreshes delivery states from matching retained Store commands. The brief
+includes the latest accepted instruction from the Owner or the source's own
+manager, with its body and delivery state,
+and any distinct delivered instruction whose turn is unfinished. If a separate
+successor SEND will deliver an item, its copy in the brief is context.
+Cancelled inputs are excluded from pending instructions. Unknown
+or dispatched inputs appear by ID and never include their text. Pending trusted
+review findings are quoted with their provenance within the review excerpt
+budget. A legacy record can show unavailable delivery evidence separately from
 an explicit unknown outcome and link its retained predecessor brief. Automatic
 Goal continuations are excluded. The brief also
 includes Store facts about A (workspace, branch and base, Git work, Goal status and
-last check exit, open claims, open or unknown commands of the handed-off generation,
+last check exit, immediate children and their states, open claims, open or unknown commands of the handed-off generation,
 and any last turn whose effects are uncertain), labelled as recorded by Swarm. It
 then quotes facts the Router read from
 [Git and the file system](monitoring.md#work-recorded-in-git) for this transfer:
-HEAD, base, status, commits since the base, the diff from the base, the uncommitted
+current branch, HEAD, clean or dirty state, base and recent commits, followed by
+optional status and diff excerpts. The excerpts show the diff from the base, the uncommitted
 patch of tracked files, the latest checkpoint and the task record. New files are named
 in the status and kept in the checkpoint, because the brief itself is persisted. It carries
 pointers to A/generation/command/turn retained history. A vendor transcript or a
@@ -1425,9 +1433,11 @@ transfer against current A and B.
 
 Before dispatching the source stop, Owner and automatic switches update the Git
 task record and freeze the rendered successor input. They size the exact text and
-encoded frame with room for the widest destination identity. Saved bodies are
-mandatory for pointer tasks. A sizing or record preparation failure refuses before
-either native effect. A successful brief reports the count of saved sources it
+encoded frame with room for the widest destination identity. Oversize text is
+truncated with an explicit marker and a pointer to its full retained command
+or Git source. If a legacy generated restart note has no retained original task
+binding, the brief says so and carries the best retained instructions and
+current Git facts. A successful brief reports the count of saved sources it
 delivered in full. H2 consumes the frozen text after it revalidates the task
 binding and custody. The post-stop source checkpoint updates the Store's work
 truth independently of the brief.
