@@ -535,7 +535,10 @@ turn inherits that attribution in its creation transaction. A transfer changes
 subsequent dispatches. Existing turns keep their recorded attribution. Legacy
 turns, native starts without a verified SEND, and dispatches outside an
 assignment appear in the separate unattributed read. Input bound to an already
-running native turn leaves its original attribution in place. The Owner reads
+running native turn leaves its original attribution in place. Chat Agents are
+never SEND targets, so their turns are never attributed and intentionally
+count as unattributed when their execution project matches; only
+`observe_only` Agents are excluded from that read. The Owner reads
 these pages with `project.assignment.usage`. The two page types can be shown
 independently in the desktop. Their counters use native turn scopes, with
 session cumulative usage available separately through `usage.summary`.
