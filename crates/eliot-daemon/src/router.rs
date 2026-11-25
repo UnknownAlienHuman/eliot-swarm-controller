@@ -124,7 +124,7 @@ use eliot_store::{
 };
 use serde_json::{Value, json};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     path::PathBuf,
     sync::{
         Arc, Mutex,
@@ -294,6 +294,64 @@ struct RouterInner {
     /// acceptance never wakes arbitration ahead of committed `capacity.released`.
     launch_arbitration: watch::Sender<u64>,
     direct_launches: Mutex<launch_queue::DirectLaunches>,
+    usage_summary_cache: Mutex<UsageSummaryCache>,
+}
+
+const USAGE_SUMMARY_CACHE_CAPACITY: usize = 8;
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct UsageSummaryCacheKey {
+    agent: Option<String>,
+    generation: Option<i64>,
+    project: Option<String>,
+    root: Option<String>,
+    pairs: Vec<(i64, i64)>,
+    agents_included: usize,
+    truncated: bool,
+}
+
+#[derive(Default)]
+struct UsageSummaryCache {
+    entries: HashMap<UsageSummaryCacheKey, (i64, i64, UsageSummaryResponse)>,
+    order: VecDeque<UsageSummaryCacheKey>,
+}
+
+impl UsageSummaryCache {
+    fn get(
+        &mut self,
+        key: &UsageSummaryCacheKey,
+        revision: (i64, i64),
+    ) -> Option<UsageSummaryResponse> {
+        let Some((total_changes, data_version, response)) = self.entries.get(key) else {
+            return None;
+        };
+        if (*total_changes, *data_version) != revision {
+            self.entries.remove(key);
+            self.order.retain(|entry| entry != key);
+            return None;
+        }
+        let response = response.clone();
+        self.order.retain(|entry| entry != key);
+        self.order.push_back(key.clone());
+        Some(response)
+    }
+
+    fn insert(
+        &mut self,
+        key: UsageSummaryCacheKey,
+        revision: (i64, i64),
+        response: UsageSummaryResponse,
+    ) {
+        self.entries
+            .insert(key.clone(), (revision.0, revision.1, response));
+        self.order.retain(|entry| entry != &key);
+        self.order.push_back(key);
+        while self.order.len() > USAGE_SUMMARY_CACHE_CAPACITY {
+            if let Some(oldest) = self.order.pop_front() {
+                self.entries.remove(&oldest);
+            }
+        }
+    }
 }
 
 #[derive(Default)]
@@ -594,6 +652,7 @@ impl Router {
                 goal_reconcile,
                 launch_arbitration,
                 direct_launches: Mutex::new(launch_queue::DirectLaunches::default()),
+                usage_summary_cache: Mutex::new(UsageSummaryCache::default()),
             }),
         })
     }
@@ -5830,7 +5889,9 @@ impl Router {
         request.validate()?;
         let response = {
             let store = self.inner.store.lock().await;
+            store.ensure_committed_reads()?;
             let resolved = store.resolve_usage_scope(&request)?;
+            let truncated = resolved.truncated;
             let (pairs, agents_included) = match principal {
                 Principal::Owner => (resolved.pairs, resolved.agents_included),
                 Principal::Agent { id, .. } => {
@@ -5849,7 +5910,7 @@ impl Router {
                     })?;
                     let mut pairs = Vec::new();
                     let mut agents = HashSet::new();
-                    for (num, generation) in resolved.pairs {
+                    for (num, generation) in resolved.pairs.iter().copied() {
                         let target = format!("a{num}");
                         if target == *id || store.agent_in_scope(&caller, &target)? {
                             agents.insert(num);
@@ -5868,18 +5929,48 @@ impl Router {
                     ));
                 }
             };
-            let truncated = resolved.truncated;
-            store.summarize_usage(
-                UsageScopeView {
-                    agent: request.agent.clone(),
-                    generation: request.generation,
-                    project: request.project.clone(),
-                    root: request.root.clone(),
-                },
-                &pairs,
+            let key = UsageSummaryCacheKey {
+                agent: request.agent.clone(),
+                generation: request.generation,
+                project: request.project.clone(),
+                root: request.root.clone(),
+                pairs,
                 agents_included,
                 truncated,
-            )?
+            };
+            let revision = store.usage_revision()?;
+            if let Some(response) = self
+                .inner
+                .usage_summary_cache
+                .lock_recover()
+                .get(&key, revision)
+            {
+                response
+            } else {
+                let response = store.summarize_usage(
+                    UsageScopeView {
+                        agent: request.agent.clone(),
+                        generation: request.generation,
+                        project: request.project.clone(),
+                        root: request.root.clone(),
+                    },
+                    &key.pairs,
+                    key.agents_included,
+                    key.truncated,
+                )?;
+                request
+                    .validate_response(&response)
+                    .map_err(|_| Error::new("internal", "usage summary is invalid"))?;
+                let after = store.usage_revision()?;
+                if after == revision {
+                    self.inner.usage_summary_cache.lock_recover().insert(
+                        key,
+                        revision,
+                        response.clone(),
+                    );
+                }
+                response
+            }
         };
         request
             .validate_response(&response)

@@ -556,6 +556,22 @@ impl Store {
         Ok(bindings)
     }
 
+    /// Revision of this Store writer's committed database view. The pair is
+    /// sampled on the same connection so local writes and external commits
+    /// both invalidate usage read memoization.
+    pub fn usage_revision(&self) -> Result<(i64, i64)> {
+        self.ensure_committed_reads()?;
+        let total_changes = self
+            .connection
+            .query_row("SELECT total_changes()", [], |row| row.get(0))
+            .map_err(sql_error)?;
+        let data_version = self
+            .connection
+            .query_row("PRAGMA data_version", [], |row| row.get(0))
+            .map_err(sql_error)?;
+        Ok((total_changes, data_version))
+    }
+
     /// Resolve one usage scope to its retained (agent, generation) pairs.
     /// Agent scope covers every retained generation unless the request names
     /// one, and the native descendants observed under those generations.
@@ -657,6 +673,7 @@ impl Store {
         agents_included: usize,
         truncated: bool,
     ) -> Result<UsageSummaryResponse> {
+        self.ensure_committed_reads()?;
         let pruned_through = retention::coverage_pruned_through(&self.connection)?;
         let history_complete = pruned_through == 0;
         let history_reason = if history_complete {
