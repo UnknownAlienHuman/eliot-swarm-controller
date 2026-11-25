@@ -156,6 +156,7 @@ fn kind_title(kind: OwnerInboxKind) -> &'static str {
         OwnerInboxKind::WorkNotInGit => "Work not in Git",
         OwnerInboxKind::HarnessAuth => "Harness sign-in",
         OwnerInboxKind::ArtifactCapacity => "Artifact capacity",
+        OwnerInboxKind::ProjectCheck => "Project checks with unknown outcome",
     }
 }
 
@@ -174,6 +175,7 @@ fn kind_word(kind: OwnerInboxKind) -> &'static str {
         OwnerInboxKind::WorkNotInGit => "Not in Git",
         OwnerInboxKind::HarnessAuth => "Sign-in",
         OwnerInboxKind::ArtifactCapacity => "Capacity",
+        OwnerInboxKind::ProjectCheck => "Check outcome unknown",
     }
 }
 
@@ -193,6 +195,10 @@ fn kind_count(kind: OwnerInboxKind, count: usize) -> String {
         OwnerInboxKind::WorkNotInGit => ("item not in Git", "items not in Git"),
         OwnerInboxKind::HarnessAuth => ("sign-in", "sign-ins"),
         OwnerInboxKind::ArtifactCapacity => ("capacity warning", "capacity warnings"),
+        OwnerInboxKind::ProjectCheck => (
+            "project check with unknown outcome",
+            "project checks with unknown outcomes",
+        ),
     };
     eliot_core::count_words(count as u64, one, many)
 }
