@@ -123,7 +123,7 @@ checked! {
     SwitchRequest => SwitchResponse, "swarm.switch";
     HarnessModelsRequest => HarnessModelsResponse, "harness.models";
     UsageSummaryRequest => UsageSummaryResponse, "usage.summary";
-    eliot_core::api::GoalGetRequest => eliot_core::api::GoalView, "goal.get";
+    eliot_core::api::GoalGetRequest => Option<eliot_core::api::GoalView>, "goal.get";
     eliot_core::api::WorkspaceListRequest => eliot_core::api::WorkspaceListResponse, "workspace.list";
     eliot_core::api::RoutingPreviewRequest => eliot_core::api::RoutingPreviewResponse, "routing.preview";
     eliot_core::api::harness::ModelsCatalogWatchRequest => eliot_core::api::harness::ModelsCatalogWatchResponse, "models.catalog.watch";
@@ -1750,9 +1750,8 @@ pub async fn goal_get(data_dir: &Path, agent: &str) -> Result<Option<eliot_core:
         mode: eliot_core::api::GoalMode::Eliot,
     };
     match call(data_dir, &request).await {
-        Ok(reply) => Ok(Some(reply)),
         Err(error) if error.code == "not_found" => Ok(None),
-        Err(error) => Err(error),
+        reply => reply,
     }
 }
 

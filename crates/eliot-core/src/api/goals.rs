@@ -862,11 +862,15 @@ impl GoalGetRequest {
         validate_agent(&self.agent)
     }
 
-    pub fn validate_response(&self, response: &GoalView) -> Result<()> {
+    /// A missing Goal reads as none, never as an error.
+    pub fn validate_response(&self, response: &Option<GoalView>) -> Result<()> {
+        let Some(view) = response else {
+            return self.validate();
+        };
         if self.validate().is_err()
-            || response.agent != self.agent
-            || response.mode != self.mode
-            || response.validate().is_err()
+            || view.agent != self.agent
+            || view.mode != self.mode
+            || view.validate().is_err()
         {
             return Err(Error::new(
                 "unknown",

@@ -376,13 +376,13 @@ impl Router {
             GoalGetRequest::validate,
         )?;
         require_eliot_mode(request.mode)?;
+        // A missing Goal reads as none, never as an error.
         let view = self
             .inner
             .store
             .lock()
             .await
-            .goal_get(&request.agent, request.mode.as_str())?
-            .ok_or_else(|| Error::new("not_found", "goal was not found"))?;
+            .goal_get(&request.agent, request.mode.as_str())?;
         request.validate_response(&view)?;
         serde_json::to_value(view)
             .map_err(|_| Error::new("internal", "goal state could not be encoded"))

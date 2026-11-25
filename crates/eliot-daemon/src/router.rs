@@ -262,6 +262,11 @@ struct RouterInner {
     /// Worker names already reported as unregistered. In-memory only, so a
     /// restart logs each missing registration once more.
     worker_registration_missing_logged: Mutex<HashSet<String>>,
+    /// Historical native-turn readbacks already refused as unsupported, by
+    /// (agent, generation). The stand refusal is stable for the generation,
+    /// so retries would only repeat the refused plugin open and its log.
+    /// In-memory only, so a restart logs each refusal once more.
+    turn_history_unsupported: Mutex<HashSet<(String, i64)>>,
     automatic_cleanup: Mutex<cleanup::AutomaticCleanupState>,
     cleanup_worker: Mutex<Option<String>>,
     mode: AtomicU8,
@@ -646,6 +651,7 @@ impl Router {
                         .collect(),
                 ),
                 worker_registration_missing_logged: Mutex::new(HashSet::new()),
+                turn_history_unsupported: Mutex::new(HashSet::new()),
                 automatic_cleanup: Mutex::new(cleanup::AutomaticCleanupState::default()),
                 cleanup_worker: Mutex::new(None),
                 mode: AtomicU8::new(MODE_OPEN),

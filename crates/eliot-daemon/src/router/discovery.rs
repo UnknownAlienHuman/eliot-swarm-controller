@@ -371,7 +371,7 @@ const METHODS: &[Method] = &[
     method!("provider.holds", ProviderHoldsRequest, ProviderHoldsResponse, true, false, "Page provider holds without credential values.", {"limit":20}),
     method!("provider.clear_hold", ProviderClearHoldRequest, ProviderClearHoldResponse, true, true, "Record corrective evidence and clear a provider hold.", {"id":EXAMPLE_ID,"scope":"profile:codex","corrective_evidence":"owner_verified","expected_probe_command":null}),
     method!("goal.set", GoalSetRequest, GoalView, true, true, "Set a bounded Eliot Goal; native mode is unsupported and max_cost needs the Agent's native session cost in its unit.", {"id":EXAMPLE_ID,"agent":"a1","definition":{"text":"Complete the assigned task.","check":["git","diff","--exit-code"],"max_rounds":1}}),
-    method!("goal.get", GoalGetRequest, GoalView, true, false, "Read the Eliot Goal for one Agent.", {"agent":"a1"}),
+    method!("goal.get", GoalGetRequest, Option<GoalView>, true, false, "Read the Eliot Goal for one Agent; null when it has none.", {"agent":"a1"}),
     method!("goal.pause", GoalPauseRequest, GoalView, true, true, "Pause an Eliot Goal without replaying an uncertain round.", {"id":EXAMPLE_ID,"agent":"a1","reason":"Owner pause."}),
     method!("goal.clear", GoalClearRequest, GoalView, true, true, "Clear one Eliot Goal.", {"id":EXAMPLE_ID,"agent":"a1"}),
     method!("goal.resume", GoalResumeRequest, GoalView, true, true, "Resume a paused Eliot Goal.", {"id":EXAMPLE_ID,"agent":"a1"}),

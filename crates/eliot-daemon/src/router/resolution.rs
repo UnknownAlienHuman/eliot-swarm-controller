@@ -16,9 +16,16 @@ use eliot_core::{
         TurnResolveRequest,
     },
 };
+use eliot_plugin::sync::LockExt;
 use eliot_store::{HistoricalTurn, HistoricalTurnCursor, TurnInactiveProof};
 use serde::de::DeserializeOwned;
 use serde_json::Value;
+
+/// Stand login refusal that stays unsupported for the whole agent
+/// generation: a copied store has no adopted proxy, so every retained
+/// history read for the generation fails the same stand verification
+/// (Codex `direct_login_refusal`).
+const STAND_LOGIN_UNSUPPORTED: &str = "stand_codex_login_unsupported";
 
 /// Authorize, secret-scan, parse, and validate one resolution request: the
 /// single validation gate for both resolution RPCs.
@@ -108,9 +115,11 @@ impl Router {
             let status = if let Some((_, status)) = turn.retained_terminal {
                 Some(status)
             } else if reader == Some(TurnHistoryReadback::HistoryFile) {
-                let result = self.inner.plugin_host.historical_turn_evidence(&turn).await;
-                self.historical_readback(&turn, "native.turn_evidence", result)
-                    .flatten()
+                let result = self.cached_historical_turn_evidence(&turn).await;
+                result.and_then(|result| {
+                    self.historical_readback(&turn, "native.turn_evidence", result)
+                        .flatten()
+                })
             } else if reader == Some(TurnHistoryReadback::OwnedSnapshot)
                 && turn.agent.generation == turn.generation
                 && turn.agent.native_scope.as_deref() == Some(turn.native_scope.as_str())
@@ -159,6 +168,33 @@ impl Router {
             }
         }
         Ok(next)
+    }
+
+    /// Read retained native history unless this agent generation was already
+    /// refused as unsupported. The stand refusal is stable for the
+    /// generation, so a retry would only repeat the refused plugin open;
+    /// the first refusal is still logged once through `historical_readback`.
+    async fn cached_historical_turn_evidence(
+        &self,
+        turn: &HistoricalTurn,
+    ) -> Option<Result<Option<eliot_core::api::TurnResolveStatus>>> {
+        let key = (turn.agent.id.clone(), turn.generation);
+        if self
+            .inner
+            .turn_history_unsupported
+            .lock_recover()
+            .contains(&key)
+        {
+            return None;
+        }
+        let result = self.inner.plugin_host.historical_turn_evidence(turn).await;
+        if matches!(&result, Err(error) if error.code == STAND_LOGIN_UNSUPPORTED) {
+            self.inner
+                .turn_history_unsupported
+                .lock_recover()
+                .insert(key);
+        }
+        Some(result)
     }
 
     fn historical_readback<T>(
