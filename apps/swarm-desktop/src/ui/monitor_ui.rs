@@ -837,9 +837,9 @@ impl DesktopApp {
             .text(search.text.clone())
             .placeholder_text("Search Agents")
             .automation_name("Search Agents")
-            .on_text_changed(
+            .on_text_changed(crate::views::text_edits(
                 context.callback(|text| Message::Monitor(MonitorMsg::SearchChanged(text))),
-            );
+            ));
         let by_project = self.monitor.by_project;
         items.push(KeyedView::new(
             "title",
@@ -1145,10 +1145,12 @@ impl DesktopApp {
     /// wrong, Activity & resources, Context, Heavy work, Technical). Ids and
     /// readback text live here, not in the conversation. Moving it under
     /// another task is a menu action ([`super::move_ui`]).
-    pub(super) fn details_view(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
-        let Some(id) = self.monitor.selected.clone() else {
-            return View::empty();
-        };
+    pub(super) fn details_view(
+        &self,
+        context: &mut ViewContext<Self>,
+        palette: Palette,
+    ) -> Option<View> {
+        let id = self.monitor.selected.clone()?;
         let mut items: Vec<KeyedView> = Vec::new();
         let mut technical = vec![format!("ID {id}")];
         let data = &self.monitor.data;
@@ -1781,7 +1783,7 @@ impl DesktopApp {
             ),
         ));
 
-        self.pane_body("Agent details", items)
+        Some(self.pane_body("Agent details", items))
     }
 }
 

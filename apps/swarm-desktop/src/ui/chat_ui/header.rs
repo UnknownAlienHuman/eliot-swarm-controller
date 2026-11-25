@@ -317,7 +317,7 @@ impl DesktopApp {
     ) -> View {
         Border::new()
             .grid_row(4)
-            .width(column)
+            .maybe_width(column)
             .max_width(tokens::layout::READING_WIDTH)
             .horizontal_alignment(HorizontalAlignment::Center)
             .margin(Thickness::new(0.0, tokens::spacing::SM, 0.0, 0.0))
@@ -370,7 +370,7 @@ impl DesktopApp {
                                     .content(m3::label("Force stop")),
                             )),
                     )),
-            )
+            ).into()
     }
 }
 
@@ -430,25 +430,29 @@ impl Pill {
     /// The pill: 24 DIPs, its mark and word 6 DIPs apart, 10 DIPs inside.
     fn view(self, palette: Palette) -> View {
         let (container, on) = palette.status_chip(self.tone());
-        let mark: View = match self {
-            Self::Working(word) => m3::row_mark(palette, m3::RowMark::Working, word),
-            Self::Waiting => m3::row_mark(palette, m3::RowMark::Waiting, "Waiting for you"),
-            Self::Idle => m3::row_mark(palette, m3::RowMark::Idle, "Idle"),
-            Self::Hold => m3::carrier(
+        let mark: Option<View> = match self {
+            Self::Working(word) => Some(m3::row_mark(palette, m3::RowMark::Working, word)),
+            Self::Waiting => Some(m3::row_mark(
+                palette,
+                m3::RowMark::Waiting,
+                "Waiting for you",
+            )),
+            Self::Idle => Some(m3::row_mark(palette, m3::RowMark::Idle, "Idle")),
+            Self::Hold => Some(m3::carrier(
                 palette,
                 |s| s.on_tertiary_container,
                 "Provider hold",
                 tokens::icon::CHEVRON,
                 m3::xs_icon(m3::glyph::HOLD),
-            ),
-            Self::Failed(word) => m3::carrier(
+            )),
+            Self::Failed(word) => Some(m3::carrier(
                 palette,
                 |s| s.error,
                 word,
                 tokens::icon::CHEVRON,
                 m3::xs_icon(m3::glyph::ERROR),
-            ),
-            Self::Stopped => View::empty(),
+            )),
+            Self::Stopped => None,
         };
         Border::new()
             .height(tokens::height::BADGE)
@@ -461,13 +465,17 @@ impl Pill {
                 StackPanel::new()
                     .orientation(Orientation::Horizontal)
                     .spacing(tokens::spacing::CHIP_GAP)
-                    .children((
+                    .keyed_children(crate::views::slots([
                         mark,
-                        m3::text(self.word(), tokens::text::LABEL)
-                            .foreground(on)
-                            .vertical_alignment(VerticalAlignment::Center),
-                    )),
+                        Some(
+                            m3::text(self.word(), tokens::text::LABEL)
+                                .foreground(on)
+                                .vertical_alignment(VerticalAlignment::Center)
+                                .into(),
+                        ),
+                    ])),
             )
+            .into()
     }
 }
 
@@ -519,7 +527,7 @@ impl Component for Header {
     }
 
     fn update(&mut self, message: Message, _context: &ComponentContext<Self>) {
-        let _ = self.send.call(message);
+        self.send.call(message);
     }
 
     fn view(&self, input: &HeaderInput, context: &mut ViewContext<Self>) -> View {
@@ -535,20 +543,21 @@ impl Component for Header {
                     // whose callback changed, replacing the native
                     // MenuFlyout and dropping a click on the open one.
                     // Reactor reports the chosen item's label only.
-                    context.callback(|label: String| {
+                    crate::views::menu_keys(context.callback(|label: String| {
                         Action::from_label(&label)
                             .map_or(Message::Menu(menu_ui::MenuMsg::Ignored), |action| {
                                 Message::Chat(ChatMsg::AgentMenu(action))
                             })
-                    }),
+                    })),
                 )),
             None => m3::icon_button(palette)
                 .is_enabled(false)
                 .automation_name("More task actions")
-                .content(m3::icon(m3::glyph::MORE)),
+                .content(m3::icon(m3::glyph::MORE))
+                .into(),
         };
-        let goal: View = match &input.goal {
-            Some(words) => m3::status_chip_button(palette)
+        let goal: Option<View> = input.goal.as_ref().map(|words| {
+            m3::status_chip_button(palette)
                 .automation_name(format!("{words}: open Details"))
                 .on_click(
                     context.message(Message::Monitor(MonitorMsg::PanelChosen(Panel::Details))),
@@ -558,9 +567,9 @@ impl Component for Header {
                     words,
                     false,
                     tokens::layout::PROJECT_CHIP_WIDTH,
-                )),
-            None => View::empty(),
-        };
+                ))
+                .into()
+        });
         // The pane toggles (component 3): pressed = that tab of the right
         // pane is open; the pressed one closes the pane. Changes and
         // "Agents N" are labelled buttons (tonal when pressed), Agents
@@ -588,10 +597,9 @@ impl Component for Header {
         };
         let changes: View = {
             let pressed = input.open == Panel::Changes;
-            let counts: View = match input.changes {
-                Some((add, del)) => m3::diff_counts(add, del, pressed),
-                None => View::empty(),
-            };
+            let counts: Option<View> = input
+                .changes
+                .map(|(add, del)| m3::diff_counts(add, del, pressed));
             labelled(pressed)
                 .automation_name(named(Panel::Changes, "Changes"))
                 .on_click(toggle(Panel::Changes))
@@ -603,11 +611,14 @@ impl Component for Header {
                             tokens::spacing::INSET - tokens::spacing::ROW,
                             0.0,
                         ))
-                        .children((
-                            m3::text("Changes", tokens::text::BUTTON)
-                                .vertical_alignment(VerticalAlignment::Center),
+                        .keyed_children(crate::views::slots([
+                            Some(
+                                m3::text("Changes", tokens::text::BUTTON)
+                                    .vertical_alignment(VerticalAlignment::Center)
+                                    .into(),
+                            ),
                             counts,
-                        )),
+                        ])),
                 )
                 .tooltip("Changes")
         };
@@ -622,7 +633,7 @@ impl Component for Header {
                 } else {
                     glyph.to_owned()
                 }))
-                .tooltip(words.to_owned())
+                .tooltip(words)
         };
         let agents: View = if input.workers > 0 {
             let pressed = input.open == Panel::Agents;
@@ -684,43 +695,54 @@ impl Component for Header {
                             // Keyed by the open tab: a toggle whose pressed
                             // state changes is a new control, so its colors
                             // (tonal or outlined, on or off) are applied.
-                            .keyed_children(vec![
-                                KeyedView::new("pill", input.pill.view(palette)),
-                                KeyedView::new("goal", goal),
-                                KeyedView::new(
-                                    format!("changes:{}", input.open == Panel::Changes),
-                                    changes,
-                                ),
-                                KeyedView::new(
-                                    format!("agents:{}", input.open == Panel::Agents),
-                                    agents,
-                                ),
-                                KeyedView::new(
-                                    format!("details:{}", input.open == Panel::Details),
-                                    details,
-                                ),
-                                KeyedView::new(
-                                    format!("terminal:{}", input.open == Panel::Terminal),
-                                    terminal,
-                                ),
-                                KeyedView::new("more", more),
-                            ]),
+                            .keyed_children(
+                                [
+                                    Some(KeyedView::new("pill", input.pill.view(palette))),
+                                    goal.map(|goal| KeyedView::new("goal", goal)),
+                                    Some(KeyedView::new(
+                                        format!("changes:{}", input.open == Panel::Changes),
+                                        changes,
+                                    )),
+                                    Some(KeyedView::new(
+                                        format!("agents:{}", input.open == Panel::Agents),
+                                        agents,
+                                    )),
+                                    Some(KeyedView::new(
+                                        format!("details:{}", input.open == Panel::Details),
+                                        details,
+                                    )),
+                                    Some(KeyedView::new(
+                                        format!("terminal:{}", input.open == Panel::Terminal),
+                                        terminal,
+                                    )),
+                                    Some(KeyedView::new("more", more)),
+                                ]
+                                .into_iter()
+                                .flatten()
+                                .collect::<Vec<_>>(),
+                            ),
                     )),
             );
         // The wave under the header while a turn runs (`.wave-bar`).
-        let wave: View = if input.running {
-            Border::new()
-                .height(tokens::wave::TRACK)
-                .padding(Thickness::xy(tokens::spacing::MD, 0.0))
-                .content(
-                    ProgressBar::new()
-                        .is_indeterminate(true)
-                        .automation_name("Turn running")
-                        .horizontal_alignment(HorizontalAlignment::Stretch),
-                )
+        let wave: Option<View> = if input.running {
+            Some(
+                Border::new()
+                    .height(tokens::wave::TRACK)
+                    .padding(Thickness::xy(tokens::spacing::MD, 0.0))
+                    .content(
+                        ProgressBar::new()
+                            .is_indeterminate(true)
+                            .automation_name("Turn running")
+                            .horizontal_alignment(HorizontalAlignment::Stretch),
+                    )
+                    .into(),
+            )
         } else {
-            View::empty()
+            None
         };
-        StackPanel::new().grid_row(0).children((bar, wave))
+        StackPanel::new()
+            .grid_row(0)
+            .keyed_children(crate::views::slots([Some(bar.into()), wave]))
+            .into()
     }
 }

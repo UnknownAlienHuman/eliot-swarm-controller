@@ -2487,37 +2487,42 @@ impl DesktopApp {
         // the main area, over it in a narrow window, or the whole card in
         // Full view (the conversation is then not drawn).
         let full = self.panel_shown() && self.pane.full;
-        let main: View = if full { View::empty() } else { main };
-        let panel: View = if !self.panel_shown() {
-            View::empty()
-        } else if full {
-            Border::new()
-                .background(palette.pane())
-                .corner_radius(radius)
-                .content(self.panel_view(context, palette))
-        } else if self.pane_overlays() {
-            Border::new()
-                .width(
-                    self.pane_width().min(
-                        self.window_width
-                            .map_or(f64::MAX, |width| width - tokens::layout::CARD_GAP),
-                    ),
-                )
-                .horizontal_alignment(HorizontalAlignment::Right)
-                .background(palette.pane())
-                .corner_radius(CornerRadius::new(0.0, radius, radius, 0.0))
-                .border_brush(palette.outline())
-                .border_thickness(Thickness::new(tokens::layout::HAIRLINE, 0.0, 0.0, 0.0))
-                .content(self.panel_view(context, palette))
+        let main: Option<View> = if full { None } else { Some(main) };
+        let panel: Option<View> = if !self.panel_shown() {
+            None
         } else {
-            card_columns.push(GridLength::Pixel(self.pane_width()));
-            Border::new()
-                .grid_column(1)
-                .background(palette.pane())
-                .corner_radius(CornerRadius::new(0.0, radius, radius, 0.0))
-                .border_brush(palette.outline())
-                .border_thickness(Thickness::new(tokens::layout::HAIRLINE, 0.0, 0.0, 0.0))
-                .content(self.panel_view(context, palette))
+            Some(if full {
+                Border::new()
+                    .background(palette.pane())
+                    .corner_radius(radius)
+                    .content(self.panel_view(context, palette))
+                    .into()
+            } else if self.pane_overlays() {
+                Border::new()
+                    .width(
+                        self.pane_width().min(
+                            self.window_width
+                                .map_or(f64::MAX, |width| width - tokens::layout::CARD_GAP),
+                        ),
+                    )
+                    .horizontal_alignment(HorizontalAlignment::Right)
+                    .background(palette.pane())
+                    .corner_radius(CornerRadius::new(0.0, radius, radius, 0.0))
+                    .border_brush(palette.outline())
+                    .border_thickness(Thickness::new(tokens::layout::HAIRLINE, 0.0, 0.0, 0.0))
+                    .content(self.panel_view(context, palette))
+                    .into()
+            } else {
+                card_columns.push(GridLength::Pixel(self.pane_width()));
+                Border::new()
+                    .grid_column(1)
+                    .background(palette.pane())
+                    .corner_radius(CornerRadius::new(0.0, radius, radius, 0.0))
+                    .border_brush(palette.outline())
+                    .border_thickness(Thickness::new(tokens::layout::HAIRLINE, 0.0, 0.0, 0.0))
+                    .content(self.panel_view(context, palette))
+                    .into()
+            })
         };
         // Its `elevation-1` is a real shadow on the composition host
         // (`crate::shadow`), as the composer's; the true-black themes ring
@@ -2539,7 +2544,13 @@ impl DesktopApp {
                 .content(
                     Grid::new()
                         .columns(card_columns)
-                        .children((Border::new().content(main), panel)),
+                        .keyed_children(crate::views::slots([
+                            Some(
+                                crate::views::MaybeContent::maybe_content(Border::new(), main)
+                                    .into(),
+                            ),
+                            panel,
+                        ])),
                 ),
         );
         // Settings replaces the sidebar with its own navigation. While the
@@ -2559,6 +2570,7 @@ impl DesktopApp {
                         .content(side),
                     Border::new().background(Brush::Solid(Color::transparent())),
                 ))
+                .into()
         } else {
             side
         };
@@ -2574,29 +2586,33 @@ impl DesktopApp {
             ])
             .children((Border::new().grid_column(0).content(side), card));
         // One cell: the window, the row-menu button that carries the
-        // sidebar's menu flyout, the attach chooser's button, and the
-        // confirmation dialog.
-        let overlay = if self.handoff.open {
+        // sidebar's menu flyout and the attach chooser's button; the
+        // confirmation dialog is attached to it (a Reactor 0.101 dialog is
+        // an attachment, not a view).
+        let overlay: Option<ContentDialog> = if self.handoff.open {
             self.handoff_dialog(context)
         } else if self.settings.cleanup_confirm {
             self.cleanup_confirmation(context, palette)
         } else if let Some(dialog) = &self.bulk {
-            self.bulk_dialog(dialog, context, palette)
+            Some(self.bulk_dialog(dialog, context, palette))
         } else if self.link.confirm_fresh {
-            self.fresh_confirmation(context, palette)
+            Some(self.fresh_confirmation(context, palette))
         } else if self.inbox.confirm.is_some() {
             self.inbox_confirmation(context, palette)
         } else if self.settings.daemon_confirm.is_some() {
-            self.daemon_confirmation(context, palette)
+            Some(self.daemon_confirmation(context, palette))
         } else {
-            self.task_dialog(context, palette)
+            Some(self.task_dialog(context, palette))
         };
         let window = Grid::new().children((
             columns_grid,
             self.menu_anchor(context),
             self.attach_anchor(context, palette),
-            overlay,
         ));
+        let window: View = match overlay {
+            Some(dialog) => window.content_dialog(dialog),
+            None => window.into(),
+        };
         // Reactor updates a Button's resource overrides in place, but WinUI
         // resolves a template's ThemeResource values only when the template
         // is applied or the theme changes, and the theme change arrives before
@@ -2616,7 +2632,9 @@ impl DesktopApp {
                 "still"
             },
         );
-        Grid::new().keyed_children(vec![KeyedView::new(palette_key, window)])
+        Grid::new()
+            .keyed_children(vec![KeyedView::new(palette_key, window)])
+            .into()
     }
 
     /// The sidebar's sections now: a search's matches flat in their
@@ -2866,7 +2884,7 @@ impl DesktopApp {
             None
         };
         // The dot sits on the button's corner, clear of the icon.
-        let dot: View = tone.map_or_else(View::empty, |tone| {
+        let dot: Option<View> = tone.map(|tone| {
             Border::new()
                 .horizontal_alignment(HorizontalAlignment::Right)
                 .vertical_alignment(VerticalAlignment::Top)
@@ -2877,6 +2895,7 @@ impl DesktopApp {
                     0.0,
                 ))
                 .content(m3::status_mark(palette, tone, tokens::layout::DOT))
+                .into()
         });
         let button = |glyph: &str, name: String, message: Message| {
             m3::icon_button(palette)
@@ -2917,17 +2936,20 @@ impl DesktopApp {
             ))
             .spacing(tokens::spacing::ROW_GAP)
             .children((
-                Grid::new().children((
-                    button(
-                        m3::glyph::HUB,
-                        format!(
-                            "Agents: {summary} ({})",
-                            if open { "open" } else { "closed" }
-                        ),
-                        Message::Shell(ShellMsg::PlaceOpened(page_ui::Place::Agents)),
+                Grid::new().keyed_children(crate::views::slots([
+                    Some(
+                        button(
+                            m3::glyph::HUB,
+                            format!(
+                                "Agents: {summary} ({})",
+                                if open { "open" } else { "closed" }
+                            ),
+                            Message::Shell(ShellMsg::PlaceOpened(page_ui::Place::Agents)),
+                        )
+                        .into(),
                     ),
                     dot,
-                )),
+                ])),
                 button(
                     m3::glyph::SETTINGS,
                     "Settings".to_owned(),
@@ -2937,6 +2959,7 @@ impl DesktopApp {
         Grid::new()
             .rows([GridLength::Auto, GridLength::STAR])
             .children((top, bottom))
+            .into()
     }
 
     /// Settings in the sidebar's place (the Codex settings navigation), on
@@ -2960,9 +2983,9 @@ impl DesktopApp {
                         .text(self.settings.query.clone())
                         .placeholder_text("Search settings")
                         .automation_name("Search settings")
-                        .on_text_changed(
+                        .on_text_changed(crate::views::text_edits(
                             context.callback(|text| Message::Shell(ShellMsg::SettingsSearch(text))),
-                        ),
+                        )),
                 ),
             ));
         let rows = self.settings_rows(context, palette);
@@ -2980,6 +3003,7 @@ impl DesktopApp {
                             .keyed_children(rows),
                     ),
             ))
+            .into()
     }
 
     /// Show a short notice above the composer (refusals, uncertain

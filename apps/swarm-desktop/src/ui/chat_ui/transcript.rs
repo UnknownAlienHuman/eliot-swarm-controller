@@ -161,7 +161,7 @@ pub(super) fn starting_view(
     let (shown, files) = crate::attachments::split(text);
     StackPanel::new()
         .grid_row(1)
-        .width(column)
+        .maybe_width(column)
         .max_width(tokens::layout::READING_WIDTH)
         .horizontal_alignment(HorizontalAlignment::Center)
         .vertical_alignment(VerticalAlignment::Top)
@@ -175,21 +175,17 @@ pub(super) fn starting_view(
                 .horizontal_alignment(HorizontalAlignment::Right)
                 .max_width(tokens::layout::READING_WIDTH * tokens::layout::BUBBLE_SHARE)
                 .automation_name(format!("You: {shown}"))
-                .children((
-                    m3::bubble(
+                .keyed_children(crate::views::slots([
+                    Some(m3::bubble(
                         palette,
                         m3::body(shown.to_owned()).text_wrapping(TextWrapping::Wrap),
                         None,
-                    ),
-                    if files.is_empty() {
-                        View::empty()
-                    } else {
-                        views::attached_chips(&files, palette)
-                    },
-                )),
+                    )),
+                    (!files.is_empty()).then(|| views::attached_chips(&files, palette)),
+                ])),
             StackPanel::new()
                 .spacing(tokens::spacing::XS)
-                .automation_name(label.to_owned())
+                .automation_name(label)
                 .children((
                     m3::secondary(label.to_owned()),
                     ProgressBar::new()
@@ -198,6 +194,7 @@ pub(super) fn starting_view(
                         .horizontal_alignment(HorizontalAlignment::Left),
                 )),
         ))
+        .into()
 }
 
 /// Multiple-choice submission rule: the MSP wire carries exactly one of

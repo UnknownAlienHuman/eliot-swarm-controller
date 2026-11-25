@@ -25,6 +25,90 @@ use crate::markdown::{Block, Doc, Inline};
 use crate::theme::winui::Palette;
 use crate::ui::tokens;
 
+/// Children with optional slots. Reactor 0.101 has no empty view, so an
+/// absent slot is left out, and each present child is keyed by its slot
+/// index: the key a positional child at that index gets, so a slot that
+/// fills or empties does not shift its siblings' identity.
+pub fn slots<const N: usize>(children: [Option<View>; N]) -> Vec<KeyedView> {
+    children
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, child)| child.map(|view| KeyedView::new(index, view)))
+        .collect()
+}
+
+/// Optional content: Reactor 0.101 has no empty view, so a control whose
+/// slot is empty keeps no child.
+pub trait MaybeContent: Sized {
+    fn maybe_content(self, content: Option<View>) -> Self;
+}
+
+impl MaybeContent for Border {
+    fn maybe_content(self, content: Option<View>) -> Self {
+        match content {
+            Some(content) => self.content(content),
+            None => self,
+        }
+    }
+}
+
+/// Optional sizes: Reactor 0.101 takes a plain `f64`; an omitted size
+/// leaves the control at its default (Auto), as `None` did in 0.100.
+pub trait MaybeSize: Sized {
+    fn maybe_width(self, width: Option<f64>) -> Self;
+    fn maybe_max_width(self, width: Option<f64>) -> Self;
+}
+
+macro_rules! maybe_size {
+    ($($control:ty),*) => {$(
+        impl MaybeSize for $control {
+            fn maybe_width(self, width: Option<f64>) -> Self {
+                match width {
+                    Some(width) => self.width(width),
+                    None => self,
+                }
+            }
+
+            fn maybe_max_width(self, width: Option<f64>) -> Self {
+                match width {
+                    Some(width) => self.max_width(width),
+                    None => self,
+                }
+            }
+        }
+    )*};
+}
+
+maybe_size!(Border, Grid, StackPanel);
+
+/// A text box's edits for a `String` handler: Reactor 0.101 reports them as
+/// `Rc<str>`.
+pub fn text_edits(callback: Callback<String>) -> impl Fn(Rc<str>) + 'static {
+    move |text| callback.call(text.to_string())
+}
+
+/// A menu's picks for a `String` handler: Reactor 0.101 reports the picked
+/// item's `Key` (0.100 reported its label); every menu here keys its items
+/// by string.
+pub fn menu_keys(callback: Callback<String>) -> impl Fn(Key) + 'static {
+    move |key| {
+        if let Some(key) = key.as_str() {
+            callback.call(key.to_owned());
+        }
+    }
+}
+
+/// A two-state check's changes for a `bool` handler: Reactor 0.101 reports
+/// `IsChecked` as `Option<bool>`; indeterminate reads as unchecked.
+pub fn check_changes(callback: Callback<bool>) -> impl Fn(Option<bool>) + 'static {
+    move |checked| callback.call(checked == Some(true))
+}
+
+/// A code block's font: the system monospace face, Cascadia Mono, then
+/// Consolas where it is missing. Set on the code `TextBlock` alone; no
+/// application font key changes.
+const CODE_FONT: &str = "Cascadia Mono, Consolas";
+
 /// One display block, ready for the UI thread.
 #[derive(Clone)]
 pub enum RenderedBlock {
@@ -203,6 +287,7 @@ fn list_view(items: &[(usize, String, RichText)]) -> View {
                     )
                 }),
         )
+        .into()
 }
 
 fn render_part(part: &Part, docs: &HashMap<u64, Doc>) -> RenderedPart {
@@ -309,14 +394,16 @@ const INSET: f64 = (tokens::height::CONTROL - tokens::icon::ROW) / 2.0;
 fn copy_button(name: &str, hovered: bool, palette: Palette, callback: impl Fn() + 'static) -> View {
     if hovered {
         crate::m3::icon_button(palette)
-            .automation_name(name.to_owned())
+            .automation_name(name)
             .on_click(callback)
             .content(copy_glyph())
+            .into()
     } else {
         crate::m3::reveal_button()
-            .automation_name(name.to_owned())
+            .automation_name(name)
             .on_click(callback)
             .content(copy_glyph())
+            .into()
     }
 }
 
@@ -360,30 +447,36 @@ fn block_views(
                     let copy = callbacks.copy_code.clone();
                     let key = part.key.clone();
                     let code_index = *code_index;
-                    StackPanel::new().spacing(tokens::spacing::XS).children((
-                        Border::new()
-                            .background(palette.composer())
-                            .border_brush(palette.outline())
-                            .border_thickness(Thickness::uniform(tokens::layout::HAIRLINE))
-                            .corner_radius(tokens::radius::CONTAINER)
-                            .padding(Thickness::xy(tokens::spacing::INSET, tokens::spacing::SM))
-                            .content(
-                                ScrollViewer::new()
-                                    .horizontal_scroll_bar_visibility(ScrollBarVisibility::Auto)
-                                    .vertical_scroll_bar_visibility(ScrollBarVisibility::Disabled)
-                                    .content(
-                                        crate::m3::body(text.clone())
-                                            .text_wrapping(TextWrapping::NoWrap)
-                                            .is_text_selection_enabled(true),
-                                    ),
-                            ),
-                        Border::new()
-                            .horizontal_alignment(HorizontalAlignment::Left)
-                            .margin(Thickness::new(-INSET, 0.0, 0.0, 0.0))
-                            .content(copy_button("Copy code", hovered, palette, move || {
-                                let _ = copy.call((key.clone(), code_index));
-                            })),
-                    ))
+                    StackPanel::new()
+                        .spacing(tokens::spacing::XS)
+                        .children((
+                            Border::new()
+                                .background(palette.composer())
+                                .border_brush(palette.outline())
+                                .border_thickness(Thickness::uniform(tokens::layout::HAIRLINE))
+                                .corner_radius(tokens::radius::CONTAINER)
+                                .padding(Thickness::xy(tokens::spacing::INSET, tokens::spacing::SM))
+                                .content(
+                                    ScrollViewer::new()
+                                        .horizontal_scroll_bar_visibility(ScrollBarVisibility::Auto)
+                                        .vertical_scroll_bar_visibility(
+                                            ScrollBarVisibility::Disabled,
+                                        )
+                                        .content(
+                                            crate::m3::body(text.clone())
+                                                .font_family(CODE_FONT)
+                                                .text_wrapping(TextWrapping::NoWrap)
+                                                .is_text_selection_enabled(true),
+                                        ),
+                                ),
+                            Border::new()
+                                .horizontal_alignment(HorizontalAlignment::Left)
+                                .margin(Thickness::new(-INSET, 0.0, 0.0, 0.0))
+                                .content(copy_button("Copy code", hovered, palette, move || {
+                                    copy.call((key.clone(), code_index));
+                                })),
+                        ))
+                        .into()
                 }
                 RenderedBlock::Rule => crate::m3::divider(palette).into(),
                 RenderedBlock::Table(table) => View::component::<TableView>(TableInput {
@@ -407,33 +500,33 @@ fn part_view(
     hovered: bool,
     callbacks: &RowCallbacks,
     palette: Palette,
-) -> View {
+) -> Option<View> {
     let copy = callbacks.copy_part.clone();
     let key = part.key.clone();
     let copy_message = move || {
-        let _ = copy.call(key.clone());
+        copy.call(key.clone());
     };
-    match part.kind {
+    Some(match part.kind {
         PartKind::Input => StackPanel::new()
             .spacing(tokens::spacing::XS)
             .horizontal_alignment(HorizontalAlignment::Right)
             .max_width(tokens::layout::READING_WIDTH * tokens::layout::BUBBLE_SHARE)
-            .children((
-                crate::m3::bubble(
+            .keyed_children(crate::views::slots([
+                Some(crate::m3::bubble(
                     palette,
                     bubble_content(&part.plain, &part.label, palette),
                     None,
+                )),
+                (!part.attachments.is_empty()).then(|| attached_chips(&part.attachments, palette)),
+                Some(
+                    Border::new()
+                        .horizontal_alignment(HorizontalAlignment::Right)
+                        .margin(Thickness::new(0.0, 0.0, -INSET, 0.0))
+                        .content(copy_button("Copy message", hovered, palette, copy_message))
+                        .into(),
                 ),
-                if part.attachments.is_empty() {
-                    View::empty()
-                } else {
-                    attached_chips(&part.attachments, palette)
-                },
-                Border::new()
-                    .horizontal_alignment(HorizontalAlignment::Right)
-                    .margin(Thickness::new(0.0, 0.0, -INSET, 0.0))
-                    .content(copy_button("Copy message", hovered, palette, copy_message)),
-            )),
+            ]))
+            .into(),
         // A steered message stays in the turn it steered, its label under
         // the text ("Steer · 14:02").
         PartKind::Steer => Border::new()
@@ -444,87 +537,109 @@ fn part_view(
                 palette,
                 bubble_content(&part.plain, &part.label, palette),
                 None,
-            )),
+            ))
+            .into(),
         // The agent's commentary between steps (`.note`).
         PartKind::Progress => StackPanel::new()
             .spacing(tokens::spacing::SM)
             .margin(Thickness::xy(tokens::spacing::ROW, tokens::spacing::XS))
-            .keyed_children(block_views(part, callbacks, hovered, palette)),
+            .keyed_children(block_views(part, callbacks, hovered, palette))
+            .into(),
         PartKind::Tools => step_view(part, expanded, callbacks, palette),
-        PartKind::Log => View::empty(),
-        PartKind::Edited => View::empty(),
+        PartKind::Log | PartKind::Edited => return None,
         // The answer: Markdown on the surface; a label only when the
         // outcome is not a plain success.
         PartKind::Final => {
-            let note: View = if part.label == "Assistant" {
-                View::empty()
-            } else {
-                label(&part.label).into()
-            };
-            StackPanel::new().spacing(tokens::spacing::SM).children((
-                note,
-                StackPanel::new()
-                    .spacing(tokens::spacing::SM)
-                    .keyed_children(block_views(part, callbacks, hovered, palette)),
-                Border::new()
-                    .horizontal_alignment(HorizontalAlignment::Left)
-                    .margin(Thickness::new(-INSET, 0.0, 0.0, 0.0))
-                    .content(copy_button("Copy message", hovered, palette, copy_message)),
-            ))
+            let note: Option<View> = (part.label != "Assistant").then(|| label(&part.label).into());
+            StackPanel::new()
+                .spacing(tokens::spacing::SM)
+                .keyed_children(crate::views::slots([
+                    note,
+                    Some(
+                        StackPanel::new()
+                            .spacing(tokens::spacing::SM)
+                            .keyed_children(block_views(part, callbacks, hovered, palette))
+                            .into(),
+                    ),
+                    Some(
+                        Border::new()
+                            .horizontal_alignment(HorizontalAlignment::Left)
+                            .margin(Thickness::new(-INSET, 0.0, 0.0, 0.0))
+                            .content(copy_button("Copy message", hovered, palette, copy_message))
+                            .into(),
+                    ),
+                ]))
+                .into()
         }
         // A local input waiting for its turn ("Sending…", "Starting
         // Codex…"): its words and the wave.
-        PartKind::Working => StackPanel::new().spacing(tokens::spacing::XS).children((
-            label(&part.label),
-            // Why the check of its outcome failed, when it did.
-            if part.detail.is_empty() {
-                View::empty()
-            } else {
-                label(&part.detail.join(" · "))
-                    .foreground(palette.attention())
-                    .text_wrapping(TextWrapping::Wrap)
-                    .is_text_selection_enabled(true)
-                    .into()
-            },
-            ProgressBar::new()
-                .is_indeterminate(true)
-                .width(tokens::layout::PROGRESS_WIDTH)
-                .horizontal_alignment(HorizontalAlignment::Left),
-        )),
+        PartKind::Working => StackPanel::new()
+            .spacing(tokens::spacing::XS)
+            .keyed_children(crate::views::slots([
+                Some(label(&part.label).into()),
+                // Why the check of its outcome failed, when it did.
+                (!part.detail.is_empty()).then(|| {
+                    label(&part.detail.join(" · "))
+                        .foreground(palette.attention())
+                        .text_wrapping(TextWrapping::Wrap)
+                        .is_text_selection_enabled(true)
+                        .into()
+                }),
+                Some(
+                    ProgressBar::new()
+                        .is_indeterminate(true)
+                        .width(tokens::layout::PROGRESS_WIDTH)
+                        .horizontal_alignment(HorizontalAlignment::Left)
+                        .into(),
+                ),
+            ]))
+            .into(),
         // A start that did not happen: why (`swarm why`), its origin, and
         // Retry when the failure is definite.
         PartKind::Failed | PartKind::TurnFailed | PartKind::Unconfirmed => {
-            let action: View = if part.kind == PartKind::Failed {
+            let action: Option<View> = if part.kind == PartKind::Failed {
                 let retry = callbacks.retry.clone();
                 let key = part.key.clone();
-                crate::m3::outlined(palette)
-                    .horizontal_alignment(HorizontalAlignment::Left)
-                    .automation_name("Retry")
-                    .on_click(move || {
-                        let _ = retry.call(key.clone());
-                    })
-                    .content(crate::m3::label("Retry"))
+                Some(
+                    crate::m3::outlined(palette)
+                        .horizontal_alignment(HorizontalAlignment::Left)
+                        .automation_name("Retry")
+                        .on_click(move || {
+                            retry.call(key.clone());
+                        })
+                        .content(crate::m3::label("Retry"))
+                        .into(),
+                )
             } else if let (PartKind::TurnFailed, Some(pick_model)) =
                 (part.kind, callbacks.pick_model.clone())
             {
-                crate::m3::outlined(palette)
-                    .horizontal_alignment(HorizontalAlignment::Left)
-                    .automation_name("Pick another model")
-                    .on_click(move || {
-                        let _ = pick_model.call(());
-                    })
-                    .content(crate::m3::label("Pick another model"))
+                Some(
+                    crate::m3::outlined(palette)
+                        .horizontal_alignment(HorizontalAlignment::Left)
+                        .automation_name("Pick another model")
+                        .on_click(move || {
+                            pick_model.call(());
+                        })
+                        .content(crate::m3::label("Pick another model"))
+                        .into(),
+                )
             } else {
-                View::empty()
+                None
             };
-            StackPanel::new().spacing(tokens::spacing::XS).children((
-                crate::m3::body(format!("{} · {}", part.label, part.plain))
-                    .text_wrapping(TextWrapping::Wrap)
-                    .is_text_selection_enabled(true)
-                    .foreground(palette.attention()),
-                label(&part.detail.join(" · ")),
-                action,
-            ))
+            StackPanel::new()
+                .spacing(tokens::spacing::XS)
+                .keyed_children(crate::views::slots([
+                    Some(
+                        crate::m3::body(format!("{} · {}", part.label, part.plain))
+                            .text_wrapping(TextWrapping::Wrap)
+                            .is_text_selection_enabled(true)
+                            .foreground(palette.attention())
+                            .into(),
+                    ),
+                    Some(label(&part.detail.join(" · ")).into()),
+                    action,
+                ]))
+                .into()
         }
         // What Swarm inserted (a Swarm note, service or peer mail): never
         // the owner's bubble. One step row with its fixed frame line, the
@@ -539,15 +654,15 @@ fn part_view(
                     if expanded { "expanded" } else { "collapsed" }
                 ))
                 .on_click(move || {
-                    let _ = toggle.call((key.clone(), !expanded));
+                    toggle.call((key.clone(), !expanded));
                 })
                 .content(crate::m3::step_content(
                     crate::m3::icon(crate::m3::glyph::INFO),
                     &part.label,
-                    View::empty(),
+                    None,
                     palette,
                 ));
-            let detail: View = if expanded && !part.plain.is_empty() {
+            let detail: Option<View> = (expanded && !part.plain.is_empty()).then(|| {
                 Border::new()
                     .background(palette.composer())
                     .corner_radius(tokens::radius::CONTAINER)
@@ -558,12 +673,12 @@ fn part_view(
                             .is_text_selection_enabled(true)
                             .automation_name(format!("Swarm note content: {}", part.plain)),
                     )
-            } else {
-                View::empty()
-            };
+                    .into()
+            });
             StackPanel::new()
                 .spacing(tokens::spacing::XS)
-                .children((row, detail))
+                .keyed_children(crate::views::slots([Some(row.into()), detail]))
+                .into()
         }
         // The end of a turn without an answer ("Stopped by you after 3m")
         // is a service line; other notices keep their label.
@@ -576,19 +691,23 @@ fn part_view(
             .into(),
         // Where a new generation starts: one quiet line, read out by name.
         PartKind::Generation => service_line(&part.label, generation_glyph(&part.label)),
-    }
+    })
 }
 
 /// A message bubble's text and, under it, its time and label
 /// ("You · 13:58", "Steer · 14:02") in `label-small`.
 fn bubble_content(text: &str, meta: &str, palette: Palette) -> View {
-    StackPanel::new().spacing(tokens::spacing::XS).children((
-        crate::m3::body(text.to_owned())
-            .foreground(palette.on_selected())
-            .text_wrapping(TextWrapping::Wrap)
-            .is_text_selection_enabled(true),
-        crate::m3::text(meta.to_owned(), tokens::text::TRAILING).foreground(palette.on_selected()),
-    ))
+    StackPanel::new()
+        .spacing(tokens::spacing::XS)
+        .children((
+            crate::m3::body(text.to_owned())
+                .foreground(palette.on_selected())
+                .text_wrapping(TextWrapping::Wrap)
+                .is_text_selection_enabled(true),
+            crate::m3::text(meta.to_owned(), tokens::text::TRAILING)
+                .foreground(palette.on_selected()),
+        ))
+        .into()
 }
 
 /// A service line (`.svc`): quiet centred text after a 16-DIP icon.
@@ -597,13 +716,14 @@ fn service_line(text: &str, glyph: &str) -> View {
         .orientation(Orientation::Horizontal)
         .spacing(tokens::spacing::SM)
         .horizontal_alignment(HorizontalAlignment::Center)
-        .automation_name(text.to_owned())
+        .automation_name(text)
         .children((
             crate::m3::muted_icon(glyph),
             crate::m3::secondary(text.to_owned())
                 .vertical_alignment(VerticalAlignment::Center)
                 .text_wrapping(TextWrapping::Wrap),
         ))
+        .into()
 }
 
 /// The icon of a generation's line: a restart, a resume, a move.
@@ -667,21 +787,24 @@ impl Component for TableView {
         let copy = context.callback(move |()| {
             let _ = crate::clipboard::set_text(&text);
         });
-        StackPanel::new().spacing(tokens::spacing::XS).children((
-            grid,
-            StackPanel::new()
-                .orientation(Orientation::Horizontal)
-                .spacing(tokens::spacing::SM)
-                .children((
-                    crate::m3::secondary(left_out.join(" \u{b7} "))
-                        .vertical_alignment(VerticalAlignment::Center),
-                    crate::m3::text_button(input.palette)
-                        .automation_name("Copy table: every row, tab-separated")
-                        .on_click(copy)
-                        .content(crate::m3::label("Copy table"))
-                        .tooltip("Copies every row, tab-separated"),
-                )),
-        ))
+        StackPanel::new()
+            .spacing(tokens::spacing::XS)
+            .children((
+                grid,
+                StackPanel::new()
+                    .orientation(Orientation::Horizontal)
+                    .spacing(tokens::spacing::SM)
+                    .children((
+                        crate::m3::secondary(left_out.join(" \u{b7} "))
+                            .vertical_alignment(VerticalAlignment::Center),
+                        crate::m3::text_button(input.palette)
+                            .automation_name("Copy table: every row, tab-separated")
+                            .on_click(copy)
+                            .content(crate::m3::label("Copy table"))
+                            .tooltip("Copies every row, tab-separated"),
+                    )),
+            ))
+            .into()
     }
 }
 
@@ -731,6 +854,7 @@ fn table_grid(head: &[String], rows: &[Vec<String>], palette: Palette) -> View {
         .columns(vec![GridLength::STAR; columns])
         .automation_name("Table")
         .keyed_children(cells)
+        .into()
 }
 
 /// A table cell's top and bottom inset.
@@ -797,10 +921,10 @@ fn step_view(
             if expanded { "expanded" } else { "collapsed" }
         ))
         .on_click(move || {
-            let _ = toggle.call((key.clone(), !expanded));
+            toggle.call((key.clone(), !expanded));
         })
         .content(crate::m3::step_content(lead, &name, trailing, palette));
-    let detail: View = if expanded {
+    let detail: Option<View> = expanded.then(|| {
         StackPanel::new()
             .spacing(tokens::spacing::XS)
             .margin(Thickness::new(
@@ -809,16 +933,20 @@ fn step_view(
                 tokens::spacing::ROW,
                 tokens::spacing::XS,
             ))
-            .children((
-                crate::m3::secondary(format!("{status}\n{}", part.detail.join("\n")))
-                    .text_wrapping(TextWrapping::Wrap)
-                    .is_text_selection_enabled(true),
+            .keyed_children(crate::views::slots([
+                Some(
+                    crate::m3::secondary(format!("{status}\n{}", part.detail.join("\n")))
+                        .text_wrapping(TextWrapping::Wrap)
+                        .is_text_selection_enabled(true)
+                        .into(),
+                ),
                 path_actions(&part.key, &part.detail_paths, callbacks, palette),
-            ))
-    } else {
-        View::empty()
-    };
-    StackPanel::new().children((row, detail))
+            ]))
+            .into()
+    });
+    StackPanel::new()
+        .keyed_children(crate::views::slots([Some(row.into()), detail]))
+        .into()
 }
 
 /// An `Rc` compared by identity: a component input whose content is rebuilt
@@ -1012,21 +1140,23 @@ impl Component for Transcript {
 
     fn view(&self, input: &TranscriptInput, _context: &mut ViewContext<Self>) -> View {
         let palette = input.palette;
-        let load_older: View = match &input.load_older {
-            Some((enabled, load)) if self.hidden == 0 => crate::m3::text_button(palette)
-                .is_enabled(*enabled)
-                .horizontal_alignment(HorizontalAlignment::Center)
-                .margin(Thickness::new(0.0, 0.0, 0.0, tokens::spacing::MD))
-                .on_click(load.clone())
-                .content(crate::m3::label("Load older messages")),
-            _ => View::empty(),
+        let load_older: Option<View> = match &input.load_older {
+            Some((enabled, load)) if self.hidden == 0 => Some(
+                crate::m3::text_button(palette)
+                    .is_enabled(*enabled)
+                    .horizontal_alignment(HorizontalAlignment::Center)
+                    .margin(Thickness::new(0.0, 0.0, 0.0, tokens::spacing::MD))
+                    .on_click(load.clone())
+                    .content(crate::m3::label("Load older messages"))
+                    .into(),
+            ),
+            _ => None,
         };
-        let empty: View = match input.empty {
-            Some(line) => crate::m3::secondary(line)
+        let empty: Option<View> = input.empty.map(|line| {
+            crate::m3::secondary(line)
                 .horizontal_alignment(HorizontalAlignment::Center)
-                .into(),
-            None => View::empty(),
-        };
+                .into()
+        });
         // One container per conversation, keyed by its serial: the shown one
         // first, then the ones left (zero height, transparent and clipped),
         // so a switch inserts the new one in front and moves nothing.
@@ -1054,16 +1184,17 @@ impl Component for Transcript {
             .automation_id(input.automation_id)
             .content(
                 StackPanel::new()
-                    .width(input.column)
+                    .maybe_width(input.column)
                     .max_width(tokens::layout::READING_WIDTH)
                     .horizontal_alignment(HorizontalAlignment::Center)
                     .margin(Thickness::xy(0.0, tokens::spacing::MD))
-                    .children((
+                    .keyed_children(crate::views::slots([
                         load_older,
                         empty,
-                        StackPanel::new().keyed_children(conversations),
-                    )),
+                        Some(StackPanel::new().keyed_children(conversations).into()),
+                    ])),
             )
+            .into()
     }
 }
 
@@ -1205,7 +1336,7 @@ fn turn_views(input: &TranscriptInput, skip: usize) -> Vec<KeyedView> {
             Some(KeyedView::new(
                 item.key.clone(),
                 StackPanel::new()
-                    .width(input.column)
+                    .maybe_width(input.column)
                     .spacing(tokens::spacing::SM)
                     .margin(Thickness::new(0.0, 0.0, 0.0, tokens::spacing::LG))
                     .keyed_children(views),
@@ -1261,7 +1392,7 @@ fn log_head(
         .text_trimming(TextTrimming::CharacterEllipsis)
         .into(),
     };
-    let doing: View = if head.running && !head.doing.is_empty() {
+    let doing: Option<View> = (head.running && !head.doing.is_empty()).then(|| {
         StackPanel::new()
             .orientation(Orientation::Horizontal)
             .spacing(tokens::spacing::SM)
@@ -1273,9 +1404,8 @@ fn log_head(
                     .foreground(palette.primary_text())
                     .vertical_alignment(VerticalAlignment::Center),
             ))
-    } else {
-        View::empty()
-    };
+            .into()
+    });
     let toggle = callbacks.toggle_tools.clone();
     let (state_key, set) = if head.running {
         (log_key("shut", &part.key), head.open)
@@ -1289,42 +1419,44 @@ fn log_head(
             if head.open { "open" } else { "closed" }
         ))
         .on_click(move || {
-            let _ = toggle.call((state_key.clone(), set));
+            toggle.call((state_key.clone(), set));
         })
         .content(
             Grid::new()
                 .columns([GridLength::Auto, GridLength::STAR, GridLength::Auto])
                 .column_spacing(tokens::spacing::SM)
-                .children((
-                    crate::m3::icon(if head.open {
+                .keyed_children(crate::views::slots([
+                    Some(crate::m3::icon(if head.open {
                         crate::m3::glyph::CHEVRON_UP
                     } else {
                         crate::m3::glyph::CHEVRON_DOWN
-                    }),
-                    Border::new()
-                        .grid_column(1)
-                        .vertical_alignment(VerticalAlignment::Center)
-                        .content(text),
+                    })),
+                    Some(
+                        Border::new()
+                            .grid_column(1)
+                            .vertical_alignment(VerticalAlignment::Center)
+                            .content(text)
+                            .into(),
+                    ),
                     doing,
-                )),
+                ])),
         );
-    let more: View = match head.more {
-        Some(steps) => {
-            let toggle = callbacks.toggle_tools.clone();
-            let key = log_key("all", &part.key);
-            crate::m3::text_button(palette)
-                .horizontal_alignment(HorizontalAlignment::Left)
-                .automation_name(format!("Show all {steps} steps"))
-                .on_click(move || {
-                    let _ = toggle.call((key.clone(), true));
-                })
-                .content(crate::m3::label(&format!("Show all {steps}")))
-        }
-        None => View::empty(),
-    };
+    let more: Option<View> = head.more.map(|steps| {
+        let toggle = callbacks.toggle_tools.clone();
+        let key = log_key("all", &part.key);
+        crate::m3::text_button(palette)
+            .horizontal_alignment(HorizontalAlignment::Left)
+            .automation_name(format!("Show all {steps} steps"))
+            .on_click(move || {
+                toggle.call((key.clone(), true));
+            })
+            .content(crate::m3::label(&format!("Show all {steps}")))
+            .into()
+    });
     StackPanel::new()
         .spacing(tokens::spacing::ROW_GAP)
-        .children((button, more))
+        .keyed_children(crate::views::slots([Some(button.into()), more]))
+        .into()
 }
 
 /// The Edited files card under an answer (`.edited`): up to five paths,
@@ -1357,31 +1489,33 @@ fn edited_card(part: &RenderedPart, all: bool, callbacks: &RowCallbacks, palette
                 )),
         ));
     }
-    let more: View = if part.detail.len() > EDITED_FILES && !all {
+    let more: Option<View> = (part.detail.len() > EDITED_FILES && !all).then(|| {
         let toggle = callbacks.toggle_tools.clone();
         let key = log_key("more", &part.key);
         let hidden = part.detail.len() - EDITED_FILES;
         crate::m3::text_button(palette)
             .automation_name(format!("Show {hidden} more edited files"))
             .on_click(move || {
-                let _ = toggle.call((key.clone(), true));
+                toggle.call((key.clone(), true));
             })
             .content(crate::m3::label(&format!("Show {hidden} more")))
-    } else {
-        View::empty()
-    };
+            .into()
+    });
     rows.push(KeyedView::new(
         "actions",
         Grid::new()
             .columns([GridLength::Auto, GridLength::STAR, GridLength::Auto])
-            .children((
+            .keyed_children(crate::views::slots([
                 more,
-                crate::m3::text_button(palette)
-                    .grid_column(2)
-                    .automation_name("View changes")
-                    .on_click(callbacks.view_changes.clone())
-                    .content(crate::m3::label("View changes")),
-            )),
+                Some(
+                    crate::m3::text_button(palette)
+                        .grid_column(2)
+                        .automation_name("View changes")
+                        .on_click(callbacks.view_changes.clone())
+                        .content(crate::m3::label("View changes"))
+                        .into(),
+                ),
+            ])),
     ));
     Border::new()
         .background(palette.composer())
@@ -1394,6 +1528,7 @@ fn edited_card(part: &RenderedPart, all: bool, callbacks: &RowCallbacks, palette
                 .spacing(tokens::spacing::ROW_GAP)
                 .keyed_children(rows),
         )
+        .into()
 }
 
 /// One part's input: the rendered part (replaced only on a new revision)
@@ -1430,16 +1565,18 @@ impl Component for PartView {
     fn view(&self, input: &PartInput, context: &mut ViewContext<Self>) -> View {
         let part = &*input.part.0;
         let (callbacks, palette) = (&*input.callbacks, input.palette);
-        let body = StackPanel::new().spacing(tokens::spacing::XS).children((
-            part_view(part, input.expanded, self.hovered, callbacks, palette),
-            // The assistant's files are actions; the owner's own message
-            // only names them.
-            if matches!(part.kind, PartKind::Progress | PartKind::Final) {
-                path_actions(&part.key, &part.file_paths, callbacks, palette)
-            } else {
-                View::empty()
-            },
-        ));
+        let body = StackPanel::new()
+            .spacing(tokens::spacing::XS)
+            .keyed_children(crate::views::slots([
+                part_view(part, input.expanded, self.hovered, callbacks, palette),
+                // The assistant's files are actions; the owner's own message
+                // only names them.
+                if matches!(part.kind, PartKind::Progress | PartKind::Final) {
+                    path_actions(&part.key, &part.file_paths, callbacks, palette)
+                } else {
+                    None
+                },
+            ]));
         // A message with Copy is a hover area: its actions show while the
         // pointer is over it.
         if matches!(
@@ -1451,8 +1588,9 @@ impl Component for PartView {
                 .on_pointer_entered(context.callback(|_: PointerEventInfo| true))
                 .on_pointer_exited(context.callback(|_: PointerEventInfo| false))
                 .content(body)
+                .into()
         } else {
-            body
+            body.into()
         }
     }
 }
@@ -1589,7 +1727,12 @@ const FILE_CHIPS: usize = 6;
 /// name, the full path in the tooltip; one chip per file however often it
 /// is named). A click opens it in Explorer (`ui::reveal`); Reactor 0.100.0
 /// hyperlinks only navigate URIs, and prose selection is kept.
-fn path_actions(part: &str, paths: &[String], callbacks: &RowCallbacks, palette: Palette) -> View {
+fn path_actions(
+    part: &str,
+    paths: &[String],
+    callbacks: &RowCallbacks,
+    palette: Palette,
+) -> Option<View> {
     let mut seen = HashSet::new();
     let files: Vec<(String, String)> = paths
         .iter()
@@ -1609,20 +1752,22 @@ fn path_actions(part: &str, paths: &[String], callbacks: &RowCallbacks, palette:
         })
         .collect();
     if files.is_empty() {
-        return View::empty();
+        return None;
     }
-    let mut note = View::empty();
+    let mut note: Option<View> = None;
     let mut chips: Vec<KeyedView> = Vec::new();
     for (reference, resolved) in files.iter().take(FILE_CHIPS) {
         let item = format!("{}{part}:{reference}", callbacks.path_scope);
         if let Some((failed, text)) = &callbacks.path_failure
             && failed == &item
         {
-            note = crate::m3::secondary(text.clone())
-                .foreground(palette.attention())
-                .text_wrapping(TextWrapping::Wrap)
-                .is_text_selection_enabled(true)
-                .into();
+            note = Some(
+                crate::m3::secondary(text.clone())
+                    .foreground(palette.attention())
+                    .text_wrapping(TextWrapping::Wrap)
+                    .is_text_selection_enabled(true)
+                    .into(),
+            );
         }
         let open = callbacks.open_path.clone();
         let target = resolved.clone();
@@ -1632,7 +1777,7 @@ fn path_actions(part: &str, paths: &[String], callbacks: &RowCallbacks, palette:
             crate::m3::file_chip(palette)
                 .automation_name(format!("Open {resolved} in Explorer"))
                 .on_click(move || {
-                    let _ = open.call((item.clone(), target.clone()));
+                    open.call((item.clone(), target.clone()));
                 })
                 .content(crate::m3::file_chip_content(file_glyph(resolved), &name))
                 .tooltip(resolved.clone()),
@@ -1645,13 +1790,21 @@ fn path_actions(part: &str, paths: &[String], callbacks: &RowCallbacks, palette:
                 .vertical_alignment(VerticalAlignment::Center),
         ));
     }
-    StackPanel::new().spacing(tokens::spacing::XS).children((
+    Some(
         StackPanel::new()
-            .orientation(Orientation::Horizontal)
-            .spacing(tokens::spacing::CHIP_GAP)
-            .keyed_children(chips),
-        note,
-    ))
+            .spacing(tokens::spacing::XS)
+            .keyed_children(crate::views::slots([
+                Some(
+                    StackPanel::new()
+                        .orientation(Orientation::Horizontal)
+                        .spacing(tokens::spacing::CHIP_GAP)
+                        .keyed_children(chips)
+                        .into(),
+                ),
+                note,
+            ]))
+            .into(),
+    )
 }
 
 /// A folder's glyph for a folder, else a file's.
@@ -1688,4 +1841,5 @@ pub fn attached_chips(files: &[String], palette: Palette) -> View {
                 })
                 .collect::<Vec<_>>(),
         )
+        .into()
 }

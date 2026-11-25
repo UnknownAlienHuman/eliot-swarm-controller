@@ -677,19 +677,20 @@ impl DesktopApp {
 
     /// The pane: its tab strip over the open tab.
     pub(super) fn pane_view(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
-        let body: View = match self.panel {
-            Panel::Changes => self.changes_view(context, palette),
-            Panel::Agents => self.tree_view(context, palette),
+        let body: Option<View> = match self.panel {
+            Panel::Changes => Some(self.changes_view(context, palette)),
+            Panel::Agents => Some(self.tree_view(context, palette)),
             Panel::Details => self.details_view(context, palette),
-            Panel::Terminal => self.terminal_view(context, palette),
-            Panel::Closed => View::empty(),
+            Panel::Terminal => Some(self.terminal_view(context, palette)),
+            Panel::Closed => None,
         };
         Grid::new()
             .rows([GridLength::Auto, GridLength::STAR])
             .children((
                 self.tab_strip(context, palette),
-                Border::new().grid_row(1).content(body),
+                Border::new().grid_row(1).maybe_content(body),
             ))
+            .into()
     }
 
     /// The strip (`.tabs`): the four tabs, then Wide and Full view, over an
@@ -701,7 +702,7 @@ impl DesktopApp {
             let selected = self.panel == panel;
             let column = cells.len() as i32;
             columns.push(GridLength::Auto);
-            let indicator: View = if selected {
+            let indicator: Option<View> = selected.then(|| {
                 Border::new()
                     .height(tokens::layout::TAB_INDICATOR)
                     .margin(Thickness::xy(tokens::spacing::SM, 0.0))
@@ -714,32 +715,35 @@ impl DesktopApp {
                     ))
                     .background(palette.primary())
                     .into()
-            } else {
-                View::empty()
-            };
+            });
             cells.push(KeyedView::new(
                 format!("tab:{}:{selected}", panel.label()),
-                Grid::new().grid_column(column).children((
-                    Button::new()
-                        .resource_overrides(palette.tab(selected))
-                        .height(tokens::height::CONTROL)
-                        .min_height(tokens::height::CONTROL)
-                        .automation_name(if selected {
-                            format!("{} (shown)", panel.label())
-                        } else {
-                            panel.label().to_owned()
-                        })
-                        .on_click(context.message(Message::Pane(PaneMsg::Tab(panel))))
-                        .content(
-                            m3::text(panel.label(), tokens::text::BUTTON)
-                                .margin(Thickness::xy(
-                                    tokens::spacing::TEXT_INSET - tokens::spacing::ROW,
-                                    0.0,
-                                ))
-                                .vertical_alignment(VerticalAlignment::Center),
+                Grid::new()
+                    .grid_column(column)
+                    .keyed_children(crate::views::slots([
+                        Some(
+                            Button::new()
+                                .resource_overrides(palette.tab(selected))
+                                .height(tokens::height::CONTROL)
+                                .min_height(tokens::height::CONTROL)
+                                .automation_name(if selected {
+                                    format!("{} (shown)", panel.label())
+                                } else {
+                                    panel.label().to_owned()
+                                })
+                                .on_click(context.message(Message::Pane(PaneMsg::Tab(panel))))
+                                .content(
+                                    m3::text(panel.label(), tokens::text::BUTTON)
+                                        .margin(Thickness::xy(
+                                            tokens::spacing::TEXT_INSET - tokens::spacing::ROW,
+                                            0.0,
+                                        ))
+                                        .vertical_alignment(VerticalAlignment::Center),
+                                )
+                                .into(),
                         ),
-                    indicator,
-                )),
+                        indicator,
+                    ])),
             ));
         }
         columns.push(GridLength::STAR);
@@ -778,6 +782,7 @@ impl DesktopApp {
                     .column_spacing(tokens::spacing::ROW_GAP)
                     .keyed_children(cells),
             )
+            .into()
     }
 
     /// A tab's body (`.pane-r .body`): 12 DIPs in, its parts 12 apart, in
@@ -785,13 +790,14 @@ impl DesktopApp {
     pub(super) fn pane_body(&self, name: &str, items: Vec<KeyedView>) -> View {
         ScrollViewer::new()
             .vertical_scroll_bar_visibility(ScrollBarVisibility::Auto)
-            .automation_name(name.to_owned())
+            .automation_name(name)
             .content(
                 StackPanel::new()
                     .spacing(tokens::spacing::INSET)
                     .margin(Thickness::uniform(tokens::spacing::INSET))
                     .keyed_children(items),
             )
+            .into()
     }
 
     /// Changes (skeleton 5.4, `Decision.dc.html`): Compare and Refresh;
@@ -853,7 +859,9 @@ impl DesktopApp {
             .text(changes.filter.clone())
             .placeholder_text("Filter files")
             .automation_name("Filter files")
-            .on_text_changed(context.callback(|text| Message::Pane(PaneMsg::Filter(text))));
+            .on_text_changed(crate::views::text_edits(
+                context.callback(|text| Message::Pane(PaneMsg::Filter(text))),
+            ));
         items.push(KeyedView::new(
             "view",
             toolbar(
@@ -1255,6 +1263,7 @@ impl DesktopApp {
                     .spacing(tokens::spacing::CHIP_GAP)
                     .keyed_children(parts),
             )
+            .into()
     }
 
     /// Merge and check (`git.integrate`): the button, its question, the
@@ -1274,8 +1283,8 @@ impl DesktopApp {
                         )
                     },
                 );
-                m3::card_high(palette).content(
-                    StackPanel::new().spacing(tokens::spacing::SM).children((
+                m3::card_high(palette)
+                    .content(StackPanel::new().spacing(tokens::spacing::SM).children((
                         m3::body(what).text_wrapping(TextWrapping::Wrap),
                         toolbar(
                             vec![],
@@ -1305,22 +1314,24 @@ impl DesktopApp {
                                 ),
                             ],
                         ),
-                    )),
-                )
+                    )))
+                    .into()
             }
-            Merge::Running(agent) if *agent == open => m3::card_high(palette).content(
-                StackPanel::new()
-                    .orientation(Orientation::Horizontal)
-                    .spacing(tokens::spacing::SM)
-                    .children((
-                        ProgressRing::new()
-                            .is_indeterminate(true)
-                            .width(tokens::layout::LOADER_SMALL)
-                            .height(tokens::layout::LOADER_SMALL)
-                            .vertical_alignment(VerticalAlignment::Center),
-                        m3::body("Merging and running the project check…"),
-                    )),
-            ),
+            Merge::Running(agent) if *agent == open => m3::card_high(palette)
+                .content(
+                    StackPanel::new()
+                        .orientation(Orientation::Horizontal)
+                        .spacing(tokens::spacing::SM)
+                        .children((
+                            ProgressRing::new()
+                                .is_indeterminate(true)
+                                .width(tokens::layout::LOADER_SMALL)
+                                .height(tokens::layout::LOADER_SMALL)
+                                .vertical_alignment(VerticalAlignment::Center),
+                            m3::body("Merging and running the project check…"),
+                        )),
+                )
+                .into(),
             Merge::Done(agent, result) if *agent == open => merge_result(palette, result, context),
             _ => {
                 let button = m3::tonal(palette)
@@ -1345,7 +1356,7 @@ impl DesktopApp {
                             )),
                     );
                 let button: View = match request {
-                    Ok(_) => button,
+                    Ok(_) => button.into(),
                     Err(why) => Border::new().content(button).tooltip(why),
                 };
                 toolbar(vec![], vec![KeyedView::new("merge", button)])
@@ -1721,6 +1732,7 @@ impl DesktopApp {
                     .spacing(tokens::spacing::CHIP_GAP)
                     .keyed_children(parts),
             )
+            .into()
     }
 
     /// Details › Goal's controls where the daemon has the call: Pause or
@@ -1755,7 +1767,7 @@ impl DesktopApp {
                             .automation_name(format!("{label}: {why}"))
                             .content(m3::label(label)),
                     )
-                    .tooltip(why.to_owned()),
+                    .tooltip(why),
             )
         };
         let mut actions = vec![unavailable(
@@ -1817,6 +1829,7 @@ fn toolbar(lead: Vec<KeyedView>, trail: Vec<KeyedView>) -> View {
                 .vertical_alignment(VerticalAlignment::Center)
                 .keyed_children(trail),
         ))
+        .into()
 }
 
 /// A porcelain status (`agent.git` dirty entry) in the tab's words.
@@ -1912,6 +1925,7 @@ fn summary_line(
         .orientation(Orientation::Horizontal)
         .spacing(tokens::spacing::XS)
         .keyed_children(parts)
+        .into()
 }
 
 /// A changed file (component 48, `.filelist .f`): its icon, the name
@@ -1972,7 +1986,7 @@ fn file_row(
                         .vertical_alignment(VerticalAlignment::Center),
                 )),
         )
-        .tooltip(path.to_owned())
+        .tooltip(path)
 }
 
 /// The selected file: Open in editor and Copy path, and why its diff is
@@ -2007,7 +2021,7 @@ fn selected_file(palette: Palette, path: &str, context: &mut ViewContext<Desktop
                     ], vec![
                 ]),
             )),
-        )
+        ).into()
 }
 
 /// Merge and check's result card: merged and checked, conflicting paths,
@@ -2093,24 +2107,26 @@ fn merge_result(
     } else {
         title_view
     };
-    m3::card_high(palette).content(
-        StackPanel::new().spacing(tokens::spacing::XS).children((
-            Grid::new()
-                .columns([GridLength::STAR, GridLength::Auto])
-                .children((
-                    title_view.vertical_alignment(VerticalAlignment::Center),
-                    m3::icon_button(palette)
-                        .grid_column(1)
-                        .automation_name("Dismiss the merge result")
-                        .on_click(context.message(Message::Pane(PaneMsg::MergeDismissed)))
-                        .content(m3::icon(m3::glyph::CLOSE)),
-                )),
-            m3::body(lines.join("\n"))
-                .text_wrapping(TextWrapping::Wrap)
-                .is_text_selection_enabled(true)
-                .automation_name(format!("{title}: {}", lines.join(" "))),
-        )),
-    )
+    m3::card_high(palette)
+        .content(
+            StackPanel::new().spacing(tokens::spacing::XS).children((
+                Grid::new()
+                    .columns([GridLength::STAR, GridLength::Auto])
+                    .children((
+                        title_view.vertical_alignment(VerticalAlignment::Center),
+                        m3::icon_button(palette)
+                            .grid_column(1)
+                            .automation_name("Dismiss the merge result")
+                            .on_click(context.message(Message::Pane(PaneMsg::MergeDismissed)))
+                            .content(m3::icon(m3::glyph::CLOSE)),
+                    )),
+                m3::body(lines.join("\n"))
+                    .text_wrapping(TextWrapping::Wrap)
+                    .is_text_selection_enabled(true)
+                    .automation_name(format!("{title}: {}", lines.join(" "))),
+            )),
+        )
+        .into()
 }
 
 /// One Agents tab row (component 49): its fold chevron, then the row (its
@@ -2126,20 +2142,17 @@ fn tree_row(
     context: &mut ViewContext<DesktopApp>,
 ) -> View {
     let row = &entry.row;
-    let counts: View = match row
+    let counts: Option<View> = row
         .work
         .as_ref()
         .and_then(|work| work.insertions.zip(work.deletions))
-    {
-        Some((add, del)) => m3::diff_counts(add, del, entry.selected),
-        None => View::empty(),
-    };
+        .map(|(add, del)| m3::diff_counts(add, del, entry.selected));
     let mut name: Vec<KeyedView> = vec![
         KeyedView::new(
             "mark",
             Border::new()
                 .vertical_alignment(VerticalAlignment::Center)
-                .content(super::page_ui::agent_mark(
+                .maybe_content(super::page_ui::agent_mark(
                     palette,
                     row.state,
                     row.status_line.as_deref(),
@@ -2194,8 +2207,9 @@ fn tree_row(
                 Border::new()
                     .grid_column(3)
                     .vertical_alignment(VerticalAlignment::Center)
-                    .content(counts),
+                    .maybe_content(counts),
             ))
+            .into()
     } else {
         StackPanel::new()
             .vertical_alignment(VerticalAlignment::Center)
@@ -2208,7 +2222,7 @@ fn tree_row(
                         Border::new()
                             .grid_column(1)
                             .vertical_alignment(VerticalAlignment::Center)
-                            .content(counts),
+                            .maybe_content(counts),
                     )),
                 Grid::new()
                     .margin(Thickness::new(
@@ -2221,6 +2235,7 @@ fn tree_row(
                     .column_spacing(tokens::spacing::SM)
                     .children((model, activity.grid_column(1))),
             ))
+            .into()
     };
     let words = format!(
         "{}, {}, {}, {}{}",
@@ -2243,8 +2258,8 @@ fn tree_row(
         .on_click(context.message(Message::Pane(PaneMsg::TreeOpen(row.id.clone()))))
         .content(content)
         .tooltip(words.clone());
-    let chevron: View = match children {
-        Some(open) => m3::icon_button(palette)
+    let chevron: Option<View> = children.map(|open| {
+        m3::icon_button(palette)
             .automation_name(format!(
                 "{} the workers of {}",
                 if open { "Hide" } else { "Show" },
@@ -2255,11 +2270,11 @@ fn tree_row(
                 m3::glyph::CHEVRON_DOWN
             } else {
                 m3::glyph::CHEVRON_RIGHT
-            })),
-        None => View::empty(),
-    };
-    let stop: View = match entry.stop {
-        Some(state) => m3::icon_button(palette)
+            }))
+            .into()
+    });
+    let stop: Option<View> = entry.stop.map(|state| {
+        m3::icon_button(palette)
             .is_enabled(state == monitor_view::StopButton::Ready)
             .automation_name(match state {
                 monitor_view::StopButton::Stopping => format!("Stopping {}", entry.title),
@@ -2270,20 +2285,21 @@ fn tree_row(
                 row.generation,
             ))))
             .content(m3::icon(m3::glyph::STOP_CIRCLE))
-            .tooltip("Stop Agent"),
-        None => View::empty(),
-    };
-    let handoff: View = if entry.observed {
-        View::empty()
+            .tooltip("Stop Agent")
+    });
+    let handoff: Option<View> = if entry.observed {
+        None
     } else {
-        m3::icon_button(palette)
-            .automation_name(format!("Hand off {}", entry.title))
-            .on_click(context.message(Message::Pane(PaneMsg::TreeHandoff(
-                row.id.clone(),
-                row.generation,
-            ))))
-            .content(m3::icon(m3::glyph::FORWARD))
-            .tooltip("Hand off or switch model")
+        Some(
+            m3::icon_button(palette)
+                .automation_name(format!("Hand off {}", entry.title))
+                .on_click(context.message(Message::Pane(PaneMsg::TreeHandoff(
+                    row.id.clone(),
+                    row.generation,
+                ))))
+                .content(m3::icon(m3::glyph::FORWARD))
+                .tooltip("Hand off or switch model"),
+        )
     };
     Grid::new()
         .margin(Thickness::new(
@@ -2301,15 +2317,16 @@ fn tree_row(
         .children((
             Border::new()
                 .vertical_alignment(VerticalAlignment::Center)
-                .content(chevron),
+                .maybe_content(chevron),
             button,
             Border::new()
                 .grid_column(2)
                 .vertical_alignment(VerticalAlignment::Center)
-                .content(stop),
+                .maybe_content(stop),
             Border::new()
                 .grid_column(3)
                 .vertical_alignment(VerticalAlignment::Center)
-                .content(handoff),
+                .maybe_content(handoff),
         ))
+        .into()
 }

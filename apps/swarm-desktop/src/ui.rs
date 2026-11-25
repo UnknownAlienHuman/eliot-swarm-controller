@@ -53,6 +53,8 @@ use eliot_core::api::{
 };
 use windows_reactor::*;
 
+use crate::views::{MaybeContent, MaybeSize};
+
 mod automation_ui;
 mod bulk_ui;
 mod chat_ui;

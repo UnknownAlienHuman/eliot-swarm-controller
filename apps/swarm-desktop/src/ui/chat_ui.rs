@@ -1557,7 +1557,7 @@ impl DesktopApp {
     /// task} when there is one.
     fn home_view(
         &self,
-        alert: View,
+        alert: Option<View>,
         composer: View,
         context: &mut ViewContext<Self>,
         palette: Palette,
@@ -1650,6 +1650,7 @@ impl DesktopApp {
                     self.title_project(context, palette),
                     m3::text("?", tokens::text::HERO).vertical_alignment(VerticalAlignment::Center),
                 ))
+                .into()
         };
         let width = self.column_width(tokens::layout::HOME_WIDTH);
         ScrollViewer::new()
@@ -1657,7 +1658,7 @@ impl DesktopApp {
             .vertical_scroll_bar_visibility(ScrollBarVisibility::Auto)
             .content(
                 StackPanel::new()
-                    .width(width)
+                    .maybe_width(width)
                     .max_width(tokens::layout::HOME_WIDTH)
                     .horizontal_alignment(HorizontalAlignment::Center)
                     .margin(Thickness::new(
@@ -1667,17 +1668,21 @@ impl DesktopApp {
                         tokens::spacing::XL,
                     ))
                     .spacing(tokens::spacing::HOME_GROUP_GAP)
-                    .children((
-                        title,
+                    .keyed_children(crate::views::slots([
+                        Some(title),
                         alert,
-                        composer,
-                        StackPanel::new()
-                            .orientation(Orientation::Horizontal)
-                            .horizontal_alignment(HorizontalAlignment::Center)
-                            .spacing(tokens::spacing::SM)
-                            .keyed_children(cards),
-                    )),
+                        Some(composer),
+                        Some(
+                            StackPanel::new()
+                                .orientation(Orientation::Horizontal)
+                                .horizontal_alignment(HorizontalAlignment::Center)
+                                .spacing(tokens::spacing::SM)
+                                .keyed_children(cards)
+                                .into(),
+                        ),
+                    ])),
             )
+            .into()
     }
 
     /// The Settings page is drawn here too, over the transcript component,
@@ -1721,115 +1726,128 @@ impl DesktopApp {
                     GridLength::Auto,
                     GridLength::Auto,
                 ])
-                .children((
-                    View::empty(),
-                    View::fragment((transcript, page)),
-                    View::empty(),
-                    View::empty(),
-                    View::empty(),
-                    View::empty(),
-                    View::empty(),
-                ));
+                // The transcript stays mounted under the page (by its key,
+                // in every layout of this grid).
+                .keyed_children([
+                    KeyedView::new("transcript", transcript),
+                    KeyedView::new("page", page),
+                ])
+                .into();
         }
         let agent = self.selected_agent_id();
-        let header: View = match agent.as_deref() {
-            Some(agent) => self.header_view(agent, context, palette),
-            None => View::empty(),
-        };
+        let header: Option<View> = agent
+            .as_deref()
+            .map(|agent| self.header_view(agent, context, palette));
         // The transcript stays in place without an open Agent too, so the
         // conversation just left is removed over later frames, not at once
         // (`views::Transcript`); the start or Home screen covers it.
         let home = agent.is_none() && self.launch.starting.is_none();
-        let cover: View = match agent {
+        let cover: Option<View> = match agent {
             // The start is being submitted: the message and what happens
             // now, at once (no empty pause after Send).
             None if self.launch.starting.is_some() => {
                 let (text, label) = self.launch.starting.clone().unwrap_or_default();
-                starting_view(&text, &label, column, palette)
+                Some(starting_view(&text, &label, column, palette))
             }
             // Home is built below, around the notice and the composer.
-            _ => View::empty(),
+            _ => None,
         };
         let reconnect = self.reconnect_notice(column, palette);
-        let alert: View = match (&self.chat.confirm_force, &self.alert) {
+        let alert: Option<View> = match (&self.chat.confirm_force, &self.alert) {
             (Some((bound, title)), _) => {
-                self.force_stop_banner(bound, title, column, context, palette)
+                Some(self.force_stop_banner(bound, title, column, context, palette))
             }
             // A restart in progress says so once, over the reads it stalls.
-            (None, _) if reconnect.is_some() => reconnect.unwrap_or_else(View::empty),
+            (None, _) if reconnect.is_some() => reconnect,
             (None, Some(text)) => {
-                let queue: View = if self
+                let queue: Option<View> = if self
                     .launch
                     .queue_offer
                     .as_ref()
                     .is_some_and(|offer| &offer.alert == text)
                 {
-                    m3::text_button(palette)
-                        .grid_column(2)
-                        .is_enabled(!self.submitting())
-                        .automation_name("Queue it")
-                        .on_click(context.message(Message::Launch(LaunchMsg::QueueRequested)))
-                        .content("Queue it")
-                } else {
-                    View::empty()
-                };
-                Border::new()
-                    .grid_row(4)
-                    .width(column)
-                    .max_width(tokens::layout::READING_WIDTH)
-                    .horizontal_alignment(HorizontalAlignment::Center)
-                    .margin(Thickness::new(0.0, tokens::spacing::SM, 0.0, 0.0))
-                    // Alerts are refusals, uncertain outcomes and failed
-                    // reads: the attention surface and mark, the text in
-                    // the body color so it stays easy to read.
-                    .background(palette.attention_container())
-                    .border_brush(palette.attention_outline())
-                    .border_thickness(Thickness::uniform(tokens::layout::HAIRLINE))
-                    .corner_radius(tokens::radius::CONTAINER)
-                    .padding(Thickness::new(
-                        tokens::spacing::MD,
-                        tokens::spacing::XS,
-                        tokens::spacing::XS,
-                        tokens::spacing::XS,
-                    ))
-                    .content(
-                        Grid::new()
-                            .columns([
-                                GridLength::Auto,
-                                GridLength::STAR,
-                                GridLength::Auto,
-                                GridLength::Auto,
-                            ])
-                            .column_spacing(tokens::spacing::SM)
-                            .children((
-                                Border::new()
-                                    .vertical_alignment(VerticalAlignment::Center)
-                                    .content(m3::status_mark(
-                                        palette,
-                                        crate::theme::StatusTone::Attention,
-                                        tokens::layout::DOT,
-                                    )),
-                                m3::body(text.clone())
-                                    .grid_column(1)
-                                    .foreground(palette.text())
-                                    .vertical_alignment(VerticalAlignment::Center)
-                                    .text_wrapping(TextWrapping::Wrap)
-                                    .is_text_selection_enabled(true),
-                                queue,
-                                m3::icon_button(palette)
-                                    .grid_column(3)
-                                    .automation_name("Dismiss")
-                                    .on_click(
-                                        context.message(Message::Shell(ShellMsg::AlertDismissed)),
-                                    )
-                                    .content(m3::icon(m3::glyph::CLOSE)),
-                            )),
+                    Some(
+                        m3::text_button(palette)
+                            .grid_column(2)
+                            .is_enabled(!self.submitting())
+                            .automation_name("Queue it")
+                            .on_click(context.message(Message::Launch(LaunchMsg::QueueRequested)))
+                            .content("Queue it")
+                            .into(),
                     )
+                } else {
+                    None
+                };
+                Some(
+                    Border::new()
+                        .grid_row(4)
+                        .maybe_width(column)
+                        .max_width(tokens::layout::READING_WIDTH)
+                        .horizontal_alignment(HorizontalAlignment::Center)
+                        .margin(Thickness::new(0.0, tokens::spacing::SM, 0.0, 0.0))
+                        // Alerts are refusals, uncertain outcomes and failed
+                        // reads: the attention surface and mark, the text in
+                        // the body color so it stays easy to read.
+                        .background(palette.attention_container())
+                        .border_brush(palette.attention_outline())
+                        .border_thickness(Thickness::uniform(tokens::layout::HAIRLINE))
+                        .corner_radius(tokens::radius::CONTAINER)
+                        .padding(Thickness::new(
+                            tokens::spacing::MD,
+                            tokens::spacing::XS,
+                            tokens::spacing::XS,
+                            tokens::spacing::XS,
+                        ))
+                        .content(
+                            Grid::new()
+                                .columns([
+                                    GridLength::Auto,
+                                    GridLength::STAR,
+                                    GridLength::Auto,
+                                    GridLength::Auto,
+                                ])
+                                .column_spacing(tokens::spacing::SM)
+                                .keyed_children(crate::views::slots([
+                                    Some(
+                                        Border::new()
+                                            .vertical_alignment(VerticalAlignment::Center)
+                                            .content(m3::status_mark(
+                                                palette,
+                                                crate::theme::StatusTone::Attention,
+                                                tokens::layout::DOT,
+                                            ))
+                                            .into(),
+                                    ),
+                                    Some(
+                                        m3::body(text.clone())
+                                            .grid_column(1)
+                                            .foreground(palette.text())
+                                            .vertical_alignment(VerticalAlignment::Center)
+                                            .text_wrapping(TextWrapping::Wrap)
+                                            .is_text_selection_enabled(true)
+                                            .into(),
+                                    ),
+                                    queue,
+                                    Some(
+                                        m3::icon_button(palette)
+                                            .grid_column(3)
+                                            .automation_name("Dismiss")
+                                            .on_click(
+                                                context.message(Message::Shell(
+                                                    ShellMsg::AlertDismissed,
+                                                )),
+                                            )
+                                            .content(m3::icon(m3::glyph::CLOSE))
+                                            .into(),
+                                    ),
+                                ])),
+                        )
+                        .into(),
+                )
             }
             (None, None) => self
                 .archived_notice(column, context, palette)
-                .or_else(|| self.loss_notice(column, context, palette))
-                .unwrap_or_else(View::empty),
+                .or_else(|| self.loss_notice(column, context, palette)),
         };
         // Waiting for the owner: the decision panel takes the composer's
         // place; otherwise the hold strip and the workers line sit above
@@ -1850,16 +1868,19 @@ impl DesktopApp {
                 if home || above.is_empty() {
                     composer
                 } else {
-                    StackPanel::new().grid_row(5).children((
-                        StackPanel::new()
-                            .width(column)
-                            .max_width(tokens::layout::READING_WIDTH)
-                            .horizontal_alignment(HorizontalAlignment::Center)
-                            .margin(Thickness::new(0.0, tokens::spacing::SM, 0.0, 0.0))
-                            .spacing(tokens::spacing::SM)
-                            .keyed_children(above),
-                        composer,
-                    ))
+                    StackPanel::new()
+                        .grid_row(5)
+                        .children((
+                            StackPanel::new()
+                                .maybe_width(column)
+                                .max_width(tokens::layout::READING_WIDTH)
+                                .horizontal_alignment(HorizontalAlignment::Center)
+                                .margin(Thickness::new(0.0, tokens::spacing::SM, 0.0, 0.0))
+                                .spacing(tokens::spacing::SM)
+                                .keyed_children(above),
+                            composer,
+                        ))
+                        .into()
                 }
             }
         };
@@ -1876,22 +1897,24 @@ impl DesktopApp {
                     GridLength::Auto,
                     GridLength::Auto,
                 ])
-                .children((
-                    header,
-                    View::fragment((transcript, home)),
-                    View::empty(),
-                    View::empty(),
-                    View::empty(),
-                ));
+                .keyed_children(
+                    header
+                        .map(|header| KeyedView::new("header", header))
+                        .into_iter()
+                        .chain([
+                            KeyedView::new("transcript", transcript),
+                            KeyedView::new("home", home),
+                        ]),
+                )
+                .into();
         }
 
-        let body = View::fragment((transcript, cover));
         // The live line under the header (Reconnecting, Live updates
         // stopped), in the transcript's row over its top.
         let live = Border::new()
             .grid_row(1)
             .vertical_alignment(VerticalAlignment::Top)
-            .content(self.live_line(context, palette));
+            .maybe_content(self.live_line(context, palette));
         // Rows: the header, the transcript, (spare), (spare), the notice,
         // the composer or the decision panel (its popovers are flyouts).
         Grid::new()
@@ -1903,7 +1926,19 @@ impl DesktopApp {
                 GridLength::Auto,
                 GridLength::Auto,
             ])
-            .children((header, View::fragment((body, live)), alert, composer))
+            .keyed_children(
+                [
+                    header.map(|header| KeyedView::new("header", header)),
+                    Some(KeyedView::new("transcript", transcript)),
+                    cover.map(|cover| KeyedView::new("cover", cover)),
+                    Some(KeyedView::new("live", live)),
+                    alert.map(|alert| KeyedView::new("alert", alert)),
+                    Some(KeyedView::new("composer", composer)),
+                ]
+                .into_iter()
+                .flatten(),
+            )
+            .into()
     }
 
     /// The reading column's width: the reading width, or the main area less

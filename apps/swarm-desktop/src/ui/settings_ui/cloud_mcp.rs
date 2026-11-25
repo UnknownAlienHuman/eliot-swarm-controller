@@ -18,7 +18,7 @@ impl DesktopApp {
             m3::setting_row(
                 "Cloud MCP",
                 "Serve Swarm's MCP endpoint through a Cloudflare tunnel behind Cloudflare Access. The daemon applies a change at its next start.",
-                switch,
+                View::from(switch),
             ),
         )];
         if enabled {
@@ -34,9 +34,11 @@ impl DesktopApp {
                                 m3::field()
                                     .text(model::cloud_field(&self.settings.cloud, key))
                                     .automation_name(*label)
-                                    .on_text_changed(context.callback(move |text| {
-                                        Message::Settings(SettingsMsg::CloudField(index, text))
-                                    }))
+                                    .on_text_changed(crate::views::text_edits(context.callback(
+                                        move |text| {
+                                            Message::Settings(SettingsMsg::CloudField(index, text))
+                                        },
+                                    )))
                                     .into(),
                                 None,
                             ),

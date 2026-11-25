@@ -82,7 +82,7 @@ impl DesktopApp {
                     ));
                 rows.push(KeyedView::new(
                     format!("{role}:{index}:{name}:{first}:{last}"),
-                    candidate_row(index + 1, name, buttons),
+                    candidate_row(index + 1, name, buttons.into()),
                 ));
             }
             let addable = self.addable_profiles(&role);
@@ -130,9 +130,9 @@ impl DesktopApp {
                             .text(self.settings.new_role.clone())
                             .placeholder_text("Role name, for example review")
                             .automation_name("New role name")
-                            .on_text_changed(context.callback(|text| {
+                            .on_text_changed(crate::views::text_edits(context.callback(|text| {
                                 Message::Settings(SettingsMsg::NewRoleChanged(text))
-                            }))
+                            })))
                             .into(),
                         Some(
                             m3::outlined(palette)
@@ -141,7 +141,8 @@ impl DesktopApp {
                                 .on_click(
                                     context.message(Message::Settings(SettingsMsg::RoleAdded)),
                                 )
-                                .content(m3::label("Add role")),
+                                .content(m3::label("Add role"))
+                                .into(),
                         ),
                     ),
                 )],
@@ -150,6 +151,7 @@ impl DesktopApp {
         StackPanel::new()
             .spacing(tokens::spacing::MD)
             .keyed_children(groups)
+            .into()
     }
 }
 
@@ -171,4 +173,5 @@ fn candidate_row(place: usize, name: &str, buttons: View) -> View {
                 .text_trimming(TextTrimming::CharacterEllipsis),
             Border::new().grid_column(2).content(buttons),
         ))
+        .into()
 }

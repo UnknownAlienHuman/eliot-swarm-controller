@@ -242,13 +242,13 @@ impl DesktopApp {
                             .content(m3::icon_label(m3::glyph::NEW_TASK, "New automation"))
                             .menu(Menu::new(
                                 new_menu,
-                                context.callback(|key: String| {
+                                crate::views::menu_keys(context.callback(|key: String| {
                                     if key == "queue" {
                                         Message::Automation(AutomationMsg::FormOpened(None))
                                     } else {
                                         Message::Automation(AutomationMsg::Rule(RuleMsg::New))
                                     }
-                                }),
+                                })),
                             )),
                     ),
                 ],
@@ -419,34 +419,41 @@ impl DesktopApp {
             let open = self.automation.technical.contains(&card.key);
             right.push(KeyedView::new(
                 format!("technical:{}:{open}", card.key),
-                StackPanel::new().spacing(tokens::spacing::XS).children((
-                    m3::text_button(palette)
-                        .horizontal_alignment(HorizontalAlignment::Left)
-                        .automation_name(format!(
-                            "Technical details of {} ({})",
-                            card.title,
-                            if open { "expanded" } else { "collapsed" }
-                        ))
-                        .on_click(context.message(Message::Automation(
-                            AutomationMsg::TechnicalToggled(card.key.clone()),
-                        )))
-                        .content(m3::icon_label(
-                            if open {
-                                m3::glyph::CHEVRON_DOWN
-                            } else {
-                                m3::glyph::CHEVRON_RIGHT
-                            },
-                            "Technical details",
-                        )),
-                    if open {
-                        m3::secondary(card.technical.join("\n"))
-                            .text_wrapping(TextWrapping::Wrap)
-                            .is_text_selection_enabled(true)
-                            .into()
-                    } else {
-                        View::empty()
-                    },
-                )),
+                StackPanel::new()
+                    .spacing(tokens::spacing::XS)
+                    .keyed_children(crate::views::slots([
+                        Some(
+                            m3::text_button(palette)
+                                .horizontal_alignment(HorizontalAlignment::Left)
+                                .automation_name(format!(
+                                    "Technical details of {} ({})",
+                                    card.title,
+                                    if open { "expanded" } else { "collapsed" }
+                                ))
+                                .on_click(context.message(Message::Automation(
+                                    AutomationMsg::TechnicalToggled(card.key.clone()),
+                                )))
+                                .content(m3::icon_label(
+                                    if open {
+                                        m3::glyph::CHEVRON_DOWN
+                                    } else {
+                                        m3::glyph::CHEVRON_RIGHT
+                                    },
+                                    "Technical details",
+                                ))
+                                .into(),
+                        ),
+                        if open {
+                            Some(
+                                m3::secondary(card.technical.join("\n"))
+                                    .text_wrapping(TextWrapping::Wrap)
+                                    .is_text_selection_enabled(true)
+                                    .into(),
+                            )
+                        } else {
+                            None
+                        },
+                    ])),
             ));
         }
         right.push(KeyedView::new(
@@ -553,20 +560,22 @@ impl DesktopApp {
         };
         let toggling = self.automation.toggling.contains(&card.key);
         let key = card.key.clone();
-        let switch: View = Grid::new().keyed_children(vec![KeyedView::new(
-            format!("switch:{on}:{switchable}:{toggling}"),
-            ToggleSwitch::new()
-                .is_on(on)
-                .is_enabled(switchable && !toggling)
-                .min_width(0.0)
-                .automation_name(match why {
-                    Some(why) => format!("{} enabled: {why}", card.title),
-                    None => format!("{} enabled", card.title),
-                })
-                .on_toggled(context.callback(move |on: bool| {
-                    Message::Automation(AutomationMsg::Rule(RuleMsg::Toggled(key.clone(), on)))
-                })),
-        )]);
+        let switch: View = Grid::new()
+            .keyed_children(vec![KeyedView::new(
+                format!("switch:{on}:{switchable}:{toggling}"),
+                ToggleSwitch::new()
+                    .is_on(on)
+                    .is_enabled(switchable && !toggling)
+                    .min_width(0.0)
+                    .automation_name(match why {
+                        Some(why) => format!("{} enabled: {why}", card.title),
+                        None => format!("{} enabled", card.title),
+                    })
+                    .on_toggled(context.callback(move |on: bool| {
+                        Message::Automation(AutomationMsg::Rule(RuleMsg::Toggled(key.clone(), on)))
+                    })),
+            )])
+            .into();
         let switch = match why {
             Some(why) => Border::new()
                 .background(Brush::Solid(Color::argb(0, 0, 0, 0)))
@@ -621,25 +630,27 @@ impl DesktopApp {
                     .content(m3::icon(m3::glyph::MORE_VERTICAL))
                     .menu(Menu::new(
                         menu,
-                        context.callback(|key: String| {
+                        crate::views::menu_keys(context.callback(|key: String| {
                             Message::Automation(AutomationMsg::Rule(RuleMsg::Menu(key)))
-                        }),
+                        })),
                     )),
             ));
         let row: View = if text.is_empty() {
-            content
+            content.into()
         } else {
-            StackPanel::new().children((
-                content,
-                StackPanel::new()
-                    .margin(Thickness::new(
-                        tokens::spacing::ROW,
-                        0.0,
-                        0.0,
-                        tokens::spacing::SM,
-                    ))
-                    .keyed_children(text),
-            ))
+            StackPanel::new()
+                .children((
+                    content,
+                    StackPanel::new()
+                        .margin(Thickness::new(
+                            tokens::spacing::ROW,
+                            0.0,
+                            0.0,
+                            tokens::spacing::SM,
+                        ))
+                        .keyed_children(text),
+                ))
+                .into()
         };
         if selected {
             // The ring spans the card's row (`.arow.sel`): out over the
@@ -654,6 +665,7 @@ impl DesktopApp {
                     0.0,
                 ))
                 .content(row)
+                .into()
         } else {
             row
         }
@@ -676,10 +688,12 @@ impl DesktopApp {
         let generated = editor.rule.as_ref().is_some_and(|rule| rule.file.is_none());
         let mut parts: Vec<KeyedView> =
             vec![KeyedView::new("head", page_ui::panel_head(&title, None))];
-        let field_error = |field: EditorField| -> View {
+        let field_error = |field: EditorField| -> Option<View> {
             match &editor.field_error {
-                Some((at, error)) if *at == field => page_ui::error_line(palette, error.clone()),
-                _ => View::empty(),
+                Some((at, error)) if *at == field => {
+                    Some(page_ui::error_line(palette, error.clone()))
+                }
+                _ => None,
             }
         };
         let word = |text: &str, row: i32| -> View {
@@ -711,9 +725,9 @@ impl DesktopApp {
                     .max_height(tokens::layout::SOURCE_MAX_HEIGHT)
                     .is_enabled(enabled)
                     .automation_name(format!("{title} as TOML"))
-                    .on_text_changed(context.callback(|text| {
+                    .on_text_changed(crate::views::text_edits(context.callback(|text| {
                         Message::Automation(AutomationMsg::Rule(RuleMsg::TomlText(text)))
-                    })),
+                    }))),
             ));
         } else {
             let sentence = &editor.sentence;
@@ -723,17 +737,27 @@ impl DesktopApp {
                 rows.push(KeyedView::new("name-word", word("Name", row)));
                 rows.push(KeyedView::new(
                     "name",
-                    StackPanel::new().grid_row(row).grid_column(1).children((
-                        m3::field()
-                            .text(editor.id.clone())
-                            .placeholder_text("check-after-turn")
-                            .is_enabled(enabled)
-                            .automation_name("Rule name")
-                            .on_text_changed(context.callback(|text| {
-                                Message::Automation(AutomationMsg::Rule(RuleMsg::Id(text)))
-                            })),
-                        field_error(EditorField::Name),
-                    )),
+                    StackPanel::new()
+                        .grid_row(row)
+                        .grid_column(1)
+                        .keyed_children(crate::views::slots([
+                            Some(
+                                m3::field()
+                                    .text(editor.id.clone())
+                                    .placeholder_text("check-after-turn")
+                                    .is_enabled(enabled)
+                                    .automation_name("Rule name")
+                                    .on_text_changed(crate::views::text_edits(context.callback(
+                                        |text| {
+                                            Message::Automation(AutomationMsg::Rule(RuleMsg::Id(
+                                                text,
+                                            )))
+                                        },
+                                    )))
+                                    .into(),
+                            ),
+                            field_error(EditorField::Name),
+                        ])),
                 ));
                 row += 1;
             }
@@ -764,9 +788,9 @@ impl DesktopApp {
                         })
                         .is_enabled(enabled)
                         .automation_name("When, typed")
-                        .on_text_changed(context.callback(|text| {
+                        .on_text_changed(crate::views::text_edits(context.callback(|text| {
                             Message::Automation(AutomationMsg::Rule(RuleMsg::WhenValue(text)))
-                        })),
+                        }))),
                 ));
             }
             if sentence.when == WhenKind::Cron {
@@ -777,12 +801,14 @@ impl DesktopApp {
                         .placeholder_text("Time zone (UTC when empty)")
                         .is_enabled(enabled)
                         .automation_name("Time zone")
-                        .on_text_changed(context.callback(|text| {
+                        .on_text_changed(crate::views::text_edits(context.callback(|text| {
                             Message::Automation(AutomationMsg::Rule(RuleMsg::Zone(text)))
-                        })),
+                        }))),
                 ));
             }
-            when.push(KeyedView::new("when-error", field_error(EditorField::When)));
+            when.extend(
+                field_error(EditorField::When).map(|view| KeyedView::new("when-error", view)),
+            );
             rows.push(KeyedView::new("when-word", word("When", row)));
             rows.push(KeyedView::new(
                 "when",
@@ -796,17 +822,27 @@ impl DesktopApp {
             rows.push(KeyedView::new("if-word", word("Only if", row)));
             rows.push(KeyedView::new(
                 "if",
-                StackPanel::new().grid_row(row).grid_column(1).children((
-                    m3::field()
-                        .text(sentence.only_if.clone())
-                        .placeholder_text("Always")
-                        .is_enabled(enabled)
-                        .automation_name("Only if")
-                        .on_text_changed(context.callback(|text| {
-                            Message::Automation(AutomationMsg::Rule(RuleMsg::OnlyIf(text)))
-                        })),
-                    field_error(EditorField::OnlyIf),
-                )),
+                StackPanel::new()
+                    .grid_row(row)
+                    .grid_column(1)
+                    .keyed_children(crate::views::slots([
+                        Some(
+                            m3::field()
+                                .text(sentence.only_if.clone())
+                                .placeholder_text("Always")
+                                .is_enabled(enabled)
+                                .automation_name("Only if")
+                                .on_text_changed(crate::views::text_edits(context.callback(
+                                    |text| {
+                                        Message::Automation(AutomationMsg::Rule(RuleMsg::OnlyIf(
+                                            text,
+                                        )))
+                                    },
+                                )))
+                                .into(),
+                        ),
+                        field_error(EditorField::OnlyIf),
+                    ])),
             ));
             row += 1;
             let action_labels = action_labels(sentence);
@@ -831,9 +867,9 @@ impl DesktopApp {
                         .placeholder_text("The text it sends")
                         .is_enabled(enabled)
                         .automation_name("Text")
-                        .on_text_changed(context.callback(|text| {
+                        .on_text_changed(crate::views::text_edits(context.callback(|text| {
                             Message::Automation(AutomationMsg::Rule(RuleMsg::Text(text)))
-                        })),
+                        }))),
                 ));
             }
             if sentence.more_actions > 0 {
@@ -845,7 +881,7 @@ impl DesktopApp {
                     )),
                 ));
             }
-            act.push(KeyedView::new("do-error", field_error(EditorField::Do)));
+            act.extend(field_error(EditorField::Do).map(|view| KeyedView::new("do-error", view)));
             rows.push(KeyedView::new("do-word", word("Do", row)));
             rows.push(KeyedView::new(
                 "do",
@@ -858,26 +894,35 @@ impl DesktopApp {
             row += 1;
             rows.push(KeyedView::new("repeat-word", word("Repeat", row)));
             let repeat: View = match (sentence.repeat, &sentence.limit_words) {
-                (Some(max), words) => StackPanel::new().spacing(tokens::spacing::XS).children((
-                    NumberBox::new()
-                        .width(tokens::page::REPEAT_FIELD)
-                        .horizontal_alignment(HorizontalAlignment::Left)
-                        .minimum(1.0)
-                        .value(Some(max as f64))
-                        .is_enabled(enabled)
-                        .automation_name("Repeat at most")
-                        .on_value_changed(context.callback(|value| {
-                            Message::Automation(AutomationMsg::Rule(RuleMsg::Repeat(value)))
-                        })),
-                    m3::secondary(match words {
-                        Some(words) if !words.is_empty() => {
-                            format!("times at most ({words}), then it waits")
-                        }
-                        _ => "times at most, then it waits".to_owned(),
-                    })
-                    .text_wrapping(TextWrapping::Wrap),
-                    field_error(EditorField::Repeat),
-                )),
+                (Some(max), words) => StackPanel::new()
+                    .spacing(tokens::spacing::XS)
+                    .keyed_children(crate::views::slots([
+                        Some(
+                            NumberBox::new()
+                                .width(tokens::page::REPEAT_FIELD)
+                                .horizontal_alignment(HorizontalAlignment::Left)
+                                .minimum(1.0)
+                                .value(Some(max as f64))
+                                .is_enabled(enabled)
+                                .automation_name("Repeat at most")
+                                .on_value_changed(context.callback(|value| {
+                                    Message::Automation(AutomationMsg::Rule(RuleMsg::Repeat(value)))
+                                }))
+                                .into(),
+                        ),
+                        Some(
+                            m3::secondary(match words {
+                                Some(words) if !words.is_empty() => {
+                                    format!("times at most ({words}), then it waits")
+                                }
+                                _ => "times at most, then it waits".to_owned(),
+                            })
+                            .text_wrapping(TextWrapping::Wrap)
+                            .into(),
+                        ),
+                        field_error(EditorField::Repeat),
+                    ]))
+                    .into(),
                 (None, _) => m3::secondary("No limit · Edit as TOML to add one")
                     .vertical_alignment(VerticalAlignment::Center)
                     .into(),
@@ -1038,12 +1083,14 @@ impl DesktopApp {
                         label,
                         m3::field()
                             .is_enabled(!form.saving)
-                            .text(value.to_owned())
+                            .text(value)
                             .placeholder_text(hint)
-                            .automation_name(label.to_owned())
-                            .on_text_changed(context.callback(move |text| {
-                                Message::Automation(AutomationMsg::FormText(field, text))
-                            }))
+                            .automation_name(label)
+                            .on_text_changed(crate::views::text_edits(context.callback(
+                                move |text| {
+                                    Message::Automation(AutomationMsg::FormText(field, text))
+                                },
+                            )))
                             .into(),
                         None,
                     ),
@@ -1095,17 +1142,19 @@ impl DesktopApp {
             StackPanel::new().children((
                 m3::form_row(
                     "Work in",
-                    Grid::new().keyed_children(vec![KeyedView::new(
-                        format!("{}:{workspace_index:?}", labels.join("\u{1f}")),
-                        m3::enum_width(ComboBox::new())
-                            .is_enabled(!form.saving)
-                            .items_source(labels)
-                            .selected_index(workspace_index)
-                            .automation_name("Work in")
-                            .on_selection_changed(context.callback(|index| {
-                                Message::Automation(AutomationMsg::FormWorkspace(index))
-                            })),
-                    )]),
+                    Grid::new()
+                        .keyed_children(vec![KeyedView::new(
+                            format!("{}:{workspace_index:?}", labels.join("\u{1f}")),
+                            m3::enum_width(ComboBox::new())
+                                .is_enabled(!form.saving)
+                                .items_source(labels)
+                                .selected_index(workspace_index)
+                                .automation_name("Work in")
+                                .on_selection_changed(context.callback(|index| {
+                                    Message::Automation(AutomationMsg::FormWorkspace(index))
+                                })),
+                        )])
+                        .into(),
                     None,
                 ),
                 m3::help("The project the tasks start in."),
@@ -1118,17 +1167,19 @@ impl DesktopApp {
             StackPanel::new().children((
                 m3::form_row(
                     "Start as",
-                    Grid::new().keyed_children(vec![KeyedView::new(
-                        format!("{}:{role_index:?}", roles.join("\u{1f}")),
-                        m3::enum_width(ComboBox::new())
-                            .is_enabled(!form.saving)
-                            .items_source(roles)
-                            .selected_index(role_index)
-                            .automation_name("Start as")
-                            .on_selection_changed(context.callback(|index| {
-                                Message::Automation(AutomationMsg::FormRole(index))
-                            })),
-                    )]),
+                    Grid::new()
+                        .keyed_children(vec![KeyedView::new(
+                            format!("{}:{role_index:?}", roles.join("\u{1f}")),
+                            m3::enum_width(ComboBox::new())
+                                .is_enabled(!form.saving)
+                                .items_source(roles)
+                                .selected_index(role_index)
+                                .automation_name("Start as")
+                                .on_selection_changed(context.callback(|index| {
+                                    Message::Automation(AutomationMsg::FormRole(index))
+                                })),
+                        )])
+                        .into(),
                     None,
                 ),
                 m3::help("The kind of task. Settings › Routing picks its model for this role."),

@@ -1244,7 +1244,11 @@ impl DesktopApp {
         entries
     }
 
-    pub(super) fn task_dialog(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
+    pub(super) fn task_dialog(
+        &self,
+        context: &mut ViewContext<Self>,
+        palette: Palette,
+    ) -> ContentDialog {
         if let Some((target, action)) = &self.menu.confirm {
             return self.confirm_dialog(target, *action, context, palette);
         }
@@ -1255,7 +1259,6 @@ impl DesktopApp {
         ContentDialog::new()
             .is_open(false)
             .on_closed(context.callback(move |_| Message::DialogClosed(epoch)))
-            .content(View::empty())
     }
 
     /// The window's row-menu button. It is never shown (no size, not
@@ -1288,11 +1291,11 @@ impl DesktopApp {
             .vertical_alignment(VerticalAlignment::Top)
             .menu(Menu::new(
                 items,
-                context.callback(|label: String| {
+                crate::views::menu_keys(context.callback(|label: String| {
                     Action::from_label(&label).map_or(Message::Menu(MenuMsg::Ignored), |action| {
                         Message::Menu(MenuMsg::Picked(action))
                     })
-                }),
+                })),
             ))
     }
 
@@ -1338,7 +1341,7 @@ impl DesktopApp {
         action: Action,
         context: &mut ViewContext<Self>,
         palette: Palette,
-    ) -> View {
+    ) -> ContentDialog {
         let (title, body, button) = match target {
             Target::Agent(agent) if action == Action::Stop => (
                 format!("Stop “{}”?", target.title()),
@@ -1389,12 +1392,15 @@ impl DesktopApp {
                     .element_ref(&self.dialog.close)
                     .automation_name("Cancel")
                     .on_click(context.message(Message::Menu(MenuMsg::Confirmed(false))))
-                    .content(m3::label("Cancel")),
-                m3::destructive(palette)
-                    .element_ref(&self.dialog.primary)
-                    .automation_name(format!("{button}: {}", target.title()))
-                    .on_click(context.message(Message::Menu(MenuMsg::Confirmed(true))))
-                    .content(m3::label(button)),
+                    .content(m3::label("Cancel"))
+                    .into(),
+                View::from(
+                    m3::destructive(palette)
+                        .element_ref(&self.dialog.primary)
+                        .automation_name(format!("{button}: {}", target.title()))
+                        .on_click(context.message(Message::Menu(MenuMsg::Confirmed(true))))
+                        .content(m3::label(button)),
+                ),
             ),
             tokens::layout::DIALOG_WIDTH,
         )
@@ -1412,7 +1418,7 @@ impl DesktopApp {
         Some(
             Border::new()
                 .grid_row(4)
-                .width(column)
+                .maybe_width(column)
                 .max_width(tokens::layout::READING_WIDTH)
                 .horizontal_alignment(HorizontalAlignment::Center)
                 .margin(Thickness::new(0.0, tokens::spacing::SM, 0.0, 0.0))
@@ -1448,7 +1454,8 @@ impl DesktopApp {
                                 )
                                 .content(m3::icon(m3::glyph::CLOSE)),
                         )),
-                ),
+                )
+                .into(),
         )
     }
 
@@ -1494,7 +1501,7 @@ impl Component for AttachRows {
     }
 
     fn update(&mut self, message: Message, _context: &ComponentContext<Self>) {
-        let _ = self.send.call(message);
+        self.send.call(message);
     }
 
     fn view(&self, input: &AttachRowsInput, context: &mut ViewContext<Self>) -> View {
@@ -1518,9 +1525,9 @@ impl Component for AttachRows {
                             &choice.name,
                             &path,
                             if current {
-                                m3::icon(m3::glyph::CHECK)
+                                Some(m3::icon(m3::glyph::CHECK))
                             } else {
-                                View::empty()
+                                None
                             },
                         )),
                 )
@@ -1538,6 +1545,7 @@ impl Component for AttachRows {
                     .vertical_scroll_bar_visibility(ScrollBarVisibility::Auto)
                     .content(StackPanel::new().keyed_children(rows)),
             ))
+            .into()
     }
 }
 

@@ -879,7 +879,7 @@ impl DesktopApp {
         dialog: &BulkDialog,
         context: &mut ViewContext<Self>,
         palette: Palette,
-    ) -> View {
+    ) -> ContentDialog {
         let count = dialog.plan.items.len();
         // Projects are named in the list; tasks say where they are.
         let place = if dialog.op == BulkOp::RemoveProjects {
@@ -920,7 +920,8 @@ impl DesktopApp {
                             .width(tokens::layout::RING)
                             .height(tokens::layout::RING),
                         m3::secondary("Reading every task and project…"),
-                    )),
+                    ))
+                    .into(),
             ),
             Phase::Confirm => {
                 for (index, item) in dialog.plan.items.iter().take(LISTED).enumerate() {
@@ -971,7 +972,8 @@ impl DesktopApp {
                         } else {
                             "Each one is checked by Swarm as it goes."
                         }),
-                    )),
+                    ))
+                    .into(),
             ),
             Phase::Done => {
                 let done = dialog
@@ -1083,15 +1085,18 @@ impl DesktopApp {
             .automation_name(format!("{close_label} {}", dialog.op.verb().to_lowercase()))
             .on_click(context.message(Message::Bulk(close_message)))
             .content(m3::label(close_label));
-        let primary: View = if dialog.phase == Phase::Confirm && count > 0 {
+        let primary: Option<View> = if dialog.phase == Phase::Confirm && count > 0 {
             let label = format!("{} {}", dialog.op.verb(), dialog.op.noun(count));
-            m3::destructive(palette)
-                .element_ref(&self.dialog.primary)
-                .automation_name(format!("Confirm: {label}"))
-                .on_click(context.message(Message::Bulk(BulkMsg::Confirmed(true))))
-                .content(m3::label(&label))
+            Some(
+                m3::destructive(palette)
+                    .element_ref(&self.dialog.primary)
+                    .automation_name(format!("Confirm: {label}"))
+                    .on_click(context.message(Message::Bulk(BulkMsg::Confirmed(true))))
+                    .content(m3::label(&label))
+                    .into(),
+            )
         } else {
-            View::empty()
+            None
         };
         super::dialog_ui::surface(
             context,
@@ -1100,8 +1105,9 @@ impl DesktopApp {
             title,
             StackPanel::new()
                 .spacing(tokens::spacing::XS)
-                .keyed_children(lines),
-            super::dialog_ui::actions(close, primary),
+                .keyed_children(lines)
+                .into(),
+            super::dialog_ui::actions(close.into(), primary),
             460.0,
         )
     }

@@ -151,16 +151,16 @@ impl DesktopApp {
             ))
             .on_click(context.callback(|()| Message::Launch(LaunchMsg::Toggle(Pop::Quotas))));
         let content = m3::sidebar_row(
-            Border::new().width(tokens::icon::ROW).content(ring),
+            View::from(Border::new().width(tokens::icon::ROW).content(ring)),
             "Usage",
             open,
             0.0,
             false,
             None,
             if word.is_empty() {
-                View::empty()
+                None
             } else {
-                m3::trailing(word, open).into()
+                Some(m3::trailing(word, open).into())
             },
         );
         let row = self.anchored_popover(
@@ -181,7 +181,9 @@ impl DesktopApp {
         } else {
             format!("usage:{low}:{}", tightest.is_some())
         };
-        Grid::new().keyed_children(vec![KeyedView::new(key, row)])
+        Grid::new()
+            .keyed_children(vec![KeyedView::new(key, row)])
+            .into()
     }
 
     /// The Usage popover (`Hold.dc.html`): "Usage" with when the limits
@@ -351,6 +353,7 @@ impl DesktopApp {
                     footer,
                 )),
             )
+            .into()
     }
 }
 

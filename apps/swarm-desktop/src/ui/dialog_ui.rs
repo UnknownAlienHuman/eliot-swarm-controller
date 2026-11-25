@@ -22,7 +22,7 @@ pub(super) fn surface(
     body: View,
     footer: View,
     width: f64,
-) -> View {
+) -> ContentDialog {
     // The card is painted here, in the window's scheme: a ContentDialog
     // resolves its own background from the Windows theme (and keeps it
     // across a scheme change), which left a Light card under Dark text.
@@ -52,12 +52,13 @@ pub(super) fn surface(
         )
 }
 
-pub(super) fn actions(close: View, primary: View) -> View {
+pub(super) fn actions(close: View, primary: impl Into<Option<View>>) -> View {
     StackPanel::new()
         .orientation(Orientation::Horizontal)
         .horizontal_alignment(HorizontalAlignment::Right)
         .spacing(tokens::spacing::SM)
-        .children((close, primary))
+        .keyed_children(crate::views::slots([Some(close), primary.into()]))
+        .into()
 }
 
 impl DesktopApp {

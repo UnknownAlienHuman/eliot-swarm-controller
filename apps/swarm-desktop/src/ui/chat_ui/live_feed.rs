@@ -253,25 +253,27 @@ impl DesktopApp {
         }
         let place = Border::new()
             .grid_row(4)
-            .width(column)
+            .maybe_width(column)
             .max_width(tokens::layout::READING_WIDTH)
             .horizontal_alignment(HorizontalAlignment::Center)
             .margin(Thickness::new(0.0, tokens::spacing::SM, 0.0, 0.0))
-            .automation_name(words.to_owned());
+            .automation_name(words);
         match detail.state {
             eliot_core::AgentState::Lost => Some(
-                place.content(
-                    StackPanel::new()
-                        .orientation(Orientation::Horizontal)
-                        .spacing(tokens::spacing::SM)
-                        .horizontal_alignment(HorizontalAlignment::Center)
-                        .children((
-                            m3::muted_icon(m3::glyph::RESTART),
-                            m3::secondary(words.to_owned())
-                                .vertical_alignment(VerticalAlignment::Center)
-                                .text_trimming(TextTrimming::CharacterEllipsis),
-                        )),
-                ),
+                place
+                    .content(
+                        StackPanel::new()
+                            .orientation(Orientation::Horizontal)
+                            .spacing(tokens::spacing::SM)
+                            .horizontal_alignment(HorizontalAlignment::Center)
+                            .children((
+                                m3::muted_icon(m3::glyph::RESTART),
+                                m3::secondary(words.to_owned())
+                                    .vertical_alignment(VerticalAlignment::Center)
+                                    .text_trimming(TextTrimming::CharacterEllipsis),
+                            )),
+                    )
+                    .into(),
             ),
             eliot_core::AgentState::Failed => {
                 let (container, on) = palette.status_chip(crate::theme::StatusTone::Failed);
@@ -318,7 +320,8 @@ impl DesktopApp {
                                         )))
                                         .content(m3::label("Details")),
                                 )),
-                        ),
+                        )
+                        .into(),
                 )
             }
             _ => None,

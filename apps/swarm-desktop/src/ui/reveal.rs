@@ -318,14 +318,16 @@ impl DesktopApp {
 
     /// Why the last open of `path` failed, in the error color; empty
     /// otherwise.
-    pub(super) fn reveal_note(&self, item: &str, palette: Palette) -> View {
+    pub(super) fn reveal_note(&self, item: &str, palette: Palette) -> Option<View> {
         match &self.revealed {
-            Some((failed, note)) if failed == item => m3::secondary(note.clone())
-                .foreground(palette.attention())
-                .text_wrapping(TextWrapping::Wrap)
-                .is_text_selection_enabled(true)
-                .into(),
-            _ => View::empty(),
+            Some((failed, note)) if failed == item => Some(
+                m3::secondary(note.clone())
+                    .foreground(palette.attention())
+                    .text_wrapping(TextWrapping::Wrap)
+                    .is_text_selection_enabled(true)
+                    .into(),
+            ),
+            _ => None,
         }
     }
 
@@ -339,10 +341,12 @@ impl DesktopApp {
         path: &str,
     ) -> View {
         let open = self.reveal_message(context, path);
-        StackPanel::new().children((
-            path_row(palette, title, note, path, open),
-            self.reveal_note(path, palette),
-        ))
+        StackPanel::new()
+            .keyed_children(crate::views::slots([
+                Some(path_row(palette, title, note, path, open)),
+                self.reveal_note(path, palette),
+            ]))
+            .into()
     }
 
     /// [`path_link`] with its failure note under it.
@@ -353,9 +357,11 @@ impl DesktopApp {
         path: &str,
     ) -> View {
         let open = self.reveal_message(context, path);
-        StackPanel::new().children((
-            path_link(palette, path, open),
-            self.reveal_note(path, palette),
-        ))
+        StackPanel::new()
+            .keyed_children(crate::views::slots([
+                Some(path_link(palette, path, open)),
+                self.reveal_note(path, palette),
+            ]))
+            .into()
     }
 }

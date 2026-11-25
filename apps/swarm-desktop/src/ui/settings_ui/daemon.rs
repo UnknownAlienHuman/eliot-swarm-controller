@@ -18,16 +18,18 @@ fn daemon_switch(
     name: &str,
 ) -> View {
     let on = model::daemon_bool(daemon, pointer, default);
-    Grid::new().keyed_children(vec![KeyedView::new(
-        format!("{pointer}:{on}"),
-        ToggleSwitch::new()
-            .is_on(on)
-            .min_width(0.0)
-            .automation_name(name.to_owned())
-            .on_toggled(context.callback(move |on: bool| {
-                Message::Settings(SettingsMsg::DaemonEdit(DaemonEdit::Switch(pointer, on)))
-            })),
-    )])
+    Grid::new()
+        .keyed_children(vec![KeyedView::new(
+            format!("{pointer}:{on}"),
+            ToggleSwitch::new()
+                .is_on(on)
+                .min_width(0.0)
+                .automation_name(name)
+                .on_toggled(context.callback(move |on: bool| {
+                    Message::Settings(SettingsMsg::DaemonEdit(DaemonEdit::Switch(pointer, on)))
+                })),
+        )])
+        .into()
 }
 
 /// A row's number box over a `[daemon]` key; empty removes the key.
@@ -42,7 +44,7 @@ fn daemon_number(
         .width(tokens::layout::NUMBER_WIDTH)
         .minimum(minimum)
         .value(model::daemon_number(daemon, pointer))
-        .automation_name(name.to_owned())
+        .automation_name(name)
         .on_value_changed(context.callback(move |value| {
             Message::Settings(SettingsMsg::DaemonEdit(DaemonEdit::Number(pointer, value)))
         }))
@@ -72,26 +74,28 @@ fn daemon_choice(
     let labels: Vec<String> = std::iter::once(format!("Default ({})", choices[0].1))
         .chain(choices.iter().map(|(_, label)| (*label).to_owned()))
         .collect();
-    Grid::new().keyed_children(vec![KeyedView::new(
-        format!("{pointer}:{index}"),
-        ComboBox::new()
-            .width(tokens::page::SETTINGS_CONTROL)
-            .items_source(labels)
-            .selected_index(Some(index))
-            .automation_name(name.to_owned())
-            // A selection WinUI reports for the list it was given is the
-            // value shown: the edit then changes nothing.
-            .on_selection_changed(context.callback(move |index: Option<usize>| {
-                Message::Settings(SettingsMsg::DaemonEdit(match index {
-                    Some(0) => DaemonEdit::Text(pointer, String::new()),
-                    Some(index) => match choices.get(index - 1) {
-                        Some((value, _)) => DaemonEdit::Choice(pointer, value),
+    Grid::new()
+        .keyed_children(vec![KeyedView::new(
+            format!("{pointer}:{index}"),
+            ComboBox::new()
+                .width(tokens::page::SETTINGS_CONTROL)
+                .items_source(labels)
+                .selected_index(Some(index))
+                .automation_name(name)
+                // A selection WinUI reports for the list it was given is the
+                // value shown: the edit then changes nothing.
+                .on_selection_changed(context.callback(move |index: Option<usize>| {
+                    Message::Settings(SettingsMsg::DaemonEdit(match index {
+                        Some(0) => DaemonEdit::Text(pointer, String::new()),
+                        Some(index) => match choices.get(index - 1) {
+                            Some((value, _)) => DaemonEdit::Choice(pointer, value),
+                            None => DaemonEdit::Unchanged,
+                        },
                         None => DaemonEdit::Unchanged,
-                    },
-                    None => DaemonEdit::Unchanged,
-                }))
-            })),
-    )])
+                    }))
+                })),
+        )])
+        .into()
 }
 
 /// One attention kind: its title and sentence, its `enabled` key, its wait
@@ -355,7 +359,7 @@ impl DesktopApp {
         &self,
         context: &mut ViewContext<Self>,
         palette: Palette,
-    ) -> View {
+    ) -> ContentDialog {
         let (lines, deletes) =
             daemon_changes(&self.settings.base(Section::Daemon), &self.settings.daemon);
         let mut rows: Vec<KeyedView> = lines
@@ -390,7 +394,8 @@ impl DesktopApp {
             },
             StackPanel::new()
                 .spacing(tokens::spacing::SM)
-                .keyed_children(rows),
+                .keyed_children(rows)
+                .into(),
             super::super::dialog_ui::actions(
                 m3::text_button(palette)
                     .element_ref(&self.dialog.close)
@@ -398,14 +403,17 @@ impl DesktopApp {
                     .on_click(
                         context.message(Message::Settings(SettingsMsg::DaemonConfirmed(false))),
                     )
-                    .content(m3::label("Cancel")),
-                save.element_ref(&self.dialog.primary)
-                    .is_enabled(!lines.is_empty())
-                    .automation_name("Save the daemon settings")
-                    .on_click(
-                        context.message(Message::Settings(SettingsMsg::DaemonConfirmed(true))),
-                    )
-                    .content(m3::label("Save")),
+                    .content(m3::label("Cancel"))
+                    .into(),
+                View::from(
+                    save.element_ref(&self.dialog.primary)
+                        .is_enabled(!lines.is_empty())
+                        .automation_name("Save the daemon settings")
+                        .on_click(
+                            context.message(Message::Settings(SettingsMsg::DaemonConfirmed(true))),
+                        )
+                        .content(m3::label("Save")),
+                ),
             ),
             tokens::layout::DIALOG_WIDTH,
         )
@@ -444,9 +452,9 @@ impl DesktopApp {
                                     .max_height(tokens::layout::SOURCE_MAX_HEIGHT)
                                     .is_enabled(!self.settings.busy())
                                     .automation_name("Owner rules")
-                                    .on_text_changed(context.callback(|text| {
+                                    .on_text_changed(crate::views::text_edits(context.callback(|text| {
                                         Message::Settings(SettingsMsg::OwnerRulesText(text))
-                                    })),
+                                    }))),
                                 m3::secondary(if bytes > 8 * 1024 {
                                     format!("{bytes} bytes: longer than 8 KiB, which agents read slowly.")
                                 } else {
@@ -456,7 +464,7 @@ impl DesktopApp {
                     )],
                 ),
                 self.save_bar(Page::OwnerRules, dirty, context, palette),
-            ))
+            )).into()
     }
 
     /// Attention: the daemon's reactions by kind, each on by default; the
@@ -500,18 +508,21 @@ impl DesktopApp {
                 ));
             }
         }
-        StackPanel::new().spacing(tokens::spacing::SM).children((
-            m3::card_title("Reactions"),
-            m3::settings_card(palette, rows),
-            m3::secondary("The daemon applies a change at its next start. Save asks first.")
-                .text_wrapping(TextWrapping::Wrap),
-            self.save_bar(
-                Page::Attention,
-                self.settings.dirty(Page::Attention),
-                context,
-                palette,
-            ),
-        ))
+        StackPanel::new()
+            .spacing(tokens::spacing::SM)
+            .children((
+                m3::card_title("Reactions"),
+                m3::settings_card(palette, rows),
+                m3::secondary("The daemon applies a change at its next start. Save asks first.")
+                    .text_wrapping(TextWrapping::Wrap),
+                self.save_bar(
+                    Page::Attention,
+                    self.settings.dirty(Page::Attention),
+                    context,
+                    palette,
+                ),
+            ))
+            .into()
     }
 
     /// Accounts & proxies: what the settings hold, by name; they are
@@ -558,29 +569,33 @@ impl DesktopApp {
             if entries.is_empty() {
                 return vec![KeyedView::new(
                     "none",
-                    m3::setting_row(&format!("No {what}"), "None is configured.", View::empty()),
+                    m3::setting_row(&format!("No {what}"), "None is configured.", None),
                 )];
             }
             entries
                 .into_iter()
                 .map(|(name, words)| {
-                    KeyedView::new(name.clone(), m3::setting_row(&name, &words, View::empty()))
+                    KeyedView::new(name.clone(), m3::setting_row(&name, &words, None))
                 })
                 .collect()
         };
-        StackPanel::new().spacing(tokens::spacing::SM).children((
-            m3::card_title("Accounts"),
-            m3::settings_card(palette, list(Section::Accounts, "accounts")),
-            m3::card_title("Proxies"),
-            m3::settings_card(palette, list(Section::Proxies, "proxies")),
-            m3::text_button(palette)
-                .horizontal_alignment(HorizontalAlignment::Left)
-                .automation_name("Edit in Settings file & history")
-                .on_click(
-                    context.message(Message::Settings(SettingsMsg::PageSelected(Page::Advanced))),
-                )
-                .content(m3::label("Edit in Settings file & history")),
-        ))
+        StackPanel::new()
+            .spacing(tokens::spacing::SM)
+            .children((
+                m3::card_title("Accounts"),
+                m3::settings_card(palette, list(Section::Accounts, "accounts")),
+                m3::card_title("Proxies"),
+                m3::settings_card(palette, list(Section::Proxies, "proxies")),
+                m3::text_button(palette)
+                    .horizontal_alignment(HorizontalAlignment::Left)
+                    .automation_name("Edit in Settings file & history")
+                    .on_click(
+                        context
+                            .message(Message::Settings(SettingsMsg::PageSelected(Page::Advanced))),
+                    )
+                    .content(m3::label("Edit in Settings file & history")),
+            ))
+            .into()
     }
 
     /// Daemon: what a restart does, how much the log says, where chats
@@ -618,17 +633,17 @@ impl DesktopApp {
                             m3::setting_row(
                                 "Chats folder",
                                 "Where chats without a project work; empty uses the data folder.",
-                                m3::field()
+                                View::from(m3::field()
                                     .width(tokens::page::SETTINGS_CONTROL)
                                     .text(chats)
                                     .placeholder_text("Default")
                                     .automation_name("Chats folder")
-                                    .on_text_changed(context.callback(|text| {
+                                    .on_text_changed(crate::views::text_edits(context.callback(|text| {
                                         Message::Settings(SettingsMsg::DaemonEdit(
                                             DaemonEdit::Text("/chats_root", text),
                                         ))
-                                    }))
-                                    .into(),
+                                    }))))
+                                    ,
                             ),
                         ),
                     ],
@@ -638,7 +653,7 @@ impl DesktopApp {
                 )
                 .text_wrapping(TextWrapping::Wrap),
                 self.save_bar(Page::Daemon, self.settings.dirty(Page::Daemon), context, palette),
-            ))
+            )).into()
     }
 
     /// Retention: how long the store keeps events, commands and mail.
@@ -711,6 +726,6 @@ impl DesktopApp {
                 context,
                 palette,
             ),
-        ))
+        )).into()
     }
 }

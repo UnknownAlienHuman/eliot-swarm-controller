@@ -109,13 +109,16 @@ impl DesktopApp {
                         .is_checked(checked)
                         .is_enabled(!state.cleanup_busy)
                         .automation_name(format!("Remove {}: {summary}", group.title()))
-                        .on_is_checked_changed(context.callback(move |on: bool| {
-                            Message::Settings(SettingsMsg::CleanupGroupToggled(group, on))
-                        }))
+                        .on_is_checked_changed(crate::views::check_changes(context.callback(
+                            move |on: bool| {
+                                Message::Settings(SettingsMsg::CleanupGroupToggled(group, on))
+                            },
+                        )))
                         .content(m3::text(
                             format!("{} · {summary}", group.title()),
                             tokens::text::HEADER,
                         ))
+                        .into()
                 } else {
                     m3::text(
                         format!("{} · {summary}", group.title()),
@@ -169,15 +172,15 @@ impl DesktopApp {
                     let path = &item.artifact.path;
                     let view = if on_disk {
                         let reveal_item = format!("cleanup:{}", item.artifact.id);
-                        StackPanel::new().children((
-                            super::super::reveal::path_item(
+                        StackPanel::new().keyed_children(crate::views::slots([
+                            Some(super::super::reveal::path_item(
                                 palette,
                                 &name,
-                                lines,
+                                lines.into(),
                                 self.reveal_item_message(context, &reveal_item, path),
-                            ),
+                            )),
                             self.reveal_note(&reveal_item, palette),
-                        ))
+                        ]))
                     } else {
                         lines
                     };
@@ -211,7 +214,7 @@ impl DesktopApp {
                                 }),
                                 &label,
                                 "",
-                                View::empty(),
+                                None,
                             )),
                     ));
                     if open {
@@ -271,6 +274,7 @@ impl DesktopApp {
         StackPanel::new()
             .spacing(tokens::spacing::SM)
             .keyed_children(parts)
+            .into()
     }
 
     /// Kept outside the page scroller: selection and Remove never scroll away.
@@ -278,10 +282,10 @@ impl DesktopApp {
         &self,
         context: &mut ViewContext<Self>,
         palette: Palette,
-    ) -> View {
+    ) -> Option<View> {
         let state = &self.settings;
         let Some(plan) = &state.cleanup_plan else {
-            return View::empty();
+            return None;
         };
         let groups = crate::worktrees::cleanup_groups(plan);
         let mut parts = Vec::new();
@@ -328,36 +332,39 @@ impl DesktopApp {
                     })),
             ));
         }
-        m3::card_high(palette)
-            .width(self.settings_column_width())
-            .horizontal_alignment(HorizontalAlignment::Center)
-            .margin(Thickness::uniform(tokens::spacing::SM))
-            .content(
-                StackPanel::new()
-                    .orientation(Orientation::Horizontal)
-                    .horizontal_alignment(HorizontalAlignment::Right)
-                    .spacing(tokens::spacing::SM)
-                    .keyed_children(parts),
-            )
+        Some(
+            m3::card_high(palette)
+                .maybe_width(self.settings_column_width())
+                .horizontal_alignment(HorizontalAlignment::Center)
+                .margin(Thickness::uniform(tokens::spacing::SM))
+                .content(
+                    StackPanel::new()
+                        .orientation(Orientation::Horizontal)
+                        .horizontal_alignment(HorizontalAlignment::Right)
+                        .spacing(tokens::spacing::SM)
+                        .keyed_children(parts),
+                )
+                .into(),
+        )
     }
 
     pub(in crate::ui) fn cleanup_confirmation(
         &self,
         context: &mut ViewContext<Self>,
         palette: Palette,
-    ) -> View {
+    ) -> Option<ContentDialog> {
         let Some(plan) = &self.settings.cleanup_plan else {
-            return View::empty();
+            return None;
         };
         let selected = crate::worktrees::selected_artifacts(plan, &self.settings.cleanup_unchecked);
-        super::super::dialog_ui::surface(context, self.dialog.epoch, palette, "Remove selected items?".to_owned(),
+        Some(super::super::dialog_ui::surface(context, self.dialog.epoch, palette, "Remove selected items?".to_owned(),
             m3::body(format!("Remove {}? This cannot be undone. Kept items stay; Swarm checks each item again before removing it.",
                 eliot_core::count_words(selected.len() as u64, "item", "items"))).text_wrapping(TextWrapping::Wrap).into(),
             super::super::dialog_ui::actions(
                 m3::text_button(palette).element_ref(&self.dialog.close).automation_name("Cancel cleanup")
-                    .on_click(context.message(Message::Settings(SettingsMsg::CleanupConfirmed(false)))).content(m3::label("Cancel")),
-                m3::destructive(palette).element_ref(&self.dialog.primary).is_enabled(!self.settings.cleanup_busy && !selected.is_empty()).automation_name("Confirm Remove")
-                    .on_click(context.message(Message::Settings(SettingsMsg::CleanupConfirmed(true)))).content(m3::label("Remove"))), tokens::layout::DIALOG_WIDTH)
+                    .on_click(context.message(Message::Settings(SettingsMsg::CleanupConfirmed(false)))).content(m3::label("Cancel")).into(),
+                View::from(m3::destructive(palette).element_ref(&self.dialog.primary).is_enabled(!self.settings.cleanup_busy && !selected.is_empty()).automation_name("Confirm Remove")
+                    .on_click(context.message(Message::Settings(SettingsMsg::CleanupConfirmed(true)))).content(m3::label("Remove")))), tokens::layout::DIALOG_WIDTH))
     }
 
     /// Worktrees & cleanup (Codex's Worktrees page as the pattern): where
@@ -383,17 +390,20 @@ impl DesktopApp {
                     m3::setting_row(
                         "Clean up finished work",
                         "Review what Swarm can remove for finished tasks, by kind, with sizes and reasons. Nothing is removed until you confirm.",
-                        m3::outlined(palette)
-                            .automation_name("Review cleanup")
-                            .is_enabled(!self.settings.cleanup_busy)
-                            .on_click(
-                                context.message(Message::Settings(SettingsMsg::CleanupPlan(None))),
-                            )
-                            .content(m3::label(if self.settings.cleanup_plan.is_some() {
-                                "Review again"
-                            } else {
-                                "Review…"
-                            })),
+                        View::from(
+                            m3::outlined(palette)
+                                .automation_name("Review cleanup")
+                                .is_enabled(!self.settings.cleanup_busy)
+                                .on_click(
+                                    context
+                                        .message(Message::Settings(SettingsMsg::CleanupPlan(None))),
+                                )
+                                .content(m3::label(if self.settings.cleanup_plan.is_some() {
+                                    "Review again"
+                                } else {
+                                    "Review…"
+                                })),
+                        ),
                     ),
                 ),
             ],
@@ -471,26 +481,32 @@ impl DesktopApp {
                 )),
             ));
         }
-        StackPanel::new().spacing(tokens::spacing::MD).children((
-            StackPanel::new().spacing(tokens::spacing::SM).children((
-                m3::card_title("Creation and cleanup"),
-                settings,
-                cleanup,
-            )),
-            m3::section_heading(
-                "Managed worktrees",
-                &heading,
-                Some(
-                    m3::text_button(palette)
-                        .is_enabled(!self.settings.worktrees_loading)
-                        .automation_name("Read managed worktrees again")
-                        .on_click(context.message(Message::Settings(SettingsMsg::WorktreesRefresh)))
-                        .content(m3::label("Refresh")),
+        StackPanel::new()
+            .spacing(tokens::spacing::MD)
+            .children((
+                StackPanel::new().spacing(tokens::spacing::SM).children((
+                    m3::card_title("Creation and cleanup"),
+                    settings,
+                    cleanup,
+                )),
+                m3::section_heading(
+                    "Managed worktrees",
+                    &heading,
+                    Some(
+                        m3::text_button(palette)
+                            .is_enabled(!self.settings.worktrees_loading)
+                            .automation_name("Read managed worktrees again")
+                            .on_click(
+                                context.message(Message::Settings(SettingsMsg::WorktreesRefresh)),
+                            )
+                            .content(m3::label("Refresh"))
+                            .into(),
+                    ),
                 ),
-            ),
-            StackPanel::new()
-                .spacing(tokens::spacing::MD)
-                .keyed_children(groups),
-        ))
+                StackPanel::new()
+                    .spacing(tokens::spacing::MD)
+                    .keyed_children(groups),
+            ))
+            .into()
     }
 }

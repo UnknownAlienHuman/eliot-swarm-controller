@@ -220,7 +220,7 @@ impl DesktopApp {
         dialog: &MoveDialog,
         context: &mut ViewContext<Self>,
         palette: Palette,
-    ) -> View {
+    ) -> ContentDialog {
         let title = self.agent_label(&dialog.agent);
         let (candidates, unread): (&[UiAgent], usize) = match &dialog.search {
             Search::Read(managers) => (&managers.agents, managers.unread),
@@ -321,29 +321,33 @@ impl DesktopApp {
                 .max_height(tokens::layout::MOVE_LIST_MAX_HEIGHT)
                 .vertical_scroll_bar_visibility(ScrollBarVisibility::Auto)
                 .automation_name("Tasks to move under")
-                .content(StackPanel::new().keyed_children(rows)),
+                .content(StackPanel::new().keyed_children(rows))
+                .into(),
         };
         // The search is bounded: say what it left unread.
-        let incomplete: View =
-            match reparent::unread_words(dialog.agent.scope(), candidates.len(), unread) {
-                Some(words) => m3::secondary(words)
+        let incomplete: Option<View> =
+            reparent::unread_words(dialog.agent.scope(), candidates.len(), unread).map(|words| {
+                m3::secondary(words)
                     .text_wrapping(TextWrapping::Wrap)
+                    .into()
+            });
+        let summary: Option<View> = match (&dialog.error, picked) {
+            (Some(error), _) => Some(
+                m3::body(error.clone())
+                    .foreground(palette.attention())
+                    .text_wrapping(TextWrapping::Wrap)
+                    .is_text_selection_enabled(true)
                     .into(),
-                None => View::empty(),
-            };
-        let summary: View = match (&dialog.error, picked) {
-            (Some(error), _) => m3::body(error.clone())
-                .foreground(palette.attention())
+            ),
+            (None, Some(parent)) => Some(
+                m3::secondary(format!(
+                    "“{title}” will work under “{}”. Its own workers move with it.",
+                    self.agent_label(parent)
+                ))
                 .text_wrapping(TextWrapping::Wrap)
-                .is_text_selection_enabled(true)
                 .into(),
-            (None, Some(parent)) => m3::secondary(format!(
-                "“{title}” will work under “{}”. Its own workers move with it.",
-                self.agent_label(parent)
-            ))
-            .text_wrapping(TextWrapping::Wrap)
-            .into(),
-            (None, None) => View::empty(),
+            ),
+            (None, None) => None,
         };
         let confirm: View = match picked {
             Some(parent) => m3::filled(palette)
@@ -362,11 +366,13 @@ impl DesktopApp {
                     "Moving…"
                 } else {
                     "Move"
-                })),
+                }))
+                .into(),
             None => m3::filled(palette)
                 .is_enabled(false)
                 .automation_name("Move (pick a task first)")
-                .content(m3::label("Move")),
+                .content(m3::label("Move"))
+                .into(),
         };
         let heading = format!("Move “{title}” under another task");
         super::dialog_ui::surface(
@@ -374,29 +380,39 @@ impl DesktopApp {
             self.dialog.epoch,
             palette,
             heading,
-            StackPanel::new().spacing(tokens::spacing::MD).children((
-                m3::secondary(format!(
-                    "Pick a running or ready {}. Its workers move with it.",
-                    scope.offered()
-                ))
-                .text_wrapping(TextWrapping::Wrap),
-                m3::field()
-                    .text(dialog.query.clone())
-                    .placeholder_text("Search tasks")
-                    .automation_name("Search tasks to move under")
-                    .on_text_changed(
-                        context.callback(|text| Message::Move(MoveMsg::QueryChanged(text))),
+            StackPanel::new()
+                .spacing(tokens::spacing::MD)
+                .keyed_children(crate::views::slots([
+                    Some(
+                        m3::secondary(format!(
+                            "Pick a running or ready {}. Its workers move with it.",
+                            scope.offered()
+                        ))
+                        .text_wrapping(TextWrapping::Wrap)
+                        .into(),
                     ),
-                list,
-                incomplete,
-                summary,
-            )),
+                    Some(
+                        m3::field()
+                            .text(dialog.query.clone())
+                            .placeholder_text("Search tasks")
+                            .automation_name("Search tasks to move under")
+                            .on_text_changed(crate::views::text_edits(
+                                context.callback(|text| Message::Move(MoveMsg::QueryChanged(text))),
+                            ))
+                            .into(),
+                    ),
+                    Some(list),
+                    incomplete,
+                    summary,
+                ]))
+                .into(),
             super::dialog_ui::actions(
                 m3::text_button(palette)
                     .element_ref(&self.dialog.close)
                     .automation_name("Cancel move")
                     .on_click(context.message(Message::Move(MoveMsg::Closed)))
-                    .content(m3::label("Cancel")),
+                    .content(m3::label("Cancel"))
+                    .into(),
                 confirm,
             ),
             tokens::layout::MOVE_DIALOG_WIDTH,

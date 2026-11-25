@@ -16,6 +16,7 @@ use crate::monitor::{
 };
 use crate::theme::winui::Palette;
 use crate::ui::tokens;
+use crate::views::MaybeContent;
 
 pub fn project_instruction_lines(reply: &AgentGetResponse) -> Option<Vec<String>> {
     let delivery = reply.instruction_delivery.as_ref()?;
@@ -220,29 +221,32 @@ fn chart_card(
             )
         })
         .collect();
-    StackPanel::new().spacing(tokens::spacing::XS).children((
-        Grid::new()
-            .columns([GridLength::STAR, GridLength::Auto])
-            .children((
-                crate::m3::muted(title, tokens::text::CAPTION)
-                    .vertical_alignment(VerticalAlignment::Bottom),
-                crate::m3::text(latest, tokens::text::HEADER).grid_column(1),
-            )),
-        // The plot well in the surface color: one tonal step from the card
-        // in both schemes (the highest container nearly matched the light
-        // card).
-        Border::new()
-            .background(palette.surface())
-            .corner_radius(tokens::radius::CONTAINER)
-            .padding(Thickness::uniform(tokens::spacing::SM))
-            .content(
-                Grid::new()
-                    .height(PLOT_HEIGHT)
-                    .columns((0..GRAPH_BARS).map(|_| GridLength::STAR))
-                    .keyed_children(bars),
-            ),
-        small(format!("{scale} · {note}")).foreground(palette.muted()),
-    ))
+    StackPanel::new()
+        .spacing(tokens::spacing::XS)
+        .children((
+            Grid::new()
+                .columns([GridLength::STAR, GridLength::Auto])
+                .children((
+                    crate::m3::muted(title, tokens::text::CAPTION)
+                        .vertical_alignment(VerticalAlignment::Bottom),
+                    crate::m3::text(latest, tokens::text::HEADER).grid_column(1),
+                )),
+            // The plot well in the surface color: one tonal step from the card
+            // in both schemes (the highest container nearly matched the light
+            // card).
+            Border::new()
+                .background(palette.surface())
+                .corner_radius(tokens::radius::CONTAINER)
+                .padding(Thickness::uniform(tokens::spacing::SM))
+                .content(
+                    Grid::new()
+                        .height(PLOT_HEIGHT)
+                        .columns((0..GRAPH_BARS).map(|_| GridLength::STAR))
+                        .keyed_children(bars),
+                ),
+            small(format!("{scale} · {note}")).foreground(palette.muted()),
+        ))
+        .into()
 }
 
 /// The Agent's identity and settings from the monitor's detail read (when
@@ -615,7 +619,7 @@ impl Component for MonitorList {
     fn view(&self, input: &MonitorListInput, _context: &mut ViewContext<Self>) -> View {
         let mut entries: Vec<KeyedView> = vec![KeyedView::new("head", head_row(input.palette))];
         entries.extend(input.entries.iter().map(|entry| entry_view(entry, input)));
-        StackPanel::new().keyed_children(entries)
+        StackPanel::new().keyed_children(entries).into()
     }
 }
 
@@ -669,22 +673,28 @@ fn head_row(palette: Palette) -> View {
         .border_thickness(Thickness::new(0.0, 0.0, 0.0, tokens::layout::HAIRLINE))
         .automation_name("Columns: Task, Model, Activity, CPU, Memory")
         .content(
-            Grid::new().columns(outer_columns()).children((
-                View::empty(),
-                Grid::new()
-                    .grid_column(1)
-                    .margin(Thickness::xy(tokens::spacing::ROW, 0.0))
-                    .columns(row_columns())
-                    .column_spacing(tokens::spacing::SM)
-                    .children((
-                        label("Task", 0, false),
-                        label("Model", 1, false),
-                        label("Activity", 2, false),
-                        label("CPU", 3, true),
-                        label("Memory", 4, true),
-                    )),
-            )),
+            Grid::new()
+                .columns(outer_columns())
+                .keyed_children(crate::views::slots([
+                    None,
+                    Some(
+                        Grid::new()
+                            .grid_column(1)
+                            .margin(Thickness::xy(tokens::spacing::ROW, 0.0))
+                            .columns(row_columns())
+                            .column_spacing(tokens::spacing::SM)
+                            .children((
+                                label("Task", 0, false),
+                                label("Model", 1, false),
+                                label("Activity", 2, false),
+                                label("CPU", 3, true),
+                                label("Memory", 4, true),
+                            ))
+                            .into(),
+                    ),
+                ])),
         )
+        .into()
 }
 
 /// One tree row (`.trow`): the chevron of its children, then the row (its
@@ -698,7 +708,7 @@ fn fleet_row(entry: &RowEntry, input: &MonitorListInput) -> View {
             "mark",
             Border::new()
                 .vertical_alignment(VerticalAlignment::Center)
-                .content(crate::ui::page_ui::agent_mark(
+                .maybe_content(crate::ui::page_ui::agent_mark(
                     palette,
                     row.state,
                     row.status_line.as_deref(),
@@ -784,71 +794,79 @@ fn fleet_row(entry: &RowEntry, input: &MonitorListInput) -> View {
         .grid_column(1)
         .automation_name(name.clone())
         .on_click(move || {
-            let _ = open.call(id.clone());
+            open.call(id.clone());
         })
         .content(content)
         .tooltip(name);
-    let chevron: View = match entry.children {
-        Some(open) => {
-            let (children, id) = (input.children.clone(), row.id.clone());
-            crate::m3::icon_button(palette)
-                .automation_name(format!(
-                    "{} the workers of {}",
-                    if open { "Hide" } else { "Show" },
-                    entry.title
-                ))
-                .on_click(move || {
-                    let _ = children.call(id.clone());
-                })
-                .content(crate::m3::small_icon(if open {
-                    crate::m3::glyph::CHEVRON_DOWN
-                } else {
-                    crate::m3::glyph::CHEVRON_RIGHT
-                }))
-        }
-        None => View::empty(),
-    };
-    let action: View = if let Some(enabled) = entry.resume {
-        let (resume, id, generation) = (input.resume.clone(), row.id.clone(), row.generation);
+    let chevron: Option<View> = entry.children.map(|open| {
+        let (children, id) = (input.children.clone(), row.id.clone());
         crate::m3::icon_button(palette)
-            .is_enabled(enabled)
-            .automation_name(format!("Resume {} (run {generation})", entry.title))
+            .automation_name(format!(
+                "{} the workers of {}",
+                if open { "Hide" } else { "Show" },
+                entry.title
+            ))
             .on_click(move || {
-                let _ = resume.call((id.clone(), generation));
+                children.call(id.clone());
             })
-            .content(crate::m3::icon(crate::m3::glyph::RESUME))
+            .content(crate::m3::small_icon(if open {
+                crate::m3::glyph::CHEVRON_DOWN
+            } else {
+                crate::m3::glyph::CHEVRON_RIGHT
+            }))
+            .into()
+    });
+    let action: Option<View> = if let Some(enabled) = entry.resume {
+        let (resume, id, generation) = (input.resume.clone(), row.id.clone(), row.generation);
+        Some(
+            crate::m3::icon_button(palette)
+                .is_enabled(enabled)
+                .automation_name(format!("Resume {} (run {generation})", entry.title))
+                .on_click(move || {
+                    resume.call((id.clone(), generation));
+                })
+                .content(crate::m3::icon(crate::m3::glyph::RESUME))
+                .into(),
+        )
     } else if let Some(state) = entry.stop {
         let (stop, id, generation) = (input.stop.clone(), row.id.clone(), row.generation);
-        crate::m3::icon_button(palette)
-            .is_enabled(state == StopButton::Ready)
-            .automation_name(match state {
-                StopButton::Stopping => format!("Stopping {}", entry.title),
-                _ => format!("Stop Agent {} (run {generation})", entry.title),
-            })
-            .on_click(move || {
-                let _ = stop.call((id.clone(), generation));
-            })
-            .content(crate::m3::icon(crate::m3::glyph::STOP_CIRCLE))
+        Some(
+            crate::m3::icon_button(palette)
+                .is_enabled(state == StopButton::Ready)
+                .automation_name(match state {
+                    StopButton::Stopping => format!("Stopping {}", entry.title),
+                    _ => format!("Stop Agent {} (run {generation})", entry.title),
+                })
+                .on_click(move || {
+                    stop.call((id.clone(), generation));
+                })
+                .content(crate::m3::icon(crate::m3::glyph::STOP_CIRCLE))
+                .into(),
+        )
     } else {
-        View::empty()
+        None
     };
     let grid = Grid::new().columns(outer_columns()).children((
-        Border::new()
-            .vertical_alignment(VerticalAlignment::Center)
-            .content(chevron),
+        crate::views::MaybeContent::maybe_content(
+            Border::new().vertical_alignment(VerticalAlignment::Center),
+            chevron,
+        ),
         button,
-        Border::new()
-            .grid_column(2)
-            .vertical_alignment(VerticalAlignment::Center)
-            .content(action),
+        crate::views::MaybeContent::maybe_content(
+            Border::new()
+                .grid_column(2)
+                .vertical_alignment(VerticalAlignment::Center),
+            action,
+        ),
     ));
     if entry.attention {
         Border::new()
             .corner_radius(tokens::radius::PILL)
             .background(palette.status_chip(crate::theme::StatusTone::Attention).0)
             .content(grid)
+            .into()
     } else {
-        grid
+        grid.into()
     }
 }
 
@@ -882,7 +900,7 @@ fn entry_view(entry: &MonitorEntry, input: &MonitorListInput) -> KeyedView {
                     }),
                     label,
                     "",
-                    View::empty(),
+                    None,
                 )),
         ),
         MonitorEntry::Row(entry) => KeyedView::new(

@@ -100,14 +100,16 @@ pub struct ProfilesActions {
 /// A switch keyed by its state (WinUI keeps a toggled switch's own state
 /// otherwise), as General's and Cloud MCP's.
 fn switch(key: &str, on: bool, enabled: bool, name: String, toggled: Callback<bool>) -> View {
-    Grid::new().keyed_children(vec![KeyedView::new(
-        format!("{key}:{on}:{enabled}"),
-        ToggleSwitch::new()
-            .is_on(on)
-            .is_enabled(enabled)
-            .automation_name(name)
-            .on_toggled(toggled),
-    )])
+    Grid::new()
+        .keyed_children(vec![KeyedView::new(
+            format!("{key}:{on}:{enabled}"),
+            ToggleSwitch::new()
+                .is_on(on)
+                .is_enabled(enabled)
+                .automation_name(name)
+                .on_toggled(toggled),
+        )])
+        .into()
 }
 
 /// The Subagents card of the selected profile: the presets it may start
@@ -133,7 +135,7 @@ fn subagents_card(
         crate::m3::setting_row(
             "Can start",
             "Presets this one may start as Swarm subagents.",
-            View::empty(),
+            None,
         ),
     )];
     match form.children {
@@ -153,7 +155,7 @@ fn subagents_card(
                         .is_enabled(!busy)
                         .min_width(0.0)
                         .automation_name(format!("Can start {child}"))
-                        .on_is_checked_changed(toggled.clone())
+                        .on_is_checked_changed(crate::views::check_changes(toggled.clone()))
                         .content(crate::m3::label(&child)),
                 ));
             }
@@ -202,7 +204,7 @@ fn subagents_card(
         None => crate::m3::setting_row(
             "Manages its subagents through Swarm",
             "Complex value: edit it as TOML",
-            View::empty(),
+            None,
         ),
         Some(control) => crate::m3::setting_row(
             "Manages its subagents through Swarm",
@@ -241,10 +243,12 @@ pub fn profiles_screen(data: ProfilesData<'_>, actions: ProfilesActions, palette
     // in one card row (no divider between them).
     let with_error = |key: &str, row: View| -> View {
         match data.field_error.filter(|(field, _)| *field == key) {
-            Some((_, words)) => StackPanel::new().children((
-                row,
-                crate::m3::help(words.to_owned()).foreground(palette.attention()),
-            )),
+            Some((_, words)) => StackPanel::new()
+                .children((
+                    row,
+                    crate::m3::help(words.to_owned()).foreground(palette.attention()),
+                ))
+                .into(),
             None => row,
         }
     };
@@ -278,10 +282,12 @@ pub fn profiles_screen(data: ProfilesData<'_>, actions: ProfilesActions, palette
                         .column_spacing(tokens::spacing::SM)
                         .children((
                             crate::m3::field()
-                                .text(data.new_name.to_owned())
+                                .text(data.new_name)
                                 .placeholder_text("New preset name")
                                 .automation_name("New preset name")
-                                .on_text_changed(actions.new_name_changed.clone()),
+                                .on_text_changed(crate::views::text_edits(
+                                    actions.new_name_changed.clone(),
+                                )),
                             Grid::new()
                                 .grid_column(1)
                                 .keyed_children(vec![KeyedView::new(
@@ -293,13 +299,15 @@ pub fn profiles_screen(data: ProfilesData<'_>, actions: ProfilesActions, palette
                                         .automation_name("New preset agent app")
                                         .on_selection_changed(actions.new_harness_picked.clone()),
                                 )]),
-                        )),
+                        ))
+                        .into(),
                     Some(
                         crate::m3::outlined(palette)
                             .is_enabled(!data.busy)
                             .automation_name("Create preset")
                             .on_click(actions.create.clone())
-                            .content(crate::m3::label("Create")),
+                            .content(crate::m3::label("Create"))
+                            .into(),
                     ),
                 ),
             ),
@@ -317,9 +325,9 @@ pub fn profiles_screen(data: ProfilesData<'_>, actions: ProfilesActions, palette
             crate::m3::row(palette, selected)
                 .automation_name(format!("Profile {name}: {detail}"))
                 .on_click(move || {
-                    let _ = select.call(Some(index));
+                    select.call(Some(index));
                 })
-                .content(crate::m3::row_content(None, name, &detail, View::empty())),
+                .content(crate::m3::row_content(None, name, &detail, None)),
         ));
     }
     if rows.is_empty() {
@@ -408,15 +416,17 @@ pub fn profiles_screen(data: ProfilesData<'_>, actions: ProfilesActions, palette
                     // A dropdown sized for its values. WinUI drops a
                     // ComboBox's selection when its items change, so the
                     // choices key the control.
-                    Grid::new().keyed_children(vec![KeyedView::new(
-                        format!("{}\u{1f}{selected}", choices.join("\u{1f}")),
-                        crate::m3::enum_width(ComboBox::new())
-                            .items_source(choices)
-                            .selected_index(selected)
-                            .is_enabled(!data.busy)
-                            .automation_name(format!("Profile {}", field.label))
-                            .on_selection_changed(picked),
-                    )])
+                    Grid::new()
+                        .keyed_children(vec![KeyedView::new(
+                            format!("{}\u{1f}{selected}", choices.join("\u{1f}")),
+                            crate::m3::enum_width(ComboBox::new())
+                                .items_source(choices)
+                                .selected_index(selected)
+                                .is_enabled(!data.busy)
+                                .automation_name(format!("Profile {}", field.label))
+                                .on_selection_changed(picked),
+                        )])
+                        .into()
                 }
             };
             form.push(KeyedView::new(
@@ -431,17 +441,18 @@ pub fn profiles_screen(data: ProfilesData<'_>, actions: ProfilesActions, palette
                 crate::m3::form_row(
                     "Duplicate as",
                     crate::m3::field()
-                        .text(data.duplicate_name.to_owned())
+                        .text(data.duplicate_name)
                         .placeholder_text("New preset name")
                         .automation_name("Duplicate as")
-                        .on_text_changed(actions.duplicate_name_changed)
+                        .on_text_changed(crate::views::text_edits(actions.duplicate_name_changed))
                         .into(),
                     Some(
                         crate::m3::outlined(palette)
                             .is_enabled(!data.busy)
                             .automation_name("Duplicate preset")
                             .on_click(actions.duplicate)
-                            .content(crate::m3::label("Duplicate")),
+                            .content(crate::m3::label("Duplicate"))
+                            .into(),
                     ),
                 ),
             ),
@@ -473,14 +484,14 @@ pub fn profiles_screen(data: ProfilesData<'_>, actions: ProfilesActions, palette
         }));
     let source: Option<View> = data.source_open.then(|| {
         crate::m3::field()
-            .text(data.view.to_owned())
+            .text(data.view)
             .accepts_return(true)
             .text_wrapping(TextWrapping::NoWrap)
             .is_enabled(data.editable && !data.busy)
             .automation_name("Profile source")
             .min_height(tokens::layout::SOURCE_MIN_HEIGHT)
             .max_height(tokens::layout::SOURCE_MAX_HEIGHT)
-            .on_text_changed(actions.draft_changed)
+            .on_text_changed(crate::views::text_edits(actions.draft_changed))
             .into()
     });
     // Only shown parts take a place, so no empty child adds a gap.
@@ -512,6 +523,7 @@ pub fn profiles_screen(data: ProfilesData<'_>, actions: ProfilesActions, palette
     StackPanel::new()
         .spacing(tokens::spacing::MD)
         .keyed_children(parts)
+        .into()
 }
 
 /// A daemon time (epoch ms) on this computer's clock: "00:06:45" for a
@@ -906,7 +918,7 @@ pub fn scripts_screen(data: ScriptsData<'_>, actions: ScriptsActions, palette: P
                 "Script",
                 small("No scripts yet. Put them in the scripts folder of Swarm's data folder, or in a project's .eliot\\scripts folder.")
                     .into(),
-                Some(refresh),
+                Some(refresh.into()),
             ),
         ));
     } else {
@@ -922,7 +934,7 @@ pub fn scripts_screen(data: ScriptsData<'_>, actions: ScriptsActions, palette: P
                     .horizontal_alignment(HorizontalAlignment::Stretch)
                     .on_selection_changed(actions.select)
                     .into(),
-                Some(refresh),
+                Some(refresh.into()),
             ),
         ));
     }
@@ -951,17 +963,18 @@ pub fn scripts_screen(data: ScriptsData<'_>, actions: ScriptsActions, palette: P
             crate::m3::form_row(
                 "Editor",
                 crate::m3::field()
-                    .text(data.editor_exe.to_owned())
+                    .text(data.editor_exe)
                     .placeholder_text("Editor .exe (absolute path)")
                     .automation_name("Editor executable")
-                    .on_text_changed(actions.editor_changed)
+                    .on_text_changed(crate::views::text_edits(actions.editor_changed))
                     .into(),
                 Some(
                     crate::m3::outlined(palette)
                         .is_enabled(data.display_path.is_some())
                         .automation_name("Open in editor")
                         .on_click(actions.open_editor)
-                        .content(crate::m3::label("Open in editor")),
+                        .content(crate::m3::label("Open in editor"))
+                        .into(),
                 ),
             ),
         ));
@@ -977,14 +990,14 @@ pub fn scripts_screen(data: ScriptsData<'_>, actions: ScriptsActions, palette: P
         page.push(KeyedView::new(
             "source",
             crate::m3::field()
-                .text(data.view.to_owned())
+                .text(data.view)
                 .accepts_return(true)
                 .text_wrapping(TextWrapping::NoWrap)
                 .is_enabled(data.editable && !data.busy)
                 .automation_name("Script source")
                 .min_height(tokens::layout::SOURCE_MIN_HEIGHT)
                 .max_height(tokens::layout::SOURCE_MAX_HEIGHT)
-                .on_text_changed(actions.draft_changed),
+                .on_text_changed(crate::views::text_edits(actions.draft_changed)),
         ));
         below.push(KeyedView::new(
             "actions",
@@ -1051,4 +1064,5 @@ pub fn scripts_screen(data: ScriptsData<'_>, actions: ScriptsActions, palette: P
     StackPanel::new()
         .spacing(tokens::spacing::MD)
         .keyed_children(page)
+        .into()
 }

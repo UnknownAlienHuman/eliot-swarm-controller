@@ -49,10 +49,10 @@ impl DesktopApp {
                     .width(tokens::layout::FOLDER_WIDTH)
                     .horizontal_alignment(HorizontalAlignment::Left)
                     .vertical_alignment(VerticalAlignment::Center)
-                    .on_text_changed(
+                    .on_text_changed(crate::views::text_edits(
                         context
                             .callback(|value| Message::Launch(LaunchMsg::WorkspaceChanged(value))),
-                    )
+                    ))
                     .into()
             },
         )
@@ -91,35 +91,39 @@ impl DesktopApp {
     /// or "Work locally"; a click switches between them where the folder
     /// lets it choose, and a project that starts each task in its own
     /// worktree shows that fixed fact.
-    fn place_chip(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
+    fn place_chip(&self, context: &mut ViewContext<Self>, palette: Palette) -> Option<View> {
         match self.worktree_chip() {
-            launch_ui::WorktreeChip::Hidden => View::empty(),
-            launch_ui::WorktreeChip::Fixed => m3::fixed_chip(
-                palette,
-                false,
-                Some(m3::glyph::WORKTREE),
-                "New worktree",
-                "New worktree: this project starts each task in its own worktree",
-            )
-            .tooltip("This project starts each task in its own worktree."),
-            launch_ui::WorktreeChip::Toggle(on) => m3::chip(palette)
-                .automation_name(if on {
-                    "New worktree: the task works in a new worktree (switch to work locally)"
-                } else {
-                    "Work locally: the task works in this folder (switch to a new worktree)"
-                })
-                .on_click(context.callback(|()| Message::Launch(LaunchMsg::WorktreeToggled)))
-                .content(m3::chip_content(
-                    Some(m3::glyph::WORKTREE),
-                    if on { "New worktree" } else { "Work locally" },
+            launch_ui::WorktreeChip::Hidden => None,
+            launch_ui::WorktreeChip::Fixed => Some(
+                m3::fixed_chip(
+                    palette,
                     false,
-                    tokens::layout::PROJECT_CHIP_WIDTH,
-                ))
-                .tooltip(if on {
-                    "The task works in a new worktree. Click to work in this folder."
-                } else {
-                    "The task works in this folder. Click to start it in a new worktree."
-                }),
+                    Some(m3::glyph::WORKTREE),
+                    "New worktree",
+                    "New worktree: this project starts each task in its own worktree",
+                )
+                .tooltip("This project starts each task in its own worktree."),
+            ),
+            launch_ui::WorktreeChip::Toggle(on) => Some(
+                m3::chip(palette)
+                    .automation_name(if on {
+                        "New worktree: the task works in a new worktree (switch to work locally)"
+                    } else {
+                        "Work locally: the task works in this folder (switch to a new worktree)"
+                    })
+                    .on_click(context.callback(|()| Message::Launch(LaunchMsg::WorktreeToggled)))
+                    .content(m3::chip_content(
+                        Some(m3::glyph::WORKTREE),
+                        if on { "New worktree" } else { "Work locally" },
+                        false,
+                        tokens::layout::PROJECT_CHIP_WIDTH,
+                    ))
+                    .tooltip(if on {
+                        "The task works in a new worktree. Click to work in this folder."
+                    } else {
+                        "The task works in this folder. Click to start it in a new worktree."
+                    }),
+            ),
         }
     }
 
@@ -167,30 +171,33 @@ impl DesktopApp {
                 let access = self.launch.access();
                 let full = access == Access::Full;
                 // Keyed by level: a chip's colors apply when it is created.
-                Grid::new().keyed_children(vec![KeyedView::new(
-                    format!("access:{}", access.wire()),
-                    self.popover_chip(
-                        if full {
-                            m3::attention_chip(palette)
-                        } else {
-                            m3::chip(palette)
-                        }
-                        .automation_name(format!("Access: {}", access.label()))
-                        .on_click(
-                            context.callback(|()| Message::Launch(LaunchMsg::Toggle(Pop::Access))),
+                Grid::new()
+                    .keyed_children(vec![KeyedView::new(
+                        format!("access:{}", access.wire()),
+                        self.popover_chip(
+                            if full {
+                                m3::attention_chip(palette)
+                            } else {
+                                m3::chip(palette)
+                            }
+                            .automation_name(format!("Access: {}", access.label()))
+                            .on_click(
+                                context
+                                    .callback(|()| Message::Launch(LaunchMsg::Toggle(Pop::Access))),
+                            ),
+                            m3::chip_content(
+                                Some(access_glyph(access)),
+                                access.label(),
+                                false,
+                                tokens::layout::PROJECT_CHIP_WIDTH,
+                            ),
+                            &[Pop::Access],
+                            FlyoutPlacement::TopEdgeAlignedLeft,
+                            context,
+                            palette,
                         ),
-                        m3::chip_content(
-                            Some(access_glyph(access)),
-                            access.label(),
-                            false,
-                            tokens::layout::PROJECT_CHIP_WIDTH,
-                        ),
-                        &[Pop::Access],
-                        FlyoutPlacement::TopEdgeAlignedLeft,
-                        context,
-                        palette,
-                    ),
-                )])
+                    )])
+                    .into()
             }
             // A preset (or Auto's pick) carries its own permissions: an
             // outlined chip that is not a control (Full access in the
@@ -220,12 +227,13 @@ impl DesktopApp {
         StackPanel::new()
             .orientation(Orientation::Horizontal)
             .spacing(tokens::spacing::CHIP_GAP)
-            .children((
-                self.project_chip(label_width, context, palette),
+            .keyed_children(crate::views::slots([
+                Some(self.project_chip(label_width, context, palette)),
                 self.place_chip(context, palette),
-                model,
-                access,
-            ))
+                Some(model),
+                Some(access),
+            ]))
+            .into()
     }
 
     /// The Home question's project name (`Main.dc.html`'s title button): a
@@ -257,7 +265,8 @@ impl DesktopApp {
                         .max_width(tokens::layout::PROJECT_CHIP_WIDTH)
                         .text_trimming(TextTrimming::CharacterEllipsis),
                     m3::icon(m3::glyph::CHEVRON_DOWN),
-                )),
+                ))
+                .into(),
             &[Pop::TitleProject],
             FlyoutPlacement::Bottom,
             context,
@@ -299,20 +308,20 @@ impl DesktopApp {
         palette: Palette,
     ) -> View {
         let Some(pop) = open else {
-            return chip.content(label);
+            return chip.content(label).into();
         };
-        let content = match pop {
-            Pop::Model => self.model_popover(context, palette),
-            Pop::Manage => self.manage_popover(context, palette),
-            Pop::Access => self.access_popover(context, palette),
-            Pop::Project | Pop::TitleProject => self.project_popover(context, palette),
-            Pop::Quotas => self.quotas_popover(context, palette),
+        let content: Option<View> = match pop {
+            Pop::Model => Some(self.model_popover(context, palette)),
+            Pop::Manage => Some(self.manage_popover(context, palette)),
+            Pop::Access => Some(self.access_popover(context, palette)),
+            Pop::Project | Pop::TitleProject => Some(self.project_popover(context, palette)),
+            Pop::Quotas => Some(self.quotas_popover(context, palette)),
             Pop::Effort => self.effort_popover(context, palette),
             Pop::Usage => self.usage_popover(context, palette),
         };
         chip.automation_id(crate::flyout::POPOVER_ANCHOR)
             .content(label)
-            .flyout_with(Flyout::rich(Border::new().content(content)).placement(placement))
+            .flyout_with(Flyout::rich(Border::new().maybe_content(content)).placement(placement))
     }
 
     pub(super) fn model_popover(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
@@ -438,9 +447,9 @@ impl DesktopApp {
             .text(self.launch.query.clone())
             .placeholder_text("Search models")
             .automation_name("Search models")
-            .on_text_changed(
+            .on_text_changed(crate::views::text_edits(
                 context.callback(|text| Message::Launch(LaunchMsg::PickerQuery(text))),
-            );
+            ));
         // OpenCode's sliders button at the right end of the search row: the
         // picker's one filter control (Manage models, and Auto's order).
         let manage = m3::icon_button(palette)
@@ -473,6 +482,7 @@ impl DesktopApp {
                     tokens::spacing::XS,
                 )),
             ))
+            .into()
     }
 
     /// One choosable row (OpenCode's): the check, the full model name and an
@@ -528,11 +538,7 @@ impl DesktopApp {
         if highlighted {
             button = button.element_ref(&self.launch.row_ref);
         }
-        let check = if item.current {
-            m3::icon(m3::glyph::CHECK)
-        } else {
-            View::empty()
-        };
+        let check: Option<View> = item.current.then(|| m3::icon(m3::glyph::CHECK));
         let labels: Vec<_> = [
             (item.default, "Default"),
             (item.favorite, "Favorite"),
@@ -556,10 +562,10 @@ impl DesktopApp {
                 .children((
                     Border::new()
                         .vertical_alignment(VerticalAlignment::Center)
-                        .content(check),
+                        .maybe_content(check),
                     TextBlock::new()
                         .grid_column(1)
-                        .text(title.to_owned())
+                        .text(title)
                         .vertical_alignment(VerticalAlignment::Center)
                         .text_trimming(TextTrimming::CharacterEllipsis),
                     m3::secondary(note.to_owned())
@@ -575,7 +581,7 @@ impl DesktopApp {
                 )),
         );
         let segment = highlighted && enabled && !item.efforts.is_empty();
-        let effort: View = if segment {
+        let effort: Option<View> = if segment {
             let segments: Vec<KeyedView> =
                 item.efforts
                     .iter()
@@ -603,23 +609,23 @@ impl DesktopApp {
                         )
                     })
                     .collect();
-            effort_chip(
+            Some(effort_chip(
                 palette,
                 StackPanel::new()
                     .orientation(Orientation::Horizontal)
                     .keyed_children(segments),
-            )
+            ))
         } else if let Some((label, name)) = match item.effort.as_deref() {
             Some(effort) => Some((picker::effort_label(effort), picker::effort_name(effort))),
             // Display only: the row's choice still carries no effort.
             None if model_row => Some(("Default", DEFAULT_EFFORT.to_owned())),
             None => None,
         } {
-            effort_chip(palette, chip_text(label, &name, true))
+            Some(effort_chip(palette, chip_text(label, &name, true)))
         } else {
-            View::empty()
+            None
         };
-        let star: View = if highlighted && enabled && item.model_ref().is_some() {
+        let star: Option<View> = if highlighted && enabled && item.model_ref().is_some() {
             let (glyph, action) = if item.favorite {
                 (
                     m3::glyph::STAR_FILLED,
@@ -628,14 +634,18 @@ impl DesktopApp {
             } else {
                 (m3::glyph::STAR, format!("Add {title} to favorites"))
             };
-            m3::icon_button(palette)
-                .automation_name(action)
-                .on_click(
-                    context.message(Message::Launch(LaunchMsg::PickerFavorite(item.key.clone()))),
-                )
-                .content(m3::icon(glyph))
+            Some(
+                m3::icon_button(palette)
+                    .automation_name(action)
+                    .on_click(
+                        context
+                            .message(Message::Launch(LaunchMsg::PickerFavorite(item.key.clone()))),
+                    )
+                    .content(m3::icon(glyph))
+                    .into(),
+            )
         } else {
-            View::empty()
+            None
         };
         // Every row keeps the star's column, so the effort chips line up.
         let trailing = Grid::new()
@@ -643,13 +653,18 @@ impl DesktopApp {
             .columns([GridLength::Auto, GridLength::Pixel(tokens::height::CONTROL)])
             .column_spacing(tokens::spacing::XS)
             .vertical_alignment(VerticalAlignment::Center)
-            .keyed_children(vec![
-                KeyedView::new(format!("effort:{segment}"), effort),
-                KeyedView::new(
-                    format!("star:{highlighted}:{}", item.favorite),
-                    Border::new().grid_column(1).content(star),
-                ),
-            ]);
+            .keyed_children(
+                [
+                    effort.map(|effort| KeyedView::new(format!("effort:{segment}"), effort)),
+                    Some(KeyedView::new(
+                        format!("star:{highlighted}:{}", item.favorite),
+                        Border::new().grid_column(1).maybe_content(star),
+                    )),
+                ]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>(),
+            );
         Border::new()
             .corner_radius(tokens::radius::PILL)
             .background(if highlighted {
@@ -668,6 +683,7 @@ impl DesktopApp {
                     .columns([GridLength::STAR, GridLength::Auto])
                     .children((button, trailing)),
             )
+            .into()
     }
 
     /// The Codex access menu: three levels, each with an icon, a title and
@@ -732,11 +748,7 @@ impl DesktopApp {
                             Border::new()
                                 .grid_column(2)
                                 .vertical_alignment(VerticalAlignment::Center)
-                                .content(if selected {
-                                    m3::icon(m3::glyph::CHECK)
-                                } else {
-                                    View::empty()
-                                }),
+                                .maybe_content(selected.then(|| m3::icon(m3::glyph::CHECK))),
                         )),
                 );
             rows.push(KeyedView::new(
@@ -761,6 +773,7 @@ impl DesktopApp {
         StackPanel::new()
             .width(tokens::layout::MENU_WIDTH)
             .keyed_children(rows)
+            .into()
     }
 
     /// The project list: a search field, the registered projects (name and
@@ -805,11 +818,7 @@ impl DesktopApp {
                                     Some(glyph),
                                     &name,
                                     &path,
-                                    if selected {
-                                        m3::icon(m3::glyph::CHECK)
-                                    } else {
-                                        View::empty()
-                                    },
+                                    selected.then(|| m3::icon(m3::glyph::CHECK)),
                                 )),
                         ),
                 )
@@ -820,9 +829,9 @@ impl DesktopApp {
             .text(self.launch.project_query.clone())
             .placeholder_text("Search projects")
             .automation_name("Search projects")
-            .on_text_changed(
+            .on_text_changed(crate::views::text_edits(
                 context.callback(|text| Message::Launch(LaunchMsg::ProjectQuery(text))),
-            );
+            ));
         StackPanel::new()
             .width(tokens::layout::MENU_WIDTH)
             .spacing(tokens::spacing::XS)
@@ -833,6 +842,7 @@ impl DesktopApp {
                     .vertical_scroll_bar_visibility(ScrollBarVisibility::Auto)
                     .content(StackPanel::new().keyed_children(rows)),
             ))
+            .into()
     }
 }
 
@@ -908,29 +918,35 @@ impl DesktopApp {
                         ])
                         .min_height(tokens::height::SUB_ROW)
                         .margin(Thickness::new(tokens::spacing::INSET, 0.0, 0.0, 0.0))
-                        .children((
-                            View::empty(),
-                            m3::body(model.title.clone())
-                                .grid_column(1)
-                                .vertical_alignment(VerticalAlignment::Center)
-                                .text_trimming(TextTrimming::CharacterEllipsis),
-                            ToggleSwitch::new()
-                                .grid_column(2)
-                                .is_on(model.visible)
-                                .vertical_alignment(VerticalAlignment::Center)
-                                .automation_name(format!(
-                                    "Show {} in the model selector",
-                                    model.title
-                                ))
-                                .on_toggled(context.callback(move |on: bool| {
-                                    Message::Launch(LaunchMsg::ManageModel {
-                                        harness: harness.clone(),
-                                        provider: provider.clone(),
-                                        model: id.clone(),
-                                        visible: on,
-                                    })
-                                })),
-                        )),
+                        .keyed_children(crate::views::slots([
+                            None,
+                            Some(
+                                m3::body(model.title.clone())
+                                    .grid_column(1)
+                                    .vertical_alignment(VerticalAlignment::Center)
+                                    .text_trimming(TextTrimming::CharacterEllipsis)
+                                    .into(),
+                            ),
+                            Some(
+                                ToggleSwitch::new()
+                                    .grid_column(2)
+                                    .is_on(model.visible)
+                                    .vertical_alignment(VerticalAlignment::Center)
+                                    .automation_name(format!(
+                                        "Show {} in the model selector",
+                                        model.title
+                                    ))
+                                    .on_toggled(context.callback(move |on: bool| {
+                                        Message::Launch(LaunchMsg::ManageModel {
+                                            harness: harness.clone(),
+                                            provider: provider.clone(),
+                                            model: id.clone(),
+                                            visible: on,
+                                        })
+                                    }))
+                                    .into(),
+                            ),
+                        ])),
                 ));
             }
             if group.models.len() > MANAGE_GROUP_ROWS {
@@ -970,9 +986,9 @@ impl DesktopApp {
             .text(self.launch.manage_query.clone())
             .placeholder_text("Search models")
             .automation_name("Search models to manage")
-            .on_text_changed(
+            .on_text_changed(crate::views::text_edits(
                 context.callback(|text| Message::Launch(LaunchMsg::ManageQuery(text))),
-            );
+            ));
         StackPanel::new()
             .width(tokens::layout::PICKER_WIDTH)
             .spacing(tokens::spacing::SM)
@@ -985,6 +1001,7 @@ impl DesktopApp {
                     .automation_name("Model groups")
                     .content(StackPanel::new().keyed_children(rows)),
             ))
+            .into()
     }
 }
 
@@ -1015,7 +1032,7 @@ fn manage_group_row(
                         None,
                         &group.title,
                         &count,
-                        View::empty(),
+                        None,
                     )),
                 )),
         );
@@ -1032,6 +1049,7 @@ fn manage_group_row(
         .columns([GridLength::STAR, GridLength::Auto])
         .column_spacing(tokens::spacing::SM)
         .children((toggle, check))
+        .into()
 }
 
 /// A collapsible picker group: the chevron and title collapse or expand it
@@ -1059,16 +1077,13 @@ fn group_heading(
             StackPanel::new()
                 .orientation(Orientation::Horizontal)
                 .spacing(tokens::spacing::SM)
-                .children((
-                    m3::icon(glyph),
-                    label,
-                    if note.is_empty() {
-                        View::empty()
-                    } else {
-                        m3::secondary(note.to_owned()).into()
-                    },
-                )),
+                .keyed_children(crate::views::slots([
+                    Some(m3::icon(glyph)),
+                    Some(label.into()),
+                    (!note.is_empty()).then(|| m3::secondary(note.to_owned()).into()),
+                ])),
         )
+        .into()
 }
 
 /// A filled effort chip container, shared by its static tag and segments.
@@ -1079,6 +1094,7 @@ fn effort_chip(palette: Palette, content: impl Into<View>) -> View {
         .background(palette.container())
         .vertical_alignment(VerticalAlignment::Center)
         .content(content)
+        .into()
 }
 
 /// The short effort label, named in full words for accessibility.
@@ -1088,7 +1104,7 @@ fn chip_text(label: &str, name: &str, muted: bool) -> TextBlock {
     } else {
         m3::text(label.to_owned(), tokens::text::CHIP)
     };
-    text.automation_name(name.to_owned())
+    text.automation_name(name)
         .margin(Thickness::xy(tokens::spacing::SM, 0.0))
         .vertical_alignment(VerticalAlignment::Center)
 }
@@ -1113,12 +1129,13 @@ fn heading(title: &str, note: &str) -> View {
             tokens::spacing::INSET,
             tokens::spacing::XS,
         ))
-        .children((
-            m3::section_label(title.to_owned()).font_weight(m3::weight(tokens::text::HEADER)),
-            if note.is_empty() {
-                View::empty()
-            } else {
-                m3::secondary(note.to_owned()).into()
-            },
-        ))
+        .keyed_children(crate::views::slots([
+            Some(
+                m3::section_label(title.to_owned())
+                    .font_weight(m3::weight(tokens::text::HEADER))
+                    .into(),
+            ),
+            (!note.is_empty()).then(|| m3::secondary(note.to_owned()).into()),
+        ]))
+        .into()
 }

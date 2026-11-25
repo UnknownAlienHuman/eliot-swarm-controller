@@ -103,18 +103,21 @@ impl DesktopApp {
                 )
             })
         };
-        let chips: View = match (agent.as_deref(), detail) {
+        let chips: Option<View> = match (agent.as_deref(), detail) {
             (None, _) => {
-                self.composer_chips(label(tokens::layout::HOME_BAR_FIXED), context, palette)
+                Some(self.composer_chips(label(tokens::layout::HOME_BAR_FIXED), context, palette))
             }
-            (Some(_), Some(detail)) => StackPanel::new()
-                .orientation(Orientation::Horizontal)
-                .spacing(tokens::spacing::CHIP_GAP)
-                .children((
-                    self.model_chip(detail, running, label(0.0), context, palette),
-                    access_chip(detail, palette),
-                )),
-            (Some(_), None) => View::empty(),
+            (Some(_), Some(detail)) => Some(
+                StackPanel::new()
+                    .orientation(Orientation::Horizontal)
+                    .spacing(tokens::spacing::CHIP_GAP)
+                    .keyed_children(crate::views::slots([
+                        Some(self.model_chip(detail, running, label(0.0), context, palette)),
+                        access_chip(detail, palette),
+                    ]))
+                    .into(),
+            ),
+            (Some(_), None) => None,
         };
         let retry = agent
             .as_ref()
@@ -165,16 +168,19 @@ impl DesktopApp {
             // The task's quota ring (its harness's tightest window, with
             // its popover) and the context ring.
             usage: if home {
-                View::empty()
+                None
             } else {
-                StackPanel::new()
-                    .orientation(Orientation::Horizontal)
-                    .spacing(tokens::spacing::XS)
-                    .vertical_alignment(VerticalAlignment::Center)
-                    .children((
-                        self.usage_indicator(context, palette),
-                        self.context_ring(context, palette),
-                    ))
+                Some(
+                    StackPanel::new()
+                        .orientation(Orientation::Horizontal)
+                        .spacing(tokens::spacing::XS)
+                        .vertical_alignment(VerticalAlignment::Center)
+                        .keyed_children(crate::views::slots([
+                            self.usage_indicator(context, palette),
+                            self.context_ring(context, palette),
+                        ]))
+                        .into(),
+                )
             },
             // Add as a note: a live Agent the daemon can take a note for.
             note: detail
@@ -317,10 +323,8 @@ impl DesktopApp {
         &self,
         context: &mut ViewContext<Self>,
         palette: Palette,
-    ) -> View {
-        let Some(detail) = self.bound_detail().ok() else {
-            return View::empty();
-        };
+    ) -> Option<View> {
+        let detail = self.bound_detail().ok()?;
         let harness = crate::picker::harness_label(&detail.harness);
         let read = self.agent_catalog();
         let (model_locked, effort_locked) = match read {
@@ -348,23 +352,30 @@ impl DesktopApp {
         };
         let ready = matches!(read, Some(Ok(_)));
         let enabled = ready && !self.submitting();
-        let steps: View = match read {
-            Some(Err(error)) => StackPanel::new().spacing(tokens::spacing::XS).children((
-                m3::secondary(format!(
-                    "Effort levels not read: {}",
-                    crate::state::plain_error(error)
-                ))
-                .foreground(palette.attention())
-                .text_wrapping(TextWrapping::Wrap),
-                m3::text_button(palette)
-                    .automation_name("Retry reading effort levels")
-                    .on_click(context.message(Message::Configure(ConfigureMsg::CatalogRetry)))
-                    .content(m3::label("Retry")),
-            )),
-            _ if effort_locked || (!ready && efforts.is_empty()) => View::empty(),
+        let steps: Option<View> = match read {
+            Some(Err(error)) => Some(
+                StackPanel::new()
+                    .spacing(tokens::spacing::XS)
+                    .children((
+                        m3::secondary(format!(
+                            "Effort levels not read: {}",
+                            crate::state::plain_error(error)
+                        ))
+                        .foreground(palette.attention())
+                        .text_wrapping(TextWrapping::Wrap),
+                        m3::text_button(palette)
+                            .automation_name("Retry reading effort levels")
+                            .on_click(
+                                context.message(Message::Configure(ConfigureMsg::CatalogRetry)),
+                            )
+                            .content(m3::label("Retry")),
+                    ))
+                    .into(),
+            ),
+            _ if effort_locked || (!ready && efforts.is_empty()) => None,
             _ => {
                 if efforts.is_empty() {
-                    m3::secondary("This model has no effort levels to choose.").into()
+                    Some(m3::secondary("This model has no effort levels to choose.").into())
                 } else {
                     let segments = efforts
                         .iter()
@@ -390,7 +401,7 @@ impl DesktopApp {
                             )
                         })
                         .collect();
-                    m3::segmented(palette, segments)
+                    Some(m3::segmented(palette, segments))
                 }
             }
         };
@@ -402,45 +413,55 @@ impl DesktopApp {
             None => "Checking what this task can change…".to_owned(),
             Some(Err(_)) => String::new(),
         };
-        let change_model: View =
+        let change_model: Option<View> =
             if (ready && !model_locked) || preview.is_some() || detail.harness == "opencode" {
-                StackPanel::new().spacing(tokens::spacing::XS).children((
-                    m3::divider(palette),
-                    m3::row(palette, false)
-                        .is_enabled(!self.submitting())
-                        .automation_name("Change model")
-                        .on_click(context.message(Message::Launch(LaunchMsg::Toggle(Pop::Model))))
-                        .content(m3::row_content(
-                            Some(m3::glyph::MODEL),
-                            "Change model…",
-                            "",
-                            m3::icon(m3::glyph::CHEVRON_RIGHT),
-                        )),
-                ))
+                Some(
+                    StackPanel::new()
+                        .spacing(tokens::spacing::XS)
+                        .children((
+                            m3::divider(palette),
+                            m3::row(palette, false)
+                                .is_enabled(!self.submitting())
+                                .automation_name("Change model")
+                                .on_click(
+                                    context.message(Message::Launch(LaunchMsg::Toggle(Pop::Model))),
+                                )
+                                .content(m3::row_content(
+                                    Some(m3::glyph::MODEL),
+                                    "Change model…",
+                                    "",
+                                    m3::icon(m3::glyph::CHEVRON_RIGHT),
+                                )),
+                        ))
+                        .into(),
+                )
             } else {
-                View::empty()
+                None
             };
-        let hints: View = if effort_locked || !ready || efforts.is_empty() {
-            View::empty()
+        let hints: Option<View> = if effort_locked || !ready || efforts.is_empty() {
+            None
         } else {
-            m3::secondary("←→ effort   Enter apply   Esc close").into()
+            Some(m3::secondary("←→ effort   Enter apply   Esc close").into())
         };
-        StackPanel::new()
-            .min_width(tokens::layout::EFFORT_MENU_MIN_WIDTH)
-            .spacing(tokens::spacing::SM)
-            .margin(Thickness::uniform(tokens::spacing::SM))
-            .automation_name("Model and effort")
-            .children((
-                header,
-                steps,
-                if note.is_empty() {
-                    View::empty()
-                } else {
-                    m3::secondary(note).text_wrapping(TextWrapping::Wrap).into()
-                },
-                hints,
-                change_model,
-            ))
+        Some(
+            StackPanel::new()
+                .min_width(tokens::layout::EFFORT_MENU_MIN_WIDTH)
+                .spacing(tokens::spacing::SM)
+                .margin(Thickness::uniform(tokens::spacing::SM))
+                .automation_name("Model and effort")
+                .keyed_children(crate::views::slots([
+                    Some(header.into()),
+                    steps,
+                    if note.is_empty() {
+                        None
+                    } else {
+                        Some(m3::secondary(note).text_wrapping(TextWrapping::Wrap).into())
+                    },
+                    hints,
+                    change_model,
+                ]))
+                .into(),
+        )
     }
 
     /// Codex's usage popover over the composer: where the usage comes from,
@@ -449,12 +470,10 @@ impl DesktopApp {
         &self,
         context: &mut ViewContext<Self>,
         palette: Palette,
-    ) -> View {
-        let Some(harness) = self.composer_harness() else {
-            return View::empty();
-        };
+    ) -> Option<View> {
+        let harness = self.composer_harness()?;
         let Some(Ok(reply)) = self.settings.quotas.get(&harness) else {
-            return View::empty();
+            return None;
         };
         let label = crate::picker::harness_label(&harness);
         let mut source = match crate::quota::plan(reply) {
@@ -494,35 +513,38 @@ impl DesktopApp {
                 )
             })
             .collect();
-        StackPanel::new()
-            .width(tokens::layout::USAGE_MENU_WIDTH)
-            .spacing(tokens::spacing::XS)
-            .automation_name("Usage")
-            .children((
-                StackPanel::new()
-                    .margin(Thickness::new(
-                        tokens::spacing::SM,
-                        tokens::spacing::SM,
-                        tokens::spacing::SM,
-                        0.0,
-                    ))
-                    .children((
-                        m3::secondary(source).text_wrapping(TextWrapping::Wrap),
-                        StackPanel::new().keyed_children(rows),
-                    )),
-                m3::divider(palette),
-                m3::row(palette, false)
-                    .automation_name("Manage usage")
-                    .on_click(context.message(Message::Shell(ShellMsg::SettingsPage(
-                        settings_ui::Page::Usage,
-                    ))))
-                    .content(m3::row_content(
-                        None,
-                        "Manage usage",
-                        "",
-                        m3::icon(m3::glyph::CHEVRON_RIGHT),
-                    )),
-            ))
+        Some(
+            StackPanel::new()
+                .width(tokens::layout::USAGE_MENU_WIDTH)
+                .spacing(tokens::spacing::XS)
+                .automation_name("Usage")
+                .children((
+                    StackPanel::new()
+                        .margin(Thickness::new(
+                            tokens::spacing::SM,
+                            tokens::spacing::SM,
+                            tokens::spacing::SM,
+                            0.0,
+                        ))
+                        .children((
+                            m3::secondary(source).text_wrapping(TextWrapping::Wrap),
+                            StackPanel::new().keyed_children(rows),
+                        )),
+                    m3::divider(palette),
+                    m3::row(palette, false)
+                        .automation_name("Manage usage")
+                        .on_click(context.message(Message::Shell(ShellMsg::SettingsPage(
+                            settings_ui::Page::Usage,
+                        ))))
+                        .content(m3::row_content(
+                            None,
+                            "Manage usage",
+                            "",
+                            m3::icon(m3::glyph::CHEVRON_RIGHT),
+                        )),
+                ))
+                .into(),
+        )
     }
 
     /// The harness the composer talks to: the open Agent's, else the new
@@ -569,16 +591,12 @@ impl DesktopApp {
     /// real reading under the threshold on the account the task runs on; a
     /// neutral outline ring when that is not known or another provider's
     /// limits apply. Nothing when the harness reports no quota.
-    fn usage_indicator(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
-        let Some(harness) = self.composer_harness() else {
-            return View::empty();
-        };
+    fn usage_indicator(&self, context: &mut ViewContext<Self>, palette: Palette) -> Option<View> {
+        let harness = self.composer_harness()?;
         let Some(Ok(reply)) = self.settings.quotas.get(&harness) else {
-            return View::empty();
+            return None;
         };
-        let Some(window) = crate::quota::tightest(reply) else {
-            return View::empty();
-        };
+        let window = crate::quota::tightest(reply)?;
         let label = crate::picker::harness_label(&harness);
         let open = self.launch.open == Some(Pop::Usage);
         let remaining = window.remaining as f64;
@@ -650,24 +668,25 @@ impl DesktopApp {
         // the button's resources, read when its template is applied) and
         // by whether its flyout is open (a tooltip and a flyout do not
         // share a button).
-        Grid::new().keyed_children(vec![KeyedView::new(
-            format!(
-                "usage:{applies}:{}:{open}",
-                remaining < crate::theme::QUOTA_LOW
-            ),
-            button,
-        )])
+        Some(
+            Grid::new()
+                .keyed_children(vec![KeyedView::new(
+                    format!(
+                        "usage:{applies}:{}:{open}",
+                        remaining < crate::theme::QUOTA_LOW
+                    ),
+                    button,
+                )])
+                .into(),
+        )
     }
 
     /// The context ring beside the main action (`.ring`): how full the
     /// session's context is, as the harness reports it ("Context 34%",
     /// used and window in its tooltip); a click opens Details. Nothing
     /// when the harness reports no context fill.
-    fn context_ring(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
-        let Some((used, window)) = self.bound_detail().ok().and_then(|detail| detail.context)
-        else {
-            return View::empty();
-        };
+    fn context_ring(&self, context: &mut ViewContext<Self>, palette: Palette) -> Option<View> {
+        let (used, window) = self.bound_detail().ok().and_then(|detail| detail.context)?;
         let share = (used as f64 / window as f64 * 100.0).clamp(0.0, 100.0);
         let words = format!(
             "Context {}% \u{b7} {}k of {}k tokens",
@@ -675,47 +694,51 @@ impl DesktopApp {
             used / 1_000,
             window / 1_000
         );
-        Button::new()
-            .resource_overrides(palette.context_ring())
-            .style(ButtonStyle::Subtle)
-            .width(tokens::height::CONTROL)
-            .height(tokens::height::CONTROL)
-            .vertical_alignment(VerticalAlignment::Center)
-            .automation_name(format!("{words} (open Details)"))
-            .on_click(context.message(Message::Monitor(MonitorMsg::PanelChosen(Panel::Details))))
-            .content(
-                ProgressRing::new()
-                    .is_indeterminate(false)
-                    .minimum(0.0)
-                    .maximum(100.0)
-                    .value(share)
-                    .width(tokens::layout::USAGE_RING)
-                    .height(tokens::layout::USAGE_RING)
-                    .horizontal_alignment(HorizontalAlignment::Center)
-                    .vertical_alignment(VerticalAlignment::Center),
-            )
-            .tooltip(words)
+        Some(
+            Button::new()
+                .resource_overrides(palette.context_ring())
+                .style(ButtonStyle::Subtle)
+                .width(tokens::height::CONTROL)
+                .height(tokens::height::CONTROL)
+                .vertical_alignment(VerticalAlignment::Center)
+                .automation_name(format!("{words} (open Details)"))
+                .on_click(
+                    context.message(Message::Monitor(MonitorMsg::PanelChosen(Panel::Details))),
+                )
+                .content(
+                    ProgressRing::new()
+                        .is_indeterminate(false)
+                        .minimum(0.0)
+                        .maximum(100.0)
+                        .value(share)
+                        .width(tokens::layout::USAGE_RING)
+                        .height(tokens::layout::USAGE_RING)
+                        .horizontal_alignment(HorizontalAlignment::Center)
+                        .vertical_alignment(VerticalAlignment::Center),
+                )
+                .tooltip(words),
+        )
     }
 }
 
 /// The open Agent's access, read only (`.chip.plain`): fixed for the
 /// Agent; changing it is a hand-off. None when the launch named no level.
-fn access_chip(detail: &UiDetail, palette: Palette) -> View {
-    let Some(access) = detail.settings.access.as_deref().and_then(|wire| {
+fn access_chip(detail: &UiDetail, palette: Palette) -> Option<View> {
+    let access = detail.settings.access.as_deref().and_then(|wire| {
         crate::settings::Access::ALL
             .into_iter()
             .find(|access| access.wire() == wire)
-    }) else {
-        return View::empty();
-    };
-    m3::fixed_chip(
-        palette,
-        access == crate::settings::Access::Full,
-        Some(m3::glyph::SHIELD),
-        access.label(),
-        &format!("Access: {} (fixed for this Agent)", access.label()),
+    })?;
+    Some(
+        m3::fixed_chip(
+            palette,
+            access == crate::settings::Access::Full,
+            Some(m3::glyph::SHIELD),
+            access.label(),
+            &format!("Access: {} (fixed for this Agent)", access.label()),
+        )
+        .tooltip("Access is fixed for this Agent; hand off to change it"),
     )
-    .tooltip("Access is fixed for this Agent; hand off to change it")
 }
 
 /// A stopped, failed or lost Agent that Resume starts again (not while a
@@ -807,8 +830,8 @@ pub(in crate::ui) struct ComposerInput {
     /// projects.
     folder: Option<View>,
     attached: Vec<String>,
-    chips: View,
-    usage: View,
+    chips: Option<View>,
+    usage: Option<View>,
     /// Add as a note is offered: the Agent's generation.
     note: Option<i64>,
     primary: Primary,
@@ -891,7 +914,7 @@ impl Component for Composer {
         {
             return;
         }
-        let _ = self.input.send.call(message);
+        self.input.send.call(message);
     }
 
     fn view(&self, input: &ComposerInput, context: &mut ViewContext<Self>) -> View {
@@ -914,9 +937,9 @@ impl Component for Composer {
             .text_wrapping(TextWrapping::Wrap)
             .min_height(tokens::layout::COMPOSER_MIN_HEIGHT)
             .max_height(tokens::layout::COMPOSER_MAX_HEIGHT)
-            .on_text_changed(
+            .on_text_changed(crate::views::text_edits(
                 context.callback(|value| Message::Chat(ChatMsg::ComposerChanged(value))),
-            );
+            ));
         // WinUI's text box insets its text: the margin starts the text at
         // the card's 16-DIP inset, where the chips start.
         let field = Border::new()
@@ -931,14 +954,16 @@ impl Component for Composer {
         let chips = StackPanel::new()
             .orientation(Orientation::Horizontal)
             .spacing(tokens::spacing::CHIP_GAP)
-            .children((
-                m3::icon_button(palette)
-                    .automation_name("Attach files")
-                    .on_click(context.message(Message::Launch(LaunchMsg::AttachRequested)))
-                    .content(m3::icon(m3::glyph::NEW_TASK))
-                    .tooltip("Attach files"),
+            .keyed_children(crate::views::slots([
+                Some(
+                    m3::icon_button(palette)
+                        .automation_name("Attach files")
+                        .on_click(context.message(Message::Launch(LaunchMsg::AttachRequested)))
+                        .content(m3::icon(m3::glyph::NEW_TASK))
+                        .tooltip("Attach files"),
+                ),
                 input.chips.clone(),
-            ));
+            ]));
         let bottom = Grid::new()
             .columns([GridLength::STAR, GridLength::Auto])
             .column_spacing(tokens::spacing::SM)
@@ -969,7 +994,7 @@ impl Component for Composer {
         rows.push(KeyedView::new("bottom", bottom));
         Border::new()
             .grid_row(5)
-            .width(input.width)
+            .maybe_width(input.width)
             .max_width(input.widest)
             .horizontal_alignment(HorizontalAlignment::Center)
             .margin(if home {
@@ -985,6 +1010,7 @@ impl Component for Composer {
                     .spacing(tokens::spacing::SM)
                     .keyed_children(rows),
             ))
+            .into()
     }
 }
 
@@ -1048,11 +1074,13 @@ fn composer_actions(
         Primary::ReadingResume => m3::resume_button(palette)
             .is_enabled(false)
             .automation_name("Resume")
-            .content(m3::icon(m3::glyph::RESUME)),
+            .content(m3::icon(m3::glyph::RESUME))
+            .into(),
         Primary::ReadingRunning => m3::stop_button(palette)
             .is_enabled(false)
             .automation_name("Stop turn")
-            .content(m3::stop_mark(palette)),
+            .content(m3::stop_mark(palette))
+            .into(),
         Primary::Turn {
             agent,
             running,
@@ -1096,18 +1124,20 @@ fn composer_actions(
         Primary::Start => start_split(palette, enabled, draft_blank, context),
     };
     // The hint before the ring and the action, while Enter steers.
-    let hint: View = match &input.primary {
+    let hint: Option<View> = match &input.primary {
         Primary::Turn {
             running: Some(_), ..
-        } if input.hint && !draft_blank => m3::secondary("Enter to steer")
-            .vertical_alignment(VerticalAlignment::Center)
-            .into(),
-        _ => View::empty(),
+        } if input.hint && !draft_blank => Some(
+            m3::secondary("Enter to steer")
+                .vertical_alignment(VerticalAlignment::Center)
+                .into(),
+        ),
+        _ => None,
     };
     // The ▾ beside the action (an open Agent): Add as a note, the text
     // into the Agent's context at its next safe point without a new turn.
-    let note: View = match (&input.primary, input.note) {
-        (Primary::Start, _) => View::empty(),
+    let note: Option<View> = match (&input.primary, input.note) {
+        (Primary::Start, _) => None,
         (primary, generation) => {
             let ready = enabled && !draft_blank && generation.is_some();
             let item = if ready {
@@ -1125,21 +1155,23 @@ fn composer_actions(
                 Primary::Resume(..) | Primary::ReadingResume => palette.resume_fab(),
                 _ => palette.filled(),
             };
-            m3::send_menu_button(overrides)
-                .is_enabled(ready)
-                .automation_name("More send options: Add as a note")
-                .content(m3::small_icon(m3::glyph::CHEVRON_DOWN))
-                .menu(Menu::new(
-                    vec![item],
-                    // Capture-free: one identity across renders.
-                    context.callback(|label: String| {
-                        if label == NOTE_LABEL {
-                            Message::Chat(ChatMsg::NoteRequested)
-                        } else {
-                            Message::Menu(MenuMsg::Ignored)
-                        }
-                    }),
-                ))
+            Some(
+                m3::send_menu_button(overrides)
+                    .is_enabled(ready)
+                    .automation_name("More send options: Add as a note")
+                    .content(m3::small_icon(m3::glyph::CHEVRON_DOWN))
+                    .menu(Menu::new(
+                        vec![item],
+                        // Capture-free: one identity across renders.
+                        crate::views::menu_keys(context.callback(|label: String| {
+                            if label == NOTE_LABEL {
+                                Message::Chat(ChatMsg::NoteRequested)
+                            } else {
+                                Message::Menu(MenuMsg::Ignored)
+                            }
+                        })),
+                    )),
+            )
         }
     };
     // The glow's host shares the action's cell, under it; the action keeps
@@ -1167,22 +1199,30 @@ fn composer_actions(
     StackPanel::new()
         .orientation(Orientation::Horizontal)
         .spacing(tokens::spacing::ROW)
-        .children((
+        .keyed_children(crate::views::slots([
             hint,
             input.usage.clone(),
-            StackPanel::new()
-                .orientation(Orientation::Horizontal)
-                .spacing(tokens::spacing::ROW_GAP)
-                .vertical_alignment(VerticalAlignment::Center)
-                .children((
-                    Grid::new()
-                        .vertical_alignment(VerticalAlignment::Center)
-                        .keyed_children(action),
-                    Grid::new()
-                        .vertical_alignment(VerticalAlignment::Center)
-                        .keyed_children(vec![KeyedView::new(format!("note:{kind}"), note)]),
-                )),
-        ))
+            Some(
+                StackPanel::new()
+                    .orientation(Orientation::Horizontal)
+                    .spacing(tokens::spacing::ROW_GAP)
+                    .vertical_alignment(VerticalAlignment::Center)
+                    .children((
+                        Grid::new()
+                            .vertical_alignment(VerticalAlignment::Center)
+                            .keyed_children(action),
+                        Grid::new()
+                            .vertical_alignment(VerticalAlignment::Center)
+                            .keyed_children(
+                                note.map(|note| KeyedView::new(format!("note:{kind}"), note))
+                                    .into_iter()
+                                    .collect::<Vec<_>>(),
+                            ),
+                    ))
+                    .into(),
+            ),
+        ]))
+        .into()
 }
 
 /// The composer menu's one item.
@@ -1229,6 +1269,7 @@ fn attachment_chips(
         .orientation(Orientation::Horizontal)
         .spacing(tokens::spacing::CHIP_GAP)
         .keyed_children(chips)
+        .into()
 }
 
 /// Home's split Start task (`Main.dc.html`, the SplitButton component):
@@ -1289,14 +1330,15 @@ fn start_split(
                 .menu(Menu::new(
                     items,
                     // Capture-free: one identity across renders.
-                    context.callback(|label: String| {
+                    crate::views::menu_keys(context.callback(|label: String| {
                         match super::menu_ui::Action::from_label(&label) {
                             Some(super::menu_ui::Action::QueueLaunch) => {
                                 Message::Launch(LaunchMsg::QueueDraft)
                             }
                             _ => Message::Menu(MenuMsg::Ignored),
                         }
-                    }),
+                    })),
                 )),
         ))
+        .into()
 }

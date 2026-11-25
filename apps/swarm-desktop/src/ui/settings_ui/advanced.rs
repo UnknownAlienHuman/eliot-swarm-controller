@@ -29,16 +29,16 @@ impl DesktopApp {
                     Border::new()
                         .height(tokens::height::CONTROL)
                         .automation_name(format!("{headline}, {supporting}"))
-                        .content(m3::row_content(None, &headline, &supporting, View::empty())),
+                        .content(m3::row_content(None, &headline, &supporting, None)),
                 )
             })
             .collect();
-        let history_view: View = if !open {
-            View::empty()
+        let history_view: Option<View> = if !open {
+            None
         } else if history.is_empty() {
-            m3::secondary("No settings changes recorded yet.").into()
+            Some(m3::secondary("No settings changes recorded yet.").into())
         } else {
-            m3::settings_card(palette, history)
+            Some(m3::settings_card(palette, history))
         };
         let restart = if self.settings.restart_required.is_empty() {
             "Every section applies without a restart.".to_owned()
@@ -56,8 +56,8 @@ impl DesktopApp {
         let dirty = self.settings.dirty(Page::Advanced);
         StackPanel::new()
             .spacing(tokens::spacing::MD)
-            .children((
-                m3::settings_card(
+            .keyed_children(crate::views::slots([
+                Some(m3::settings_card(
                     palette,
                     vec![
                         KeyedView::new(
@@ -71,7 +71,7 @@ impl DesktopApp {
                                         .on_click(context.message(Message::Shell(
                                             ShellMsg::RefreshRequested,
                                         )))
-                                        .content(m3::label("Reload")),
+                                        .content(m3::label("Reload")).into(),
                                 ),
                             ),
                         ),
@@ -105,22 +105,22 @@ impl DesktopApp {
                                         .on_click(context.message(Message::Settings(
                                             SettingsMsg::HistoryToggled,
                                         )))
-                                        .content(m3::label(if open { "Hide" } else { "Show" })),
+                                        .content(m3::label(if open { "Hide" } else { "Show" })).into(),
                                 ),
                             ),
                         ),
                     ],
-                ),
+                )),
                 history_view,
-                m3::settings_card(palette, vec![KeyedView::new("storage", self.storage_row())]),
-                m3::section_heading(
+                Some(m3::settings_card(palette, vec![KeyedView::new("storage", self.storage_row())])),
+                Some(m3::section_heading(
                     "All settings",
                     &format!(
                         "Every section of config.toml as JSON, including daemon, mail, accounts and proxies. {restart}"
                     ),
                     None,
-                ),
-                m3::field()
+                )),
+                Some(m3::field()
                     .accepts_return(true)
                     .text_wrapping(TextWrapping::NoWrap)
                     .min_height(tokens::layout::SOURCE_MIN_HEIGHT)
@@ -129,9 +129,9 @@ impl DesktopApp {
                     .text(self.primed(&self.settings.all))
                     .is_enabled(!self.settings.busy())
                     .on_text_changed(
-                        context.callback(|text| Message::Settings(SettingsMsg::AllDraft(text))),
-                    ),
-                self.save_bar(Page::Advanced, dirty, context, palette),
-            ))
+                        crate::views::text_edits(context.callback(|text| Message::Settings(SettingsMsg::AllDraft(text)))),
+                    ).into()),
+                Some(self.save_bar(Page::Advanced, dirty, context, palette)),
+            ])).into()
     }
 }
