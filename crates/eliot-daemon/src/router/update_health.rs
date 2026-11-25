@@ -19,7 +19,7 @@ pub(super) struct BootHealth {
 fn subject(agent: &Agent, kind: UpdateProbeKind) -> Result<UpdateStartSubject> {
     let digest = eliot_core::canonical_json_sha256(&json!({
         "agent":agent.id, "generation":agent.generation, "harness": agent.harness,
-        "kind":kind, "profile":agent.profile_snapshot, "effective":agent.effective,
+        "kind":kind, "profile":agent.profile,
         "workspace":agent.workspace, "native_scope":agent.native_scope, "native_ref":agent.native_ref,
     })).map_err(|_| Error::new("unknown", "update readiness subject cannot be bound"))?;
     Ok(UpdateStartSubject {
@@ -130,7 +130,7 @@ impl Router {
             .ok()
             .flatten()
             .filter(|agent| agent.generation == generation)
-            .and_then(|agent| subject(&agent, UpdateProbeKind::Resume).ok());
+            .and_then(|agent| subject(&agent, sample_kind(&agent)).ok());
         let mut boot = self.inner.update_boot.lock_recover();
         if boot.finished.is_some() {
             return;
@@ -161,6 +161,20 @@ impl Router {
             entry.state = UpdateStartState::Refused;
             entry.code = Some(error.code.clone());
             entry.origin = error.origin;
+        }
+    }
+
+    pub(super) fn note_update_boot_not_dispatched(&self, agent: &str, generation: i64) {
+        let mut boot = self.inner.update_boot.lock_recover();
+        if boot.finished.is_none()
+            && let Some(entry) = boot.attempts.iter_mut().find(|e| {
+                e.subject.agent == agent
+                    && e.subject.generation == generation
+                    && e.command_id.is_none()
+                    && e.state == UpdateStartState::Unknown
+            })
+        {
+            entry.state = UpdateStartState::NotDispatched;
         }
     }
 

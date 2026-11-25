@@ -1374,13 +1374,20 @@ impl Router {
                 }
                 self.note_update_boot_request(&candidate.agent, candidate.generation)
                     .await;
-                if let Some(admission) = self.prepare_restart_resume(&candidate).await
-                    && admission.is_new
-                    && command_needs_worker(&admission.command)
-                {
-                    let target = Some((candidate.agent, candidate.generation));
-                    self.queue_boot_resume(&mut workers, &admission, target)
-                        .await?;
+                match self.prepare_restart_resume(&candidate).await {
+                    Some(admission)
+                        if admission.is_new && command_needs_worker(&admission.command) =>
+                    {
+                        let target = Some((candidate.agent, candidate.generation));
+                        self.queue_boot_resume(&mut workers, &admission, target)
+                            .await?;
+                    }
+                    Some(_) | None => {
+                        self.note_update_boot_not_dispatched(
+                            &candidate.agent,
+                            candidate.generation,
+                        );
+                    }
                 }
             }
             self.wait_restart_resume_workers(workers).await?;

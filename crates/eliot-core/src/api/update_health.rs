@@ -53,6 +53,7 @@ impl UpdateHealthRequest {
 #[serde(rename_all = "snake_case")]
 pub enum UpdateStartState {
     Ready,
+    NotDispatched,
     Refused,
     Unknown,
 }
