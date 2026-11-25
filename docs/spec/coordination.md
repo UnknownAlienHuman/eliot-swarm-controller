@@ -1347,7 +1347,9 @@ its fence row is cleared; while the parent is Dispatched, the linked launch bypa
 ordinary owner check and its matching switch fence. The durable `switch_checkout_owners`
 row stores the canonical checkout key, current Agent and any in-flight switch; a
 successful handoff moves ownership to B in the H2 transaction.
-Rejection clears the exact switch reservation in the settlement transaction.
+Preparation rejection commits cancellation of the undispatched source Stop,
+release of the exact reservation, the parent refusal and the automatic
+attempt's settlement in one Store transaction.
 Startup reconciles matching stranded rejected reservations. The canonical
 owner remains. Checkout admission's custody check is authoritative after
 rejection, including rejection for unproven process custody, and continues to

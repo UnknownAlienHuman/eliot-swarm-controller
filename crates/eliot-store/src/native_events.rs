@@ -253,6 +253,24 @@ impl PendingCommandEvent {
             format!("command.{}", command_state_name(self.state))
         }
     }
+
+    pub(super) fn commit(
+        self,
+        tx: &Transaction<'_>,
+        agent_num: i64,
+        generation: i64,
+        now: i64,
+    ) -> Result<Event> {
+        insert_daemon_command_event(
+            tx,
+            now,
+            &self.kind(),
+            Some(agent_num),
+            Some(generation),
+            &self.command_id,
+            self.data,
+        )
+    }
 }
 
 /// Inputs shared by the native-effect persistence helpers, in the caller's transaction.
@@ -1366,7 +1384,10 @@ fn persist_turn_terminal(
         rollback_inline_mail_tx(tx, agent_num, generation, turn_id)?;
     }
     if native_event.kind == "turn.unknown" && next_agent.active_turn.as_deref() == Some(turn_id) {
-        return Ok(Vec::new());
+        // Keep pending native requests available for exact late readback.
+        return context::settle_ended_turn_context_tx(
+            tx, agent_num, generation, turn_id, false, now,
+        );
     }
     db!(tx.execute(
         "UPDATE pending_requests SET state = 'stale'
@@ -1384,7 +1405,14 @@ fn persist_turn_terminal(
             "terminal turn retains pending requests in the Agent projection",
         ));
     }
-    context::settle_ended_turn_context_tx(tx, agent_num, generation, turn_id, now)
+    context::settle_ended_turn_context_tx(
+        tx,
+        agent_num,
+        generation,
+        turn_id,
+        state != TurnState::Unknown && !next_agent.is_terminal(),
+        now,
+    )
 }
 
 /// A commandless native terminal: the running unbound turn, or that turn

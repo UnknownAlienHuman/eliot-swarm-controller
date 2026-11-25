@@ -1158,7 +1158,9 @@ Outside paths replace the user-profile prefix with `%USERPROFILE%` before persis
 A native `compact_boundary` record yields
 `session.context.compacted` and includes `turn_id` only for a committed active turn.
 For [#881 item 2](https://github.com/UnknownAlienHuman/eliot-swarm-controller/issues/881),
-moving pending inserts to the next input at turn end substitutes for the Stop hook.
+moving unclaimed `soonest` inserts to the next input at turn end substitutes for
+the Stop hook. Store cancels an unclaimed explicit `turn_safe_point` insert
+when its captured turn ends.
 
 The OpenCode `context` hook (`before_model`) is the second consumer. The Rust host binds
 the native session over RPC `eliot-context` version 1 (`bind`/`next`/`resolve` on the

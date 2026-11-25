@@ -113,8 +113,8 @@ pub enum ReviewWorktreeState {
     ChangedOrUnconfirmedAtDeliveryCheck,
 }
 
-/// Retained `inject` arguments may carry daemon-only review labels. Submitted
-/// requests still decode through `InjectArgs`, which rejects this field.
+/// Retained `inject` arguments can carry daemon-only delivery policy and
+/// review labels. Submitted requests still decode through `InjectArgs`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RetainedInjectArgs {
@@ -123,6 +123,12 @@ pub struct RetainedInjectArgs {
     pub point: InjectPoint,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_at_ms: Option<i64>,
+    #[serde(
+        default,
+        rename = "_fallback_to_next_input",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub fallback_to_next_input: Option<bool>,
     #[serde(
         default,
         rename = "_trusted_review_labels",

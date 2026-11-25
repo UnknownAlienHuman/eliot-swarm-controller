@@ -135,7 +135,11 @@ pub(crate) async fn dispatch(
             }
             update::run_interrupting(release, data_dir, wait_seconds, json_output).await
         }
-        CliCommand::Daemon(args) => daemon::run_daemon(args, data_dir, json_output, id).await,
+        CliCommand::Daemon(args) => {
+            // Daemon startup runs Store migrations on this thread. Keep its
+            // long-lived state off the caller's stack during SQLite setup.
+            Box::pin(daemon::run_daemon(args, data_dir, json_output, id)).await
+        }
         CliCommand::Mcp(args) => daemon::run_mcp(args, data_dir, json_output).await,
         CliCommand::Status => daemon::run_status(data_dir, json_output).await,
         CliCommand::Autonomy(args) => autonomy::run(args, &data_dir, json_output).await,

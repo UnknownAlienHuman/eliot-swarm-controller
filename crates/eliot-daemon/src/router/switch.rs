@@ -59,9 +59,19 @@ impl Router {
     async fn reject_switch_input(&self, id: &str, error: &Error) {
         let policy = self.secret_policy_snapshot();
         let mut store = self.inner.store.lock().await;
-        if let Ok(change) = store.fail_switch_preparation(id, error, &policy, now_ms()) {
-            self.publish_locked(&change.events);
-            log_refusal(&policy, id, &error.code, &error.message);
+        match store.fail_switch_preparation(id, error, &policy, now_ms()) {
+            Ok(change) => {
+                self.publish_locked(&change.events);
+                if !change.events.is_empty() && change.value.state == CommandState::Rejected {
+                    log_refusal(&policy, id, &error.code, &error.message);
+                }
+            }
+            Err(error) => crate::logging::record(
+                &policy,
+                "switch.refusal_persist_failed",
+                &[("command_id", id)],
+                Some(&error),
+            ),
         }
         self.signal_progress();
         self.signal_launch_arbitration();
@@ -707,7 +717,9 @@ impl Router {
                 let mut store = self.inner.store.lock().await;
                 if let Ok(change) = store.fail_switch_preparation(id, &error, &policy, now_ms()) {
                     self.publish_locked(&change.events);
-                    log_refusal(&policy, id, &error.code, &error.message);
+                    if !change.events.is_empty() && change.value.state == CommandState::Rejected {
+                        log_refusal(&policy, id, &error.code, &error.message);
+                    }
                 }
                 self.signal_progress();
                 self.signal_launch_arbitration();

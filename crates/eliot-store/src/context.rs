@@ -78,6 +78,71 @@ pub struct TurnInsertionEvidence {
 }
 
 impl Store {
+    /// Expire a bounded slice of unclaimed next-input items without a SEND.
+    pub fn expire_next_input_contexts(&mut self, now: i64) -> Result<Vec<Event>> {
+        const DUE: &str = "SELECT id, target, generation
+            FROM commands INDEXED BY commands_next_input_context_expiry
+            WHERE verb='inject' AND state IN ('accepted','queued')
+              AND target IS NOT NULL AND generation IS NOT NULL AND turn_id IS NULL
+              AND json_extract(args, '$.point')='next_input'
+              AND json_type(args, '$.expires_at_ms')='integer'
+              AND json_extract(args, '$.expires_at_ms') <= ?1
+            ORDER BY json_extract(args, '$.expires_at_ms'), rowid LIMIT ?2";
+        const BATCH: i64 = 32;
+
+        self.ensure_writer_healthy()?;
+        let result = (|| {
+            if !self
+                .connection
+                .prepare_cached(DUE)
+                .map_err(sql_error)?
+                .exists(params![now, 1])
+                .map_err(sql_error)?
+            {
+                return Ok(Vec::new());
+            }
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            let due = tx
+                .prepare_cached(DUE)
+                .map_err(sql_error)?
+                .query_map(params![now, BATCH], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                })
+                .map_err(sql_error)?
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(sql_error)?;
+            let mut events = Vec::with_capacity(due.len());
+            for (id, target, generation) in due {
+                let record = load_command_record(&tx, &id)?.ok_or_else(|| {
+                    Error::new("source_integrity", "expired next-input command disappeared")
+                })?;
+                settle_pending_context_refusal(
+                    &tx,
+                    &record,
+                    target,
+                    generation,
+                    (
+                        "expired",
+                        Some("next-input delivery deadline elapsed before claim"),
+                    ),
+                    now,
+                    &mut events,
+                )?;
+            }
+            commit_transaction(tx, &self.write_faulted)?;
+            Ok(events)
+        })();
+        self.fault_on_persistence_error(&result);
+        result
+    }
+
     pub fn session_ready_event(&self, agent: &str, generation: i64) -> Result<Option<Event>> {
         let record = self
             .connection
@@ -647,19 +712,28 @@ pub(super) fn admit_tx(
         ));
     }
     let points = context_points(&agent)?;
-    if args.point == InjectPoint::Soonest {
+    let active_context_turn = if args.point != InjectPoint::NextInput
+        && matches!(agent.state, AgentState::Busy | AgentState::Waiting)
+        && let Some(turn_id) = agent.active_turn.as_deref()
+        && turn_accepts_context_tx(tx, agent_num, agent.generation, turn_id)?
+    {
+        Some(turn_id)
+    } else {
+        None
+    };
+    let fallback_to_next_input = args.point == InjectPoint::Soonest;
+    if fallback_to_next_input {
         if let Some(expected) = request.expected_turn_id.as_deref()
             && agent.active_turn.as_deref() != Some(expected)
             && !captured_turn_exists(tx, agent_num, agent.generation, expected)?
         {
             return Err(Error::new("stale_generation", "inject turn is unknown"));
         }
-        let active = matches!(agent.state, AgentState::Busy | AgentState::Waiting)
-            && agent.active_turn.is_some()
+        let active = active_context_turn.is_some()
             && request
                 .expected_turn_id
-                .as_ref()
-                .is_none_or(|turn| agent.active_turn.as_ref() == Some(turn));
+                .as_deref()
+                .is_none_or(|turn| active_context_turn == Some(turn));
         args.point = [InjectPoint::TurnSafePoint, InjectPoint::ActiveTurn]
             .into_iter()
             .find(|point| active && points.contains(point))
@@ -680,13 +754,7 @@ pub(super) fn admit_tx(
                 InjectPoint::TurnSafePoint => "turn_safe_point",
                 _ => "active_turn",
             };
-            if !matches!(agent.state, AgentState::Busy | AgentState::Waiting) {
-                return Err(Error::new(
-                    "bad_state",
-                    format!("{point_name} inject requires an active turn"),
-                ));
-            }
-            let turn_id = agent.active_turn.as_deref().ok_or_else(|| {
+            let turn_id = active_context_turn.ok_or_else(|| {
                 Error::new(
                     "bad_state",
                     format!("{point_name} inject requires an exact active turn"),
@@ -707,6 +775,9 @@ pub(super) fn admit_tx(
     };
 
     let mut resolved = json!(args);
+    if args.point != InjectPoint::NextInput {
+        resolved["_fallback_to_next_input"] = json!(fallback_to_next_input);
+    }
     if let Some(labels) = &request.trusted_review_labels {
         resolved["_trusted_review_labels"] = serde_json::to_value(labels)
             .map_err(|_| Error::new("internal", "trusted review labels could not be encoded"))?;
@@ -1098,20 +1169,25 @@ impl Store {
             ));
         }
         validate_id_age(consumer_id, now)?;
+        let running_turn = turn_accepts_context_tx(&tx, agent_num, generation, turn_id)?;
 
         let mut events = Vec::new();
         let mut selected: Vec<ContextItem> = Vec::new();
         let mut selected_ids = Vec::new();
         let mut payload_bytes = 0_usize;
         let in_flight_stop = has_in_flight_stop_tx(&tx, agent_num, generation)?;
-        let mut pending_candidates = pending_context_batch(
-            &tx,
-            agent_num,
-            generation,
-            InjectPoint::TurnSafePoint,
-            Some(turn_id),
-        )?;
-        if agent.steers_at_turn_safe_point() {
+        let mut pending_candidates = if running_turn {
+            pending_context_batch(
+                &tx,
+                agent_num,
+                generation,
+                InjectPoint::TurnSafePoint,
+                Some(turn_id),
+            )?
+        } else {
+            Vec::new()
+        };
+        if running_turn && agent.steers_at_turn_safe_point() {
             pending_candidates.extend(pending_turn_steers(&tx, agent_num, generation, turn_id)?);
             pending_candidates.sort_by_key(|(created_at, rowid, _)| (*created_at, *rowid));
         }
@@ -1567,19 +1643,19 @@ pub(super) fn settle_ended_turn_context_tx(
     agent_num: i64,
     generation: i64,
     turn_id: &str,
+    allow_fallback: bool,
     now: i64,
 ) -> Result<Vec<super::native_events::PendingCommandEvent>> {
     let mut events = Vec::new();
     let agent = load_agent_by_num(tx, agent_num)?;
-    let can_move = agent.as_ref().is_some_and(next_input_available);
+    let can_move = allow_fallback && agent.as_ref().is_some_and(next_input_available);
     let safe_point_steers = agent.as_ref().is_some_and(Agent::steers_at_turn_safe_point);
     for command_id in pending_turn_context_command_ids(tx, agent_num, generation, turn_id)? {
         let record = load_command_record(tx, &command_id)?
             .ok_or_else(|| Error::new("source_integrity", "turn context disappeared"))?;
-        let expired = decode_inject_args(&record.command.args)?
-            .expires_at_ms
-            .is_some_and(|expires| expires <= now);
-        if can_move && !expired {
+        let args = decode_inject_args(&record.command.args)?;
+        let expired = args.expires_at_ms.is_some_and(|expires| expires <= now);
+        if can_move && !expired && allows_next_input_fallback(tx, &record, &args)? {
             let outcome = move_context_to_next_input(tx, &command_id, now)?;
             events.push(super::native_events::PendingCommandEvent {
                 command_id: command_id.clone(),
@@ -1684,6 +1760,76 @@ pub(super) fn move_context_to_next_input(
 pub(super) fn next_input_available(agent: &Agent) -> bool {
     !agent.is_terminal()
         && context_points(agent).is_ok_and(|points| points.contains(&InjectPoint::NextInput))
+}
+
+pub(super) fn allows_next_input_fallback(
+    tx: &Transaction<'_>,
+    record: &CommandRecord,
+    args: &core::RetainedInjectArgs,
+) -> Result<bool> {
+    if let Some(allowed) = args.fallback_to_next_input {
+        return Ok(allowed);
+    }
+    if args.point == InjectPoint::Soonest {
+        return Ok(true);
+    }
+    if args.point == InjectPoint::NextInput {
+        return Ok(false);
+    }
+    // Legacy admissions kept the resolved point, but their request digest
+    // still binds the caller's original point. An unproven match stays bound.
+    let command = &record.command;
+    let Some((_, _, digest)) = command_binding(tx, &command.id)? else {
+        return Ok(false);
+    };
+    let mut request = SubmitCommand::new(command.id.as_str(), "inject");
+    request.target = command.target.clone();
+    request.expected_generation = command.expected_generation;
+    request.expected_turn_id = record.expected_turn_id.clone();
+    for key in ["point", "at"] {
+        let mut semantic_args = json!({"text": args.text});
+        semantic_args[key] = json!(InjectPoint::Soonest);
+        if let Some(expires) = args.expires_at_ms {
+            semantic_args["expires_at_ms"] = json!(expires);
+        }
+        if legacy_request_digest_matches(&request, &semantic_args, &digest)? {
+            return Ok(true);
+        }
+        if args.expires_at_ms.is_none() {
+            semantic_args["expires_at_ms"] = Value::Null;
+            if legacy_request_digest_matches(&request, &semantic_args, &digest)? {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+fn legacy_request_digest_matches(
+    request: &SubmitCommand,
+    args: &Value,
+    digest: &[u8],
+) -> Result<bool> {
+    match admission::command_semantic_payload(request, args.clone()) {
+        Ok(payload) => Ok(canonical::digest(&payload)? == digest),
+        Err(error) if error.code == "frame_too_large" => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+pub(super) fn turn_accepts_context_tx(
+    tx: &Transaction<'_>,
+    agent_num: i64,
+    generation: i64,
+    turn_id: &str,
+) -> Result<bool> {
+    tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM turns
+                       WHERE agent=?1 AND generation=?2 AND turn_id=?3 AND state='running')",
+        params![agent_num, generation, turn_id],
+        |row| row.get(0),
+    )
+    .map_err(sql_error)
 }
 
 pub(super) fn unknown_claim_outcome(outcome: Option<&Value>, reason: &str) -> Value {

@@ -74,6 +74,16 @@ pub(crate) async fn run_context_notes(
 }
 
 impl Router {
+    pub(crate) async fn expire_next_input_contexts(&self) -> Result<()> {
+        let mut store = self.inner.store.lock().await;
+        let events = store.expire_next_input_contexts(now_ms())?;
+        if !events.is_empty() {
+            self.publish_locked(&events);
+            self.signal_progress();
+        }
+        Ok(())
+    }
+
     async fn note_committed_fact(&self, event: &Event) -> Result<()> {
         if self.inner.mode.load(Ordering::SeqCst) != MODE_OPEN {
             return Ok(());

@@ -3154,6 +3154,7 @@ fn plugin_command_args(command: &Command) -> Result<Value> {
         }
         "inject" => {
             args.remove("_trusted_review_labels");
+            args.remove("_fallback_to_next_input");
             // Direct active_turn inject: keep the original typed payload and the
             // captured turn. Any builder failure here is known before plugin
             // I/O, so it classifies native_not_dispatched (Rejected), never

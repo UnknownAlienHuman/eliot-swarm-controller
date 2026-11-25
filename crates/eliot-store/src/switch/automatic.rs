@@ -481,25 +481,6 @@ impl Store {
         Ok(())
     }
 
-    pub(crate) fn settle_automatic_handoff_attempt(
-        &mut self,
-        switch_command: &str,
-        state: CommandState,
-        now: i64,
-    ) -> Result<()> {
-        self.ensure_writer_healthy()?;
-        let result = (|| {
-            let tx = self
-                .connection
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(sql_error)?;
-            Self::settle_automatic_handoff_attempt_tx(&tx, switch_command, state, now)?;
-            commit_transaction(tx, &self.write_faulted)
-        })();
-        self.fault_on_persistence_error(&result);
-        result
-    }
-
     fn record_automatic_handoff_refusal_tx(
         tx: &Transaction<'_>,
         agent: &Agent,

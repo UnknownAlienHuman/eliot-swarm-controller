@@ -569,13 +569,19 @@ verbs are not advertised. No fake success or compatibility executor.
 The canonical `InjectArgs`, `InjectPoint`, `ContextItem` and `ContextOutcome` DTOs are
 defined in [Core context types](../../crates/eliot-core/src/context.rs); this spec owns
 their command and effect semantics. `inject` uses the existing `SubmitCommand` with
-`args` decoded as `InjectArgs`. The point is `next_input`, `turn_safe_point`, or
-`active_turn`, and `expires_at_ms` is optional.
+`args` decoded as `InjectArgs`. The point is `soonest`, `next_input`,
+`turn_safe_point`, or `active_turn`, and `expires_at_ms` is optional.
 
-Store binds each admitted context command to the target's current generation. A
-`turn_safe_point` or `active_turn` command also captures the exact active turn at
-admission; it cannot float to another turn or fall back to a send. `next_input` has
-no turn binding and is eligible only for the next send in that same generation.
+Store binds each admitted context command to the target's current generation.
+An explicit `turn_safe_point` or `active_turn` command captures the exact active
+turn at admission. That binding stays in force through cancellation or refusal.
+`next_input` has no turn binding and is eligible only for the next send in that
+same generation. Store retains fallback permission when `soonest` selects an
+in-turn point. An unclaimed safe-point item can move when its turn ends, and a
+confirmed pre-effect refusal of active-turn delivery can move in the same
+generation. New explicit in-turn items record that fallback is disabled. Older
+items can fall back when their retained request digest binds `soonest`.
+The daemon keeps this flag out of plugin command arguments.
 Queued pending contexts (`next_input`, `turn_safe_point`) are claimed FIFO from
 existing command rows for the target's current generation. At claim, Store
 rechecks project assignment and transfer fences, the frozen project binding for
@@ -591,7 +597,10 @@ The ordinary router dispatches each `active_turn` command as
 one immediate native effect with no queue consumer. Admission or queue acceptance
 does not establish application.
 
-For `next_input`, the router claims eligible, unexpired items as part of dispatching the
+The daemon's one-second maintenance tick settles due, unclaimed `next_input`
+items as rejected with `expired` in bounded batches. Store commits the expiry
+and command event together. For `next_input`, the router claims eligible,
+unexpired items as part of dispatching the
 next ordinary SEND and the adapter prepends them inside that same native send. An item that
 is unfit even alone is rejected with `frame_too_large` so it cannot wedge the queue; anything
 that fits alone but not with the current batch ends the entire scan and stays pending for a
@@ -616,7 +625,12 @@ weaker SEND.
 Before dispatch, an expired item or one whose generation or captured turn is stale is
 cancelled. Once claimed/dispatched, an uncertain native effect is `unknown` and is never
 requeued. A late hook response is discarded rather than carried into a later callback or
-turn. On harnesses that deliver `steer` through `turn_safe_point` hooks (Claude), pending
+turn. Every terminal or unknown turn settles its pending turn-bound context in
+the same transaction, including an Owner-resolved interrupt. Ending a generation
+cancels its unclaimed items. An unknown turn cancels unclaimed turn-bound
+items. Its retained active pointer supports late readback. New in-turn delivery
+requires a running turn.
+On harnesses that deliver `steer` through `turn_safe_point` hooks (Claude), pending
 exact-turn `steer` commands share the `hook.event` FIFO safe-point claim with
 `turn_safe_point` injects in the `#888` Swarm note frame without using `InjectArgs` or
 moving to `next_input`: if the captured turn ends before any safe point arrives, an

@@ -1,6 +1,6 @@
 use super::*;
 
-pub(super) const CURRENT_SCHEMA_VERSION: i64 = RESTART_CONTINUATION_BRIEF_VERSION;
+pub(super) const CURRENT_SCHEMA_VERSION: i64 = NEXT_INPUT_CONTEXT_EXPIRY_VERSION;
 const HARNESS_CHECK_SCHEMA_VERSION: i64 = 112;
 const WORK_TRUTH_VERSION: i64 = 113;
 const WORK_TRUTH_INTENT_VERSION: i64 = 114;
@@ -28,6 +28,7 @@ const PROJECT_OVERVIEW_GIT_VERSION: i64 = 135;
 const BROKEN_NATIVE_SESSION_VERSION: i64 = 136;
 const CHILD_CLEANUP_VERSION: i64 = 137;
 const RESTART_CONTINUATION_BRIEF_VERSION: i64 = 139;
+const NEXT_INPUT_CONTEXT_EXPIRY_VERSION: i64 = 140;
 
 fn has_restart_continuation_brief_column(connection: &Connection) -> Result<bool> {
     connection
@@ -284,6 +285,27 @@ impl Store {
             tx.execute(
                 "INSERT INTO schema_migrations(version) VALUES (?1)",
                 [RESTART_CONTINUATION_BRIEF_VERSION],
+            )
+            .map_err(sql_error)?;
+            tx.commit().map_err(sql_error)?;
+        }
+        if current < NEXT_INPUT_CONTEXT_EXPIRY_VERSION {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            tx.execute_batch(
+                "CREATE INDEX commands_next_input_context_expiry
+                 ON commands(json_extract(args, '$.expires_at_ms'))
+                 WHERE verb='inject' AND state IN ('accepted','queued')
+                   AND target IS NOT NULL AND generation IS NOT NULL AND turn_id IS NULL
+                   AND json_extract(args, '$.point')='next_input'
+                   AND json_type(args, '$.expires_at_ms')='integer';",
+            )
+            .map_err(sql_error)?;
+            tx.execute(
+                "INSERT INTO schema_migrations(version) VALUES (?1)",
+                [NEXT_INPUT_CONTEXT_EXPIRY_VERSION],
             )
             .map_err(sql_error)?;
             tx.commit().map_err(sql_error)?;

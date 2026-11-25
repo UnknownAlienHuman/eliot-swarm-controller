@@ -1367,15 +1367,7 @@ impl Store {
         // Keep native batch ACKs scoped to native rows; the associated command
         // event follows those rows but commits in the same transaction.
         for command_event in command_events {
-            committed_events.push(insert_daemon_command_event(
-                tx,
-                now,
-                &command_event.kind(),
-                Some(agent_num),
-                Some(batch.generation),
-                &command_event.command_id,
-                command_event.data,
-            )?);
+            committed_events.push(command_event.commit(tx, agent_num, batch.generation, now)?);
         }
         committed_events.extend(provider_events);
         if !observed {

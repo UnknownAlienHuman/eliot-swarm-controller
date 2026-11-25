@@ -2419,82 +2419,91 @@ impl Store {
         policy: &core::SecretPolicy,
         now: i64,
     ) -> Result<Change<Command>> {
-        let parent = switch_parent(&self.connection, id)?;
-        let retained = decode_switch(parent.args)?;
-        let source = load_agent_by_num(&self.connection, parse_agent_id(&retained.request.from)?)?;
-        let mut events = Vec::new();
-        if let Some(source) = source {
-            let stop = retained
-                .source_stop_command
-                .as_deref()
-                .map(|stop_id| load_command(&self.connection, stop_id))
-                .transpose()?
-                .flatten();
-            let pending = stop.as_ref().filter(|stop| {
-                stop.state == CommandState::Accepted
-                    && stop.verb == "stop"
-                    && stop.target.as_deref() == Some(source.id.as_str())
-                    && stop.generation == Some(source.generation)
-            });
-            let stop_settled = stop.as_ref().is_none_or(|stop| {
-                matches!(
-                    stop.state,
-                    CommandState::Failed
-                        | CommandState::Rejected
-                        | CommandState::Cancelled
-                        | CommandState::Applied
-                )
-            });
-            let exit_proven = stop.as_ref().is_none_or(|stop| {
-                stop.state != CommandState::Applied
-                    || handoff::session_exit_blocker(&self.connection, &source)
-                        .is_ok_and(|blocker| blocker.is_none())
-            });
-            if pending.is_some() || (stop_settled && exit_proven) {
-                let tx = self
-                    .connection
-                    .transaction_with_behavior(TransactionBehavior::Immediate)
-                    .map_err(sql_error)?;
-                if let Some(stop) = pending {
-                    cancel_pending_command_tx(
+        self.ensure_writer_healthy()?;
+        let result = (|| {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            let parent = switch_parent(&tx, id)?;
+            if !matches!(
+                parent.state,
+                CommandState::Accepted | CommandState::Queued | CommandState::Dispatched
+            ) {
+                return Ok(Change {
+                    value: parent,
+                    events: Vec::new(),
+                });
+            }
+            let retained = decode_switch(parent.args)?;
+            let source_num = parse_agent_id(&retained.request.from)?;
+            let mut events = Vec::new();
+            if let Some(source) = load_agent_by_num(&tx, source_num)? {
+                let stop = retained
+                    .source_stop_command
+                    .as_deref()
+                    .map(|stop_id| component(&tx, id, stop_id, 3))
+                    .transpose()?
+                    .flatten();
+                let pending = stop.as_ref().filter(|stop| {
+                    stop.state == CommandState::Accepted
+                        && stop.verb == "stop"
+                        && stop.target.as_deref() == Some(source.id.as_str())
+                        && stop.generation == Some(source.generation)
+                });
+                let stop_settled = stop.as_ref().is_none_or(|stop| stop.state.is_terminal());
+                let exit_proven = stop.as_ref().is_none_or(|stop| {
+                    stop.state != CommandState::Applied
+                        || handoff::session_exit_blocker(&tx, &source)
+                            .is_ok_and(|blocker| blocker.is_none())
+                });
+                if pending.is_some() || (stop_settled && exit_proven) {
+                    if let Some(stop) = pending {
+                        cancel_pending_command_tx(
+                            &tx,
+                            source_num,
+                            source.generation,
+                            &stop.id,
+                            "switch_preparation_refused",
+                            now,
+                            &mut events,
+                        )?;
+                    }
+                    release_switch_checkout_fences(
                         &tx,
-                        parse_agent_id(&source.id)?,
-                        source.generation,
-                        &stop.id,
-                        "switch_preparation_refused",
+                        id,
+                        retained.source_checkout_key.as_deref(),
+                        retained.target_checkout_key.as_deref(),
+                        &source,
                         now,
-                        &mut events,
                     )?;
                 }
-                release_switch_checkout_fences(
-                    &tx,
-                    id,
-                    retained.source_checkout_key.as_deref(),
-                    retained.target_checkout_key.as_deref(),
-                    &source,
-                    now,
-                )?;
-                commit_transaction(tx, &self.write_faulted)?;
             }
-        }
-        let mut value = self.switch_result(id)?;
-        set_switch_error(&mut value, error, policy);
-        value.state = CommandState::Rejected;
-        value.next_action.clear();
-        value.routing = error.routing.clone();
-        let mut change = self.settle(
-            id,
-            CommandState::Rejected,
-            Some(
-                serde_json::to_value(value)
-                    .map_err(|_| Error::new("internal", "cannot encode switch result"))?,
-            ),
-            now,
-        )?;
-        events.append(&mut change.events);
-        change.events = events;
-        self.settle_automatic_handoff_attempt(id, CommandState::Rejected, now)?;
-        Ok(change)
+            let mut value = result_on(&tx, id)?;
+            set_switch_error(&mut value, error, policy);
+            value.state = CommandState::Rejected;
+            value.next_action.clear();
+            value.routing = error.routing.clone();
+            let outcome = serde_json::to_value(value)
+                .map_err(|_| Error::new("internal", "cannot encode switch result"))?;
+            let change = Self::settle_command_tx(
+                &tx,
+                id,
+                CommandState::Rejected,
+                Some(outcome),
+                now,
+                false,
+            )?;
+            events.extend(change.events);
+            Self::settle_automatic_handoff_attempt_tx(&tx, id, CommandState::Rejected, now)?;
+            commit_transaction(tx, &self.write_faulted)?;
+            Ok(Change {
+                value: change.value,
+                events,
+            })
+        })();
+        self.fault_on_persistence_error(&result);
+        result
     }
 
     /// Latest exact provider switch fact for this attempt, including queueing.
