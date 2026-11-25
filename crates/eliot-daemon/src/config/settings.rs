@@ -1287,7 +1287,8 @@ const DEFAULT_CHATS_ROOT: &str = "default_chats_root";
 /// to chats_root that differs from it requests an explicit path.
 fn implicit_chats_root(value: &JsonValue) -> Option<&JsonValue> {
     let default = value.get(DEFAULT_CHATS_ROOT)?;
-    (default.is_string() && value.get("chats_root") == Some(default)).then_some(default)
+    let proposed = value.get("chats_root")?.as_str()?;
+    super::projects::equivalent_chat_roots(proposed, default.as_str()?).then_some(default)
 }
 
 /// One section's replacement TOML; empty when the section is removed (an
@@ -1367,7 +1368,9 @@ pub fn stored_section(section: SettingsSection, value: &JsonValue) -> Option<Jso
     let source = section_source(section, value, true).ok()?;
     let mut stored = section_json(&source, section_name(section)).ok()?;
     if section == SettingsSection::Daemon
-        && let Some(default) = implicit_chats_root(value)
+        && stored.get("chats_root").is_none()
+        && value.get("chats_root").is_some()
+        && let Some(default) = value.get(DEFAULT_CHATS_ROOT)
     {
         stored["chats_root"] = default.clone();
         stored[DEFAULT_CHATS_ROOT] = default.clone();

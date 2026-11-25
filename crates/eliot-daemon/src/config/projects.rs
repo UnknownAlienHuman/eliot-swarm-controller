@@ -258,15 +258,46 @@ fn protected_paths(data_root: &Path) -> Vec<PathBuf> {
     protected
 }
 
+/// Match an alternate spelling of the displayed default without accepting
+/// paths that fail the ordinary chat-root component checks.
+pub(super) fn equivalent_chat_roots(left: &str, right: &str) -> bool {
+    match (
+        resolve_chat_directory(Path::new(left)),
+        resolve_chat_directory(Path::new(right)),
+    ) {
+        (Ok(left), Ok(right)) => path_comparison_key(&left) == path_comparison_key(&right),
+        _ => false,
+    }
+}
+
+fn chats_root_error(reason: &str) -> core::Error {
+    core::Error::new("profile_error", format!("daemon.chats_root {reason}"))
+}
+
 fn validate_chats_root(root: &Path, protected: &[PathBuf]) -> core::Result<PathBuf> {
+    let root = resolve_chat_directory(root)?;
+    let normalized_root = path_comparison_key(&root);
+    for path in protected {
+        let protected = resolve_existing_prefix(path).map_err(|error| {
+            chats_root_error(&format!("could not verify a protected root: {error}"))
+        })?;
+        let protected = path_comparison_key(&protected);
+        if normalized_root.starts_with(&protected) || protected.starts_with(&normalized_root) {
+            return Err(chats_root_error(
+                "overlaps a protected data or configuration root",
+            ));
+        }
+    }
+    Ok(root)
+}
+
+fn resolve_chat_directory(root: &Path) -> core::Result<PathBuf> {
     use std::path::Component;
 
-    let refused =
-        |reason: &str| core::Error::new("profile_error", format!("daemon.chats_root {reason}"));
     let text = root
         .to_str()
-        .ok_or_else(|| refused("must be valid UTF-8"))?;
-    super::validate_absolute_setting_path(text).map_err(refused)?;
+        .ok_or_else(|| chats_root_error("must be valid UTF-8"))?;
+    super::validate_absolute_setting_path(text).map_err(chats_root_error)?;
 
     // Inspect the supplied spelling before canonicalization can erase a link
     // or junction. Nonexistent suffixes are allowed for exclusive creation.
@@ -274,7 +305,7 @@ fn validate_chats_root(root: &Path, protected: &[PathBuf]) -> core::Result<PathB
     for component in root.components() {
         match component {
             Component::ParentDir | Component::CurDir => {
-                return Err(refused("must not contain traversal components"));
+                return Err(chats_root_error("must not contain traversal components"));
             }
             #[cfg(windows)]
             Component::Prefix(drive) => {
@@ -282,7 +313,7 @@ fn validate_chats_root(root: &Path, protected: &[PathBuf]) -> core::Result<PathB
                     drive.kind(),
                     std::path::Prefix::Disk(_) | std::path::Prefix::VerbatimDisk(_)
                 ) {
-                    return Err(refused("must use a local Windows drive"));
+                    return Err(chats_root_error("must use a local Windows drive"));
                 }
                 // A drive prefix by itself is not a filesystem location.
                 // Inspect it once the root separator has been appended.
@@ -295,7 +326,9 @@ fn validate_chats_root(root: &Path, protected: &[PathBuf]) -> core::Result<PathB
                     .to_str()
                     .is_none_or(|name| name.ends_with(['.', ' ']) || name.contains(':')) =>
             {
-                return Err(refused("contains an invalid Windows path component"));
+                return Err(chats_root_error(
+                    "contains an invalid Windows path component",
+                ));
             }
             _ => prefix.push(component),
         }
@@ -304,29 +337,25 @@ fn validate_chats_root(root: &Path, protected: &[PathBuf]) -> core::Result<PathB
                 if metadata.file_type().is_symlink()
                     || crate::platform::is_reparse_point(&metadata) =>
             {
-                return Err(refused("traverses a link or reparse point"));
+                return Err(chats_root_error("traverses a link or reparse point"));
             }
             Ok(metadata) if !metadata.is_dir() => {
-                return Err(refused("contains a component that is not a directory"));
+                return Err(chats_root_error(
+                    "contains a component that is not a directory",
+                ));
             }
             Ok(_) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(refused(&format!("could not be inspected: {error}"))),
+            Err(error) => {
+                return Err(chats_root_error(&format!(
+                    "could not be inspected: {error}"
+                )));
+            }
         }
     }
 
-    let root = resolve_existing_prefix(root)
-        .map_err(|error| refused(&format!("could not be resolved: {error}")))?;
-    let normalized_root = path_comparison_key(&root);
-    for path in protected {
-        let protected = resolve_existing_prefix(path)
-            .map_err(|error| refused(&format!("could not verify a protected root: {error}")))?;
-        let protected = path_comparison_key(&protected);
-        if normalized_root.starts_with(&protected) || protected.starts_with(&normalized_root) {
-            return Err(refused("overlaps a protected data or configuration root"));
-        }
-    }
-    Ok(root)
+    resolve_existing_prefix(root)
+        .map_err(|error| chats_root_error(&format!("could not be resolved: {error}")))
 }
 
 fn resolve_existing_prefix(path: &Path) -> std::io::Result<PathBuf> {
