@@ -186,7 +186,25 @@ pub fn spawn_stderr<R>(reader: R, policy: Arc<SecretPolicy>) -> StderrCapture
 where
     R: AsyncRead + Unpin + Send + 'static,
 {
-    spawn_stderr_inner(reader, policy, None, false, None)
+    spawn_stderr_inner(reader, policy, None, false, None, None)
+}
+
+/// Observe one exact native line without publishing it or interrupting capture.
+pub fn spawn_stderr_with_line_signal<R>(
+    reader: R,
+    policy: Arc<SecretPolicy>,
+    expected: String,
+    notify: impl FnOnce() + Send + 'static,
+) -> StderrCapture
+where
+    R: AsyncRead + Unpin + Send + 'static,
+{
+    let signal = LineSignal {
+        expected: expected.into_bytes(),
+        position: 0,
+        notify: Box::new(notify),
+    };
+    spawn_stderr_inner(reader, policy, None, false, None, Some(signal))
 }
 
 /// Retain the beginning of sanitized stderr while draining the entire pipe.
@@ -194,7 +212,7 @@ pub fn spawn_stderr_prefix<R>(reader: R, policy: Arc<SecretPolicy>) -> StderrCap
 where
     R: AsyncRead + Unpin + Send + 'static,
 {
-    spawn_stderr_inner(reader, policy, None, true, None)
+    spawn_stderr_inner(reader, policy, None, true, None, None)
 }
 
 /// Plugin-owned telemetry channel. Filter before the diagnostic tail, including
@@ -217,10 +235,38 @@ where
         Some(Box::new(telemetry)),
         false,
         Some(crash_line_prefix.into()),
+        None,
     )
 }
 
 type Telemetry = Box<dyn Fn(&str) + Send + Sync>;
+
+struct LineSignal {
+    expected: Vec<u8>,
+    position: usize,
+    notify: Box<dyn FnOnce() + Send>,
+}
+
+impl LineSignal {
+    fn observe(&mut self, input: &[u8]) -> bool {
+        for &byte in input {
+            if byte == b'\n' {
+                if self.position == self.expected.len() || self.position == self.expected.len() + 1
+                {
+                    return true;
+                }
+                self.position = 0;
+            } else if self.expected.get(self.position) == Some(&byte)
+                || (self.position == self.expected.len() && byte == b'\r')
+            {
+                self.position += 1;
+            } else {
+                self.position = usize::MAX;
+            }
+        }
+        false
+    }
+}
 
 fn spawn_stderr_inner<R>(
     reader: R,
@@ -228,6 +274,7 @@ fn spawn_stderr_inner<R>(
     telemetry: Option<Telemetry>,
     keep_prefix: bool,
     crash_line_prefix: Option<Arc<str>>,
+    signal: Option<LineSignal>,
 ) -> StderrCapture
 where
     R: AsyncRead + Unpin + Send + 'static,
@@ -240,7 +287,7 @@ where
         crash_line_prefix,
     };
     let state = Arc::clone(&view.state);
-    let task = tokio::spawn(drain(reader, policy, state, telemetry));
+    let task = tokio::spawn(drain(reader, policy, state, telemetry, signal));
     StderrCapture {
         view,
         task: Some(task),
@@ -252,6 +299,7 @@ async fn drain<R: AsyncRead + Unpin>(
     policy: Arc<SecretPolicy>,
     state: Arc<Mutex<CaptureState>>,
     telemetry: Option<Telemetry>,
+    mut signal: Option<LineSignal>,
 ) {
     let mut input = [0_u8; READ_BYTES];
     // The raw suffix is local to this task. Its maximum carry is determined by
@@ -270,6 +318,13 @@ async fn drain<R: AsyncRead + Unpin>(
                 return;
             }
         };
+        if signal
+            .as_mut()
+            .is_some_and(|signal| signal.observe(&input[..count]))
+            && let Some(signal) = signal.take()
+        {
+            (signal.notify)();
+        }
         let filtered;
         let bytes = if let Some(telemetry) = telemetry.as_ref() {
             filtered = filter.push(&input[..count], telemetry.as_ref());

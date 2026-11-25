@@ -74,6 +74,13 @@ overlap; the enclosing transfer span measures the actual critical path.
 Credentials, helper output, environment values and config contents never
 enter these records. Standard logging discards them.
 
+Normal launch waits for the owned process's exact loopback listening line
+before sending the authenticated `GET /api/config` proof. If the line is
+unavailable after one readiness-poll interval, the same bounded HTTP
+readback proceeds. The config document still has to name the Agent's
+isolated root. Debug timings distinguish listening, each config probe,
+session creation, the first session event and observed MCP connection.
+
 MCP inventory settlement polls the installed `GET /api/mcp` status with a
 50 ms initial delay, doubling to a 1 s maximum for cold starts. Both reads
 and sleeps share the earlier of the 20 s settlement cap and start deadline;

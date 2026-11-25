@@ -4008,7 +4008,10 @@ async fn observe_mcp_servers(
             return Readiness::Unavailable;
         };
         match mcp_settle(&servers) {
-            McpSettle::Connected => Readiness::Settled((servers, true)),
+            McpSettle::Connected => {
+                drop(crate::native::startup::Step::new("managed_mcp_connected"));
+                Readiness::Settled((servers, true))
+            }
             McpSettle::Terminal => Readiness::Settled((servers, false)),
             McpSettle::KeepPolling => Readiness::Pending((servers, false)),
         }
