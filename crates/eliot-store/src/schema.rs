@@ -98,31 +98,17 @@ impl Store {
             self.migrate_checkpoint_restore_intents()?;
         }
         if current < CHECKPOINT_RESTORE_CUSTODY_VERSION {
-            let tx = self
-                .connection
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(sql_error)?;
-            tx.execute_batch(
+            self.migrate_sql(
                 "ALTER TABLE checkpoint_restore_intents ADD COLUMN writer_namespace TEXT;
                  ALTER TABLE checkpoint_restore_intents ADD COLUMN custody_error TEXT;",
-            )
-            .map_err(sql_error)?;
-            tx.execute(
-                "INSERT INTO schema_migrations(version) VALUES (?1)",
-                [CHECKPOINT_RESTORE_CUSTODY_VERSION],
-            )
-            .map_err(sql_error)?;
-            tx.commit().map_err(sql_error)?;
+                Some(CHECKPOINT_RESTORE_CUSTODY_VERSION),
+            )?;
         }
         if current < FAILED_CUSTODY_VERSION {
             self.migrate_failed_custody(FAILED_CUSTODY_VERSION)?;
         }
         if current < CHAT_ARTIFACT_RESUME_VERSION {
-            let tx = self
-                .connection
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(sql_error)?;
-            tx.execute_batch(
+            self.migrate_sql(
                 "UPDATE artifacts AS artifact
                  SET generation = agent.generation,
                      body = json_set(artifact.body, '$.generation', agent.generation)
@@ -137,30 +123,20 @@ impl Store {
                    AND json_extract(artifact.body, '$.purpose') = 'Swarm chat directory'
                    AND json_extract(artifact.body, '$.state') = 'registered';
                  INSERT INTO schema_migrations(version) VALUES (130);",
-            )
-            .map_err(sql_error)?;
-            tx.commit().map_err(sql_error)?;
+                None,
+            )?;
         }
         if current < OWNER_INBOX_LOOKUPS_VERSION {
-            let tx = self
-                .connection
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(sql_error)?;
-            tx.execute_batch(
+            self.migrate_sql(
                 "CREATE INDEX owner_inbox_resume_failures ON commands(id, updated_at)
                    WHERE verb = 'resume' AND principal = 'owner'
                      AND state IN ('rejected', 'failed');
                  INSERT INTO schema_migrations(version) VALUES (131);",
-            )
-            .map_err(sql_error)?;
-            tx.commit().map_err(sql_error)?;
+                None,
+            )?;
         }
         if current < ATTENTION_NATIVE_TURN_ACTIVITY_VERSION {
-            let tx = self
-                .connection
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(sql_error)?;
-            tx.execute_batch(
+            self.migrate_sql(
                 "CREATE INDEX attention_native_turn_activity
                  ON events(agent, generation, json_extract(data, '$.turn_id'), seq, ts, source)
                  WHERE native_id IS NOT NULL
@@ -169,52 +145,27 @@ impl Store {
                                 'tool.started', 'tool.completed', 'request.opened',
                                 'request.resolved', 'request.closed');
                  INSERT INTO schema_migrations(version) VALUES (132);",
-            )
-            .map_err(sql_error)?;
-            tx.commit().map_err(sql_error)?;
+                None,
+            )?;
         }
         if current < AUTH_LOGIN_UNKNOWN_VERSION {
             self.migrate_auth_login_unknown(AUTH_LOGIN_UNKNOWN_VERSION)?;
         }
         if current < ATTENTION_ENDPOINTS_CUSTODY_VERSION {
-            let tx = self
-                .connection
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(sql_error)?;
-            tx.execute_batch(include_str!(
-                "../migrations/attention_endpoints_and_custody.sql"
-            ))
-            .map_err(sql_error)?;
-            tx.execute(
-                "INSERT INTO schema_migrations(version) VALUES (?1)",
-                [ATTENTION_ENDPOINTS_CUSTODY_VERSION],
-            )
-            .map_err(sql_error)?;
-            tx.commit().map_err(sql_error)?;
+            self.migrate_sql(
+                include_str!("../migrations/attention_endpoints_and_custody.sql"),
+                Some(ATTENTION_ENDPOINTS_CUSTODY_VERSION),
+            )?;
         }
         if current < PROJECT_OVERVIEW_GIT_VERSION {
-            let tx = self
-                .connection
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(sql_error)?;
-            tx.execute_batch(
+            self.migrate_sql(
                 "CREATE INDEX project_overview_git ON events(agent, generation, seq DESC)
                    WHERE source = 'git' AND kind = 'git.changed';",
-            )
-            .map_err(sql_error)?;
-            tx.execute(
-                "INSERT INTO schema_migrations(version) VALUES (?1)",
-                [PROJECT_OVERVIEW_GIT_VERSION],
-            )
-            .map_err(sql_error)?;
-            tx.commit().map_err(sql_error)?;
+                Some(PROJECT_OVERVIEW_GIT_VERSION),
+            )?;
         }
         if current < BROKEN_NATIVE_SESSION_VERSION {
-            let tx = self
-                .connection
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(sql_error)?;
-            tx.execute_batch(
+            self.migrate_sql(
                 "CREATE TABLE broken_native_sessions (
                     agent INTEGER NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
                     generation INTEGER NOT NULL,
@@ -223,20 +174,11 @@ impl Store {
                     PRIMARY KEY (agent, generation)
                  );
                  CREATE INDEX broken_native_sessions_recent ON broken_native_sessions(recorded_at DESC);",
-            ).map_err(sql_error)?;
-            tx.execute(
-                "INSERT INTO schema_migrations(version) VALUES (?1)",
-                [BROKEN_NATIVE_SESSION_VERSION],
-            )
-            .map_err(sql_error)?;
-            tx.commit().map_err(sql_error)?;
+                Some(BROKEN_NATIVE_SESSION_VERSION),
+            )?;
         }
         if current < CHILD_CLEANUP_VERSION {
-            let tx = self
-                .connection
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(sql_error)?;
-            tx.execute_batch(
+            self.migrate_sql(
                 "CREATE TABLE child_cleanup (
                      child INTEGER NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
                      child_generation INTEGER NOT NULL CHECK(child_generation > 0),
@@ -255,9 +197,9 @@ impl Store {
                  ) WITHOUT ROWID;
                  CREATE INDEX child_cleanup_due ON child_cleanup(not_before, child, child_generation)
                      WHERE state = 'pending' OR (state = 'kept' AND notice_delivered = 0);
-                 INSERT INTO schema_migrations(version) VALUES (137);"
-            ).map_err(sql_error)?;
-            tx.commit().map_err(sql_error)?;
+                 INSERT INTO schema_migrations(version) VALUES (137);",
+                None,
+            )?;
         }
         // Migration 139 shipped before 138. Use the receipt rather than the
         // maximum version to decide whether parked SEND custody is available.
@@ -270,11 +212,7 @@ impl Store {
             )
             .map_err(sql_error)?;
         if !has_restart_deferred_sends {
-            let tx = self
-                .connection
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(sql_error)?;
-            tx.execute_batch(
+            self.migrate_sql(
                 "CREATE TABLE IF NOT EXISTS restart_deferred_sends (
                    command_id TEXT PRIMARY KEY NOT NULL REFERENCES commands(id) ON DELETE CASCADE,
                    restart_id TEXT NOT NULL,
@@ -282,14 +220,8 @@ impl Store {
                    native_ref TEXT NOT NULL,
                    sealed INTEGER NOT NULL DEFAULT 0 CHECK (sealed IN (0, 1))
                  );",
-            )
-            .map_err(sql_error)?;
-            tx.execute(
-                "INSERT INTO schema_migrations(version) VALUES (?1)",
-                [RESTART_DEFERRED_SENDS_VERSION],
-            )
-            .map_err(sql_error)?;
-            tx.commit().map_err(sql_error)?;
+                Some(RESTART_DEFERRED_SENDS_VERSION),
+            )?;
         }
         // An earlier private build recorded 138 before it tracked the seal.
         if !self.connection.query_row(
@@ -333,70 +265,56 @@ impl Store {
             tx.commit().map_err(sql_error)?;
         }
         if current < NEXT_INPUT_CONTEXT_EXPIRY_VERSION {
-            let tx = self
-                .connection
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(sql_error)?;
-            tx.execute_batch(
+            self.migrate_sql(
                 "CREATE INDEX commands_next_input_context_expiry
                  ON commands(json_extract(args, '$.expires_at_ms'))
                  WHERE verb='inject' AND state IN ('accepted','queued')
                    AND target IS NOT NULL AND generation IS NOT NULL AND turn_id IS NULL
                    AND json_extract(args, '$.point')='next_input'
                    AND json_type(args, '$.expires_at_ms')='integer';",
-            )
-            .map_err(sql_error)?;
-            tx.execute(
-                "INSERT INTO schema_migrations(version) VALUES (?1)",
-                [NEXT_INPUT_CONTEXT_EXPIRY_VERSION],
-            )
-            .map_err(sql_error)?;
-            tx.commit().map_err(sql_error)?;
+                Some(NEXT_INPUT_CONTEXT_EXPIRY_VERSION),
+            )?;
         }
         if current < SOURCE_REPLAY_COMPARISON_VERSION {
-            let tx = self
-                .connection
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(sql_error)?;
-            tx.execute_batch("ALTER TABLE source_state ADD COLUMN last_batch_replay TEXT;")
-                .map_err(sql_error)?;
-            tx.execute(
-                "INSERT INTO schema_migrations(version) VALUES (?1)",
-                [SOURCE_REPLAY_COMPARISON_VERSION],
-            )
-            .map_err(sql_error)?;
-            tx.commit().map_err(sql_error)?;
+            self.migrate_sql(
+                "ALTER TABLE source_state ADD COLUMN last_batch_replay TEXT;",
+                Some(SOURCE_REPLAY_COMPARISON_VERSION),
+            )?;
         }
         if current < CHILD_DIGEST_ASSIGNMENT_VERSION {
-            let tx = self
-                .connection
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(sql_error)?;
-            tx.execute_batch(
+            self.migrate_sql(
                 "ALTER TABLE completion_digests ADD COLUMN requested_parent INTEGER;
                  ALTER TABLE completion_digests ADD COLUMN transferred_child INTEGER;
                  ALTER TABLE completion_digests ADD COLUMN transferred_mail_id TEXT;
                  CREATE INDEX completion_digests_wake_mail
                    ON completion_digests(COALESCE(transferred_mail_id, delivered_mail_id))
                    WHERE COALESCE(transferred_mail_id, delivered_mail_id) IS NOT NULL;",
-            )
-            .map_err(sql_error)?;
-            tx.execute(
-                "INSERT INTO schema_migrations(version) VALUES (?1)",
-                [CHILD_DIGEST_ASSIGNMENT_VERSION],
-            )
-            .map_err(sql_error)?;
-            tx.commit().map_err(sql_error)?;
+                Some(CHILD_DIGEST_ASSIGNMENT_VERSION),
+            )?;
         }
         Ok(())
     }
 
-    fn migrate_checkpoint_restore_intents(&mut self) -> Result<()> {
+    /// Run one migration in its own immediate transaction. Pass a version
+    /// when the batch does not insert its own schema migration row.
+    fn migrate_sql(&mut self, sql: &str, version: Option<i64>) -> Result<()> {
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(sql_error)?;
-        tx.execute_batch(
+        tx.execute_batch(sql).map_err(sql_error)?;
+        if let Some(version) = version {
+            tx.execute(
+                "INSERT INTO schema_migrations(version) VALUES (?1)",
+                [version],
+            )
+            .map_err(sql_error)?;
+        }
+        tx.commit().map_err(sql_error)
+    }
+
+    fn migrate_checkpoint_restore_intents(&mut self) -> Result<()> {
+        self.migrate_sql(
             "CREATE TABLE checkpoint_restore_intents (
                  id TEXT PRIMARY KEY NOT NULL REFERENCES writes(id),
                  workspace TEXT NOT NULL UNIQUE,
@@ -407,110 +325,55 @@ impl Store {
              );
              CREATE INDEX checkpoint_restore_common_dir
                  ON checkpoint_restore_intents(common_dir);",
+            Some(CHECKPOINT_RESTORE_INTENT_VERSION),
         )
-        .map_err(sql_error)?;
-        tx.execute(
-            "INSERT INTO schema_migrations(version) VALUES (?1)",
-            [CHECKPOINT_RESTORE_INTENT_VERSION],
-        )
-        .map_err(sql_error)?;
-        tx.commit().map_err(sql_error)
     }
 
     fn migrate_attention_lookups(&mut self) -> Result<()> {
-        let tx = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(sql_error)?;
-        tx.execute_batch(
+        self.migrate_sql(
             "CREATE INDEX attention_successful_turns ON turns(agent, completed_at DESC, turn_id DESC)
              WHERE state = 'completed' AND outcome = 'success'
                AND started_at > 0 AND completed_at >= started_at;",
-        ).map_err(sql_error)?;
-        tx.execute(
-            "INSERT INTO schema_migrations(version) VALUES (?1)",
-            [ATTENTION_LOOKUPS_VERSION],
+            Some(ATTENTION_LOOKUPS_VERSION),
         )
-        .map_err(sql_error)?;
-        tx.commit().map_err(sql_error)
     }
 
     fn migrate_mail_notice_revision(&mut self) -> Result<()> {
-        let tx = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(sql_error)?;
-        tx.execute_batch(include_str!("../migrations/mail_notice_revision.sql"))
-            .map_err(sql_error)?;
-        tx.execute(
-            "INSERT INTO schema_migrations(version) VALUES (?1)",
-            [MAIL_NOTICE_REVISION_VERSION],
+        self.migrate_sql(
+            include_str!("../migrations/mail_notice_revision.sql"),
+            Some(MAIL_NOTICE_REVISION_VERSION),
         )
-        .map_err(sql_error)?;
-        tx.commit().map_err(sql_error)
     }
 
     fn migrate_mail_pending_wake(&mut self) -> Result<()> {
-        let tx = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(sql_error)?;
-        tx.execute_batch(
+        self.migrate_sql(
             "CREATE INDEX messages_pending_wake ON messages(recipient)
              WHERE read_at IS NULL AND wake = 1;",
+            Some(MAIL_PENDING_WAKE_VERSION),
         )
-        .map_err(sql_error)?;
-        tx.execute(
-            "INSERT INTO schema_migrations(version) VALUES (?1)",
-            [MAIL_PENDING_WAKE_VERSION],
-        )
-        .map_err(sql_error)?;
-        tx.commit().map_err(sql_error)
     }
 
     fn migrate_muse_turn_models(&mut self) -> Result<()> {
-        let tx = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(sql_error)?;
-        tx.execute_batch(include_str!("../migrations/muse_turn_models.sql"))
-            .map_err(sql_error)?;
-        tx.execute(
-            "INSERT INTO schema_migrations(version) VALUES (?1)",
-            [MUSE_TURN_MODEL_VERSION],
+        self.migrate_sql(
+            include_str!("../migrations/muse_turn_models.sql"),
+            Some(MUSE_TURN_MODEL_VERSION),
         )
-        .map_err(sql_error)?;
-        tx.commit().map_err(sql_error)
     }
 
     fn migrate_native_followup(&mut self) -> Result<()> {
-        let tx = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(sql_error)?;
-        tx.execute_batch(
+        self.migrate_sql(
             "ALTER TABLE turns ADD COLUMN native_followup_pending INTEGER NOT NULL DEFAULT 0
                  CHECK (native_followup_pending IN (0, 1));
              ALTER TABLE turns ADD COLUMN native_wake_cancel_reason TEXT;
              ALTER TABLE agents ADD COLUMN native_wake_interrupted_generation INTEGER;",
+            Some(NATIVE_FOLLOWUP_SCHEMA_VERSION),
         )
-        .map_err(sql_error)?;
-        tx.execute(
-            "INSERT INTO schema_migrations(version) VALUES (?1)",
-            [NATIVE_FOLLOWUP_SCHEMA_VERSION],
-        )
-        .map_err(sql_error)?;
-        tx.commit().map_err(sql_error)
     }
 
     // Keep the debug-build migration frames small enough for Windows.
     fn migrate_through_42(&mut self, current: i64) -> Result<()> {
         if current == 0 {
-            let tx = self
-                .connection
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(sql_error)?;
-            tx.execute_batch(
+            self.migrate_sql(
                 "CREATE TABLE agents (
                  id INTEGER PRIMARY KEY AUTOINCREMENT,
                  generation INTEGER NOT NULL DEFAULT 0,
@@ -624,16 +487,11 @@ impl Store {
                  created_at INTEGER NOT NULL
              );
              INSERT INTO schema_migrations(version) VALUES (1);",
-            )
-            .map_err(sql_error)?;
-            tx.commit().map_err(sql_error)?;
+                None,
+            )?;
         }
         if current < 2 {
-            let tx = self
-                .connection
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(sql_error)?;
-            tx.execute_batch(
+            self.migrate_sql(
                 "ALTER TABLE agents ADD COLUMN profile_snapshot TEXT NOT NULL DEFAULT '{}';
                  ALTER TABLE agents ADD COLUMN native_scope TEXT;
                  ALTER TABLE agents ADD COLUMN native_ref TEXT;
@@ -648,16 +506,11 @@ impl Store {
                  ALTER TABLE source_state ADD COLUMN gap_to TEXT;
                  ALTER TABLE source_state ADD COLUMN gap_seq INTEGER;
                  INSERT INTO schema_migrations(version) VALUES (2);",
-            )
-            .map_err(sql_error)?;
-            tx.commit().map_err(sql_error)?;
+                None,
+            )?;
         }
         if current < 3 {
-            let tx = self
-                .connection
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(sql_error)?;
-            tx.execute_batch(
+            self.migrate_sql(
                 "ALTER TABLE agents ADD COLUMN pending TEXT NOT NULL DEFAULT '[]';
                  ALTER TABLE commands ADD COLUMN request_id TEXT;
                  CREATE INDEX commands_request_open
@@ -677,16 +530,11 @@ impl Store {
                      ON pending_requests(agent, generation, turn_id, request_id)
                      WHERE state = 'pending';
                  INSERT INTO schema_migrations(version) VALUES (3);",
-            )
-            .map_err(sql_error)?;
-            tx.commit().map_err(sql_error)?;
+                None,
+            )?;
         }
         if current < 4 {
-            let tx = self
-                .connection
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(sql_error)?;
-            tx.execute_batch(
+            self.migrate_sql(
                 "CREATE TABLE processes (
                      host_boot_id TEXT NOT NULL CHECK(length(host_boot_id) > 0),
                      pid INTEGER NOT NULL CHECK(pid > 0 AND pid <= 4294967295),
@@ -701,16 +549,11 @@ impl Store {
                  );
                  CREATE INDEX processes_owner ON processes(owner, state);
                  INSERT INTO schema_migrations(version) VALUES (4);",
-            )
-            .map_err(sql_error)?;
-            tx.commit().map_err(sql_error)?;
+                None,
+            )?;
         }
         if current < 5 {
-            let tx = self
-                .connection
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(sql_error)?;
-            tx.execute_batch(
+            self.migrate_sql(
                 "CREATE TABLE agent_edits (
                      agent INTEGER NOT NULL,
                      generation INTEGER NOT NULL,
@@ -726,16 +569,11 @@ impl Store {
                      updated_at INTEGER NOT NULL
                  );
                  INSERT INTO schema_migrations(version) VALUES (5);",
-            )
-            .map_err(sql_error)?;
-            tx.commit().map_err(sql_error)?;
+                None,
+            )?;
         }
         if current < 6 {
-            let tx = self
-                .connection
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(sql_error)?;
-            tx.execute_batch(
+            self.migrate_sql(
                 "CREATE TABLE workspaces (
                      agent INTEGER PRIMARY KEY REFERENCES agents(id),
                      target_generation INTEGER NOT NULL CHECK(target_generation > 0),
@@ -748,36 +586,27 @@ impl Store {
                      outcome TEXT, updated_at INTEGER NOT NULL
                  );
                  INSERT INTO schema_migrations(version) VALUES (6);",
-            ).map_err(sql_error)?;
-            tx.commit().map_err(sql_error)?;
+                None,
+            )?;
         }
         if current < 7 {
-            let tx = self
-                .connection
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(sql_error)?;
-            tx.execute_batch(
+            self.migrate_sql(
                 "ALTER TABLE agents ADD COLUMN origin TEXT NOT NULL DEFAULT 'eliot' CHECK(origin IN ('eliot','native','external'));
                  ALTER TABLE agents ADD COLUMN observe_only INTEGER NOT NULL DEFAULT 0
                      CHECK(observe_only IN (0,1) AND (state <> 'unknown' OR observe_only = 1) AND (observe_only = 0 OR token IS NULL));
                  INSERT INTO schema_migrations(version) VALUES (7);",
-            ).map_err(sql_error)?;
-            tx.commit().map_err(sql_error)?;
+                None,
+            )?;
         }
         if current < 8 {
-            let tx = self
-                .connection
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(sql_error)?;
-            tx.execute_batch(
+            self.migrate_sql(
                 "ALTER TABLE source_state ADD COLUMN last_handoff_digest BLOB
                      CHECK(last_handoff_digest IS NULL OR length(last_handoff_digest) = 32);
                  ALTER TABLE source_state ADD COLUMN last_handoff TEXT
                      CHECK((last_handoff IS NULL) = (last_handoff_digest IS NULL));
                  INSERT INTO schema_migrations(version) VALUES (8);",
-            )
-            .map_err(sql_error)?;
-            tx.commit().map_err(sql_error)?;
+                None,
+            )?;
         }
         if current < 9 {
             let tx = self
@@ -797,11 +626,7 @@ impl Store {
             tx.commit().map_err(sql_error)?;
         }
         if current < 10 {
-            let tx = self
-                .connection
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(sql_error)?;
-            tx.execute_batch(
+            self.migrate_sql(
                 "ALTER TABLE commands ADD COLUMN probe INTEGER NOT NULL DEFAULT 0
                      CHECK(probe IN (0,1));
                  CREATE TABLE provider_holds (
@@ -815,16 +640,11 @@ impl Store {
                         OR (state = 'probing' AND probe_command IS NOT NULL))
                  );
                  INSERT INTO schema_migrations(version) VALUES (10);",
-            )
-            .map_err(sql_error)?;
-            tx.commit().map_err(sql_error)?;
+                None,
+            )?;
         }
         if current < 11 {
-            let tx = self
-                .connection
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(sql_error)?;
-            tx.execute_batch(
+            self.migrate_sql(
                 "ALTER TABLE events ADD COLUMN subject TEXT;
                  CREATE TABLE rule_state (
                      principal TEXT NOT NULL,
@@ -841,16 +661,11 @@ impl Store {
                  CREATE INDEX commands_rule_action_window ON commands(created_at)
                      WHERE link_kind = 'rule_action';
                  INSERT INTO schema_migrations(version) VALUES (11);",
-            )
-            .map_err(sql_error)?;
-            tx.commit().map_err(sql_error)?;
+                None,
+            )?;
         }
         if current < 12 {
-            let tx = self
-                .connection
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(sql_error)?;
-            tx.execute_batch(
+            self.migrate_sql(
                 "CREATE TABLE timers (
                      principal TEXT NOT NULL,
                      rule TEXT NOT NULL,
@@ -868,16 +683,11 @@ impl Store {
                  CREATE INDEX timers_due ON timers(next_due_at, principal, rule)
                      WHERE next_due_at IS NOT NULL;
                  INSERT INTO schema_migrations(version) VALUES (12);",
-            )
-            .map_err(sql_error)?;
-            tx.commit().map_err(sql_error)?;
+                None,
+            )?;
         }
         if current < 13 {
-            let tx = self
-                .connection
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(sql_error)?;
-            tx.execute_batch(
+            self.migrate_sql(
                 "ALTER TABLE events ADD COLUMN cause TEXT;
                  ALTER TABLE commands ADD COLUMN cause TEXT;
                  ALTER TABLE rule_state ADD COLUMN retiring_revision INTEGER
@@ -888,16 +698,11 @@ impl Store {
                  ALTER TABLE rule_state ADD COLUMN retire_through INTEGER
                      CHECK(retire_through IS NULL OR retire_through >= 0);
                  INSERT INTO schema_migrations(version) VALUES (13);",
-            )
-            .map_err(sql_error)?;
-            tx.commit().map_err(sql_error)?;
+                None,
+            )?;
         }
         if current < 14 {
-            let tx = self
-                .connection
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(sql_error)?;
-            tx.execute_batch(
+            self.migrate_sql(
                 "ALTER TABLE commands ADD COLUMN project_binding TEXT;
                  CREATE TABLE project_registrations (
                      revision INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -914,31 +719,21 @@ impl Store {
                  INSERT INTO rule_history_coverage(singleton, pruned_through)
                      VALUES (1, 0);
                  INSERT INTO schema_migrations(version) VALUES (14);",
-            )
-            .map_err(sql_error)?;
-            tx.commit().map_err(sql_error)?;
+                None,
+            )?;
         }
         if current < 15 {
-            let tx = self
-                .connection
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(sql_error)?;
-            tx.execute_batch(
+            self.migrate_sql(
                 "ALTER TABLE project_registrations
                      ADD COLUMN interpreters TEXT NOT NULL DEFAULT '{}';
                  ALTER TABLE project_registrations
                      ADD COLUMN run_env TEXT NOT NULL DEFAULT '[]';
                  INSERT INTO schema_migrations(version) VALUES (15);",
-            )
-            .map_err(sql_error)?;
-            tx.commit().map_err(sql_error)?;
+                None,
+            )?;
         }
         if current < 16 {
-            let tx = self
-                .connection
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(sql_error)?;
-            tx.execute_batch(
+            self.migrate_sql(
                 "CREATE INDEX commands_git_fetch_open_repo ON commands(
                      json_extract(args, '$.common_dir')
                  ) WHERE verb = 'git.fetch'
@@ -946,9 +741,8 @@ impl Store {
                  ALTER TABLE project_registrations ADD COLUMN git TEXT;
                  CREATE INDEX workspaces_git_repo ON workspaces(repo_common_dir);
                  INSERT INTO schema_migrations(version) VALUES (16);",
-            )
-            .map_err(sql_error)?;
-            tx.commit().map_err(sql_error)?;
+                None,
+            )?;
         }
         if current < 17 {
             let tx = self
@@ -960,27 +754,18 @@ impl Store {
             tx.commit().map_err(sql_error)?;
         }
         if current < 18 {
-            let tx = self
-                .connection
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(sql_error)?;
-            tx.execute_batch(
+            self.migrate_sql(
                 "CREATE INDEX commands_unsettled_created ON commands(created_at)
                      WHERE state IN ('accepted', 'queued', 'dispatched', 'unknown');
                  DROP INDEX commands_open;
                  CREATE INDEX processes_owner_identity
                      ON processes(owner, host_boot_id, pid, start_time);
                  INSERT INTO schema_migrations(version) VALUES (18);",
-            )
-            .map_err(sql_error)?;
-            tx.commit().map_err(sql_error)?;
+                None,
+            )?;
         }
         if current < 19 {
-            let tx = self
-                .connection
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(sql_error)?;
-            tx.execute_batch(
+            self.migrate_sql(
                 "CREATE TABLE goals (
                      agent INTEGER NOT NULL,
                      mode TEXT NOT NULL,
@@ -1004,30 +789,20 @@ impl Store {
                      PRIMARY KEY(agent, mode, generation, revision, round_key)
                  );
                  INSERT INTO schema_migrations(version) VALUES (19);",
-            )
-            .map_err(sql_error)?;
-            tx.commit().map_err(sql_error)?;
+                None,
+            )?;
         }
         if current < 20 {
-            let tx = self
-                .connection
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(sql_error)?;
-            tx.execute_batch(
+            self.migrate_sql(
                 "ALTER TABLE goal_markers
                      ADD COLUMN round_key_kind TEXT NOT NULL DEFAULT 'idle'
                      CHECK(round_key_kind IN ('idle', 'slot'));
                  INSERT INTO schema_migrations(version) VALUES (20);",
-            )
-            .map_err(sql_error)?;
-            tx.commit().map_err(sql_error)?;
+                None,
+            )?;
         }
         if current < 21 {
-            let tx = self
-                .connection
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(sql_error)?;
-            tx.execute_batch(
+            self.migrate_sql(
                 "CREATE TABLE messages (
                      id INTEGER PRIMARY KEY AUTOINCREMENT,
                      delivery_id TEXT NOT NULL UNIQUE,
@@ -1052,29 +827,19 @@ impl Store {
                      open_notice_command TEXT
                  );
                  INSERT INTO schema_migrations(version) VALUES (21);",
-            )
-            .map_err(sql_error)?;
-            tx.commit().map_err(sql_error)?;
+                None,
+            )?;
         }
         if current < 22 {
-            let tx = self
-                .connection
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(sql_error)?;
-            tx.execute_batch(
+            self.migrate_sql(
                 "CREATE INDEX messages_prune_acked ON messages(read_at, delivery_id)
                      WHERE read_at IS NOT NULL;
                  INSERT INTO schema_migrations(version) VALUES (22);",
-            )
-            .map_err(sql_error)?;
-            tx.commit().map_err(sql_error)?;
+                None,
+            )?;
         }
         if current < 23 {
-            let tx = self
-                .connection
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(sql_error)?;
-            tx.execute_batch(
+            self.migrate_sql(
                 "ALTER TABLE agents ADD COLUMN parent INTEGER REFERENCES agents(id);
                  ALTER TABLE agents ADD COLUMN root INTEGER REFERENCES agents(id);
                  ALTER TABLE agents ADD COLUMN depth INTEGER NOT NULL DEFAULT 0
@@ -1086,16 +851,11 @@ impl Store {
                  CREATE INDEX agents_parent ON agents(parent);
                  CREATE INDEX agents_root ON agents(root);
                  INSERT INTO schema_migrations(version) VALUES (23);",
-            )
-            .map_err(sql_error)?;
-            tx.commit().map_err(sql_error)?;
+                None,
+            )?;
         }
         if current < 24 {
-            let tx = self
-                .connection
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(sql_error)?;
-            tx.execute_batch(
+            self.migrate_sql(
                 "CREATE TABLE claims (
                      agent INTEGER NOT NULL, generation INTEGER NOT NULL, glob TEXT NOT NULL,
                      note TEXT, expires_at INTEGER NOT NULL, created_at INTEGER NOT NULL,
@@ -1103,32 +863,22 @@ impl Store {
                  );
                  CREATE INDEX claims_expiry ON claims(expires_at);
                  INSERT INTO schema_migrations(version) VALUES (24);",
-            )
-            .map_err(sql_error)?;
-            tx.commit().map_err(sql_error)?;
+                None,
+            )?;
         }
         if current < 25 {
-            let tx = self
-                .connection
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(sql_error)?;
-            tx.execute_batch(
+            self.migrate_sql(
                 "CREATE TABLE owned_exits (
                      agent INTEGER NOT NULL, generation INTEGER NOT NULL,
                      proven_at INTEGER NOT NULL,
                      PRIMARY KEY(agent, generation)
                  );
                  INSERT INTO schema_migrations(version) VALUES (25);",
-            )
-            .map_err(sql_error)?;
-            tx.commit().map_err(sql_error)?;
+                None,
+            )?;
         }
         if current < 26 {
-            let tx = self
-                .connection
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(sql_error)?;
-            tx.execute_batch(
+            self.migrate_sql(
                 "CREATE TABLE native_child_registrations (
                      producer INTEGER NOT NULL REFERENCES agents(id),
                      producer_generation INTEGER NOT NULL CHECK(producer_generation > 0),
@@ -1140,57 +890,37 @@ impl Store {
                      PRIMARY KEY(parent, parent_generation, registration_id)
                  );
                  INSERT INTO schema_migrations(version) VALUES (26);",
-            )
-            .map_err(sql_error)?;
-            tx.commit().map_err(sql_error)?;
+                None,
+            )?;
         }
         if current < 27 {
-            let tx = self
-                .connection
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(sql_error)?;
-            tx.execute_batch(
+            self.migrate_sql(
                 "ALTER TABLE turns ADD COLUMN usage TEXT;
                  INSERT INTO schema_migrations(version) VALUES (27);",
-            )
-            .map_err(sql_error)?;
-            tx.commit().map_err(sql_error)?;
+                None,
+            )?;
         }
         if current < 28 {
-            let tx = self
-                .connection
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(sql_error)?;
-            tx.execute_batch(
+            self.migrate_sql(
                 "CREATE INDEX commands_context_pending ON commands(
                      target, generation, json_extract(args, '$.point'), turn_id, created_at
                  ) WHERE verb = 'inject' AND state IN ('accepted', 'queued');
                  INSERT INTO schema_migrations(version) VALUES (28);",
-            )
-            .map_err(sql_error)?;
-            tx.commit().map_err(sql_error)?;
+                None,
+            )?;
         }
         if current < 29 {
-            let tx = self
-                .connection
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(sql_error)?;
-            tx.execute_batch(
+            self.migrate_sql(
                 "ALTER TABLE turns ADD COLUMN outcome TEXT
                      CHECK(outcome IS NULL OR outcome IN ('success','failure','interrupted','unknown'));
                  ALTER TABLE turns ADD COLUMN native_status TEXT
                      CHECK(native_status IS NULL OR length(native_status) > 0);
                  INSERT INTO schema_migrations(version) VALUES (29);",
-            )
-            .map_err(sql_error)?;
-            tx.commit().map_err(sql_error)?;
+                None,
+            )?;
         }
         if current < 30 {
-            let tx = self
-                .connection
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(sql_error)?;
-            tx.execute_batch(
+            self.migrate_sql(
                 "CREATE INDEX native_children_producer ON native_child_registrations(producer, producer_generation, child);
                  CREATE INDEX turns_native_activity ON turns(agent, generation, state, COALESCE(completed_at, started_at, 0));
                  CREATE INDEX events_native_progress_time ON events(agent, generation, ts DESC)
@@ -1231,31 +961,22 @@ impl Store {
                        AND EXISTS(SELECT 1 FROM agents c WHERE c.id = OLD.agent AND c.generation = OLD.generation);
                  END;
                  INSERT INTO schema_migrations(version) VALUES (30);",
-            ).map_err(sql_error)?;
-            tx.commit().map_err(sql_error)?;
+                None,
+            )?;
         }
         if current < 31 {
-            let tx = self
-                .connection
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(sql_error)?;
-            tx.execute_batch(
+            self.migrate_sql(
                 "CREATE INDEX agents_list_state ON agents(state, id);
                  CREATE INDEX agents_list_project ON agents(project, id);
                  CREATE INDEX agents_list_harness ON agents(harness, id);
                  CREATE INDEX agents_list_parent ON agents(parent, id);
                  CREATE INDEX agents_list_root ON agents(root, id);
                  INSERT INTO schema_migrations(version) VALUES (31);",
-            )
-            .map_err(sql_error)?;
-            tx.commit().map_err(sql_error)?;
+                None,
+            )?;
         }
         if current < 32 {
-            let tx = self
-                .connection
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(sql_error)?;
-            tx.execute_batch(
+            self.migrate_sql(
                 "CREATE TABLE attention_wakes (
                      recipient INTEGER NOT NULL REFERENCES agents(id),
                      thread TEXT NOT NULL,
@@ -1264,16 +985,11 @@ impl Store {
                  );
                  CREATE INDEX attention_wakes_thread ON attention_wakes(thread);
                  INSERT INTO schema_migrations(version) VALUES (32);",
-            )
-            .map_err(sql_error)?;
-            tx.commit().map_err(sql_error)?;
+                None,
+            )?;
         }
         if current < 33 {
-            let tx = self
-                .connection
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(sql_error)?;
-            tx.execute_batch(
+            self.migrate_sql(
                 "CREATE TABLE session_usage (
                      agent INTEGER NOT NULL REFERENCES agents(id),
                      generation INTEGER NOT NULL CHECK(generation > 0),
@@ -1282,16 +998,11 @@ impl Store {
                      PRIMARY KEY(agent, generation)
                  );
                  INSERT INTO schema_migrations(version) VALUES (33);",
-            )
-            .map_err(sql_error)?;
-            tx.commit().map_err(sql_error)?;
+                None,
+            )?;
         }
         if current < 34 {
-            let tx = self
-                .connection
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(sql_error)?;
-            tx.execute_batch(
+            self.migrate_sql(
                 "CREATE TABLE agent_config (
                      agent INTEGER NOT NULL REFERENCES agents(id),
                      generation INTEGER NOT NULL CHECK(generation > 0),
@@ -1309,42 +1020,27 @@ impl Store {
                  ALTER TABLE turns ADD COLUMN config_revision INTEGER NOT NULL DEFAULT 0
                      CHECK(typeof(config_revision) = 'integer' AND config_revision >= 0);
                  INSERT INTO schema_migrations(version) VALUES (34);",
-            )
-            .map_err(sql_error)?;
-            tx.commit().map_err(sql_error)?;
+                None,
+            )?;
         }
         if current < 35 {
-            let tx = self
-                .connection
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(sql_error)?;
-            tx.execute_batch(
+            self.migrate_sql(
                 "ALTER TABLE agent_config ADD COLUMN provenance TEXT NOT NULL DEFAULT 'configure'
                      CHECK(provenance IN ('configure', 'inherited_from'));
                  INSERT INTO schema_migrations(version) VALUES (35);",
-            )
-            .map_err(sql_error)?;
-            tx.commit().map_err(sql_error)?;
+                None,
+            )?;
         }
         if current < 36 {
-            let tx = self
-                .connection
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(sql_error)?;
-            tx.execute_batch(
+            self.migrate_sql(
                 "ALTER TABLE agents ADD COLUMN profile_inherited INTEGER NOT NULL DEFAULT 0
                      CHECK(profile_inherited IN (0, 1));
                  INSERT INTO schema_migrations(version) VALUES (36);",
-            )
-            .map_err(sql_error)?;
-            tx.commit().map_err(sql_error)?;
+                None,
+            )?;
         }
         if current < 37 {
-            let tx = self
-                .connection
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(sql_error)?;
-            tx.execute_batch(
+            self.migrate_sql(
                 "CREATE TABLE completion_digests (
                      id TEXT PRIMARY KEY,
                      parent INTEGER NOT NULL REFERENCES agents(id),
@@ -1361,16 +1057,11 @@ impl Store {
                  CREATE INDEX completion_digests_pending
                      ON completion_digests(delivered_at, created_at);
                  INSERT INTO schema_migrations(version) VALUES (37);",
-            )
-            .map_err(sql_error)?;
-            tx.commit().map_err(sql_error)?;
+                None,
+            )?;
         }
         if current < 38 {
-            let tx = self
-                .connection
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(sql_error)?;
-            tx.execute_batch(
+            self.migrate_sql(
                 "CREATE TABLE inference_clients (
                      client_id TEXT PRIMARY KEY, current_version INTEGER NOT NULL,
                      current_hash TEXT NOT NULL, current_file TEXT NOT NULL, pending_version INTEGER, pending_hash TEXT, pending_file TEXT,
@@ -1385,16 +1076,12 @@ impl Store {
                      cancel_id TEXT REFERENCES writes(id), release_id TEXT REFERENCES writes(id),
                      UNIQUE(client_id, admission_seq));
                  CREATE INDEX inference_client_calls ON inference_calls(client_id, admission_seq);
-                 INSERT INTO schema_migrations(version) VALUES (38);"
-            ).map_err(sql_error)?;
-            tx.commit().map_err(sql_error)?;
+                 INSERT INTO schema_migrations(version) VALUES (38);",
+                None,
+            )?;
         }
         if current < 39 {
-            let tx = self
-                .connection
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(sql_error)?;
-            tx.execute_batch(
+            self.migrate_sql(
                 "ALTER TABLE inference_clients ADD COLUMN last_write_seq INTEGER NOT NULL DEFAULT 0 CHECK(last_write_seq>=0);
                  ALTER TABLE inference_clients ADD COLUMN retain_after_seq INTEGER NOT NULL DEFAULT 0 CHECK(retain_after_seq>=0);
                  ALTER TABLE inference_clients ADD COLUMN write_retain_after_seq INTEGER NOT NULL DEFAULT 0 CHECK(write_retain_after_seq>=0);
@@ -1420,9 +1107,9 @@ impl Store {
                      ORDER BY created_at DESC,id DESC LIMIT 1)
                    WHERE previous_version IS NOT NULL;
                  CREATE UNIQUE INDEX inference_write_inventory ON writes(principal,inference_seq) WHERE inference_seq IS NOT NULL;
-                 INSERT INTO schema_migrations(version) VALUES (39);"
-            ).map_err(sql_error)?;
-            tx.commit().map_err(sql_error)?;
+                 INSERT INTO schema_migrations(version) VALUES (39);",
+                None,
+            )?;
         }
         if current < 40 {
             let tx = self
@@ -1446,11 +1133,7 @@ impl Store {
             tx.commit().map_err(sql_error)?;
         }
         if current < 41 {
-            let tx = self
-                .connection
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(sql_error)?;
-            tx.execute_batch(
+            self.migrate_sql(
                 "CREATE TABLE settings_history (
                      revision INTEGER PRIMARY KEY AUTOINCREMENT,
                      previous_revision TEXT,
@@ -1463,34 +1146,24 @@ impl Store {
                  CREATE INDEX settings_history_created
                      ON settings_history(created_at DESC, revision DESC);
                  INSERT INTO schema_migrations(version) VALUES (41);",
-            )
-            .map_err(sql_error)?;
-            tx.commit().map_err(sql_error)?;
+                None,
+            )?;
         }
         if current < 42 {
-            let tx = self
-                .connection
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(sql_error)?;
-            tx.execute_batch(
+            self.migrate_sql(
                 "ALTER TABLE agents ADD COLUMN profile_choice TEXT;
                  CREATE INDEX commands_assignment ON commands(json_extract(args,'$.assignment.key'))
                      WHERE verb='launch';
                  INSERT INTO schema_migrations(version) VALUES (42);",
-            )
-            .map_err(sql_error)?;
-            tx.commit().map_err(sql_error)?;
+                None,
+            )?;
         }
         Ok(())
     }
 
     fn migrate_after_42(&mut self, current: i64) -> Result<()> {
         if current < 43 {
-            let tx = self
-                .connection
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(sql_error)?;
-            tx.execute_batch(
+            self.migrate_sql(
                 "ALTER TABLE commands ADD COLUMN assignment_busy INTEGER NOT NULL DEFAULT 0
                      CHECK(assignment_busy IN (0,1));
                  DROP INDEX commands_assignment;
@@ -1584,105 +1257,68 @@ impl Store {
                    ) AND verb='launch';
                  END;
                  INSERT INTO schema_migrations(version) VALUES (43);",
-            )
-            .map_err(sql_error)?;
-            tx.commit().map_err(sql_error)?;
+                None,
+            )?;
         }
         if current < 44 {
-            let tx = self
-                .connection
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(sql_error)?;
-            tx.execute_batch(
+            self.migrate_sql(
                 "CREATE INDEX commands_turn_unknown
                     ON commands(target, generation, turn_id, state, id)
                     WHERE state IN ('accepted','queued','dispatched','unknown');
                   INSERT INTO schema_migrations(version) VALUES (44);",
-            )
-            .map_err(sql_error)?;
-            tx.commit().map_err(sql_error)?;
+                None,
+            )?;
         }
         if current < 45 {
-            let tx = self
-                .connection
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(sql_error)?;
-            tx.execute_batch(
+            self.migrate_sql(
                 "ALTER TABLE turns ADD COLUMN preceded_by TEXT;
                   INSERT INTO schema_migrations(version) VALUES (45);",
-            )
-            .map_err(sql_error)?;
-            tx.commit().map_err(sql_error)?;
+                None,
+            )?;
         }
         if current < 46 {
-            let tx = self
-                .connection
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(sql_error)?;
-            tx.execute_batch(
+            self.migrate_sql(
                 "CREATE TABLE artifacts (id TEXT PRIMARY KEY, agent INTEGER NOT NULL REFERENCES agents(id), generation INTEGER NOT NULL, path TEXT NOT NULL UNIQUE, body TEXT NOT NULL);
                  CREATE INDEX artifacts_owner ON artifacts(agent,generation);
                  CREATE TABLE cleanup_plans (id TEXT PRIMARY KEY, principal TEXT NOT NULL, body TEXT NOT NULL, apply_id TEXT UNIQUE);
                  INSERT INTO schema_migrations(version) VALUES (46);",
-            )
-            .map_err(sql_error)?;
-            tx.commit().map_err(sql_error)?;
+                None,
+            )?;
         }
         if current < 47 {
-            let tx = self
-                .connection
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(sql_error)?;
-            tx.execute_batch(
+            self.migrate_sql(
                 "CREATE INDEX writes_principal_method ON writes(principal, method);
                  INSERT INTO schema_migrations(version) VALUES (47);",
-            )
-            .map_err(sql_error)?;
-            tx.commit().map_err(sql_error)?;
+                None,
+            )?;
         }
         if current < 48 {
-            let tx = self
-                .connection
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(sql_error)?;
-            tx.execute_batch("ALTER TABLE agents ADD COLUMN archived INTEGER NOT NULL DEFAULT 0 CHECK(archived IN (0,1));
+            self.migrate_sql(
+                "ALTER TABLE agents ADD COLUMN archived INTEGER NOT NULL DEFAULT 0 CHECK(archived IN (0,1));
                 ALTER TABLE agents ADD COLUMN chat INTEGER NOT NULL DEFAULT 0 CHECK(chat IN (0,1));
                 CREATE INDEX agents_list_archived ON agents(archived,id);
-                INSERT INTO schema_migrations(version) VALUES (48);").map_err(sql_error)?;
-            tx.commit().map_err(sql_error)?;
+                INSERT INTO schema_migrations(version) VALUES (48);",
+                None,
+            )?;
         }
         if current < 49 {
-            let tx = self
-                .connection
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(sql_error)?;
-            tx.execute_batch(
+            self.migrate_sql(
                 "CREATE INDEX events_heavy_agent_generation
                      ON events(agent, generation, seq) WHERE kind = 'activity.heavy';
                  INSERT INTO schema_migrations(version) VALUES (49);",
-            )
-            .map_err(sql_error)?;
-            tx.commit().map_err(sql_error)?;
+                None,
+            )?;
         }
         if current < 50 {
-            let tx = self
-                .connection
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(sql_error)?;
-            tx.execute_batch(
+            self.migrate_sql(
                 "CREATE INDEX processes_live_owner ON processes(owner)
                      WHERE state IN ('running','unknown');
                  INSERT INTO schema_migrations(version) VALUES (50);",
-            )
-            .map_err(sql_error)?;
-            tx.commit().map_err(sql_error)?;
+                None,
+            )?;
         }
         if current < 51 {
-            let tx = self
-                .connection
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(sql_error)?;
-            tx.execute_batch(
+            self.migrate_sql(
                 "CREATE INDEX events_git_hints ON events(agent, generation, seq)
                  WHERE kind = 'tool.completed' AND native_id IS NOT NULL
                    AND source NOT IN ('git', 'os', 'daemon')
@@ -1693,16 +1329,11 @@ impl Store {
                         OR json_type(data, '$.changed_paths_truncated') = 'true'
                         OR json_type(data, '$.redacted') = 'true');
                  INSERT INTO schema_migrations(version) VALUES (51);",
-            )
-            .map_err(sql_error)?;
-            tx.commit().map_err(sql_error)?;
+                None,
+            )?;
         }
         if current < 52 {
-            let tx = self
-                .connection
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(sql_error)?;
-            tx.execute_batch(
+            self.migrate_sql(
                 "CREATE TABLE custody_binding (
                      singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
                      store_id TEXT NOT NULL, data_dir BLOB NOT NULL, namespace TEXT NOT NULL
@@ -1714,44 +1345,30 @@ impl Store {
                        AND events.generation = agents.generation AND kind = 'agent.starting'
                        AND seq > (SELECT since_seq FROM store_identity WHERE singleton = 1)
                    );
-                 INSERT INTO schema_migrations(version) VALUES (52);"
-            ).map_err(sql_error)?;
-            tx.commit().map_err(sql_error)?;
+                 INSERT INTO schema_migrations(version) VALUES (52);",
+                None,
+            )?;
         }
         if current < 53 {
-            let tx = self
-                .connection
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(sql_error)?;
-            tx.execute_batch(
+            self.migrate_sql(
                 "ALTER TABLE agents ADD COLUMN project_scope TEXT;
                  CREATE INDEX agents_list_project_scope
                    ON agents(COALESCE(project_scope, project), id);
                  INSERT INTO schema_migrations(version) VALUES (53);",
-            )
-            .map_err(sql_error)?;
-            tx.commit().map_err(sql_error)?;
+                None,
+            )?;
         }
         if current < 54 {
-            let tx = self
-                .connection
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(sql_error)?;
-            tx.execute_batch(
+            self.migrate_sql(
                 "ALTER TABLE rule_state ADD COLUMN source_present INTEGER NOT NULL DEFAULT 1
                    CHECK(source_present IN (0, 1));
                  CREATE TABLE paused_assignment_timers (rule TEXT NOT NULL PRIMARY KEY);
                  INSERT INTO schema_migrations(version) VALUES (54);",
-            )
-            .map_err(sql_error)?;
-            tx.commit().map_err(sql_error)?;
+                None,
+            )?;
         }
         if current < 55 {
-            let tx = self
-                .connection
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(sql_error)?;
-            tx.execute_batch(
+            self.migrate_sql(
                 "CREATE TABLE project_assignments (
                      project TEXT PRIMARY KEY,
                      manager INTEGER,
@@ -1764,9 +1381,8 @@ impl Store {
                  ALTER TABLE commands ADD COLUMN assignment_binding TEXT;
                  ALTER TABLE cleanup_plans ADD COLUMN assignment_binding TEXT;
                  INSERT INTO schema_migrations(version) VALUES (55);",
-            )
-            .map_err(sql_error)?;
-            tx.commit().map_err(sql_error)?;
+                None,
+            )?;
         }
         if current < 58 {
             // v58 adds the four store performance indexes. Databases
@@ -1785,11 +1401,7 @@ impl Store {
                 )
                 .map_err(sql_error)?;
             if !has_assignments {
-                let tx = self
-                    .connection
-                    .transaction_with_behavior(TransactionBehavior::Immediate)
-                    .map_err(sql_error)?;
-                tx.execute_batch(
+                self.migrate_sql(
                     "CREATE TABLE project_assignments (
                          project TEXT PRIMARY KEY,
                          manager INTEGER,
@@ -1801,15 +1413,10 @@ impl Store {
                      );
                      ALTER TABLE commands ADD COLUMN assignment_binding TEXT;
                      ALTER TABLE cleanup_plans ADD COLUMN assignment_binding TEXT;",
-                )
-                .map_err(sql_error)?;
-                tx.commit().map_err(sql_error)?;
+                    None,
+                )?;
             }
-            let tx = self
-                .connection
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(sql_error)?;
-            tx.execute_batch(
+            self.migrate_sql(
                 "CREATE INDEX IF NOT EXISTS commands_prune_roots ON commands(created_at, id)
                     WHERE parent_command IS NULL;
                  CREATE INDEX IF NOT EXISTS completion_digests_pending_cursor
@@ -1819,9 +1426,8 @@ impl Store {
                  CREATE INDEX IF NOT EXISTS workspaces_start_command
                     ON workspaces(start_command_id);
                    INSERT INTO schema_migrations(version) VALUES (58);",
-            )
-            .map_err(sql_error)?;
-            tx.commit().map_err(sql_error)?;
+                None,
+            )?;
         }
         // Migration 58 historically could commit before these two steps.
         // Check their own receipts so a restart can finish an interrupted upgrade.
@@ -1875,51 +1481,32 @@ impl Store {
             tx.commit().map_err(sql_error)?;
         }
         if !has_57 {
-            let tx = self
-                .connection
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(sql_error)?;
-            tx.execute_batch(
+            self.migrate_sql(
                 "ALTER TABLE project_assignments ADD COLUMN workspace_path TEXT;
                  ALTER TABLE project_assignments ADD COLUMN workspace_adopted INTEGER NOT NULL DEFAULT 0
                      CHECK(workspace_adopted IN (0, 1));
                  INSERT INTO schema_migrations(version) VALUES (57);",
-            )
-            .map_err(sql_error)?;
-            tx.commit().map_err(sql_error)?;
+                None,
+            )?;
         }
         if current < 59 {
-            let tx = self
-                .connection
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(sql_error)?;
-            tx.execute_batch(
+            self.migrate_sql(
                 "ALTER TABLE turns ADD COLUMN effective_model TEXT;
                  ALTER TABLE turns ADD COLUMN native_error_message TEXT;
                  INSERT INTO schema_migrations(version) VALUES (59);",
-            )
-            .map_err(sql_error)?;
-            tx.commit().map_err(sql_error)?;
+                None,
+            )?;
         }
         if current < 60 {
-            let tx = self
-                .connection
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(sql_error)?;
-            tx.execute_batch(
+            self.migrate_sql(
                 "ALTER TABLE artifacts ADD COLUMN seq INTEGER NOT NULL DEFAULT 0;
                  UPDATE artifacts SET seq = (SELECT COUNT(*) FROM artifacts AS older WHERE older.id <= artifacts.id);
                  INSERT INTO schema_migrations(version) VALUES (60);",
-            )
-            .map_err(sql_error)?;
-            tx.commit().map_err(sql_error)?;
+                None,
+            )?;
         }
         if current < 61 {
-            let tx = self
-                .connection
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(sql_error)?;
-            tx.execute_batch(
+            self.migrate_sql(
                 "CREATE TABLE IF NOT EXISTS project_transfers (
                      project TEXT PRIMARY KEY,
                      intent TEXT NOT NULL UNIQUE,
@@ -1928,16 +1515,11 @@ impl Store {
                  );
                  ALTER TABLE workspaces ADD COLUMN original_preparation TEXT;
                  INSERT INTO schema_migrations(version) VALUES (61);",
-            )
-            .map_err(sql_error)?;
-            tx.commit().map_err(sql_error)?;
+                None,
+            )?;
         }
         if current < 62 {
-            let tx = self
-                .connection
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(sql_error)?;
-            tx.execute_batch(
+            self.migrate_sql(
                 "CREATE TABLE launch_intents (
                      id TEXT PRIMARY KEY REFERENCES writes(id),
                      project TEXT NOT NULL,
@@ -1969,32 +1551,22 @@ impl Store {
                      priority INTEGER NOT NULL
                  );
                 INSERT INTO schema_migrations(version) VALUES (62);",
-            )
-            .map_err(sql_error)?;
-            tx.commit().map_err(sql_error)?;
+                None,
+            )?;
         }
         if current < 63 {
             // The sidebar's recent order reads one activity key the Store
             // already maintains on the same writes: `updated_at` is bumped
             // by the core reducer on every native event, so no new column
             // is needed, only the index the ordering seeks.
-            let tx = self
-                .connection
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(sql_error)?;
-            tx.execute_batch(
+            self.migrate_sql(
                 "CREATE INDEX IF NOT EXISTS agents_recent ON agents(updated_at DESC, id DESC);
                  INSERT INTO schema_migrations(version) VALUES (63);",
-            )
-            .map_err(sql_error)?;
-            tx.commit().map_err(sql_error)?;
+                None,
+            )?;
         }
         if current < 64 {
-            let tx = self
-                .connection
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(sql_error)?;
-            tx.execute_batch(
+            self.migrate_sql(
                 "CREATE TABLE chat_organization (
                      agent INTEGER PRIMARY KEY REFERENCES agents(id),
                      project_link TEXT,
@@ -2032,23 +1604,17 @@ impl Store {
                      SELECT single.chat_id, single.project, '[]'
                      FROM single;
                 INSERT INTO schema_migrations(version) VALUES (64);",
-            )
-            .map_err(sql_error)?;
-            tx.commit().map_err(sql_error)?;
+                None,
+            )?;
         }
         if current < 65 {
             // Menu writes carry the overlay revision they observed; the
             // Store refuses a write whose revision moved (k184b P2).
-            let tx = self
-                .connection
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(sql_error)?;
-            tx.execute_batch(
+            self.migrate_sql(
                 "ALTER TABLE chat_organization ADD COLUMN revision INTEGER NOT NULL DEFAULT 1;
                  INSERT INTO schema_migrations(version) VALUES (65);",
-            )
-            .map_err(sql_error)?;
-            tx.commit().map_err(sql_error)?;
+                None,
+            )?;
         }
         if current < 66 {
             let tx = self
@@ -2066,11 +1632,7 @@ impl Store {
             tx.commit().map_err(sql_error)?;
         }
         if current < 67 {
-            let tx = self
-                .connection
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(sql_error)?;
-            tx.execute_batch(
+            self.migrate_sql(
                 "ALTER TABLE turns ADD COLUMN tool_calls INTEGER NOT NULL DEFAULT 0 CHECK(tool_calls >= 0);
                  ALTER TABLE turns ADD COLUMN messages INTEGER NOT NULL DEFAULT 0 CHECK(messages >= 0);
                  CREATE TABLE IF NOT EXISTS git_work_state (
@@ -2089,9 +1651,8 @@ impl Store {
                      updated_at INTEGER NOT NULL
                  );
                  INSERT INTO schema_migrations(version) VALUES (67);",
-            )
-            .map_err(sql_error)?;
-            tx.commit().map_err(sql_error)?;
+                None,
+            )?;
         }
         if current < 68 {
             let tx = self
@@ -2137,11 +1698,7 @@ impl Store {
             tx.commit().map_err(sql_error)?;
         }
         if current < 71 {
-            let tx = self
-                .connection
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(sql_error)?;
-            tx.execute_batch(
+            self.migrate_sql(
                 "ALTER TABLE provider_holds ADD COLUMN next_probe_at INTEGER
                      CHECK(next_probe_at IS NULL OR next_probe_at >= 0);
                  ALTER TABLE provider_holds ADD COLUMN probe_attempts INTEGER NOT NULL DEFAULT 0
@@ -2170,23 +1727,17 @@ impl Store {
                      WHERE retry_after IS NOT NULL AND state = 'held'
                        AND kind IN ('rate_limit','quota');
                  INSERT INTO schema_migrations(version) VALUES (71);",
-            )
-            .map_err(sql_error)?;
-            tx.commit().map_err(sql_error)?;
+                None,
+            )?;
         }
         if current < 72 {
-            let tx = self
-                .connection
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(sql_error)?;
-            tx.execute_batch(
+            self.migrate_sql(
                 "ALTER TABLE provider_holds ADD COLUMN held_since INTEGER NOT NULL DEFAULT 0
                      CHECK(held_since >= 0);
                  UPDATE provider_holds SET held_since = updated_at;
                  INSERT INTO schema_migrations(version) VALUES (72);",
-            )
-            .map_err(sql_error)?;
-            tx.commit().map_err(sql_error)?;
+                None,
+            )?;
         }
         if current < 73 {
             let tx = self
@@ -2209,40 +1760,26 @@ impl Store {
             tx.commit().map_err(sql_error)?;
         }
         if current < 74 {
-            let tx = self
-                .connection
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(sql_error)?;
-            tx.execute_batch(
+            self.migrate_sql(
                 "CREATE INDEX source_state_open_gap_seq ON source_state(gap_seq)
                      WHERE state = 'open' AND gap_seq IS NOT NULL AND gap_from IS NOT NULL;
                  INSERT INTO schema_migrations(version) VALUES (74);",
-            )
-            .map_err(sql_error)?;
-            tx.commit().map_err(sql_error)?;
+                None,
+            )?;
         }
         if current < 75 {
-            let tx = self
-                .connection
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(sql_error)?;
-            tx.execute_batch(
+            self.migrate_sql(
                 "CREATE INDEX messages_presentation_command ON messages(presentation_command)
                      WHERE presentation_command IS NOT NULL;
                  CREATE INDEX mail_notices_open_notice_command ON mail_notices(open_notice_command)
                      WHERE open_notice_command IS NOT NULL;
                  CREATE INDEX writes_created_at ON writes(created_at, id);
                  INSERT INTO schema_migrations(version) VALUES (75);",
-            )
-            .map_err(sql_error)?;
-            tx.commit().map_err(sql_error)?;
+                None,
+            )?;
         }
         if current < 76 {
-            let tx = self
-                .connection
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(sql_error)?;
-            tx.execute_batch(
+            self.migrate_sql(
                 "ALTER TABLE turns ADD COLUMN start_command_id TEXT;
                  WITH event_facts AS (
                      SELECT e.agent, e.generation,
@@ -2298,16 +1835,11 @@ impl Store {
                        AND u.turn_id = turns.turn_id
                  );
                  INSERT INTO schema_migrations(version) VALUES (76);",
-            )
-            .map_err(sql_error)?;
-            tx.commit().map_err(sql_error)?;
+                None,
+            )?;
         }
         if current < 77 {
-            let tx = self
-                .connection
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(sql_error)?;
-            tx.execute_batch(
+            self.migrate_sql(
                 "CREATE TABLE git_committed_oids (
                      agent INTEGER NOT NULL,
                      generation INTEGER NOT NULL,
@@ -2342,16 +1874,11 @@ impl Store {
                      WHERE agent = OLD.id AND generation = OLD.generation;
                  END;
                  INSERT INTO schema_migrations(version) VALUES (77);",
-            )
-            .map_err(sql_error)?;
-            tx.commit().map_err(sql_error)?;
+                None,
+            )?;
         }
         if current < 78 {
-            let tx = self
-                .connection
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(sql_error)?;
-            tx.execute_batch(
+            self.migrate_sql(
                 "ALTER TABLE turns ADD COLUMN insertion_seq INTEGER NOT NULL DEFAULT 0;
                  UPDATE turns SET insertion_seq = rowid;
                  CREATE TABLE turn_insertion_sequence (
@@ -2391,16 +1918,11 @@ impl Store {
                      END
                  FROM (SELECT DISTINCT agent, generation FROM turns) t;
                  INSERT INTO schema_migrations(version) VALUES (78);",
-            )
-            .map_err(sql_error)?;
-            tx.commit().map_err(sql_error)?;
+                None,
+            )?;
         }
         if current < 79 {
-            let tx = self
-                .connection
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(sql_error)?;
-            tx.execute_batch(
+            self.migrate_sql(
                 "CREATE INDEX events_monitoring_agent
                  ON events(agent, kind, seq)
                  WHERE kind IN ('session.growth', 'x.user.agent.attention_step');
@@ -2434,9 +1956,8 @@ impl Store {
                  ALTER TABLE provider_holds ADD COLUMN attention_notified INTEGER NOT NULL DEFAULT 0
                      CHECK(attention_notified IN (0,1));
                  INSERT INTO schema_migrations(version) VALUES (79);",
-            )
-            .map_err(sql_error)?;
-            tx.commit().map_err(sql_error)?;
+                None,
+            )?;
         }
         if current < 80 {
             let tx = self
@@ -2471,11 +1992,7 @@ impl Store {
             tx.commit().map_err(sql_error)?;
         }
         if current < 81 {
-            let tx = self
-                .connection
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(sql_error)?;
-            tx.execute_batch(
+            self.migrate_sql(
                 "CREATE TABLE assignment_legacy_floors (
                      assignment_key TEXT PRIMARY KEY,
                      cursor TEXT NOT NULL
@@ -2488,16 +2005,11 @@ impl Store {
                    AND set_by='owner' AND note='automation assignment cursor'
                    AND json_type(value,'$.cursor')='text';
                  INSERT INTO schema_migrations(version) VALUES (81);",
-            )
-            .map_err(sql_error)?;
-            tx.commit().map_err(sql_error)?;
+                None,
+            )?;
         }
         if current < 82 {
-            let tx = self
-                .connection
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(sql_error)?;
-            tx.execute_batch(
+            self.migrate_sql(
                 "CREATE TABLE agent_wakes (
                      id TEXT PRIMARY KEY,
                      agent INTEGER NOT NULL REFERENCES agents(id),
@@ -2524,49 +2036,33 @@ impl Store {
                      ON agent_wakes(agent, generation)
                      WHERE state IN ('waiting','satisfied','delivery_pending');
                  INSERT INTO schema_migrations(version) VALUES (82);",
-            )
-            .map_err(sql_error)?;
-            tx.commit().map_err(sql_error)?;
+                None,
+            )?;
         }
         if current < 83 {
-            let tx = self
-                .connection
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(sql_error)?;
-            tx.execute_batch(
+            self.migrate_sql(
                 "ALTER TABLE agents ADD COLUMN instruction_delivery TEXT;
                  INSERT INTO schema_migrations(version) VALUES (83);",
-            )
-            .map_err(sql_error)?;
-            tx.commit().map_err(sql_error)?;
+                None,
+            )?;
         }
         if current < 84 {
-            let tx = self
-                .connection
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(sql_error)?;
-            tx.execute_batch(
+            self.migrate_sql(
                 "ALTER TABLE agents ADD COLUMN policy_applied INTEGER NOT NULL DEFAULT 0
                      CHECK(policy_applied IN (0,1));
                  ALTER TABLE agents ADD COLUMN policy_opt_out_reason TEXT;
                  CREATE INDEX agents_project_policy_window ON agents(project, created_at, id)
                      WHERE origin = 'eliot';
                  INSERT INTO schema_migrations(version) VALUES (84);",
-            )
-            .map_err(sql_error)?;
-            tx.commit().map_err(sql_error)?;
+                None,
+            )?;
         }
         if current < 85 {
-            let tx = self
-                .connection
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(sql_error)?;
-            tx.execute_batch(
+            self.migrate_sql(
                 "ALTER TABLE launch_intents ADD COLUMN owner_process TEXT;
                  INSERT INTO schema_migrations(version) VALUES (85);",
-            )
-            .map_err(sql_error)?;
-            tx.commit().map_err(sql_error)?;
+                None,
+            )?;
         }
         if current < 86 {
             let tx = self
@@ -2601,11 +2097,7 @@ impl Store {
             tx.commit().map_err(sql_error)?;
         }
         if current < 88 {
-            let tx = self
-                .connection
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(sql_error)?;
-            tx.execute_batch(
+            self.migrate_sql(
                 "CREATE TABLE context_notes_cursor (id INTEGER PRIMARY KEY CHECK(id=1), seq INTEGER NOT NULL);
                  INSERT INTO context_notes_cursor VALUES(1, COALESCE((SELECT seq FROM sqlite_sequence WHERE name='events'), 0));
                  CREATE TABLE context_noted_paths (
@@ -2616,15 +2108,11 @@ impl Store {
                  ) WITHOUT ROWID;
                  CREATE INDEX context_noted_paths_turn ON context_noted_paths(agent,generation,turn_id,note_id);
                  INSERT INTO schema_migrations(version) VALUES(88);",
-            ).map_err(sql_error)?;
-            tx.commit().map_err(sql_error)?;
+                None,
+            )?;
         }
         if current < 89 {
-            let tx = self
-                .connection
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(sql_error)?;
-            tx.execute_batch(
+            self.migrate_sql(
                 "CREATE TABLE git_integration_custody (
                      command_id TEXT PRIMARY KEY REFERENCES commands(id) ON DELETE CASCADE,
                      scratch_id TEXT NOT NULL UNIQUE,
@@ -2640,31 +2128,21 @@ impl Store {
                  CREATE INDEX git_integration_cleanup
                      ON git_integration_custody(common_dir) WHERE cleaned = 0;
                  INSERT INTO schema_migrations(version) VALUES (89);",
-            )
-            .map_err(sql_error)?;
-            tx.commit().map_err(sql_error)?;
+                None,
+            )?;
         }
         if current < 91 {
-            let tx = self
-                .connection
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(sql_error)?;
-            tx.execute_batch(
+            self.migrate_sql(
                 "ALTER TABLE launch_intents ADD COLUMN owner_automation INTEGER NOT NULL
                      DEFAULT 0 CHECK(owner_automation IN (0,1));
                  ALTER TABLE assignment_waits ADD COLUMN owner_automation INTEGER NOT NULL
                      DEFAULT 1 CHECK(owner_automation IN (0,1));
                  INSERT INTO schema_migrations(version) VALUES(91);",
-            )
-            .map_err(sql_error)?;
-            tx.commit().map_err(sql_error)?;
+                None,
+            )?;
         }
         if current < 92 {
-            let tx = self
-                .connection
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(sql_error)?;
-            tx.execute_batch(
+            self.migrate_sql(
                 "CREATE TABLE owner_inbox_snoozes (
                      kind TEXT NOT NULL,
                      subject TEXT NOT NULL,
@@ -2691,16 +2169,11 @@ impl Store {
                  CREATE INDEX owner_inbox_unknown_turns ON turns(agent,generation,turn_id)
                      WHERE state='unknown';
                  INSERT INTO schema_migrations(version) VALUES (92);",
-            )
-            .map_err(sql_error)?;
-            tx.commit().map_err(sql_error)?;
+                None,
+            )?;
         }
         if current < 94 {
-            let tx = self
-                .connection
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(sql_error)?;
-            tx.execute_batch(
+            self.migrate_sql(
                 "CREATE TABLE goal_check_history (
                      id INTEGER PRIMARY KEY AUTOINCREMENT,
                      project_id TEXT NOT NULL,
@@ -2717,9 +2190,8 @@ impl Store {
                      WHERE kind = 'source.gap' OR kind = 'x.user.agent.attention'
                         OR kind = 'command.dispatched';
                  INSERT INTO schema_migrations(version) VALUES (94);",
-            )
-            .map_err(sql_error)?;
-            tx.commit().map_err(sql_error)?;
+                None,
+            )?;
         }
         if current < 95 {
             let tx = self
@@ -2747,11 +2219,7 @@ impl Store {
             tx.commit().map_err(sql_error)?;
         }
         if current < 96 {
-            let tx = self
-                .connection
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(sql_error)?;
-            tx.execute_batch(
+            self.migrate_sql(
                 "ALTER TABLE rule_state ADD COLUMN suppressed_count INTEGER NOT NULL DEFAULT 0
                      CHECK(suppressed_count >= 0);
                  CREATE TABLE rule_once_keys (
@@ -2775,28 +2243,18 @@ impl Store {
                  CREATE INDEX rule_key_usage_window
                      ON rule_key_usage(principal, rule, key_digest, used_at);
                  INSERT INTO schema_migrations(version) VALUES (96);",
-            )
-            .map_err(sql_error)?;
-            tx.commit().map_err(sql_error)?;
+                None,
+            )?;
         }
         if current < 97 {
-            let tx = self
-                .connection
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(sql_error)?;
-            tx.execute_batch(
+            self.migrate_sql(
                 "ALTER TABLE agents ADD COLUMN owner_rules_delivery TEXT;
                  INSERT INTO schema_migrations(version) VALUES (97);",
-            )
-            .map_err(sql_error)?;
-            tx.commit().map_err(sql_error)?;
+                None,
+            )?;
         }
         if current < 98 {
-            let tx = self
-                .connection
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(sql_error)?;
-            tx.execute_batch(
+            self.migrate_sql(
                 "CREATE TABLE background_process_wakes (
                      id TEXT PRIMARY KEY,
                      agent INTEGER NOT NULL REFERENCES agents(id),
@@ -2835,16 +2293,11 @@ impl Store {
                      ON background_process_wakes(settled_at, id)
                      WHERE state IN ('delivered', 'expired', 'cancelled', 'failed', 'stale');
                  INSERT INTO schema_migrations(version) VALUES (98);",
-            )
-            .map_err(sql_error)?;
-            tx.commit().map_err(sql_error)?;
+                None,
+            )?;
         }
         if current < 99 {
-            let tx = self
-                .connection
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(sql_error)?;
-            tx.execute_batch(
+            self.migrate_sql(
                 "CREATE INDEX IF NOT EXISTS events_turn_notice
                      ON events(agent, generation, json_extract(data, '$.turn_id'), seq DESC)
                      WHERE kind = 'turn.notice';
@@ -2865,71 +2318,46 @@ impl Store {
                      WHERE verb IN ('launch', 'resume')
                        AND state IN ('accepted', 'queued', 'dispatched');
                  INSERT INTO schema_migrations(version) VALUES (99);",
-            )
-            .map_err(sql_error)?;
-            tx.commit().map_err(sql_error)?;
+                None,
+            )?;
         }
         if current < 100 {
-            let tx = self
-                .connection
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(sql_error)?;
-            tx.execute_batch(
+            self.migrate_sql(
                 "CREATE INDEX IF NOT EXISTS commands_turn_steer_pending
                      ON commands(target, generation, turn_id, created_at)
                      WHERE verb = 'steer' AND state IN ('accepted', 'queued');
                  INSERT INTO schema_migrations(version) VALUES (100);",
-            )
-            .map_err(sql_error)?;
-            tx.commit().map_err(sql_error)?;
+                None,
+            )?;
         }
         if current < 101 {
-            let tx = self
-                .connection
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(sql_error)?;
-            tx.execute_batch(
+            self.migrate_sql(
                 "ALTER TABLE background_process_wakes ADD COLUMN tool_time_basis TEXT
                      CHECK (tool_time_basis IS NULL OR tool_time_basis IN ('native', 'commit'));
                  INSERT INTO schema_migrations(version) VALUES (101);",
-            )
-            .map_err(sql_error)?;
-            tx.commit().map_err(sql_error)?;
+                None,
+            )?;
         }
         if current < 102 {
-            let tx = self
-                .connection
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(sql_error)?;
-            tx.execute_batch(
+            self.migrate_sql(
                 "ALTER TABLE turns ADD COLUMN native_trigger TEXT;
                  INSERT INTO schema_migrations(version) VALUES (102);",
-            )
-            .map_err(sql_error)?;
-            tx.commit().map_err(sql_error)?;
+                None,
+            )?;
         }
         if current < 103 {
-            let tx = self
-                .connection
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(sql_error)?;
-            tx.execute_batch(
+            self.migrate_sql(
                 "CREATE INDEX commands_owner_control_failures
                      ON commands(target, generation, updated_at DESC)
                      WHERE principal = 'owner'
                        AND verb IN ('stop', 'interrupt')
                        AND state IN ('rejected', 'failed', 'unknown');
                  INSERT INTO schema_migrations(version) VALUES (103);",
-            )
-            .map_err(sql_error)?;
-            tx.commit().map_err(sql_error)?;
+                None,
+            )?;
         }
         if current < 104 {
-            let tx = self
-                .connection
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(sql_error)?;
-            tx.execute_batch(
+            self.migrate_sql(
                 "DROP INDEX IF EXISTS commands_owner_control_failures;
                  CREATE INDEX commands_owner_control_results
                      ON commands(target, generation, created_at DESC)
@@ -2938,16 +2366,11 @@ impl Store {
                        AND verb IN ('stop', 'interrupt')
                        AND state IN ('applied', 'rejected', 'failed', 'unknown');
                  INSERT INTO schema_migrations(version) VALUES (104);",
-            )
-            .map_err(sql_error)?;
-            tx.commit().map_err(sql_error)?;
+                None,
+            )?;
         }
         if current < 105 {
-            let tx = self
-                .connection
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(sql_error)?;
-            tx.execute_batch(
+            self.migrate_sql(
                 "CREATE TABLE native_session_unclassified (
                      harness TEXT NOT NULL,
                      native_scope TEXT NOT NULL,
@@ -2965,9 +2388,8 @@ impl Store {
                    AND a.native_scope IS NOT NULL AND a.native_ref IS NOT NULL
                  GROUP BY a.harness, a.native_scope, a.native_ref;
                  INSERT INTO schema_migrations(version) VALUES (105);",
-            )
-            .map_err(sql_error)?;
-            tx.commit().map_err(sql_error)?;
+                None,
+            )?;
         }
         if current < 106 {
             let tx = self
@@ -2982,38 +2404,24 @@ impl Store {
             tx.commit().map_err(sql_error)?;
         }
         if current < 107 {
-            let tx = self
-                .connection
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(sql_error)?;
-            tx.execute_batch(
+            self.migrate_sql(
                 "ALTER TABLE goal_markers ADD COLUMN custody_closed INTEGER NOT NULL DEFAULT 0
                      CHECK (custody_closed IN (0, 1));
                  INSERT INTO schema_migrations(version) VALUES (107);",
-            )
-            .map_err(sql_error)?;
-            tx.commit().map_err(sql_error)?;
+                None,
+            )?;
         }
         if current < 108 {
-            let tx = self
-                .connection
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(sql_error)?;
-            tx.execute_batch(
+            self.migrate_sql(
                 "ALTER TABLE native_child_registrations ADD COLUMN parent_turn_id TEXT;
                  CREATE INDEX native_child_parent_turn
                      ON native_child_registrations(parent, parent_generation, parent_turn_id);
                  INSERT INTO schema_migrations(version) VALUES (108);",
-            )
-            .map_err(sql_error)?;
-            tx.commit().map_err(sql_error)?;
+                None,
+            )?;
         }
         if current < 109 {
-            let tx = self
-                .connection
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(sql_error)?;
-            tx.execute_batch(
+            self.migrate_sql(
                 "ALTER TABLE processes ADD COLUMN observed_as_child INTEGER
                      NOT NULL DEFAULT 0 CHECK (observed_as_child IN (0, 1));
                  CREATE TABLE child_process_counts (
@@ -3030,24 +2438,19 @@ impl Store {
                              observed = observed + 1, exited = exited + excluded.exited;
                      END;
                  INSERT INTO schema_migrations(version) VALUES (109);",
-            )
-            .map_err(sql_error)?;
-            tx.commit().map_err(sql_error)?;
+                None,
+            )?;
         }
         if current < 110 {
-            let tx = self
-                .connection
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(sql_error)?;
-            tx.execute_batch(
+            self.migrate_sql(
                 "ALTER TABLE messages ADD COLUMN wake INTEGER NOT NULL DEFAULT 1 CHECK (wake IN (0, 1));
                  ALTER TABLE messages ADD COLUMN inline_ack_pending INTEGER NOT NULL DEFAULT 0
                      CHECK (inline_ack_pending IN (0, 1));
                  ALTER TABLE messages ADD COLUMN inline_wake_retries INTEGER NOT NULL DEFAULT 0
                      CHECK (inline_wake_retries BETWEEN 0 AND 2);
                  INSERT INTO schema_migrations(version) VALUES (110);",
-            ).map_err(sql_error)?;
-            tx.commit().map_err(sql_error)?;
+                None,
+            )?;
         }
         if current < 111 {
             let tx = self
@@ -3065,11 +2468,7 @@ impl Store {
             tx.commit().map_err(sql_error)?;
         }
         if current < HARNESS_CHECK_SCHEMA_VERSION {
-            let tx = self
-                .connection
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(sql_error)?;
-            tx.execute_batch(
+            self.migrate_sql(
                 "CREATE TABLE harness_checks (
                      harness TEXT PRIMARY KEY CHECK(harness <> ''),
                      installed_version TEXT NOT NULL DEFAULT '',
@@ -3113,25 +2512,15 @@ impl Store {
                      first_failure TEXT,
                      PRIMARY KEY (harness, version_key)
                  ) WITHOUT ROWID;",
-            )
-            .map_err(sql_error)?;
-            tx.execute(
-                "INSERT INTO schema_migrations(version) VALUES (?1)",
-                [HARNESS_CHECK_SCHEMA_VERSION],
-            )
-            .map_err(sql_error)?;
-            tx.commit().map_err(sql_error)?;
+                Some(HARNESS_CHECK_SCHEMA_VERSION),
+            )?;
         }
         Ok(())
     }
 
     fn migrate_work_truth(&mut self, current: i64) -> Result<()> {
         if current < WORK_TRUTH_VERSION {
-            let tx = self
-                .connection
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(sql_error)?;
-            tx.execute_batch(
+            self.migrate_sql(
                 "CREATE TABLE work_truth_cursor (id INTEGER PRIMARY KEY CHECK(id=1), seq INTEGER NOT NULL);
                  INSERT INTO work_truth_cursor VALUES(1, COALESCE((SELECT seq FROM sqlite_sequence WHERE name='events'), 0));
                  CREATE TABLE git_checkpoints (
@@ -3166,21 +2555,11 @@ impl Store {
                      successor INTEGER NOT NULL
                  );
                  CREATE INDEX agent_successors_successor ON agent_successors(successor);",
-            )
-            .map_err(sql_error)?;
-            tx.execute(
-                "INSERT INTO schema_migrations(version) VALUES (?1)",
-                [WORK_TRUTH_VERSION],
-            )
-            .map_err(sql_error)?;
-            tx.commit().map_err(sql_error)?;
+                Some(WORK_TRUTH_VERSION),
+            )?;
         }
         if current < WORK_TRUTH_INTENT_VERSION {
-            let tx = self
-                .connection
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(sql_error)?;
-            tx.execute_batch(
+            self.migrate_sql(
                 "ALTER TABLE git_checkpoints ADD COLUMN task_command TEXT;
                  CREATE TABLE git_checkpoint_intents (
                      common_dir TEXT PRIMARY KEY,
@@ -3190,14 +2569,8 @@ impl Store {
                      input TEXT NOT NULL,
                      UNIQUE(agent, generation)
                  );",
-            )
-            .map_err(sql_error)?;
-            tx.execute(
-                "INSERT INTO schema_migrations(version) VALUES (?1)",
-                [WORK_TRUTH_INTENT_VERSION],
-            )
-            .map_err(sql_error)?;
-            tx.commit().map_err(sql_error)?;
+                Some(WORK_TRUTH_INTENT_VERSION),
+            )?;
         }
         for (version, sql) in [
             (
@@ -3287,18 +2660,10 @@ impl Store {
 
     fn migrate_repeat_failure_alerts(&mut self, current: i64) -> Result<()> {
         if current < REPEAT_FAILURE_ALERTS_VERSION {
-            let tx = self
-                .connection
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(sql_error)?;
-            tx.execute_batch(include_str!("../migrations/repeat_failure_alerts.sql"))
-                .map_err(sql_error)?;
-            tx.execute(
-                "INSERT INTO schema_migrations(version) VALUES (?1)",
-                [REPEAT_FAILURE_ALERTS_VERSION],
-            )
-            .map_err(sql_error)?;
-            tx.commit().map_err(sql_error)?;
+            self.migrate_sql(
+                include_str!("../migrations/repeat_failure_alerts.sql"),
+                Some(REPEAT_FAILURE_ALERTS_VERSION),
+            )?;
         }
         Ok(())
     }
