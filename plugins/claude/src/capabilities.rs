@@ -41,6 +41,7 @@ pub fn declaration() -> HarnessCapabilities {
         profile: ProfileCapabilities {
             read_only_markers: &[("permission_mode", "plan")],
             named_profile: Some(crate::profile_config::MAPPING),
+            launch_model_scope: eliot_core::api::harness::LaunchModelScope::FixedRoute,
             environment: eliot_core::api::harness::ProfileEnvironment {
                 store_paths: &["CLAUDE_CONFIG_DIR"],
                 legacy_captured_paths: &["CLAUDE_CONFIG_DIR"],

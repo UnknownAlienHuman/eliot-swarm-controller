@@ -328,6 +328,7 @@ pub struct ProfileCapabilities {
     pub script_wrapper_cmd: bool,
     pub command_refusal: Option<fn(&str) -> Option<&'static str>>,
     pub local_provider: Option<LocalProviderValidator>,
+    pub launch_model_scope: LaunchModelScope,
     pub project_doc_max_bytes: bool,
     /// Native approval selector in profile summaries. The default field is `approval_policy`.
     pub approval_field: Option<&'static str>,
@@ -336,6 +337,17 @@ pub struct ProfileCapabilities {
 
 type LocalProviderValidator =
     fn(&crate::local_provider::LocalProvider, &[String]) -> std::result::Result<(), String>;
+
+/// Adapter proof that a model selected from an Owner profile stays on its route.
+#[derive(Clone, Copy, Debug, Default)]
+pub enum LaunchModelScope {
+    #[default]
+    Unsupported,
+    /// The native model selector cannot change the profile's frozen route.
+    FixedRoute,
+    /// The native model identifier also encodes provider authority.
+    Check(fn(&super::native_profile::NativeProfileInput<'_>, &str) -> bool),
+}
 
 impl ProfileCapabilities {
     pub fn of(harness: &str) -> Self {

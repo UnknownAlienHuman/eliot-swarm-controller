@@ -314,6 +314,11 @@ pub(crate) fn list(data_root: &Path, policy: &SecretPolicy) -> core::Result<Prof
                 name: name.clone(),
                 harness: entry.harness.trim().to_owned(),
                 model: entry.model.clone(),
+                launch_models: if resolved.is_ok() {
+                    entry.launch_models.clone()
+                } else {
+                    Vec::new()
+                },
                 effort: entry.effort.clone(),
                 permissions: entry.permissions.clone(),
                 // The display policy is the harness-native resolved value, never the raw entry fallback: a launchable profile must not advertise a policy the frozen snapshot omits.

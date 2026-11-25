@@ -3898,6 +3898,7 @@ impl Router {
         }
 
         let launch = LaunchCommandArgs::read(&request.args)?;
+        check_profile_model_request(&request.args, &launch, principal)?;
 
         // Ad-hoc Owner launch: freeze a profile-equivalent snapshot from
         // built-in per-harness defaults plus flags. Agent principals keep
@@ -4118,7 +4119,12 @@ impl Router {
                 let profile_name = launch
                     .profile
                     .ok_or_else(|| Error::new("invalid", "profile must be a non-empty string"))?;
-                let mut snapshot = self.resolve_profile_cached(&profile_name)?;
+                let mut snapshot = crate::config::resolve_profile_for_launch(
+                    &self.inner.profile_cache,
+                    &self.inner.data_root,
+                    &profile_name,
+                    launch.profile_model.as_deref(),
+                )?;
                 crate::config::capture_native_store_inputs(
                     &mut snapshot,
                     self.inner.stand_store_root.as_deref(),
@@ -8434,6 +8440,7 @@ fn normalize_launch(request: &mut SubmitCommand, principal: &Principal) -> Resul
     reject_launch_derived_keys(&request.args)?;
     project_checks::validate_launch_inputs(&request.args, matches!(principal, Principal::Owner))?;
     let launch = LaunchCommandArgs::read(&request.args)?;
+    check_profile_model_request(&request.args, &launch, principal)?;
     if request.args.get("role").is_some() {
         let role = launch
             .role
@@ -8569,6 +8576,48 @@ fn normalize_launch(request: &mut SubmitCommand, principal: &Principal) -> Resul
             workspace
         }),
     );
+    Ok(())
+}
+
+fn check_profile_model_request(
+    args: &Value,
+    launch: &LaunchCommandArgs,
+    principal: &Principal,
+) -> Result<()> {
+    let Some(model) = launch.profile_model.as_deref() else {
+        return Ok(());
+    };
+    require_owner(principal)?;
+    if args.get("parent").is_some()
+        || args.get("harness").is_some()
+        || args.get("role").is_some()
+        || launch
+            .profile
+            .as_deref()
+            .is_none_or(|profile| profile.trim().is_empty())
+    {
+        return Err(Error::invalid_field(
+            "args.profile_model",
+            "an exact model ID for an explicitly named, parentless Owner profile launch",
+        ));
+    }
+    if !crate::config::valid_model_selector(model) {
+        return Err(Error::invalid_field(
+            "args.profile_model",
+            "a nonempty single model ID",
+        ));
+    }
+    if let Some(field) = eliot_core::PROVIDER_LAUNCH_OVERRIDE_FIELDS
+        .iter()
+        .copied()
+        .chain(["local_provider"])
+        .find(|field| args.get(*field).is_some())
+    {
+        return Err(Error::invalid_field(
+            format!("args.{field}"),
+            "omit route and native overrides on a saved profile model selection",
+        ));
+    }
     Ok(())
 }
 

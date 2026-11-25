@@ -93,6 +93,7 @@ pub fn declaration() -> HarnessCapabilities {
         profile: ProfileCapabilities {
             read_only_markers: &[("collaboration_mode", "plan")],
             named_profile: Some(crate::profile_config::MAPPING),
+            launch_model_scope: eliot_core::api::harness::LaunchModelScope::FixedRoute,
             environment: eliot_core::api::harness::ProfileEnvironment {
                 auth_scope: CODEX_PROXY_SELECTOR_ENV_NAMES,
                 cleanup_roots: CODEX_PROXY_SELECTOR_ENV_NAMES,

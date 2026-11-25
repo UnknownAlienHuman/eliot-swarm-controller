@@ -111,3 +111,16 @@ fn validate_model(model: &str) -> NativeProfileResult<()> {
     }
     Ok(())
 }
+
+pub(super) fn launch_model_stays_on_route(entry: &NativeProfileInput<'_>, selected: &str) -> bool {
+    let Some((provider, model)) = split_provider_model(selected) else {
+        return false;
+    };
+    if let Some(local) = entry.local_provider {
+        return local.contains_model(provider, model);
+    }
+    entry
+        .model
+        .and_then(split_provider_model)
+        .is_some_and(|(configured, _)| configured == provider)
+}

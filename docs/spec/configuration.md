@@ -418,6 +418,21 @@ non-regular files, read failures and files beyond its fixed read bound report
 CRLF expansion, an optional BOM and trailing newlines, so line-ending normalization
 does not truncate equivalent text. The comparison makes zero configuration writes.
 
+## Owner model selection on a saved route
+
+Set `launch_models = ["<exact model ID>", ...]` on a named Claude, Codex,
+or OpenCode profile to allow model selection at launch. Omit the list or
+leave it empty to disable the feature. A non-empty list requires a saved
+`model` and at most 32 distinct IDs. OpenCode selections must use the
+saved model's provider prefix, and local-provider selections must name a
+model declared by that provider.
+
+`swarm launch --profile P --model M` selects the saved route and an exact
+listed model for one parentless Owner launch. The choice leaves the saved
+profile and the route's credentials, native settings and delegation intact.
+The daemon validates the list and the route against one settings revision.
+See [the launch contract](api.md#command-admission) for admission and readback.
+
 ## Ad-hoc Owner launch (no stored profile)
 
 `swarm launch --harness <codex|claude|muse|opencode|antigravity>

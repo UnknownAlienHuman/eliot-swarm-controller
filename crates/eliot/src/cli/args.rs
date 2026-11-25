@@ -490,7 +490,7 @@ pub(crate) struct LaunchArgs {
     /// per-harness defaults plus --model/--effort/--auth. Owner-only.
     #[arg(long, value_name = "HARNESS")]
     pub(crate) harness: Option<String>,
-    /// Ad-hoc model id; omitted uses the harness native default.
+    /// Ad-hoc model ID, or an exact model from the named Owner profile's launch_models.
     #[arg(long, value_name = "MODEL")]
     pub(crate) model: Option<String>,
     /// Ad-hoc reasoning effort; omitted uses the harness native default.
