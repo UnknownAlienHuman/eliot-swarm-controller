@@ -472,7 +472,7 @@ impl OwnedChild {
     ) -> std::result::Result<Self, AgentSpawnError> {
         let job = super::windows::Job::new_named_leaf(&checkpoint_restore_job_name(id))
             .map_err(AgentSpawnError::NotSpawned)?;
-        Self::spawn_in_job_checked(command, job, |child| {
+        Self::spawn_in_job_checked(command, job, false, |child| {
             let pid = child.id().ok_or_else(|| {
                 Error::new(
                     "process_identity",
@@ -499,19 +499,22 @@ impl OwnedChild {
         namespace: &str,
         agent: &str,
         generation: i64,
+        windows_detached_stdio: bool,
     ) -> std::result::Result<Self, AgentSpawnError> {
         #[cfg(windows)]
         {
             let name = agent_custody_name(namespace, agent, generation);
-            Self::spawn_in_job(
+            Self::spawn_in_job_checked(
                 command,
                 super::windows::Job::new_named_kill_on_close(&name)
                     .map_err(AgentSpawnError::NotSpawned)?,
+                windows_detached_stdio,
+                |_| Ok(()),
             )
         }
         #[cfg(not(windows))]
         {
-            let _ = (namespace, agent, generation);
+            let _ = (namespace, agent, generation, windows_detached_stdio);
             Self::spawn(command).map_err(AgentSpawnError::NotSpawned)
         }
     }
@@ -525,7 +528,7 @@ impl OwnedChild {
         command: Command,
         job: super::windows::Job,
     ) -> std::result::Result<Self, AgentSpawnError> {
-        Self::spawn_in_job_checked(command, job, |_| Ok(()))
+        Self::spawn_in_job_checked(command, job, false, |_| Ok(()))
     }
 
     #[cfg(windows)]
@@ -541,7 +544,7 @@ impl OwnedChild {
         let name = agent_custody_name("integration", scratch_id, 1);
         let job = super::windows::Job::new_named_kill_on_close(&name)
             .map_err(AgentSpawnError::NotSpawned)?;
-        Self::spawn_in_job_checked(command, job, |child| {
+        Self::spawn_in_job_checked(command, job, false, |child| {
             let pid = child.id().ok_or_else(|| {
                 Error::new(
                     "process_identity",
@@ -564,14 +567,23 @@ impl OwnedChild {
     fn spawn_in_job_checked(
         mut command: Command,
         job: super::windows::Job,
+        detached_stdio: bool,
         before_resume: impl FnOnce(&Child) -> Result<()>,
     ) -> std::result::Result<Self, AgentSpawnError> {
         use std::os::windows::process::CommandExt;
-        use windows_sys::Win32::System::Threading::{CREATE_NO_WINDOW, CREATE_SUSPENDED};
+        use windows_sys::Win32::System::Threading::{
+            CREATE_NO_WINDOW, CREATE_SUSPENDED, DETACHED_PROCESS,
+        };
+
+        let console = if detached_stdio {
+            DETACHED_PROCESS
+        } else {
+            CREATE_NO_WINDOW
+        };
 
         command
             .as_std_mut()
-            .creation_flags(CREATE_SUSPENDED | CREATE_NO_WINDOW);
+            .creation_flags(CREATE_SUSPENDED | console);
         let mut child = command
             .spawn()
             .map_err(|error| spawn_io_error("spawn suspended child", error))?;

@@ -2014,7 +2014,13 @@ impl PluginHost {
             .plugin_command(&agent.harness, Path::new(workspace), true)
             .map_err(AgentSpawnError::NotSpawned)?;
         self.state.agent_custodies.spawn(&agent.id, || {
-            OwnedChild::spawn_agent(command, &namespace, &agent.id, agent.generation)
+            OwnedChild::spawn_agent(
+                command,
+                &namespace,
+                &agent.id,
+                agent.generation,
+                HarnessCapabilities::of(&agent.harness).windows_detached_stdio,
+            )
         })
     }
 

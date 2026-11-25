@@ -94,6 +94,7 @@ pub fn declaration() -> HarnessCapabilities {
         configure_session_mode: ConfigureSessionMode::WhenModelPresent,
         configure_requires_idle_turn: true,
         executable_stems: &["claude"],
+        windows_detached_stdio: true,
         version_prefixes: &["claude-code", "claude"],
         legacy_result_status: true,
         input_token_accounting: InputTokenAccounting::ExcludesCacheWrites,

@@ -183,6 +183,8 @@ launch before spawn.
 [Claude Code environment variables](https://code.claude.com/docs/en/env-vars).
 
 Resolve Windows executables explicitly; never insert an unrequested shell wrapper.
+The Windows Agent plugin and its piped native CLI run detached from the console.
+The generation Job still owns their custody and any terminal children the CLI starts.
 Avoid modes that disable required hooks/instructions.
 
 Stop drops the CLI's stdin and kills only that direct child by handle (kill

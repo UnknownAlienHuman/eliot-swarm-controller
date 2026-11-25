@@ -42,6 +42,7 @@ pub trait NativeStdioConfig: Clone + Send + Sync + 'static {
     const SHORT: &'static str;
     /// Request id prefix, e.g. `"codex"`.
     const ID_PREFIX: &'static str;
+    const WINDOWS_DETACHED_STDIO: bool = false;
     /// Inbound method names this host can legitimately send (notifications
     /// and server requests Eliot consumes). Oversized-frame diagnosis
     /// records a method only on exact match here; everything else is
@@ -133,6 +134,7 @@ impl<C: NativeStdioConfig> StdioProcess<C> {
         let labels = NativeLabels {
             short: C::SHORT,
             server: C::SERVER,
+            windows_detached_stdio: C::WINDOWS_DETACHED_STDIO,
         };
         // JSON-RPC: keep nonblocking routing; a pending reply must never
         // wait behind a saturated emit queue.
