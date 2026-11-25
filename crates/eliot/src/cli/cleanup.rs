@@ -18,9 +18,12 @@ pub(super) fn remove_dir_all(path: &std::path::Path) -> std::io::Result<()> {
 /// mapped; any uncertain or failed removal is retained and reported.
 #[cfg(windows)]
 pub(super) fn prune_update_images(
-    directory: &std::path::Path,
-    retained: &[&std::path::Path],
+    data_root: &std::path::Path,
+    retained_sha256: &[&str],
+    keep_desktop_images: bool,
 ) -> Result<(), String> {
+    let directory = eliot_daemon::operator::update_images_directory(data_root)
+        .map_err(|error| error.to_string())?;
     let entries = std::fs::read_dir(directory)
         .map_err(|error| format!("inspect staged image directory: {error}"))?;
     for entry in entries {
@@ -36,7 +39,13 @@ pub(super) fn prune_update_images(
         else {
             continue;
         };
-        if retained.iter().any(|keep| *keep == path) {
+        if name.starts_with(".swarm-desktop-release-") && keep_desktop_images {
+            continue;
+        }
+        if retained_sha256.contains(&digest) {
+            continue;
+        }
+        if eliot_daemon::operator::validate_update_image(&path).is_err() {
             continue;
         }
         let metadata = std::fs::symlink_metadata(&path)

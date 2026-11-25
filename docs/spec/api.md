@@ -3511,25 +3511,32 @@ detached with the same target data directory. For subsequent updates, the
 operator closes a changed companion only when it can verify the process it
 started for that directory.
 
-Before release metadata inspection, the updater hashes the selected executable
-and stages those exact bytes as a read-only, content-addressed
-`.swarm-release-<sha256>` file beside it, preserving executable permissions.
-The selected release directory remains the child working directory. Metadata
-inspection, Store preflight and candidate spawn all use the staged path. A
+Before release metadata inspection, under the updater transition lock, the
+updater validates or creates the private `update-images` directory under the
+selected data root. It hashes the selected executable and stages those exact
+bytes there as a read-only, content-addressed `.swarm-release-<sha256>` file,
+preserving executable permissions. Metadata inspection, Store preflight and
+candidate spawn all use the staged path; the selected release directory remains
+the daemon's working directory. A
 pre-existing artifact is reused only when it is a regular non-symlink file and
 its bytes match the digest in its name. A mismatched regular file or symlink at
 the exact updater-owned artifact path is removed before staging; a directory
 or an artifact that cannot be safely removed causes refusal. An incomplete
 artifact created by the current attempt is removed on staging failure; if that
 cleanup fails, the result is uncertain and the failure reports the retained
-path. On Windows the optional desktop companion is staged, hash-verified and
-pinned by the same rules before launch. After a successful update, Windows
-prunes verified inactive images in the selected release directory while
-retaining the running and previous daemon images and the active and previous
-desktop companions. A mapped or otherwise undeletable image is retained.
-Staging currently lives beside the selected release, so pruning does not reach
-artifacts in other source directories; non-Windows pruning is deferred because
-the updater cannot prove that an old image is not mapped by another process.
+path. The data-root path and `update-images` directory are checked as private
+real directories; symlink or reparse-point paths are refused. On Windows the
+optional desktop companion is staged, hash-verified and pinned by the same
+rules before launch, while retaining the selected release directory as its
+working directory. After startup is ready and the desktop start attempt has
+settled, Windows prunes verified inactive images from this shared directory.
+It retains the active and previous daemon images and the active desktop image.
+The previous desktop image is retained by the exact digest in its private
+`DesktopRecord`; if that record is missing or unresolved, desktop images are
+retained. Windows refuses deletion of a mapped or otherwise in-use image and
+the updater restores its read-only protection. Non-Windows pruning is deferred
+because the updater cannot prove that an old image is not mapped by another
+process.
 
 The updater binds the reported release hash to the launched process image as
 well as to the staged file. On Windows it opens the staged file with read

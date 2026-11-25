@@ -215,14 +215,24 @@ async fn run_update(
     if identity.principal != "owner" {
         return Err(Failure::new(3, "daemon update requires the local Owner"));
     }
+    let _transition = lock_transition(&data_dir).map_err(Failure::for_read)?;
     require_lossless_restart_drain(&data_dir).await?;
     let previous_binary = running_binary(&old).map_err(Failure::for_read)?;
     let previous_hash = binary_sha256(&previous_binary).map_err(Failure::for_read)?;
     let binary = release_binary(&source)?;
+    let working_directory = binary
+        .parent()
+        .ok_or_else(|| Failure::new(2, "invalid release working directory"))?
+        .to_owned();
+    let image_directory =
+        eliot_daemon::operator::update_images_directory(&data_dir).map_err(Failure::for_read)?;
+    #[cfg(windows)]
+    let previous_desktop_hash =
+        eliot_daemon::operator::recorded_desktop_sha256(&data_dir).map_err(Failure::for_read)?;
     // Stage a content-addressed copy before inspecting it. The original path can
     // change while the update drains; metadata, preflight, and spawn must all use
     // the same staged bytes.
-    let (launch_binary, sha256) = prepare_update_release(&binary)?;
+    let (launch_binary, sha256) = prepare_update_release(&binary, &image_directory)?;
     #[cfg(windows)]
     let _launch_pin = pin_update_release(&launch_binary, &sha256)?;
     let previous = release_info(&previous_binary).await?;
@@ -243,13 +253,12 @@ async fn run_update(
         ));
     }
     #[cfg(windows)]
-    let desktop = desktop_binary(&binary)?;
+    let desktop = desktop_binary(&binary, &image_directory)?;
     #[cfg(windows)]
     let _desktop_pin = desktop
         .as_ref()
         .map(|(path, hash)| pin_update_release(path, hash))
         .transpose()?;
-    let _transition = lock_transition(&data_dir).map_err(Failure::for_read)?;
     check_same_daemon(&data_dir, &old)?;
     let startup_path = replacement_data_dir(&data_dir, &old).map_err(Failure::for_read)?;
     preflight_store(&startup_path, &launch_binary).await?;
@@ -376,26 +385,27 @@ async fn run_update(
         );
         return Ok(error.exit_code);
     }
-    let replacement = match start_update(&startup_path, &launch_binary, backup.id).await {
-        Ok(info) => info,
-        Err(error) => {
-            return Ok(rollback(
-                &startup_path,
-                &previous,
-                &backup,
-                RollbackStore::Unpublished,
-                error.message,
-                UpdateAgents {
-                    before,
-                    stopped,
-                    mode,
-                    health: None,
-                },
-                json_output,
-            )
-            .await);
-        }
-    };
+    let replacement =
+        match start_update(&startup_path, &launch_binary, backup.id, &working_directory).await {
+            Ok(info) => info,
+            Err(error) => {
+                return Ok(rollback(
+                    &startup_path,
+                    &previous,
+                    &backup,
+                    RollbackStore::Unpublished,
+                    error.message,
+                    UpdateAgents {
+                        before,
+                        stopped,
+                        mode,
+                        health: None,
+                    },
+                    json_output,
+                )
+                .await);
+            }
+        };
     if let Err(error) = verify_running_release(&startup_path, &replacement, &sha256) {
         return Ok(rollback(
             &startup_path,
@@ -407,6 +417,7 @@ async fn run_update(
                 before,
                 stopped,
                 mode,
+                health: None,
             },
             json_output,
         )
@@ -478,18 +489,6 @@ async fn run_update(
     }
     let health_uncertain = !startup_health.is_ready();
     let backup_cleanup = discard_update_backup(&startup_path, backup.id).err();
-    #[cfg(windows)]
-    let image_cleanup = {
-        let mut retained = vec![launch_binary.as_path(), previous_binary.as_path()];
-        if let Some((desktop_path, _)) = desktop.as_ref() {
-            retained.push(desktop_path.as_path());
-        }
-        let previous_desktop = previous_binary.with_file_name("swarm-desktop.exe");
-        retained.push(previous_desktop.as_path());
-        super::cleanup::prune_update_images(binary.parent().unwrap_or(&binary), &retained).err()
-    };
-    #[cfg(not(windows))]
-    let image_cleanup: Option<String> = None;
     let (interruptions, resume_failed) = Box::pin(resume_interrupted(
         &data_dir,
         &stopped,
@@ -498,9 +497,32 @@ async fn run_update(
     .await;
 
     #[cfg(windows)]
-    let (desktop, desktop_failed) = start_companion(&data_dir, desktop);
+    let (desktop_result, desktop_failed) =
+        start_companion(&data_dir, desktop.clone(), &working_directory);
     #[cfg(not(windows))]
-    let (desktop, desktop_failed) = (None::<Value>, false);
+    let (desktop_result, desktop_failed) = (None::<Value>, false);
+    #[cfg(any(windows, target_os = "linux"))]
+    let image_cleanup = {
+        if desktop_failed || backup_cleanup.is_some() || resume_failed || health_uncertain {
+            None
+        } else {
+            let mut retained = vec![sha256.as_str(), previous_hash.as_str()];
+            if let Some((_, desktop_hash)) = desktop.as_ref() {
+                retained.push(desktop_hash.as_str());
+            }
+            if let Some(hash) = previous_desktop_hash.as_deref() {
+                retained.push(hash);
+            }
+            super::cleanup::prune_update_images(
+                &data_dir,
+                &retained,
+                previous_desktop_hash.is_none(),
+            )
+            .err()
+        }
+    };
+    #[cfg(not(any(windows, target_os = "linux")))]
+    let image_cleanup: Option<String> = None;
     let reply = json!({
             "state": if desktop_failed || backup_cleanup.is_some() || image_cleanup.is_some() || resume_failed || health_uncertain || decision_failed { "partial" } else { "ready" },
             "startup_health": startup_health, "restart_id": prepare.id,
@@ -509,7 +531,7 @@ async fn run_update(
             "deadline_policy": mode, "interrupted_agents": interruptions,
             "commit_reply_uncertain": commit_reply_uncertain,
             "binary": eliot_core::display_path(&launch_binary.to_string_lossy()), "version": candidate.version,
-            "sha256": sha256, "desktop": desktop,
+            "sha256": sha256, "desktop": desktop_result,
             "backup": backup.retained(), "backup_cleanup_error": backup_cleanup.as_ref().map(ToString::to_string),
             "staged_image_cleanup_error": image_cleanup.as_ref(),
             "agents_before": before, "agents_after": observe_agents(&data_dir, &before).await,
@@ -1443,18 +1465,19 @@ fn release_binary(source: &Path) -> Result<PathBuf, Failure> {
     Ok(path)
 }
 
-/// Create or verify a versioned launch image beside the supplied release. Its
-/// parent is intentionally the release directory so the child keeps the same
-/// working-directory semantics as a direct launch. Existing content-addressed
-/// images are accepted only after their bytes match the name's digest.
-fn prepare_update_release(source: &Path) -> Result<(PathBuf, String), Failure> {
-    prepare_update_image(source, ".swarm-release-")
+/// Create or verify a versioned launch image in the private updater directory.
+/// The caller separately preserves the selected release's working directory.
+fn prepare_update_release(source: &Path, directory: &Path) -> Result<(PathBuf, String), Failure> {
+    prepare_update_image(source, directory, ".swarm-release-")
 }
 
-fn prepare_update_image(source: &Path, prefix: &str) -> Result<(PathBuf, String), Failure> {
+fn prepare_update_image(
+    source: &Path,
+    directory: &Path,
+    prefix: &str,
+) -> Result<(PathBuf, String), Failure> {
     let digest = binary_sha256(source).map_err(Failure::for_read)?;
-    let artifact =
-        source.with_file_name(format!("{prefix}{digest}{}", std::env::consts::EXE_SUFFIX));
+    let artifact = directory.join(format!("{prefix}{digest}{}", std::env::consts::EXE_SUFFIX));
     let artifact_metadata = match std::fs::symlink_metadata(&artifact) {
         Ok(metadata) if metadata.file_type().is_file() => Some(metadata),
         Ok(metadata) if metadata.file_type().is_symlink() => {
@@ -1485,6 +1508,7 @@ fn prepare_update_image(source: &Path, prefix: &str) -> Result<(PathBuf, String)
     };
     let mut needs_stage = artifact_metadata.is_none();
     if artifact_metadata.is_some() {
+        eliot_daemon::operator::validate_update_image(&artifact).map_err(Failure::for_read)?;
         let staged_digest = binary_sha256(&artifact).map_err(Failure::for_read)?;
         if staged_digest != digest {
             remove_incomplete_release(&artifact).map_err(|error| {
@@ -1522,6 +1546,7 @@ fn prepare_update_image(source: &Path, prefix: &str) -> Result<(PathBuf, String)
                     Failure::new(2, format!("stage versioned release image: {error}"))
                 })?;
         }
+        eliot_daemon::operator::validate_update_image(&artifact).map_err(Failure::for_read)?;
         let staged_digest = binary_sha256(&artifact).map_err(Failure::for_read)?;
         if staged_digest != digest {
             return Err(Failure::new(
@@ -1560,6 +1585,8 @@ fn prepare_update_image(source: &Path, prefix: &str) -> Result<(PathBuf, String)
 
 fn remove_incomplete_release(path: &Path) -> std::io::Result<()> {
     #[cfg(windows)]
+    let was_readonly = std::fs::metadata(path).map(|metadata| metadata.permissions().readonly());
+    #[cfg(windows)]
     if let Ok(metadata) = std::fs::metadata(path) {
         let mut permissions = metadata.permissions();
         #[expect(
@@ -1571,7 +1598,18 @@ fn remove_incomplete_release(path: &Path) -> std::io::Result<()> {
     }
     match std::fs::remove_file(path) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        result => result,
+        Err(error) => {
+            #[cfg(windows)]
+            if let Ok(was_readonly) = was_readonly
+                && let Ok(metadata) = std::fs::metadata(path)
+            {
+                let mut permissions = metadata.permissions();
+                permissions.set_readonly(was_readonly);
+                let _ = std::fs::set_permissions(path, permissions);
+            }
+            Err(error)
+        }
+        Ok(()) => Ok(()),
     }
 }
 
@@ -1717,24 +1755,33 @@ async fn release_info(binary: &Path) -> Result<ReleaseInfo, Failure> {
 }
 
 #[cfg(windows)]
-fn desktop_binary(binary: &Path) -> Result<Option<(PathBuf, String)>, Failure> {
+fn desktop_binary(binary: &Path, directory: &Path) -> Result<Option<(PathBuf, String)>, Failure> {
     let desktop = binary.with_file_name("swarm-desktop.exe");
     if !desktop.is_file() {
         return Ok(None);
     }
-    let (staged, hash) = prepare_update_image(&desktop, ".swarm-desktop-release-")?;
+    let (staged, hash) = prepare_update_image(&desktop, directory, ".swarm-desktop-release-")?;
     Ok(Some((staged, hash)))
 }
 
 #[cfg(windows)]
-fn start_companion(data_dir: &Path, desktop: Option<(PathBuf, String)>) -> (Option<Value>, bool) {
+fn start_companion(
+    data_dir: &Path,
+    desktop: Option<(PathBuf, String)>,
+    working_directory: &Path,
+) -> (Option<Value>, bool) {
     let Some((binary, sha256)) = desktop else {
         return (
             Some(json!({"reason": "release contains no desktop companion"})),
             false,
         );
     };
-    match eliot_daemon::operator::start_desktop(data_dir, &binary, sha256.clone()) {
+    match eliot_daemon::operator::start_desktop_in_directory(
+        data_dir,
+        &binary,
+        working_directory,
+        sha256.clone(),
+    ) {
         Ok(pid) => (Some(json!({"pid": pid, "sha256": sha256})), false),
         Err(error) => (Some(json!({"reason": error.to_string()})), true),
     }
