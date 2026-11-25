@@ -83,7 +83,6 @@ impl ArtifactRegisterRequest {
 }
 
 #[derive(schemars::JsonSchema, Clone, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct ArtifactView {
     pub id: String,
     pub agent: String,
@@ -344,7 +343,6 @@ where
 }
 
 #[derive(schemars::JsonSchema, Clone, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct CleanupCandidate {
     pub artifact: ArtifactView,
     pub bytes: Option<u64>,
@@ -353,7 +351,6 @@ pub struct CleanupCandidate {
 }
 
 #[derive(schemars::JsonSchema, Clone, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct CleanupInventoryIssue {
     pub agent: String,
     pub generation: i64,
@@ -363,7 +360,6 @@ pub struct CleanupInventoryIssue {
 }
 
 #[derive(schemars::JsonSchema, Clone, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct CleanupPlan {
     pub plan_id: String,
     pub created_at: i64,
@@ -424,7 +420,6 @@ impl CleanupApplyRequest {
 }
 
 #[derive(schemars::JsonSchema, Clone, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct CleanupItemOutcome {
     pub artifact_id: String,
     pub outcome: String,
@@ -435,7 +430,6 @@ pub struct CleanupItemOutcome {
 }
 
 #[derive(schemars::JsonSchema, Clone, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct CleanupApplyResponse {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,

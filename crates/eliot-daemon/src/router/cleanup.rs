@@ -3423,15 +3423,23 @@ fn cleanup_plan_request_binding(
     request: &CleanupPlanRequest,
     bulk: bool,
 ) -> Result<String> {
-    let mut value = json!({
-        "principal": principal,
-        "scope": request.scope,
-        "project": request.project.as_deref(),
-        "older_than": request.older_than,
-    });
-    if bulk {
-        value["bulk"] = json!(true);
+    #[derive(serde::Serialize)]
+    struct PlanBinding<'a> {
+        principal: &'a str,
+        scope: CleanupScope,
+        project: Option<&'a str>,
+        older_than: Option<i64>,
+        #[serde(skip_serializing_if = "std::ops::Not::not")]
+        bulk: bool,
     }
+    let value = serde_json::to_value(PlanBinding {
+        principal,
+        scope: request.scope,
+        project: request.project.as_deref(),
+        older_than: request.older_than,
+        bulk,
+    })
+    .map_err(|_| Error::new("internal", "cleanup request binding could not encode"))?;
     let digest = eliot_core::canonical_json_sha256(&value)
         .map_err(|_| Error::new("internal", "cleanup request binding could not encode"))?;
     let mut binding = String::with_capacity(64);

@@ -805,6 +805,19 @@ impl Store {
         method: &str,
         payload: &Value,
     ) -> Result<Option<Value>> {
+        self.cleanup_replay_json(principal, id, method, payload)?
+            .as_deref()
+            .map(decode_json)
+            .transpose()
+    }
+
+    pub fn cleanup_replay_json(
+        &self,
+        principal: &str,
+        id: &str,
+        method: &str,
+        payload: &Value,
+    ) -> Result<Option<String>> {
         let digest = canonical::digest(payload)?;
         if let Some((p, m, d, result)) = write_binding(&self.connection, id)? {
             if p != principal || m != method || d != digest {
@@ -813,7 +826,7 @@ impl Store {
                     "cleanup write id has another binding",
                 ));
             }
-            return Ok(Some(decode_json(&result)?));
+            return Ok(Some(result));
         }
         if command_binding(&self.connection, id)?.is_some()
             || digest_id_bound(&self.connection, id)?
@@ -823,7 +836,7 @@ impl Store {
         Ok(None)
     }
 
-    pub fn cleanup_job_receipt(&self, principal: &str, id: &str) -> Result<(String, Value)> {
+    pub fn cleanup_job_receipt(&self, principal: &str, id: &str) -> Result<(String, String)> {
         self.ensure_committed_reads()?;
         let Some((author, method, _, result)) = write_binding(&self.connection, id)? else {
             return Err(Error::new("not_found", "cleanup receipt absent"));
@@ -837,7 +850,7 @@ impl Store {
                 "cleanup receipt belongs to another principal",
             ));
         }
-        Ok((method, decode_json(&result)?))
+        Ok((method, result))
     }
 
     /// Use the authority of one reserved cleanup item without changing its
@@ -1165,9 +1178,9 @@ impl Store {
         // the retry must still read back the retained response instead of
         // `not_found` for the missing plan row.
         if let Some(value) =
-            self.cleanup_replay(principal, &request.id, "cleanup.apply", &payload)?
+            self.cleanup_replay_json(principal, &request.id, "cleanup.apply", &payload)?
         {
-            let mut response: CleanupApplyResponse = serde_json::from_value(value)
+            let mut response: CleanupApplyResponse = serde_json::from_str(&value)
                 .map_err(|_| Error::new("source_integrity", "invalid cleanup receipt"))?;
             let plan = match self.cleanup_plan(principal, &request.plan_id) {
                 Ok(plan) => plan,
