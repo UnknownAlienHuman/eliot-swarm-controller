@@ -106,7 +106,7 @@ use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, 
 use serde::de::DeserializeOwned;
 use serde_json::{Map, Value, json};
 use std::{
-    cell::Cell,
+    cell::{Cell, RefCell},
     collections::{BTreeMap, HashSet},
     path::Path,
     time::Duration,
@@ -497,6 +497,9 @@ struct StoredOwnerRulesDelivery {
 pub struct Store {
     connection: Connection,
     write_faulted: Cell<bool>,
+    /// One exact autonomy response for this pooled connection. SQLite's
+    /// connection-local data_version invalidates it; no TTL is involved.
+    autonomy_cache: RefCell<Option<autonomy::AutonomyCache>>,
     /// Persistent keyset cursor for retention command pruning: the last
     /// examined expired root `(created_at, id)`, or `None` at the oldest.
     /// Successive passes resume here instead of restarting at the oldest
@@ -571,6 +574,7 @@ impl Store {
         Ok(Self {
             connection,
             write_faulted: Cell::new(false),
+            autonomy_cache: RefCell::new(None),
             retention_commands_cursor: None,
             retention_processes_cursor: None,
             retention_attention_advisory_cursor: None,
@@ -655,6 +659,7 @@ impl Store {
         let mut store = Self {
             connection,
             write_faulted: Cell::new(false),
+            autonomy_cache: RefCell::new(None),
             retention_commands_cursor: None,
             retention_processes_cursor: None,
             retention_attention_advisory_cursor: None,

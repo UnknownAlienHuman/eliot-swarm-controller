@@ -10,6 +10,14 @@ use super::{Result, Store, sql_error};
 use eliot_core::api::AutonomyResponse;
 use rusqlite::{Connection, OptionalExtension};
 
+pub(super) struct AutonomyCache {
+    data_version: i64,
+    since: i64,
+    until: i64,
+    confirmed: super::StuckStates,
+    response: AutonomyResponse,
+}
+
 pub(super) const PROVIDER_HOLD_AGE_INDEX: &str =
     "CREATE INDEX IF NOT EXISTS autonomy_fleet_provider_hold_age
     ON provider_holds(held_since, scope) WHERE state IN ('held', 'probing');";
@@ -23,6 +31,21 @@ impl Store {
         confirmed: &super::StuckStates,
     ) -> Result<AutonomyResponse> {
         let connection = &self.connection;
+        let data_version = connection
+            .query_row("PRAGMA data_version", [], |row| row.get(0))
+            .map_err(sql_error)?;
+        // Reuse is deliberately limited to the exact fixed window and the
+        // exact confirmed-stuck predicate set. Shifting windows recompute;
+        // writes observed by this connection invalidate without a TTL.
+        if let Some(cache) = self.autonomy_cache.borrow().as_ref()
+            && cache.data_version == data_version
+            && cache.since == since
+            && cache.until == until
+            && cache.confirmed == *confirmed
+        {
+            return Ok(cache.response.clone());
+        }
+
         let activity = activity::read(connection, since, until)?;
         let fleet = fleet::read(connection, since, until, confirmed)?;
         let mut report = AutonomyResponse {
@@ -46,6 +69,13 @@ impl Store {
             report.executor_swarm.limit_coverage(reason);
             report.work_in_git.limit_coverage(reason);
         }
+        *self.autonomy_cache.borrow_mut() = Some(AutonomyCache {
+            data_version,
+            since,
+            until,
+            confirmed: confirmed.clone(),
+            response: report.clone(),
+        });
         Ok(report)
     }
 }
