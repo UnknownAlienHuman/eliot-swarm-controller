@@ -85,6 +85,7 @@ struct AvailableRoute {
 pub(super) struct HandoffRoute {
     pub(super) reason: HandoffReason,
     pub(super) kind: Option<eliot_core::ProviderRestrictionKind>,
+    pub(super) withheld_fresh_session: bool,
     /// A role a manager asked for, in place of the source's own.
     pub(super) role: Option<String>,
     /// A manager's child profiles.
@@ -157,6 +158,7 @@ struct RoutePreflight {
     provider_source: Option<Value>,
     handoff_source: Option<Value>,
     withheld_provider_routes: HashSet<String>,
+    withheld_fresh_session: bool,
     handoff_allowed: Option<Vec<String>>,
     /// Source profile when a sandboxed successor could not commit here.
     handoff_no_commit: Option<String>,
@@ -512,6 +514,9 @@ impl Router {
                     "Automatic handoff is disabled",
                 ));
             }
+            if route.withheld_fresh_session {
+                return Ok(vec![source.profile.clone()]);
+            }
             if let Some(role) = withheld_role(source) {
                 if !routing.provider_failover() {
                     return Err(Error::new(
@@ -633,6 +638,7 @@ impl Router {
             prefer_candidate_order: route.role.is_none(),
             handoff_source: Some(source.profile_snapshot.clone()),
             withheld_provider_routes,
+            withheld_fresh_session: route.withheld_fresh_session,
             handoff_allowed: route.allowed.clone(),
             handoff_no_commit: (!can_commit).then(|| source.profile.clone()),
             ..RoutePreflight::default()
@@ -858,7 +864,15 @@ impl Router {
         {
             return Ok(Err(RouteSkipReason::Unauthorized));
         }
-        if !preflight.withheld_provider_routes.is_empty() {
+        if preflight.withheld_fresh_session {
+            if !preflight
+                .handoff_source
+                .as_ref()
+                .is_some_and(|source| eliot_core::withheld_fresh_session_matches(source, &snapshot))
+            {
+                return Ok(Err(RouteSkipReason::InvalidProfile));
+            }
+        } else if !preflight.withheld_provider_routes.is_empty() {
             let profile_withheld = preflight
                 .withheld_provider_routes
                 .contains(&eliot_core::provider_profile_refusal_marker(name));

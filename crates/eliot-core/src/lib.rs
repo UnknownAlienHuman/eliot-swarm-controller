@@ -122,7 +122,7 @@ pub use routing::{
     UNATTRIBUTED_PROVIDER_HOLD_REASON, frozen_provider_scope, frozen_provider_scope_for,
     growth_switch_authority_matches, handoff_authority_refusal, is_unattributed_provider_hold,
     model_hold_scope, provider_profile_refusal_marker, provider_response_route_key,
-    provider_switch_authority,
+    provider_switch_authority, withheld_fresh_session_matches,
 };
 pub use secrets::SecretPolicy;
 pub use source_handoff::{SourceHandoff, SourceHandoffAck, SourceHandoffGap};

@@ -1782,7 +1782,11 @@ The daemon evaluates this every five seconds for root and child Agents outside c
 
 - a failed Codex turn with an exact provider-withheld response. The daemon carries
   the retained task and its sources to a fresh successor through the ordinary
-  switch. It keeps the source turn and its effects in the original session.
+  switch. When eligible, it first tries the same preset with its original
+  explicit model and provider binding. A switch reservation spends that
+  exception for the lineage for 30 minutes. The source turn and its effects
+  stay in the original session, and uncertain input is excluded from transfer.
+  Setting `auto_handoff = false` disables this automatic continuation.
 - a quota or rate-limit hold on an idle Agent that still owes work: its held turn did
   not finish, input is waiting or was refused by the hold, or a Goal is active;
 - a lost or failed session of this daemon's lifetime with the same kinds of owed work,
@@ -1802,7 +1806,8 @@ The daemon evaluates this every five seconds for root and child Agents outside c
   worktree before issuing a new Resume.
 
 Held, lost and broken sessions use `handoff_fallback` in configured order. A lost
-or broken session can reuse its profile if the fallback list names it. For a withheld response on a
+or broken session can reuse its profile if the fallback list names it. When
+the fresh-session exception is unavailable for a withheld response on a
 role-routed Agent, `on_provider_failure = "next"` selects from the remaining presets
 in that role. An explicitly selected preset uses `handoff_fallback` when
 `auto_handoff` is enabled. The adapter declares which frozen account and
