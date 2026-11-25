@@ -151,13 +151,14 @@ impl DesktopApp {
             FlyoutPlacement::TopEdgeAlignedLeft,
             context,
         );
-        // Swarm's pick for Auto in the tooltip (a chip carrying its open
-        // flyout takes none).
+        // Swarm's pick for Auto, else the full words, in the tooltip (a
+        // chip carrying its open flyout takes none).
         let model = match (&self.launch.choice, model_open) {
             (Choice::Auto, false) => model.tooltip(match auto_profile {
                 Some(profile) => format!("Routing picks {profile}"),
                 None => self.launch.auto_detail(),
             }),
+            (_, false) => model.tooltip(self.launch.choice.chip_name(auto_profile)),
             _ => model,
         };
         let access: View = match &self.launch.choice {

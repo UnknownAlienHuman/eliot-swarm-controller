@@ -1,6 +1,7 @@
 //! The sidebar's Usage row and its popover (`Sidebar.dc.html` footer,
-//! `Hold.dc.html`; skeleton 5.12): the row shows a ring of the tightest
-//! harness window it knows and a short word ("Codex 62% · 1 hold"); it
+//! `Hold.dc.html`; skeleton 5.12): the row shows the static Usage mark
+//! (§4.2) and a short word of the tightest harness window it knows ("Codex
+//! 62% · 1 hold"); it
 //! opens a real WinUI `Flyout` beside the sidebar
 //! ([`DesktopApp::anchored_popover`], `Pop::Quotas`) that lists each
 //! harness's tightest window (its share left, when it resets, a meter that
@@ -83,10 +84,10 @@ impl DesktopApp {
         }
     }
 
-    /// The footer's Usage row (`Sidebar.dc.html`): the ring (the share
-    /// used of the tightest window read; `error` under 20 % left), "Usage"
-    /// and its word ("Codex 62% · 1 hold"); before any reading, a neutral
-    /// ring and no word. It carries the Usage popover while that is open.
+    /// The footer's Usage row (`Sidebar.dc.html`): the static Usage mark
+    /// (§4.2: no row draws a progress ring; critical under 20 % left),
+    /// "Usage" and its word ("Codex 62% · 1 hold"); before any reading, no
+    /// word. It carries the Usage popover while that is open.
     pub(super) fn usage_row(&self, context: &mut ViewContext<Self>) -> View {
         let tightest = self
             .tightest_windows()
@@ -110,21 +111,11 @@ impl DesktopApp {
             (tightest.window.remaining as f64) < crate::controls::QUOTA_LOW
         });
         let open = self.launch.open == Some(Pop::Quotas);
-        let ring: View = match &tightest {
-            // WinUI's own determinate ring: its accent arc and track.
-            Some(tightest) => ProgressRing::new()
-                .is_indeterminate(false)
-                .minimum(0.0)
-                .maximum(100.0)
-                .value(100.0 - tightest.window.remaining as f64)
-                .width(tokens::layout::ROW_RING)
-                .height(tokens::layout::ROW_RING)
-                .min_width(tokens::layout::ROW_RING)
-                .min_height(tokens::layout::ROW_RING)
-                .vertical_alignment(VerticalAlignment::Center)
-                .into(),
-            // No limit read yet: the Usage icon in the ring's place.
-            None => controls::icon(controls::glyph::USAGE),
+        // A static mark; the word beside it carries the share left.
+        let mark: View = if low {
+            controls::critical_icon(controls::glyph::USAGE, tokens::icon::ROW)
+        } else {
+            controls::icon(controls::glyph::USAGE)
         };
         let spoken = if word.is_empty() {
             "Usage: limits not read yet".to_owned()
@@ -142,7 +133,7 @@ impl DesktopApp {
             ))
             .on_click(context.callback(|()| Message::Launch(LaunchMsg::Toggle(Pop::Quotas))));
         let content = controls::sidebar_row(
-            View::from(Border::new().width(tokens::icon::ROW).content(ring)),
+            View::from(Border::new().width(tokens::icon::ROW).content(mark)),
             "Usage",
             open,
             0.0,
@@ -169,7 +160,7 @@ impl DesktopApp {
         let key = if open {
             "usage:open".to_owned()
         } else {
-            format!("usage:{low}:{}", tightest.is_some())
+            format!("usage:{low}")
         };
         Grid::new()
             .keyed_children(vec![KeyedView::new(key, row)])

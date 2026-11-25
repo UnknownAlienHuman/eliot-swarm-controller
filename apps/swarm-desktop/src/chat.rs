@@ -71,6 +71,8 @@ pub const CHAT_KINDS: &[&str] = &[
     "command.accepted",
     // A delivered Swarm note (an `inject` command) settles here.
     "command.applied",
+    // A steer the turn did not take (it ended before a safe point).
+    "command.rejected",
     // A mail delivery to the Agent (bodyless): an inline mail notice's
     // text is redacted in its command, so its mails are read by delivery.
     "mail.delivered",
@@ -191,6 +193,8 @@ enum Activity {
         command: String,
         /// When the daemon accepted it (its event time).
         at: i64,
+        /// Why the turn did not take it, once the daemon refused it.
+        refused: Option<String>,
     },
     /// A Swarm note (an `inject` command) delivered into this turn, and
     /// whether a project rule caused it (its frame then names the rule).
@@ -994,6 +998,35 @@ pub struct Conversation {
     /// The Agent's mail deliveries seen in its events, newest last
     /// (bounded by [`MAX_DELIVERIES`]).
     deliveries: VecDeque<String>,
+    /// The exact text of the steers this window sent, kept while their
+    /// turn shows them, so a refused one goes back to the composer whole.
+    steer_exact: HashMap<String, String>,
+    /// Steers refused since the last [`Conversation::take_refused_steers`].
+    refused: Vec<RefusedSteer>,
+}
+
+/// A steer the turn did not take: why, and its exact text when this window
+/// sent it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RefusedSteer {
+    pub reason: String,
+    pub text: Option<String>,
+}
+
+/// Why a command was refused, in the daemon's words (its outcome's
+/// `message`, else its reason code in words).
+fn refusal_words(event: &Event) -> String {
+    let outcome = event.data.get("outcome");
+    let field = |name: &str| {
+        outcome
+            .and_then(|outcome| outcome.get(name))
+            .and_then(serde_json::Value::as_str)
+            .filter(|text| !text.trim().is_empty())
+    };
+    field("message")
+        .map(str::to_owned)
+        .or_else(|| field("reason").map(eliot_core::reason_words))
+        .unwrap_or_else(|| "No reason was reported.".to_owned())
 }
 
 fn data_str<'a>(event: &'a Event, field: &str) -> Option<&'a str> {
@@ -1081,12 +1114,14 @@ impl Conversation {
         let local = std::mem::take(&mut self.local);
         let inputs = std::mem::take(&mut self.inputs);
         let pending_exact = std::mem::take(&mut self.pending_exact);
+        let steer_exact = std::mem::take(&mut self.steer_exact);
         let notes = std::mem::take(&mut self.local_notes);
         let failures = std::mem::take(&mut self.local_failures);
         *self = Self::new(&self.agent);
         self.coverage = coverage;
         self.inputs = inputs;
         self.pending_exact = pending_exact;
+        self.steer_exact = steer_exact;
         self.local = local;
         self.local_notes = notes;
         self.local_failures = failures;
@@ -1148,6 +1183,10 @@ impl Conversation {
                 self.note_delivered(event, generation, &mut invalidation);
                 continue;
             }
+            if event.kind == "command.rejected" {
+                self.note_refused(event);
+                continue;
+            }
             if event.kind == "mail.delivered" {
                 if let Some(id) = data_str(event, "delivery_id")
                     && !self.deliveries.iter().any(|known| known == id)
@@ -1207,6 +1246,7 @@ impl Conversation {
                             turn.activity.push(Activity::Steer {
                                 command: command.to_owned(),
                                 at: event.ts,
+                                refused: None,
                             });
                         }
                         if !self.inputs.contains_key(command) {
@@ -1268,8 +1308,55 @@ impl Conversation {
         }
         self.pending_exact
             .retain(|command, _| self.local.iter().any(|known| known == command));
+        let steer_exact = std::mem::take(&mut self.steer_exact);
+        self.steer_exact = steer_exact
+            .into_iter()
+            .filter(|(command, _)| self.knows(command))
+            .collect();
         self.enforce_bounds();
         invalidation
+    }
+
+    /// A refused command: a steer shown in its turn says it was not
+    /// applied, and is reported once ([`Self::take_refused_steers`]).
+    fn note_refused(&mut self, event: &Event) {
+        let Some(command) = data_str(event, "command_id") else {
+            return;
+        };
+        let reason = refusal_words(event);
+        let mut found = false;
+        for turn in self.turns.values_mut() {
+            for entry in &mut turn.activity {
+                if let Activity::Steer {
+                    command: known,
+                    refused,
+                    ..
+                } = entry
+                    && known == command
+                    && refused.is_none()
+                {
+                    *refused = Some(reason.clone());
+                    found = true;
+                }
+            }
+        }
+        if found {
+            self.refused.push(RefusedSteer {
+                reason,
+                text: self.steer_exact.remove(command),
+            });
+        }
+    }
+
+    /// The steers refused since the last call, each once.
+    pub fn take_refused_steers(&mut self) -> Vec<RefusedSteer> {
+        std::mem::take(&mut self.refused)
+    }
+
+    /// Keep the exact text of a steer this window sent until its turn
+    /// takes or refuses it.
+    pub fn note_steer_text(&mut self, command: &str, text: &str) {
+        self.steer_exact.insert(command.to_owned(), text.to_owned());
     }
 
     /// A delivered Swarm note (`command.applied` whose outcome says
@@ -1737,10 +1824,20 @@ impl Conversation {
                     text.clone(),
                     Vec::new(),
                 )),
-                Activity::Steer { command, at } => activity.push(Part::new(
+                Activity::Steer {
+                    command,
+                    at,
+                    refused,
+                } => activity.push(Part::new(
                     format!("steer:{command}"),
                     PartKind::Steer,
-                    format!("Steer \u{b7} {}", crate::monitor::clock(*at)),
+                    match refused {
+                        Some(_) => format!(
+                            "Steer \u{b7} {} \u{b7} not applied",
+                            crate::monitor::clock(*at)
+                        ),
+                        None => format!("Steer \u{b7} {}", crate::monitor::clock(*at)),
+                    },
                     match self.inputs.get(command) {
                         Some(InputText::Loaded(text) | InputText::Note { text, .. }) => {
                             text.clone()
@@ -1755,7 +1852,8 @@ impl Conversation {
                         }
                         None => "(loading input text…)".to_owned(),
                     },
-                    Vec::new(),
+                    // Why the turn did not take it.
+                    refused.iter().cloned().collect(),
                 )),
                 Activity::Note { command, rule } => {
                     let key = format!("note:{command}");

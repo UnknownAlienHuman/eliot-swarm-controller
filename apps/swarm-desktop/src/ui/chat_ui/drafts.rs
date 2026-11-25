@@ -1,8 +1,7 @@
 use super::*;
 
 impl DesktopApp {
-    /// Submit one draft action on a worker. `fallback` marks the send that
-    /// follows a steer refused because the turn just ended.
+    /// Submit one draft action on a worker.
     #[allow(
         clippy::too_many_arguments,
         reason = "The operation's distinct inputs remain explicit at its established call boundary."
@@ -15,7 +14,6 @@ impl DesktopApp {
         text: String,
         revision: u64,
         blank: bool,
-        fallback: bool,
         context: &ComponentContext<Self>,
     ) {
         let Ok(data_dir) = self.data_dir.clone() else {
@@ -69,7 +67,6 @@ impl DesktopApp {
                                     &text,
                                     revision,
                                     &action,
-                                    fallback,
                                 )
                             })?;
                         (command_id, state, linked, true)
@@ -82,7 +79,6 @@ impl DesktopApp {
                             &text,
                             revision,
                             &action,
-                            fallback,
                         ));
                     }
                 };
@@ -95,17 +91,12 @@ impl DesktopApp {
                     text: if blank { String::new() } else { text },
                     state,
                     recovered,
-                    fallback,
                 })
             })))
         });
     }
 
-    pub(super) fn send_submitted(
-        &mut self,
-        outcome: Result<SendOutcome, SendFailure>,
-        context: &ComponentContext<Self>,
-    ) {
+    pub(super) fn send_submitted(&mut self, outcome: Result<SendOutcome, SendFailure>) {
         // Keyboard focus goes back to the composer (no-op while it is unbound).
         self.take_focus(FocusTarget::Composer);
         self.settle_mutation(settles(&outcome));
@@ -135,9 +126,6 @@ impl DesktopApp {
                     keep_admitted_input(convo, &outcome, &harness);
                 }
                 self.rebuild_items();
-                if outcome.fallback {
-                    self.alert("The turn had just ended, so the message went as the next one.");
-                }
                 self.set_status(format!(
                     "{} {} ({}){}{}.",
                     outcome.what,
@@ -159,40 +147,9 @@ impl DesktopApp {
                 if let Some(convo) = self.chat.convo.as_mut() {
                     convo.forget_local(&failure.mutation_id);
                 }
-                // A steer the turn no longer takes goes as the next message:
-                // a new action (its own ledger key and id), after a definite
-                // refusal only.
-                if let DraftAction::Steer(bound) = &failure.action
-                    && STEER_FALLBACK.contains(&failure.error.code.as_str())
-                {
-                    let action = DraftAction::Send {
-                        agent: bound.agent.clone(),
-                    };
-                    let key = format!("{}:after-steer", action.key(failure.revision));
-                    let mutation_id = self.ledger.id_for(&key);
-                    self.in_flight_key = Some(key.clone());
-                    // The steer is definitely settled; its snapshot (if any)
-                    // is superseded by the fallback submission below.
-                    abandon_retry(&mut self.chat.pending_retry, &mut self.ledger, &bound.agent);
-                    if let Some(convo) = self.chat.convo.as_mut()
-                        && convo.agent() == bound.agent
-                    {
-                        convo.note_local_input(&mutation_id, &failure.text);
-                        convo.set_local_note(&mutation_id, Some("Sending…".to_owned()));
-                    }
-                    self.rebuild_items();
-                    self.spawn_draft(
-                        action,
-                        mutation_id,
-                        key,
-                        failure.text,
-                        failure.revision,
-                        false,
-                        true,
-                        context,
-                    );
-                    return;
-                }
+                // A refused steer is never sent on by itself (§9.4): its
+                // text goes back to the composer, where Send sends it as
+                // the next message once the turn has ended.
                 let agent = failure.action.agent().to_owned();
                 let restored = self.chat.drafts.borrow_mut().restore(
                     &agent,
@@ -219,7 +176,6 @@ impl DesktopApp {
                                 revision: failure.revision,
                                 mutation_id: failure.mutation_id.clone(),
                                 ledger_key: failure.ledger_key.clone(),
-                                fallback: failure.fallback,
                             },
                         );
                     }
@@ -239,10 +195,54 @@ impl DesktopApp {
                     {
                         abandon_retry(&mut self.chat.pending_retry, &mut self.ledger, &agent);
                     }
-                    self.alert(format!("Not sent: {}", failure.error.user_message()));
+                    self.alert(match failure.action {
+                        DraftAction::Steer(_) => {
+                            steer_refused(&failure.error.user_message(), restored)
+                        }
+                        _ => format!("Not sent: {}", failure.error.user_message()),
+                    });
                 }
             }
         }
+    }
+
+    /// Steers the turn refused after admitting them (it ended before a
+    /// safe point): each is said in words, and its text goes back to an
+    /// empty composer for Send, never sent on by itself (§9.4).
+    pub(super) fn report_refused_steers(&mut self) {
+        let Some(convo) = self.chat.convo.as_mut() else {
+            return;
+        };
+        let agent = convo.agent().to_owned();
+        for steer in convo.take_refused_steers() {
+            // Only a steer this window sent has its exact text.
+            let Some(text) = steer.text else {
+                continue;
+            };
+            let restored = {
+                let mut drafts = self.chat.drafts.borrow_mut();
+                let empty = drafts.text(Some(&agent)).trim().is_empty();
+                if empty {
+                    drafts.set(Some(&agent), text);
+                }
+                empty
+            };
+            self.alert(steer_refused(&steer.reason, restored));
+        }
+    }
+}
+
+/// A refused steer in words, and where its text is.
+fn steer_refused(reason: &str, restored: bool) -> String {
+    let reason = reason.trim_end_matches('.');
+    if restored {
+        format!(
+            "Steer not applied: {reason}. Its text is back in the composer: Send sends it as the next message."
+        )
+    } else {
+        format!(
+            "Steer not applied: {reason}. The composer has newer text, so the steer's text stays in the turn's work log."
+        )
     }
 }
 
@@ -285,10 +285,13 @@ fn keep_admitted_input(convo: &mut Conversation, outcome: &SendOutcome, harness:
             outcome.command_id.as_str(),
             format!("Waiting for {harness}…"),
         ),
-        ("Steer", _) => (
-            outcome.command_id.as_str(),
-            "Sent to the running turn".to_owned(),
-        ),
+        ("Steer", _) => {
+            convo.note_steer_text(&outcome.command_id, &outcome.text);
+            (
+                outcome.command_id.as_str(),
+                "Sent to the running turn".to_owned(),
+            )
+        }
         ("Resume", Some(linked)) => (linked, format!("Starting {harness}…")),
         _ => return,
     };
