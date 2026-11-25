@@ -2955,6 +2955,9 @@ the last presentation, skips the one-minute cooldown once. A fresh Swarm
 completion digest registered by the same recipient generation has the same
 one-attempt exception. The open-notice, busy, pending-input, provider-hold and
 unknown gates still apply.
+A completion claim spends cooldown even if submission is refused. Inline
+submission refusals count toward the two wake attempts. Earlier-generation
+and handed-off completions use the ordinary one-minute cooldown.
 Eligible mail for the current generation is presented with sender, thread,
 delivery ID and body within the encoded wake budget. Peer bodies are fenced
 untrusted data. The exact wake's first committed model output or successful

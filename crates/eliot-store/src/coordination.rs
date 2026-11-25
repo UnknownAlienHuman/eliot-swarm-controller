@@ -38,20 +38,30 @@ const MAIL_SEND_METHOD: &str = "mail.send";
 const MAIL_ACK_METHOD: &str = "mail.ack";
 const VAR_SET_METHOD: &str = "var.set";
 
-/// An exact, fresh result requested by this recipient generation. The first
-/// notice is eligible during cooldown. The presentation and failed-attempt
-/// paths stamp the notice time, so the same delivery cannot bypass it again.
+macro_rules! self_completion_mail {
+    () => {
+        "m.sender = 'swarm' AND EXISTS (
+            SELECT 1 FROM completion_digests d
+            WHERE d.id = substr(m.delivery_id, 1, instr(m.delivery_id, '/') - 1)
+              AND d.delivered_mail_id = m.delivery_id AND d.parent = m.recipient
+              AND d.requester = ('agent:a' || m.recipient || ':' || m.recipient_generation)
+        )"
+    };
+}
+
+/// An untouched result can bypass cooldown once. The claim advances the
+/// notice time even if submit refuses before native dispatch.
 /// Uses outer Agent and notice aliases `a` and `mn`.
-const FRESH_COMPLETION_WAKE_SQL: &str = "EXISTS (
-    SELECT 1 FROM messages m
-    JOIN completion_digests d ON d.id = substr(m.delivery_id, 1, instr(m.delivery_id, '/') - 1)
-      AND d.delivered_mail_id = m.delivery_id
+const FRESH_COMPLETION_WAKE_SQL: &str = concat!(
+    "EXISTS (SELECT 1 FROM messages m
     WHERE m.recipient = a.id AND m.recipient_generation = a.generation
-      AND m.sender = 'swarm' AND m.wake = 1 AND m.read_at IS NULL
+      AND m.wake = 1 AND m.read_at IS NULL
       AND m.presented_at IS NULL AND m.presentation_command IS NULL
       AND m.inline_wake_retries = 0 AND m.admitted_at > mn.last_notice_at
-      AND d.parent = a.id AND d.requester = ('agent:a' || a.id || ':' || a.generation)
-)";
+      AND ",
+    self_completion_mail!(),
+    ")"
+);
 /// Bound lock hold time and rollback work when concurrent writes share a commit.
 pub const MAX_VAR_WRITE_GROUP: usize = 64;
 
@@ -1964,14 +1974,34 @@ impl Store {
             commit_transaction(tx, &self.write_faulted)?;
             return Ok(None);
         }
-        // A reservation spends no cooldown: new rows start at 0, conflicts keep
-        // the prior presentation time (stamped only at `turn.started`).
+        // A self-requested completion spends the normal cooldown at claim.
+        // This covers count-only wakes as well as inline delivery, including
+        // submit failures before any native input can be admitted.
+        let completion_attempt: bool = tx
+            .query_row(
+                concat!(
+                    "SELECT EXISTS(SELECT 1 FROM messages m
+                 WHERE m.recipient = ?1 AND m.recipient_generation = ?2
+                   AND m.wake = 1 AND m.read_at IS NULL AND m.presented_at IS NULL
+                   AND m.inline_wake_retries < 2 AND ",
+                    self_completion_mail!(),
+                    ")"
+                ),
+                params![num, agent.generation],
+                |row| row.get(0),
+            )
+            .map_err(sql_error)?;
         db!(tx.execute(
             "INSERT INTO mail_notices(recipient, last_notice_at, open_notice_command)
-             VALUES (?1, 0, ?2)
+             VALUES (?1, ?3, ?2)
              ON CONFLICT(recipient) DO UPDATE SET
+                 last_notice_at = MAX(mail_notices.last_notice_at, excluded.last_notice_at),
                  open_notice_command = excluded.open_notice_command",
-            params![num, notice_command],
+            params![
+                num,
+                notice_command,
+                if completion_attempt { now } else { 0 }
+            ],
         ));
         // Count-only attention spends its one wake on claim. Inline
         // attention spends it when the exact turn shows model progress.
@@ -2000,15 +2030,20 @@ impl Store {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(sql_error)?;
-        db!(tx.execute(
+        let released = db!(tx.execute(
             "UPDATE mail_notices SET open_notice_command = NULL
              WHERE recipient = ?1 AND open_notice_command = ?2",
             params![num, notice_command],
         ));
         db!(tx.execute(
-            "UPDATE messages SET presentation_command = NULL
+            concat!(
+                "UPDATE messages AS m SET presentation_command = NULL,
+                 inline_wake_retries = CASE WHEN ?3 AND ",
+                self_completion_mail!(),
+                " THEN MIN(inline_wake_retries + 1, 2) ELSE inline_wake_retries END
              WHERE recipient = ?1 AND presentation_command = ?2 AND presented_at IS NULL",
-            params![num, notice_command],
+            ),
+            params![num, notice_command, released == 1],
         ));
         commit_transaction(tx, &self.write_faulted)?;
         Ok(())

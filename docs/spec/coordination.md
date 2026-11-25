@@ -532,6 +532,11 @@ completion digest registered by the same recipient generation can also skip
 it once. The digest must still be unread and untouched by a notice, with an
 admission time after the previous notice. Open-notice, busy, pending-input,
 provider-hold and unknown gates still apply.
+The claim spends cooldown for a self-requested completion. If submission is
+refused, inline completion delivery remains unread and consumes one of its
+two wake attempts. Its one automatic retry uses the ordinary cooldown.
+Completions requested by an earlier generation or handed off to a successor
+also use the ordinary cooldown. Once wake-eligible, they can wait up to a minute.
 The notice is an ordinary owner `send` bound to the recipient's
 current generation. At claim, Store selects eligible unread mail addressed to
 that generation, in admission order. Each inline entry carries its sender,
@@ -586,9 +591,10 @@ parses notice text. Internal `notice_kind` remains Store admission metadata
 and is stripped at daemon dispatch, so vendor plugins receive only text arguments.
 Deferred mail re-offers on idle through the same atomic claim. An idle event
 caused by that recipient's own notice command cannot trigger a re-offer.
-Deferral leaves the cooldown timestamp unchanged. A claim preserves the prior
-`last_notice_at`, initially 0, and a failed admission clears only the matching
-open claim. Settlement of a notice `send` as `rejected`, `failed`, or `cancelled`
+Deferral leaves the cooldown timestamp unchanged. An ordinary claim preserves
+the prior `last_notice_at`, initially 0. A failed admission clears only the
+matching open claim and releases its inline bindings. Settlement of a notice
+`send` as `rejected`, `failed`, or `cancelled`
 stamps the shared cooldown and clears that exact open claim in the same
 transaction. Restart recovery clears only commandless open claims.
 Command retention clears the open reference of the exact completed notice it
