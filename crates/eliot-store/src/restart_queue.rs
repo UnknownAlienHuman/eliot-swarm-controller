@@ -61,6 +61,39 @@ pub(super) fn is_parked(connection: &Connection, id: &str) -> Result<bool> {
         .map_err(sql_error)
 }
 
+pub(super) fn pending_before_resume(
+    connection: &Connection,
+    agent_num: i64,
+    agent: &Agent,
+) -> Result<bool> {
+    connection
+        .prepare_cached(
+            "SELECT EXISTS(SELECT 1 FROM commands c
+               JOIN restart_deferred_sends d ON d.command_id=c.id
+              WHERE c.target=?1 AND c.generation<?2 AND c.state IN ('accepted','queued')
+                AND d.native_scope=?3 AND d.native_ref=?4)",
+        )
+        .map_err(sql_error)?
+        .query_row(
+            params![
+                agent_num,
+                agent.generation,
+                agent.native_scope,
+                agent.native_ref
+            ],
+            |row| row.get(0),
+        )
+        .map_err(sql_error)
+}
+
+pub(super) fn consume_on_dispatch(tx: &Transaction<'_>, id: &str) -> Result<()> {
+    tx.prepare_cached("DELETE FROM restart_deferred_sends WHERE command_id=?1")
+        .map_err(sql_error)?
+        .execute([id])
+        .map_err(sql_error)?;
+    Ok(())
+}
+
 /// Rebind the original receipts only after this Resume settled applied on
 /// the same native subject. A failed or unknown Resume leaves the rows parked.
 pub(super) fn release_after_resume(
@@ -89,11 +122,8 @@ pub(super) fn release_after_resume(
         .collect::<rusqlite::Result<Vec<_>>>()
         .map_err(sql_error)?;
     for id in ids {
-        tx.execute(
-            "DELETE FROM restart_deferred_sends WHERE command_id=?1",
-            [&id],
-        )
-        .map_err(sql_error)?;
+        // Keep the marker through recovery and work scheduling. Dispatch
+        // consumes it atomically with the no-replay boundary.
         events.push(insert_daemon_command_event(
             tx,
             now,

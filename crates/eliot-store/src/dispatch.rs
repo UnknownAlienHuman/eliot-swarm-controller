@@ -606,7 +606,8 @@ fn dispatch_send_tx(
             "cannot dispatch input to a terminal Agent",
         ));
     }
-    let ready = send_input_gate_open(tx, agent_num, agent.generation)?;
+    let ready = send_input_gate_open(tx, agent_num, agent.generation)?
+        && !super::restart_queue::pending_before_resume(tx, agent_num, agent)?;
     let earliest = earliest_pending_send(tx, agent_num, agent.generation)?;
     // Shared admission order: only a configure admitted no later
     // than this send holds the settings lane. A later configure
@@ -661,6 +662,7 @@ fn dispatch_send_tx(
         }),
     )?;
     update_command_state(tx, id, CommandState::Dispatched, None, None, now)?;
+    super::restart_queue::consume_on_dispatch(tx, id)?;
     events.push(insert_daemon_command_event(
         tx,
         now,
