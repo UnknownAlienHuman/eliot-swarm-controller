@@ -219,7 +219,11 @@ impl Router {
                     "the patch digest Agent workspace or base differs from the event snapshot",
                 ));
             }
-            let binding = store.get_workspace_by_path(&workspace)?;
+            let binding = if expected_base.is_none() {
+                store.get_workspace_by_path(&workspace)?
+            } else {
+                None
+            };
             let common = binding
                 .as_ref()
                 .map(|binding| binding.repo_common_dir.clone());
