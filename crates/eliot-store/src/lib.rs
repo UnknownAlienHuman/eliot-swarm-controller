@@ -2792,16 +2792,15 @@ impl Store {
         let verbatim_workspace = core::verbatim_path(std::path::Path::new(workspace))
             .to_string_lossy()
             .into_owned();
-        let cwd = "COALESCE(json_extract(c.data, '$.git_branch_switch.cwd'),
-                           json_extract(c.data, '$.shell_execution_cwd'))";
-        let workspace_filter = if cfg!(windows) {
+        let legacy_cwd = "json_extract(c.data, '$.git_branch_switch.cwd')";
+        let legacy_workspace_filter = if cfg!(windows) {
             format!(
-                "lower(replace({cwd}, char(92), '/')) IN (
+                "lower(replace({legacy_cwd}, char(92), '/')) IN (
                     lower(replace(?1, char(92), '/')), lower(replace(?2, char(92), '/')),
                     lower(replace(?3, char(92), '/')))"
             )
         } else {
-            format!("{cwd} IN (?1, ?2, ?3)")
+            format!("{legacy_cwd} IN (?1, ?2, ?3)")
         };
         let mut statement = self
             .connection
@@ -2816,11 +2815,12 @@ impl Store {
                    AND c.generation IS NOT NULL
                    AND (?4 IS NULL OR c.generation = ?4)
                    AND json_extract(c.data, '$.status') = 'completed'
-                   AND {workspace_filter}
-                   AND (json_extract(c.data, '$.git_branch_switch.branch') IS NOT NULL
-                        OR json_extract(s.data, '$.command') LIKE 'git%switch%'
-                        OR json_extract(s.data, '$.command') LIKE 'git%checkout%')
-                 ORDER BY c.seq DESC LIMIT 65"
+                   AND (({legacy_workspace_filter}
+                         AND json_extract(c.data, '$.git_branch_switch.branch') IS NOT NULL)
+                        OR (json_extract(c.data, '$.tool_kind') = 'shell'
+                            AND json_extract(s.data, '$.tool_kind') = 'shell'
+                            AND json_type(c.data, '$.shell_execution_cwd') = 'text'))
+                 ORDER BY c.seq DESC"
             ))
             .map_err(sql_error)?;
         let rows = statement
@@ -2840,13 +2840,7 @@ impl Store {
             )
             .map_err(sql_error)?;
         let mut candidates = Vec::new();
-        for (offset, row) in rows.enumerate() {
-            if offset == 64 {
-                return Err(Error::new(
-                    "workspace_branch_unattributed",
-                    "native checkout evidence reached its read bound",
-                ));
-            }
+        for row in rows {
             let (
                 agent_num,
                 generation,
@@ -2866,15 +2860,21 @@ impl Store {
                 continue;
             };
             if branch.is_some_and(|branch| checkout.branch != branch)
-                || core::workspace_path_key(checkout.cwd) != core::workspace_path_key(workspace)
+                || core::workspace_path_key(&checkout.cwd) != core::workspace_path_key(workspace)
             {
                 continue;
+            }
+            if candidates.len() == 64 {
+                return Err(Error::new(
+                    "workspace_branch_unattributed",
+                    "native checkout evidence reached its read bound",
+                ));
             }
             candidates.push(NativeBranchSwitchCandidate {
                 agent: format!("a{agent_num}"),
                 generation,
                 branch: checkout.branch.to_owned(),
-                workspace: checkout.cwd.to_owned(),
+                workspace: checkout.cwd.into_owned(),
                 start_seq,
                 terminal_seq,
                 started_at_ms: checkout.started_at_ms,

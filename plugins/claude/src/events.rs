@@ -1880,6 +1880,9 @@ impl EventProcessor {
                 "item_id": tool_use.id,
                 "tool": tool_use.name,
             });
+            if tool_use.name == "Bash" {
+                data["tool_kind"] = json!("shell");
+            }
             self.scope_turn_command(&mut data);
             if let Some(at) = eliot_plugin::quota::rfc3339_ms(record.get("timestamp")) {
                 data["native_at_ms"] = json!(at);
@@ -1973,6 +1976,9 @@ impl EventProcessor {
                 "tool": tool,
                 "status": tool_result_status(result.is_error),
             });
+            if tool == "Bash" {
+                data["tool_kind"] = json!("shell");
+            }
             self.scope_turn_command(&mut data);
             if let Some(at) = eliot_plugin::quota::rfc3339_ms(record.get("timestamp")) {
                 data["native_at_ms"] = json!(at);

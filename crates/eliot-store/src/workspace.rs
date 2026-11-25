@@ -69,7 +69,7 @@ pub(super) fn workspace_from_row(
 
 pub(super) struct NativeBranchCheckout<'a> {
     pub branch: &'a str,
-    pub cwd: &'a str,
+    pub cwd: std::borrow::Cow<'a, str>,
     pub started_at_ms: i64,
     pub completed_at_ms: i64,
 }
@@ -108,24 +108,30 @@ pub(super) fn native_branch_checkout<'a>(
         }
         (
             fact["branch"].as_str()?,
-            cwd,
+            cwd.into(),
             start["native_at_ms"].as_i64().unwrap_or(start_ts),
             fact["native_at_ms"].as_i64()?,
         )
     } else {
-        if start["command_truncated"].as_bool() != Some(false)
-            || terminal["exit_code"].as_i64().is_some_and(|exit| exit != 0)
+        if start["tool_kind"].as_str() != Some("shell")
+            || terminal["tool_kind"].as_str() != Some("shell")
+            || start["command_truncated"].as_bool() != Some(false)
+            || (!terminal["exit_code"].is_null() && terminal["exit_code"].as_i64() != Some(0))
         {
             return None;
         }
-        (
-            direct_git_checkout_branch(start["command"].as_str()?)?,
+        let (branch, cwd) = direct_git_checkout(
+            start["command"].as_str()?,
             terminal["shell_execution_cwd"].as_str()?,
+        )?;
+        (
+            branch,
+            cwd,
             start["native_at_ms"].as_i64()?,
             terminal["native_at_ms"].as_i64()?,
         )
     };
-    (std::path::Path::new(cwd).is_absolute()
+    (std::path::Path::new(cwd.as_ref()).is_absolute()
         && started_at_ms > 0
         && started_at_ms <= completed_at_ms)
         .then_some(NativeBranchCheckout {
@@ -136,32 +142,117 @@ pub(super) fn native_branch_checkout<'a>(
         })
 }
 
-/// Accept a single direct command with a literal local branch operand.
-fn direct_git_checkout_branch(command: &str) -> Option<&str> {
-    if command
-        .chars()
-        .any(|ch| !ch.is_alphanumeric() && !matches!(ch, ' ' | '\t' | '.' | '-' | '_' | '/'))
-    {
+/// Read only a direct Git invocation, with an optional literal directory
+/// selected by a leading cd or Git's global -C. Never evaluate shell input.
+fn direct_git_checkout<'a>(
+    command: &'a str,
+    native_cwd: &'a str,
+) -> Option<(&'a str, std::borrow::Cow<'a, str>)> {
+    let words = literal_checkout_words(command)?;
+    let mut cwd = std::borrow::Cow::Borrowed(native_cwd);
+    let git = match words.as_slice() {
+        ["cd", directory, "&&", git @ ..] => {
+            cwd = checkout_directory(&cwd, directory)?.into();
+            git
+        }
+        git => git,
+    };
+    let ["git" | "git.exe", args @ ..] = git else {
         return None;
-    }
-    let mut words = command.split_ascii_whitespace();
-    if !matches!(words.next()?, "git" | "git.exe") {
-        return None;
-    }
-    let operation = words.next()?;
-    let operand = words.next()?;
-    let branch = match (operation, operand) {
-        ("switch", "-c" | "--create" | "--") | ("checkout", "-b") => words.next()?,
-        ("switch" | "checkout", name) if !name.starts_with('-') => name,
+    };
+    let args = match args {
+        ["-C", directory, args @ ..] => {
+            cwd = checkout_directory(&cwd, directory)?.into();
+            args
+        }
+        args => args,
+    };
+    let branch = match args {
+        ["switch" | "checkout", branch]
+        | [
+            "switch",
+            "-c" | "-C" | "--create" | "--force-create" | "--",
+            branch,
+        ]
+        | ["checkout", "-b" | "-B", branch] => *branch,
         _ => return None,
     };
-    if words.next().is_some()
-        || branch.starts_with('-')
+    if branch
+        .chars()
+        .any(|ch| !ch.is_alphanumeric() && !matches!(ch, '.' | '-' | '_' | '/'))
         || core::api::validate_integration_branch(branch).is_err()
     {
         return None;
     }
-    Some(branch)
+    Some((branch, cwd))
+}
+
+fn literal_checkout_words(mut rest: &str) -> Option<Vec<&str>> {
+    let mut words = Vec::new();
+    loop {
+        rest = rest.trim_start_matches([' ', '\t']);
+        let Some(first) = rest.chars().next() else {
+            return Some(words);
+        };
+        if words.len() == 9 {
+            return None;
+        }
+        if let Some(after) = rest.strip_prefix("&&") {
+            words.push("&&");
+            rest = after;
+            continue;
+        }
+        let quoted = matches!(first, '\'' | '"');
+        let word;
+        if quoted {
+            let content = &rest[1..];
+            let end = content.find(first)?;
+            (word, rest) = (&content[..end], &content[end + 1..]);
+            if (!rest.is_empty() && !rest.starts_with([' ', '\t']) && !rest.starts_with("&&"))
+                || (first == '"' && (word.ends_with('\\') || word.contains("\\\\")))
+            {
+                return None;
+            }
+        } else {
+            let end = rest.find([' ', '\t', '&']).unwrap_or(rest.len());
+            (word, rest) = rest.split_at(end);
+        }
+        if word.is_empty()
+            || word.chars().any(|ch| {
+                !ch.is_alphanumeric()
+                    && !matches!(ch, '.' | '-' | '_' | '/' | ':')
+                    && !(quoted && matches!(ch, ' ' | '\\'))
+            })
+        {
+            return None;
+        }
+        words.push(word);
+    }
+}
+
+fn checkout_directory(base: &str, directory: &str) -> Option<String> {
+    use std::path::{Component, Path, PathBuf};
+
+    let directory = Path::new(directory);
+    if directory == Path::new("&&")
+        || directory
+            .components()
+            .any(|part| part == Component::ParentDir)
+        || (!directory.is_absolute()
+            && (directory.has_root()
+                || matches!(directory.components().next(), Some(Component::Prefix(_)))))
+    {
+        return None;
+    }
+    let path = Path::new(base).join(directory);
+    if !path.is_absolute() {
+        return None;
+    }
+    path.components()
+        .collect::<PathBuf>()
+        .into_os_string()
+        .into_string()
+        .ok()
 }
 
 fn valid_native_branch_switch_evidence(
@@ -218,7 +309,7 @@ fn valid_native_branch_switch_evidence(
     Ok(
         native_branch_checkout(&start, &terminal, start_ts).is_some_and(|checkout| {
             checkout.branch == drift.observed_branch
-                && core::workspace_path_key(checkout.cwd) == core::workspace_path_key(workspace)
+                && core::workspace_path_key(&checkout.cwd) == core::workspace_path_key(workspace)
                 && checkout.started_at_ms == started_at
                 && checkout.completed_at_ms == completed_at
         }),

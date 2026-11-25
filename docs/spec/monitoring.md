@@ -472,9 +472,15 @@ and reciprocal Git registration still match, and the registry branch agrees with
 symbolic `HEAD`. A changed branch must be clean and have a successful native checkout
 in that exact workspace, paired by item, turn and generation with its start event.
 The Store accepts retained structured `git switch` facts from Codex. For a native
-shell result with a confirmed working directory, the Store recognizes one direct
-`git switch` or `git checkout` with a literal branch operand. The two Claude
-tool hooks must agree on the working directory for that exact foreground invocation.
+shell result, both events must identify a shell tool and the completion must
+report success. A reported exit code must be zero. The Store recognizes one
+direct `git switch` or `git checkout` with a literal branch operand, including
+`checkout -b` and `checkout -B`. It resolves an optional leading
+`cd <directory> &&` and a Git-global `-C <directory>` against the shell's native
+working directory before comparing the checkout path. The two Claude tool hooks
+must agree on the shell session directory for that exact foreground invocation.
+Paths requiring shell expansion, alias resolution, or parent traversal fall
+outside this attribution grammar.
 The latest HEAD checkout reflog entry
 must name the same transition and fall within that tool's start-to-completion window,
 allowing one second for reflog timestamp precision. The prior branch is the branch in
