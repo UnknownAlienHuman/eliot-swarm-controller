@@ -1,13 +1,109 @@
 //! Read-only Git checkout identities rooted in an existing registration.
 
 use super::*;
+use crate::fs_invalidation::WorkspaceInvalidation;
 use crate::platform::is_reparse_point;
 use eliot_core::api::{ProjectCheckoutView, ProjectRegistrationView};
 use futures_util::{StreamExt, stream};
-use std::collections::BTreeMap;
+use std::{
+    collections::{BTreeMap, HashMap},
+    sync::Mutex,
+};
 
 const MAX_CHECKOUTS: usize = 1_000;
 const CHECKOUT_READBACK_BYTES: usize = 900 * 1024;
+const PROJECT_CACHE_CAPACITY: usize = 64;
+
+pub(crate) struct ProjectReadCache {
+    entries: Mutex<HashMap<String, CachedProjectReadback>>,
+}
+
+struct CachedProjectReadback {
+    watcher: WorkspaceInvalidation,
+    revision: crate::fs_invalidation::FilesystemRevision,
+    registrations: Vec<String>,
+    origin: Option<String>,
+    checkouts: Vec<CachedCheckout>,
+}
+
+struct CachedCheckout {
+    _stamp: CheckoutReadStamp,
+    view: ProjectCheckoutView,
+}
+
+impl Default for ProjectReadCache {
+    fn default() -> Self {
+        Self {
+            entries: Mutex::new(HashMap::new()),
+        }
+    }
+}
+
+impl ProjectReadCache {
+    fn hit(&self, common: &str, registrations: &mut [&mut ProjectRegistrationView]) -> bool {
+        let mut entries = self.entries.lock().expect("project cache mutex poisoned");
+        let Some(entry) = entries.get_mut(common) else {
+            return false;
+        };
+        if entry.watcher.is_degraded()
+            || entry.watcher.revision().as_ref() != Some(&entry.revision)
+            || entry.registrations
+                != registrations
+                    .iter()
+                    .map(|registration| registration.checkout.clone())
+                    .collect::<Vec<_>>()
+        {
+            return false;
+        }
+        for (index, registration) in registrations.iter_mut().enumerate() {
+            registration.origin = entry.origin.clone();
+            registration.checkouts = if index == 0 {
+                entry
+                    .checkouts
+                    .iter()
+                    .map(|checkout| checkout.view.clone())
+                    .collect()
+            } else {
+                Vec::new()
+            };
+        }
+        true
+    }
+
+    fn replace(
+        &self,
+        common: String,
+        watcher: WorkspaceInvalidation,
+        revision: crate::fs_invalidation::FilesystemRevision,
+        registrations: Vec<String>,
+        origin: Option<String>,
+        checkouts: Vec<CachedCheckout>,
+    ) {
+        let retired = {
+            let mut entries = self.entries.lock().expect("project cache mutex poisoned");
+            entries.insert(
+                common,
+                CachedProjectReadback {
+                    watcher,
+                    revision,
+                    registrations,
+                    origin,
+                    checkouts,
+                },
+            );
+            if entries.len() > PROJECT_CACHE_CAPACITY {
+                entries
+                    .keys()
+                    .next()
+                    .cloned()
+                    .and_then(|key| entries.remove(&key))
+            } else {
+                None
+            }
+        };
+        drop(retired);
+    }
+}
 
 /// The worktree and Git administration directories stay pinned through the
 /// patch read. Resolve the files-format HEAD without another Git process.
@@ -256,7 +352,10 @@ fn read_diff_metadata(file: fs::File, limit: u64) -> Result<Vec<u8>> {
 }
 
 impl WorkspaceGit {
-    pub(crate) async fn fill_project_readbacks(registrations: &mut [ProjectRegistrationView]) {
+    pub(crate) async fn fill_project_readbacks(
+        cache: &ProjectReadCache,
+        registrations: &mut [ProjectRegistrationView],
+    ) {
         if registrations.is_empty() {
             return;
         }
@@ -274,10 +373,22 @@ impl WorkspaceGit {
         stream::iter(groups)
             .for_each_concurrent(4, |(common_dir, registrations)| {
                 let git = &git;
+                let cache = cache;
                 async move {
                     if Instant::now() >= deadline {
                         return;
                     }
+                    let mut registrations = registrations;
+                    let mut registration_refs: Vec<_> = registrations.iter_mut().collect();
+                    if cache.hit(&common_dir, &mut registration_refs) {
+                        return;
+                    }
+                    drop(registration_refs);
+                    let watcher = project_watcher(&common_dir);
+                    if let Some(watcher) = watcher.as_ref() {
+                        watcher.take_dirty();
+                    }
+                    let revision = watcher.as_ref().and_then(WorkspaceInvalidation::revision);
                     let (origin, checkouts) =
                         tokio::join!(git.origin_name(&common_dir, deadline), async {
                             let Ok(common) = canonical_root(&common_dir) else {
@@ -332,11 +443,50 @@ impl WorkspaceGit {
                                 .await
                         });
                     let mut checkouts = checkouts;
+                    let cached = match (watcher, revision) {
+                        (Some(watcher), Some(revision)) if !watcher.is_degraded() => {
+                            let cached = checkouts
+                                .iter()
+                                .filter_map(|checkout| {
+                                    let view = checkout.clone();
+                                    let bound =
+                                        DiffCheckout::open(&view.path, Some(&common_dir)).ok()?;
+                                    let stamp = bound.read_stamp().ok()?;
+                                    Some(CachedCheckout {
+                                        _stamp: stamp,
+                                        view,
+                                    })
+                                })
+                                .collect::<Vec<_>>();
+                            (cached.len() == checkouts.len()
+                                && watcher.revision().as_ref() == Some(&revision))
+                            .then_some((watcher, revision, cached))
+                        }
+                        _ => None,
+                    };
                     // One registration carries the shared inventory. Keep the
                     // response bounded when several registrations share a repo.
-                    for registration in registrations {
+                    for (index, registration) in registrations.iter_mut().enumerate() {
                         registration.origin = origin.clone();
-                        registration.checkouts = std::mem::take(&mut checkouts);
+                        registration.checkouts = if index == 0 {
+                            checkouts.clone()
+                        } else {
+                            Vec::new()
+                        };
+                    }
+                    if let Some((watcher, revision, cached)) = cached {
+                        let registration_keys = registrations
+                            .iter()
+                            .map(|registration| registration.checkout.clone())
+                            .collect();
+                        cache.replace(
+                            common_dir,
+                            watcher,
+                            revision,
+                            registration_keys,
+                            origin,
+                            cached,
+                        );
                     }
                 }
             })
@@ -607,4 +757,31 @@ fn same_path(left: &Path, right: &Path) -> bool {
     } else {
         left == right
     }
+}
+
+#[cfg(any(windows, target_os = "linux"))]
+fn project_watcher(common: &str) -> Option<WorkspaceInvalidation> {
+    let common = canonical_root(common).ok()?;
+    let registry = common.join("worktrees");
+    let mut paths = vec![(common.clone(), notify::RecursiveMode::NonRecursive)];
+    if registry.is_dir() {
+        paths.push((registry.clone(), notify::RecursiveMode::Recursive));
+    }
+    for name in ["refs", "info", "reftable"] {
+        let path = common.join(name);
+        if path.is_dir() {
+            paths.push((path, notify::RecursiveMode::Recursive));
+        }
+    }
+    WorkspaceInvalidation::watch_paths(paths, move |path| {
+        let relevant = path.starts_with(&common);
+        let binding = path == common || path == registry || path.starts_with(&registry);
+        (relevant, binding)
+    })
+    .ok()
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
+fn project_watcher(_common: &str) -> Option<WorkspaceInvalidation> {
+    None
 }
