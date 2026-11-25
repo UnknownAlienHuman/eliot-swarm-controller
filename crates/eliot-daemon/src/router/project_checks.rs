@@ -412,19 +412,14 @@ pub(crate) async fn run_project_checks(
         review_event_count: 0,
     };
     let mut recovered_through = 0;
-    {
-        let mut store = router.inner.store.lock().await;
-        store.abandon_started_project_check_obligations(now_ms())?;
-        let obligations = store
-            .pending_project_check_obligations(recovered_through, MAX_PENDING_CHECKS as i64)?;
-        drop(store);
-        recovered_through = obligations
-            .last()
-            .map_or(recovered_through, |event| event.seq);
-        for event in obligations {
-            schedule_edit(&router, event, &mut driver).await;
-        }
-    }
+    let mut abandon_started = true;
+    recover_project_check_obligations(
+        &router,
+        &mut driver,
+        &mut recovered_through,
+        &mut abandon_started,
+    )
+    .await;
     let mut reap = tokio::time::interval(REAP_INTERVAL);
     reap.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -495,10 +490,22 @@ pub(crate) async fn run_project_checks(
                 let store = router.inner.store.lock().await;
                 driver.check_states.retain(|key, _| is_live_generation(&store, key));
                 drop(store);
-                recover_project_check_obligations(&router, &mut driver, &mut recovered_through).await;
+                recover_project_check_obligations(
+                    &router,
+                    &mut driver,
+                    &mut recovered_through,
+                    &mut abandon_started,
+                ).await;
             },
-            _ = &mut timer, if driver.tasks.len() < MAX_CONCURRENT_CHECKS => {
-                start_due_checks(&router, &shutdown, &mut driver).await?;
+            _ = &mut timer, if !abandon_started && driver.tasks.len() < MAX_CONCURRENT_CHECKS => {
+                if let Err(error) = start_due_checks(&router, &shutdown, &mut driver).await {
+                    log_worker(
+                        &router,
+                        "daemon.project_check_start_failed",
+                        None,
+                        &error.to_string(),
+                    );
+                }
             }
         }
     }
@@ -508,10 +515,31 @@ async fn recover_project_check_obligations(
     router: &Router,
     driver: &mut CheckDriver,
     recovered_through: &mut i64,
+    abandon_started: &mut bool,
 ) {
     let available = MAX_PENDING_CHECKS.saturating_sub(driver.review_event_count);
     if available == 0 {
         return;
+    }
+    if *abandon_started {
+        match router
+            .inner
+            .store
+            .lock()
+            .await
+            .abandon_started_project_check_obligations(now_ms())
+        {
+            Ok(()) => *abandon_started = false,
+            Err(error) => {
+                log_worker(
+                    router,
+                    "daemon.project_check_recovery_failed",
+                    None,
+                    &error.to_string(),
+                );
+                return;
+            }
+        }
     }
     let mut obligations = match router
         .inner
@@ -1487,6 +1515,15 @@ pub(super) async fn publish_goal_worktree_pass(
             generation,
         };
         let changed = (observed != fingerprint).then_some(observed.as_str());
+        let claimed = router
+            .inner
+            .store
+            .lock()
+            .await
+            .claim_project_check_obligation(event);
+        if !matches!(claimed, Ok(true)) {
+            return;
+        }
         record_worktree_check_outcome(router, &key, event, &agent.project, changed).await;
     }
 }
