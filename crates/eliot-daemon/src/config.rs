@@ -1484,6 +1484,7 @@ impl DaemonConfig {
             on_restart: self.on_restart,
             artifact_roots: self.artifact_roots,
             retention: self.retention.validate()?,
+            agent_retirement: self.agent_retirement,
             limits: self.limits,
             attention_suspicion_secs: self.attention_suspicion_secs,
             attention,

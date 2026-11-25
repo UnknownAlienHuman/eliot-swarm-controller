@@ -346,8 +346,8 @@ async fn run_retention(
                 );
             }
         }
-        let retirement_deadline = time::Instant::now() + RETENTION_TICK_TIME_BUDGET;
-        while !*shutdown.borrow() && time::Instant::now() < retirement_deadline {
+        let retirement_deadline = std::time::Instant::now() + RETENTION_TICK_TIME_BUDGET;
+        while !*shutdown.borrow() && std::time::Instant::now() < retirement_deadline {
             match router
                 .retire_agent_page(&config.agent_retirement, retirement_cursor)
                 .await
