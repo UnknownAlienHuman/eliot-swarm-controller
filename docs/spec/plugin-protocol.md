@@ -90,11 +90,12 @@ message. Each adapter defines the evidence for `model_verified`. For Muse,
 each main turn begins unverified. The owned session's raw provider response
 must name the model on that exact turn before it becomes verified. A
 selection acknowledgement, catalogue row, session label or token-usage
-model cannot supply that evidence. Muse applies its documented canonical
-comparison to each foreground provider response. Unnamed models leave
+model cannot supply that evidence. The adapter supplies raw and canonical IDs
+for each foreground response. Shared Rust checks the model and owns turn
+containment, including the outcome override and cancellation deadline. Unnamed models leave
 verification false and allow the native turn to settle. The first explicit
 mismatch commits both IDs and a [profile hold](monitoring.md#provider-holds)
-while the adapter cancels the exact turn and suppresses its response.
+while the adapter translates the exact cancellation and suppresses that turn's response.
 Failed or unconfirmed cancellation falls back to stopping the owned host.
 Native terminal evidence or ordinary loss recovery determines whether
 the turn ended.

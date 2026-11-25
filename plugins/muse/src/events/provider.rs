@@ -1,6 +1,7 @@
 //! Provider model evidence from the owned MSP session's raw live stream.
 
 use eliot_core::{Error, Result};
+use eliot_plugin::turn_containment::{CancellationProof, ObservedModel};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::time::Instant;
@@ -135,7 +136,14 @@ pub(super) fn signal(params: &Value) -> Option<Signal<'_>> {
     })
 }
 
-pub(super) fn canonical_model(id: &str) -> &str {
+pub(super) fn observed_model(id: &str) -> ObservedModel<'_> {
+    ObservedModel {
+        raw: id,
+        canonical: canonical_model(id),
+    }
+}
+
+fn canonical_model(id: &str) -> &str {
     let id = id.strip_prefix("meta.").unwrap_or(id);
     let mut parts = id.rsplitn(4, '-');
     if let (Some(day), Some(month), Some(year), Some(model)) =
@@ -161,7 +169,7 @@ pub(super) async fn cancel(
     session: &str,
     turn: &str,
     deadline: Instant,
-) -> bool {
+) -> CancellationProof {
     let command_id = crate::host::new_command_id();
     let params = NativeTurnCancelParams {
         command_id: command_id.clone(),
@@ -169,12 +177,16 @@ pub(super) async fn cancel(
         turn_id: Some(turn.to_owned()),
     };
     let Ok(params) = serde_json::to_value(params) else {
-        return false;
+        return CancellationProof::Unconfirmed;
     };
     let Ok(reply) = native.call("turn/cancel", params, deadline).await else {
-        return false;
+        return CancellationProof::Unconfirmed;
     };
-    serde_json::from_value::<NativeTurnCancelResult>(reply).is_ok_and(|ack| {
+    if serde_json::from_value::<NativeTurnCancelResult>(reply).is_ok_and(|ack| {
         ack.command_id == command_id && ack.turn_id == turn && ack.status == "accepted"
-    })
+    }) {
+        CancellationProof::Accepted
+    } else {
+        CancellationProof::Unconfirmed
+    }
 }

@@ -19,6 +19,10 @@ use eliot_plugin::{
         next_input_outcomes, redact_request_details_for_commit, rejected_control, request_event_id,
         request_reply_applied, unknown_control,
     },
+    turn_containment::{
+        ModelDisposition, cancellation_deadline, model_disposition, model_terminal,
+        stop_after_cancel, wait_for_containment_stop,
+    },
 };
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -632,20 +636,7 @@ pub(crate) fn spawn(
 
 impl EventHandle {
     pub async fn wait_for_model_stop(&self) {
-        let mut status = self.actor.watch().clone();
-        loop {
-            let deadline = status.borrow_and_update().model_stop_at;
-            if let Some(deadline) = deadline {
-                match timeout_at(deadline, status.changed()).await {
-                    Err(_) if status.borrow().model_stop_at == Some(deadline) => return,
-                    Err(_) | Ok(Ok(())) => continue,
-                    Ok(Err(_)) => break,
-                }
-            } else if status.changed().await.is_err() {
-                break;
-            }
-        }
-        std::future::pending::<()>().await;
+        wait_for_containment_stop(self.actor.watch().clone(), |status| status.model_stop_at).await;
     }
 
     pub async fn view_readback(
@@ -1627,9 +1618,9 @@ impl EventProcessor {
             .await?;
         self.messages = TurnMessages::default();
         if cancellation.is_some() {
-            let deadline = Instant::now() + Duration::from_secs(5);
-            let accepted = provider::cancel(&self.native, &session_id, &turn_id, deadline).await;
-            self.status.model_stop_at = Some(if accepted { deadline } else { Instant::now() });
+            let deadline = cancellation_deadline();
+            let proof = provider::cancel(&self.native, &session_id, &turn_id, deadline).await;
+            self.status.model_stop_at = Some(stop_after_cancel(deadline, proof));
             return Ok(());
         }
         self.apply_stashed_entries().await?;
@@ -3133,66 +3124,68 @@ impl EventProcessor {
             signal.record_id,
             "turn.model_observed",
         )?;
-        // Muse 1.4.25 fills an omitted response model with the requested
-        // selector. An exact echo carries no independent provider evidence.
-        let Some(actual) =
-            actual.filter(|actual| Some(*actual) != self.turn_model.expected.as_deref())
-        else {
-            self.status.provider_model_turn = None;
-            self.commit_event(
-                "turn.model_observed",
-                native_id,
-                json!({
-                    "turn_id": signal.turn_id,
-                    "model_unverified_reason": eliot_core::PROVIDER_MODEL_UNNAMED,
-                }),
-            )
-            .await?;
-            return self.flush_observed_messages(signal.turn_id).await;
-        };
+        let model = model_disposition(
+            self.turn_model
+                .expected
+                .as_deref()
+                .map(provider::observed_model),
+            actual.map(provider::observed_model),
+        );
         let policy = SecretPolicy::new(self.secrets.iter().cloned());
-        let model = policy.redact_bounded(actual, 256);
-        if let Some(expected) = self.turn_model.expected.as_deref()
-            && provider::canonical_model(expected) != provider::canonical_model(actual)
-        {
-            let mismatch = eliot_core::ProviderModelMismatch {
-                requested_model: policy.redact_bounded(expected, 256),
-                reported_model: model,
-                revision: self
-                    .model_hold_settings_path
-                    .as_deref()
-                    .and_then(crate::install::model_hold_revision_for_path),
-            };
-            self.status.model_mismatch = Some((signal.turn_id.to_owned(), mismatch.reason()));
-            self.status.provider_model_turn = None;
-            self.messages = TurnMessages::default();
-
-            // The hold and the cancellation are independent. Start the exact
-            // cancel immediately and persist the mismatch even if it fails.
-            let native = self.native.clone();
-            let deadline = Instant::now() + Duration::from_secs(5);
-            let (committed, accepted) = tokio::join!(
+        match model {
+            ModelDisposition::Unverified => {
+                self.status.provider_model_turn = None;
                 self.commit_event(
                     "turn.model_observed",
                     native_id,
                     json!({
-                        "turn_id": signal.turn_id, "model_mismatch": mismatch,
-                    })
-                ),
-                provider::cancel(&native, signal.session_id, signal.turn_id, deadline),
-            );
-            self.status.model_stop_at = Some(if accepted { deadline } else { Instant::now() });
-            return committed;
+                        "turn_id": signal.turn_id,
+                        "model_unverified_reason": eliot_core::PROVIDER_MODEL_UNNAMED,
+                    }),
+                )
+                .await?;
+            }
+            ModelDisposition::Verified(reported) => {
+                let model = policy.redact_bounded(reported, 256);
+                self.commit_event(
+                    "turn.model_observed",
+                    native_id,
+                    json!({ "turn_id": signal.turn_id, "model": model }),
+                )
+                .await?;
+                self.status.provider_model_turn = Some(signal.turn_id.to_owned());
+            }
+            ModelDisposition::Contain {
+                requested,
+                reported,
+            } => {
+                let mismatch = eliot_core::ProviderModelMismatch {
+                    requested_model: policy.redact_bounded(requested, 256),
+                    reported_model: policy.redact_bounded(reported, 256),
+                    revision: self
+                        .model_hold_settings_path
+                        .as_deref()
+                        .and_then(crate::install::model_hold_revision_for_path),
+                };
+                self.status.model_mismatch = Some((signal.turn_id.to_owned(), mismatch.reason()));
+                self.status.provider_model_turn = None;
+                self.messages = TurnMessages::default();
+
+                // The hold and the exact native cancellation are independent.
+                let native = self.native.clone();
+                let deadline = cancellation_deadline();
+                let (committed, proof) = tokio::join!(
+                    self.commit_event(
+                        "turn.model_observed",
+                        native_id,
+                        json!({ "turn_id": signal.turn_id, "model_mismatch": mismatch }),
+                    ),
+                    provider::cancel(&native, signal.session_id, signal.turn_id, deadline),
+                );
+                self.status.model_stop_at = Some(stop_after_cancel(deadline, proof));
+                return committed;
+            }
         }
-        self.commit_event(
-            "turn.model_observed",
-            native_id,
-            json!({
-                "turn_id": signal.turn_id, "model": model,
-            }),
-        )
-        .await?;
-        self.status.provider_model_turn = Some(signal.turn_id.to_owned());
         self.flush_observed_messages(signal.turn_id).await
     }
 
@@ -3607,33 +3600,30 @@ impl EventProcessor {
         }
         let model_verified =
             self.status.provider_model_turn.as_deref() == Some(notification.turn_id.as_str());
-        let model_error = if let Some((_, reason)) = self.status.model_mismatch.as_ref() {
-            Some(("model_mismatch", reason.clone()))
-        } else {
-            None
-        };
-        if model_error.is_none() {
+        let mismatch = self
+            .status
+            .model_mismatch
+            .as_ref()
+            .map(|(_, reason)| reason.clone());
+        let terminal = model_terminal(
+            turn_status(&notification.terminal).unwrap_or("other"),
+            turn_outcome(&notification.terminal).unwrap_or("unknown"),
+            mismatch.as_deref(),
+        );
+        if terminal.mismatch.is_none() {
             self.flush_observed_messages(&notification.turn_id).await?;
         }
-        let status_text = if model_error.is_some() {
-            "failed"
-        } else {
-            turn_status(&notification.terminal).unwrap_or("other")
-        };
+        let status_text = terminal.status;
         let command_id = self.status.active_command_id.clone();
         let provider_restriction = terminal_provider_restriction(&self.status, &notification);
         let secrets = SecretPolicy::new(self.secrets.iter().cloned());
         let mut data = json!({
             "turn_id": notification.turn_id,
             "status": status_text,
-            "outcome": if model_error.is_some() {
-                "failure"
-            } else {
-                turn_outcome(&notification.terminal).unwrap_or("unknown")
-            },
+            "outcome": terminal.outcome,
             "native_status": native_terminal(&notification.terminal).unwrap_or("other"),
         });
-        if model_error.is_none()
+        if terminal.mismatch.is_none()
             && !model_verified
             && notification.terminal == NativeTurnTerminal::Completed
         {
@@ -3683,13 +3673,13 @@ impl EventProcessor {
         }
         // The durable terminal record keeps the structured error message,
         // falling back to the terminal reason the readback used to drop.
-        let native_error = model_error
-            .as_ref()
-            .map(|(_, reason)| reason.clone())
+        let native_error = terminal
+            .mismatch
+            .map(str::to_owned)
             .or_else(|| turn_native_error(&notification, &notification.terminal, &secrets));
         attach_native_error(&mut data, native_error.as_deref(), &secrets);
-        if let Some((code, _)) = model_error {
-            data["native_error"]["code"] = json!(code);
+        if terminal.mismatch.is_some() {
+            data["native_error"]["code"] = json!("model_mismatch");
             eliot_plugin::session::attach_failure_origin(
                 &mut data,
                 "muse",

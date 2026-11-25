@@ -165,9 +165,9 @@ can launch without sign-in.
 An explicit mismatch clears the effective model, suppresses that turn's
 response and records a durable [profile model hold](../spec/monitoring.md#provider-holds)
 with both IDs.
-The adapter checks the exact `turn/cancel` acknowledgement and verifies
-the native terminal. A failed or unconfirmed cancellation invokes the
-existing owned-host stop path. The Owner inbox shows one item for the
+The adapter translates the exact `turn/cancel` acknowledgement and the
+native terminal. Shared containment owns the wait for settlement and invokes
+the existing owned-host stop path if cancellation stays unconfirmed. The Owner inbox shows one item for the
 profile hold. `swarm why` retains the turn diagnosis.
 
 Before `turn/steer` (including `inject active_turn`), the adapter makes a bounded,
