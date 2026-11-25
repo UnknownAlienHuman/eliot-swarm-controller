@@ -53,7 +53,7 @@ impl Router {
             .clone()
             .try_acquire_owned()
             .map_err(|_| Error::new("unavailable", "an autonomy report is already running"))?;
-        let readers = Arc::clone(&self.inner.projection_readers);
+        let readers = self.inner.projection_readers.clone();
         let confirmed = self.confirmed_stuck();
         let report = tokio::task::spawn_blocking(move || {
             let _permit = permit;
