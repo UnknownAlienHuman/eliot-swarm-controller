@@ -1019,6 +1019,12 @@ pub(crate) async fn run_diff(
             .map_err(Failure::invalid_response)?;
         for file in response.files {
             print!("{}", file.text);
+            if file.truncated {
+                if !file.text.is_empty() && !file.text.ends_with('\n') {
+                    println!();
+                }
+                println!("[Diff truncated for {}]", file.path);
+            }
         }
         if response.truncated {
             eprintln!("Diff is truncated or has incomplete file coverage.");

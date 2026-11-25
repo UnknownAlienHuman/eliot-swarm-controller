@@ -102,7 +102,31 @@ impl Router {
             .as_ref()
             .is_none_or(|paths| !paths.is_empty())
         {
-            let (bytes, truncated) = GitProbe::new()?.diff_output(&checkout, &base, &[]).await?;
+            let mut pathspec = Vec::new();
+            if let Some(path) = request.path.as_deref() {
+                pathspec.push(path);
+                if let Some(GitView::Data(observation)) = git.as_ref()
+                    && observation.head.as_deref() == Some(&head)
+                    && let Some(entries) = observation.dirty.as_ref()
+                    && let Some(companion) = entries.iter().find_map(|entry| {
+                        let original = entry.original_path.as_deref()?;
+                        if entry.path == path {
+                            Some(original)
+                        } else if original == path {
+                            Some(entry.path.as_str())
+                        } else {
+                            None
+                        }
+                    })
+                    && companion != path
+                    && valid_diff_path(companion)
+                {
+                    pathspec.push(companion);
+                }
+            }
+            let (bytes, truncated) = GitProbe::new()?
+                .diff_output(&checkout, &base, &pathspec)
+                .await?;
             diff.read_tracked(&bytes, truncated)?;
             if let Some(GitView::Data(git)) = git
                 && git.available

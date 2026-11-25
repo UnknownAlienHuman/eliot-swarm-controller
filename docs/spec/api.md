@@ -3077,8 +3077,9 @@ It uses the same Owner, self and managed Agent scope as `agent.git` and
   and names that turn. These paths scope the current patch. They convey no
   historical hunk attribution. Commands without reported paths add no files.
 
-The optional `path` selects one literal workspace-relative path, including
-either side of a detected rename. The patch includes binary notices, rename
+The optional `path` limits Git to one literal workspace-relative path. When the
+Git observation records a rename, selecting either path includes its companion.
+The patch includes binary notices, rename
 paths and Git modes. Untracked additions use the current complete `agent.git`
 file observation. Missing observation coverage or any output limit sets
 `truncated`. Core bounds the returned text to 256 KiB, 100 files and 1,000
