@@ -115,11 +115,13 @@ fn is_known_streaming_detail(event_type: &str) -> bool {
         event_type,
         "session.compaction.delta"
             | "session.idle"
+            | "session.instructions.updated"
             | "session.reasoning.delta"
             | "session.reasoning.ended"
             | "session.reasoning.started"
             | "session.step.ended"
             | "session.step.failed"
+            | "session.step.first-token"
             | "session.step.streamed"
             | "session.text.delta"
             | "session.text.ended"

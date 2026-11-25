@@ -1,4 +1,5 @@
 mod children;
+mod warnings;
 use self::children::{
     ChildState, ChildThreads, spawned_item_id, spawned_parent_thread, top_level_parent_thread,
 };
@@ -6,8 +7,8 @@ use crate::native_child::{
     ChildBinding, binding_from_ack, build_registration, is_admission_rejection, register_child,
 };
 use eliot_core::{
-    ChildRegistration, ContextItem, ContextWindowTracker, Error, ProviderRestriction, Result,
-    SecretPolicy, SessionTokenTotals, SessionUsage, TurnUsage,
+    ChildRegistration, ContextItem, ContextWindowTracker, Error, NATIVE_WARNING_EVENT,
+    ProviderRestriction, Result, SecretPolicy, SessionTokenTotals, SessionUsage, TurnUsage,
     api::{NativeNotice, NativeNoticeKind},
     limits::{MAX_TOOL_COMMAND_BYTES, MAX_TOOL_ERROR_TAIL_BYTES},
     turn_started_data,
@@ -63,6 +64,7 @@ pub(crate) struct EventStatus {
     pub failure: Option<String>,
     pub batch_unknown: bool,
     pub source_unknown: bool,
+    pub unbound_warnings_dropped: u64,
     pub stopped: bool,
     pub session_history_failure_at: Option<Instant>,
     pub compaction: Option<CompactionProgress>,
@@ -230,6 +232,7 @@ struct EventProcessor {
     session_usage_turn: Option<String>,
     /// Unique native id sequence for transient retry/error notices.
     notice_seq: u64,
+    warnings: warnings::Warnings,
     native_scope: String,
     child_bindings: HashMap<String, ChildBinding>,
     child_states: HashMap<String, ChildState>,
@@ -437,6 +440,7 @@ impl EventProcessor {
             session_usage: None,
             session_usage_turn: None,
             notice_seq: 0,
+            warnings: warnings::Warnings::default(),
             native_scope: config.native_scope.clone(),
             child_bindings: HashMap::new(),
             child_states: HashMap::new(),
@@ -703,6 +707,14 @@ impl EventProcessor {
         // folded and committed immediately, even while idle.
         if method == "thread/tokenUsage/updated" {
             return !self.status.ready;
+        }
+        if method == "warning" {
+            return !self.status.ready && params.get("threadId").is_some_and(Value::is_string);
+        }
+        if method == "mcpServer/startupStatus/updated" {
+            return !self.status.ready
+                && params.get("status").and_then(Value::as_str) == Some("failed")
+                && params.get("threadId").is_some_and(Value::is_string);
         }
         if self.compaction_notification_matches(method, params) {
             return false;
@@ -1419,7 +1431,7 @@ impl EventProcessor {
             .map_err(|_| {
                 Error::new(
                     "native_protocol",
-                    "Codex serverRequest/resolved did not match the 0.161 schema",
+                    "Codex serverRequest/resolved did not match the native schema",
                 )
             })?;
         let thread_id =
@@ -1597,7 +1609,7 @@ impl EventProcessor {
                     serde_json::from_value(params).map_err(|_| {
                         Error::new(
                             "native_protocol",
-                            "Codex item/started did not match the 0.161 schema",
+                            "Codex item/started did not match the native schema",
                         )
                     })?;
                 validate_thread_and_turn(
@@ -1675,7 +1687,7 @@ impl EventProcessor {
                     serde_json::from_value(params.clone()).map_err(|_| {
                         Error::new(
                             "native_protocol",
-                            "Codex item/completed did not match the 0.161 schema",
+                            "Codex item/completed did not match the native schema",
                         )
                     })?;
                 validate_thread_and_turn(
@@ -1746,6 +1758,28 @@ impl EventProcessor {
             "error" => {
                 self.note_native_error(params).await?;
             }
+            "warning" => {
+                let policy = SecretPolicy::new(self.secrets.iter().cloned());
+                if let Some((id, data)) =
+                    self.warnings
+                        .observe(self.status.thread_id.as_deref(), params, &policy)?
+                {
+                    self.commit_event(NATIVE_WARNING_EVENT, id, data).await?;
+                }
+                self.status.unbound_warnings_dropped = self.warnings.unbound_dropped();
+            }
+            "mcpServer/startupStatus/updated" => {
+                let policy = SecretPolicy::new(self.secrets.iter().cloned());
+                if let Some((id, data)) = self.warnings.observe_startup_status(
+                    self.status.thread_id.as_deref(),
+                    params,
+                    &policy,
+                )? {
+                    self.commit_event(NATIVE_WARNING_EVENT, id, data).await?;
+                }
+                self.status.unbound_warnings_dropped = self.warnings.unbound_dropped();
+            }
+            _ if is_advisory_notification(method) => {}
             _ => {
                 if self.status.ready
                     && params
@@ -1864,13 +1898,13 @@ impl EventProcessor {
             }
         }
         if completed_file_change {
-            // Installed 0.161 ThreadItem/FileUpdateChange: only native path fields,
+            // Installed ThreadItem/FileUpdateChange: only native path fields,
             // including update.move_path, are edit hints; diffs are never persisted.
             let file_change: NativeFileChangeItem =
                 serde_json::from_value(item.clone()).map_err(|_| {
                     Error::new(
                         "native_protocol",
-                        "Codex completed fileChange did not match the 0.161 schema",
+                        "Codex completed fileChange did not match the native schema",
                     )
                 })?;
             data["changed_paths"] = json!([]);
@@ -2348,6 +2382,18 @@ fn turn_activity_notification(method: &str) -> bool {
         || matches!(method, "turn/diff/updated" | "turn/plan/updated")
 }
 
+fn is_advisory_notification(method: &str) -> bool {
+    matches!(
+        method,
+        "account/rateLimits/updated"
+            | "thread/status/changed"
+            | "turn/diff/updated"
+            | "mcpServer/startupStatus/updated"
+            | "item/commandExecution/terminalInteraction"
+            | "model/safetyBuffering/updated"
+    )
+}
+
 fn known_notification(method: &str) -> bool {
     matches!(
         method,
@@ -2359,6 +2405,7 @@ fn known_notification(method: &str) -> bool {
             | "thread/started"
             | "thread/tokenUsage/updated"
             | "error"
+            | "mcpServer/startupStatus/updated"
             | "turn/diff/updated"
             | "turn/plan/updated"
             | "item/mcpToolCall/progress"

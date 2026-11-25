@@ -1162,6 +1162,9 @@ processing the stream. These facts carry the adapter's decode site and a bounded
 native discriminator, without the raw payload. They have no lifecycle, authority or
 outcome semantics. A terminal record with an unfamiliar outcome cannot establish
 success, failure or interruption. Preserve frame integrity and exact binding checks.
+Known native advisory and progress records with no independent durable meaning
+do not consume the diagnostic budget. Adapter-specific contracts name those
+records and retain their existing binding, progress and native-history handling.
 Detect native capabilities from advertised or observed behavior. Installed version
 strings are diagnostic metadata. Choose native formats from the advertised methods,
 schema or fields present in the data. Check the feature or authority required for the
@@ -1173,6 +1176,20 @@ Codex skip-lists the known high-volume notifications `item/agentMessage/delta`,
 `item/reasoning/textDelta` before its transport queue. These notifications have
 no independent normalized event; supported completions carry the durable facts.
 An unfamiliar method cannot establish a native turn binding.
+
+`session.native_warning` retains the [Core diagnostic](../../crates/eliot-core/src/native_data.rs)
+for an exact owned thread and generation, independently of turn state. Codex
+0.167.1 `warning` has an optional `threadId` and no turn ID, so a warning is
+thread-scoped, including after its turn has ended; it is never attached to a
+guessed or active turn. Codex supplies cumulative per-code counts with a bounded
+code inventory and the redacted, UTF-8-bounded message. A missing or mismatched
+thread binding increments `unbound_warnings_dropped` in the native snapshot and
+retains no warning text. The diagnostic supplies no lifecycle, progress, quota
+or settlement evidence. MCP startup status emits the same typed diagnostic only
+for `status: failed` on the exact owned thread; starting, ready and cancelled
+updates remain silent. Its bounded message preserves the startup error or typed
+failure reason. An unbound startup failure is counted as dropped without retaining
+its payload.
 
 Known Codex `reasoning` item envelopes are not schema-drift diagnostics.
 Keep normal item processing, including existing thread and turn binding,

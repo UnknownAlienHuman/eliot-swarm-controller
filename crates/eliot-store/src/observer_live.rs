@@ -94,6 +94,9 @@ pub(super) fn persist_turn_fact(
     agent: &Agent,
     event: &NativeEvent,
 ) -> Result<()> {
+    if event.kind == core::NATIVE_WARNING_EVENT {
+        return core::NativeWarning::validate_data(&event.data, agent.native_ref.as_deref());
+    }
     if !matches!(
         event.kind.as_str(),
         "turn.started" | "turn.completed" | "message.completed"

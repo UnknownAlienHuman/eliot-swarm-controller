@@ -21,6 +21,7 @@ pub(super) struct ChildState {
     final_text: Option<String>,
     lifecycle: ChildLifecycle,
     unclassified_seq: u64,
+    warnings: warnings::Warnings,
     /// Baseline and latest cumulative token snapshot for this exact child
     /// turn. The terminal event carries only their difference.
     turn_usage: Option<(String, NativeTokenUsageDelta, NativeTokenUsageDelta)>,
@@ -40,6 +41,7 @@ impl ChildState {
             final_text: None,
             lifecycle: ChildLifecycle::default(),
             unclassified_seq: 0,
+            warnings: warnings::Warnings::default(),
             turn_usage: None,
             ready_committed: false,
         }
@@ -619,6 +621,21 @@ impl EventProcessor {
             }
             return;
         }
+        if method == "mcpServer/startupStatus/updated"
+            && params.get("status").and_then(Value::as_str) != Some("failed")
+        {
+            return;
+        }
+        let warning_without_child_binding =
+            method == "warning" || method == "mcpServer/startupStatus/updated";
+        if warning_without_child_binding
+            && !self.child_states.contains_key(&child_thread)
+            && !self.child_pending.contains_key(&child_thread)
+        {
+            self.warnings.record_unbound_dropped();
+            self.status.unbound_warnings_dropped = self.warnings.unbound_dropped();
+            return;
+        }
         if self
             .child_states
             .get(&child_thread)
@@ -1186,6 +1203,53 @@ impl EventProcessor {
             "thread/tokenUsage/updated" => {
                 self.note_child_token_usage(child_thread, &params)?;
             }
+            "warning" => {
+                let policy = SecretPolicy::new(self.secrets.iter().cloned());
+                let state = self
+                    .child_states
+                    .get_mut(child_thread)
+                    .ok_or_else(|| Error::new("bad_state", "Codex child state missing"))?;
+                if let Some((id, data)) =
+                    state
+                        .warnings
+                        .observe(Some(child_thread), params, &policy)?
+                {
+                    state
+                        .commit_event(
+                            &mut self.sink,
+                            &self.host,
+                            &self.credential,
+                            NATIVE_WARNING_EVENT,
+                            id,
+                            data,
+                        )
+                        .await?;
+                }
+            }
+            "mcpServer/startupStatus/updated" => {
+                let policy = SecretPolicy::new(self.secrets.iter().cloned());
+                let state = self
+                    .child_states
+                    .get_mut(child_thread)
+                    .ok_or_else(|| Error::new("bad_state", "Codex child state missing"))?;
+                if let Some((id, data)) =
+                    state
+                        .warnings
+                        .observe_startup_status(Some(child_thread), params, &policy)?
+                {
+                    state
+                        .commit_event(
+                            &mut self.sink,
+                            &self.host,
+                            &self.credential,
+                            NATIVE_WARNING_EVENT,
+                            id,
+                            data,
+                        )
+                        .await?;
+                }
+            }
+            _ if is_advisory_notification(method) => {}
             _ => {
                 let host = self.host.clone();
                 let credential = self.credential.clone();
