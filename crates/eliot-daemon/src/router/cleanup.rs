@@ -92,6 +92,7 @@ pub(super) struct AutomaticCleanupState {
     first_sweep_complete: bool,
     active_sweep: Option<AutomaticCleanupProgress>,
     last_sweep: Option<eliot_core::api::AutomaticCleanupSweep>,
+    owned_scans: HashMap<String, discovery::OwnedRootResume>,
 }
 
 impl AutomaticCleanupState {
@@ -341,7 +342,8 @@ impl Router {
             if let Some(size) = item.bytes {
                 if item.verdict == "safe" {
                     class.would_remove = class.would_remove.saturating_add(size);
-                } else {
+                }
+                if outcome == "kept" {
                     class.kept = class.kept.saturating_add(size);
                 }
             } else {
@@ -1453,6 +1455,7 @@ impl Router {
                 kept_ids: None,
                 backfill_after: None,
                 owned_backfill_after: None,
+                owned_root_scan: None,
                 inventory_rank: None,
                 inventory_seq_after: None,
                 request_binding: None,
@@ -1473,19 +1476,22 @@ impl Router {
         {
             return Err(Error::new("invalid", "cleanup continuation is stale"));
         }
-        if page.snapshot_seq.is_none() && page.owned_backfill_after != Some(0) {
-            let cursor = page.owned_backfill_after.unwrap_or(0);
-            if let Some(after) = self
-                .backfill_owned_cleanup_children(cursor, &name, request.project.as_deref())
+        if page.snapshot_seq.is_none()
+            && (page.owned_backfill_after != Some(0) || page.owned_root_scan.is_some())
+            && self
+                .backfill_owned_cleanup_children(
+                    &mut page,
+                    &binding,
+                    &name,
+                    request.project.as_deref(),
+                    &mut plan.inventory_issues,
+                )
                 .await?
-            {
-                page.owned_backfill_after = Some(after);
-                page.request_binding = Some(binding);
-                plan.truncated = true;
-                plan.continuation = Some(page.encode()?);
-                return Ok(plan);
-            }
-            page.owned_backfill_after = Some(0);
+        {
+            page.request_binding = Some(binding);
+            plan.truncated = true;
+            plan.continuation = Some(page.encode()?);
+            return Ok(plan);
         }
         if !auto_cleanup && page.snapshot_seq.is_none() {
             // Backfill within one slice, then freeze the inventory on the
@@ -1807,6 +1813,7 @@ impl Router {
                     kept_ids,
                     backfill_after: None,
                     owned_backfill_after: None,
+                    owned_root_scan: None,
                     inventory_rank: keep_scan_cursor.then_some(next_rank),
                     inventory_seq_after: if keep_scan_cursor { next_seq } else { None },
                     request_binding: Some(binding),
@@ -2129,12 +2136,7 @@ impl Router {
             (agent, store.agent_artifact_root(id, generation)?)
         };
         if let Some(root) = root {
-            self.discover_owned_cleanup_children(
-                &root,
-                true,
-                Instant::now() + CLEANUP_BACKFILL_BUDGET,
-            )
-            .await?;
+            self.discover_terminal_cargo_children(&root).await?;
         }
         let inventory = self
             .inner

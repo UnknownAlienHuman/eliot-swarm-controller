@@ -48,6 +48,10 @@ Omitted scope resolves to `all` for the authenticated Owner and `self_tree` for 
 Backfill reports an unreadable or missing source in the page's `inventory_issues`
 with Agent, generation, path when available, and bounded reason and detail. It
 continues inventory for other entries. These diagnostics grant no cleanup authority.
+When owned-root discovery reaches 1,024 entries or its time budget, it reports
+`owned_root_scan_incomplete` and resumes inside the same root through the
+continuation. An expired cursor or changed directory identity requires a fresh
+plan.
 Manual plans select `registered` rows. Settled rows (`removed`, `unknown`,
 `skipped(...)`) are attempt history read back from retained plans, and filtering
 them before the page cap keeps a settled prefix from starving later eligible
@@ -346,7 +350,10 @@ and the latest completed sweep's aggregate outcomes since daemon startup. A
 kept artifacts or planned removals. An identical observation from a later sweep
 does not record another item. The daemon keeps bounded recent observations and
 evicts the oldest at capacity. Every sweep still measures its current totals and
-updates status independently of diagnostic events. Command and apply receipts
+updates status independently of diagnostic events. Per-class would-remove
+bytes are plan estimates. Kept bytes reflect known sizes of kept outcomes,
+including a candidate counted in the plan whose removal was refused. Removed
+bytes come from settled removals. Command and apply receipts
 remain the evidence for actual outcomes.
 
 The direct manager ends a completed child with a graceful Stop while it has

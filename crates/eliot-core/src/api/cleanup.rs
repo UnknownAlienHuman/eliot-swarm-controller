@@ -235,10 +235,13 @@ pub struct PlanContinuation {
     /// of returning the same empty page and token.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backfill_after: Option<String>,
-    /// Owned-root discovery sequence. Zero marks completion before the
-    /// ordinary Agent backfill freezes the inventory.
+    /// Last completed owned-root sequence. Zero without a root cursor marks
+    /// completion before the ordinary Agent backfill freezes the inventory.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owned_backfill_after: Option<i64>,
+    /// Daemon-local cursor for an incomplete scan of the next owned root.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owned_root_scan: Option<String>,
     /// Rank and ledger sequence reached by the bounded Store inventory scan.
     /// This advances through empty/filtered pages without changing the
     /// displayed-artifact cursor above.
@@ -256,7 +259,7 @@ pub struct PlanContinuation {
 #[doc(hidden)]
 pub enum CleanupContinuationInputSchema {
     Token(String),
-    State(PlanContinuation),
+    State(Box<PlanContinuation>),
 }
 
 impl PlanContinuation {
@@ -319,6 +322,12 @@ impl PlanContinuation {
                 .is_some_and(|id| crate::parse_agent_id(id).is_err())
             || self.snapshot_seq.is_some_and(|seq| seq < 0)
             || self.owned_backfill_after.is_some_and(|seq| seq < 0)
+            || self.owned_root_scan.as_deref().is_some_and(|id| {
+                cleanup_id(id).is_err()
+                    || self.owned_backfill_after.is_none()
+                    || self.snapshot_seq.is_some()
+                    || self.request_binding.is_none()
+            })
             || self.inventory_rank.is_some_and(|rank| rank > 3)
             || (self.inventory_rank.is_none() && self.inventory_seq_after.is_some())
             || self.inventory_seq_after.is_some_and(|seq| seq <= 0)

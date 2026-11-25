@@ -1,18 +1,55 @@
 //! Discover regenerable targets and private stands under durable artifact roots.
 use super::*;
-use std::collections::VecDeque;
+use eliot_plugin::FileIdentity;
+use std::fs::ReadDir;
 use std::time::UNIX_EPOCH;
+use tokio::sync::oneshot;
 
 const MAX_DISCOVERY_ENTRIES: usize = 1024;
 const MAX_CARGO_DEPTH: usize = 3;
 
+const MAX_OWNED_SCANS: usize = 32;
+const OWNED_SCAN_TTL: Duration = Duration::from_secs(5 * 60);
+
+struct OwnedRootWalk {
+    path: PathBuf,
+    cursors: Vec<ReadDir>,
+    paused_identities: Vec<FileIdentity>,
+}
+
+pub(super) struct OwnedRootResume {
+    after: i64,
+    seq: i64,
+    binding: String,
+    walk: OwnedRootWalk,
+    _expiry: oneshot::Sender<()>,
+}
+
 impl Router {
     pub(super) async fn backfill_owned_cleanup_children(
         &self,
-        mut after: i64,
+        page: &mut PlanContinuation,
+        binding: &str,
         principal: &str,
         project: Option<&str>,
-    ) -> Result<Option<i64>> {
+        issues: &mut Vec<CleanupInventoryIssue>,
+    ) -> Result<bool> {
+        let mut after = page.owned_backfill_after.unwrap_or(0);
+        let mut resume = page
+            .owned_root_scan
+            .take()
+            .map(|id| {
+                let mut scans = self.inner.automatic_cleanup.lock_recover();
+                if !scans
+                    .owned_scans
+                    .get(&id)
+                    .is_some_and(|scan| scan.after == after && scan.binding == binding)
+                {
+                    return Err(stale_scan());
+                }
+                scans.owned_scans.remove(&id).ok_or_else(stale_scan)
+            })
+            .transpose()?;
         let deadline = Instant::now() + CLEANUP_BACKFILL_BUDGET;
         for _ in 0..4 {
             let roots = self
@@ -22,52 +59,160 @@ impl Router {
                 .await
                 .cleanup_owned_roots_page(after)?;
             if roots.is_empty() {
-                return Ok(None);
+                if resume.is_some() {
+                    return Err(stale_scan());
+                }
+                page.owned_backfill_after = Some(0);
+                return Ok(false);
             }
             for (seq, root) in roots {
-                if Instant::now() >= deadline {
-                    return Ok(Some(after));
+                if resume.is_none() && Instant::now() >= deadline {
+                    page.owned_backfill_after = Some(after);
+                    return Ok(true);
                 }
-                after = seq;
-                if project.is_some_and(|project| root.project != project)
-                    || (principal != "owner"
-                        && !self
+                let authorized = project.is_none_or(|project| root.project == project)
+                    && (principal == "owner"
+                        || self
                             .inner
                             .store
                             .lock()
                             .await
-                            .cleanup_authorized(principal, &root)?)
+                            .cleanup_authorized(principal, &root)?);
+                if resume
+                    .as_ref()
+                    .is_some_and(|scan| scan.seq != seq || !authorized)
                 {
-                    continue;
+                    return Err(stale_scan());
                 }
-                if let Err(error) = self
-                    .discover_owned_cleanup_children(&root, false, deadline)
-                    .await
-                    && matches!(error.code.as_str(), "internal" | "unavailable")
-                {
-                    crate::logging::record(
-                        &self.secret_policy_snapshot(),
-                        "daemon.cleanup_discovery_failed",
-                        &[("agent", &root.agent)],
-                        Some(&error),
-                    );
+                if authorized {
+                    let walk = resume.take().map(|scan| scan.walk);
+                    let resumed = walk.is_some();
+                    match self
+                        .discover_owned_cleanup_children(&root, false, walk, deadline)
+                        .await
+                    {
+                        Ok(Some(walk)) => {
+                            page.owned_root_scan =
+                                Some(self.park_owned_scan(after, seq, binding, walk)?);
+                            page.owned_backfill_after = Some(after);
+                            issues.push(self.owned_scan_issue(
+                                &root,
+                                "owned_root_scan_incomplete",
+                                "Owned artifact discovery will resume within this root",
+                            ));
+                            return Ok(true);
+                        }
+                        Ok(None) => {}
+                        Err(error) if resumed && error.code == "invalid" => return Err(error),
+                        Err(error) => issues.push(self.owned_scan_issue(
+                            &root,
+                            "owned_root_scan_failed",
+                            &error.message,
+                        )),
+                    }
                 }
+                after = seq;
             }
         }
-        Ok(Some(after))
+        page.owned_backfill_after = Some(after);
+        Ok(true)
     }
 
-    pub(super) async fn discover_owned_cleanup_children(
+    fn owned_scan_issue(
+        &self,
+        root: &ArtifactView,
+        reason: &str,
+        detail: &str,
+    ) -> CleanupInventoryIssue {
+        let policy = self.secret_policy_snapshot();
+        CleanupInventoryIssue {
+            agent: root.agent.clone(),
+            generation: root.generation,
+            path: Some(policy.redact_bounded(&root.path, 384)),
+            reason: reason.to_owned(),
+            detail: policy.redact_bounded(detail, 384),
+        }
+    }
+
+    fn park_owned_scan(
+        &self,
+        after: i64,
+        seq: i64,
+        binding: &str,
+        walk: OwnedRootWalk,
+    ) -> Result<String> {
+        let id = ulid::Ulid::new().to_string();
+        let (expiry, cancel) = oneshot::channel();
+        {
+            let mut state = self.inner.automatic_cleanup.lock_recover();
+            if state.owned_scans.len() >= MAX_OWNED_SCANS {
+                return Err(Error::new(
+                    "busy",
+                    "Too many incomplete owned artifact scans",
+                ));
+            }
+            state.owned_scans.insert(
+                id.clone(),
+                OwnedRootResume {
+                    after,
+                    seq,
+                    binding: binding.to_owned(),
+                    walk,
+                    _expiry: expiry,
+                },
+            );
+        }
+        let inner = Arc::downgrade(&self.inner);
+        let parked = id.clone();
+        let expires = Instant::now() + OWNED_SCAN_TTL;
+        drop(tokio::spawn(async move {
+            if timeout_at(expires, cancel).await.is_err()
+                && let Some(inner) = inner.upgrade()
+            {
+                inner
+                    .automatic_cleanup
+                    .lock_recover()
+                    .owned_scans
+                    .remove(&parked);
+            }
+        }));
+        Ok(id)
+    }
+
+    pub(super) async fn discover_terminal_cargo_children(&self, root: &ArtifactView) -> Result<()> {
+        // The terminal hook takes one slice. Periodic inventory owns the
+        // continuation and discovers any remaining targets.
+        self.discover_owned_cleanup_children(
+            root,
+            true,
+            None,
+            Instant::now() + CLEANUP_BACKFILL_BUDGET,
+        )
+        .await
+        .map(|_| ())
+    }
+
+    async fn discover_owned_cleanup_children(
         &self,
         root: &ArtifactView,
         cargo_only: bool,
+        walk: Option<OwnedRootWalk>,
         deadline: Instant,
-    ) -> Result<()> {
-        let path = self.verify_discovery_root(root)?;
+    ) -> Result<Option<OwnedRootWalk>> {
+        let path = self
+            .verify_discovery_root(root)
+            .map_err(|error| if walk.is_some() { stale_scan() } else { error })?;
         let daemon_root = self.inner.data_root.clone();
         let root = root.clone();
-        let candidates = tokio::task::spawn_blocking(move || {
-            discover_children(path, &root, &daemon_root, cargo_only, deadline)
+        let (candidates, remaining) = tokio::task::spawn_blocking(move || {
+            let mut walk = walk.unwrap_or_else(|| OwnedRootWalk {
+                path: path.clone(),
+                cursors: Vec::new(),
+                paused_identities: Vec::new(),
+            });
+            let (candidates, finished) =
+                walk.advance(&path, &root, &daemon_root, cargo_only, deadline)?;
+            Ok::<_, Error>((candidates, (!finished).then_some(walk)))
         })
         .await
         .map_err(|_| Error::new("internal", "artifact discovery worker did not settle"))??;
@@ -84,7 +229,7 @@ impl Router {
                 Some(_) => {}
             }
         }
-        Ok(())
+        Ok(remaining)
     }
 
     fn verify_discovery_root(&self, root: &ArtifactView) -> Result<PathBuf> {
@@ -150,35 +295,90 @@ impl Router {
     }
 }
 
-fn discover_children(
-    path: PathBuf,
-    root: &ArtifactView,
-    daemon_root: &Path,
-    cargo_only: bool,
-    deadline: Instant,
-) -> Result<Vec<ArtifactView>> {
-    let mut directories = VecDeque::from([(path, 1)]);
-    let mut candidates = Vec::new();
-    let mut remaining = MAX_DISCOVERY_ENTRIES;
-    'directories: while let Some((parent, depth)) = directories.pop_front() {
-        let Ok(parent) = Directory::open(&parent) else {
-            continue;
-        };
-        for entry in parent.entries().map_err(discovery_io)? {
-            if remaining == 0 || Instant::now() >= deadline {
-                break 'directories;
+fn stale_scan() -> Error {
+    Error::new(
+        "invalid",
+        "owned artifact scan continuation is stale; start a new cleanup plan",
+    )
+}
+
+impl OwnedRootWalk {
+    fn advance(
+        &mut self,
+        path: &Path,
+        root: &ArtifactView,
+        daemon_root: &Path,
+        cargo_only: bool,
+        deadline: Instant,
+    ) -> Result<(Vec<ArtifactView>, bool)> {
+        if !self.path.starts_with(path) {
+            return Err(stale_scan());
+        }
+        let resumed = !self.cursors.is_empty();
+        let mut directory = Directory::open(&self.path)
+            .map_err(|error| if resumed { stale_scan() } else { error })?;
+        if resumed {
+            if directory
+                .directory_identities(self.cursors.len())
+                .map_err(discovery_io)?
+                != self.paused_identities
+            {
+                return Err(stale_scan());
             }
+        } else {
+            if directory.identity()? != root.identity {
+                return Err(Error::new(
+                    "identity_changed",
+                    "artifact root ownership changed",
+                ));
+            }
+            self.cursors
+                .push(directory.entries().map_err(discovery_io)?);
+        }
+        let mut candidates = Vec::new();
+        let mut remaining = MAX_DISCOVERY_ENTRIES;
+        while !self.cursors.is_empty() {
+            if remaining == 0 || Instant::now() >= deadline {
+                // Save the native iterator position, release the path pins and
+                // re-open the same directory identities before the next slice.
+                self.path.clone_from(&directory.path);
+                self.paused_identities = directory
+                    .directory_identities(self.cursors.len())
+                    .map_err(discovery_io)?;
+                return Ok((candidates, false));
+            }
+            let depth = self.cursors.len();
+            let Some(entry) = self
+                .cursors
+                .last_mut()
+                .unwrap()
+                .next()
+                .transpose()
+                .map_err(discovery_io)?
+            else {
+                self.cursors.pop();
+                if depth > 1 {
+                    directory.pop_entry_directory();
+                }
+                continue;
+            };
             remaining -= 1;
-            let entry = entry.map_err(discovery_io)?;
-            let path = parent.path.join(entry.file_name());
+            let path = directory.path.join(entry.file_name());
             if !entry.file_type().is_ok_and(|kind| kind.is_dir())
                 || validate_cleanup_path(&path).is_err()
             {
                 continue;
             }
-            let Ok(directory) = Directory::open(&path) else {
+            let modified = directory
+                .entry_metadata(&entry)
+                .ok()
+                .and_then(|metadata| metadata.modified().ok())
+                .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+                .and_then(|time| i64::try_from(time.as_millis()).ok())
+                .unwrap_or(root.created_at);
+            if directory.push_entry_directory(&entry).is_err() {
                 continue;
-            };
+            }
             let identity = directory.identity()?;
             let stand = if depth == 1 && !cargo_only {
                 crate::stand_cleanup::owned_stand_artifact_times(daemon_root, &path, &identity)
@@ -187,53 +387,50 @@ fn discover_children(
             } else {
                 None
             };
-            let (kind, purpose, created_at, expires_at) = if let Some((created, expires)) = stand {
-                (
+            let class = if let Some((created, expires)) = stand {
+                Some((
                     ArtifactKind::DataDir,
                     SWARM_STAND_ARTIFACT_PURPOSE,
                     created,
                     Some(expires),
-                )
+                ))
             } else if protected_cargo_parent(&path) {
-                continue;
+                None
             } else if cargo_target(&directory) {
-                let modified = entry
-                    .metadata()
-                    .ok()
-                    .and_then(|metadata| metadata.modified().ok())
-                    .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
-                    .and_then(|time| i64::try_from(time.as_millis()).ok())
-                    .unwrap_or(root.created_at);
-                (
+                Some((
                     ArtifactKind::Build,
                     SWARM_CARGO_TARGET_ARTIFACT_PURPOSE,
                     modified.max(root.created_at),
                     None,
-                )
-            } else {
-                if depth < MAX_CARGO_DEPTH {
-                    directories.push_back((path, depth + 1));
-                }
+                ))
+            } else if depth < MAX_CARGO_DEPTH {
+                self.cursors
+                    .push(directory.entries().map_err(discovery_io)?);
                 continue;
+            } else {
+                None
             };
-            candidates.push(ArtifactView {
-                id: ulid::Ulid::new().to_string(),
-                agent: root.agent.clone(),
-                generation: root.generation,
-                project: root.project.clone(),
-                tree: Vec::new(),
-                path: path.to_string_lossy().into_owned(),
-                kind,
-                purpose: purpose.to_owned(),
-                identity,
-                created_at,
-                expires_at,
-                state: "registered".to_owned(),
-                git: None,
-            });
+            directory.pop_entry_directory();
+            if let Some((kind, purpose, created_at, expires_at)) = class {
+                candidates.push(ArtifactView {
+                    id: ulid::Ulid::new().to_string(),
+                    agent: root.agent.clone(),
+                    generation: root.generation,
+                    project: root.project.clone(),
+                    tree: Vec::new(),
+                    path: path.to_string_lossy().into_owned(),
+                    kind,
+                    purpose: purpose.to_owned(),
+                    identity,
+                    created_at,
+                    expires_at,
+                    state: "registered".to_owned(),
+                    git: None,
+                });
+            }
         }
+        Ok((candidates, true))
     }
-    Ok(candidates)
 }
 
 fn protected_cargo_parent(path: &Path) -> bool {
