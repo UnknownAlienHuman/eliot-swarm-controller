@@ -401,8 +401,7 @@ pub(crate) async fn run_launch(
         sources,
         goal,
         no_policy,
-        // The override applies to direct launches only. Queue admission rejects it.
-        owner_override: (!queue && owner_override).then_some(true),
+        owner_override: owner_override.then_some(true),
         ..Default::default()
     });
     if queue {
