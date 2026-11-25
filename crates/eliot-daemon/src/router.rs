@@ -1659,21 +1659,28 @@ impl Router {
         health: WorkerTaskHealth,
         failure: Option<(String, String, u32)>,
     ) {
-        if let Some(task) = self
-            .inner
-            .worker_tasks
-            .lock_recover()
-            .iter_mut()
-            .find(|task| task.name == name)
-        {
-            task.health = health;
-            task.failure_code = None;
-            if let Some((code, cause, restart_count)) = failure {
-                task.failure_code = Some(code);
-                task.last_failure = Some(cause);
-                task.restart_count = restart_count;
-            }
+        let mut tasks = self.inner.worker_tasks.lock_recover();
+        let Some(task) = tasks.iter_mut().find(|task| task.name == name) else {
+            drop(tasks);
+            crate::logging::record(
+                &self.secret_policy_snapshot(),
+                "daemon.worker_status_unregistered",
+                &[("worker", name)],
+                Some(&Error::new(
+                    "internal",
+                    "worker report has no daemon status registration",
+                )),
+            );
+            return;
+        };
+        task.health = health;
+        task.failure_code = None;
+        if let Some((code, cause, restart_count)) = failure {
+            task.failure_code = Some(code);
+            task.last_failure = Some(cause);
+            task.restart_count = restart_count;
         }
+        drop(tasks);
         self.signal_progress();
     }
 

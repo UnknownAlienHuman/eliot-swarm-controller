@@ -994,13 +994,14 @@ carry the same short revision suffix and literal `-dirty` marker. Human `swarm
 status` prints the identity in one line; JSON status retains the typed
 `build_identity` object.
 
-`daemon.status` also reports bounded, redacted runtime status for the two
-daemon-owned automation tasks (`rule_worker` and `goal_driver`) via Core
-`WorkerTaskStatus`/`WorkerTaskHealth`. `starting` means spawned but not yet past the
+`daemon.status` reports bounded, redacted runtime status for all 15
+supervised daemon workers via Core `WorkerTaskStatus`/`WorkerTaskHealth`.
+An unregistered worker name is logged as an error. `starting` means spawned but not yet past the
 task startup boundary; `running` means alive after that boundary and does not prove
 rule/timer/goal delivery; `stopped` means the task exited without error (including
-shutdown); `failed` carries only a bounded code (`worker_panicked`, `worker_cancelled`,
-`worker_task_failed`, `worker_exited`, or the task's error code), never raw messages.
+shutdown); `failed` carries a bounded code and a redacted failure summary.
+The summary remains visible on recovery, and `restart_count` counts restarts
+scheduled during this daemon run.
 The rule worker propagates its actual exit reason from its admission-closed
 return sites: an intentional admission/shutdown exit surfaces as `stopped`,
 while any other `Ok(())` surfaces as `failed` (`worker_exited`).

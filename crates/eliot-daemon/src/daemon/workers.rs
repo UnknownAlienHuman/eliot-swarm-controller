@@ -18,6 +18,10 @@ pub(crate) const WORKER_NAMES: [&str; DaemonStatusResponse::MAX_AUTOMATION_TASKS
     "mail_reoffer",
     "agent_wake",
     "completion_digest",
+    "catalog_refresh",
+    "context_notes",
+    "work_truth",
+    "provider_switch",
 ];
 
 const INITIAL_BACKOFF: Duration = Duration::from_millis(250);
@@ -129,6 +133,18 @@ pub(crate) async fn supervise_with<F, Fut, H>(
     Fut: Future<Output = WorkerOutcome> + Send + 'static,
     H: FnMut(&Error) + Send + 'static,
 {
+    if !WORKER_NAMES.contains(&name) {
+        logging::record(
+            &reporter.policy,
+            "daemon.worker_status_unregistered",
+            &[("worker", name)],
+            Some(&Error::new(
+                "internal",
+                "worker has no daemon status registration",
+            )),
+        );
+        return;
+    }
     let mut restart_count = 0_u32;
     let mut consecutive_failures = 0_u32;
     loop {
