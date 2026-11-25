@@ -18,6 +18,7 @@ impl NativeStdioConfig for CodexStdioConfig {
     const SERVER: &'static str = "Codex app-server";
     const SHORT: &'static str = "Codex";
     const ID_PREFIX: &'static str = "codex";
+    const WINDOWS_DETACHED_STDIO: bool = true;
     /// Inbound methods the Codex host can legitimately send: the
     /// notifications the event task consumes plus the three server-request
     /// families Eliot answers (`events.rs`, `native/requests.rs`).

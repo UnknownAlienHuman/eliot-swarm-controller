@@ -7,13 +7,13 @@ use crate::{
             MAX_MODEL_ID_BYTES, ReaderContext, run_canonical_models, run_model_metadata, run_models,
         },
         server::{
-            ArchiveServerLaunch, provider_config, validate_local_provider,
+            ArchiveServerLaunch, RemoteAgentMcp, provider_config, validate_local_provider,
             validate_local_provider_environment,
         },
         transfer_selected_integration,
         types::{
             ConfigEntry, ConfigMcpServer, InboxUser, McpServerReadback, ModelRef, NativeModelEntry,
-            PermissionRule, SessionInfo,
+            PermissionRule, SessionInfo, mcp_header_digests,
         },
     },
 };
@@ -406,6 +406,7 @@ struct ParsedStart {
     swarm_executable: PathBuf,
     swarm_data_dir: PathBuf,
     swarm_mcp_environment: Vec<(OsString, OsString)>,
+    remote_mcp: Option<RemoteAgentMcp>,
 }
 
 /// Outcome of start phase 4: either a created session ready for the
@@ -1161,6 +1162,18 @@ impl OpenCodePlugin {
             )
         })?;
         let swarm_mcp_environment = mcp_environment.variables;
+        let remote_mcp = eliot_plugin::native_cli::shared_agent_mcp_url(
+            params
+                .agent_mcp_url
+                .as_deref()
+                .filter(|_| params.pass_agent_identity_to_shell.unwrap_or(true)),
+            &environment,
+        )?
+        .map(|url| RemoteAgentMcp {
+            url: url.to_owned(),
+            agent_id: params.agent_id.clone(),
+            generation: params.generation,
+        });
         Ok(Box::new(ParsedStart {
             params,
             native_subagents,
@@ -1186,6 +1199,7 @@ impl OpenCodePlugin {
             swarm_executable,
             swarm_data_dir,
             swarm_mcp_environment,
+            remote_mcp,
         }))
     }
 
@@ -1259,6 +1273,7 @@ impl OpenCodePlugin {
                 swarm_executable: parsed.swarm_executable.clone(),
                 swarm_data_dir: parsed.swarm_data_dir.clone(),
                 swarm_environment: parsed.swarm_mcp_environment.clone(),
+                remote_mcp: parsed.remote_mcp.clone(),
                 native_subagents: parsed.native_subagents.clone(),
             },
             &parsed.secrets,
@@ -1621,8 +1636,6 @@ impl OpenCodePlugin {
         // effective config proves neither and fails the start closed with
         // the created session killed, exactly like the gate above.
         {
-            let expected_command = managed_mcp_command(parsed);
-            let expected_environment = managed_mcp_environment(parsed);
             let proof = match session
                 .http
                 .get_config(phase_deadline(cutoff, RPC_TIMEOUT))
@@ -1639,11 +1652,7 @@ impl OpenCodePlugin {
                             .iter()
                             .any(|server| server.is_serving(SWARM_MCP_SERVER_NAME))
                     }) {
-                        verify_managed_mcp_transport(
-                            &documents,
-                            &expected_command,
-                            &expected_environment,
-                        )
+                        verify_managed_mcp_transport(&documents, parsed)
                     } else {
                         Ok(())
                     }
@@ -2179,11 +2188,7 @@ impl OpenCodePlugin {
                 .iter()
                 .any(|server| server.is_serving(SWARM_MCP_SERVER_NAME))
         }) {
-            verify_managed_mcp_transport(
-                &documents,
-                &managed_mcp_command(parsed),
-                &managed_mcp_environment(parsed),
-            )?;
+            verify_managed_mcp_transport(&documents, parsed)?;
         }
         Ok((mcp_servers, mcp_servers_verified))
     }
@@ -4199,28 +4204,46 @@ fn winning_managed_mcp_server(documents: &[ConfigEntry]) -> Option<&ConfigMcpSer
 /// transport: a same-name entry from any inherited layer (ancestor direct
 /// file, `.opencode/` project directory, or machine scope outside the file
 /// scan) replaces the managed document entry natively, while the inventory
-/// gate only sees the name and status. The winning definition must be the
-/// local stdio shape with exactly the generated argv, no URL, and the
-/// expected scoped Agent environment; anything else refuses the start.
-fn verify_managed_mcp_transport(
-    documents: &[ConfigEntry],
-    expected_command: &[String],
-    expected_environment: &std::collections::HashMap<String, String>,
-) -> Result<()> {
+/// gate only sees the name and status. The winning definition must match
+/// the generated argv and environment or the exact loopback route and headers.
+fn verify_managed_mcp_transport(documents: &[ConfigEntry], parsed: &ParsedStart) -> Result<()> {
     let server = winning_managed_mcp_server(documents).ok_or_else(|| {
         Error::new(
             "profile_error",
             "OpenCode managed MCP entry has no effective transport",
         )
     })?;
-    let transport_ok = server
-        .server_type
-        .as_deref()
-        .is_none_or(|kind| kind == "local")
-        && server.command.as_deref() == Some(expected_command)
-        && server.url.as_deref().is_none_or(str::is_empty)
-        && (server.environment.as_ref() == Some(expected_environment)
-            || (expected_environment.is_empty() && server.environment.is_none()));
+    let transport_ok = if let Some(remote) = &parsed.remote_mcp {
+        let token = eliot_plugin::native_cli::unique_environment_value(
+            &parsed.environment,
+            "ELIOT_AGENT_TOKEN",
+        )
+        .and_then(std::ffi::OsStr::to_str)
+        .ok_or_else(|| {
+            Error::new(
+                "profile_error",
+                "OpenCode shared Agent MCP identity is incomplete",
+            )
+        })?;
+        server.server_type.as_deref() == Some("remote")
+            && server.url.as_deref() == Some(remote.url.as_str())
+            && server.command.is_none()
+            && server.environment.is_none()
+            && server.header_digests.as_ref().is_some_and(|headers| {
+                *headers == mcp_header_digests(remote.headers(RemoteAgentMcp::TOKEN_REFERENCE))
+                    || *headers == mcp_header_digests(remote.headers(token))
+            })
+    } else {
+        let expected_environment = managed_mcp_environment(parsed);
+        server
+            .server_type
+            .as_deref()
+            .is_none_or(|kind| kind == "local")
+            && server.command.as_ref() == Some(&managed_mcp_command(parsed))
+            && server.url.as_deref().is_none_or(str::is_empty)
+            && (server.environment.as_ref() == Some(&expected_environment)
+                || (expected_environment.is_empty() && server.environment.is_none()))
+    };
     if !transport_ok {
         return Err(Error::new(
             "profile_error",

@@ -21,6 +21,7 @@
 //! and the resume preflight refuses a non-idle retained session.
 
 use std::{
+    collections::HashMap,
     ffi::OsString,
     path::{Path, PathBuf},
     time::Duration,
@@ -133,9 +134,10 @@ pub const SWARM_MCP_SERVER_NAME: &str = eliot_plugin::native_cli::WORKER_SWARM_M
 /// fragment is a profile error raised by the caller, never rendered here.
 ///
 /// `swarm_executable` and `swarm_data_dir` are the absolute active Swarm
-/// executable and the Agent's owned Eliot data root. The private config carries
-/// the exact Agent identity in OpenCode's MCP `environment` map, never in the
-/// shell-visible server environment. Shape verified against
+/// executable and the Agent's owned Eliot data root for stdio. Shared HTTP
+/// references `{env:ELIOT_AGENT_TOKEN}` in config and uses the credential
+/// already supplied to the server environment by the frozen profile policy.
+/// The stdio shape was verified against
 /// the installed 2.2.7 server: `mcp add` writes
 /// `mcp.servers.<name> = {type: "local", command: [...], environment?}`,
 /// and `GET /api/config` echoes the document while `GET /api/mcp`
@@ -160,6 +162,28 @@ fn native_subagents_permission(native_subagents: Option<&str>) -> Option<serde_j
     }
 }
 
+#[derive(Clone)]
+pub(crate) struct RemoteAgentMcp {
+    pub url: String,
+    pub agent_id: String,
+    pub generation: i64,
+}
+
+impl RemoteAgentMcp {
+    pub const TOKEN_REFERENCE: &str = "{env:ELIOT_AGENT_TOKEN}";
+
+    pub fn headers(&self, bearer: &str) -> HashMap<String, String> {
+        HashMap::from([
+            ("x-eliot-agent-id".into(), self.agent_id.clone()),
+            (
+                "x-eliot-agent-generation".into(),
+                self.generation.to_string(),
+            ),
+            ("Authorization".into(), format!("Bearer {bearer}")),
+        ])
+    }
+}
+
 fn agent_config_json(
     model: Option<&str>,
     fragment: Option<&LocalProvider>,
@@ -167,29 +191,35 @@ fn agent_config_json(
     swarm_data_dir: &str,
     swarm_environment: &[(OsString, OsString)],
     native_subagents: Option<&str>,
+    remote_mcp: Option<&RemoteAgentMcp>,
 ) -> String {
     let mut servers = serde_json::Map::new();
-    let environment = swarm_environment
-        .iter()
-        .map(|(name, value)| {
-            (
-                name.to_string_lossy().into_owned(),
-                serde_json::Value::String(value.to_string_lossy().into_owned()),
-            )
+    let managed = if let Some(remote) = remote_mcp {
+        serde_json::json!({
+            "type": "remote", "url": remote.url, "oauth": false,
+            "headers": remote.headers(RemoteAgentMcp::TOKEN_REFERENCE),
         })
-        .collect::<serde_json::Map<_, _>>();
-    let mut command = vec![swarm_executable.to_owned()];
-    command.extend(eliot_plugin::native_cli::worker_swarm_mcp_args(
-        swarm_data_dir,
-    ));
-    servers.insert(
-        SWARM_MCP_SERVER_NAME.to_owned(),
+    } else {
+        let environment = swarm_environment
+            .iter()
+            .map(|(name, value)| {
+                (
+                    name.to_string_lossy().into_owned(),
+                    serde_json::Value::String(value.to_string_lossy().into_owned()),
+                )
+            })
+            .collect::<serde_json::Map<_, _>>();
+        let mut command = vec![swarm_executable.to_owned()];
+        command.extend(eliot_plugin::native_cli::worker_swarm_mcp_args(
+            swarm_data_dir,
+        ));
         serde_json::json!({
             "type": "local",
             "command": command,
             "environment": environment,
-        }),
-    );
+        })
+    };
+    servers.insert(SWARM_MCP_SERVER_NAME.to_owned(), managed);
     let mcp = serde_json::Value::Object({
         let mut mcp = serde_json::Map::new();
         mcp.insert("servers".to_owned(), serde_json::Value::Object(servers));
@@ -282,6 +312,7 @@ pub struct ServerLaunch {
     pub swarm_data_dir: PathBuf,
     /// Scoped Agent identity passed only to the managed MCP child.
     pub swarm_environment: Vec<(OsString, OsString)>,
+    pub(crate) remote_mcp: Option<RemoteAgentMcp>,
     /// Frozen native-subagent switch (`allow` or `deny`): `deny` keeps the
     /// `task` deny in the isolated per-Agent config as a second layer next
     /// to the authoritative per-session `subagent` deny ruleset.
@@ -425,6 +456,7 @@ impl OwnedServer {
                 swarm_data_dir,
                 &launch.swarm_environment,
                 launch.native_subagents.as_deref(),
+                launch.remote_mcp.as_ref(),
             ),
         )
         .map_err(|error| {

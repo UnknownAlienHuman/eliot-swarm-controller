@@ -183,6 +183,9 @@ launch before spawn.
 [Claude Code environment variables](https://code.claude.com/docs/en/env-vars).
 
 Resolve Windows executables explicitly; never insert an unrequested shell wrapper.
+The Windows Agent plugin and native CLI use redirected stdin, stdout, and stderr
+without joining a console. The CLI owns the console policy for its Bash tools and
+hooks. The generation Job retains custody of the plugin and its descendants.
 Avoid modes that disable required hooks/instructions.
 
 Stop drops the CLI's stdin and kills only that direct child by handle (kill

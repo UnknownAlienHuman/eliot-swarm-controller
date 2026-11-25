@@ -32,6 +32,7 @@ use crate::native::types::{
 };
 
 const LABELS: NativeLabels = NativeLabels {
+    windows_detached_stdio: true,
     short: "Claude",
     server: "Claude",
 };

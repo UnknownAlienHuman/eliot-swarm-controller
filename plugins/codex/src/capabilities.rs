@@ -141,6 +141,7 @@ pub fn declaration() -> HarnessCapabilities {
         observed_live_families: eliot_core::OBSERVED_ROLLOUT_FAMILIES,
         native_child_families: &eliot_core::CODEX_NATIVE_CHILD_FAMILIES,
         executable_stems: &["codex"],
+        windows_detached_stdio: true,
         version_prefixes: &["codex-cli", "codex"],
         input_token_accounting: InputTokenAccounting::IncludesCacheReads,
         ..HarnessCapabilities::default()

@@ -88,6 +88,9 @@ Use an existing authenticated `CODEX_HOME` and a disposable existing workspace.
 No proxy, native Goal, subagent, worktree creation or transcript handoff is needed yet.
 
 1. Spawn `codex app-server --listen stdio://` inside Agent custody and start its reader.
+   The Windows plugin and app-server use redirected stdin, stdout, and stderr
+   without joining a console. Codex owns the console policy for its terminal
+   children, and the generation Job retains custody of the process tree.
 2. Send `initialize`, await success, then send `initialized`.
 3. Read paginated `model/list`. Select the explicitly configured Luna model and an
    effort supported by that response. Apply the frozen profile effort on start and
@@ -162,17 +165,28 @@ an Agent create, replace, remove or corrupt loose objects or packs used by any r
 
 ### Eliot MCP bridge
 
-Each controlled Agent generation receives a private process-local stdio server named
-eliot_swarm_<start-command-ulid>, using the active Swarm executable, that Agent's owned
-Eliot data directory, and its selected workspace as the server cwd. Its only tool is
-swarm, with the installed schema { method: string, params: object }. Use the advertised
-Eliot method and its existing params DTO for Eliot status, control, or coordination.
-Authentication is inherited by the server and must not appear in tool arguments. Use
-normal Codex tools for workspace work. The per-generation config sets native
-approval_mode to approve for this swarm tool only, so its calls do not request Codex
-MCP approval when the profile policy is never. This leaves the profile approval policy
-and workspace permissions unchanged; Eliot still authorizes every call as the exact
-Agent generation.
+Each controlled Agent generation receives one generated server named
+`eliot_swarm_<start-command-ulid>`, using the existing authenticated loopback bridge
+when its URL is available, no HTTP proxy is configured, and the Agent token is already
+in the daemon-provided native launch environment. Codex then uses native streamable
+HTTP with `ELIOT_AGENT_TOKEN` as its bearer token environment reference and the exact
+Agent id and generation in request headers.
+Codex uses the daemon-provided scoped launch environment; the token is never written
+into config or argv. Shell access follows the existing
+`pass_agent_identity_to_shell` policy. If the listener is absent, a proxy is configured,
+or the native environment lacks the token, Codex uses the private stdio server. A
+malformed supplied listener URL refuses start before native spawn. Stdio uses the active Swarm
+executable, the Agent's owned Eliot data directory, and its selected workspace as cwd.
+Either transport exposes only `swarm`, with the installed schema `{ method: string,
+params: object }`. Use the advertised Eliot method and its existing params DTO for Eliot
+status, control, or coordination. Authentication must not appear in tool arguments.
+Use normal Codex tools for workspace work. The per-generation config sets native
+`approval_mode` to `approve` for this Swarm tool only, so its calls do not request Codex
+MCP approval when the profile policy is `never`. This leaves the profile approval
+policy and workspace permissions unchanged; Eliot still authorizes every call as the
+exact Agent generation. The managed generated server remains subject to the same
+owner-prefix suppression, minimal-policy checks, and thread-scoped inventory readback
+before any input is sent.
 
 ### Worker MCP policy
 

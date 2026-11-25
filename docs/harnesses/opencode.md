@@ -327,16 +327,15 @@ profiles against these endpoints stay `unsupported`.
 ## Eliot MCP bridge
 
 Each owned generation's per-Agent `opencode.jsonc` carries one
-`mcp.servers.eliot-swarm` entry: a local stdio server running the active
-Swarm executable with the Agent's owned Eliot data directory and
-`mcp --require-agent` arguments. Its only tool is `swarm`, with the
-installed schema `{ method: string, params: object }`. Use the advertised
-Eliot method and its existing params DTO for Eliot status, control, or
-coordination. Authentication is inherited by the server from the serve
-process environment (the Agent's own identity) and must not appear in tool
-arguments or in the config document: the file carries only the public
-command, and `--require-agent` fails closed without the inherited
-identity. Use normal OpenCode tools for workspace work.
+`mcp.servers.eliot-swarm` entry. When the daemon supplies its shared loopback
+listener, and the native process already receives the Agent credential without
+a configured proxy, the entry uses Streamable HTTP. The bearer header references
+the existing environment variable, OAuth is disabled, and the listener checks
+the Agent and generation for each request. Without that safe route, the plugin
+uses its local `swarm mcp --require-agent` stdio transport. Native config
+readback must prove the winning entry uses the generated transport. The tool
+remains `swarm` with `{ method: string, params: object }`. Use normal OpenCode
+tools for workspace work.
 
 Verified against installed OpenCode 2.2.7: `mcp add` writes
 `mcp.servers.<name> = {type: "local", command: [...], environment?}`

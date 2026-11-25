@@ -385,6 +385,7 @@ mod process_birth {
 pub struct NativeLabels {
     pub short: &'static str,
     pub server: &'static str,
+    pub windows_detached_stdio: bool,
 }
 
 #[derive(Clone)]
@@ -984,6 +985,14 @@ impl NativeChild {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
+
+        #[cfg(windows)]
+        if labels.windows_detached_stdio {
+            use std::os::windows::process::CommandExt;
+            command
+                .as_std_mut()
+                .creation_flags(windows_sys::Win32::System::Threading::DETACHED_PROCESS);
+        }
 
         let mut child = command.spawn().map_err(|error| {
             Error::new(

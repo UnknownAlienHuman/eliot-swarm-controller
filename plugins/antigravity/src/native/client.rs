@@ -37,6 +37,7 @@ use tokio::{
 };
 
 const LABELS: NativeLabels = NativeLabels {
+    windows_detached_stdio: false,
     short: "Antigravity",
     server: "Antigravity ACP server",
 };

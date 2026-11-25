@@ -194,6 +194,7 @@ struct ValidatedStartPlan {
     swarm_executable: PathBuf,
     mcp_cwd: PathBuf,
     mcp_server_name: String,
+    agent_mcp_url: Option<String>,
     provider_probe: bool,
     native_subagents: Option<String>,
     credential: String,
@@ -365,7 +366,7 @@ fn validate_start_plan(
         mut secrets,
         mut metadata_secrets,
     } = target_environment(params.target_environment.as_ref(), profile.get("pass_env"))?;
-    if !provider_probe {
+    let agent_mcp_url = if !provider_probe {
         let mcp_environment = eliot_plugin::session::agent_mcp_environment(
             params.mcp_environment.as_ref(),
             params.target_environment.as_ref(),
@@ -375,7 +376,14 @@ fn validate_start_plan(
             "Codex",
         )?;
         secrets.extend(mcp_environment.secrets);
-    }
+        eliot_plugin::native_cli::shared_agent_mcp_url(
+            params.agent_mcp_url.as_deref(),
+            &environment,
+        )?
+        .map(str::to_owned)
+    } else {
+        None
+    };
     if provider_probe {
         environment.retain(|(name, _)| {
             !name
@@ -444,6 +452,7 @@ fn validate_start_plan(
         mcp_cwd,
 
         mcp_server_name,
+        agent_mcp_url,
         provider_probe,
         native_subagents,
         credential: initialized.credential.clone(),
@@ -1133,6 +1142,9 @@ impl CodexPlugin {
                 &plan.swarm_executable,
                 &plan.data_dir,
                 &plan.mcp_cwd,
+                plan.agent_mcp_url.as_deref(),
+                &params.agent_id,
+                params.generation,
                 &mcp_disables,
                 &plugin_disables,
                 plan.native_subagents.as_deref(),

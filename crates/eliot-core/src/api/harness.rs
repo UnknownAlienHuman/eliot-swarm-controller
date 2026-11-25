@@ -386,6 +386,9 @@ pub struct HarnessCapabilities {
     pub native_child_history_refusal: Option<&'static str>,
     /// Process executable stems owned by this harness runtime.
     pub executable_stems: &'static [&'static str],
+    /// The controlled Windows plugin and native agent communicate over pipes
+    /// and do not require an inherited console.
+    pub windows_detached_stdio: bool,
     /// Product prefixes stripped when normalizing `--version` strings.
     pub version_prefixes: &'static [&'static str],
     /// Retained turn status can be a native print result subtype.
