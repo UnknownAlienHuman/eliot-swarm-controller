@@ -2231,7 +2231,7 @@ pinned_agents = ["a123"]
 
 Omitted keys use the shown defaults and an empty pin list. Both thresholds
 are positive integer seconds. The daemon reloads the settings on its
-[retention cadence](#daemon-retention). Set `enabled = false` to pause the
+[retention cadence](#daemon-and-automation-settings). Set `enabled = false` to pause the
 archive pass. A pinned Agent stays out of automatic retirement, and explicit
 Owner archive and unarchive remain available.
 
