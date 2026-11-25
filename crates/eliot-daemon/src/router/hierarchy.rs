@@ -195,6 +195,8 @@ pub(super) fn inherit_parent_launch_bindings(child: &mut Value, parent: &Value) 
     for key in [
         "pass_env_values",
         "native_route_identity",
+        "native_route_home",
+        "native_route_fingerprints",
         "native_store_binding",
     ] {
         match parent.get(key) {
