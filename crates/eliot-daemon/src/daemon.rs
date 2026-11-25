@@ -1744,7 +1744,7 @@ async fn client_call_with_identity_measured(
     }
     let credential = auth["credential"].as_str().unwrap_or("");
     let policy = SecretPolicy::new([credential]);
-    raw_client_call_measured(&info.endpoint, method, params, auth, &policy, timings)
+    raw_client_call_measured(&info, method, params, auth, &policy, timings)
         .await
         .map_err(|error| with_connect_hint(path, error))
 }
@@ -1776,7 +1776,7 @@ pub async fn client_call_with_owner_credential(
         "credential": owner_credential,
     });
     let policy = SecretPolicy::new([owner_credential]);
-    raw_client_call(&info.endpoint, method, params, auth, &policy)
+    raw_client_call(&info, method, params, auth, &policy)
         .await
         .map_err(|error| with_connect_hint(path, error))
 }
@@ -1799,7 +1799,7 @@ pub async fn client_call_with_remote_context(
         .map_err(|error| with_connect_hint(path, error))?;
     let policy = SecretPolicy::new([token.as_str()]);
     let auth = json!({"kind":"owner", "credential": token, "remote_call": remote});
-    let result = raw_client_call(&info.endpoint, method, params, auth, &policy)
+    let result = raw_client_call(&info, method, params, auth, &policy)
         .await
         .map_err(|error| with_connect_hint(path, error))?;
     let echoed: eliot_core::RemoteCallContext =
@@ -1833,7 +1833,7 @@ pub async fn client_call_with_remote_mcp_tool(
     let policy = SecretPolicy::new([token.as_str()]);
     let mut auth = json!({"kind":"owner", "credential": token, "remote_call": remote});
     auth["swarm_mcp_call_id"] = json!(remote.call_id);
-    let result = raw_client_call(&info.endpoint, method, params, auth, &policy)
+    let result = raw_client_call(&info, method, params, auth, &policy)
         .await
         .map_err(|error| with_connect_hint(path, error))?;
     let echoed: eliot_core::RemoteCallContext =
@@ -1846,17 +1846,17 @@ pub async fn client_call_with_remote_mcp_tool(
 }
 
 async fn raw_client_call(
-    endpoint: &str,
+    daemon: &DaemonInfo,
     method: &str,
     params: Value,
     auth: Value,
     policy: &SecretPolicy,
 ) -> Result<Value> {
-    raw_client_call_measured(endpoint, method, params, auth, policy, None).await
+    raw_client_call_measured(daemon, method, params, auth, policy, None).await
 }
 
 async fn raw_client_call_measured(
-    endpoint: &str,
+    daemon: &DaemonInfo,
     method: &str,
     params: Value,
     auth: Value,
@@ -1891,14 +1891,23 @@ async fn raw_client_call_measured(
     // connect timeout or refusal positively establishes zero bytes written
     // and stays a retryable `unavailable` — nothing was admitted.
     let connect_started = Instant::now();
-    let stream = timeout_at(deadline, IpcStream::connect(endpoint, deadline))
-        .await
-        .map_err(|_| {
-            Error::new(
-                "unavailable",
-                "daemon IPC connect deadline elapsed before any request was sent",
-            )
-        })??;
+    let peer_exit = crate::operator::wait_for_daemon_exit(daemon);
+    tokio::pin!(peer_exit);
+    let connect = async {
+        timeout_at(deadline, IpcStream::connect(&daemon.endpoint, deadline))
+            .await
+            .map_err(|_| {
+                Error::new(
+                    "unavailable",
+                    "daemon IPC connect deadline elapsed before any request was sent",
+                )
+            })?
+    };
+    let stream = tokio::select! {
+        biased;
+        result = connect => result?,
+        () = &mut peer_exit => return Err(ipc_closed(true, "daemon process exited before the request was sent")),
+    };
     if let Some(timing) = timings.as_deref_mut() {
         timing.connect_ns = nanos(connect_started.elapsed());
     }
@@ -1906,22 +1915,31 @@ async fn raw_client_call_measured(
         stream,
         LinesCodec::new_with_max_length(MAX_RPC_FRAME_BYTES.saturating_sub(1)),
     );
-    // Once any byte of the frame may have been written, a stalled or failed
-    // send can no longer prove non-execution: `LinesCodec::decode_eof` yields
-    // a trailing unterminated line, so the daemon may admit a request the
-    // client never sees answered. Send-phase failures are `unknown`.
+    let read_only = crate::router::discovery::is_read_only(method);
+    // From the first possible write, a disconnected mutation can already be
+    // admitted. Fail the transport promptly and leave its outcome unresolved.
     let round_trip_started = Instant::now();
-    timeout_at(deadline, framed.send(frame))
-        .await
-        .map_err(|_| Error::new("unknown", "daemon RPC exceeded its absolute deadline"))?
-        .map_err(|_| Error::new("unknown", "daemon RPC write failed"))?;
-    // The request is written: a local reply-integrity failure cannot prove
-    // non-execution. Matching, decoded daemon errors keep their domain code.
-    let line = timeout_at(deadline, framed.next())
-        .await
-        .map_err(|_| Error::new("unknown", "daemon RPC exceeded its absolute deadline"))?
-        .ok_or_else(|| Error::new("unknown", "daemon closed the RPC connection"))?
-        .map_err(|_| Error::new("unknown", "daemon response frame is invalid"))?;
+    let exchange = async {
+        timeout_at(deadline, framed.send(frame))
+            .await
+            .map_err(|_| Error::new("unknown", "daemon RPC exceeded its absolute deadline"))?
+            .map_err(|_| ipc_closed(read_only, "daemon IPC write failed"))?;
+        timeout_at(deadline, framed.next())
+            .await
+            .map_err(|_| Error::new("unknown", "daemon RPC exceeded its absolute deadline"))?
+            .ok_or_else(|| ipc_closed(read_only, "daemon IPC closed before replying"))?
+            .map_err(|error| match error {
+                tokio_util::codec::LinesCodecError::Io(_) => {
+                    ipc_closed(read_only, "daemon IPC read failed before replying")
+                }
+                _ => Error::new("unknown", "daemon response frame is invalid"),
+            })
+    };
+    let line = tokio::select! {
+        biased;
+        result = exchange => result?,
+        () = &mut peer_exit => return Err(ipc_closed(read_only, "daemon process exited before replying")),
+    };
     if let Some(timing) = timings.as_deref_mut() {
         timing.round_trip_ns = nanos(round_trip_started.elapsed());
     }
@@ -1973,6 +1991,15 @@ async fn raw_client_call_measured(
             "daemon response must contain exactly one result or error",
         )),
     }
+}
+
+fn ipc_closed(read_only_or_unsent: bool, message: &str) -> Error {
+    if read_only_or_unsent {
+        Error::new("unavailable", message)
+    } else {
+        Error::new("unknown", format!("{message}; mutation outcome is unknown"))
+    }
+    .with_where("client.ipc")
 }
 
 /// Typed caller boundary over the existing authenticated client. Params are

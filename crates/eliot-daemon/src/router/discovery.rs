@@ -424,6 +424,13 @@ pub(super) fn is_mutation(name: &str) -> bool {
         .any(|method| method.name == name && method.mutation)
 }
 
+/// A request known to have no mutation to reconcile after losing its reply.
+pub(crate) fn is_read_only(name: &str) -> bool {
+    METHODS
+        .iter()
+        .any(|method| method.name == name && !method.mutation)
+}
+
 pub(super) fn canonical_method(name: &str) -> Option<&'static str> {
     METHODS
         .iter()
