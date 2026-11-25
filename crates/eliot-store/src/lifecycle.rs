@@ -270,7 +270,29 @@ impl Store {
             && state == CommandState::Applied
             && let (Some(agent), Some(generation)) = (target, generation)
         {
-            super::restart_queue::release_after_resume(tx, agent, generation, now, &mut events)?;
+            if record
+                .command
+                .outcome
+                .as_ref()
+                .is_some_and(|outcome| outcome["restart_fresh_native"] == true)
+            {
+                events.extend(super::restart_queue::retire_sealed(
+                    tx,
+                    agent,
+                    generation - 1,
+                    None,
+                    "restart_native_subject_changed",
+                    now,
+                )?);
+            } else {
+                super::restart_queue::release_after_resume(
+                    tx,
+                    agent,
+                    generation,
+                    now,
+                    &mut events,
+                )?;
+            }
         }
 
         if record.command.verb == "send" && state != CommandState::Applied {
