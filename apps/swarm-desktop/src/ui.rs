@@ -982,6 +982,7 @@ impl Component for DesktopApp {
                 place_read: None,
                 place_epoch: 0,
                 batch: None,
+                project_reads: 0,
             },
             launch: launch_ui::LaunchState {
                 workspace: input

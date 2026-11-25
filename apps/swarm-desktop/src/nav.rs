@@ -295,7 +295,10 @@ impl Checkout {
 
     /// A linked worktree known only from the last Git read while its
     /// project's Git metadata refreshes: whether it still exists is
-    /// unknown, so a start there waits. A registered checkout stays usable.
+    /// unknown, so a start there waits. A registered checkout stays usable:
+    /// the daemon reads a launch workspace's Git identity on disk when it
+    /// admits the launch (`bootstrap::discover_project`), whatever the
+    /// desktop last read.
     pub fn paused(&self) -> bool {
         self.refreshing && self.registration_ids.is_empty()
     }

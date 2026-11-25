@@ -317,6 +317,9 @@ pub(super) struct ShellState {
     /// The reads of the sidebar refresh being collected
     /// ([`DesktopApp::spawn_read`]).
     pub(super) batch: Option<Vec<SidebarRead>>,
+    /// `project.list` reads in flight ([`DesktopApp::load_projects`] and
+    /// [`DesktopApp::poll_projects`]): a poll waits while any is.
+    pub(super) project_reads: u32,
     pub(super) selection: Selection,
     pub(super) projects: Vec<UiProject>,
     /// The sidebar's projects as the daemon groups and counts them.
@@ -477,13 +480,7 @@ impl DesktopApp {
                     self.load_routing_preview(context);
                     // The picker opens on a read catalogue (the daemon caches it).
                     self.load_catalog(context);
-                    if let Ok(data_dir) = self.data_dir.clone() {
-                        let _task = context.spawn_background(move |_| {
-                            Message::Shell(ShellMsg::ProjectsLoaded(load_projects_blocking(
-                                &data_dir,
-                            )))
-                        });
-                    }
+                    self.load_projects(context);
                     if first_connection {
                         self.watch_list(LIST_REFRESH_MS, context);
                     } else {
@@ -547,36 +544,45 @@ impl DesktopApp {
                     self.link_suspect(context);
                 }
             }
-            ShellMsg::ProjectsLoaded(projects) => match projects {
-                Ok(mut projects) => {
-                    keep_last_known(&mut projects, &self.nav.projects);
-                    self.nav.projects = projects;
-                    let workspace = self.launch.workspace.clone();
-                    if let Some(project) = self
-                        .nav
-                        .projects
-                        .iter()
-                        .find(|project| project.workspace == workspace)
-                        .cloned()
-                    {
-                        // The opened checkout is a registered project.
-                        self.pick_project(&project.workspace);
-                    } else if !self.launch.custom_workspace
-                        && let Some(first) = self.nav.projects.first().cloned()
-                    {
-                        // A new task starts in the first project until one is picked.
-                        self.pick_project(&first.workspace);
+            ShellMsg::ProjectsLoaded(projects) => {
+                self.nav.project_reads = self.nav.project_reads.saturating_sub(1);
+                match projects {
+                    Ok(mut projects) => {
+                        keep_last_known(&mut projects, &self.nav.projects);
+                        self.nav.projects = projects;
+                        let workspace = self.launch.workspace.clone();
+                        if let Some(project) = self
+                            .nav
+                            .projects
+                            .iter()
+                            .find(|project| project.workspace == workspace)
+                            .cloned()
+                        {
+                            // The opened checkout is a registered project.
+                            self.pick_project(&project.workspace);
+                        } else if !self.launch.custom_workspace
+                            && let Some(first) = self.nav.projects.first().cloned()
+                        {
+                            // A new task starts in the first project until one is picked.
+                            self.pick_project(&first.workspace);
+                        }
+                        self.refresh_search();
                     }
-                    self.refresh_search();
+                    Err(error) => self.alert(format!("Projects not read: {error}")),
                 }
-                Err(error) => self.alert(format!("Projects not read: {error}")),
-            },
+            }
             ShellMsg::ProjectsPolled(read) => {
-                // A failed read keeps what is shown; the next poll reads
-                // again. A row still refreshing keeps its last known Git
-                // data; one whose marker cleared takes the new metadata.
-                let Ok(mut read) = read else {
-                    return;
+                // A failed read keeps what is shown and says why; the next
+                // poll reads again. A row still refreshing keeps its last
+                // known Git data; one whose marker cleared takes the new
+                // metadata.
+                self.nav.project_reads = self.nav.project_reads.saturating_sub(1);
+                let mut read = match read {
+                    Ok(read) => read,
+                    Err(error) => {
+                        self.alert(format!("Projects not read: {error}"));
+                        return;
+                    }
                 };
                 keep_last_known(&mut read, &self.nav.projects);
                 let mut git_changed = false;
@@ -888,11 +894,7 @@ impl DesktopApp {
                 self.nav.branches.insert(id, branch);
             }
             ShellMsg::RefreshRequested => {
-                if let Ok(data_dir) = self.data_dir.clone() {
-                    let _task = context.spawn_background(move |_| {
-                        Message::Shell(ShellMsg::ProjectsLoaded(load_projects_blocking(&data_dir)))
-                    });
-                }
+                self.load_projects(context);
                 self.load_agents(context, None);
                 self.load_organization(context);
                 // Expanded branches are read again; their rows stay until then.
@@ -1639,6 +1641,15 @@ impl DesktopApp {
                 .any(|checkout| checkout.refreshing && nav::path_key(&checkout.path) == key)
     }
 
+    /// The checkout at `path` is paused while its project's Git metadata
+    /// refreshes ([`nav::Checkout::paused`]).
+    pub(super) fn checkout_paused(&self, path: &str) -> bool {
+        let key = nav::path_key(path);
+        self.checkouts()
+            .iter()
+            .any(|checkout| checkout.paused() && nav::path_key(&checkout.path) == key)
+    }
+
     /// A task can start in `path`: a listed checkout that is not missing
     /// and not paused while its Git metadata refreshes.
     pub(super) fn can_launch_here(&self, path: &str) -> bool {
@@ -2302,7 +2313,8 @@ impl DesktopApp {
     /// its marker clears) or a launch policy editor shows the use counter
     /// (Settings › Projects with a project open). In the sidebar refresh
     /// it is that refresh's one `project.list`, and the next refresh waits
-    /// for its reply.
+    /// for its reply. It skips while another project read is in flight, so
+    /// a slow reply never overlaps the next tick.
     pub(super) fn poll_projects(&mut self, context: &ComponentContext<Self>) {
         let refreshing = self
             .nav
@@ -2315,11 +2327,27 @@ impl DesktopApp {
         if !refreshing && !policy {
             return;
         }
+        if self.nav.project_reads > 0 {
+            return;
+        }
         let Ok(data_dir) = self.data_dir.clone() else {
             return;
         };
+        self.nav.project_reads += 1;
         self.spawn_read(context, move || {
             ShellMsg::ProjectsPolled(load_projects_blocking(&data_dir))
+        });
+    }
+
+    /// Read the projects again (start-up, a refresh, a settings save): it
+    /// always runs, and a poll waits until it replies.
+    pub(super) fn load_projects(&mut self, context: &ComponentContext<Self>) {
+        let Ok(data_dir) = self.data_dir.clone() else {
+            return;
+        };
+        self.nav.project_reads += 1;
+        let _task = context.spawn_background(move |_| {
+            Message::Shell(ShellMsg::ProjectsLoaded(load_projects_blocking(&data_dir)))
         });
     }
 

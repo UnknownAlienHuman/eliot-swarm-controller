@@ -1438,6 +1438,10 @@ impl DesktopApp {
             self.alert("Choose a project, a folder, or No project (chat).");
             return None;
         }
+        if !self.launch.chat && self.checkout_paused(&self.launch.workspace) {
+            self.alert("This worktree is paused while its Git metadata refreshes.");
+            return None;
+        }
         self.close_popover();
         let place = if self.launch.chat {
             client::LaunchPlace::Chat
