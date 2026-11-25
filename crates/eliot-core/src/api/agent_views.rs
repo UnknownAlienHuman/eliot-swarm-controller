@@ -2463,6 +2463,8 @@ pub struct DaemonSidebarResponse {
 #[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DaemonStatusResponse {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rpc_latency: Option<super::RpcLatencyReport>,
     #[serde(default)]
     pub owner_inbox: std::collections::BTreeMap<super::OwnerInboxKind, usize>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

@@ -28,6 +28,7 @@ pub(crate) mod publication;
 mod redaction;
 mod restart_capacity;
 mod router;
+mod rpc_latency;
 pub(crate) mod scripts;
 mod setup;
 mod skill;

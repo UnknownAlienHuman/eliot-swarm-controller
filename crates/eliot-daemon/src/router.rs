@@ -153,7 +153,7 @@ struct BootResumeWorker {
     target: Option<(String, i64)>,
 }
 
-type StoreHandle = Arc<AsyncMutex<eliot_store::Store>>;
+use crate::rpc_latency::StoreHandle;
 
 const MODE_OPEN: u8 = 0;
 const MODE_QUIESCE: u8 = 1;
@@ -201,6 +201,7 @@ pub(crate) struct Router {
 }
 
 struct RouterInner {
+    rpc_latencies: crate::rpc_latency::RpcLatencies,
     acl_notices: Arc<crate::acl_notice::AclNotices>,
     data_root: PathBuf,
     stand_store_root: Option<PathBuf>,
@@ -502,6 +503,7 @@ impl Router {
         );
         Ok(Self {
             inner: Arc::new(RouterInner {
+                rpc_latencies: Default::default(),
                 acl_notices,
                 data_root,
                 stand_store_root,
@@ -1072,6 +1074,19 @@ impl Router {
             self.inner.shutdown_ready.store(true, Ordering::SeqCst);
         }
         self.signal_progress();
+    }
+
+    pub(crate) fn record_rpc_latency(
+        &self,
+        method: &str,
+        duration: Duration,
+        store_wait: Duration,
+    ) {
+        if let Some(method) = discovery::canonical_method(method) {
+            self.inner
+                .rpc_latencies
+                .record(method, duration, store_wait);
+        }
     }
 
     pub(crate) async fn request_force(&self) {
@@ -5125,6 +5140,7 @@ impl Router {
             _ => (Vec::new(), true),
         };
         let response = HarnessDoctorResponse {
+            rpc_latency: Some(self.inner.rpc_latencies.report()),
             harnesses,
             profile_command_issues,
             profile_first_calls,

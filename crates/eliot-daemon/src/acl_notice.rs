@@ -1,9 +1,7 @@
 use crate::{bus::Bus, platform::ForeignDataDirAce};
 use eliot_core::{SecretPolicy, api::NotifyDefinitionArgs, workspace_path_key};
 use eliot_plugin::sync::LockExt;
-use eliot_store::Store;
 use std::{collections::HashSet, sync::Mutex as SyncMutex};
-use tokio::sync::Mutex;
 
 #[derive(Hash, Eq, PartialEq)]
 struct GrantKey {
@@ -23,7 +21,7 @@ impl AclNotices {
     /// observation included a grant already reported by an earlier repair.
     pub(crate) async fn report(
         &self,
-        store: &Mutex<Store>,
+        store: &crate::rpc_latency::StoreLock,
         bus: &Bus,
         policy: &SecretPolicy,
         removed: Vec<ForeignDataDirAce>,

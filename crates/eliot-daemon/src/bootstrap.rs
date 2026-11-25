@@ -12,7 +12,6 @@ use eliot_core::{
 };
 use eliot_store::{ProjectRegistrationInput, Store};
 use serde_json::{Value, json};
-use tokio::sync::Mutex;
 
 /// Where a new private data directory named `name` goes for this process:
 /// beside `current`, unless Windows would redirect that location.
@@ -38,7 +37,7 @@ pub fn ensure_private_data_dir(path: impl AsRef<Path>) -> Result<PathBuf> {
 /// checkout).
 pub(crate) async fn ensure_hot_start(
     data_root: &Path,
-    store: &Mutex<Store>,
+    store: &crate::rpc_latency::StoreLock,
     policy: &SecretPolicy,
 ) -> Result<()> {
     use crate::config::settings;
@@ -70,7 +69,7 @@ pub(crate) async fn ensure_hot_start(
 /// preserved.
 pub(crate) async fn discover_project(
     data_root: &Path,
-    store: &Mutex<Store>,
+    store: &crate::rpc_latency::StoreLock,
     workspace: &Path,
     policy: &SecretPolicy,
 ) -> Result<ProjectDiscoverResponse> {

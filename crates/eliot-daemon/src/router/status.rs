@@ -164,6 +164,9 @@ impl Router {
             (status.markers.clone(), status.truncated)
         };
         serde_json::to_value(DaemonStatusResponse {
+            rpc_latency: request
+                .rpc_latency
+                .then(|| self.inner.rpc_latencies.report()),
             artifact_capacity: Some(artifact_capacity),
             owner_inbox,
             harness_checks,

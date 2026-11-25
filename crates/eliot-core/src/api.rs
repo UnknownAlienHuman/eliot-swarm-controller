@@ -46,6 +46,11 @@ pub use provider_response::*;
 mod read_validation;
 mod reads;
 mod resolutions;
+mod rpc_latency;
+pub use rpc_latency::{
+    RPC_LATENCY_SAMPLES_PER_METHOD, RPC_LATENCY_SLOW_CALLS, RPC_LATENCY_WINDOW_SECONDS,
+    RpcLatencyPercentiles, RpcLatencyReport, RpcMethodLatency, SlowRpcCall,
+};
 mod rule_edit;
 mod rules;
 mod script_edit;

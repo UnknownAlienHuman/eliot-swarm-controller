@@ -1,9 +1,8 @@
 use super::*;
 use crate::platform::{OwnedChild, data_dir::replace_file};
 use eliot_core::api::CheckpointRestoreRequest;
-use eliot_store::{CheckpointRestoreIntent, CheckpointRestoreWriterObservation, Store};
+use eliot_store::{CheckpointRestoreIntent, CheckpointRestoreWriterObservation};
 use std::io::Write;
-use tokio::sync::Mutex;
 
 pub(crate) struct CheckpointRestoreOutcome {
     pub(crate) head: String,
@@ -17,7 +16,7 @@ struct RestoredFile {
 }
 
 pub(crate) struct CheckpointRestoreWriter<'a> {
-    pub(crate) store: &'a Mutex<Store>,
+    pub(crate) store: &'a crate::rpc_latency::StoreLock,
     pub(crate) id: &'a str,
 }
 

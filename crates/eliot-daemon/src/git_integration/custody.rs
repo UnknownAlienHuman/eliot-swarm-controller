@@ -1,25 +1,27 @@
 use super::{GitProbe, WorkspaceGit, path_text, unavailable, worktree_registered};
 use crate::platform::{OwnedChild, custody::AgentSpawnError};
 use eliot_core::{Error, Result};
-use eliot_store::{IntegrationCustody, Store};
+use eliot_store::IntegrationCustody;
 use std::{
     fs,
     io::{ErrorKind, Read},
     path::{Path, PathBuf},
     sync::Arc,
 };
-use tokio::sync::Mutex;
 
 #[derive(Clone)]
 pub(crate) struct IntegrationLease {
-    store: Arc<Mutex<Store>>,
+    store: crate::rpc_latency::StoreHandle,
     command_id: String,
     #[cfg(windows)]
     scratch_id: String,
 }
 
 impl IntegrationLease {
-    pub(super) fn for_record(store: &Arc<Mutex<Store>>, record: &IntegrationCustody) -> Self {
+    pub(super) fn for_record(
+        store: &crate::rpc_latency::StoreHandle,
+        record: &IntegrationCustody,
+    ) -> Self {
         Self {
             store: Arc::clone(store),
             command_id: record.command_id.clone(),
@@ -233,7 +235,7 @@ fn verify_registration_link(scratch: &Scratch) -> Result<()> {
 /// Remove only this checkout and its unique Git registration. A repository-wide
 /// prune could discard another checkout whose disk is temporarily unavailable.
 pub(crate) async fn reconcile(
-    store: &Arc<Mutex<Store>>,
+    store: &crate::rpc_latency::StoreHandle,
     data_root: &Path,
     record: &IntegrationCustody,
 ) -> Result<()> {

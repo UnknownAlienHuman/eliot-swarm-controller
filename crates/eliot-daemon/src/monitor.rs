@@ -92,7 +92,7 @@ pub(crate) struct Monitoring {
 }
 
 struct State {
-    store: Arc<AsyncMutex<eliot_store::Store>>,
+    store: crate::rpc_latency::StoreHandle,
     bus: Bus,
     secrets: SecretSet,
     targets: Mutex<HashMap<ProcessKey, Arc<Target>>>,
@@ -281,7 +281,7 @@ struct GitGroup {
 
 impl Monitoring {
     pub(crate) fn new(
-        store: Arc<AsyncMutex<eliot_store::Store>>,
+        store: crate::rpc_latency::StoreHandle,
         bus: Bus,
         secrets: SecretSet,
     ) -> Self {
