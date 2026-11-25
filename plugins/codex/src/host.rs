@@ -2857,6 +2857,7 @@ impl CodexPlugin {
                 "last_turn": event_status.last_turn,
                 "batch_unknown": event_status.batch_unknown,
                 "source_unknown": event_status.source_unknown,
+                "unbound_warnings_dropped": event_status.unbound_warnings_dropped,
             }));
         }
         let event_status = session.events.status();
@@ -2944,6 +2945,7 @@ impl CodexPlugin {
             "last_turn": last_turn,
             "batch_unknown": event_status.batch_unknown,
             "source_unknown": event_status.source_unknown,
+            "unbound_warnings_dropped": event_status.unbound_warnings_dropped,
             "result_known": result_known,
             "turn_evidence": turn_evidence,
         }))

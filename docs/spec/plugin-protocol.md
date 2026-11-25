@@ -1179,9 +1179,17 @@ An unfamiliar method cannot establish a native turn binding.
 
 `session.native_warning` retains the [Core diagnostic](../../crates/eliot-core/src/native_data.rs)
 for an exact owned thread and generation, independently of turn state. Codex
-supplies cumulative per-code counts with a bounded code inventory and the
-redacted, UTF-8-bounded message. The diagnostic supplies no lifecycle, progress,
-quota or settlement evidence. Unbound warnings stay in the native adapter.
+0.167.1 `warning` has an optional `threadId` and no turn ID, so a warning is
+thread-scoped, including after its turn has ended; it is never attached to a
+guessed or active turn. Codex supplies cumulative per-code counts with a bounded
+code inventory and the redacted, UTF-8-bounded message. A missing or mismatched
+thread binding increments `unbound_warnings_dropped` in the native snapshot and
+retains no warning text. The diagnostic supplies no lifecycle, progress, quota
+or settlement evidence. MCP startup status emits the same typed diagnostic only
+for `status: failed` on the exact owned thread; starting, ready and cancelled
+updates remain silent. Its bounded message preserves the startup error or typed
+failure reason. An unbound startup failure is counted as dropped without retaining
+its payload.
 
 Known Codex `reasoning` item envelopes are not schema-drift diagnostics.
 Keep normal item processing, including existing thread and turn binding,

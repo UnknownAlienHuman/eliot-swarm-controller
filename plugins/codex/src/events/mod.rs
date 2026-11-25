@@ -64,6 +64,7 @@ pub(crate) struct EventStatus {
     pub failure: Option<String>,
     pub batch_unknown: bool,
     pub source_unknown: bool,
+    pub unbound_warnings_dropped: u64,
     pub stopped: bool,
     pub session_history_failure_at: Option<Instant>,
     pub compaction: Option<CompactionProgress>,
@@ -707,7 +708,7 @@ impl EventProcessor {
         if method == "thread/tokenUsage/updated" {
             return !self.status.ready;
         }
-        if method == "warning" {
+        if matches!(method, "warning" | "mcpServer/startupStatus/updated") {
             return !self.status.ready && params.get("threadId").is_some_and(Value::is_string);
         }
         if self.compaction_notification_matches(method, params) {
@@ -1753,12 +1754,25 @@ impl EventProcessor {
                 self.note_native_error(params).await?;
             }
             "warning" => {
-                if let Some(thread) = self.status.thread_id.as_deref() {
-                    let policy = SecretPolicy::new(self.secrets.iter().cloned());
-                    if let Some((id, data)) = self.warnings.observe(thread, params, &policy)? {
-                        self.commit_event(NATIVE_WARNING_EVENT, id, data).await?;
-                    }
+                let policy = SecretPolicy::new(self.secrets.iter().cloned());
+                if let Some((id, data)) =
+                    self.warnings
+                        .observe(self.status.thread_id.as_deref(), params, &policy)?
+                {
+                    self.commit_event(NATIVE_WARNING_EVENT, id, data).await?;
                 }
+                self.status.unbound_warnings_dropped = self.warnings.unbound_dropped();
+            }
+            "mcpServer/startupStatus/updated" => {
+                let policy = SecretPolicy::new(self.secrets.iter().cloned());
+                if let Some((id, data)) = self.warnings.observe_startup_status(
+                    self.status.thread_id.as_deref(),
+                    params,
+                    &policy,
+                )? {
+                    self.commit_event(NATIVE_WARNING_EVENT, id, data).await?;
+                }
+                self.status.unbound_warnings_dropped = self.warnings.unbound_dropped();
             }
             _ if is_advisory_notification(method) => {}
             _ => {

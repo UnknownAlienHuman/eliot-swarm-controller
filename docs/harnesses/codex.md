@@ -786,7 +786,8 @@ they do not produce a guessed `tool.completed`. Unknown message phases do not ma
 final answer, and unknown patch-change kinds do not add an inferred move path.
 
 The installed 0.167.1 schema identifies these items and notifications as known.
-They add no independent durable fact to the parent or child stream.
+The advisory updates add no independent durable fact; an MCP startup failure is
+retained as a bounded diagnostic on its exact owned thread.
 
 | Native input | Durable evidence |
 | --- | --- |
@@ -795,14 +796,17 @@ They add no independent durable fact to the parent or child stream.
 | `thread/status/changed` | Exact thread and turn readback or lifecycle events establish state and settlement. |
 | `turn/diff/updated` | Keep existing active-turn activity handling. File changes and Git readback supply retained change facts. |
 | `item/commandExecution/terminalInteraction` | Keep existing active-turn activity handling, and use the exact tool item for lifecycle and outcome. Terminal input stays native. |
-| `mcpServer/startupStatus/updated` | Native initialization and operation-specific readback supply the readiness facts Eliot uses. |
+| `mcpServer/startupStatus/updated` | Starting, ready and cancelled updates are silent. `failed` becomes a bounded `session.native_warning` on the exact owned thread, preserving the failure reason or redacted error; an unbound failure is counted as dropped without its text. |
 | `model/safetyBuffering/updated` | The advisory supplies no structured outcome or routing decision. Its content stays native. |
 
-`warning` produces a typed `session.native_warning` diagnostic only when its
-`threadId` matches the exact owned thread. The adapter records a running count
-per bounded code and redacts the message before truncating it. The 0.167.1
-schema has no code field, so uncoded notifications use `warning`. The diagnostic
-remains visible in retained events even if a later turn fails.
+`warning` has a required `message`, optional `threadId`, and no turn binding in
+the installed 0.167.1 schema. It produces a typed `session.native_warning`
+diagnostic only when `threadId` matches the exact owned thread. The adapter
+records a running count per bounded code and redacts the message before
+truncating it. The schema has no code field, so uncoded notifications use
+`warning`. The diagnostic remains thread-scoped and visible in retained events
+after the turn ends. Missing or mismatched thread bindings increment
+`unbound_warnings_dropped` in the native snapshot; their message is discarded.
 
 If the Codex stream could not commit its final tool records, exact turn
 settlement or generation loss closes retained tool starts as `unknown`.

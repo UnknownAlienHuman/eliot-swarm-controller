@@ -16,37 +16,105 @@ struct Notification {
     message: String,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct StartupStatus {
+    thread_id: Option<String>,
+    name: String,
+    status: String,
+    error: Option<String>,
+    failure_reason: Option<String>,
+}
+
 #[derive(Default)]
 pub(super) struct Warnings {
     counts: HashMap<String, u64>,
     sequence: u64,
+    unbound_dropped: u64,
 }
 
 impl Warnings {
     pub(super) fn observe(
         &mut self,
-        thread: &str,
+        bound_thread: Option<&str>,
         params: Value,
         policy: &SecretPolicy,
     ) -> Result<Option<(String, Value)>> {
         let Ok(notification) = serde_json::from_value::<Notification>(params) else {
             return Ok(None);
         };
-        if notification.thread_id.as_deref() != Some(thread) || notification.message.is_empty() {
-            return Ok(None);
-        }
-        // The 0.167.1 wire schema supplies no structured warning code.
-        let mut code = notification
+        let code = notification
             .code
             .as_deref()
             .filter(|code| is_native_discriminator(code) && !policy.contains_text(code))
             .unwrap_or("warning");
+        self.observe_fields(
+            bound_thread,
+            notification.thread_id.as_deref(),
+            code,
+            &notification.message,
+            policy,
+        )
+    }
+
+    pub(super) fn observe_startup_status(
+        &mut self,
+        bound_thread: Option<&str>,
+        params: Value,
+        policy: &SecretPolicy,
+    ) -> Result<Option<(String, Value)>> {
+        let Ok(notification) = serde_json::from_value::<StartupStatus>(params) else {
+            return Ok(None);
+        };
+        if notification.status != "failed" {
+            return Ok(None);
+        }
+        let code = if notification.failure_reason.as_deref() == Some("reauthenticationRequired") {
+            "mcp_reauthentication_required"
+        } else {
+            "mcp_server_startup_failed"
+        };
+        let detail = notification
+            .error
+            .or(notification.failure_reason)
+            .unwrap_or_else(|| "MCP server startup failed".to_owned());
+        let message = format!("{}: {detail}", notification.name);
+        self.observe_fields(
+            bound_thread,
+            notification.thread_id.as_deref(),
+            code,
+            &message,
+            policy,
+        )
+    }
+
+    pub(super) fn unbound_dropped(&self) -> u64 {
+        self.unbound_dropped
+    }
+
+    fn observe_fields(
+        &mut self,
+        bound_thread: Option<&str>,
+        notification_thread: Option<&str>,
+        code: &str,
+        source_message: &str,
+        policy: &SecretPolicy,
+    ) -> Result<Option<(String, Value)>> {
+        let Some(thread) = bound_thread.filter(|thread| Some(*thread) == notification_thread)
+        else {
+            self.unbound_dropped = self.unbound_dropped.saturating_add(1);
+            return Ok(None);
+        };
+        if source_message.is_empty() {
+            return Ok(None);
+        }
+        let mut code = code;
         if !self.counts.contains_key(code) && self.counts.len() >= MAX_WARNING_CODES - 1 {
             code = "other";
         }
         let count = self.counts.entry(code.to_owned()).or_default();
         *count = count.saturating_add(1);
-        let mut message = policy.redact_text(&notification.message);
+        let mut message = policy.redact_text(source_message);
         let truncated = message.len() > MAX_NATIVE_WARNING_BYTES;
         if truncated {
             message.truncate(message.floor_char_boundary(MAX_NATIVE_WARNING_BYTES));
