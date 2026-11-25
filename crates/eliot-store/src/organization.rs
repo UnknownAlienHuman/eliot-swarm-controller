@@ -150,76 +150,115 @@ impl LinkRequest<'_> {
     }
 }
 
-/// Retained roots of one execution project: parentless, live-scope,
-/// non-chat Agents in id order. The caller picks the archived predicate, so
-/// assignment need stays display-scoped while ambiguity counts every
-/// retained root independently of the archived filter.
+/// Retained controlled roots grouped by the same evidence as their rows.
 fn organization_roots(conn: &Connection, project: &str, archived: &str) -> Result<Vec<i64>> {
     let mut statement = conn
         .prepare(&format!(
             "SELECT a.id FROM agents a WHERE a.parent IS NULL AND a.observe_only = 0
-             AND a.chat = 0 AND a.project = ?1 AND {archived}
-             ORDER BY a.id LIMIT {}",
-            MAX_ORG_ROOTS_PER_GROUP as i64,
+             AND a.chat = 0 AND {} = ?1 AND {archived}
+             ORDER BY a.id LIMIT ?2",
+            retained_project("a")
         ))
         .map_err(sql_error)?;
     let rows = statement
-        .query_map([project], |row| row.get::<_, i64>(0))
+        .query_map(params![project, MAX_ORG_ROOTS_PER_GROUP as i64], |row| {
+            row.get(0)
+        })
         .map_err(sql_error)?;
     rows.collect::<rusqlite::Result<_>>().map_err(sql_error)
 }
 
-/// The organization group of one Agent row (aliases `a` for `agents`, `o`
-/// for its `chat_organization` overlay): a chat's placement link when it is
-/// a retained registration, any other Agent's execution project when that
-/// is one, else NULL for the no-project bucket. The projection's per-group
-/// totals and every `agent.list` row read this one expression, so a row
-/// never reads in a different group than the projection counts it.
-/// A legacy Agent whose retained project label is a checkout path groups
-/// under the registration of that exact path, without rewriting the
-/// retained label; two registrations on one path stay unplaced (ambiguous).
-pub(super) fn organization_group() -> String {
-    let path = checkout_key_sql("a.project");
-    let checkout = checkout_key_sql("r.checkout");
-    format!(
-        "CASE WHEN (a.chat = 1 AND o.project_link IS NOT NULL
-         AND EXISTS(SELECT 1 FROM project_registrations r WHERE r.id = o.project_link))
-    THEN o.project_link
-    WHEN (a.chat = 0
-          AND EXISTS(SELECT 1 FROM project_registrations r WHERE r.id = a.project))
-    THEN a.project
-    WHEN (a.chat = 0 AND (SELECT COUNT(*) FROM project_registrations r
-          WHERE {checkout} = {path}) = 1)
-    THEN (SELECT r.id FROM project_registrations r WHERE {checkout} = {path})
-    ELSE NULL END"
-    )
+/// Potential independent writers in a registered project. Ambiguous legacy
+/// roots are included for every matching project so that absence of a
+/// presentation link cannot make their custody disappear.
+pub(super) fn retained_root_writers(
+    conn: &Connection,
+    project: &str,
+    except: Option<i64>,
+    limit: i64,
+) -> Result<Vec<i64>> {
+    let evidence = repository_evidence("a");
+    let mut statement = conn
+        .prepare_cached(&format!(
+            "SELECT a.id FROM agents a WHERE a.parent IS NULL AND a.observe_only=0 AND a.chat=0
+               AND a.id IS NOT ?2
+               AND (a.state IN ('created','starting','idle','busy','waiting','unknown')
+                    OR a.capacity_generation IS NOT NULL
+                    OR EXISTS (SELECT 1 FROM processes p WHERE p.state <> 'exited'
+                        AND p.owner IN ('agent:a' || a.id || '#' || a.generation,
+                                        'workspace:a' || a.id || '#' || a.generation)))
+               AND (a.project=?1 OR (NOT EXISTS (
+                    SELECT 1 FROM project_registrations known WHERE known.id=a.project)
+                    AND EXISTS (SELECT 1 FROM project_registrations r WHERE r.id=?1 AND ({evidence}))))
+             ORDER BY a.id LIMIT ?3",
+        ))
+        .map_err(sql_error)?;
+    let rows = statement
+        .query_map(params![project, except, limit], |row| row.get(0))
+        .map_err(sql_error)?;
+    rows.collect::<rusqlite::Result<_>>().map_err(sql_error)
 }
 
-/// One normalized checkout path, trailing separators trimmed. On Windows a
-/// `\\?\` verbatim prefix is dropped, backslashes become `/` and ASCII case
-/// is folded (Windows compares paths case-insensitively; SQLite's `lower`
-/// folds ASCII only). Elsewhere case and a literal backslash are part of the
-/// name, so `/repo/Foo` and `/repo/foo` stay distinct. [`checkout_key_sql`]
-/// is its SQL twin.
-fn checkout_key(path: &str) -> String {
-    if cfg!(windows) {
-        path.replace(r"\\?\", "")
-            .replace('\\', "/")
-            .trim_end_matches('/')
-            .to_ascii_lowercase()
-    } else {
-        path.trim_end_matches('/').to_owned()
-    }
-}
-
-/// The SQL twin of [`checkout_key`] over one column expression: the group
-/// key and both member predicates normalize through it.
 fn checkout_key_sql(column: &str) -> String {
     if cfg!(windows) {
         format!(r"lower(rtrim(replace(replace({column}, '\\?\', ''), '\', '/'), '/'))")
     } else {
         format!("rtrim({column}, '/')")
     }
+}
+
+fn repository_evidence(agent: &str) -> String {
+    let project = checkout_key_sql(&format!("{agent}.project"));
+    let workspace = checkout_key_sql(&format!("{agent}.workspace"));
+    let checkout = checkout_key_sql("r.checkout");
+    let retained_worktree = checkout_key_sql("w.worktree_path");
+    let recorded_common_dir = checkout_key_sql("w.repo_common_dir");
+    let registered_common_dir = checkout_key_sql("r.repo_common_dir");
+    format!(
+        "{checkout} IN ({project}, {workspace}) OR EXISTS (
+             SELECT 1 FROM workspaces w
+             WHERE (w.worktree_path = {agent}.workspace
+                    OR (w.agent = {agent}.id AND {retained_worktree} = {workspace}))
+               AND {recorded_common_dir} = {registered_common_dir})"
+    )
+}
+
+/// Resolve the retained registration or unambiguous repository evidence.
+/// Only absent evidence falls back to the parent; ambiguity stays unplaced.
+fn retained_agent_project(agent: &str, parent: &str) -> String {
+    let evidence = repository_evidence(agent);
+    format!(
+        "CASE WHEN EXISTS (SELECT 1 FROM project_registrations r WHERE r.id={agent}.project)
+         THEN {agent}.project ELSE (
+             SELECT CASE COUNT(*) WHEN 0 THEN {parent} WHEN 1 THEN MIN(r.id) END
+             FROM project_registrations r WHERE {evidence})
+         END"
+    )
+}
+
+fn retained_project(agent: &str) -> String {
+    let root = retained_agent_project("root", "NULL");
+    let parent = retained_agent_project("parent", &root);
+    retained_agent_project(
+        agent,
+        &format!(
+            "(SELECT {parent} FROM agents parent
+              LEFT JOIN agents root ON root.id={agent}.root AND root.id<>parent.id
+                   AND root.parent IS NULL AND root.chat=0
+              WHERE parent.id={agent}.parent AND parent.id<>{agent}.id
+                    AND parent.root={agent}.root AND parent.chat=0)"
+        ),
+    )
+}
+
+/// One grouping key for pages, totals, and Agent list readback. Execution
+/// labels and the scope that authorizes effects stay on the retained Agent.
+pub(super) fn organization_group() -> String {
+    format!(
+        "CASE WHEN a.chat=1 THEN (SELECT r.id FROM project_registrations r WHERE r.id=o.project_link)
+              ELSE {} END",
+        retained_project("a")
+    )
 }
 
 /// One Agent's organization group ([`organization_group`]), tags and overlay
@@ -249,44 +288,6 @@ pub(super) fn agent_organization(
     Ok((group, tags, revision))
 }
 
-/// Project-scoped member predicate shared by the count and the page, equal
-/// to [`organization_group`] `= ?1`: members of a retained registration
-/// only; chats by their overlay link alone (a retained execution label
-/// never places a chat), every other Agent by its execution project, or by
-/// the registration of its exact legacy checkout path when the requested
-/// group's checkout owns that path uniquely. `?2` binds the group's
-/// normalized checkout key (empty without a registration, matching
-/// nothing: labels are nonblank).
-fn organization_project_members() -> String {
-    let path = checkout_key_sql("a.project");
-    format!(
-        "(EXISTS(SELECT 1 FROM project_registrations r WHERE r.id = ?1)
-      AND ((a.chat = 0 AND (a.project = ?1
-           OR (?2 <> '' AND {path} = ?2
-               AND (SELECT COUNT(*) FROM project_registrations r2
-                    WHERE {} = ?2) = 1)))
-        OR (a.chat = 1 AND o.project_link = ?1)))",
-        checkout_key_sql("r2.checkout")
-    )
-}
-
-/// Unplaced-bucket predicate shared by the count and the page, equal to
-/// [`organization_group`] `IS NULL`: chats without a retained link (a chat
-/// whose linked project was removed included) plus non-chat Agents whose
-/// execution project is neither a retained registration nor the exact
-/// checkout path of exactly one registration.
-fn organization_unplaced_members() -> String {
-    let path = checkout_key_sql("a.project");
-    format!(
-        "((a.chat = 1 AND (o.project_link IS NULL
-        OR NOT EXISTS(SELECT 1 FROM project_registrations r WHERE r.id = o.project_link)))
-      OR (a.chat = 0 AND NOT EXISTS(SELECT 1 FROM project_registrations r WHERE r.id = a.project)
-          AND (SELECT COUNT(*) FROM project_registrations r2
-               WHERE {} = {path}) <> 1))",
-        checkout_key_sql("r2.checkout")
-    )
-}
-
 /// Exact member total for one group through the same project-scoped
 /// predicates the page below uses, so a single-project read never
 /// aggregates the fleet.
@@ -305,11 +306,9 @@ fn organization_count(
     };
     let total: i64 = match project {
         Some(name) => {
-            let key = group_checkout_key(conn, name)?;
-            let mut statement = conn
-                .prepare(&sql(&organization_project_members(), 3))
-                .map_err(sql_error)?;
-            let mut params: Vec<rusqlite::types::Value> = vec![name.to_owned().into(), key.into()];
+            let predicate = format!("{} = ?1", organization_group());
+            let mut statement = conn.prepare(&sql(&predicate, 2)).map_err(sql_error)?;
+            let mut params: Vec<rusqlite::types::Value> = vec![name.to_owned().into()];
             params.extend(read.query_params());
             statement
                 .query_row(rusqlite::params_from_iter(params.iter()), |row| row.get(0))
@@ -317,7 +316,7 @@ fn organization_count(
         }
         None => {
             let mut statement = conn
-                .prepare(&sql(&organization_unplaced_members(), 1))
+                .prepare(&sql(&format!("{} IS NULL", organization_group()), 1))
                 .map_err(sql_error)?;
             statement
                 .query_row(
@@ -328,15 +327,6 @@ fn organization_count(
         }
     };
     Ok(total as usize)
-}
-
-/// The normalized checkout key of one group's registration, empty when the
-/// label has no retained registration (the legacy path arm then matches
-/// nothing).
-fn group_checkout_key(conn: &Connection, project: &str) -> Result<String> {
-    Ok(projects::project_registration_tx(conn, project)?
-        .map(|registration| checkout_key(&registration.checkout))
-        .unwrap_or_default())
 }
 
 /// What every group of one projection read shares: the archived
@@ -414,8 +404,7 @@ fn organization_members(
     let archived = read.archived;
     let take = i64::try_from(take)
         .map_err(|_| Error::new("internal", "organization page bound is invalid"))?;
-    let project_predicate = organization_project_members();
-    let unplaced_predicate = organization_unplaced_members();
+    let group = organization_group();
     let mut statement = match project {
         Some(_) => conn
             .prepare(&format!(
@@ -423,10 +412,10 @@ fn organization_members(
                         a.chat, a.archived, a.observe_only, a.workspace,
                         o.project_link, o.tags, o.continued_from
                  FROM agents a LEFT JOIN chat_organization o ON o.agent = a.id
-                 WHERE {project_predicate}
+                 WHERE {group} = ?1
                    AND {archived}{}
-                 ORDER BY a.id LIMIT ?3",
-                read.query_suffix(4)
+                 ORDER BY a.id LIMIT ?2",
+                read.query_suffix(3)
             ))
             .map_err(sql_error)?,
         None => conn
@@ -435,21 +424,16 @@ fn organization_members(
                         a.chat, a.archived, a.observe_only, a.workspace,
                         o.project_link, o.tags, o.continued_from
                  FROM agents a LEFT JOIN chat_organization o ON o.agent = a.id
-                 WHERE {unplaced_predicate}
+                 WHERE {group} IS NULL
                    AND {archived}{}
                  ORDER BY a.id LIMIT ?1",
                 read.query_suffix(2)
             ))
             .map_err(sql_error)?,
     };
-    // `?1` name, `?2` checkout key, `?3` page bound, search words from `?4`;
-    // the unplaced bucket binds `?1` page bound, words from `?2`.
+    // Project pages bind the group name and limit before any search terms.
     let mut params: Vec<rusqlite::types::Value> = match project {
-        Some(name) => vec![
-            name.to_owned().into(),
-            group_checkout_key(conn, name)?.into(),
-            take.into(),
-        ],
+        Some(name) => vec![name.to_owned().into(), take.into()],
         None => vec![take.into()],
     };
     params.extend(read.query_params());
@@ -760,7 +744,7 @@ impl Store {
                     } else {
                         let assignment = project_assignment::read_assignment(conn, project)?;
                         let manager = overview::overview_manager_view(conn, Some(&assignment))?;
-                        let needs_assignment = assignment.manager.is_none()
+                        let mut needs_assignment = assignment.manager.is_none()
                             && !organization_roots(conn, project, archived)?.is_empty();
                         // Competing roots surface without reassigning either
                         // root, counted independently of the display filter.
@@ -777,18 +761,26 @@ impl Store {
                                     }
                                     ProjectManagerIdentity::Remote { .. } => None,
                                 });
-                        // Competing roots need retained evidence of a
-                        // competing manager: the assignment names one, and
-                        // every other retained root competes with it.
-                        // Without a manager the roots wait for assignment,
-                        // never a conflict.
                         let conflicting_roots = match manager_num {
                             Some(manager) => organization_roots(conn, project, "1 = 1")?
                                 .into_iter()
                                 .filter(|root| *root != manager)
                                 .map(format_agent_id)
                                 .collect(),
-                            None => Vec::new(),
+                            None => {
+                                let writers = retained_root_writers(
+                                    conn,
+                                    project,
+                                    None,
+                                    MAX_ORG_ROOTS_PER_GROUP as i64,
+                                )?;
+                                needs_assignment |= !writers.is_empty();
+                                if writers.len() > 1 {
+                                    writers.into_iter().map(format_agent_id).collect()
+                                } else {
+                                    Vec::new()
+                                }
+                            }
                         };
                         (
                             registration,

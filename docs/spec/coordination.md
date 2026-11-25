@@ -445,8 +445,12 @@ and outcomes. Mail and authorized history reads retain their existing scope.
 Project mutations, including vars, claims, workspace setup and cleanup, must
 respect current authority. Automation uses the same command fence. Legacy rows
 with no assignment history retain ordinary control. Adoption must account for
-existing writers before claiming exclusive workspace custody. Assignment is
-Swarm control authority. Filesystem isolation depends on the native sandbox.
+existing writers before claiming exclusive workspace custody. An Owner
+selects one exact generation with `project assignment claim --revision`.
+Only a root already authorized for the execution project can acquire its
+assignment. Claim binds a ready retained managed worktree in the same
+transaction. A competing live or custody-held root blocks claim or fresh
+manager launch. Assignment is Swarm control authority. Filesystem isolation depends on the native sandbox.
 
 A manager launch in managed multi-project mode reserves the assignment,
 the workspace and capacity in one Store transaction before any external
@@ -525,11 +529,10 @@ adds the switch's `continued_from` pointer).
   event-watermark readback. Clients never repeat Git discovery or grouping.
   Chats group by their overlay link alone; a legacy chat that still carries
   an execution project reads in the no-project bucket until attached.
-  A non-chat Agent groups by its execution project when that is a retained
-  registration, else by the registration of its exact retained checkout
-  path (normalized separators, verbatim prefix and case); the retained
-  label is never rewritten, and a path two registrations share stays in
-  the no-project bucket.
+  A non-chat Agent groups by a retained execution registration, or by a
+  unique match on its retained checkout or managed-worktree common directory.
+  Absent local evidence, its retained parent and root can supply the link.
+  Ambiguous evidence leaves the row in the no-project bucket.
 - `chat.attach` moves chats under a retained project; `chat.detach` returns
   them to the no-project bucket. `chat.tag` replaces tag groups. Every write
   advances each written link's revision; a write carrying the revision it
@@ -542,13 +545,13 @@ adds the switch's `continued_from` pointer).
   the existing switch/handoff path. A chat's placement, tags, and original
   execution scope stay attached to its original identity.
 
-Migration keeps every ID and all history. Links are derived only from
-unambiguous retained facts (registration, common directory, parent); never
-from names or the last message. Retained roots competing with a project's
-assigned manager surface as an explicit ambiguity and are never
-auto-reassigned; a project without a manager only needs assignment. Rename and
-archive reuse their existing paths; presentation preferences stay in the
-existing settings. The wire contract is [Chat organization](api.md#chat-organization).
+Migration is resolved on read from retained facts. This preserves every
+Agent and worktree ID, execution scope, dirty state, and command outcome.
+The vacant assignment readback identifies competing roots and shows
+`needs_assignment` until an explicit claim. Uncertain custody still counts
+as a competing writer. Rename and archive reuse their existing paths;
+presentation preferences stay in settings. The wire contract is
+[Chat organization](api.md#chat-organization).
 
 ## Mailbox
 
