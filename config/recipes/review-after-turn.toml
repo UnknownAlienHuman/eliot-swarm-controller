@@ -14,6 +14,7 @@
 
 [[rule]]
 id = "review-after-turn"
+review = true
 on = { event = "project.worktree.check.passed", match = { "subject.profile" = "{{REVIEW_AUTHOR}}", "data.worktree.files" = { not = 0 }, "data.worktree.lines" = { at_most = 600 } } }
 once_per = "${data.worktree.fingerprint}"
 limit = { max = 2, per = "agent", window = "24h", min_interval = "2h" }
