@@ -2243,6 +2243,8 @@ async fn reconcile_due_timers_with_arbitration(
             }
         }
         if principal == "owner" && arbitrate_launches {
+            // The global pass owns the shared queue, including launches made
+            // by authenticated Agents. Each job retains its submitting principal.
             for (project, ready_at, sequence) in router.direct_launch_heads() {
                 match heads.entry(project) {
                     std::collections::btree_map::Entry::Vacant(entry) => {

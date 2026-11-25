@@ -277,6 +277,10 @@ impl ProjectDirtyView {
 #[derive(JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProjectUsageView {
+    pub agents_included: usize,
+    pub generations_included: usize,
+    pub truncated: bool,
+    pub history_complete: bool,
     /// Zero when no event history was pruned.
     pub pruned_through: i64,
     pub turns: super::TurnExpenditure,
@@ -370,7 +374,10 @@ impl ProjectOverviewEntry {
             ));
         }
         if let Some(usage) = &self.usage {
-            if usage.pruned_through < 0 {
+            if usage.pruned_through < 0
+                || usage.history_complete != (usage.pruned_through == 0)
+                || usage.generations_included < usage.agents_included
+            {
                 return Err(Error::new(
                     "unknown",
                     "project overview usage coverage is invalid",

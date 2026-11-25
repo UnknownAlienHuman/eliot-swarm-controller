@@ -5,8 +5,8 @@ use super::*;
 use eliot_core::api::{
     FleetTotals, HarnessCount, LifecycleTotals, NativeChildView, OverviewCoverage,
     OverviewManagerView, OverviewWorkerView, ProjectAssignment, ProjectAssignmentState,
-    ProjectDirtyView, ProjectManagerIdentity, ProjectOverviewEntry, ProjectTotals,
-    ProjectUsageView, ScopeLimits, ScopeUsage,
+    ProjectDirtyView, ProjectManagerIdentity, ProjectOverviewEntry, ProjectTotals, ScopeLimits,
+    ScopeUsage,
 };
 
 const PROJECTS: &str = "SELECT id AS project FROM project_registrations
@@ -108,7 +108,7 @@ pub(super) fn queue_detail_access(conn: &Connection, principal: &str) -> Result<
     })
 }
 
-fn member_sql(alias: &str, root: u8, scope: u8, slf: u8) -> String {
+pub(super) fn member_sql(alias: &str, root: u8, scope: u8, slf: u8) -> String {
     format!(
         "(?{root} IS NULL OR ({alias}.root = ?{root}
         AND (?{scope} IS NULL OR COALESCE({alias}.project_scope,{alias}.project) = ?{scope})
@@ -253,6 +253,7 @@ fn project_team(
     conn: &Connection,
     project: &str,
     limits: &ScopeLimits,
+    usage_agents: i64,
     access: &DetailAccess,
     worker_after: Option<i64>,
     workspace_after: Option<i64>,
@@ -290,17 +291,7 @@ fn project_team(
     let manager_limit = launch_queue::effective_manager_limit(conn, project, &project_limits)?;
     let (totals, project_usage) = project_header_totals(conn, project, limits)?;
     let usage = detail
-        .then(|| {
-            let (root, scope, slf) = access.members();
-            Ok::<_, Error>(ProjectUsageView {
-                pruned_through: retention::coverage_pruned_through(conn)?,
-                turns: usage::overview_turn_expenditure(
-                    conn,
-                    &member_sql("a", 2, 3, 4),
-                    params![project, root, scope, slf],
-                )?,
-            })
-        })
+        .then(|| usage::overview_project_usage(conn, project, usage_agents, access.members()))
         .transpose()?;
     Ok(ProjectOverviewEntry {
         project: project.to_owned(),

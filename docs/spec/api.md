@@ -1436,13 +1436,16 @@ the pending page. The queue reports the wait code, scope and actor who can
 change that scope. `project.overview` reports live harnesses, active turns, queued
 work and retained unknown reservations as distinct counts.
 
-An ordinary direct `launch` joins the same project arbitration pass as
-scheduled assignments and explicit interactive intents. It waits for an admission
-decision under its original command ID. A direct request denied by capacity or
-by earlier retained work in its project returns `capacity_unavailable` before
-creating a launch command, Agent, or reservation. Use `--queue` for an intent
-that must survive a refusal to admit immediately or a daemon restart. A lost
-direct reply requires a retry with the same ID. An Owner can explicitly use
+An ordinary direct `launch` joins the same daemon-wide project arbitration
+as scheduled assignments and explicit interactive intents. The worker admits
+each request under its submitting principal and original command ID. If the
+worker is unavailable, direct launches receive an immediate `unavailable`.
+A direct request denied by capacity or earlier retained work in its project
+receives `capacity_unavailable` for that request alone, before creating a
+command, Agent, or reservation. Expiry while still waiting also gives a
+definite capacity refusal. An admission decision already in progress settles
+before the RPC replies. Use `--queue` for a durable intent and retry a lost
+reply with the same ID. An Owner can explicitly use
 `--owner-override` to bypass fair ordering while still checking every
 admission limit.
 

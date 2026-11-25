@@ -19,6 +19,7 @@ pub(super) struct DirectLaunches {
 struct DirectLaunch {
     sequence: u64,
     created_at: i64,
+    deadline: Instant,
     principal: String,
     request: SubmitCommand,
     workspace: Option<WorkspacePreparationInput>,
@@ -38,14 +39,21 @@ impl Router {
         workspace: Option<WorkspacePreparationInput>,
         context: SubmissionContext<'_>,
     ) -> Result<Admission> {
+        if self.inner.launch_arbitration.is_closed() {
+            return Err(Error::new(
+                "unavailable",
+                "the daemon's launch arbitration worker is unavailable",
+            ));
+        }
         let request = submission.request();
         let project = request.args["registered_project"]
             .as_str()
             .or_else(|| request.args["project"].as_str())
             .unwrap_or_default()
             .to_owned();
-        let (settled, reply) = oneshot::channel();
-        {
+        let deadline = Instant::now() + Duration::from_millis(DIRECT_LAUNCH_WAIT_MS);
+        let (settled, mut reply) = oneshot::channel();
+        let sequence = {
             let mut queue = self.inner.direct_launches.lock_recover();
             queue.prune();
             if queue.projects.values().map(VecDeque::len).sum::<usize>() >= DIRECT_LAUNCH_LIMIT {
@@ -58,11 +66,12 @@ impl Router {
             let sequence = queue.next;
             queue
                 .projects
-                .entry(project)
+                .entry(project.clone())
                 .or_default()
                 .push_back(DirectLaunch {
                     sequence,
                     created_at: now_ms(),
+                    deadline,
                     principal: principal_name(principal),
                     request: request.clone(),
                     workspace,
@@ -70,20 +79,32 @@ impl Router {
                     owner_process: context.owner_process.cloned(),
                     settled,
                 });
-        }
+            sequence
+        };
         self.signal_launch_arbitration();
-        match timeout_at(
-            Instant::now() + Duration::from_millis(DIRECT_LAUNCH_WAIT_MS),
-            reply,
-        )
-        .await
-        {
-            Ok(Ok(result)) => result,
-            _ => Err(Error::new(
+        let result = match timeout_at(deadline, &mut reply).await {
+            Ok(result) => result,
+            Err(_) => {
+                let cancelled = self
+                    .inner
+                    .direct_launches
+                    .lock_recover()
+                    .cancel(&project, sequence);
+                if cancelled {
+                    self.signal_launch_arbitration();
+                    return Err(direct_capacity_deadline());
+                }
+                // The worker claimed the request under the Store lock. Its
+                // admission decision must settle before we can answer.
+                reply.await
+            }
+        };
+        result.unwrap_or_else(|_| {
+            Err(Error::new(
                 "unknown",
-                "direct launch arbitration reply was lost or timed out; retry with the same id",
-            )),
-        }
+                "direct launch arbitration reply was lost; retry with the same id",
+            ))
+        })
     }
 
     pub(crate) fn direct_launch_heads(&self) -> Vec<(String, i64, u64)> {
@@ -100,23 +121,17 @@ impl Router {
     }
 
     pub(crate) fn refuse_direct_behind_queued(&self, project: &str, sequence: u64) {
-        let jobs = {
-            let mut queue = self.inner.direct_launches.lock_recover();
-            queue
-                .projects
-                .get(project)
-                .and_then(VecDeque::front)
-                .is_some_and(|head| head.sequence == sequence)
-                .then(|| queue.projects.remove(project))
-                .flatten()
-        };
-        if let Some(jobs) = jobs {
-            for job in jobs {
-                let _ = job.settled.send(Err(Error::new(
-                    "capacity_unavailable",
-                    "earlier queued work has priority in this project's launch arbitration",
-                )));
-            }
+        let job = self
+            .inner
+            .direct_launches
+            .lock_recover()
+            .take_head(project, sequence);
+        if let Some(job) = job {
+            let _ = job.settled.send(Err(Error::new(
+                "capacity_unavailable",
+                "earlier queued work has priority in this project's launch arbitration",
+            )));
+            self.signal_launch_arbitration();
         }
     }
 
@@ -126,28 +141,22 @@ impl Router {
         sequence: u64,
         blocked_scopes: &HashSet<String>,
     ) -> LaunchArbitrationAttempt {
+        let mut store = self.inner.store.lock().await;
         let job = self
             .inner
             .direct_launches
             .lock_recover()
-            .projects
-            .get_mut(project)
-            .and_then(|jobs| {
-                if jobs.front().is_some_and(|head| head.sequence == sequence) {
-                    jobs.pop_front()
-                } else {
-                    None
-                }
-            });
+            .take_head(project, sequence);
         let Some(job) = job else {
             return LaunchArbitrationAttempt::Other;
         };
-        let result = {
-            let mut store = self.inner.store.lock().await;
-            if job.settled.is_closed() {
-                self.signal_launch_arbitration();
-                return LaunchArbitrationAttempt::Other;
-            }
+        if job.settled.is_closed() {
+            self.signal_launch_arbitration();
+            return LaunchArbitrationAttempt::Other;
+        }
+        let result = if Instant::now() >= job.deadline {
+            Err(direct_capacity_deadline())
+        } else {
             let context = SubmissionContext {
                 remote: job.remote.as_ref(),
                 owner_process: job.owner_process.as_ref(),
@@ -171,18 +180,24 @@ impl Router {
             }
             result
         };
+        drop(store);
         if result
             .as_ref()
             .is_err_and(|error| error.code == "arbitration_retry")
         {
-            self.inner
-                .direct_launches
-                .lock_recover()
-                .projects
-                .entry(project.to_owned())
-                .or_default()
-                .push_front(job);
-            return LaunchArbitrationAttempt::RetryPass;
+            let mut queue = self.inner.direct_launches.lock_recover();
+            if Instant::now() < job.deadline {
+                queue
+                    .projects
+                    .entry(project.to_owned())
+                    .or_default()
+                    .push_front(job);
+                return LaunchArbitrationAttempt::RetryPass;
+            }
+            drop(queue);
+            let _ = job.settled.send(Err(direct_capacity_deadline()));
+            self.signal_launch_arbitration();
+            return LaunchArbitrationAttempt::Other;
         }
         if let Ok(admission) = &result
             && admission.is_new
@@ -580,12 +595,37 @@ impl Router {
 }
 
 impl DirectLaunches {
+    fn take_head(&mut self, project: &str, sequence: u64) -> Option<DirectLaunch> {
+        let jobs = self.projects.get_mut(project)?;
+        if jobs.front()?.sequence != sequence {
+            return None;
+        }
+        jobs.pop_front()
+    }
+
+    fn cancel(&mut self, project: &str, sequence: u64) -> bool {
+        let Some(jobs) = self.projects.get_mut(project) else {
+            return false;
+        };
+        let Some(index) = jobs.iter().position(|job| job.sequence == sequence) else {
+            return false;
+        };
+        jobs.remove(index).is_some()
+    }
+
     fn prune(&mut self) {
         self.projects.retain(|_, jobs| {
             jobs.retain(|job| !job.settled.is_closed());
             !jobs.is_empty()
         });
     }
+}
+
+fn direct_capacity_deadline() -> Error {
+    Error::new(
+        "capacity_unavailable",
+        "direct launch was still waiting for capacity when its arbitration deadline expired",
+    )
 }
 
 pub(crate) enum LaunchArbitrationAttempt {

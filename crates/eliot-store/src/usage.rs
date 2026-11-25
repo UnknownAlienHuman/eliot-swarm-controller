@@ -27,10 +27,10 @@ use eliot_core::api::harness::{
 };
 use eliot_core::api::{
     FirstCallInput, MAX_FIRST_CALL_TURNS, MAX_NATIVE_CHILD_TURN_MARKERS, NativeChildTurnMarker,
-    PROFILE_FIRST_CALL_WINDOW, ProfileFirstCallInput, ProfileNativeChildUsage, SessionCostTotal,
-    SessionCumulativeTotals, SessionFacts, SessionTokenSubtotal, TurnCounterMissing,
-    TurnCounterTotals, TurnExpenditure, TurnScopeTotals, UsageScopeView, UsageSummaryRequest,
-    UsageSummaryResponse,
+    PROFILE_FIRST_CALL_WINDOW, ProfileFirstCallInput, ProfileNativeChildUsage, ProjectUsageView,
+    SessionCostTotal, SessionCumulativeTotals, SessionFacts, SessionTokenSubtotal,
+    TurnCounterMissing, TurnCounterTotals, TurnExpenditure, TurnScopeTotals, UsageScopeView,
+    UsageSummaryRequest, UsageSummaryResponse,
 };
 use rusqlite::{Connection, params, params_from_iter};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -213,28 +213,84 @@ impl TurnExpenditureAccum {
     }
 }
 
-/// Read retained turn rows without expanding an Agent selector or reading its events.
-pub(super) fn overview_turn_expenditure(
+struct ScopedUsageTurn {
+    agent: i64,
+    generation: i64,
+    state: String,
+    usage: Option<String>,
+    harness: String,
+    turn_id: String,
+    settled_at: i64,
+    manager: bool,
+}
+
+/// Seek the exact authorized Agent/generation pairs on the turns index.
+fn for_each_scoped_usage_turn(
     conn: &Connection,
-    member_sql: &str,
-    bindings: impl rusqlite::Params,
-) -> Result<TurnExpenditure> {
+    pairs: &[(i64, i64)],
+    with_manager: bool,
+    mut visit: impl FnMut(ScopedUsageTurn) -> Result<()>,
+) -> Result<()> {
+    if pairs.is_empty() {
+        return Ok(());
+    }
+    let completed = "COALESCE(t.completed_at, t.started_at, 0)";
+    let manager = if with_manager {
+        manager_at_sql("t.agent", completed)
+    } else {
+        "0".to_owned()
+    };
     let mut statement = conn
         .prepare_cached(&format!(
-            "SELECT t.state, t.usage, a.harness FROM agents a
-         CROSS JOIN turns t ON t.agent = a.id
-         WHERE a.project = ?1 AND {member_sql}"
+            "SELECT t.agent, t.generation, t.state, t.usage, a.harness, t.turn_id,
+                    {completed}, {manager}
+             FROM json_each(?1) p
+             CROSS JOIN turns t ON t.agent = json_extract(p.value, '$[0]')
+                               AND t.generation = json_extract(p.value, '$[1]')
+             CROSS JOIN agents a ON a.id = t.agent"
         ))
         .map_err(sql_error)?;
-    let mut rows = statement.query(bindings).map_err(sql_error)?;
-    let mut turns = TurnExpenditureAccum::default();
-    while let Some(row) = rows.next().map_err(sql_error)? {
-        let state: String = row.get(0).map_err(sql_error)?;
-        let usage: Option<String> = row.get(1).map_err(sql_error)?;
-        let harness: String = row.get(2).map_err(sql_error)?;
-        turns.observe(&state, usage.as_deref(), &harness)?;
+    let rows = statement
+        .query_map([encode_json(&pairs)?], |row| {
+            Ok(ScopedUsageTurn {
+                agent: row.get(0)?,
+                generation: row.get(1)?,
+                state: row.get(2)?,
+                usage: row.get(3)?,
+                harness: row.get(4)?,
+                turn_id: row.get(5)?,
+                settled_at: row.get(6)?,
+                manager: row.get(7)?,
+            })
+        })
+        .map_err(sql_error)?;
+    for row in rows {
+        visit(row.map_err(sql_error)?)?;
     }
-    Ok(turns.finish())
+    Ok(())
+}
+
+pub(super) fn overview_project_usage(
+    conn: &Connection,
+    project: &str,
+    bound: i64,
+    members: (Option<i64>, Option<&str>, bool),
+) -> Result<ProjectUsageView> {
+    let scope = resolve_project_usage(conn, project, bound, members)?;
+    let pruned_through = retention::coverage_pruned_through(conn)?;
+    let mut turns = TurnExpenditureAccum::default();
+    for_each_scoped_usage_turn(conn, &scope.pairs, false, |row| {
+        turns.observe(&row.state, row.usage.as_deref(), &row.harness)?;
+        Ok(())
+    })?;
+    Ok(ProjectUsageView {
+        agents_included: scope.agents_included,
+        generations_included: scope.pairs.len(),
+        truncated: scope.truncated,
+        history_complete: pruned_through == 0,
+        pruned_through,
+        turns: turns.finish(),
+    })
 }
 
 #[derive(Default)]
@@ -373,6 +429,79 @@ fn normalize_turn_scope(scope: &Option<String>) -> String {
     }
 }
 
+fn resolve_project_usage(
+    conn: &Connection,
+    project: &str,
+    bound: i64,
+    (root, scope, slf): (Option<i64>, Option<&str>, bool),
+) -> Result<ResolvedUsageScope> {
+    let mut statement = conn
+        .prepare_cached(&format!(
+            "SELECT a.id, a.generation FROM agents a
+         WHERE a.project = ?1 AND {} ORDER BY a.id LIMIT ?2",
+            overview::member_sql("a", 3, 4, 5),
+        ))
+        .map_err(sql_error)?;
+    let mut agents = statement
+        .query_map(
+            params![project, bound.saturating_add(1), root, scope, slf],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(sql_error)?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(sql_error)?;
+    let truncated = agents.len() as i64 > bound;
+    agents.truncate(bound.max(0) as usize);
+    let mut scope = resolve_agent_scope(conn, agents)?;
+    scope.truncated = truncated;
+    Ok(scope)
+}
+
+fn resolve_agent_scope(
+    conn: &Connection,
+    mut agents: Vec<(i64, i64)>,
+) -> Result<ResolvedUsageScope> {
+    agents.sort();
+    agents.dedup();
+    let nums: Vec<i64> = agents.iter().map(|(num, _)| *num).collect();
+    let mut pairs: BTreeSet<(i64, i64)> = agents.into_iter().collect();
+    for (num, generation) in retained_generations(conn, &nums)? {
+        pairs.insert((num, generation));
+    }
+    Ok(ResolvedUsageScope {
+        pairs: pairs.into_iter().collect(),
+        agents_included: nums.len(),
+        truncated: false,
+    })
+}
+
+/// Distinct retained generations holding turns or session snapshots for
+/// these agents, so the Agent scope covers history beyond the current
+/// generation. Indexed by the `turns` primary-key prefix and the
+/// `session_usage` primary key; no new index needed.
+fn retained_generations(conn: &Connection, nums: &[i64]) -> Result<Vec<(i64, i64)>> {
+    if nums.is_empty() {
+        return Ok(Vec::new());
+    }
+    let placeholders = nums.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+    let mut pairs = BTreeSet::new();
+    for table in ["turns", "session_usage"] {
+        let sql = format!(
+            "SELECT agent, generation FROM {table} WHERE agent IN ({placeholders}) GROUP BY agent, generation"
+        );
+        let mut statement = conn.prepare_cached(&sql).map_err(sql_error)?;
+        let rows = statement
+            .query_map(params_from_iter(nums.iter()), |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+            })
+            .map_err(sql_error)?;
+        for row in rows {
+            pairs.insert(row.map_err(sql_error)?);
+        }
+    }
+    Ok(pairs.into_iter().collect())
+}
+
 impl Store {
     /// Read only registrations whose parent generation is already in the
     /// caller-authorized usage scope.
@@ -443,12 +572,12 @@ impl Store {
             let mut pairs = if let Some(generation) = request.generation {
                 vec![(num, generation)]
             } else {
-                self.resolve_agent_scope(vec![(num, row.generation)])?.pairs
+                resolve_agent_scope(&self.connection, vec![(num, row.generation)])?.pairs
             };
             let mut children = self.usage_native_descendants(num, request.generation, bound)?;
             let truncated = children.len() as i64 >= bound;
             children.truncate(bound.saturating_sub(1).max(0) as usize);
-            let children = self.resolve_agent_scope(children)?;
+            let children = resolve_agent_scope(&self.connection, children)?;
             let agents_included = 1 + children.agents_included;
             pairs.extend(children.pairs);
             return Ok(ResolvedUsageScope {
@@ -458,10 +587,7 @@ impl Store {
             });
         }
         if let Some(project) = request.project.as_deref() {
-            let (agents, truncated) = self.usage_agents_by_project(project, bound)?;
-            let mut scope = self.resolve_agent_scope(agents)?;
-            scope.truncated = truncated;
-            return Ok(scope);
+            return resolve_project_usage(&self.connection, project, bound, (None, None, false));
         }
         let root = request.root.as_deref().ok_or_else(|| {
             Error::new(
@@ -486,24 +612,9 @@ impl Store {
             })?;
             agents.push((num, row.generation));
         }
-        let mut scope = self.resolve_agent_scope(agents)?;
+        let mut scope = resolve_agent_scope(&self.connection, agents)?;
         scope.truncated = truncated;
         Ok(scope)
-    }
-
-    fn resolve_agent_scope(&self, mut agents: Vec<(i64, i64)>) -> Result<ResolvedUsageScope> {
-        agents.sort();
-        agents.dedup();
-        let nums: Vec<i64> = agents.iter().map(|(num, _)| *num).collect();
-        let mut pairs: BTreeSet<(i64, i64)> = agents.into_iter().collect();
-        for (num, generation) in self.retained_generations(&nums)? {
-            pairs.insert((num, generation));
-        }
-        Ok(ResolvedUsageScope {
-            pairs: pairs.into_iter().collect(),
-            agents_included: nums.len(),
-            truncated: false,
-        })
     }
 
     fn usage_native_descendants(
@@ -533,57 +644,6 @@ impl Store {
             .map_err(sql_error)?
             .collect::<rusqlite::Result<Vec<_>>>()
             .map_err(sql_error)
-    }
-
-    fn usage_agents_by_project(
-        &self,
-        project: &str,
-        bound: i64,
-    ) -> Result<(Vec<(i64, i64)>, bool)> {
-        let probe = bound.saturating_add(1);
-        let mut statement = self
-            .connection
-            .prepare("SELECT id, generation FROM agents WHERE project = ?1 ORDER BY id LIMIT ?2")
-            .map_err(sql_error)?;
-        let rows = statement
-            .query_map(params![project, probe], |row| {
-                Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
-            })
-            .map_err(sql_error)?;
-        let mut agents = Vec::new();
-        for row in rows {
-            agents.push(row.map_err(sql_error)?);
-        }
-        let truncated = agents.len() as i64 > bound;
-        agents.truncate(bound.max(0) as usize);
-        Ok((agents, truncated))
-    }
-
-    /// Distinct retained generations holding turns or session snapshots for
-    /// these agents, so the Agent scope covers history beyond the current
-    /// generation. Indexed by the `turns` primary-key prefix and the
-    /// `session_usage` primary key; no new index needed.
-    fn retained_generations(&self, nums: &[i64]) -> Result<Vec<(i64, i64)>> {
-        if nums.is_empty() {
-            return Ok(Vec::new());
-        }
-        let placeholders = nums.iter().map(|_| "?").collect::<Vec<_>>().join(",");
-        let mut pairs = BTreeSet::new();
-        for table in ["turns", "session_usage"] {
-            let sql = format!(
-                "SELECT agent, generation FROM {table} WHERE agent IN ({placeholders}) GROUP BY agent, generation"
-            );
-            let mut statement = self.connection.prepare(&sql).map_err(sql_error)?;
-            let rows = statement
-                .query_map(params_from_iter(nums.iter()), |row| {
-                    Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
-                })
-                .map_err(sql_error)?;
-            for row in rows {
-                pairs.insert(row.map_err(sql_error)?);
-            }
-        }
-        Ok(pairs.into_iter().collect())
     }
 
     /// Summarize retained usage for already-authorized (agent, generation)
@@ -629,35 +689,17 @@ impl Store {
                     |row| row.get(0),
                 )
                 .map_err(sql_error)?;
-            let completed = "COALESCE(t.completed_at, t.started_at, 0)";
-            let manager = manager_at_sql("t.agent", completed);
-            let sql = format!(
-                "SELECT t.agent, t.generation, t.state, t.usage, a.harness, t.turn_id,
-                        {completed}, {manager}
-                 FROM turns t JOIN agents a ON a.id = t.agent
-                 WHERE t.agent IN ({placeholders})"
-            );
-            let mut statement = self.connection.prepare(&sql).map_err(sql_error)?;
-            let rows = statement
-                .query_map(params_from_iter(agent_ids.iter()), |row| {
-                    Ok((
-                        row.get::<_, i64>(0)?,
-                        row.get::<_, i64>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, Option<String>>(3)?,
-                        row.get::<_, String>(4)?,
-                        row.get::<_, String>(5)?,
-                        row.get::<_, i64>(6)?,
-                        row.get::<_, bool>(7)?,
-                    ))
-                })
-                .map_err(sql_error)?;
-            for row in rows {
-                let (agent, generation, state, usage, harness, turn_id, settled_at, manager) =
-                    row.map_err(sql_error)?;
-                if !wanted.contains(&(agent, generation)) {
-                    continue;
-                }
+            for_each_scoped_usage_turn(&self.connection, pairs, true, |row| {
+                let ScopedUsageTurn {
+                    agent,
+                    generation,
+                    state,
+                    usage,
+                    harness,
+                    turn_id,
+                    settled_at,
+                    manager,
+                } = row;
                 let has_native_children = if native_child_bindings.by_turn.contains_key(&(
                     agent,
                     generation,
@@ -681,7 +723,7 @@ impl Store {
                     native_child_turns_truncated = true;
                 }
                 let Some(usage) = turns.observe(&state, usage.as_deref(), &harness)? else {
-                    continue;
+                    return Ok(());
                 };
                 role_usage.observe_turn(manager, &usage)?;
                 if let Some(input_tokens) = usage.first_call_input_tokens {
@@ -691,7 +733,8 @@ impl Store {
                         first_calls_truncated = true;
                     }
                 }
-            }
+                Ok(())
+            })?;
         }
         self.accumulate_usage_context(&wanted, &agent_ids, &mut role_usage)?;
         let sessions = self.summarize_sessions(&wanted)?;

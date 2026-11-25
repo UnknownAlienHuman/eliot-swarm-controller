@@ -432,14 +432,14 @@ time among known workspaces lets the caller assess age. This read never runs
 Git, and a project with no observed execution workspace reads as unknown.
 For a shared workspace the latest retained observation determines coverage.
 
-The same read includes token expenditure over all retained turn rows for the
-authorized current project team, across its retained generations. It uses the
-same turn scopes, normalization, counter gaps and excluded running and unknown
-turn counts as `usage.summary`. The event retention watermark `pruned_through`
-identifies history gaps. These totals cover the team independently of the rows
-on the page. Session snapshots and per-turn diagnostic detail remain available
-through `usage.summary`. Teams visible only as aggregates omit Git and token
-usage detail.
+The same read includes token expenditure for the authorized current project
+team. It uses the `usage.summary` Agent selector bound and exact retained
+Agent-generation pairs. It reports included Agent and generation counts,
+selector truncation, history completeness and the event retention watermark
+`pruned_through`. Turn scopes, counter normalization and missing or excluded
+turn counts match `usage.summary`. Usage coverage is independent of the rows
+on the page. Session snapshots and per-turn diagnostics are available through
+`usage.summary`. Teams visible only as aggregates omit Git and token usage detail.
 
 Live harnesses, dispatched starts, active turns, waiting work and retained
 unknown reservations use their respective committed generation, command, turn
