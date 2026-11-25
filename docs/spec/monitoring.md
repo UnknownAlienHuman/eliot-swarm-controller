@@ -655,6 +655,12 @@ capabilities, `PR_SET_NO_NEW_PRIVS` and irreversible `RLIMIT_NPROC=0`. Root/priv
 Linux and other Unix contexts return explicit unavailable; there is no unfenced retry
 or fallback. These restrictions apply to Git reads, not normal harness/plugin custody.
 
+Workspace identity, branch and worktree registry reads use a fixed allowlist
+of Git built-ins that cannot invoke filters, executable aliases or merge
+drivers. They use the same leaf custody, deadline and output bounds without
+starting a separate executable-configuration probe. Reads of worktree content
+and commands that can invoke configured drivers retain that probe.
+
 Diff/log commands additionally pass `--no-ext-diff --no-textconv`. Monitor-built Git
 commands also set `core.safecrlf=false`, so a CRLF conversion warning for a dirty file
 under `core.autocrlf` is not read as a failure by the leaf fence; none of them checks
