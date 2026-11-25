@@ -881,7 +881,7 @@ pub(super) fn claim_next_input_tx(
             if args.point != InjectPoint::NextInput {
                 continue;
             }
-            if reject_stale_assignment(tx, &record, agent_num, agent.generation, now, events)? {
+            if reject_unauthorized_context(tx, &record, agent_num, agent, now, events)? {
                 continue;
             }
             if args
@@ -1144,7 +1144,7 @@ impl Store {
                 if args.point != InjectPoint::TurnSafePoint {
                     continue;
                 }
-                if reject_stale_assignment(&tx, &record, agent_num, generation, now, &mut events)? {
+                if reject_unauthorized_context(&tx, &record, agent_num, &agent, now, &mut events)? {
                     continue;
                 }
                 if args
@@ -2401,6 +2401,16 @@ fn check_pending_steer_dispatch(
     record: &CommandRecord,
     agent: &Agent,
 ) -> Result<()> {
+    check_context_authority(tx, record, agent)?;
+    provider_holds::require_dispatch_tx(tx, agent, &record.command)?;
+    Ok(())
+}
+
+fn check_context_authority(
+    tx: &Transaction<'_>,
+    record: &CommandRecord,
+    agent: &Agent,
+) -> Result<()> {
     project_assignment::check_dispatch(tx, record)?;
     projects::validate_project_command_dispatch_tx(tx, record)?;
     admission::require_reply_authority(&record.command.principal, &record.command.verb, agent)?;
@@ -2408,7 +2418,6 @@ fn check_pending_steer_dispatch(
         let caller = hierarchy::parse_caller(tx, &record.command.principal)?;
         hierarchy::caller_may_command(tx, &caller, agent)?;
     }
-    provider_holds::require_dispatch_tx(tx, agent, &record.command)?;
     Ok(())
 }
 
@@ -2447,15 +2456,16 @@ fn reject_pending_steer(
     Ok(())
 }
 
-fn reject_stale_assignment(
+/// Check the retained issuer before the queued item enters a native input.
+fn reject_unauthorized_context(
     tx: &Transaction<'_>,
     record: &CommandRecord,
     agent_num: i64,
-    generation: i64,
+    agent: &Agent,
     now: i64,
     events: &mut Vec<Event>,
 ) -> Result<bool> {
-    match project_assignment::check_dispatch(tx, record) {
+    match check_context_authority(tx, record, agent) {
         Ok(()) => Ok(false),
         Err(error)
             if matches!(
@@ -2463,7 +2473,15 @@ fn reject_stale_assignment(
                 "stale_assignment" | "not_allowed" | "stale_generation"
             ) =>
         {
-            reject_pending_context(tx, record, agent_num, generation, &error.code, now, events)?;
+            reject_pending_context(
+                tx,
+                record,
+                agent_num,
+                agent.generation,
+                &error.code,
+                now,
+                events,
+            )?;
             Ok(true)
         }
         Err(error) => Err(error),
