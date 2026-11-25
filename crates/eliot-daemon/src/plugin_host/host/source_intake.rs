@@ -1222,7 +1222,7 @@ fn rejection_gap(mut gap: SourceGap, cause: &str, credentials: &[String]) -> Opt
     if gap
         .to
         .as_deref()
-        .is_some_and(|cursor| policy.contains_text(cursor))
+        .is_some_and(|cursor| policy.contains_native_secret(cursor))
     {
         gap.to = None;
     }

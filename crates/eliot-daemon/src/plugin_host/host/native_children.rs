@@ -181,7 +181,7 @@ fn check_registration_secrets(registration: &ChildRegistration, secrets: &[Strin
         registration.native_ref.as_str(),
     ]
     .into_iter()
-    .any(|value| policy.contains_text(value))
+    .any(|value| policy.contains_native_secret(value))
     {
         return Err(Error::new(
             "secret_in_payload",

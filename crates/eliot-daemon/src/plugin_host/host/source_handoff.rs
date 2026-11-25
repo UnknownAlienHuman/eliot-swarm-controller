@@ -118,7 +118,7 @@ pub(super) async fn record_source_health(
     let policy = SecretPolicy::new(secrets);
     if [&update.agent_id, &update.source, &update.health]
         .into_iter()
-        .any(|value| policy.contains_text(value))
+        .any(|value| policy.contains_native_secret(value))
     {
         return Err(CoreError::new(
             "secret_in_payload",
