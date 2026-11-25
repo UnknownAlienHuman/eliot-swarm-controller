@@ -1616,10 +1616,9 @@ subject in the Owner inbox. Each command has at most one current command item.
 An active Goal with a running turn on its bound Agent generation waits for that
 turn when the Goal has no unresolved round and an owned process is running or
 an open native source is healthy or slow. A stale or failed source alone
-supplies no execution evidence for the Agent or Goal. The wait keeps the
-cadence due time when a slot becomes due during a long tool call. A start with
-neither a dispatcher nor running custody still qualifies for Stuck after
-confirmation.
+supplies no execution evidence for the Agent or Goal. The active turn's wait
+is independent of the Goal cadence. A start with neither a dispatcher nor
+running custody still qualifies for Stuck after confirmation.
 The `swarm status` liveness summary includes the number of confirmed commands
 without a dispatcher and the oldest command's ID and age, including snoozed
 items (#929, #883).
