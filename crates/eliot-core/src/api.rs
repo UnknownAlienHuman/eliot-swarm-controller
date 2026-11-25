@@ -150,7 +150,7 @@ pub use git_integrate::{
 mod update_health;
 pub use update_health::{
     UPDATE_HEALTH_MAX_SUBJECTS, UpdateHealthRequest, UpdateHealthResponse, UpdateProbeKind,
-    UpdateStartEvidence, UpdateStartState, UpdateStartSubject,
+    UpdateStartEvidence, UpdateStartState, UpdateStartSubject, UpdateStartSummary,
 };
 
 pub use goals::{
