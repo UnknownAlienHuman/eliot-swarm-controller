@@ -1038,6 +1038,9 @@ impl Router {
         observation: &eliot_core::api::harness::QuotaObservation,
         projection: eliot_core::api::harness::QuotaWindowProjection,
     ) {
+        let Some(details) = details.as_object_mut() else {
+            return;
+        };
         let Some(container) = details
             .get_mut(projection.container_key)
             .and_then(Value::as_object_mut)
@@ -1070,7 +1073,10 @@ impl Router {
                 fields.insert(key.to_owned(), json!(window.window_duration_mins));
             }
         }
-        details[projection.observed_at_key] = json!(observation.observed_at_ms);
+        details.insert(
+            projection.observed_at_key.to_owned(),
+            json!(observation.observed_at_ms),
+        );
     }
 
     /// Page the installed harness catalogues for the current settings revision.

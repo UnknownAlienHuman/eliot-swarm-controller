@@ -1115,8 +1115,10 @@ automatic model probes for these holds. Unresolved probes remain fenced.
 Passive release is limited to providers that declare `retained_quota`; the
 Store repeats that capability check and requires fresh provider evidence newer
 than the exact unchanged hold. Codex sparse account-window observations can
-decorate quota readbacks for routing and display, but Codex has no retained
-quota capability and cannot use passive quota-readback release. Codex holds
+decorate quota readbacks for routing and display. The projection folds the
+newest 64 matching updates in observation order, keeping the full read as the
+base. Codex has no retained quota capability and cannot use passive
+quota-readback release. Codex holds
 retain the existing reset-deadline and explicit Owner correction paths; when a
 probe is due, the native SEND probe owns quota-based release.
 Each admitted probe records `provider.hold_probe_started` and known

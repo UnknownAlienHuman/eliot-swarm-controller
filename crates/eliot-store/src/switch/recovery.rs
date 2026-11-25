@@ -34,6 +34,15 @@ impl Store {
                 .connection
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(sql_error)?;
+            tx.execute(
+                "DELETE FROM switch_child_id_reservations
+                 WHERE EXISTS (
+                    SELECT 1 FROM commands parent WHERE parent.id=switch_command
+                      AND parent.method='swarm.switch' AND parent.state='rejected'
+                 )",
+                [],
+            )
+            .map_err(sql_error)?;
             let ids = {
                 let mut statement = tx
                     .prepare(
@@ -102,6 +111,13 @@ pub(crate) fn release_rejected_switch_fence_tx(
     parent: &Command,
     now: i64,
 ) -> Result<bool> {
+    // The parent is already rejected in this transaction. Delete only unused
+    // claims owned by it; actual child command rows keep their IDs.
+    tx.execute(
+        "DELETE FROM switch_child_id_reservations WHERE switch_command=?1",
+        [&parent.id],
+    )
+    .map_err(sql_error)?;
     let retained = decode_switch(parent.args.clone())?;
     let Some(source_key) = retained.source_checkout_key.as_deref() else {
         return Ok(false);
