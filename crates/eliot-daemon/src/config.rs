@@ -213,11 +213,45 @@ pub(crate) fn native_route_fingerprints(
                 Value::Bool(false) => "empty".to_owned(),
                 Value::Bool(true) => "present".to_owned(),
                 Value::String(text) if text.is_empty() => "empty".to_owned(),
+                Value::String(text) if name.ends_with("_BASE_URL") => {
+                    let Ok(mut url) = reqwest::Url::parse(text) else {
+                        return Ok((name.clone(), Value::String("invalid_url".to_owned())));
+                    };
+                    if !matches!(url.scheme(), "http" | "https") || url.host().is_none() {
+                        return Ok((name.clone(), Value::String("invalid_url".to_owned())));
+                    }
+                    url.set_password(None).map_err(|()| {
+                        core::Error::new("internal", "remove private route URL password")
+                    })?;
+                    url.set_username("").map_err(|()| {
+                        core::Error::new("internal", "remove private route URL username")
+                    })?;
+                    url.set_query(None);
+                    url.set_fragment(None);
+                    format!("url-sha256:{}", route_digest(&Value::String(url.into()))?)
+                }
                 _ => format!("sha256:{}", route_digest(value)?),
             };
             Ok((name.clone(), Value::String(safe)))
         })
         .collect()
+}
+
+pub(crate) fn safe_route_fingerprint(name: &str, value: &str) -> bool {
+    if matches!(value, "unset" | "empty" | "present") {
+        return true;
+    }
+    let prefix = if name.ends_with("_BASE_URL") {
+        if value == "invalid_url" {
+            return true;
+        }
+        "url-sha256:"
+    } else {
+        "sha256:"
+    };
+    value
+        .strip_prefix(prefix)
+        .is_some_and(|hash| hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit()))
 }
 
 /// Only absolute paths, empty inputs and captured absence can be restored.

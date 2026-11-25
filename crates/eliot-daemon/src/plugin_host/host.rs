@@ -3830,7 +3830,10 @@ fn prepare_process_environment(
         }
     }
 
-    if let Some(home) = profile.get("native_route_home") {
+    // These captured default paths select the native home. Reapply them before
+    // checking the route so the controller launcher's environment cannot reselect it.
+    let frozen_home = profile.get("native_route_home");
+    if let Some(home) = frozen_home {
         let home = home.as_object().ok_or_else(|| {
             Error::new("invalid", "frozen native route home inputs are malformed")
         })?;
@@ -3846,7 +3849,9 @@ fn prepare_process_environment(
             if let Some(value) = value.as_str() {
                 insert_environment(&mut environment, name, value.to_owned());
             } else {
-                environment.remove(name);
+                environment.retain(|key, _| {
+                    key != name && (!cfg!(windows) || !key.eq_ignore_ascii_case(name))
+                });
             }
         }
     }
@@ -3879,13 +3884,8 @@ fn prepare_process_environment(
                             .filter_map(|(name, new)| {
                                 let old = expected.get(name)?.as_str()?;
                                 let new = new.as_str()?;
-                                (old != new
-                                    && (matches!(old, "unset" | "empty" | "present")
-                                        || old.strip_prefix("sha256:").is_some_and(|hash| {
-                                            hash.len() == 64
-                                                && hash.bytes().all(|byte| byte.is_ascii_hexdigit())
-                                        })))
-                                .then(|| format!("{name} {old} -> {new}"))
+                                (old != new && crate::config::safe_route_fingerprint(name, old))
+                                    .then(|| format!("{name} {old} -> {new}"))
                             })
                             .collect::<Vec<_>>()
                     } else {
@@ -3897,7 +3897,11 @@ fn prepare_process_environment(
                     changed.join(", ")
                 };
                 return Err(Error::new(
-                    "profile_error",
+                    if frozen_home.is_some() {
+                        "profile_error"
+                    } else {
+                        "unavailable"
+                    },
                     format!("frozen native route changed: {change}"),
                 ));
             }

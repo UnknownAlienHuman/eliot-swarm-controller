@@ -1309,12 +1309,16 @@ Claude and XDG store selectors and private provider selectors bind to the
 opaque `native_route_identity`. New snapshots also retain per-selector
 fingerprints and nonsecret absolute default home paths (`HOME`, and on Windows
 `USERPROFILE` and `LOCALAPPDATA`), including empty and unset values. These paths
-belong to the native process environment and are restored from the snapshot
-when the controller executable or its startup environment changes. Admitted
-live selectors must still match. Refusals name the changed selectors and
-their safe states or fingerprints. Older snapshots with only an opaque
-identity still require an exact match and report both aggregate fingerprints
-on mismatch. Snapshots without an identity bypass native read caches. Codex
+belong to the frozen native process environment. Swarm restores captured home
+keys without comparing the launcher's live values, because the captured home
+determines the native route across controller restarts. All other admitted
+selectors must still match. Refusals name the changed facts and their safe
+states or fingerprints. URL diagnostic fingerprints omit userinfo, query, and
+fragment. Changes confined to those components still fail the full route check
+and report both aggregate identities. Older snapshots with only an opaque
+identity still require an exact live match and report a mismatch as
+`unavailable`, with both values of `native_route_identity`. Snapshots without
+an identity bypass native read caches. Codex
 retains its existing execution inputs in `pass_env_values`. Public catalog
 scope omits store paths and fingerprints.
 
