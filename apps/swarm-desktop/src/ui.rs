@@ -1060,7 +1060,7 @@ impl Component for DesktopApp {
         }
         self.record_location();
         self.sync_monitor();
-        self.sync_pane();
+        self.sync_pane(context);
         self.sync_dialog(context);
     }
 

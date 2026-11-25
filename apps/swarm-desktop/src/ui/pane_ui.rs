@@ -341,7 +341,21 @@ impl DesktopApp {
                     self.pane.flipped.insert(key);
                 }
             }
-            PaneMsg::Goal(control) => self.goal_control(control, context),
+            PaneMsg::Goal(client::GoalControl::Clear) => {
+                // Clearing ends the goal for good: the same question as
+                // Stop Agent, bound to the open Agent.
+                if let Some(agent) = self.selected_agent_id().and_then(|id| self.tree_agent(&id)) {
+                    self.menu.confirm = Some((
+                        super::menu_ui::Target::Agent(agent),
+                        super::menu_ui::Action::ClearGoal,
+                    ));
+                }
+            }
+            PaneMsg::Goal(control) => {
+                if let Some(agent) = self.selected_agent_id() {
+                    self.goal_control(agent, control, context);
+                }
+            }
             PaneMsg::GoalDone(agent, control, result) => {
                 self.pane.goal_busy = false;
                 match *result {
@@ -384,18 +398,6 @@ impl DesktopApp {
         }
     }
 
-    /// The open task changed while the pane shows: its open tab reads the
-    /// new task.
-    pub(super) fn pane_selected(&mut self, agent: &str, context: &ComponentContext<Self>) {
-        match self.panel {
-            Panel::Details => self.show_details(agent, context),
-            Panel::Agents => self.read_monitor(0, context),
-            Panel::Changes => self.read_changes(context),
-            Panel::Terminal => self.read_processes(context),
-            Panel::Closed => {}
-        }
-    }
-
     /// The daemon answers again: the shown tab that reads on its own reads.
     pub(super) fn pane_reread(&mut self, context: &ComponentContext<Self>) {
         if !self.panel_shown() {
@@ -408,19 +410,13 @@ impl DesktopApp {
         }
     }
 
-    /// The open conversation's readback landed: the Agents tab follows its
-    /// hierarchy root once it is known (a worker's tree is its task's).
-    pub(super) fn pane_detail_landed(&mut self, context: &ComponentContext<Self>) {
-        if self.panel == Panel::Agents
-            && self.panel_shown()
-            && self.monitor.data.tree.root != self.tree_root()
-        {
-            self.read_monitor(0, context);
-        }
-    }
-
-    /// After every update: a tab that no longer shows stops its read.
-    pub(super) fn sync_pane(&mut self) {
+    /// After every update, the one path that keeps the pane on the open
+    /// Agent, however it was opened (a sidebar row, the list refresh, the
+    /// remembered task at start, Back): a tab that no longer shows stops its
+    /// read; the shown tab, when its read is of another Agent (or none),
+    /// drops that read and reads the open Agent. A worker's Agents tab
+    /// follows its task's root once the readback names it.
+    pub(super) fn sync_pane(&mut self, context: &ComponentContext<Self>) {
         let shown = self.panel_shown();
         if !(shown && self.panel == Panel::Changes)
             && let Some(task) = self.pane.changes.task.take()
@@ -435,6 +431,24 @@ impl DesktopApp {
             task.cancel();
             self.pane.terminal.epoch += 1;
             self.pane.terminal.reading = false;
+        }
+        let Some(open) = self.selected_agent_id().filter(|_| shown) else {
+            return;
+        };
+        match self.panel {
+            Panel::Changes if self.pane.changes.agent.as_deref() != Some(open.as_str()) => {
+                self.read_changes(context);
+            }
+            Panel::Terminal if self.pane.terminal.agent.as_deref() != Some(open.as_str()) => {
+                self.read_processes(context);
+            }
+            Panel::Details if self.monitor.selected.as_deref() != Some(open.as_str()) => {
+                self.show_details(&open, context);
+            }
+            Panel::Agents if self.monitor.tree_requested != self.tree_root() => {
+                self.read_monitor(0, context);
+            }
+            _ => {}
         }
     }
 
@@ -633,9 +647,15 @@ impl DesktopApp {
         });
     }
 
-    /// `goal.pause`, `goal.resume` or `goal.clear`, one at a time.
-    fn goal_control(&mut self, control: client::GoalControl, context: &ComponentContext<Self>) {
-        let (Some(agent), Ok(data_dir)) = (self.selected_agent_id(), self.data_dir.clone()) else {
+    /// `goal.pause`, `goal.resume` or `goal.clear` on `agent`'s goal, one at
+    /// a time.
+    pub(super) fn goal_control(
+        &mut self,
+        agent: String,
+        control: client::GoalControl,
+        context: &ComponentContext<Self>,
+    ) {
+        let Ok(data_dir) = self.data_dir.clone() else {
             return;
         };
         if self.pane.goal_busy {

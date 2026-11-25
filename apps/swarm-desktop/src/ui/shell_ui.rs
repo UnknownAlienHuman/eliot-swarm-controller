@@ -750,9 +750,6 @@ impl DesktopApp {
                 if self.chat.convo.as_ref().map(Conversation::agent) != Some(&agent.id) {
                     self.open_conversation(&agent, context);
                 }
-                if self.panel != Panel::Closed {
-                    self.pane_selected(&agent.id, context);
-                }
             }
             ShellMsg::ProjectPicked(checkout) => {
                 if self.can_launch_here(&checkout) {

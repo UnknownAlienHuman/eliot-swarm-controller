@@ -94,6 +94,12 @@ pub(super) struct MonitorState {
     /// panel, and so its refresh, is closed).
     pub(super) sidebar_reading: bool,
     pub(super) autonomy: AutonomyState,
+    /// The hierarchy root the chain last planned the Agents tab's tree
+    /// for (`None`: no tree planned).
+    pub(super) tree_requested: Option<String>,
+    /// When the last tree read started (or is planned to): the next waits
+    /// [`monitor::PERIOD_MS`] after it, as the Agents page's reads do.
+    tree_started_ms: Option<i64>,
 }
 
 /// The Agents page's filter chips (`Agents.dc.html`).
@@ -224,6 +230,9 @@ impl DesktopApp {
                 }
                 self.monitor.refreshing = false;
                 if let Some(snapshot) = snapshot {
+                    if snapshot.tree.is_some() {
+                        self.monitor.tree_started_ms = Some(snapshot.read_at_ms);
+                    }
                     self.monitor.event_cursor = snapshot.event_cursor;
                     self.monitor.data.apply(*snapshot);
                     // A refresh with errors asks whether the daemon runs
@@ -458,6 +467,13 @@ impl DesktopApp {
         if let Some(task) = self.monitor.task.take() {
             task.cancel();
         }
+        // The task's tree only while the pane's Agents tab shows; noted
+        // first, so the pane does not ask again while the daemon is down.
+        let shown = self.panel_shown();
+        let tree = self
+            .tree_root()
+            .filter(|_| shown && self.panel == Panel::Agents);
+        self.monitor.tree_requested = tree.clone();
         if self.daemon_down() {
             self.monitor.refreshing = false;
             return;
@@ -476,16 +492,26 @@ impl DesktopApp {
         // only while its Details show; its usage and diagnosis only when
         // the selection or its generation changed.
         let fleet = self.main == Main::Agents;
-        let shown = self.panel_shown();
         let selected = self
             .monitor
             .selected
             .clone()
             .filter(|_| shown && self.panel == Panel::Details);
-        // The task's tree only while the Agents tab shows.
-        let tree = self
-            .tree_root()
-            .filter(|_| shown && self.panel == Panel::Agents);
+        // A tree read starts at least PERIOD_MS after the last one, however
+        // it is asked for (an event, the tab, a selection, Refresh), as the
+        // Agents page's scheduled reads do; a scheduled delay counts.
+        let now = crate::handoff::now_ms();
+        let spacing_ms = match (&tree, self.monitor.tree_started_ms) {
+            (Some(_), Some(started)) => {
+                u64::try_from(started.saturating_add(monitor::PERIOD_MS as i64) - now)
+                    .unwrap_or(0)
+                    .saturating_sub(delay_ms)
+            }
+            _ => 0,
+        };
+        if tree.is_some() {
+            self.monitor.tree_started_ms = Some(now + (delay_ms + spacing_ms) as i64);
+        }
         let cached = self.monitor.data.detail.as_ref().map(|detail| {
             (
                 detail.read.agent.agent.id.clone(),
@@ -531,6 +557,9 @@ impl DesktopApp {
         self.monitor.refreshing = true;
         self.monitor.task = Some(context.spawn_background(move |cancel| {
             let cancelled = || cancel.is_cancelled();
+            if spacing_ms > 0 && !feed::backoff(spacing_ms, &cancelled) {
+                return Message::Monitor(MonitorMsg::MonitorLoaded(epoch, None));
+            }
             // A scheduled read (`delay_ms` > 0) waits at least that long,
             // then for one of the fleet's events, at most QUIET_PERIOD_MS
             // in all. Nothing is read while the window is minimized or
