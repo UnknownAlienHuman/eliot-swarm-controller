@@ -883,7 +883,7 @@ async fn inspect_lost_agent(
     let Some(loss_ts) = loss_ts else {
         return Ok(());
     };
-    if loss_report_already_complete(router, &incident_id, &captured.agent).await? {
+    if loss_report_already_complete(router, &incident_id, loss_ts, &captured.agent).await? {
         router
             .resume_after_process_loss(agent_id, generation, event_seq, &incident_id)
             .await?;

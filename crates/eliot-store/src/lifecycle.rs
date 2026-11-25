@@ -1897,6 +1897,7 @@ fn fail_start_tx(
     // harness exit (exit_code/NTSTATUS) rides from the outcome into the
     // `agent.failed` event. The outcome's own stderr tails stay on the
     // command outcome that `swarm why` already correlates.
+    super::goals::pause_for_failed_start_tx(tx, agent_num, generation, now, events)?;
     let mut data = json!({"agent_id": agent.id, "command_id": command_id, "reason": reason});
     if let Some(record) = super::load_command_record(tx, command_id)?
         && let Some(outcome) = record.command.outcome

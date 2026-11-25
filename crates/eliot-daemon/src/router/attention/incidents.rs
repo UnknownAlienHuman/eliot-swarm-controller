@@ -153,6 +153,7 @@ fn record_obsolete_delivery(key: &IncidentKey, phase: &str, error: &Error) {
 pub(super) async fn loss_report_already_complete(
     router: &Router,
     incident_id: &str,
+    loss_ts: i64,
     agent: &Agent,
 ) -> Result<bool> {
     let store = router.inner.store.lock().await;
@@ -162,9 +163,13 @@ pub(super) async fn loss_report_already_complete(
     if !router.attention_config().agent_lost.enabled {
         return Ok(true);
     }
-    if let Some(parent) = agent.parent.as_deref()
-        && store.swarm_mail_thread_exists(&attention_thread(incident_id), parent)?
-    {
+    let thread = attention_thread(incident_id);
+    if store.swarm_mail_receipt_matches_thread(
+        &loss_supervisor_mail_id(incident_id, "incident", loss_ts),
+        &thread,
+    )? || agent.parent.as_deref().map_or(Ok(false), |parent| {
+        store.swarm_mail_thread_exists(&thread, parent)
+    })? {
         return Ok(true);
     }
     store.attention_owner_notice_exists(incident_id)
@@ -501,12 +506,7 @@ pub(super) fn freeze_loss_report(report: AttentionReport, loss_event_ts_ms: i64)
     };
     FrozenReport {
         emit_command_id: attention_ulid(&report.incident_id, phase, "emit", loss_event_ts_ms),
-        supervisor_mail_id: attention_ulid(
-            &report.incident_id,
-            phase,
-            "supervisor-mail",
-            loss_event_ts_ms,
-        ),
+        supervisor_mail_id: loss_supervisor_mail_id(&report.incident_id, phase, loss_event_ts_ms),
         owner_notify_id: attention_ulid(
             &report.incident_id,
             phase,
@@ -515,6 +515,10 @@ pub(super) fn freeze_loss_report(report: AttentionReport, loss_event_ts_ms: i64)
         ),
         report,
     }
+}
+
+fn loss_supervisor_mail_id(incident_id: &str, phase: &str, loss_ts: i64) -> String {
+    attention_ulid(incident_id, phase, "supervisor-mail", loss_ts)
 }
 
 pub(super) fn attention_ulid(incident_id: &str, phase: &str, purpose: &str, ts_ms: i64) -> String {
