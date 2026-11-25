@@ -6,7 +6,7 @@ use serde::Serialize;
 use std::{path::Path, time::Duration};
 use tokio::{
     task::JoinSet,
-    time::{Instant, sleep, timeout_at},
+    time::{Instant, sleep_until, timeout_at},
 };
 
 const RPC: &str = "daemon.update.health";
@@ -134,6 +134,7 @@ pub(super) async fn capture_previous(path: &Path) -> PreviousHealth {
 
 pub(super) async fn assess_update(path: &Path, previous: PreviousHealth) -> HealthReport {
     let deadline = Instant::now() + OBSERVE_FOR;
+    let (mut last_requested, mut last_attempts) = (0, Vec::new());
     let (source, complete, requested, evidence) = loop {
         let Some(UpdateHealthResponse::Boot {
             finished,
@@ -142,7 +143,7 @@ pub(super) async fn assess_update(path: &Path, previous: PreviousHealth) -> Heal
             attempts,
         }) = read(path, &UpdateHealthRequest::Boot, deadline).await
         else {
-            break ("boot_continuations", false, 0, Vec::new());
+            break ("boot_continuations", false, last_requested, last_attempts);
         };
         if finished {
             if !complete || requested > 0 {
@@ -165,10 +166,9 @@ pub(super) async fn assess_update(path: &Path, previous: PreviousHealth) -> Heal
             let evidence = probes(path, samples, probe_deadline).await;
             break ("readiness_probes", evidence.len() == count, count, evidence);
         }
-        if Instant::now() >= deadline {
-            break ("boot_continuations", false, requested, attempts);
-        }
-        sleep(Duration::from_millis(200)).await;
+        last_requested = requested;
+        last_attempts = attempts;
+        sleep_until((Instant::now() + Duration::from_millis(200)).min(deadline)).await;
     };
     let mut result = HealthReport {
         state: "unknown",
