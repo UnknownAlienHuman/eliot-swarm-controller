@@ -777,10 +777,21 @@ impl GitProbe {
         let commits_ahead = if head == base {
             0_u64
         } else {
-            let ancestor = match self
+            let unavailable =
+                |reason| unavailable_work(reason, Some(dirty_digest.clone()), !dirty.is_empty());
+            let max_arg = format!("--max-count={}", WORK_MAX_COMMITS_AHEAD + 1);
+            let range = format!("{base}...{head}");
+            let output = match self
                 .run(
                     root,
-                    &["merge-base", "--is-ancestor", base, head],
+                    &[
+                        "rev-list",
+                        "--left-right",
+                        "--count",
+                        &max_arg,
+                        &range,
+                        "--",
+                    ],
                     overrides,
                     &[],
                     read_deadline,
@@ -789,68 +800,51 @@ impl GitProbe {
             {
                 Ok(output) => output,
                 Err(error) if error.code == "git_leaf_fence_unavailable" => return Err(error),
-                Err(_) => {
-                    return Ok(unavailable_work(
-                        "git_unavailable",
-                        Some(dirty_digest),
-                        !dirty.is_empty(),
-                    ));
-                }
+                Err(_) => return Ok(unavailable("git_unavailable")),
             };
-            if ancestor.code != 0 {
-                return Ok(unavailable_work(
-                    "diverged_from_base",
-                    Some(dirty_digest),
-                    !dirty.is_empty(),
-                ));
+            let ahead = if output.code == 0 {
+                let counts = std::str::from_utf8(&output.stdout).ok().and_then(|text| {
+                    let mut counts = text.split_ascii_whitespace();
+                    let left = counts.next()?.parse::<u64>().ok()?;
+                    let right = counts.next()?.parse::<u64>().ok()?;
+                    counts.next().is_none().then_some((left, right))
+                });
+                match counts {
+                    Some((0, count)) => Some(count),
+                    Some(_) => return Ok(unavailable("diverged_from_base")),
+                    None => return Ok(unavailable("git_unavailable")),
+                }
+            } else {
+                None
+            };
+            if let Some(count) = ahead.filter(|&count| count <= WORK_MAX_COMMITS_AHEAD) {
+                count
+            } else {
+                // A saturated walk may stop before visiting a left-side
+                // commit. A failed walk also leaves ancestry undetermined.
+                let ancestor = match self
+                    .run(
+                        root,
+                        &["merge-base", "--is-ancestor", base, head],
+                        overrides,
+                        &[],
+                        read_deadline,
+                    )
+                    .await
+                {
+                    Ok(output) => output,
+                    Err(error) if error.code == "git_leaf_fence_unavailable" => return Err(error),
+                    Err(_) => return Ok(unavailable("git_unavailable")),
+                };
+                let reason = if ancestor.code != 0 {
+                    "diverged_from_base"
+                } else if ahead.is_some() {
+                    "cap_exceeded"
+                } else {
+                    "git_unavailable"
+                };
+                return Ok(unavailable(reason));
             }
-            let max_arg = format!("--max-count={}", WORK_MAX_COMMITS_AHEAD + 1);
-            let range = format!("{base}..{head}");
-            let count_out = match self
-                .run(
-                    root,
-                    &["rev-list", "--count", &max_arg, &range, "--"],
-                    overrides,
-                    &[],
-                    read_deadline,
-                )
-                .await
-            {
-                Ok(output) if output.code == 0 => output,
-                Err(error) if error.code == "git_leaf_fence_unavailable" => return Err(error),
-                _ => {
-                    return Ok(unavailable_work(
-                        "git_unavailable",
-                        Some(dirty_digest),
-                        !dirty.is_empty(),
-                    ));
-                }
-            };
-            let count_text = match std::str::from_utf8(&count_out.stdout) {
-                Ok(text) => text.trim(),
-                Err(_) => {
-                    return Ok(unavailable_work(
-                        "git_unavailable",
-                        Some(dirty_digest),
-                        !dirty.is_empty(),
-                    ));
-                }
-            };
-            let Ok(count) = count_text.parse::<u64>() else {
-                return Ok(unavailable_work(
-                    "git_unavailable",
-                    Some(dirty_digest),
-                    !dirty.is_empty(),
-                ));
-            };
-            if count > WORK_MAX_COMMITS_AHEAD {
-                return Ok(unavailable_work(
-                    "cap_exceeded",
-                    Some(dirty_digest),
-                    !dirty.is_empty(),
-                ));
-            }
-            count
         };
         let diff_out = match self
             .run(
