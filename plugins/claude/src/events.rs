@@ -1184,6 +1184,9 @@ impl EventProcessor {
                 {
                     self.refresh_terminal_deadline();
                 }
+                if kind == "tool_progress" {
+                    return Ok(());
+                }
                 self.record_unclassified("claude.record.type", kind).await
             }
         }

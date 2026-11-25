@@ -1174,6 +1174,14 @@ Codex skip-lists the known high-volume notifications `item/agentMessage/delta`,
 no independent normalized event; supported completions carry the durable facts.
 An unfamiliar method cannot establish a native turn binding.
 
+Known Codex `reasoning` item envelopes are not schema-drift diagnostics.
+Keep normal item processing, including existing thread and turn binding,
+but give these envelopes no independent persisted fact. Claude `tool_progress`
+is transient elapsed-time telemetry. Apply the existing exact-turn native
+deadline rule without emitting either a tool lifecycle event or an unfamiliar-record
+diagnostic. Actual tool starts and completions, session boundaries, and genuinely
+unfamiliar records still follow the ordinary persistence rules.
+
 Store applies one 64-fact cap per exact native session, across turns, generations,
 and both Codex stream and rollout publishers. `native_diagnostics` in the source
 readback reports the session's admitted and dropped counts. Suppression updates

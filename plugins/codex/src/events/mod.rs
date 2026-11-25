@@ -2817,7 +2817,7 @@ fn unclassified_native_item(item: &Value) -> Option<(&'static str, &str, bool)> 
                     ))
                 })
         }
-        "userMessage" | "contextCompaction" => None,
+        "userMessage" | "contextCompaction" | "reasoning" => None,
         _ if is_tool_type(item_type) => None,
         _ => Some(("codex.native_rpc.item_type", item_type, false)),
     }
