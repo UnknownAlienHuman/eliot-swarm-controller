@@ -92,6 +92,7 @@ pub(super) struct AutomaticCleanupState {
     first_sweep_complete: bool,
     active_sweep: Option<AutomaticCleanupProgress>,
     last_sweep: Option<eliot_core::api::AutomaticCleanupSweep>,
+    owned_scans: HashMap<String, discovery::OwnedRootResume>,
 }
 
 impl AutomaticCleanupState {
@@ -317,7 +318,7 @@ impl Router {
                     .find(|outcome| outcome.artifact_id == item.artifact.id)
             });
             if item.verdict == "safe" {
-                sweep.would_remove += 1;
+                sweep.planned += 1;
             }
             let (outcome, reason, bytes) = if item.verdict != "safe" {
                 ("kept", item.reason.as_str(), 0)
@@ -340,16 +341,19 @@ impl Router {
                 .or_default();
             if let Some(size) = item.bytes {
                 if item.verdict == "safe" {
-                    class.would_remove = class.would_remove.saturating_add(size);
-                } else {
-                    class.kept = class.kept.saturating_add(size);
+                    class.planned = class.planned.saturating_add(size);
+                }
+                match outcome {
+                    "would_remove" => class.would_remove = class.would_remove.saturating_add(size),
+                    "kept" => class.kept = class.kept.saturating_add(size),
+                    _ => {}
                 }
             } else {
                 class.unmeasured += 1;
             }
             class.removed = class.removed.saturating_add(bytes);
             match outcome {
-                "would_remove" => {}
+                "would_remove" => sweep.would_remove += 1,
                 "removed" => sweep.removed += 1,
                 "kept" => sweep.kept += 1,
                 _ => sweep.unknown += 1,
@@ -469,6 +473,7 @@ impl Router {
         progress.summary.finished_at = page.finished_at;
         progress.summary.enabled = page.enabled;
         progress.summary.plan_only &= page.plan_only;
+        progress.summary.planned += page.planned;
         progress.summary.would_remove += page.would_remove;
         progress.summary.removed += page.removed;
         progress.summary.kept += page.kept;
@@ -501,8 +506,8 @@ impl Router {
             (false, _) => "Set automation.auto_cleanup = true to apply.",
         };
         let message = format!(
-            "{} worktrees/artifacts would be removed, {} kept. Removed {}, unknown {}. {enablement}",
-            sweep.would_remove, sweep.kept, sweep.removed, sweep.unknown
+            "{} worktrees/artifacts planned for removal. Would remove {}, removed {}, kept {}, unknown {}. {enablement}",
+            sweep.planned, sweep.would_remove, sweep.removed, sweep.kept, sweep.unknown
         );
         let id = ulid::Ulid::new().to_string();
         let mut progress = self.progress_receiver();
@@ -1453,6 +1458,7 @@ impl Router {
                 kept_ids: None,
                 backfill_after: None,
                 owned_backfill_after: None,
+                owned_root_scan: None,
                 inventory_rank: None,
                 inventory_seq_after: None,
                 request_binding: None,
@@ -1473,19 +1479,22 @@ impl Router {
         {
             return Err(Error::new("invalid", "cleanup continuation is stale"));
         }
-        if page.snapshot_seq.is_none() && page.owned_backfill_after != Some(0) {
-            let cursor = page.owned_backfill_after.unwrap_or(0);
-            if let Some(after) = self
-                .backfill_owned_cleanup_children(cursor, &name, request.project.as_deref())
+        if page.snapshot_seq.is_none()
+            && (page.owned_backfill_after != Some(0) || page.owned_root_scan.is_some())
+            && self
+                .backfill_owned_cleanup_children(
+                    &mut page,
+                    &binding,
+                    &name,
+                    request.project.as_deref(),
+                    &mut plan.inventory_issues,
+                )
                 .await?
-            {
-                page.owned_backfill_after = Some(after);
-                page.request_binding = Some(binding);
-                plan.truncated = true;
-                plan.continuation = Some(page.encode()?);
-                return Ok(plan);
-            }
-            page.owned_backfill_after = Some(0);
+        {
+            page.request_binding = Some(binding);
+            plan.truncated = true;
+            plan.continuation = Some(page.encode()?);
+            return Ok(plan);
         }
         if !auto_cleanup && page.snapshot_seq.is_none() {
             // Backfill within one slice, then freeze the inventory on the
@@ -1807,6 +1816,7 @@ impl Router {
                     kept_ids,
                     backfill_after: None,
                     owned_backfill_after: None,
+                    owned_root_scan: None,
                     inventory_rank: keep_scan_cursor.then_some(next_rank),
                     inventory_seq_after: if keep_scan_cursor { next_seq } else { None },
                     request_binding: Some(binding),
@@ -2128,14 +2138,10 @@ impl Router {
             };
             (agent, store.agent_artifact_root(id, generation)?)
         };
-        if let Some(root) = root {
-            self.discover_owned_cleanup_children(
-                &root,
-                true,
-                Instant::now() + CLEANUP_BACKFILL_BUDGET,
-            )
-            .await?;
-        }
+        let inventory_issue = match root {
+            Some(root) => self.discover_terminal_cargo_children(&root).await,
+            None => None,
+        };
         let inventory = self
             .inner
             .store
@@ -2146,10 +2152,23 @@ impl Router {
             plan_id: ulid::Ulid::new().to_string(),
             created_at: now_ms(),
             items: Vec::new(),
-            inventory_issues: Vec::new(),
-            truncated: false,
+            truncated: inventory_issue.is_some(),
+            inventory_issues: inventory_issue.into_iter().collect(),
             continuation: None,
         };
+        if plan.truncated {
+            let mut store = self.inner.store.lock().await;
+            let event = store.record_automatic_cleanup(
+                json!({
+                    "plan_id": plan.plan_id,
+                    "items": [],
+                    "truncated": true,
+                    "inventory_issues": plan.inventory_issues,
+                }),
+                now_ms(),
+            )?;
+            self.publish_locked(&[event]);
+        }
         let deadline = Instant::now() + CLEANUP_PLAN_MAX_PREFLIGHT;
         for artifact in inventory {
             let Ok(candidate) =

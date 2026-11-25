@@ -48,6 +48,15 @@ Omitted scope resolves to `all` for the authenticated Owner and `self_tree` for 
 Backfill reports an unreadable or missing source in the page's `inventory_issues`
 with Agent, generation, path when available, and bounded reason and detail. It
 continues inventory for other entries. These diagnostics grant no cleanup authority.
+When owned-root discovery reaches 1,024 entries or its time budget, it reports
+`owned_root_scan_incomplete` and resumes inside the same root through the
+continuation. Resume state lives in memory. After expiry, eviction, a daemon
+restart or an identity change invalidates the saved scan, the next page reports
+`owned_root_scan_restarted` and scans that root from its first entries. Completed
+roots retain their place in the plan. Discovery retains candidates found before
+a scan error. Terminal cache release puts an incomplete or failed root in the plan's inventory
+issues and records it in `cleanup.automatic`, including when the slice found no
+candidates. Periodic inventory scans that root independently across pages.
 Manual plans select `registered` rows. Settled rows (`removed`, `unknown`,
 `skipped(...)`) are attempt history read back from retained plans, and filtering
 them before the page cap keeps a settled prefix from starving later eligible
@@ -313,10 +322,10 @@ Manual previews can backfill older ownership records. The [Owner settings]
 Both the directory record and its exact finished generation must be older than
 the configured window. Automatic apply starts after the first complete plan-only
 sweep of each daemon startup. Each completed paged
-sweep updates aggregate status and sends one Owner `notify` with would-remove and
-kept totals and enablement; intermediate pages do not send notices. Per-item
+sweep updates aggregate status and sends one Owner `notify` with plan and outcome
+totals and enablement. Intermediate pages do not send notices. Per-item
 `cleanup.automatic` reason events remain available.
-The completed status sweep includes known would-remove, removed and kept
+The completed status sweep includes known planned, would-remove, removed and kept
 bytes by class, plus a count of unmeasured entries in each class.
 Eligible paths include managed worktrees, recorded per-generation plugin directories,
 and artifacts under exact Swarm-created generation roots, including archived terminal
@@ -353,7 +362,10 @@ and the latest completed sweep's aggregate outcomes since daemon startup. A
 kept artifacts or planned removals. An identical observation from a later sweep
 does not record another item. The daemon keeps bounded recent observations and
 evicts the oldest at capacity. Every sweep still measures its current totals and
-updates status independently of diagnostic events. Command and apply receipts
+updates status independently of diagnostic events. Planned bytes sum the safe
+candidates with known sizes. Would-remove bytes describe preview outcomes.
+Kept bytes describe kept outcomes, including refused applies. Removed bytes
+come from settled removals. Outcome buckets are exclusive. Command and apply receipts
 remain the evidence for actual outcomes.
 
 The direct manager ends a completed child with a graceful Stop while it has

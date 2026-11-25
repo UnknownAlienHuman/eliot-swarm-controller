@@ -2345,6 +2345,8 @@ pub struct AutomaticCleanupSweep {
     pub finished_at: i64,
     pub enabled: bool,
     pub plan_only: bool,
+    #[serde(default)]
+    pub planned: usize,
     pub would_remove: usize,
     pub removed: usize,
     pub kept: usize,
@@ -2357,6 +2359,8 @@ pub struct AutomaticCleanupSweep {
 #[derive(schemars::JsonSchema, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AutomaticCleanupBytes {
+    #[serde(default)]
+    pub planned: u64,
     pub would_remove: u64,
     pub removed: u64,
     pub kept: u64,
@@ -2365,6 +2369,7 @@ pub struct AutomaticCleanupBytes {
 
 impl AutomaticCleanupBytes {
     pub fn accumulate(&mut self, other: Self) {
+        self.planned = self.planned.saturating_add(other.planned);
         self.would_remove = self.would_remove.saturating_add(other.would_remove);
         self.removed = self.removed.saturating_add(other.removed);
         self.kept = self.kept.saturating_add(other.kept);
