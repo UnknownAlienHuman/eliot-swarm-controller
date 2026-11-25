@@ -1018,6 +1018,13 @@ impl Component for DesktopApp {
         if let Ok(data_dir) = app.data_dir.clone() {
             let _start = app.start_connection(data_dir, 0, context);
         }
+        if std::env::var_os("ELIOT_QA_CYCLE").is_some() {
+            let _task = context.spawn_background(|cancel| {
+                let cancelled = || cancel.is_cancelled();
+                let _ = crate::feed::backoff(40_000, &cancelled);
+                Message::Shell(shell_ui::ShellMsg::QaTick(0))
+            });
+        }
         // On the UI thread, before its message loop runs.
         match crate::shortcuts::install() {
             Ok(chords) => {

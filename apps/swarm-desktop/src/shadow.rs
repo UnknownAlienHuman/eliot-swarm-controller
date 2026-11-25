@@ -474,6 +474,7 @@ impl Compositor {
                 sprite.vtable().put_shadow,
                 &shadow.cast::<ICompositionShadow>()?,
             )?;
+            QA_LAYERS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(Layer {
                 layer,
                 sprite: sprite.cast()?,
@@ -536,6 +537,55 @@ impl Layer {
     }
 }
 
+
+// QA-1011 instrumentation (not committed).
+pub static QA_LAYERS: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
+pub static QA_STATES: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
+fn qa_close_enabled() -> bool {
+    std::env::var_os("ELIOT_QA_CLOSE").is_some()
+}
+#[repr(C)]
+struct ClosableVtbl {
+    base: InspectableSlots,
+    close: unsafe extern "system" fn(Raw) -> HRESULT,
+}
+winrt_interface!(
+    IClosable,
+    ClosableVtbl,
+    GUID::from_u128(0x30d5a829_7fa4_4026_83bb_d75bae4ea99e)
+);
+#[allow(unsafe_code, reason = "QA")]
+fn qa_close<T: Interface>(object: &T) {
+    if let Ok(c) = object.cast::<IClosable>() {
+        let _ = unsafe { (c.vtable().close)(c.as_raw()) };
+    }
+}
+fn qa_log(what: &str) {
+    crate::startup::note(&format!(
+        "qa-1011 shadow {what}: layers={} states={}",
+        QA_LAYERS.load(std::sync::atomic::Ordering::SeqCst),
+        QA_STATES.load(std::sync::atomic::Ordering::SeqCst)
+    ));
+}
+impl Drop for Layer {
+    fn drop(&mut self) {
+        QA_LAYERS.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        if qa_close_enabled() {
+            qa_close(&self.sprite);
+            qa_close(&self.mask);
+            qa_close(&self.surface);
+            qa_close(&self.geometry);
+        }
+    }
+}
+impl Drop for State {
+    fn drop(&mut self) {
+        QA_STATES.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        self.drawn.clear();
+        qa_log("state dropped");
+    }
+}
+
 struct State {
     radius: f64,
     layers: &'static [brand::Shadow],
@@ -583,6 +633,7 @@ impl State {
             unsafe { set_object(&children, children.vtable().insert_at_top, &layer.sprite) }?;
             self.drawn.push(layer);
         }
+        qa_log("built");
         Ok(Some(root.cast()?))
     }
 
@@ -607,6 +658,7 @@ impl ShadowHost {
     /// A host for an element whose corner is `radius`, drawing `layers`.
     pub fn new(radius: f64, layers: &'static [brand::Shadow]) -> Self {
         let host = ElementRef::<Grid>::new();
+        QA_STATES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let state = Rc::new(RefCell::new(State {
             radius,
             layers,

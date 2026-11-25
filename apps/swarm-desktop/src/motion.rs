@@ -714,3 +714,86 @@ fn find_under(
         }
     })
 }
+
+// QA-1011 probe (not committed): weak references to every element of the
+// visual tree, taken at one moment, and later the ones still alive but no
+// longer in the tree.
+thread_local! {
+    static QA_WEAK: RefCell<Vec<(u32, windows_core::Weak<IInspectable>)>> = const { RefCell::new(Vec::new()) };
+    static QA_GEN: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+fn qa_walk() -> Vec<IInspectable> {
+    let Some(tree) = tree() else { return Vec::new() };
+    let Some(root) = root() else { return Vec::new() };
+    let mut out = Vec::new();
+    let mut queue = VecDeque::from([root]);
+    while let Some(node) = queue.pop_front() {
+        for child in children(&tree, &node) {
+            queue.push_back(child);
+        }
+        out.push(node);
+    }
+    out
+}
+
+pub fn qa_report_and_snapshot() -> String {
+    let live = qa_walk();
+    let live_set: std::collections::HashSet<usize> = live
+        .iter()
+        .filter_map(|e| e.cast::<IUnknown>().ok().map(|u| u.as_raw() as usize))
+        .collect();
+    let mut report = String::new();
+    QA_WEAK.with(|weak| {
+        let weak = weak.borrow();
+        let mut by_gen: std::collections::BTreeMap<u32, (usize, usize, std::collections::BTreeMap<String, usize>)> =
+            std::collections::BTreeMap::new();
+        for (generation, w) in weak.iter() {
+            let entry = by_gen.entry(*generation).or_default();
+            entry.0 += 1;
+            if let Some(element) = w.upgrade() {
+                let identity = element.cast::<IUnknown>().ok().map(|u| u.as_raw() as usize);
+                if identity.is_some_and(|i| !live_set.contains(&i)) {
+                    entry.1 += 1;
+                    let class = element
+                        .GetRuntimeClassName()
+                        .map(|c| c.to_string_lossy())
+                        .unwrap_or_default();
+                    let class = class.rsplit('.').next().unwrap_or("").to_owned();
+                    *entry.2.entry(class).or_default() += 1;
+                }
+            }
+        }
+        for (generation, (total, detached, classes)) in by_gen {
+            let mut top: Vec<(String, usize)> = classes.into_iter().collect();
+            top.sort_by(|a, b| b.1.cmp(&a.1));
+            top.truncate(12);
+            let _ = std::fmt::Write::write_fmt(
+                &mut report,
+                format_args!(" | gen{generation}: {detached}/{total} alive off-tree {top:?}"),
+            );
+        }
+    });
+    let generation = QA_GEN.with(|g| {
+        let n = g.get() + 1;
+        g.set(n);
+        n
+    });
+    QA_WEAK.with(|weak| {
+        let mut weak = weak.borrow_mut();
+        for element in &live {
+            if let Ok(w) = element.downgrade() {
+                weak.push((generation, w));
+            }
+        }
+    });
+    let total = live.len();
+    drop(live);
+    let resolvable = QA_WEAK.with(|weak| {
+        weak.borrow()
+            .iter()
+            .filter(|(g, w)| *g == generation && w.upgrade().is_some())
+            .count()
+    });
+    format!("qa-1011 tree: live={total} (new gen resolvable after release: {resolvable}){report}")
+}

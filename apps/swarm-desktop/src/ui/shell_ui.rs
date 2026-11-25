@@ -242,6 +242,8 @@ pub(super) enum ShellMsg {
     ListTick,
     /// Hide the sidebar to a rail of icons, or show it again.
     SidebarToggled,
+    /// QA-1011 cycler (not committed).
+    QaTick(u32),
 }
 
 /// Re-check for the empty editor render one frame later.
@@ -875,7 +877,63 @@ impl DesktopApp {
                     self.load_search(context, Some(after));
                 }
             }
-            ShellMsg::SettingsOpened => self.open_settings(None, context),
+            ShellMsg::QaTick(n) => {
+                let mode = std::env::var("ELIOT_QA_CYCLE").unwrap_or_default();
+                match mode.as_str() {
+                    "theme" => {
+                        let theme = if n % 2 == 0 {
+                            crate::settings::ThemeChoice::Light
+                        } else {
+                            crate::settings::ThemeChoice::Dark
+                        };
+                        self.shell_update(ShellMsg::ThemeChosen(theme), context);
+                    }
+                    "nav" => {
+                        if n % 2 == 0 {
+                            self.shell_update(ShellMsg::SettingsOpened, context);
+                        } else {
+                            self.shell_update(ShellMsg::SettingsClosed, context);
+                        }
+                    }
+                    "inbox" => {
+                        if n % 2 == 0 {
+                            self.shell_update(ShellMsg::PlaceOpened(page_ui::Place::Inbox), context);
+                        } else {
+                            self.shell_update(ShellMsg::SettingsClosed, context);
+                        }
+                    }
+                    "rail" => self.shell_update(ShellMsg::SidebarToggled, context),
+                    "settheme" => {
+                        if n == 0 {
+                            self.shell_update(ShellMsg::SettingsOpened, context);
+                        } else {
+                            let theme = if n % 2 == 0 {
+                                crate::settings::ThemeChoice::Light
+                            } else {
+                                crate::settings::ThemeChoice::Dark
+                            };
+                            self.shell_update(ShellMsg::ThemeChosen(theme), context);
+                        }
+                    }
+                    _ => return,
+                }
+                crate::startup::note(&format!("qa-1011 tick {n} {mode}"));
+                let period: u64 = std::env::var("ELIOT_QA_PERIOD_MS")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(3000);
+                let _task = context.spawn_background(move |cancel| {
+                    let cancelled = || cancel.is_cancelled();
+                    let _ = feed::backoff(period, &cancelled);
+                    Message::Shell(ShellMsg::QaTick(n + 1))
+                });
+            }
+            ShellMsg::SettingsOpened => {
+                if std::env::var_os("ELIOT_QA_PROBE").is_some() {
+                    crate::startup::note(&crate::motion::qa_report_and_snapshot());
+                }
+                self.open_settings(None, context)
+            }
             ShellMsg::SettingsPage(page) => self.open_settings(Some(page), context),
             ShellMsg::PlaceOpened(place) => self.open_place(place, context),
             ShellMsg::UsageRefresh => self.read_usage(context),
