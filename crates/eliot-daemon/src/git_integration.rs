@@ -21,7 +21,7 @@ use eliot_core::{
         ProjectRegistrationView, is_git_oid,
     },
 };
-use serde_json::{Value, json};
+use serde_json::json;
 use std::{fs, path::Path, sync::Arc, time::Duration};
 use tokio::{sync::watch, time::Instant};
 
@@ -30,7 +30,7 @@ const MAX_CONFLICT_PATH_BYTES: usize = 4 * 1024;
 
 pub(crate) struct GitIntegrateExecution {
     pub state: CommandState,
-    pub outcome: Value,
+    pub outcome: GitIntegrateOutcome,
 }
 
 pub(crate) async fn freeze(
@@ -157,11 +157,9 @@ fn execution(
         result.failure_code = Some("git_integrate_result_invalid".to_owned());
         state = CommandState::Unknown;
     }
-    let value = serde_json::to_value(result)
-        .unwrap_or_else(|_| json!({"code":"git_integrate_result_encode_failed"}));
     GitIntegrateExecution {
         state,
-        outcome: value,
+        outcome: result,
     }
 }
 
@@ -1048,7 +1046,7 @@ pub(crate) async fn execute(
             Some(&error),
         );
         settled.state = CommandState::Unknown;
-        settled.outcome["cleanup_pending"] = json!(true);
+        settled.outcome.cleanup_pending = true;
     }
     settled
 }

@@ -893,7 +893,7 @@ fn check_settle_verb_guards(
                 "git.integrate settlement requires its typed result",
             )
         })?;
-        let result = serde_json::from_value::<core::api::GitIntegrateOutcome>(value.clone())
+        let result = <core::api::GitIntegrateOutcome as serde::Deserialize>::deserialize(value)
             .map_err(|_| Error::new("invalid", "git.integrate result is malformed"))?;
         result.validate_for(&frozen)?;
         if state == CommandState::Applied

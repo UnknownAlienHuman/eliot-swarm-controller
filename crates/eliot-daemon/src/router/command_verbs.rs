@@ -72,7 +72,7 @@ impl Router {
                 return;
             }
         };
-        let mut execution = crate::git_integration::execute(
+        let execution = crate::git_integration::execute(
             &self.inner.data_root,
             &self.inner.store,
             id,
@@ -82,9 +82,10 @@ impl Router {
             self.secret_policy_snapshot(),
         )
         .await;
-        self.redact_native_value(&mut execution.outcome);
-        self.settle(id, execution.state, Some(execution.outcome))
-            .await;
+        let mut outcome = serde_json::to_value(execution.outcome)
+            .unwrap_or_else(|_| json!({"code":"git_integrate_result_encode_failed"}));
+        self.redact_native_value(&mut outcome);
+        self.settle(id, execution.state, Some(outcome)).await;
         self.signal_progress();
     }
 

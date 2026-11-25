@@ -66,7 +66,6 @@ impl GitIntegrateDefinitionArgs {
 }
 
 #[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct GitIntegrateBranchPin {
     pub branch: String,
     pub oid: String,
@@ -197,7 +196,6 @@ pub enum GitIntegrateCheckClassification {
 }
 
 #[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct GitIntegrateCheckFailure {
     pub exit_code: i32,
     pub tail: String,
@@ -207,14 +205,12 @@ pub struct GitIntegrateCheckFailure {
 }
 
 #[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct GitIntegrateRefUpdate {
     pub branch: String,
     pub oid: String,
 }
 
 #[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct GitIntegrateOutcome {
     pub status: GitIntegrateStatus,
     pub base_oid: String,
