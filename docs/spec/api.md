@@ -3219,7 +3219,9 @@ admission lease for interruption and settlement. The lossless preparation
 carries a wait budget of 1–1800 seconds (default 60). Bound restart attempts renew
 the short 120-second inactivity lease within an absolute ceiling of the wait
 budget plus 60 seconds. While still quiescing, expiry or confirmed cancellation releases the parked
-rows to the old daemon and reopens admission. At its deadline the CLI cancels by
+rows to the old daemon and reopens admission. If unparking fails on expiry,
+the daemon still reopens admission and reports the underlying cancellation
+error in its log. At its deadline the CLI cancels by
 default. The CLI prints the preparation ID; the Owner can cancel immediately
 with Ctrl-C (Ctrl-Break also works on Windows) or with
 `swarm daemon update --cancel PREPARE_ID` on the same data directory.

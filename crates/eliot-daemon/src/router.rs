@@ -7128,20 +7128,24 @@ impl Router {
                 expires = lease.expires;
                 continue;
             }
-            if lease.lossless
-                && let Err(error) = store.cancel_parked_restart(id)
-            {
+            let unpark_error = if lease.lossless {
+                store.cancel_parked_restart(id).err()
+            } else {
+                None
+            };
+            *current = None;
+            self.inner.mode.store(MODE_OPEN, Ordering::SeqCst);
+            drop(current);
+            drop(store);
+            self.signal_progress();
+            if let Some(error) = unpark_error {
                 crate::logging::record(
                     &self.secret_policy_snapshot(),
                     "daemon.restart_lease_expired",
-                    &[],
+                    &[("command_id", id)],
                     Some(&error),
                 );
-                return;
             }
-            *current = None;
-            self.inner.mode.store(MODE_OPEN, Ordering::SeqCst);
-            self.signal_progress();
             return;
         }
     }
