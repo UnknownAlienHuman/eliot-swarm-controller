@@ -337,6 +337,8 @@ pub mod layout {
     pub const DIALOG_PICKER_WIDTH: f64 = 136.0;
     /// A status dot in a row.
     pub const DOT: f64 = crate::brand::SIZE_DOT_WAIT;
+    /// The dot of a status pill.
+    pub const BADGE_DOT: f64 = crate::brand::SIZE_DOT;
     /// Dividers.
     pub const HAIRLINE: f64 = crate::brand::SIZE_HAIRLINE;
     /// The decision panel's `tertiary` outline.

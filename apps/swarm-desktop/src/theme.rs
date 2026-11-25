@@ -255,9 +255,7 @@ impl Roles {
         match tone {
             StatusTone::Active | StatusTone::Pending => (self.selected, self.on_selected),
             StatusTone::Attention => (self.waiting_container, self.on_waiting_container),
-            StatusTone::Failed | StatusTone::Unknown => {
-                (self.attention_container, self.on_attention_container)
-            }
+            StatusTone::Failed => (self.attention_container, self.on_attention_container),
             StatusTone::Ready | StatusTone::Neutral => (self.container, self.variant),
         }
     }
@@ -272,29 +270,12 @@ pub enum StatusTone {
     Ready,
     /// Needs the owner (`waiting`: a pending request).
     Attention,
-    /// Outcome not proven (`unknown`).
-    Unknown,
     /// `failed` or `lost`.
     Failed,
     /// On its way (`created`, `starting`).
     Pending,
     /// Ended or anything else (`stopped`).
     Neutral,
-}
-
-impl StatusTone {
-    /// The tone of a controlled Agent's typed lifecycle state.
-    pub fn of_state(state: eliot_core::AgentState) -> Self {
-        match state {
-            eliot_core::AgentState::Busy => Self::Active,
-            eliot_core::AgentState::Idle => Self::Ready,
-            eliot_core::AgentState::Waiting => Self::Attention,
-            eliot_core::AgentState::Unknown => Self::Unknown,
-            eliot_core::AgentState::Failed | eliot_core::AgentState::Lost => Self::Failed,
-            eliot_core::AgentState::Created | eliot_core::AgentState::Starting => Self::Pending,
-            eliot_core::AgentState::Stopped => Self::Neutral,
-        }
-    }
 }
 
 #[cfg(windows)]
@@ -521,6 +502,15 @@ pub mod winui {
             self.role(
                 |r| r.attention.mix(r.surface, 0.55),
                 ThemeBrush::SystemCritical,
+            )
+        }
+
+        /// A steered message: the selected role at half strength on the
+        /// surface, so it never reads as an input field.
+        pub fn steer(self) -> Brush {
+            self.role(
+                |r| r.surface.mix(r.selected, 0.5),
+                ThemeBrush::CardBackground,
             )
         }
 

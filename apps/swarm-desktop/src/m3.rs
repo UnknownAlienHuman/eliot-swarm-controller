@@ -119,8 +119,8 @@ pub fn card_high(palette: Palette) -> Border {
 
 /// A status mark of `size` DIPs whose shape tells states apart within the
 /// theme's two status colors: a filled circle for working (accent), needs
-/// you (attention) and ready (outline grey); a ring for starting (accent),
-/// ended (grey) and an unconfirmed outcome (attention); a rounded square
+/// you (attention) and ready (outline grey); a ring for starting (accent)
+/// and ended (grey); a rounded square
 /// for failed or lost (attention), so a failure never reads as a question.
 pub fn status_mark(palette: Palette, tone: StatusTone, size: f64) -> View {
     let circle = |fill: Brush| -> View {
@@ -146,7 +146,6 @@ pub fn status_mark(palette: Palette, tone: StatusTone, size: f64) -> View {
         StatusTone::Ready => circle(palette.border()),
         StatusTone::Pending => ring(palette.primary()),
         StatusTone::Neutral => ring(palette.border()),
-        StatusTone::Unknown => ring(palette.attention()),
         StatusTone::Failed => Border::new()
             .background(palette.attention())
             .corner_radius(radius::STATUS_MARK)
@@ -765,6 +764,37 @@ pub fn composer_card(
             ))
             .content(content),
     )
+}
+
+/// The header's status pill: 24 DIPs, the tone's container, a 6-DIP dot
+/// and a caption of at most `label_width` that also trims to the room the
+/// pill is given (a grid, as a horizontal stack never trims).
+pub fn status_pill(palette: Palette, tone: StatusTone, label: &str, label_width: f64) -> View {
+    let (container, on) = palette.status_chip(tone);
+    Border::new()
+        .height(height::BADGE)
+        .corner_radius(radius::BADGE)
+        .background(container)
+        .padding(Thickness::xy(spacing::ROW, 0.0))
+        .horizontal_alignment(HorizontalAlignment::Left)
+        .vertical_alignment(VerticalAlignment::Center)
+        .automation_name(label.to_owned())
+        .content(
+            Grid::new()
+                .columns([GridLength::Auto, GridLength::STAR])
+                .column_spacing(spacing::CHIP_GAP)
+                .children((
+                    Border::new()
+                        .vertical_alignment(VerticalAlignment::Center)
+                        .content(status_mark(palette, tone, layout::BADGE_DOT)),
+                    text(label.to_owned(), style::CAPTION)
+                        .grid_column(1)
+                        .foreground(on)
+                        .vertical_alignment(VerticalAlignment::Center)
+                        .max_width(label_width)
+                        .text_trimming(TextTrimming::CharacterEllipsis),
+                )),
+        )
 }
 
 /// A text field (the application's text-box style).
