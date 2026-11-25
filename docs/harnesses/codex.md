@@ -545,7 +545,10 @@ contents preserves its identity.
 
 Before opening or resuming a thread, the worker checks the effective
 provider route and compares the current catalogue digest with the frozen
-digest. A change returns `model_catalogue_changed` with both digests.
+digest. A change returns `model_catalogue_changed` with both digests. Restore
+the previous catalogue bytes to resume the Agent, or start a new Agent to
+adopt the new catalogue. A read refusal names the cause without exposing the
+configured path.
 Legacy frozen profiles without a digest keep their existing launch and
 resume behavior. The adapter reads the Owner's configuration and catalogue
 without writing to them.
