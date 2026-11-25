@@ -17,6 +17,14 @@ pub(crate) struct DiffCheckout {
     common_dir: Directory,
 }
 
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct CheckoutReadStamp {
+    /// Keep the binding identities as well as the Git file values.
+    directories: Vec<eliot_plugin::FileIdentity>,
+    pub(crate) head: String,
+    index: Option<[u8; 32]>,
+}
+
 impl DiffCheckout {
     pub(crate) fn open(workspace: &str, expected_common: Option<&str>) -> Result<Self> {
         let rejected = || problem("unavailable", "cannot bind the exact Git checkout for diff");
@@ -85,6 +93,32 @@ impl DiffCheckout {
             })
             .ok_or_else(no_head)?;
         self.reference_oid(reference)
+    }
+
+    pub(crate) fn read_stamp(&self) -> Result<CheckoutReadStamp> {
+        use sha2::{Digest, Sha256};
+        let head = self.head()?;
+        let index = match fs::symlink_metadata(self.git_dir.path.join("index")) {
+            Ok(_) => {
+                let bytes = read_diff_metadata(self.git_dir.file("index")?, 4 * 1024 * 1024)?;
+                Some(Sha256::digest(bytes).into())
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(_) => return Err(problem("unavailable", "cannot stamp the Git index")),
+        };
+        let mut directories = Vec::new();
+        for dir in [&self.root, &self.git_dir, &self.common_dir] {
+            directories.extend(
+                dir.directory_identities(1).map_err(|_| {
+                    problem("unavailable", "cannot stamp the Git directory identity")
+                })?,
+            );
+        }
+        Ok(CheckoutReadStamp {
+            directories,
+            head,
+            index,
+        })
     }
 
     pub(crate) fn on_branch(&self, branch: &str, oid: &str) -> bool {

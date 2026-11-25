@@ -280,6 +280,23 @@ struct GitGroup {
 }
 
 impl Monitoring {
+    pub(crate) fn git_watch_revision(
+        &self,
+        workspace: &str,
+    ) -> Option<crate::fs_invalidation::FilesystemRevision> {
+        let target = self
+            .inner
+            .git_workspaces
+            .lock_recover()
+            .get(workspace)
+            .cloned()?;
+        let watch = target.watch.lock_recover();
+        if !watch.active {
+            return None;
+        }
+        watch.watcher.as_ref()?.revision()
+    }
+
     pub(crate) fn new(
         store: crate::rpc_latency::StoreHandle,
         bus: Bus,
