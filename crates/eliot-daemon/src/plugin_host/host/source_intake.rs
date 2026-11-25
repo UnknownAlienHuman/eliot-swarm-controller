@@ -18,17 +18,21 @@ use crate::common::{now_ms, secure_eq};
 use crate::git_monitor::GitProbe;
 use crate::monitor::Monitoring;
 
+use eliot_core::limits::{
+    MAX_TOOL_BATCHES_PER_GROUP, MAX_TOOL_EVENTS_PER_BATCH, MAX_TOOL_GROUP_BYTES,
+};
 use eliot_core::{Error, PermissionRefusal, Result, SecretPolicy, SourceBatch, SourceGap};
 use eliot_plugin::protocol::{
     HookEvent, HookResponse, SessionUsageSampleAck, SessionUsageSampleRequest,
 };
 use eliot_plugin::sync::LockExt;
-use eliot_store::{BatchCommit, family_for_kind};
+use eliot_store::{BatchCommit, ReadyToolBatch, family_for_kind};
 use serde_json::{Value, json};
 
-use std::sync::{Arc, Mutex};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
-use tokio::sync::oneshot;
+use tokio::sync::{Mutex as AsyncMutex, oneshot};
 use tokio::time::{Instant, timeout_at};
 use ulid::Ulid;
 
@@ -39,14 +43,15 @@ struct BatchIntake<'a> {
     credentials: &'a [String],
 }
 
-const TOOL_BATCH_GROUP: usize = 8;
-
 #[derive(Default)]
-pub(super) struct ReadyToolBatches(Mutex<Vec<QueuedToolBatch>>);
+pub(super) struct ReadyToolBatches {
+    queue: Mutex<Vec<QueuedToolBatch>>,
+    streams: Mutex<HashMap<AgentKey, Weak<AsyncMutex<()>>>>,
+}
 
 struct QueuedToolBatch {
     ticket: Arc<()>,
-    batch: SourceBatch,
+    batch: ReadyToolBatch,
     queued: Instant,
     deadline: Instant,
     reply: oneshot::Sender<ToolBatchOutcome>,
@@ -59,12 +64,26 @@ enum ToolBatchOutcome {
         wait: Duration,
         held: Duration,
         batches: usize,
+        group_bytes: usize,
     },
     RestartCutoff(String),
     Unsettled(Error),
 }
 
 impl ReadyToolBatches {
+    /// Keep one FIFO admission lock shared by any overlapping connections for
+    /// this controlled stream. A connection holds it through commit or gap.
+    fn stream_order(&self, key: &AgentKey) -> Arc<AsyncMutex<()>> {
+        let mut streams = self.streams.lock_recover();
+        if let Some(order) = streams.get(key).and_then(Weak::upgrade) {
+            return order;
+        }
+        streams.retain(|_, order| order.strong_count() > 0);
+        let order = Arc::new(AsyncMutex::new(()));
+        streams.insert(key.clone(), Arc::downgrade(&order));
+        order
+    }
+
     /// A caller that acquires the existing Store lock serves the bounded
     /// ready queue. Other callers join through their own result channels.
     /// A full queue uses the original single-batch path.
@@ -73,21 +92,19 @@ impl ReadyToolBatches {
         host: &HostState,
         store: &StoreHandle,
         bus: &Bus,
-        batch: SourceBatch,
+        batch: ReadyToolBatch,
         until: Instant,
     ) -> ToolBatchOutcome {
         let (reply, mut received) = oneshot::channel();
         let ticket = Arc::new(());
-        let agent = batch.agent_id.clone();
-        let generation = batch.generation;
-        let matches_source = |job: &QueuedToolBatch| {
-            job.batch.agent_id == agent && job.batch.generation == generation
-        };
         {
-            let mut queue = self.0.lock_recover();
+            let mut queue = self.queue.lock_recover();
             queue.retain(|job| !job.reply.is_closed());
-            if queue.len() >= TOOL_BATCH_GROUP || queue.iter().any(matches_source) {
-                return ToolBatchOutcome::Direct(batch);
+            let queued_bytes: usize = queue.iter().map(|job| job.batch.encoded_bytes()).sum();
+            if queue.len() >= MAX_TOOL_BATCHES_PER_GROUP
+                || batch.encoded_bytes() > MAX_TOOL_GROUP_BYTES - queued_bytes
+            {
+                return ToolBatchOutcome::Direct(batch.into_batch());
             }
             queue.push(QueuedToolBatch {
                 ticket: Arc::clone(&ticket),
@@ -102,7 +119,7 @@ impl ReadyToolBatches {
                 biased;
                 result = &mut received => result,
                 mut writer = store.lock() => {
-                    let queued = std::mem::take(&mut *self.0.lock_recover());
+                    let queued = std::mem::take(&mut *self.queue.lock_recover());
                     let acquired = Instant::now();
                     let mut batches = Vec::with_capacity(queued.len());
                     let mut replies = Vec::with_capacity(queued.len());
@@ -122,8 +139,9 @@ impl ReadyToolBatches {
                     }
                     if !batches.is_empty() {
                         let count = batches.len();
+                        let group_bytes = batches.iter().map(ReadyToolBatch::encoded_bytes).sum();
                         let results = if count == 1 {
-                            vec![writer.put_batch(batches.pop().expect("one ready batch"), now_ms())]
+                            vec![writer.put_batch(batches.pop().expect("one ready batch").into_batch(), now_ms())]
                         } else {
                             writer.put_tool_batch_group(batches, now_ms())
                         };
@@ -137,6 +155,7 @@ impl ReadyToolBatches {
                                 wait: acquired - queued_at,
                                 held,
                                 batches: count,
+                                group_bytes,
                             });
                         }
                     }
@@ -153,7 +172,7 @@ impl ReadyToolBatches {
                 "tool group acknowledgement was not delivered",
             )),
             Err(_) => {
-                let mut queue = self.0.lock_recover();
+                let mut queue = self.queue.lock_recover();
                 if let Some(index) = queue.iter().position(|job| Arc::ptr_eq(&job.ticket, &ticket)) {
                     queue.remove(index);
                     ToolBatchOutcome::Unsettled(Error::new(
@@ -191,6 +210,9 @@ pub(super) async fn serve_plugin_requests(mut connection: PluginConnection, sour
         observation: observation.as_ref(),
     };
     let client = connection.client();
+    let stream_order = state
+        .upgrade()
+        .map(|host| host.tool_batches.stream_order(&key));
     while let Some(request) = connection.next_request().await {
         let request_id = request.id.clone();
         let method = request.method.clone();
@@ -202,6 +224,7 @@ pub(super) async fn serve_plugin_requests(mut connection: PluginConnection, sour
             _ => reply_deadline,
         };
         let mut rejected_batch = None;
+        let mut stream_guard = None;
         let result = if !matches!(
             method.as_str(),
             "events.put"
@@ -318,6 +341,29 @@ pub(super) async fn serve_plugin_requests(mut connection: PluginConnection, sour
                         }
                     }
                     "events.put" => {
+                        if let Some(order) = &stream_order
+                            && params["source"].as_str() == Some("stream")
+                            && params["agent_id"].as_str() == Some(&agent_id)
+                            && params["generation"].as_i64() == Some(generation)
+                        {
+                            match timeout_at(request_deadline, order.lock()).await {
+                                Ok(guard) => stream_guard = Some(guard),
+                                Err(_) => {
+                                    // Coverage is unresolved while the earlier batch owns the
+                                    // stream. Retirement settles the missing suffix in order.
+                                    let result = Err(late_batch_error(
+                                        &state,
+                                        &agent_id,
+                                        generation,
+                                        "stream_order",
+                                    ));
+                                    let _ =
+                                        client.respond(request_id, result, reply_deadline).await;
+                                    let _ = client.close_input(Instant::now() + RPC_GRACE).await;
+                                    break;
+                                }
+                            }
+                        }
                         let result = put_events(
                             &store,
                             &bus,
@@ -544,6 +590,7 @@ pub(super) async fn serve_plugin_requests(mut connection: PluginConnection, sour
         } else {
             result
         };
+        drop(stream_guard);
         let result = result.map_err(|error| redact_native_error(error, &source_credentials));
         let unsettled = matches!(
             method.as_str(),
@@ -814,16 +861,24 @@ async fn put_events(
     let ready_group = if !is_child
         && subject.is_none()
         && batch.source == "stream"
-        && (1..=16).contains(&batch.events.len())
+        && (1..=MAX_TOOL_EVENTS_PER_BATCH).contains(&batch.events.len())
         && batch
             .events
             .iter()
             .all(|event| matches!(event.kind.as_str(), "tool.started" | "tool.completed"))
         && let Some(host) = intake.host.upgrade()
     {
-        host.tool_batches
-            .try_submit(&host, store, bus, batch, until)
-            .await
+        match ReadyToolBatch::new(batch) {
+            Ok(batch) => {
+                host.tool_batches
+                    .try_submit(&host, store, bus, batch, until)
+                    .await
+            }
+            Err(error) => {
+                *rejected = rejection_gap(gap, &error.code, credentials);
+                return Err(error);
+            }
+        }
     } else {
         ToolBatchOutcome::Direct(batch)
     };
@@ -833,6 +888,7 @@ async fn put_events(
             wait,
             held,
             batches,
+            group_bytes,
         } => {
             if crate::logging::is_debug()
                 && let Ok(commit) = &result
@@ -847,6 +903,7 @@ async fn put_events(
                         ("events", commit.events.len() as u64),
                         ("native_events", native_events),
                         ("commit_batches", batches as u64),
+                        ("commit_batch_bytes", group_bytes as u64),
                     ],
                 );
             }

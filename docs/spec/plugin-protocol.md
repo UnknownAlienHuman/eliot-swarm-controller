@@ -577,12 +577,16 @@ Claude batches contiguous tool facts within one native frame, up to 16 facts
 and the source batch byte limit. Each group keeps native order and gets one
 durable acknowledgement. It submits the group immediately. Permission calls
 and exact turn terminals keep their individual acknowledgements.
-At the Store writer, a caller may commit up to eight already-queued tool
-batches from distinct Agent generations in one FULL-WAL transaction. A
-savepoint isolates each definite source rejection. The host publishes
+At the Store writer, a caller may commit already-queued tool batches from
+distinct Agent generations in one FULL-WAL transaction, within the shared
+[group limits](../../crates/eliot-core/src/limits.rs) of eight batches and
+1 MiB of encoded source batches. A savepoint rolls back an entire rejected
+source batch and preserves the other valid source batches. The host publishes
 committed facts in Store order and releases the individual acknowledgements
-after that transaction commits. A full ready queue uses ordinary single-batch
-admission. There is no timer or separate worker.
+after that transaction commits. A batch that does not fit uses ordinary
+single-batch admission. Overlapping requests on the same controlled stream
+wait in admission order until the preceding request commits or its rejection
+gap settles. There is no timer or separate worker.
 
 Same id with another semantic payload/cursor, or mixed new/duplicate events, is a
 source-integrity rejection. The host replies with the committed acknowledgement or

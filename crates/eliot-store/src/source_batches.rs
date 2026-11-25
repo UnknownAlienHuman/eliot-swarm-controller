@@ -1,6 +1,34 @@
 use super::native_events::{persist_effects, verified_native_event_cause_tx};
 use super::*;
+use eliot_core::limits::{
+    MAX_TOOL_BATCHES_PER_GROUP, MAX_TOOL_EVENTS_PER_BATCH, MAX_TOOL_GROUP_BYTES,
+};
 use std::borrow::Cow;
+
+/// A source batch sized before it waits for the Store writer.
+pub struct ReadyToolBatch {
+    batch: SourceBatch,
+    encoded_bytes: usize,
+}
+
+impl ReadyToolBatch {
+    pub fn new(batch: SourceBatch) -> Result<Self> {
+        let encoded_bytes = encode_json(&batch)?.len();
+        Ok(Self {
+            batch,
+            encoded_bytes,
+        })
+    }
+
+    pub fn encoded_bytes(&self) -> usize {
+        self.encoded_bytes
+    }
+
+    pub fn into_batch(self) -> SourceBatch {
+        self.batch
+    }
+}
+
 /// Daemon-derived worktree facts attached only after the native source batch
 /// digest has been checked and the exact active turn is identified.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -681,20 +709,26 @@ impl Store {
     }
 
     /// Commit ready tool observations in one FULL-WAL transaction. Each
-    /// source keeps its own acknowledgement or rejection in input order.
+    /// source batch keeps its own acknowledgement or rejection in input order.
     pub fn put_tool_batch_group(
         &mut self,
-        batches: Vec<SourceBatch>,
+        batches: Vec<ReadyToolBatch>,
         now: i64,
     ) -> Vec<Result<BatchCommit>> {
         let count = batches.len();
         let result = (|| {
             self.ensure_writer_healthy()?;
-            let mut keys = HashSet::with_capacity(count.min(8));
-            if !(1..=8).contains(&count)
-                || batches.iter().any(|batch| {
+            let mut keys = HashSet::with_capacity(count.min(MAX_TOOL_BATCHES_PER_GROUP));
+            if !(1..=MAX_TOOL_BATCHES_PER_GROUP).contains(&count)
+                || batches
+                    .iter()
+                    .map(ReadyToolBatch::encoded_bytes)
+                    .sum::<usize>()
+                    > MAX_TOOL_GROUP_BYTES
+                || batches.iter().any(|ready| {
+                    let batch = &ready.batch;
                     batch.source != "stream"
-                        || !(1..=16).contains(&batch.events.len())
+                        || !(1..=MAX_TOOL_EVENTS_PER_BATCH).contains(&batch.events.len())
                         || batch.events.iter().any(|event| {
                             !matches!(event.kind.as_str(), "tool.started" | "tool.completed")
                         })
@@ -712,7 +746,8 @@ impl Store {
             for batch in batches {
                 tx.execute_batch("SAVEPOINT ready_tool_batch")
                     .map_err(sql_error)?;
-                let outcome = Self::put_batch_tx(&tx, batch, None, None, None, None, now);
+                let outcome =
+                    Self::put_batch_tx(&tx, batch.into_batch(), None, None, None, None, now);
                 if let Err(error) = &outcome {
                     if matches!(error.code.as_str(), "internal" | "unknown") {
                         return Err(error.clone());

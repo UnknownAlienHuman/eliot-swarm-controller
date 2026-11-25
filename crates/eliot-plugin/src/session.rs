@@ -14,7 +14,7 @@
 
 use std::{ffi::OsString, path::Path, time::Duration};
 
-use eliot_core::limits::MAX_SOURCE_BATCH_BYTES;
+use eliot_core::limits::{MAX_SOURCE_BATCH_BYTES, MAX_TOOL_EVENTS_PER_BATCH};
 use eliot_core::{
     ContextItem, ContextOutcome, Error, InjectPoint, NativeEvent, PermissionRefusal, ProcessRecord,
     ProcessState, ProviderRestriction, Result, SecretPolicy, SessionUsage, SourceBatch, SourceGap,
@@ -1204,7 +1204,6 @@ impl StreamSource<'_> {
     /// Commit contiguous tool facts from one native frame in order. These
     /// observations carry no control-specific acknowledgement.
     pub async fn commit_tool_events(&mut self, mut events: Vec<NativeEvent>) -> Result<()> {
-        const MAX_TOOL_EVENTS_PER_BATCH: usize = 16;
         if events
             .iter()
             .any(|event| !matches!(event.kind.as_str(), "tool.started" | "tool.completed"))
