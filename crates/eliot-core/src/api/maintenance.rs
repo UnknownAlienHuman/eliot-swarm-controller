@@ -187,4 +187,5 @@ pub struct RetentionPreviewResponse {
     /// An explicit event cursor below this value would receive history_gap.
     pub projected_pruned_through: i64,
     pub first_kept_event_seq: Option<i64>,
+    pub first_kept_event_ms: Option<i64>,
 }

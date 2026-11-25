@@ -26,7 +26,7 @@ impl Store {
         // The CLI opens a query-only connection and begins a deferred snapshot.
         let db = &self.connection;
         let current_pruned_through = coverage_pruned_through(db)?;
-        let (events, projected_pruned_through, first_kept_event_seq) =
+        let (events, projected_pruned_through, first_kept_event) =
             events(db, current_pruned_through, cutoffs.events)?;
         let mut rows = vec![
             events,
@@ -166,7 +166,8 @@ impl Store {
             rows,
             current_pruned_through,
             projected_pruned_through,
-            first_kept_event_seq,
+            first_kept_event_seq: first_kept_event.map(|(seq, _)| seq),
+            first_kept_event_ms: first_kept_event.map(|(_, ms)| ms),
         })
     }
 }
@@ -233,7 +234,7 @@ fn events(
     db: &Connection,
     current: i64,
     cutoff: Option<i64>,
-) -> Result<(RetentionPreviewRow, i64, Option<i64>)> {
+) -> Result<(RetentionPreviewRow, i64, Option<(i64, i64)>)> {
     let high_water = count(db, "SELECT COALESCE(MAX(seq),?1) FROM events", [current])?;
     let boundary = match cutoff {
         Some(cutoff) => event_prune_end(db, current, high_water, cutoff)?,
@@ -258,10 +259,11 @@ fn events(
         .map_err(sql_error)?;
     let first_kept = db
         .query_row(
-            "SELECT MIN(seq) FROM events WHERE seq>?1",
+            "SELECT seq,ts FROM events WHERE seq>?1 ORDER BY seq LIMIT 1",
             [projected],
-            |r| r.get(0),
+            |r| Ok((r.get(0)?, r.get(1)?)),
         )
+        .optional()
         .map_err(sql_error)?;
     let mut result = row(
         "events",
@@ -270,6 +272,17 @@ fn events(
         total - deleted,
         oldest,
     );
+    if let Some(cutoff) = cutoff {
+        protect(
+            &mut result,
+            "below_current_floor",
+            count(
+                db,
+                "SELECT count(*) FROM events WHERE seq<=?1 AND ts<=?2",
+                params![current, cutoff],
+            )?,
+        );
+    }
     if let (Some(cutoff), Some(reason)) = (cutoff, boundary.blocker) {
         protect(
             &mut result,
