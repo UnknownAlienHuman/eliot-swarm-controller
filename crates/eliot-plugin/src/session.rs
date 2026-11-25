@@ -1322,6 +1322,36 @@ impl StreamSource<'_> {
             .await
     }
 
+    /// Commit one singleton native record under a caller-minted batch nonce.
+    /// The nonce is minted once per observed notice, so an exact resend
+    /// carries the same batch identity while a later notice never does.
+    pub async fn commit_singleton_batch(
+        &mut self,
+        kind: &str,
+        native_id: String,
+        data: Value,
+        nonce: &str,
+    ) -> Result<eliot_core::BatchAck> {
+        let batch = self.singleton_batch(
+            vec![NativeEvent {
+                kind: kind.to_owned(),
+                native_id,
+                data,
+                ts: None,
+            }],
+            nonce,
+        );
+        let ack = self.commit_batch_ack(batch).await?;
+        if !ack.refused_native_fields.is_empty() {
+            return Err(Error::new(
+                "secret_in_payload",
+                "Store refused an unbindable native event field",
+            )
+            .with_where("plugin.events.put"));
+        }
+        Ok(ack)
+    }
+
     /// Commit one exact native permission ask and return the daemon refusal,
     /// if its frozen project policy matched this request.
     pub async fn commit_request_event(
@@ -1372,6 +1402,23 @@ impl StreamSource<'_> {
             .with_where("plugin.events.put"));
         }
         Ok(ack)
+    }
+
+    fn singleton_batch(&self, events: Vec<NativeEvent>, nonce: &str) -> SourceBatch {
+        let native_id = &events[0].native_id;
+        let batch_id = if SecretPolicy::default().contains_native_secret(nonce) {
+            ulid::Ulid::new().to_string()
+        } else {
+            format!("{native_id}:batch:{nonce}")
+        };
+        SourceBatch {
+            batch_id,
+            agent_id: self.agent_id.to_owned(),
+            generation: self.generation,
+            source: "stream".to_owned(),
+            events,
+            cursor: None,
+        }
     }
 
     fn event_batch(&self, events: Vec<NativeEvent>) -> SourceBatch {

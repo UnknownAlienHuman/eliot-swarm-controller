@@ -4,6 +4,7 @@ use eliot_core::{
 use serde::Deserialize;
 use serde_json::Value;
 use std::collections::HashSet;
+use ulid::Ulid;
 
 const MAX_WARNING_CODES: usize = 16;
 
@@ -25,6 +26,15 @@ struct StartupStatus {
     failure_reason: Option<String>,
 }
 
+/// One observed notice with its per-submission batch nonce. The nonce is
+/// minted once per notice, so an exact resend carries the same batch identity
+/// while a later notice never does.
+pub(super) struct WarningBatch {
+    pub(super) id: String,
+    pub(super) data: Value,
+    pub(super) nonce: String,
+}
+
 #[derive(Default)]
 pub(super) struct Warnings {
     seen_codes: HashSet<String>,
@@ -38,7 +48,7 @@ impl Warnings {
         bound_thread: Option<&str>,
         params: Value,
         policy: &SecretPolicy,
-    ) -> Result<Option<(String, Value)>> {
+    ) -> Result<Option<WarningBatch>> {
         let Ok(notification) = serde_json::from_value::<Notification>(params) else {
             self.record_malformed_dropped();
             return Ok(None);
@@ -62,7 +72,7 @@ impl Warnings {
         bound_thread: Option<&str>,
         params: Value,
         policy: &SecretPolicy,
-    ) -> Result<Option<(String, Value)>> {
+    ) -> Result<Option<WarningBatch>> {
         let Ok(notification) = serde_json::from_value::<StartupStatus>(params) else {
             self.record_malformed_dropped();
             return Ok(None);
@@ -112,7 +122,7 @@ impl Warnings {
         code: &str,
         source_message: &str,
         policy: &SecretPolicy,
-    ) -> Result<Option<(String, Value)>> {
+    ) -> Result<Option<WarningBatch>> {
         let Some(thread) = bound_thread.filter(|thread| Some(*thread) == notification_thread)
         else {
             self.record_unbound_dropped();
@@ -145,6 +155,10 @@ impl Warnings {
         };
         let data = serde_json::to_value(warning)
             .map_err(|_| Error::new("internal", "Codex warning could not be encoded"))?;
-        Ok(Some((id, data)))
+        Ok(Some(WarningBatch {
+            id,
+            data,
+            nonce: Ulid::new().to_string(),
+        }))
     }
 }

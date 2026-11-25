@@ -7,6 +7,59 @@ use std::borrow::Cow;
 
 const NATIVE_FIELD_REFUSED: &str = "source.native_field_refused";
 
+/// Warning singleton batch identity: the deterministic per-warning batch,
+/// or one per-notice submission nonce minted by the producer. The nonce is
+/// bounded discriminator text so it stays out of secret bindings.
+fn warning_batch_id(native_id: &str, batch_id: &str) -> bool {
+    if batch_id == format!("{native_id}:batch") {
+        return true;
+    }
+    batch_id
+        .strip_prefix(format!("{native_id}:batch:").as_str())
+        .is_some_and(|nonce| {
+            !nonce.is_empty() && nonce.len() <= 64 && core::is_native_discriminator(nonce)
+        })
+}
+
+/// Last batch identity that incremented one warning row. An exact resend
+/// carries the recorded identity and merges without incrementing; every new
+/// notice mints a fresh nonce and counts.
+fn record_warning_batch(
+    tx: &Transaction<'_>,
+    agent: i64,
+    generation: i64,
+    native_id: &str,
+    batch_id: &str,
+) -> Result<()> {
+    tx.execute(
+        "INSERT INTO warning_merge_state(agent, generation, native_id, last_batch_id)
+         VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT (agent, generation, native_id)
+         DO UPDATE SET last_batch_id = excluded.last_batch_id",
+        params![agent, generation, native_id, batch_id],
+    )
+    .map_err(sql_error)?;
+    Ok(())
+}
+
+/// A merged warning is acknowledged by its original sequence without a
+/// second event.
+fn warning_replay(seq: i64, refused: Vec<usize>) -> BatchCommit {
+    BatchCommit {
+        ack: BatchAck {
+            first_seq: seq,
+            last_seq: seq,
+            cursor: None,
+            dropped_unclassified: 0,
+            refused_native_fields: refused,
+            permission_refusal: None,
+            native_wake_cancel: None,
+        },
+        events: Vec::new(),
+        replayed: true,
+    }
+}
+
 /// The only native event input accepted by the writer. Preparing before
 /// acquiring the writer keeps classification outside the transaction and
 /// gives every direct, observed, child and grouped batch the same digest input.
@@ -56,7 +109,7 @@ impl PreparedSourceBatch {
                 && !(warning_batch
                     && event.kind == core::NATIVE_WARNING_EVENT
                     && core::NativeWarning::has_stable_id_shape(&event.native_id)
-                    && batch.batch_id == format!("{}:batch", event.native_id))
+                    && warning_batch_id(&event.native_id, &batch.batch_id))
             {
                 return Err(Error::new(
                     "source_integrity",
@@ -1197,6 +1250,19 @@ impl Store {
                 )
                 .optional()
                 .map_err(sql_error)?;
+            // The increment is idempotent per submission: the producer mints
+            // one batch nonce per notice, so an exact resend carries the batch
+            // identity that already incremented the row while a later notice
+            // never does.
+            let last_batch: Option<String> = tx
+                .query_row(
+                    "SELECT last_batch_id FROM warning_merge_state
+                     WHERE agent=?1 AND generation=?2 AND native_id=?3",
+                    params![agent_num, batch.generation, event.native_id],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(sql_error)?;
             if let Some((seq, data)) = retained {
                 let retained: core::NativeWarning = serde_json::from_value(decode_json(&data)?)
                     .map_err(|_| Error::new("source_integrity", "retained warning is invalid"))?;
@@ -1212,12 +1278,16 @@ impl Store {
                         "warning identity collides with different retained content",
                     ));
                 }
-                // Each batch carries one occurrence, so identical warnings merge
-                // into this row by adding the incoming increment to the
+                if last_batch.as_deref() == Some(batch.batch_id.as_str()) {
+                    return Ok(warning_replay(seq, refused));
+                }
+                // Each new batch carries one occurrence, so identical warnings
+                // merge into this row by adding the incoming increment to the
                 // retained total. The total lives in the Store, never in
-                // process memory, so it survives producer restarts; an
-                // uncertain batch is never resubmitted (it blocks the source
-                // instead), so a duplicate increment cannot follow a commit.
+                // process memory, so it survives producer restarts. Retained
+                // rows are annotated in place, like other retained-row
+                // annotations; the per-warning submission record below keeps
+                // resends from incrementing twice.
                 let total = retained.count.saturating_add(incoming.count);
                 if total > retained.count {
                     let mut stored: Value = decode_json(&data)?;
@@ -1230,20 +1300,25 @@ impl Store {
                     )
                     .map_err(sql_error)?;
                 }
-                return Ok(BatchCommit {
-                    ack: BatchAck {
-                        first_seq: seq,
-                        last_seq: seq,
-                        cursor: None,
-                        dropped_unclassified: 0,
-                        refused_native_fields: refused,
-                        permission_refusal: None,
-                        native_wake_cancel: None,
-                    },
-                    events: Vec::new(),
-                    replayed: true,
-                });
+                record_warning_batch(
+                    tx,
+                    agent_num,
+                    batch.generation,
+                    &event.native_id,
+                    &batch.batch_id,
+                )?;
+                return Ok(warning_replay(seq, refused));
             }
+            // First occurrence takes the ordinary insert path below; record
+            // its batch identity first so a resend merges instead of
+            // inserting a second row.
+            record_warning_batch(
+                tx,
+                agent_num,
+                batch.generation,
+                &event.native_id,
+                &batch.batch_id,
+            )?;
         }
         if source.last_batch_id.as_deref() == Some(batch.batch_id.as_str()) {
             if source.cursor == batch.cursor

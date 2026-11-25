@@ -1196,8 +1196,11 @@ the current thread. A matching retained row for the same Agent and
 `stream` source returns its original one-event sequence as the acknowledgement without
 republishing, including when the same thread is reattached in a later
 generation. Count changes and the `other` display bucket do not alter identity.
-The retained row adds each incoming unit count, so repeated identical notices
-are counted in place without a second event and the total survives restarts.
+The retained row adds each incoming unit count in place, like other
+retained-row annotations, so repeated identical notices are counted without a
+second event and the total survives restarts. Each notice carries a
+per-submission batch nonce, and the Store records the last batch identity per
+warning ID, so an exact resend merges without incrementing twice.
 Legacy warning IDs keep their existing receipt behavior. Deduplication lasts
 only while the matching warning row is retained under the configured event-retention
 window; pruning that row permits a later identical warning to be admitted again. Different Agents, native threads,

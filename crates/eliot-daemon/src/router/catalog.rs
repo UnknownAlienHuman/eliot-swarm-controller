@@ -1019,10 +1019,10 @@ impl Router {
                 response.fetched_at_ms,
             )?
         };
+        // A truncated range is checked before the login state: an incomplete
+        // range can neither decorate a current read nor leave a stale read's
+        // values standing, so the windows are unknown either way.
         if range.truncated {
-            // The bounded sparse range is incomplete: a partial overlay would
-            // present stale windows as live, so every projected window is
-            // unknown instead.
             eliot_core::api::harness::mark_quota_windows_unknown(details, projection);
             return Ok(());
         }
