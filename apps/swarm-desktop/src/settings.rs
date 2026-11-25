@@ -22,8 +22,9 @@ const MAX_LEGACY_BYTES: usize = 8 * 1024;
 /// Light and Dark; High Contrast always follows Windows. The palettes of the
 /// retired Material desktop are still read (brand book §22.5): `purple` as
 /// Light, `amoled`, `neon` and `matrix` as Dark. The next preference save
-/// writes the normalized value through the usual revision-guarded flow;
-/// reading never writes.
+/// writes the normalized value through the usual revision-guarded flow. The
+/// only write a read makes is the one-time, revision-guarded import of the
+/// legacy preferences file into `[desktop]` ([`read`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ThemeChoice {
@@ -395,7 +396,20 @@ pub async fn read(data_dir: &Path) -> eliot_core::Result<SettingsReadResponse> {
             crate::client::call(data_dir, &request).await
         }
         Err(error) if error.code == "conflict" => crate::client::call(data_dir, &request).await,
-        Err(error) => Err(error),
+        // Any other failure (an unwritable config.toml, for one) must not
+        // block start-up on every launch: show the unified settings as read
+        // (no [desktop] section: System), keep the legacy file for the next
+        // attempt, and log why the import did not happen.
+        Err(error) => {
+            #[cfg(windows)]
+            crate::startup::note(&format!(
+                "the legacy desktop preferences were not imported: {}",
+                error.user_message()
+            ));
+            #[cfg(not(windows))]
+            let _ = error;
+            Ok(reply)
+        }
     }
 }
 
