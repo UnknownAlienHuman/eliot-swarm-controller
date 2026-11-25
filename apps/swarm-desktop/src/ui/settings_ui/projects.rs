@@ -34,26 +34,29 @@ fn policy_list(
                 } else {
                     format!("{name}: {entry} {}", index + 1)
                 })
-                .on_text_changed(
+                .on_text_changed(crate::views::text_edits(
                     context.callback(move |text| edit(PolicyEdit::Entry(list, index, text))),
-                );
-            let remove: View = if new {
-                View::empty()
+                ));
+            let remove: Option<View> = if new {
+                None
             } else {
-                m3::icon_button(palette)
-                    .grid_column(1)
-                    .width(tokens::height::CONTROL)
-                    .height(tokens::height::CONTROL)
-                    .automation_name(format!("{name}: remove {entry} {}", index + 1))
-                    .on_click(context.message(edit(PolicyEdit::Remove(list, index))))
-                    .content(m3::icon(m3::glyph::CLOSE))
+                Some(
+                    m3::icon_button(palette)
+                        .grid_column(1)
+                        .width(tokens::height::CONTROL)
+                        .height(tokens::height::CONTROL)
+                        .automation_name(format!("{name}: remove {entry} {}", index + 1))
+                        .on_click(context.message(edit(PolicyEdit::Remove(list, index))))
+                        .content(m3::icon(m3::glyph::CLOSE))
+                        .into(),
+                )
             };
             KeyedView::new(
                 format!("{list:?}:{index}"),
                 Grid::new()
                     .columns([GridLength::STAR, GridLength::Pixel(tokens::height::CONTROL)])
                     .column_spacing(tokens::spacing::XS)
-                    .children((field, remove)),
+                    .keyed_children(crate::views::slots([Some(field.into()), remove])),
             )
         })
         .collect();
@@ -61,6 +64,7 @@ fn policy_list(
         .spacing(tokens::spacing::XS)
         .margin(Thickness::xy(0.0, tokens::spacing::XS))
         .keyed_children(rows)
+        .into()
 }
 
 impl DesktopApp {
@@ -118,57 +122,64 @@ impl DesktopApp {
             let checkout_item = format!("settings-project:{id}:{path}");
             rows.push(KeyedView::new(
                 format!("project:{id}:{open}:{checked}:{name}"),
-                StackPanel::new().children((
-                    Grid::new()
-                        .columns([GridLength::Auto, GridLength::STAR, GridLength::Auto])
-                        .column_spacing(tokens::spacing::XS)
-                        .children((
-                            CheckBox::new()
-                                .is_checked(checked)
-                                .min_width(0.0)
-                                .vertical_alignment(VerticalAlignment::Center)
-                                .margin(Thickness::new(tokens::spacing::SM, 0.0, 0.0, 0.0))
-                                .automation_name(format!("Select {name}"))
-                                .on_is_checked_changed(context.callback(move |on: bool| {
-                                    Message::Settings(SettingsMsg::ProjectSelected(
-                                        select_id.clone(),
-                                        on,
-                                    ))
-                                })),
-                            m3::row(palette, open)
-                                .grid_column(1)
-                                .automation_name(format!("Project {name}: {note}"))
-                                .on_click(context.message(Message::Settings(
-                                    SettingsMsg::ProjectOpened(id.clone()),
-                                )))
-                                .content(m3::row_content(
-                                    Some(if name.contains(" › ") {
-                                        m3::glyph::WORKTREE
-                                    } else {
-                                        m3::glyph::FOLDER
-                                    }),
-                                    &name,
-                                    &note,
-                                    if missing {
-                                        m3::secondary("missing")
-                                            .foreground(palette.attention())
-                                            .vertical_alignment(VerticalAlignment::Center)
-                                            .into()
-                                    } else {
-                                        View::empty()
-                                    },
-                                )),
-                            Border::new()
-                                .grid_column(2)
-                                .vertical_alignment(VerticalAlignment::Center)
-                                .content(super::super::reveal::path_button(
-                                    palette,
-                                    &name,
-                                    self.reveal_item_message(context, &checkout_item, &path),
-                                )),
-                        )),
+                StackPanel::new().keyed_children(crate::views::slots([
+                    Some(
+                        Grid::new()
+                            .columns([GridLength::Auto, GridLength::STAR, GridLength::Auto])
+                            .column_spacing(tokens::spacing::XS)
+                            .children((
+                                CheckBox::new()
+                                    .is_checked(checked)
+                                    .min_width(0.0)
+                                    .vertical_alignment(VerticalAlignment::Center)
+                                    .margin(Thickness::new(tokens::spacing::SM, 0.0, 0.0, 0.0))
+                                    .automation_name(format!("Select {name}"))
+                                    .on_is_checked_changed(crate::views::check_changes(
+                                        context.callback(move |on: bool| {
+                                            Message::Settings(SettingsMsg::ProjectSelected(
+                                                select_id.clone(),
+                                                on,
+                                            ))
+                                        }),
+                                    )),
+                                m3::row(palette, open)
+                                    .grid_column(1)
+                                    .automation_name(format!("Project {name}: {note}"))
+                                    .on_click(context.message(Message::Settings(
+                                        SettingsMsg::ProjectOpened(id.clone()),
+                                    )))
+                                    .content(m3::row_content(
+                                        Some(if name.contains(" › ") {
+                                            m3::glyph::WORKTREE
+                                        } else {
+                                            m3::glyph::FOLDER
+                                        }),
+                                        &name,
+                                        &note,
+                                        if missing {
+                                            Some(
+                                                m3::secondary("missing")
+                                                    .foreground(palette.attention())
+                                                    .vertical_alignment(VerticalAlignment::Center)
+                                                    .into(),
+                                            )
+                                        } else {
+                                            None
+                                        },
+                                    )),
+                                Border::new()
+                                    .grid_column(2)
+                                    .vertical_alignment(VerticalAlignment::Center)
+                                    .content(super::super::reveal::path_button(
+                                        palette,
+                                        &name,
+                                        self.reveal_item_message(context, &checkout_item, &path),
+                                    )),
+                            ))
+                            .into(),
+                    ),
                     self.reveal_note(&checkout_item, palette),
-                )),
+                ])),
             ));
             if !open {
                 continue;
@@ -186,13 +197,15 @@ impl DesktopApp {
                         CheckBox::new()
                             .is_checked(on)
                             .automation_name(format!("Allow {profile} for rules of {name}"))
-                            .on_is_checked_changed(context.callback(move |on: bool| {
-                                Message::Settings(SettingsMsg::ProjectProfile(
-                                    check_id.clone(),
-                                    check_profile.clone(),
-                                    on,
-                                ))
-                            }))
+                            .on_is_checked_changed(crate::views::check_changes(context.callback(
+                                move |on: bool| {
+                                    Message::Settings(SettingsMsg::ProjectProfile(
+                                        check_id.clone(),
+                                        check_profile.clone(),
+                                        on,
+                                    ))
+                                },
+                            )))
                             .content(m3::body(profile.clone())),
                     )
                 })
@@ -201,62 +214,71 @@ impl DesktopApp {
             // 16-DIP inset of every other group.
             let editor = StackPanel::new()
                 .margin(Thickness::uniform(tokens::spacing::SM))
-                .children((
-                    m3::form_row(
+                .keyed_children(crate::views::slots([
+                    Some(m3::form_row(
                         "Checkout folder",
                         m3::field()
-                            .text(nav::display_path(&path).to_owned())
+                            .text(nav::display_path(&path))
                             .automation_name(format!("Checkout folder of {name}"))
-                            .on_text_changed(context.callback(move |text| {
-                                Message::Settings(SettingsMsg::ProjectPath(path_id.clone(), text))
-                            }))
+                            .on_text_changed(crate::views::text_edits(context.callback(
+                                move |text| {
+                                    Message::Settings(SettingsMsg::ProjectPath(
+                                        path_id.clone(),
+                                        text,
+                                    ))
+                                },
+                            )))
                             .into(),
                         Some(super::super::reveal::path_button(
                             palette,
                             &name,
                             self.reveal_item_message(context, &editor_item, &path),
                         )),
-                    ),
+                    )),
                     self.reveal_note(&editor_item, palette),
-                    m3::form_row(
+                    Some(m3::form_row(
                         "Rule profiles",
                         StackPanel::new()
                             .orientation(Orientation::Horizontal)
                             .spacing(tokens::spacing::MD)
-                            .keyed_children(checks),
+                            .keyed_children(checks)
+                            .into(),
                         None,
-                    ),
-                    m3::form_row(
+                    )),
+                    Some(m3::form_row(
                         "Rule actions",
                         m3::field()
                             .text(model::project_actions(drafts, &id))
                             .placeholder_text("For example send, stop, git.fetch")
                             .automation_name(format!("Rule actions of {name}"))
-                            .on_text_changed(context.callback(move |text| {
-                                Message::Settings(SettingsMsg::ProjectActions(
-                                    actions_id.clone(),
-                                    text,
-                                ))
-                            }))
+                            .on_text_changed(crate::views::text_edits(context.callback(
+                                move |text| {
+                                    Message::Settings(SettingsMsg::ProjectActions(
+                                        actions_id.clone(),
+                                        text,
+                                    ))
+                                },
+                            )))
                             .into(),
                         None,
-                    ),
+                    )),
                     self.policy_editor(&id, &name, context, palette),
-                    m3::destructive(palette)
-                        .margin(Thickness::new(
-                            tokens::layout::FIELD_INDENT,
-                            tokens::spacing::XS,
-                            0.0,
-                            0.0,
-                        ))
-                        .automation_name(format!("Remove project {name}"))
-                        .on_click(
-                            context.message(Message::Settings(SettingsMsg::ProjectRemoved(
-                                id.clone(),
-                            ))),
-                        )
-                        .content(m3::label("Remove project")),
-                ));
+                    Some(
+                        m3::destructive(palette)
+                            .margin(Thickness::new(
+                                tokens::layout::FIELD_INDENT,
+                                tokens::spacing::XS,
+                                0.0,
+                                0.0,
+                            ))
+                            .automation_name(format!("Remove project {name}"))
+                            .on_click(context.message(Message::Settings(
+                                SettingsMsg::ProjectRemoved(id.clone()),
+                            )))
+                            .content(m3::label("Remove project"))
+                            .into(),
+                    ),
+                ]));
             rows.push(KeyedView::new(format!("editor:{id}"), editor));
         }
         if rows.is_empty() {
@@ -322,22 +344,29 @@ impl DesktopApp {
                 m3::setting_row(
                     "Checkout folder",
                     "Choose a folder to add and save the project.",
-                    m3::filled(palette)
-                        .automation_name("Browse to add a project")
-                        .is_enabled(!self.settings.busy())
-                        .on_click(context.message(Message::Settings(SettingsMsg::ProjectBrowse)))
-                        .content(m3::icon_label(m3::glyph::OPEN_FOLDER, "Browse…")),
+                    View::from(
+                        m3::filled(palette)
+                            .automation_name("Browse to add a project")
+                            .is_enabled(!self.settings.busy())
+                            .on_click(
+                                context.message(Message::Settings(SettingsMsg::ProjectBrowse)),
+                            )
+                            .content(m3::icon_label(m3::glyph::OPEN_FOLDER, "Browse…")),
+                    ),
                 ),
             )],
         );
-        StackPanel::new().spacing(tokens::spacing::MD).children((
-            StackPanel::new()
-                .spacing(tokens::spacing::SM)
-                .children((bulk, m3::list(palette, rows))),
-            StackPanel::new()
-                .spacing(tokens::spacing::SM)
-                .children((m3::section_heading("Add a project", "", None), add)),
-        ))
+        StackPanel::new()
+            .spacing(tokens::spacing::MD)
+            .children((
+                StackPanel::new()
+                    .spacing(tokens::spacing::SM)
+                    .children((bulk, m3::list(palette, rows))),
+                StackPanel::new()
+                    .spacing(tokens::spacing::SM)
+                    .children((m3::section_heading("Add a project", "", None), add)),
+            ))
+            .into()
     }
 
     /// The open project's launch policy (`[projects.ID.policy]`): the
@@ -352,39 +381,36 @@ impl DesktopApp {
         name: &str,
         context: &mut ViewContext<Self>,
         palette: Palette,
-    ) -> View {
-        let Some(policy) = self
+    ) -> Option<View> {
+        let policy = self
             .settings
             .policy
             .as_ref()
-            .filter(|policy| policy.project == id)
-        else {
-            return View::empty();
-        };
+            .filter(|policy| policy.project == id)?;
         let fields = &policy.fields;
         let busy = self.settings.busy() || self.prefs_saving;
         let dirty = policy.dirty();
         let saving = policy.saving && busy;
         let number = |text: &str| {
             m3::field()
-                .text(text.to_owned())
+                .text(text)
                 .width(tokens::layout::NUMBER_WIDTH)
                 .horizontal_alignment(HorizontalAlignment::Left)
         };
-        let note: View = match &policy.note {
+        let note: Option<View> = match &policy.note {
             Some(note) => {
                 let text = m3::secondary(note.text.clone())
                     .text_wrapping(TextWrapping::Wrap)
                     .is_text_selection_enabled(true)
                     .automation_name(format!("Policy status: {}", note.text));
                 if note.error {
-                    text.foreground(palette.attention()).into()
+                    Some(text.foreground(palette.attention()).into())
                 } else {
-                    text.into()
+                    Some(text.into())
                 }
             }
-            None if dirty => m3::secondary("Unsaved changes.").into(),
-            None => View::empty(),
+            None if dirty => Some(m3::secondary("Unsaved changes.").into()),
+            None => None,
         };
         let now = crate::handoff::now_ms();
         let usage = self
@@ -424,7 +450,7 @@ impl DesktopApp {
             })
             .collect();
         let field_row = |label: &str, control: View| m3::form_row(label, control, None);
-        StackPanel::new()
+        Some(StackPanel::new()
             .spacing(tokens::spacing::XS)
             .margin(Thickness::new(0.0, tokens::spacing::SM, 0.0, 0.0))
             .children((
@@ -449,7 +475,7 @@ impl DesktopApp {
                     number(&fields.deadline_s)
                         .placeholder_text("Default")
                         .automation_name(format!("Policy check deadline of {name}"))
-                        .on_text_changed(context.callback(|text| edit(PolicyEdit::Deadline(text))))
+                        .on_text_changed(crate::views::text_edits(context.callback(|text| edit(PolicyEdit::Deadline(text)))))
                         .into(),
                 ),
                 field_row(
@@ -457,10 +483,10 @@ impl DesktopApp {
                     CheckBox::new()
                         .is_checked(fields.at_turn_end)
                         .automation_name(format!("Run the policy check at turn end in {name}"))
-                        .on_is_checked_changed(
+                        .on_is_checked_changed(crate::views::check_changes(
                             context.callback(|on: bool| edit(PolicyEdit::AtTurnEnd(on))),
-                        )
-                        .content(m3::body("Run the check when a turn ends")),
+                        ))
+                        .content(m3::body("Run the check when a turn ends")).into(),
                 ),
                 field_row(
                     "Timeout retry",
@@ -469,16 +495,16 @@ impl DesktopApp {
                         .automation_name(format!(
                             "The policy check of {name} is safe to repeat after a timeout"
                         ))
-                        .on_is_checked_changed(
+                        .on_is_checked_changed(crate::views::check_changes(
                             context.callback(|on: bool| edit(PolicyEdit::RetrySafe(on))),
-                        )
-                        .content(m3::body("Safe to repeat after a timeout")),
+                        ))
+                        .content(m3::body("Safe to repeat after a timeout")).into(),
                 ),
                 field_row(
                     "Rounds",
                     number(&fields.max_rounds)
                         .automation_name(format!("Policy rounds of {name}"))
-                        .on_text_changed(context.callback(|text| edit(PolicyEdit::Rounds(text))))
+                        .on_text_changed(crate::views::text_edits(context.callback(|text| edit(PolicyEdit::Rounds(text)))))
                         .into(),
                 ),
                 field_row(
@@ -491,15 +517,15 @@ impl DesktopApp {
                                 .placeholder_text("Amount")
                                 .automation_name(format!("Policy cost limit of {name}"))
                                 .on_text_changed(
-                                    context.callback(|text| edit(PolicyEdit::CostAmount(text))),
+                                    crate::views::text_edits(context.callback(|text| edit(PolicyEdit::CostAmount(text)))),
                                 ),
                             number(&fields.cost_unit)
                                 .placeholder_text("Unit")
                                 .automation_name(format!("Policy cost unit of {name}"))
                                 .on_text_changed(
-                                    context.callback(|text| edit(PolicyEdit::CostUnit(text))),
+                                    crate::views::text_edits(context.callback(|text| edit(PolicyEdit::CostUnit(text)))),
                                 ),
-                        )),
+                        )).into(),
                 ),
                 field_row(
                     "Scope",
@@ -557,7 +583,7 @@ impl DesktopApp {
                     )),
                 Border::new()
                     .margin(Thickness::new(tokens::layout::FIELD_INDENT, 0.0, 0.0, 0.0))
-                    .content(note),
+                    .maybe_content(note),
                 Border::new()
                     .margin(Thickness::new(
                         tokens::layout::FIELD_INDENT,
@@ -575,6 +601,6 @@ impl DesktopApp {
                                 .keyed_children(opt_outs),
                         )),
                     ),
-            ))
+            )).into())
     }
 }

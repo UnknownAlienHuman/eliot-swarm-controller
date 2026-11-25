@@ -29,6 +29,7 @@ use crate::theme::winui::Palette;
 use crate::theme::{self, StatusTone};
 use crate::ui::tokens::text::{self as style, TypeStyle};
 use crate::ui::tokens::{height, icon as icon_size, layout, radius, spacing};
+use crate::views::{MaybeContent, MaybeSize};
 
 thread_local! {
     static PALETTE: Cell<Option<Palette>> = const { Cell::new(None) };
@@ -54,7 +55,7 @@ pub fn weight(style: TypeStyle) -> FontWeight {
 /// Text in one of the design's type roles.
 pub fn text(value: impl Into<String>, style: TypeStyle) -> TextBlock {
     TextBlock::new()
-        .text(value)
+        .text(value.into())
         .font_size(style.size)
         .font_weight(weight(style))
 }
@@ -101,6 +102,7 @@ pub fn section_row(value: &str) -> View {
                 .automation_heading_level(AutomationHeadingLevel::Level3)
                 .vertical_alignment(VerticalAlignment::Center),
         )
+        .into()
 }
 
 /// A card on the surface: the tonal tone, the container corner (call
@@ -175,13 +177,15 @@ fn icon_sized(glyph: &str, size: f64) -> View {
                     .background(palette().text())
                     .horizontal_alignment(HorizontalAlignment::Center)
                     .vertical_alignment(VerticalAlignment::Center),
-            );
+            )
+            .into();
     }
     Viewbox::new()
         .width(size)
         .height(size)
         .vertical_alignment(VerticalAlignment::Center)
-        .slot(ViewboxSlot::Child, FontIcon::new().glyph(glyph.to_owned()))
+        .content(FontIcon::new().glyph(glyph))
+        .into()
 }
 
 /// The 18-DIP icon of rows and icon buttons.
@@ -207,10 +211,11 @@ pub fn icon_label(glyph: &str, label: &str) -> View {
         .children((
             icon(glyph),
             TextBlock::new()
-                .text(label.to_owned())
+                .text(label)
                 .vertical_alignment(VerticalAlignment::Center)
                 .text_trimming(TextTrimming::CharacterEllipsis),
         ))
+        .into()
 }
 
 /// A labelled button's label (14/500), 16 DIPs from the pill's ends.
@@ -230,19 +235,24 @@ pub fn lifted(
     place: Grid,
     view: impl Into<View>,
 ) -> View {
-    let lift: View = match palette.roles().map(|roles| roles.lift) {
-        Some(crate::theme::Lift::Shadow(_)) => shadow.view().into(),
-        Some(crate::theme::Lift::Ring(color)) => Border::new()
-            .corner_radius(radius + layout::HAIRLINE)
-            .margin(Thickness::uniform(-layout::HAIRLINE))
-            .background(Brush::Solid(crate::theme::winui::color(color)))
-            .into(),
-        None => View::empty(),
+    let lift: Option<View> = match palette.roles().map(|roles| roles.lift) {
+        Some(crate::theme::Lift::Shadow(_)) => Some(shadow.view().into()),
+        Some(crate::theme::Lift::Ring(color)) => Some(
+            Border::new()
+                .corner_radius(radius + layout::HAIRLINE)
+                .margin(Thickness::uniform(-layout::HAIRLINE))
+                .background(Brush::Solid(crate::theme::winui::color(color)))
+                .into(),
+        ),
+        None => None,
     };
-    place.keyed_children(vec![
-        KeyedView::new("lift", lift),
-        KeyedView::new("content", view.into()),
-    ])
+    place
+        .keyed_children(
+            lift.map(|lift| KeyedView::new("lift", lift))
+                .into_iter()
+                .chain([KeyedView::new("content", view.into())]),
+        )
+        .into()
 }
 
 /// The brand book's `elevation-1` layers in `palette`'s theme: none in the
@@ -381,7 +391,12 @@ pub fn sub_row(palette: Palette, selected: bool) -> Button {
 /// A row's content: an optional 18-DIP icon, the title (trimmed), an
 /// optional caption note and a trailing mark. Absent parts take no
 /// column, so no gap shifts the title.
-pub fn row_content(glyph: Option<&str>, title: &str, note: &str, trailing: View) -> View {
+pub fn row_content(
+    glyph: Option<&str>,
+    title: &str,
+    note: &str,
+    trailing: impl Into<Option<View>>,
+) -> View {
     let mut columns = Vec::new();
     let mut cells: Vec<KeyedView> = Vec::new();
     if let Some(glyph) = glyph {
@@ -389,7 +404,7 @@ pub fn row_content(glyph: Option<&str>, title: &str, note: &str, trailing: View)
         cells.push(KeyedView::new("icon", Border::new().content(icon(glyph))));
     }
     let title_cell = TextBlock::new()
-        .text(title.to_owned())
+        .text(title)
         .vertical_alignment(VerticalAlignment::Center)
         .text_trimming(TextTrimming::CharacterEllipsis);
     columns.push(if note.is_empty() {
@@ -412,17 +427,18 @@ pub fn row_content(glyph: Option<&str>, title: &str, note: &str, trailing: View)
         ));
     }
     columns.push(GridLength::Auto);
+    let trailing_cell = Border::new()
+        .grid_column(cells.len() as i32)
+        .vertical_alignment(VerticalAlignment::Center);
     cells.push(KeyedView::new(
         "trailing",
-        Border::new()
-            .grid_column(cells.len() as i32)
-            .vertical_alignment(VerticalAlignment::Center)
-            .content(trailing),
+        trailing_cell.maybe_content(trailing.into()),
     ));
     Grid::new()
         .columns(columns)
         .column_spacing(spacing::ROW)
         .keyed_children(cells)
+        .into()
 }
 
 /// A nav row's content: its icon, its label and a trailing caption
@@ -432,11 +448,7 @@ pub fn nav_content(glyph: &str, label: &str, hint: &str) -> View {
         Some(glyph),
         label,
         "",
-        if hint.is_empty() {
-            View::empty()
-        } else {
-            secondary(hint.to_owned()).into()
-        },
+        (!hint.is_empty()).then(|| secondary(hint.to_owned()).into()),
     )
 }
 
@@ -476,7 +488,7 @@ pub fn fixed_chip(
                 .is_enabled(false)
                 .height(height::CHIP)
                 .min_height(height::CHIP)
-                .automation_name(name.to_owned())
+                .automation_name(name)
                 .content(chip_content(
                     glyph,
                     label,
@@ -484,6 +496,7 @@ pub fn fixed_chip(
                     layout::PROJECT_CHIP_WIDTH,
                 )),
         )
+        .into()
 }
 
 /// A transcript action (Copy) that shows only while its message is under
@@ -515,6 +528,7 @@ pub fn chip_content(glyph: Option<&str>, label: &str, chevron: bool, max: f64) -
         .orientation(Orientation::Horizontal)
         .spacing(spacing::CHIP_GAP)
         .keyed_children(parts)
+        .into()
 }
 
 /// One segment of a segmented button (see [`segmented`]): 28 DIPs, the
@@ -548,6 +562,7 @@ pub fn segmented(palette: Palette, segments: Vec<KeyedView>) -> View {
                 .orientation(Orientation::Horizontal)
                 .keyed_children(segments),
         )
+        .into()
 }
 
 /// A pane tab (Monitor, Details): a 32-DIP pill, the selection in the
@@ -590,6 +605,7 @@ pub fn search_field(fill: Brush, field: TextBox) -> View {
                         .vertical_alignment(VerticalAlignment::Center),
                 )),
         )
+        .into()
 }
 
 /// A 16-DIP icon: inline beside 12/16 text, in a status pill.
@@ -639,7 +655,12 @@ pub fn step_row(palette: Palette, running: bool) -> Button {
 /// A step's content: the leading icon or mark, verb and object in
 /// `label-large` on-surface (trimmed), the time on the right; 10 DIPs from
 /// the row's ends.
-pub fn step_content(lead: View, name: &str, trailing: View, palette: Palette) -> View {
+pub fn step_content(
+    lead: View,
+    name: &str,
+    trailing: impl Into<Option<View>>,
+    palette: Palette,
+) -> View {
     Grid::new()
         .margin(Thickness::xy(spacing::ROW - spacing::INSET, 0.0))
         .columns([GridLength::Auto, GridLength::STAR, GridLength::Auto])
@@ -656,8 +677,9 @@ pub fn step_content(lead: View, name: &str, trailing: View, palette: Palette) ->
             Border::new()
                 .grid_column(2)
                 .vertical_alignment(VerticalAlignment::Center)
-                .content(trailing),
+                .maybe_content(trailing.into()),
         ))
+        .into()
 }
 
 /// A 16-DIP icon in `on-surface-variant` beside quiet text (a service
@@ -696,6 +718,7 @@ pub fn file_chip_content(glyph: &str, name: &str) -> View {
                 .max_width(layout::PROJECT_CHIP_WIDTH)
                 .text_trimming(TextTrimming::CharacterEllipsis),
         ))
+        .into()
 }
 
 /// A suggestion card (Home, `.suggest`): the card corner, tonal, lifting
@@ -717,6 +740,7 @@ pub fn suggestion_card(palette: Palette, card: impl Into<View>) -> View {
         .border_thickness(Thickness::uniform(layout::HAIRLINE))
         .corner_radius(radius::CONTAINER + layout::HAIRLINE)
         .content(card)
+        .into()
 }
 
 /// A message bubble (`.bubble`): `secondary-container`, right-aligned,
@@ -733,8 +757,9 @@ pub fn bubble(palette: Palette, content: impl Into<View>, max_width: Option<f64>
         ))
         .padding(Thickness::xy(spacing::TEXT_INSET, spacing::ROW))
         .horizontal_alignment(HorizontalAlignment::Right)
-        .max_width(max_width)
+        .maybe_max_width(max_width)
         .content(content)
+        .into()
 }
 
 /// The composer card: the composer role, the extra-large corner, lifted
@@ -778,7 +803,7 @@ pub fn status_pill(palette: Palette, tone: StatusTone, label: &str, label_width:
         .padding(Thickness::xy(spacing::ROW, 0.0))
         .horizontal_alignment(HorizontalAlignment::Left)
         .vertical_alignment(VerticalAlignment::Center)
-        .automation_name(label.to_owned())
+        .automation_name(label)
         .content(
             Grid::new()
                 .columns([GridLength::Auto, GridLength::STAR])
@@ -795,6 +820,7 @@ pub fn status_pill(palette: Palette, tone: StatusTone, label: &str, label_width:
                         .text_trimming(TextTrimming::CharacterEllipsis),
                 )),
         )
+        .into()
 }
 
 /// A text field (the application's text-box style).
@@ -840,6 +866,7 @@ pub fn form_row(label: &str, control: View, action: Option<View>) -> View {
         .columns(columns)
         .column_spacing(spacing::SM)
         .keyed_children(cells)
+        .into()
 }
 
 /// A form field that opens a list as a popover (the preset Model field):
@@ -866,6 +893,7 @@ pub fn field_button_content(value: &str) -> View {
                 .vertical_alignment(VerticalAlignment::Center)
                 .content(dropdown_chevron()),
         ))
+        .into()
 }
 
 /// A dropdown sized for an enum value.
@@ -900,6 +928,7 @@ pub fn list(palette: Palette, rows: Vec<KeyedView>) -> View {
                 .spacing(spacing::ROW_GAP)
                 .keyed_children(rows),
         )
+        .into()
 }
 
 /// A section title with its supporting line and an optional action on the
@@ -912,21 +941,20 @@ pub fn section_heading(title: &str, supporting: &str, action: Option<View>) -> V
             StackPanel::new()
                 .spacing(spacing::XS)
                 .vertical_alignment(VerticalAlignment::Center)
-                .children((
-                    section_title(title.to_owned()),
-                    if supporting.is_empty() {
-                        View::empty()
-                    } else {
+                .keyed_children(crate::views::slots([
+                    Some(section_title(title.to_owned()).into()),
+                    (!supporting.is_empty()).then(|| {
                         secondary(supporting.to_owned())
                             .text_wrapping(TextWrapping::Wrap)
                             .into()
-                    },
-                )),
+                    }),
+                ])),
             Border::new()
                 .grid_column(1)
                 .vertical_alignment(VerticalAlignment::Center)
-                .content(action.unwrap_or_else(View::empty)),
+                .maybe_content(action),
         ))
+        .into()
 }
 
 /// A hairline divider in the outline role.
@@ -947,7 +975,7 @@ pub fn card_title(title: &str) -> View {
 
 /// One settings row: the name and its one-line description on the left,
 /// the control on the right.
-pub fn setting_row(title: &str, description: &str, control: View) -> View {
+pub fn setting_row(title: &str, description: &str, control: impl Into<Option<View>>) -> View {
     Grid::new()
         .min_height(height::FORM_ROW)
         .margin(Thickness::xy(0.0, spacing::SM))
@@ -956,21 +984,24 @@ pub fn setting_row(title: &str, description: &str, control: View) -> View {
         .children((
             StackPanel::new()
                 .vertical_alignment(VerticalAlignment::Center)
-                .children((
-                    body(title.to_owned()).text_trimming(TextTrimming::CharacterEllipsis),
-                    if description.is_empty() {
-                        View::empty()
-                    } else {
+                .keyed_children(crate::views::slots([
+                    Some(
+                        body(title.to_owned())
+                            .text_trimming(TextTrimming::CharacterEllipsis)
+                            .into(),
+                    ),
+                    (!description.is_empty()).then(|| {
                         secondary(description.to_owned())
                             .text_wrapping(TextWrapping::Wrap)
                             .into()
-                    },
-                )),
+                    }),
+                ])),
             Border::new()
                 .grid_column(1)
                 .vertical_alignment(VerticalAlignment::Center)
-                .content(control),
+                .maybe_content(control.into()),
         ))
+        .into()
 }
 
 /// Settings rows in one card, a hairline between rows.
@@ -988,6 +1019,7 @@ pub fn settings_card(palette: Palette, rows: Vec<KeyedView>) -> View {
         .padding(Thickness::xy(spacing::MD, spacing::XS))
         .vertical_alignment(VerticalAlignment::Top)
         .content(StackPanel::new().keyed_children(children))
+        .into()
 }
 
 /// The content of a link-style text button ("Open config.toml ↗"): the
@@ -1001,6 +1033,7 @@ pub fn link_content(label: &str) -> View {
             text(label.to_owned(), style::BUTTON).vertical_alignment(VerticalAlignment::Center),
             small_icon(glyph::EXTERNAL),
         ))
+        .into()
 }
 
 /// A small outlined badge ("default").
@@ -1012,6 +1045,7 @@ pub fn badge(palette: Palette, text: &str) -> View {
         .padding(Thickness::xy(spacing::SM, 0.0))
         .vertical_alignment(VerticalAlignment::Center)
         .content(secondary(text.to_owned()))
+        .into()
 }
 
 /// A colored outline marks the quota band, including at zero remaining.
@@ -1034,7 +1068,8 @@ pub fn shape(data: &str, size: f64) -> View {
         .width(size)
         .height(size)
         .vertical_alignment(VerticalAlignment::Center)
-        .slot(ViewboxSlot::Child, PathIcon::new().data(data.to_owned()))
+        .content(PathIcon::new().data(data))
+        .into()
 }
 
 /// `content` in the color `pick` names where it is not a pressable (the
@@ -1057,8 +1092,9 @@ pub fn carrier(
         .height(size)
         .min_height(size)
         .vertical_alignment(VerticalAlignment::Center)
-        .automation_name(name.to_owned())
+        .automation_name(name)
         .content(content)
+        .into()
 }
 
 /// A counter (the Inbox count): `tertiary-container`, a 16-DIP pill,
@@ -1083,6 +1119,7 @@ pub fn count_badge(palette: Palette, count: usize) -> View {
                 .horizontal_alignment(HorizontalAlignment::Center)
                 .vertical_alignment(VerticalAlignment::Center),
         )
+        .into()
 }
 
 /// A sidebar row's trailing word, age or shortcut (`label-small`, the
@@ -1117,6 +1154,7 @@ pub fn diff_counts(insertions: u64, deletions: u64, selected: bool) -> View {
             )
             .foreground(del),
         ))
+        .into()
 }
 
 /// `1234567` as `1,234,567`.
@@ -1145,13 +1183,12 @@ pub enum RowMark {
     Queued,
     /// Failed, lost or unknown: the `error` icon in `error`.
     Failed,
-    /// Stopped: no mark.
-    None,
 }
 
 /// The view of a row's state mark: dots and the loader in a 16-DIP slot,
 /// the icons in the 20-DIP icon slot (as the design draws them). `word`
-/// names a carried icon for a screen reader.
+/// names a carried icon for a screen reader. A stopped row has no mark
+/// (`None` where a mark is optional).
 pub fn row_mark(palette: Palette, mark: RowMark, word: &str) -> View {
     let slot = |content: View| -> View {
         Border::new()
@@ -1159,6 +1196,7 @@ pub fn row_mark(palette: Palette, mark: RowMark, word: &str) -> View {
             .height(layout::MARK_SLOT)
             .vertical_alignment(VerticalAlignment::Center)
             .content(content)
+            .into()
     };
     let dot = |fill: Brush, size: f64| -> View {
         Ellipse::new()
@@ -1194,7 +1232,6 @@ pub fn row_mark(palette: Palette, mark: RowMark, word: &str) -> View {
             icon_size::ROW,
             icon(glyph::ERROR),
         ),
-        RowMark::None => View::empty(),
     }
 }
 
@@ -1204,13 +1241,13 @@ pub fn row_mark(palette: Palette, mark: RowMark, word: &str) -> View {
 /// at the end; a worker `indent`s past its manager's mark, its label at
 /// the kid size. `tone` recolors the label alone (a stopped task's).
 pub fn sidebar_row(
-    leading: View,
+    leading: impl Into<Option<View>>,
     label: &str,
     selected: bool,
     indent: f64,
     kid: bool,
     tone: Option<Brush>,
-    trailing: View,
+    trailing: impl Into<Option<View>>,
 ) -> View {
     let mut title = text(
         label.to_owned(),
@@ -1235,13 +1272,14 @@ pub fn sidebar_row(
         .children((
             Border::new()
                 .vertical_alignment(VerticalAlignment::Center)
-                .content(leading),
+                .maybe_content(leading.into()),
             title.grid_column(1),
             Border::new()
                 .grid_column(2)
                 .vertical_alignment(VerticalAlignment::Center)
-                .content(trailing),
+                .maybe_content(trailing.into()),
         ))
+        .into()
 }
 
 /// A nav row's icon: outlined, filled when its row is selected.
@@ -1255,7 +1293,7 @@ pub fn nav_icon(glyph: &str, selected: bool) -> View {
 
 /// A section label row (`.lab`): the label in `label-medium`, the variant
 /// tone, 10 DIPs in, its actions at the end (4 DIPs in).
-pub fn section_label_row(value: &str, actions: View) -> View {
+pub fn section_label_row(value: &str, actions: impl Into<Option<View>>) -> View {
     Border::new()
         .height(height::CONTROL)
         .padding(Thickness::new(spacing::ROW, 0.0, spacing::XS, 0.0))
@@ -1269,9 +1307,10 @@ pub fn section_label_row(value: &str, actions: View) -> View {
                     Border::new()
                         .grid_column(1)
                         .vertical_alignment(VerticalAlignment::Center)
-                        .content(actions),
+                        .maybe_content(actions.into()),
                 )),
         )
+        .into()
 }
 
 /// A thin quota meter: the share `value` (0 to 100) in `primary` (`error`
@@ -1294,4 +1333,5 @@ pub fn meter(palette: Palette, value: f64, low: bool) -> View {
                     .corner_radius(layout::METER / 2.0)
                     .background(fill),)),
         )
+        .into()
 }

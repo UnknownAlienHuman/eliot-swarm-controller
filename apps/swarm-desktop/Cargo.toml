@@ -48,19 +48,23 @@ url.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 eliot = { path = "../../crates/eliot" }
-# First real code import of windows-reactor: Microsoft windows-rs 0.100.0
-# (https://github.com/microsoft/windows-rs), MIT OR Apache-2.0, rust-version
-# 1.95, below the pinned workspace toolchain 1.99.1. License texts live in
-# the crate (license-mit / license-apache-2.0); no donor source is copied,
-# the library is used directly. WinUI staging at runtime uses Reactor's own
-# bootstrap inside App::run; no self-contained exe is promised.
-windows-reactor = "=0.100.0"
-# The same windows-rs 0.100.0 crates Reactor depends on, for the WinUI calls
-# Reactor does not expose: the application's resources and the title bar's
-# colors (`app_resources`). No new crate versions enter the lockfile.
-windows-collections = { version = "=0.100.0", default-features = false, features = ["std"] }
-windows-core = { version = "=0.100.0", default-features = false }
-windows-reference = { version = "=0.100.0", default-features = false, features = ["std"] }
+# windows-reactor tracks the default branch of the official Microsoft
+# windows-rs repository (https://github.com/microsoft/windows-rs) with no
+# version, tag or rev pin; Cargo.lock records the resolved commit and
+# `cargo update` follows upstream. Used under the MIT license of its
+# MIT OR Apache-2.0 dual license; rust-version 1.95 at the resolved commit,
+# below the pinned workspace toolchain 1.99.1. License texts live in the
+# crate (license-mit / license-apache-2.0); no donor source is copied, the
+# library is used directly. WinUI staging at runtime uses Reactor's own
+# bootstrap inside App::run against the installed Windows App Runtime; no
+# self-contained exe.
+windows-reactor = { git = "https://github.com/microsoft/windows-rs" }
+# The same source's crates Reactor depends on, for the WinUI calls Reactor
+# does not expose: the application's resources and the title bar's colors
+# (`app_resources`). One source for every windows-rs crate in Reactor's graph.
+windows-collections = { git = "https://github.com/microsoft/windows-rs", default-features = false, features = ["std"] }
+windows-core = { git = "https://github.com/microsoft/windows-rs", default-features = false }
+windows-reference = { git = "https://github.com/microsoft/windows-rs", default-features = false, features = ["std"] }
 # Clipboard (Reactor 0.100.0 has no clipboard API) and the High Contrast
 # check (Reactor reports Light/Dark only): the workspace pin.
 windows-sys = { workspace = true, features = [
@@ -75,10 +79,6 @@ windows-sys = { workspace = true, features = [
     # for its AppWindowTitleBar colors.
     "Win32_System_LibraryLoader",
     "Win32_System_Memory",
-    # The transcript's scroll-to-end through UI Automation (`scroll_end`):
-    # the VARIANT of its property condition.
-    "Win32_System_Ole",
-    "Win32_System_Variant",
     "Win32_UI_Shell",
     # Whether an inherited standard handle is usable (GetFileType, `startup`).
     "Win32_Storage_FileSystem",

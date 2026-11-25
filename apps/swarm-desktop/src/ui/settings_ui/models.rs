@@ -7,13 +7,16 @@ impl DesktopApp {
     pub(super) fn models_section(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
         let raw = !self.autosaves(Page::Models);
         let dirty = self.editor.draft != self.editor.base;
-        StackPanel::new().spacing(tokens::spacing::MD).children((
-            self.profiles_view(context, palette),
-            if raw {
-                self.save_bar(Page::Models, dirty, context, palette)
-            } else {
-                View::empty()
-            },
-        ))
+        StackPanel::new()
+            .spacing(tokens::spacing::MD)
+            .keyed_children(crate::views::slots([
+                Some(self.profiles_view(context, palette)),
+                if raw {
+                    Some(self.save_bar(Page::Models, dirty, context, palette))
+                } else {
+                    None
+                },
+            ]))
+            .into()
     }
 }

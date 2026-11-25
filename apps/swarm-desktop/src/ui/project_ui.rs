@@ -806,7 +806,7 @@ impl Component for ProjectView {
     }
 
     fn update(&mut self, message: Message, _context: &ComponentContext<Self>) {
-        let _ = self.send.call(message);
+        self.send.call(message);
     }
 
     fn view(&self, input: &ProjectInput, context: &mut ViewContext<Self>) -> View {
@@ -912,7 +912,7 @@ fn task_row(
         .children((
             Border::new()
                 .vertical_alignment(VerticalAlignment::Center)
-                .content(page_ui::agent_mark(
+                .maybe_content(page_ui::agent_mark(
                     palette,
                     agent.state,
                     agent.status_line.as_deref(),
@@ -932,8 +932,9 @@ fn task_row(
             .background(palette.tonal())
             .corner_radius(tokens::radius::CONTAINER)
             .content(row)
+            .into()
     } else {
-        row
+        row.into()
     }
 }
 
@@ -946,10 +947,9 @@ fn group_label(text: String, action: Option<View>) -> View {
             m3::muted(text, tokens::text::LABEL)
                 .margin(Thickness::new(tokens::spacing::XS, 0.0, 0.0, 0.0))
                 .vertical_alignment(VerticalAlignment::Center),
-            Border::new()
-                .grid_column(1)
-                .content(action.unwrap_or_else(View::empty)),
+            crate::views::MaybeContent::maybe_content(Border::new().grid_column(1), action),
         ))
+        .into()
 }
 
 fn tasks_panel(
@@ -980,6 +980,7 @@ fn tasks_panel(
                 ))
                 .on_click(context.message(Message::Project(ProjectMsg::FinishedToggled)))
                 .content(m3::label(if open { "Hide" } else { "Show" }))
+                .into()
         });
         rows.push(KeyedView::new(
             format!("label:{title}:{open}"),
@@ -1069,7 +1070,7 @@ fn manager_panel(
                         .children((
                             Border::new()
                                 .vertical_alignment(VerticalAlignment::Center)
-                                .content(page_ui::state_mark(palette, line.state)),
+                                .maybe_content(page_ui::state_mark(palette, line.state)),
                             Border::new()
                                 .grid_column(1)
                                 .content(page_ui::two_lines(&line.title, &line.words)),
@@ -1082,8 +1083,9 @@ fn manager_panel(
                                 context
                                     .message(Message::Shell(ShellMsg::AgentOpened(agent.clone()))),
                             )
-                            .content(content),
-                        None => content,
+                            .content(content)
+                            .into(),
+                        None => content.into(),
                     };
                     rows.push(KeyedView::new("agent", agent));
                 }
@@ -1142,7 +1144,8 @@ fn manager_panel(
                                 .on_click(
                                     context.message(Message::Project(ProjectMsg::CompetingToggled)),
                                 )
-                                .content(m3::label(if open { "Hide" } else { "Show" })),
+                                .content(m3::label(if open { "Hide" } else { "Show" }))
+                                .into(),
                         ),
                     ),
                 ));
@@ -1190,12 +1193,15 @@ fn strip(palette: Palette, glyph: &str, text: &str, action: Option<View>) -> Vie
                         .foreground(on)
                         .vertical_alignment(VerticalAlignment::Center)
                         .text_wrapping(TextWrapping::Wrap),
-                    Border::new()
-                        .grid_column(2)
-                        .vertical_alignment(VerticalAlignment::Center)
-                        .content(action.unwrap_or_else(View::empty)),
+                    crate::views::MaybeContent::maybe_content(
+                        Border::new()
+                            .grid_column(2)
+                            .vertical_alignment(VerticalAlignment::Center),
+                        action,
+                    ),
                 )),
         )
+        .into()
 }
 
 fn check_panel(
@@ -1206,7 +1212,8 @@ fn check_panel(
     let edit: View = m3::text_button(palette)
         .automation_name("Edit project check")
         .on_click(context.message(Message::Project(ProjectMsg::EditCheck)))
-        .content(m3::label("Edit"));
+        .content(m3::label("Edit"))
+        .into();
     let mut rows = vec![KeyedView::new(
         "head",
         page_ui::panel_head("Project check", Some(edit)),
@@ -1331,6 +1338,7 @@ fn who_entry(palette: Palette, parts: Vec<KeyedView>) -> View {
                 .spacing(tokens::spacing::ROW_GAP)
                 .keyed_children(parts),
         )
+        .into()
 }
 
 fn worktrees_panel(
@@ -1440,7 +1448,8 @@ fn automations_panel(
         .on_click(context.message(Message::Shell(ShellMsg::PlaceOpened(
             super::page_ui::Place::Automations,
         ))))
-        .content(m3::label("Manage"));
+        .content(m3::label("Manage"))
+        .into();
     let running = input
         .automations
         .iter()

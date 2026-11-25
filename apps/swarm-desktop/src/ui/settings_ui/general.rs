@@ -44,8 +44,9 @@ fn swatch(choice: ThemeChoice, palette: Palette) -> View {
             .children((
                 half(crate::theme::Theme::Light, 0),
                 half(crate::theme::Theme::Dark, 1),
-            )),
-        other => half(other.theme(false), 0),
+            ))
+            .into(),
+        other => half(other.theme(false), 0).into(),
     };
     Border::new()
         .width(tokens::page::THEME_SWATCH_WIDTH)
@@ -55,6 +56,7 @@ fn swatch(choice: ThemeChoice, palette: Palette) -> View {
         .border_thickness(Thickness::uniform(tokens::layout::HAIRLINE))
         .vertical_alignment(VerticalAlignment::Center)
         .content(body)
+        .into()
 }
 
 impl DesktopApp {
@@ -76,6 +78,7 @@ impl DesktopApp {
                             m3::small_icon(m3::glyph::CHECK),
                             m3::text(choice.label(), tokens::text::LABEL),
                         ))
+                        .into()
                 } else {
                     m3::text(choice.label(), tokens::text::LABEL)
                         .horizontal_alignment(HorizontalAlignment::Center)
@@ -157,7 +160,7 @@ impl DesktopApp {
             .map(|access| {
                 KeyedView::new(
                     access.wire(),
-                    m3::setting_row(access.label(), access.description(), View::empty()),
+                    m3::setting_row(access.label(), access.description(), None),
                 )
             })
             .collect();
@@ -188,14 +191,14 @@ impl DesktopApp {
                 vec![
                     KeyedView::new(
                         "startup",
-                        m3::setting_row("On startup", "What the window opens with", startup_picker),
+                        m3::setting_row("On startup", "What the window opens with", View::from(startup_picker)),
                     ),
                     KeyedView::new(
                         "access",
                         m3::setting_row(
                             "Default access",
                             "For new tasks. You can change it in the composer",
-                            access_picker,
+                            View::from(access_picker),
                         ),
                     ),
                 ],
@@ -206,6 +209,6 @@ impl DesktopApp {
                 "Presets and Auto keep their own permissions. OpenCode has no Full access mode.",
             )
             .text_wrapping(TextWrapping::Wrap),
-        ))
+        )).into()
     }
 }

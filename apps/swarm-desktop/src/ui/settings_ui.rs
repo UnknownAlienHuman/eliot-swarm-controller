@@ -2068,7 +2068,7 @@ impl DesktopApp {
                             } else {
                                 page.label()
                             },
-                            View::empty(),
+                            None,
                         )),
                 ));
             }
@@ -2100,8 +2100,8 @@ impl DesktopApp {
     /// column of at most 720 DIPs with the 24-DIP page padding.
     pub(super) fn settings_view(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
         let page = self.settings_page;
-        let body: View = if self.settings.loaded {
-            match page {
+        let body: Option<View> = if self.settings.loaded {
+            Some(match page {
                 Page::General => self.general_page(context, palette),
                 Page::Shortcuts => shortcuts_page(palette),
                 Page::Models => self.models_section(context, palette),
@@ -2117,23 +2117,23 @@ impl DesktopApp {
                 Page::Retention => self.retention_page(context, palette),
                 Page::Advanced => self.advanced_section(context, palette),
                 Page::Automations => self.automations_page(context, palette),
-            }
+            })
         } else if self.settings.error.is_none() {
-            m3::secondary("Reading settings…").into()
+            Some(m3::secondary("Reading settings…").into())
         } else {
-            View::empty()
+            None
         };
         let freshness = self
             .settings
             .read_at_ms
             .and_then(crate::monitor::last_read_label);
-        let status = self.settings.error.as_deref().map_or_else(
+        let status: Option<View> = self.settings.error.as_deref().map_or_else(
             || {
                 // The same text during a background read, so the page never
                 // rewraps or shifts while it refreshes.
-                freshness.map_or_else(View::empty, |label| m3::secondary(label).into())
+                freshness.map(|label| m3::secondary(label).into())
             },
-            |error| self.read_error(error, context, palette),
+            |error| Some(self.read_error(error, context, palette)),
         );
         let width = self.settings_column_width();
         // The page's tree is keyed by page, so its editors are new controls
@@ -2142,42 +2142,44 @@ impl DesktopApp {
             .vertical_scroll_bar_visibility(ScrollBarVisibility::Auto)
             .content(
                 StackPanel::new()
-                    .width(width)
+                    .maybe_width(width)
                     .horizontal_alignment(HorizontalAlignment::Center)
                     .margin(Thickness::uniform(tokens::spacing::LG))
                     .spacing(tokens::spacing::MD)
-                    .keyed_children(vec![
-                        KeyedView::new(
-                            format!("title:{}", page.label()),
-                            page_ui::toolbar(
-                                page_ui::title(page.label()),
-                                page.has_config()
-                                    .then(|| {
-                                        KeyedView::new(
-                                            "config",
-                                            m3::text_button(palette)
-                                                .automation_name("Open config.toml")
-                                                .on_click(context.message(Message::Settings(
-                                                    SettingsMsg::OpenConfig,
-                                                )))
-                                                .content(m3::link_content("Open config.toml")),
-                                        )
-                                    })
-                                    .into_iter()
-                                    .collect(),
-                            ),
-                        ),
-                        KeyedView::new("settings-read-status", status),
-                        KeyedView::new(
-                            "repair-startup-retry",
-                            self.repair_startup_retry_view(context, palette),
-                        ),
-                        KeyedView::new(
-                            "settings-section-issues",
-                            self.settings_issues_view(page, context, palette),
-                        ),
-                        KeyedView::new(format!("body:{}", page.label()), body),
-                    ]),
+                    .keyed_children(
+                        // Absent optional rows are skipped; the present ones keep their keys.
+                        vec![
+                            Some(KeyedView::new(
+                                format!("title:{}", page.label()),
+                                page_ui::toolbar(
+                                    page_ui::title(page.label()),
+                                    page.has_config()
+                                        .then(|| {
+                                            KeyedView::new(
+                                                "config",
+                                                m3::text_button(palette)
+                                                    .automation_name("Open config.toml")
+                                                    .on_click(context.message(Message::Settings(
+                                                        SettingsMsg::OpenConfig,
+                                                    )))
+                                                    .content(m3::link_content("Open config.toml")),
+                                            )
+                                        })
+                                        .into_iter()
+                                        .collect(),
+                                ),
+                            )),
+                            status.map(|status| KeyedView::new("settings-read-status", status)),
+                            self.repair_startup_retry_view(context, palette)
+                                .map(|view| KeyedView::new("repair-startup-retry", view)),
+                            self.settings_issues_view(page, context, palette)
+                                .map(|view| KeyedView::new("settings-section-issues", view)),
+                            body.map(|body| KeyedView::new(format!("body:{}", page.label()), body)),
+                        ]
+                        .into_iter()
+                        .flatten()
+                        .collect::<Vec<_>>(),
+                    ),
             );
         // The save status stays in view below the page, however far the
         // page is scrolled.
@@ -2187,27 +2189,32 @@ impl DesktopApp {
                 scroll,
                 Border::new()
                     .grid_row(1)
-                    .content(if page == Page::Worktrees {
+                    .maybe_content(if page == Page::Worktrees {
                         self.cleanup_actions(context, palette)
                     } else {
-                        View::empty()
+                        None
                     }),
                 Border::new()
                     .grid_row(2)
-                    .content(self.save_status(page, context, palette)),
+                    .maybe_content(self.save_status(page, context, palette)),
             ))
+            .into()
     }
 
-    fn repair_startup_retry_view(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
+    fn repair_startup_retry_view(
+        &self,
+        context: &mut ViewContext<Self>,
+        palette: Palette,
+    ) -> Option<View> {
         if !self.repairing_settings()
             || self.settings.repair_saved_revision.is_none()
             || self.settings.repair_saved_revision != self.settings.revision
             || self.settings.busy()
             || self.prefs_saving
         {
-            return View::empty();
+            return None;
         }
-        m3::settings_card(
+        Some(m3::settings_card(
             palette,
             vec![KeyedView::new(
                 "repair-startup-retry-action",
@@ -2216,7 +2223,7 @@ impl DesktopApp {
                     .on_click(context.message(Message::Shell(ShellMsg::RetryStartup)))
                     .content(m3::label("Retry startup")),
             )],
-        )
+        ))
     }
 
     fn settings_issues_view(
@@ -2224,7 +2231,7 @@ impl DesktopApp {
         page: Page,
         context: &mut ViewContext<Self>,
         palette: Palette,
-    ) -> View {
+    ) -> Option<View> {
         let issues: Vec<_> = self
             .settings
             .issues
@@ -2232,7 +2239,7 @@ impl DesktopApp {
             .filter(|issue| settings_issue_visible(page, issue.section))
             .collect();
         if issues.is_empty() {
-            return View::empty();
+            return None;
         }
         let mut rows = Vec::with_capacity(issues.len() + 1);
         for (index, issue) in issues.iter().enumerate() {
@@ -2283,7 +2290,7 @@ impl DesktopApp {
                     .content(m3::label(label)),
             ));
         }
-        m3::settings_card(palette, rows)
+        Some(m3::settings_card(palette, rows))
     }
 
     /// The settings column: one explicit width, so every page's groups
@@ -2316,15 +2323,17 @@ impl DesktopApp {
     /// "Saving…", or why not (in the error color, selectable) with Reload
     /// when the settings changed elsewhere. Empty until a change is made,
     /// and on the raw editors (their save bar says it).
-    fn save_status(&self, page: Page, context: &mut ViewContext<Self>, palette: Palette) -> View {
-        let Some(note) = self
+    fn save_status(
+        &self,
+        page: Page,
+        context: &mut ViewContext<Self>,
+        palette: Palette,
+    ) -> Option<View> {
+        let note = self
             .settings
             .notes
             .get(&page)
-            .filter(|_| self.autosaves(page))
-        else {
-            return View::empty();
-        };
+            .filter(|_| self.autosaves(page))?;
         let text = if note.error {
             m3::text(note.text.clone(), tokens::text::CAPTION).foreground(palette.attention())
         } else {
@@ -2334,55 +2343,73 @@ impl DesktopApp {
         .is_text_selection_enabled(true)
         .automation_name(format!("{} status: {}", page.label(), note.text))
         .vertical_alignment(VerticalAlignment::Center);
-        let mark: View = if !note.error && note.text.starts_with("Saved") {
-            Border::new()
-                .vertical_alignment(VerticalAlignment::Center)
-                .content(m3::small_icon(m3::glyph::CHECK))
-        } else {
-            View::empty()
-        };
-        let reload: View = if note.error && note.text.contains("changed somewhere else") {
-            m3::text_button(palette)
-                .is_enabled(!self.settings.reading)
-                .automation_name("Reload the settings")
-                .on_click(context.message(Message::Settings(SettingsMsg::Reload)))
-                .content(m3::label("Reload"))
-        } else {
-            View::empty()
-        };
-        Border::new()
-            .min_height(tokens::height::CONTROL)
-            .border_brush(palette.outline())
-            .border_thickness(Thickness::new(0.0, tokens::layout::HAIRLINE, 0.0, 0.0))
-            .padding(Thickness::xy(tokens::spacing::LG, 0.0))
-            .content(
-                Grid::new()
-                    .columns([GridLength::Auto, GridLength::STAR, GridLength::Auto])
-                    .column_spacing(tokens::spacing::CHIP_GAP)
-                    .children((
-                        mark,
-                        Border::new().grid_column(1).content(text),
-                        Border::new().grid_column(2).content(reload),
-                    )),
+        let mark: Option<View> = if !note.error && note.text.starts_with("Saved") {
+            Some(
+                Border::new()
+                    .vertical_alignment(VerticalAlignment::Center)
+                    .content(m3::small_icon(m3::glyph::CHECK))
+                    .into(),
             )
+        } else {
+            None
+        };
+        let reload: Option<View> = if note.error && note.text.contains("changed somewhere else") {
+            Some(
+                m3::text_button(palette)
+                    .is_enabled(!self.settings.reading)
+                    .automation_name("Reload the settings")
+                    .on_click(context.message(Message::Settings(SettingsMsg::Reload)))
+                    .content(m3::label("Reload"))
+                    .into(),
+            )
+        } else {
+            None
+        };
+        Some(
+            Border::new()
+                .min_height(tokens::height::CONTROL)
+                .border_brush(palette.outline())
+                .border_thickness(Thickness::new(0.0, tokens::layout::HAIRLINE, 0.0, 0.0))
+                .padding(Thickness::xy(tokens::spacing::LG, 0.0))
+                .content(
+                    Grid::new()
+                        .columns([GridLength::Auto, GridLength::STAR, GridLength::Auto])
+                        .column_spacing(tokens::spacing::CHIP_GAP)
+                        .keyed_children(crate::views::slots([
+                            mark,
+                            Some(Border::new().grid_column(1).content(text).into()),
+                            Some(Border::new().grid_column(2).maybe_content(reload).into()),
+                        ])),
+                )
+                .into(),
+        )
     }
 
     fn read_error(&self, error: &str, context: &mut ViewContext<Self>, palette: Palette) -> View {
-        StackPanel::new().spacing(tokens::spacing::SM).children((
-            m3::body(error.to_owned())
-                .foreground(palette.attention())
-                .text_wrapping(TextWrapping::Wrap)
-                .is_text_selection_enabled(true),
-            self.settings
-                .read_at_ms
-                .and_then(crate::monitor::last_read_label)
-                .map_or_else(View::empty, |label| m3::secondary(label).into()),
-            m3::outlined(palette)
-                .horizontal_alignment(HorizontalAlignment::Left)
-                .is_enabled(!self.settings.reading)
-                .on_click(context.message(Message::Settings(SettingsMsg::Reload)))
-                .content(m3::label("Read again")),
-        ))
+        StackPanel::new()
+            .spacing(tokens::spacing::SM)
+            .keyed_children(crate::views::slots([
+                Some(
+                    m3::body(error.to_owned())
+                        .foreground(palette.attention())
+                        .text_wrapping(TextWrapping::Wrap)
+                        .is_text_selection_enabled(true)
+                        .into(),
+                ),
+                self.settings
+                    .read_at_ms
+                    .and_then(crate::monitor::last_read_label)
+                    .map(|label| m3::secondary(label).into()),
+                Some(
+                    m3::outlined(palette)
+                        .horizontal_alignment(HorizontalAlignment::Left)
+                        .is_enabled(!self.settings.reading)
+                        .on_click(context.message(Message::Settings(SettingsMsg::Reload)))
+                        .content(m3::label("Read again"))
+                        .into(),
+                ),
+            ]))
+            .into()
     }
 
     /// Save / Validate / Discard and the last result, under the raw
@@ -2421,31 +2448,38 @@ impl DesktopApp {
         } else {
             note_text
         };
-        StackPanel::new().spacing(tokens::spacing::SM).children((
-            StackPanel::new()
-                .orientation(Orientation::Horizontal)
-                .spacing(tokens::spacing::SM)
-                .children((
-                    m3::filled(palette)
-                        .is_enabled(dirty && !busy)
-                        .automation_name(format!("Save {}", page.label()))
-                        .on_click(
-                            context.message(Message::Settings(SettingsMsg::Save(page, false))),
-                        )
-                        .content(m3::label(if saving { "Saving…" } else { "Save" })),
-                    m3::outlined(palette)
-                        .is_enabled(!busy)
-                        .automation_name(format!("Validate {}", page.label()))
-                        .on_click(context.message(Message::Settings(SettingsMsg::Save(page, true))))
-                        .content(m3::label("Validate")),
-                    m3::text_button(palette)
-                        .is_enabled(dirty && !busy)
-                        .automation_name(format!("Discard changes to {}", page.label()))
-                        .on_click(context.message(Message::Settings(SettingsMsg::Discard(page))))
-                        .content(m3::label("Discard")),
-                )),
-            note_text,
-        ))
+        StackPanel::new()
+            .spacing(tokens::spacing::SM)
+            .children((
+                StackPanel::new()
+                    .orientation(Orientation::Horizontal)
+                    .spacing(tokens::spacing::SM)
+                    .children((
+                        m3::filled(palette)
+                            .is_enabled(dirty && !busy)
+                            .automation_name(format!("Save {}", page.label()))
+                            .on_click(
+                                context.message(Message::Settings(SettingsMsg::Save(page, false))),
+                            )
+                            .content(m3::label(if saving { "Saving…" } else { "Save" })),
+                        m3::outlined(palette)
+                            .is_enabled(!busy)
+                            .automation_name(format!("Validate {}", page.label()))
+                            .on_click(
+                                context.message(Message::Settings(SettingsMsg::Save(page, true))),
+                            )
+                            .content(m3::label("Validate")),
+                        m3::text_button(palette)
+                            .is_enabled(dirty && !busy)
+                            .automation_name(format!("Discard changes to {}", page.label()))
+                            .on_click(
+                                context.message(Message::Settings(SettingsMsg::Discard(page))),
+                            )
+                            .content(m3::label("Discard")),
+                    )),
+                note_text,
+            ))
+            .into()
     }
 }
 

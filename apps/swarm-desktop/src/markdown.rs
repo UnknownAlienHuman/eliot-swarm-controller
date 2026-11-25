@@ -10,8 +10,8 @@
 //! As Codex shows an answer, no Markdown marker stays visible: list items are
 //! their own blocks (the view gives them a hanging indent), and inline code
 //! drops its backticks. Reactor's runs carry only bold and italic (no font
-//! family or color, issue #407 §3), so inline code is set off in bold and a
-//! code block keeps its own block and Copy action without a monospace font.
+//! family or color, issue #407 §3), so inline code is set off in bold; a
+//! code block is its own monospace `TextBlock` with a Copy action.
 
 use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 

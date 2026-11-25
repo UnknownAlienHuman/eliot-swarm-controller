@@ -677,11 +677,11 @@ impl DesktopApp {
     /// clicked. Ids stay out of the main view: SENDs show their text and age,
     /// and the readback with ids sits under "Readback details".
     ///
-    pub(super) fn handoff_dialog(&self, context: &mut ViewContext<Self>) -> View {
+    pub(super) fn handoff_dialog(&self, context: &mut ViewContext<Self>) -> Option<ContentDialog> {
         let state = &self.handoff;
         let palette = self.palette();
         if !state.open {
-            return View::empty();
+            return None;
         }
         let now = handoff::now_ms();
         let rows: &[SendRow] = match &state.sends {
@@ -844,6 +844,7 @@ impl DesktopApp {
                 StackPanel::new()
                     .spacing(tokens::spacing::XS)
                     .children((small(label.to_owned()).foreground(palette.muted()), control))
+                    .into()
             };
             // The effort steps as segments (the effort popover's control):
             // each shows the short word and is named in full words, and its
@@ -930,7 +931,8 @@ impl DesktopApp {
                         format!("effort:{}", efforts.join("\u{1f}")),
                         labelled("Effort", m3::segmented(palette, effort_segments)),
                     ),
-                ]);
+                ])
+                .into();
             let catalog_line = match &state.catalog {
                 Some((harness, Ok(reply))) => format!(
                     "{harness} catalogue: {} model(s){}",
@@ -1009,10 +1011,13 @@ impl DesktopApp {
                         .is_checked(state.chosen.contains(&row.id))
                         .is_enabled(can_act)
                         .automation_name(format!("Move {label}"))
-                        .on_is_checked_changed(context.callback(move |checked| {
-                            Message::Handoff(HandoffMsg::SendToggled(id.clone(), checked))
-                        }))
-                        .content(small(label)),
+                        .on_is_checked_changed(crate::views::check_changes(context.callback(
+                            move |checked| {
+                                Message::Handoff(HandoffMsg::SendToggled(id.clone(), checked))
+                            },
+                        )))
+                        .content(small(label))
+                        .into(),
                 );
             }
         }
@@ -1032,13 +1037,9 @@ impl DesktopApp {
                     .on_is_expanded_changed(
                         context.callback(|open| Message::Handoff(HandoffMsg::DetailsToggled(open))),
                     )
-                    .slots([
-                        SlotView::new(ExpanderSlot::Header, small("Readback details (ids)")),
-                        SlotView::new(
-                            ExpanderSlot::Content,
-                            small(lines.join("\n")).foreground(palette.muted()),
-                        ),
-                    ]),
+                    .header(small("Readback details (ids)"))
+                    .content(small(lines.join("\n")).foreground(palette.muted()))
+                    .into(),
             );
         }
         if !state.children.is_empty() {
@@ -1112,17 +1113,18 @@ impl DesktopApp {
                         .text(state.reason.clone())
                         .placeholder_text("Reason for an Owner assertion (required)")
                         .automation_name("Owner reason")
-                        .on_text_changed(
+                        .on_text_changed(crate::views::text_edits(
                             context
                                 .callback(|text| Message::Handoff(HandoffMsg::ReasonChanged(text))),
-                        )
+                        ))
                         .into(),
                 );
                 push(
                     "owner-actions",
                     StackPanel::new()
                         .spacing(tokens::spacing::XS)
-                        .keyed_children(owner),
+                        .keyed_children(owner)
+                        .into(),
                 );
             }
             push("owner-status", small(state.owner_status.clone()).into());
@@ -1169,24 +1171,29 @@ impl DesktopApp {
                 enabled,
             )
         };
-        let primary: View =
-            match primary_message {
-                _ if primary_label.is_empty() => View::empty(),
-                Some(message) => m3::filled(palette)
+        let primary: Option<View> = match primary_message {
+            _ if primary_label.is_empty() => None,
+            Some(message) => Some(
+                m3::filled(palette)
                     .element_ref(&self.dialog.primary)
                     .is_enabled(primary_enabled)
                     .on_click(context.message(Message::Handoff(message)))
                     .automation_name(primary_label.clone())
                     .content(m3::text(primary_label, tokens::text::EMPHASIZED).margin(
                         Thickness::xy(tokens::spacing::MD - tokens::spacing::ROW, 0.0),
-                    )),
-                None => m3::filled(palette)
+                    ))
+                    .into(),
+            ),
+            None => Some(
+                m3::filled(palette)
                     .is_enabled(false)
                     .automation_name(primary_label.clone())
                     .content(m3::text(primary_label, tokens::text::EMPHASIZED).margin(
                         Thickness::xy(tokens::spacing::MD - tokens::spacing::ROW, 0.0),
-                    )),
-            };
+                    ))
+                    .into(),
+            ),
+        };
         // The same Cancel/Close then primary order as every M3 dialog.
         let close_label = if state.outcome.is_some() {
             "Close"
@@ -1207,7 +1214,8 @@ impl DesktopApp {
                 .children((
                     small(refusal.clone()).foreground(palette.attention()),
                     small(summary),
-                )),
+                ))
+                .into(),
             None => small(summary)
                 .vertical_alignment(VerticalAlignment::Center)
                 .into(),
@@ -1221,19 +1229,20 @@ impl DesktopApp {
                     .orientation(Orientation::Horizontal)
                     .horizontal_alignment(HorizontalAlignment::Right)
                     .spacing(tokens::spacing::SM)
-                    .children((close, primary)),
+                    .keyed_children(crate::views::slots([Some(close.into()), primary])),
             ));
-        super::dialog_ui::surface(
+        Some(super::dialog_ui::surface(
             context,
             self.dialog.epoch,
             palette,
             "Hand off or switch model".to_owned(),
             StackPanel::new()
                 .spacing(tokens::spacing::XS)
-                .keyed_children(sections),
-            footer,
+                .keyed_children(sections)
+                .into(),
+            footer.into(),
             tokens::layout::HANDOFF_DIALOG_WIDTH,
-        )
+        ))
     }
 
     /// The submission for the chosen destination, from what is shown: the
@@ -1346,13 +1355,15 @@ fn option_row(
                         .min_width(0.0)
                         .vertical_alignment(VerticalAlignment::Center)
                         .automation_name(format!("{title}: {supporting}"))
-                        .on_checked(context.callback(move |checked: bool| {
-                            if checked {
-                                Message::Handoff(HandoffMsg::GroupPicked(group))
-                            } else {
-                                Message::Menu(MenuMsg::Ignored)
-                            }
-                        })),
+                        .on_checked(crate::views::check_changes(context.callback(
+                            move |checked: bool| {
+                                if checked {
+                                    Message::Handoff(HandoffMsg::GroupPicked(group))
+                                } else {
+                                    Message::Menu(MenuMsg::Ignored)
+                                }
+                            },
+                        ))),
                     StackPanel::new()
                         .grid_column(1)
                         .vertical_alignment(VerticalAlignment::Center)
@@ -1366,6 +1377,7 @@ fn option_row(
                         )),
                 )),
         )
+        .into()
 }
 
 /// The list under the chosen kind of destination: one dropdown of its
@@ -1383,8 +1395,8 @@ fn choice_list(
         .items_source(labels)
         .selected_index(selected)
         .is_enabled(enabled)
-        .placeholder_text(placeholder.to_owned())
-        .automation_name(placeholder.to_owned())
+        .placeholder_text(placeholder)
+        .automation_name(placeholder)
         .horizontal_alignment(HorizontalAlignment::Stretch)
         .margin(Thickness::new(
             RADIO_INDENT + tokens::spacing::INSET,

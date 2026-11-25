@@ -37,7 +37,7 @@ pub(super) enum Probe {
     OwnerStopped,
 }
 
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub(super) struct LinkState {
     /// A `daemon.status` probe is in flight.
     probing: bool,
@@ -473,7 +473,7 @@ impl DesktopApp {
         Some(
             Border::new()
                 .grid_row(4)
-                .width(column)
+                .maybe_width(column)
                 .max_width(tokens::layout::READING_WIDTH)
                 .horizontal_alignment(HorizontalAlignment::Center)
                 .margin(Thickness::new(0.0, tokens::spacing::SM, 0.0, 0.0))
@@ -503,7 +503,8 @@ impl DesktopApp {
                                 .vertical_alignment(VerticalAlignment::Center)
                                 .text_trimming(TextTrimming::CharacterEllipsis),
                         )),
-                ),
+                )
+                .into(),
         )
     }
 
@@ -558,6 +559,7 @@ impl DesktopApp {
                     m3::text(label.to_owned(), tokens::text::BUTTON)
                         .vertical_alignment(VerticalAlignment::Center),
                 ))
+                .into()
         };
         let main_actions: View = if stopped {
             StackPanel::new()
@@ -574,6 +576,7 @@ impl DesktopApp {
                         .on_click(shell(ShellMsg::RetryStartup))
                         .content(with_icon(m3::glyph::RESUME, "Start Swarm")),
                 ))
+                .into()
         } else if self.link.gave_up {
             // Swarm ran and stopped: starting it is the main action.
             m3::filled(palette)
@@ -581,28 +584,30 @@ impl DesktopApp {
                 .automation_name("Start Swarm: start it again on this data directory")
                 .on_click(shell(ShellMsg::RetryStartup))
                 .content(with_icon(m3::glyph::RESUME, "Start Swarm"))
+                .into()
         } else {
             m3::filled(palette)
                 .horizontal_alignment(HorizontalAlignment::Center)
                 .automation_name("Retry: start Swarm again on this data directory")
                 .on_click(shell(ShellMsg::RetryStartup))
                 .content(with_icon(m3::glyph::REFRESH, "Retry"))
+                .into()
         };
         let text_action = |name: &str, msg: ShellMsg| -> View {
             m3::text_button(palette)
-                .automation_name(name.to_owned())
+                .automation_name(name)
                 .on_click(shell(msg))
                 .content(m3::label(name))
+                .into()
         };
-        let notice: View = match &self.alert {
-            Some(text) => m3::body(text.clone())
+        let notice: Option<View> = self.alert.as_ref().map(|text| {
+            m3::body(text.clone())
                 .foreground(palette.attention())
                 .horizontal_alignment(HorizontalAlignment::Center)
                 .text_wrapping(TextWrapping::Wrap)
                 .is_text_selection_enabled(true)
-                .into(),
-            None => View::empty(),
-        };
+                .into()
+        });
         let data_dir = self
             .data_dir
             .as_ref()
@@ -616,56 +621,75 @@ impl DesktopApp {
                     .vertical_alignment(VerticalAlignment::Center)
                     .margin(Thickness::uniform(tokens::spacing::XL))
                     .spacing(tokens::spacing::MD)
-                    .children((
-                        Border::new()
-                            .horizontal_alignment(HorizontalAlignment::Center)
-                            .content(m3::carrier(
-                                palette,
-                                |s| s.primary,
-                                "Eliot Swarm",
-                                tokens::layout::MARK_LARGE,
-                                m3::shape(crate::brand::SHAPE_CLOVER, tokens::layout::MARK_LARGE),
-                            )),
-                        m3::text(title, tokens::text::PAGE)
-                            .automation_heading_level(AutomationHeadingLevel::Level1)
-                            .horizontal_alignment(HorizontalAlignment::Center)
-                            .text_wrapping(TextWrapping::Wrap),
-                        m3::body(sentence)
-                            .foreground(palette.muted())
-                            .horizontal_alignment(HorizontalAlignment::Center)
-                            .text_wrapping(TextWrapping::Wrap)
-                            .is_text_selection_enabled(true),
-                        main_actions,
-                        StackPanel::new()
-                            .orientation(Orientation::Horizontal)
-                            .horizontal_alignment(HorizontalAlignment::Center)
-                            .spacing(tokens::spacing::ROW_GAP)
-                            .children((
-                                text_action("Repair settings", ShellMsg::RepairSettings),
-                                text_action("Open config.toml", ShellMsg::OpenStartupConfig),
-                                text_action("Open log", ShellMsg::OpenStartupLog),
-                                m3::text_button(palette)
-                                    .automation_name(format!("Open data folder: {data_dir}"))
-                                    .on_click(shell(ShellMsg::OpenDataFolder))
-                                    .content(m3::label("Open data folder")),
-                            )),
-                        StackPanel::new()
-                            .orientation(Orientation::Horizontal)
-                            .horizontal_alignment(HorizontalAlignment::Center)
-                            .spacing(tokens::spacing::ROW_GAP)
-                            .children((
-                                text_action(
-                                    "Use another data directory…",
-                                    ShellMsg::ChooseDataDirectory,
-                                ),
-                                text_action(
-                                    "Start over in a new data directory…",
-                                    ShellMsg::UseFreshDirectory,
-                                ),
-                            )),
+                    .keyed_children(crate::views::slots([
+                        Some(
+                            Border::new()
+                                .horizontal_alignment(HorizontalAlignment::Center)
+                                .content(m3::carrier(
+                                    palette,
+                                    |s| s.primary,
+                                    "Eliot Swarm",
+                                    tokens::layout::MARK_LARGE,
+                                    m3::shape(
+                                        crate::brand::SHAPE_CLOVER,
+                                        tokens::layout::MARK_LARGE,
+                                    ),
+                                ))
+                                .into(),
+                        ),
+                        Some(
+                            m3::text(title, tokens::text::PAGE)
+                                .automation_heading_level(AutomationHeadingLevel::Level1)
+                                .horizontal_alignment(HorizontalAlignment::Center)
+                                .text_wrapping(TextWrapping::Wrap)
+                                .into(),
+                        ),
+                        Some(
+                            m3::body(sentence)
+                                .foreground(palette.muted())
+                                .horizontal_alignment(HorizontalAlignment::Center)
+                                .text_wrapping(TextWrapping::Wrap)
+                                .is_text_selection_enabled(true)
+                                .into(),
+                        ),
+                        Some(main_actions),
+                        Some(
+                            StackPanel::new()
+                                .orientation(Orientation::Horizontal)
+                                .horizontal_alignment(HorizontalAlignment::Center)
+                                .spacing(tokens::spacing::ROW_GAP)
+                                .children((
+                                    text_action("Repair settings", ShellMsg::RepairSettings),
+                                    text_action("Open config.toml", ShellMsg::OpenStartupConfig),
+                                    text_action("Open log", ShellMsg::OpenStartupLog),
+                                    m3::text_button(palette)
+                                        .automation_name(format!("Open data folder: {data_dir}"))
+                                        .on_click(shell(ShellMsg::OpenDataFolder))
+                                        .content(m3::label("Open data folder")),
+                                ))
+                                .into(),
+                        ),
+                        Some(
+                            StackPanel::new()
+                                .orientation(Orientation::Horizontal)
+                                .horizontal_alignment(HorizontalAlignment::Center)
+                                .spacing(tokens::spacing::ROW_GAP)
+                                .children((
+                                    text_action(
+                                        "Use another data directory…",
+                                        ShellMsg::ChooseDataDirectory,
+                                    ),
+                                    text_action(
+                                        "Start over in a new data directory…",
+                                        ShellMsg::UseFreshDirectory,
+                                    ),
+                                ))
+                                .into(),
+                        ),
                         notice,
-                    )),
+                    ])),
             )
+            .into()
     }
 
     /// Confirm the last choice: a new, empty data directory.
@@ -673,7 +697,7 @@ impl DesktopApp {
         &self,
         context: &mut ViewContext<Self>,
         palette: Palette,
-    ) -> View {
+    ) -> ContentDialog {
         let current = self
             .data_dir
             .as_ref()
@@ -695,12 +719,15 @@ impl DesktopApp {
                     .element_ref(&self.dialog.close)
                     .automation_name("Cancel")
                     .on_click(context.message(Message::Shell(ShellMsg::FreshConfirmed(false))))
-                    .content(m3::label("Cancel")),
-                m3::filled(palette)
-                    .element_ref(&self.dialog.primary)
-                    .automation_name("Create empty data directory")
-                    .on_click(context.message(Message::Shell(ShellMsg::FreshConfirmed(true))))
-                    .content(m3::label("Create and start")),
+                    .content(m3::label("Cancel"))
+                    .into(),
+                View::from(
+                    m3::filled(palette)
+                        .element_ref(&self.dialog.primary)
+                        .automation_name("Create empty data directory")
+                        .on_click(context.message(Message::Shell(ShellMsg::FreshConfirmed(true))))
+                        .content(m3::label("Create and start")),
+                ),
             ),
             tokens::layout::DIALOG_WIDTH,
         )

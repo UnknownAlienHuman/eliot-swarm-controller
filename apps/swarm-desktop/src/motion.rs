@@ -300,6 +300,13 @@ impl windows_core::RuntimeType for PointerEventHandler {
         ConstBuffer::from_slice(b"delegate({a48a71e1-8bb4-5597-9e31-903a3f6a04fb})");
 }
 
+// SAFETY: as windows-rs declares its generated delegates: the handler is a
+// windows-core `DelegateBox` around a plain `fn`, with no thread state.
+// windows-reference 0.101 boxes only `Send + Sync` values.
+unsafe impl Send for PointerEventHandler {}
+// SAFETY: as above.
+unsafe impl Sync for PointerEventHandler {}
+
 runtime_class!(FocusManager, "Microsoft.UI.Xaml.Input.FocusManager");
 runtime_class!(UIElement, "Microsoft.UI.Xaml.UIElement");
 runtime_class!(VisualTreeHelper, "Microsoft.UI.Xaml.Media.VisualTreeHelper");

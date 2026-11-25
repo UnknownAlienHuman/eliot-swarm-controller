@@ -348,7 +348,7 @@ impl Component for Autonomy {
                     crate::m3::segment(palette, selected)
                         .automation_name(format!("Autonomy for {text}"))
                         .on_click(move || {
-                            let _ = choose.call(week);
+                            choose.call(week);
                         })
                         .content(crate::m3::segment_label(text)),
                 )
@@ -375,7 +375,7 @@ impl Component for Autonomy {
                     .is_enabled(!input.reading)
                     .automation_name("Refresh autonomy")
                     .on_click(move || {
-                        let _ = refresh.call(());
+                        refresh.call(());
                     })
                     .content(crate::m3::icon(crate::m3::glyph::REFRESH)),
                 Border::new()
@@ -448,7 +448,7 @@ impl Component for Autonomy {
                                     "Show the lines by source"
                                 })
                                 .on_click(move || {
-                                    let _ = toggle.call(());
+                                    toggle.call(());
                                 })
                                 .content(crate::m3::label(if input.open {
                                     "Hide sources"
@@ -480,6 +480,7 @@ impl Component for Autonomy {
                     .spacing(tokens::spacing::SM)
                     .keyed_children(parts),
             )
+            .into()
     }
 }
 
@@ -501,33 +502,42 @@ fn line_view(line: &Line, palette: Palette) -> View {
             )
         })
         .collect();
-    let reason: View = match &line.reason {
-        Some(reason) => crate::m3::secondary(format!("{}: {reason}", line.coverage.as_str()))
+    let reason: Option<View> = line.reason.as_ref().map(|reason| {
+        crate::m3::secondary(format!("{}: {reason}", line.coverage.as_str()))
             .text_wrapping(TextWrapping::Wrap)
             .is_text_selection_enabled(true)
-            .into(),
-        None => View::empty(),
-    };
+            .into()
+    });
     StackPanel::new()
         .spacing(tokens::spacing::XS)
         .automation_name(said.join(", "))
-        .children((
-            Grid::new()
-                .columns([GridLength::STAR, GridLength::Auto])
-                .column_spacing(tokens::spacing::SM)
-                .children((
-                    crate::m3::text(line.title, tokens::text::LABEL)
-                        .vertical_alignment(VerticalAlignment::Center)
-                        .text_trimming(TextTrimming::CharacterEllipsis),
-                    Border::new()
-                        .grid_column(1)
-                        .content(crate::m3::badge(palette, line.coverage.as_str())),
-                )),
-            StackPanel::new()
-                .spacing(tokens::spacing::XS)
-                .keyed_children(values),
+        .keyed_children(crate::views::slots([
+            Some(
+                Grid::new()
+                    .columns([GridLength::STAR, GridLength::Auto])
+                    .column_spacing(tokens::spacing::SM)
+                    .children((
+                        crate::m3::text(line.title, tokens::text::LABEL)
+                            .vertical_alignment(VerticalAlignment::Center)
+                            .text_trimming(TextTrimming::CharacterEllipsis),
+                        Border::new()
+                            .grid_column(1)
+                            .content(crate::m3::badge(palette, line.coverage.as_str())),
+                    ))
+                    .into(),
+            ),
+            Some(
+                StackPanel::new()
+                    .spacing(tokens::spacing::XS)
+                    .keyed_children(values)
+                    .into(),
+            ),
             reason,
-            crate::m3::secondary(format!("Source: {}", line.source))
-                .text_wrapping(TextWrapping::Wrap),
-        ))
+            Some(
+                crate::m3::secondary(format!("Source: {}", line.source))
+                    .text_wrapping(TextWrapping::Wrap)
+                    .into(),
+            ),
+        ]))
+        .into()
 }

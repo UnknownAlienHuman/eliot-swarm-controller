@@ -36,10 +36,10 @@ pub(super) fn page(name: &str, width: Option<f64>, items: Vec<KeyedView>) -> Vie
     ScrollViewer::new()
         .vertical_scroll_bar_visibility(ScrollBarVisibility::Auto)
         .horizontal_scroll_bar_visibility(ScrollBarVisibility::Disabled)
-        .automation_name(name.to_owned())
+        .automation_name(name)
         .content(
             StackPanel::new()
-                .width(width)
+                .maybe_width(width)
                 .horizontal_alignment(HorizontalAlignment::Center)
                 .margin(Thickness::new(
                     0.0,
@@ -50,6 +50,7 @@ pub(super) fn page(name: &str, width: Option<f64>, items: Vec<KeyedView>) -> Vie
                 .spacing(tokens::spacing::MD)
                 .keyed_children(items),
         )
+        .into()
 }
 
 /// A page's title (`headline-medium`).
@@ -77,6 +78,7 @@ pub(super) fn toolbar(lead: impl Into<View>, actions: Vec<KeyedView>) -> View {
                 .vertical_alignment(VerticalAlignment::Center)
                 .keyed_children(actions),
         ))
+        .into()
 }
 
 /// A section heading on a page or in a panel (`title-small`, the variant
@@ -109,6 +111,7 @@ pub(super) fn panel(palette: Palette, gap: f64, children: Vec<KeyedView>) -> Vie
         ))
         .vertical_alignment(VerticalAlignment::Top)
         .content(StackPanel::new().spacing(gap).keyed_children(children))
+        .into()
 }
 
 /// A panel's head: its heading and an optional action at the end.
@@ -119,11 +122,14 @@ pub(super) fn panel_head(value: &str, action: Option<View>) -> View {
         .column_spacing(tokens::spacing::SM)
         .children((
             heading(value.to_owned()),
-            Border::new()
-                .grid_column(1)
-                .vertical_alignment(VerticalAlignment::Center)
-                .content(action.unwrap_or_else(View::empty)),
+            crate::views::MaybeContent::maybe_content(
+                Border::new()
+                    .grid_column(1)
+                    .vertical_alignment(VerticalAlignment::Center),
+                action,
+            ),
         ))
+        .into()
 }
 
 /// A key-value line (`.kv`): the key in the variant tone in its column,
@@ -139,6 +145,7 @@ pub(super) fn kv(key: &str, value: impl Into<View>) -> View {
             m3::muted(key.to_owned(), tokens::text::BODY),
             Border::new().grid_column(1).content(value),
         ))
+        .into()
 }
 
 /// A key-value line whose value is text (wrapped, selectable).
@@ -163,7 +170,7 @@ pub(super) fn stat(value: impl Into<String>, label: &str, tip: Option<String>) -
         ));
     match tip {
         Some(tip) => body.tooltip(tip),
-        None => body,
+        None => body.into(),
     }
 }
 
@@ -193,6 +200,7 @@ pub(super) fn grid(views: Vec<View>) -> View {
         .columns(columns)
         .column_spacing(tokens::spacing::MD)
         .keyed_children(cells)
+        .into()
 }
 
 /// The two columns of the project page and Automations (`.cols`): three
@@ -213,6 +221,7 @@ pub(super) fn columns(left: Vec<KeyedView>, left_gap: f64, right: Vec<KeyedView>
                 .vertical_alignment(VerticalAlignment::Top)
                 .keyed_children(right),
         ))
+        .into()
 }
 
 /// A filter chip with its count (`.chip`, "Working 3"): selected, it
@@ -243,6 +252,7 @@ pub(super) fn filter_chip(
             false,
             tokens::layout::PROJECT_CHIP_WIDTH,
         ))
+        .into()
 }
 
 /// A wrapping row of chips 6 DIPs apart (`.filters`). Reactor 0.100.0 has
@@ -274,6 +284,7 @@ pub(super) fn chip_rows(chips: Vec<KeyedView>, per_row: usize) -> View {
     StackPanel::new()
         .spacing(tokens::spacing::CHIP_GAP)
         .keyed_children(rows)
+        .into()
 }
 
 /// An age or count at a row's end (`.age`, `label-small`, the variant
@@ -302,9 +313,13 @@ pub(crate) fn held(status_line: Option<&str>) -> bool {
 
 /// An Agent's mark in a page row: a provider hold waits (the waiting dot),
 /// else its state's mark ([`state_mark`]).
-pub(crate) fn agent_mark(palette: Palette, state: AgentState, status_line: Option<&str>) -> View {
+pub(crate) fn agent_mark(
+    palette: Palette,
+    state: AgentState,
+    status_line: Option<&str>,
+) -> Option<View> {
     if held(status_line) {
-        m3::row_mark(palette, m3::RowMark::Waiting, "Provider hold")
+        Some(m3::row_mark(palette, m3::RowMark::Waiting, "Provider hold"))
     } else {
         state_mark(palette, state)
     }
@@ -313,19 +328,19 @@ pub(crate) fn agent_mark(palette: Palette, state: AgentState, status_line: Optio
 /// An Agent's state mark in a page row (brand book, Color, status in
 /// rows), the sidebar's marks: the loader while it works, the waiting and
 /// idle dots, the error icon, none when stopped.
-pub(crate) fn state_mark(palette: Palette, state: AgentState) -> View {
+pub(crate) fn state_mark(palette: Palette, state: AgentState) -> Option<View> {
     let (mark, word) = match state {
         AgentState::Created | AgentState::Starting | AgentState::Busy => {
-            (m3::RowMark::Working, "Working")
+            (Some(m3::RowMark::Working), "Working")
         }
-        AgentState::Waiting => (m3::RowMark::Waiting, "Waiting for you"),
-        AgentState::Idle => (m3::RowMark::Idle, "Ready"),
-        AgentState::Failed => (m3::RowMark::Failed, "Failed"),
-        AgentState::Lost => (m3::RowMark::Failed, "Lost"),
-        AgentState::Unknown => (m3::RowMark::Failed, "Unknown"),
-        AgentState::Stopped => (m3::RowMark::None, "Stopped"),
+        AgentState::Waiting => (Some(m3::RowMark::Waiting), "Waiting for you"),
+        AgentState::Idle => (Some(m3::RowMark::Idle), "Ready"),
+        AgentState::Failed => (Some(m3::RowMark::Failed), "Failed"),
+        AgentState::Lost => (Some(m3::RowMark::Failed), "Lost"),
+        AgentState::Unknown => (Some(m3::RowMark::Failed), "Unknown"),
+        AgentState::Stopped => (None, "Stopped"),
     };
-    m3::row_mark(palette, mark, word)
+    mark.map(|mark| m3::row_mark(palette, mark, word))
 }
 
 /// A row's text (`.item .tx`): the title in `title-small` and one
@@ -345,6 +360,7 @@ pub(super) fn two_lines(title: &str, line: &str) -> View {
     StackPanel::new()
         .vertical_alignment(VerticalAlignment::Center)
         .keyed_children(parts)
+        .into()
 }
 
 /// A line of text in the error color (a failed read, a refusal).
@@ -365,15 +381,18 @@ pub(super) fn read_failed(
     on_click: Callback<()>,
 ) -> View {
     let text = text.into();
-    StackPanel::new().spacing(tokens::spacing::XS).children((
-        error_line(palette, text),
-        m3::outlined(palette)
-            .horizontal_alignment(HorizontalAlignment::Left)
-            .is_enabled(enabled)
-            .automation_name(retry.to_owned())
-            .on_click(on_click)
-            .content(m3::label(retry)),
-    ))
+    StackPanel::new()
+        .spacing(tokens::spacing::XS)
+        .children((
+            error_line(palette, text),
+            m3::outlined(palette)
+                .horizontal_alignment(HorizontalAlignment::Left)
+                .is_enabled(enabled)
+                .automation_name(retry)
+                .on_click(on_click)
+                .content(m3::label(retry)),
+        ))
+        .into()
 }
 
 /// A page's empty state or reading line: one sentence in the variant

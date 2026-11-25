@@ -896,11 +896,11 @@ impl DesktopApp {
                                 .min_width(0.0)
                                 .vertical_alignment(VerticalAlignment::Center)
                                 .automation_name(format!("Select all {}", shown.len()))
-                                .on_is_checked_changed(
+                                .on_is_checked_changed(crate::views::check_changes(
                                     context.callback(|on: bool| {
                                         Message::Inbox(InboxMsg::SelectAll(on))
                                     }),
-                                ),
+                                )),
                         )]),
                         m3::text(
                             if busy {
@@ -929,6 +929,7 @@ impl DesktopApp {
                             .content(m3::label("Apply recommended")),
                     )),
             )
+            .into()
     }
 
     /// The confirmation before Apply recommended stops Agents: which ones.
@@ -936,9 +937,9 @@ impl DesktopApp {
         &self,
         context: &mut ViewContext<Self>,
         palette: Palette,
-    ) -> View {
+    ) -> Option<ContentDialog> {
         let Some(names) = &self.inbox.confirm else {
-            return View::empty();
+            return None;
         };
         let lines: Vec<KeyedView> = names
             .iter()
@@ -950,7 +951,7 @@ impl DesktopApp {
                 )
             })
             .collect();
-        super::dialog_ui::surface(
+        Some(super::dialog_ui::surface(
             context,
             self.dialog.epoch,
             palette,
@@ -965,21 +966,21 @@ impl DesktopApp {
                     StackPanel::new()
                         .spacing(tokens::spacing::XS)
                         .keyed_children(lines),
-                )),
+                )).into(),
             super::dialog_ui::actions(
                 m3::text_button(palette)
                     .element_ref(&self.dialog.close)
                     .automation_name("Cancel")
                     .on_click(context.message(Message::Inbox(InboxMsg::BulkConfirmed(false))))
-                    .content(m3::label("Cancel")),
-                m3::destructive(palette)
+                    .content(m3::label("Cancel")).into(),
+                View::from(m3::destructive(palette)
                     .element_ref(&self.dialog.primary)
                     .automation_name("Apply recommended and stop")
                     .on_click(context.message(Message::Inbox(InboxMsg::BulkConfirmed(true))))
-                    .content(m3::label("Apply recommended")),
+                    .content(m3::label("Apply recommended"))),
             ),
             tokens::layout::DIALOG_WIDTH,
-        )
+        ))
     }
 
     /// One item (`.ibx`): its check while selecting, the task and kind,
@@ -1127,7 +1128,10 @@ impl DesktopApp {
                     .content(m3::icon(m3::glyph::CHEVRON_DOWN))
                     .menu(Menu::new(
                         menu,
-                        context.callback(|key: String| Message::Inbox(InboxMsg::MenuPicked(key))),
+                        crate::views::menu_keys(
+                            context
+                                .callback(|key: String| Message::Inbox(InboxMsg::MenuPicked(key))),
+                        ),
                     )),
             ));
         }
@@ -1153,9 +1157,9 @@ impl DesktopApp {
                     .min_width(0.0)
                     .vertical_alignment(VerticalAlignment::Center)
                     .automation_name(format!("Select {subject} · {kind}"))
-                    .on_is_checked_changed(context.callback(move |on: bool| {
-                        Message::Inbox(InboxMsg::Selected(key.clone(), on))
-                    })),
+                    .on_is_checked_changed(crate::views::check_changes(context.callback(
+                        move |on: bool| Message::Inbox(InboxMsg::Selected(key.clone(), on)),
+                    ))),
             ));
             1
         } else {
@@ -1172,7 +1176,8 @@ impl DesktopApp {
                 .content(
                     m3::text(format!("{subject} · {kind}"), tokens::page::HEADING)
                         .text_trimming(TextTrimming::CharacterEllipsis),
-                ),
+                )
+                .into(),
             None => m3::text(format!("{subject} · {kind}"), tokens::page::HEADING)
                 .text_trimming(TextTrimming::CharacterEllipsis)
                 .into(),
@@ -1210,10 +1215,10 @@ impl DesktopApp {
                     .is_enabled(!inbox.ids.contains_key(&abandon_key))
                     .placeholder_text("Reason for releasing the reservation")
                     .automation_name(format!("Reason to abandon reservation: {subject}"))
-                    .on_text_changed(context.callback({
+                    .on_text_changed(crate::views::text_edits(context.callback({
                         let reference = reference.clone();
                         move |text| Message::Inbox(InboxMsg::AbandonReason(reference.clone(), text))
-                    })),
+                    }))),
             ));
         }
         let visible_outcome = if item.kind == OwnerInboxKind::HarnessAuth {
@@ -1287,6 +1292,7 @@ impl DesktopApp {
                     .column_spacing(tokens::spacing::INSET)
                     .keyed_children(cells),
             )
+            .into()
     }
 }
 

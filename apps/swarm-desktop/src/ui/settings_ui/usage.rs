@@ -52,7 +52,7 @@ impl DesktopApp {
                     m3::setting_row(
                         "Running Agents",
                         &running_note,
-                        m3::body(running_value).into(),
+                        View::from(m3::body(running_value)),
                     ),
                 ),
                 KeyedView::new(
@@ -60,7 +60,7 @@ impl DesktopApp {
                     m3::setting_row(
                         "Tokens today",
                         &coverage,
-                        m3::body(group_digits(tokens_today)).into(),
+                        View::from(m3::body(group_digits(tokens_today))),
                     ),
                 ),
             ],
@@ -105,11 +105,11 @@ impl DesktopApp {
             let rows = match (entry, read) {
                 (Some(entry), _) if !entry.installed => vec![KeyedView::new(
                     "not-installed",
-                    m3::setting_row("Not installed", "", View::empty()),
+                    m3::setting_row("Not installed", "", None),
                 )],
                 (_, None) if self.settings.quotas_loading > 0 => vec![KeyedView::new(
                     "reading",
-                    m3::setting_row("Reading limits…", "", View::empty()),
+                    m3::setting_row("Reading limits…", "", None),
                 )],
                 (_, None) => unknown_limits(""),
                 (_, Some(Err(error))) => unknown_limits(&crate::state::plain_error(error)),
@@ -157,27 +157,34 @@ impl DesktopApp {
                 )),
             ));
         }
-        StackPanel::new().spacing(tokens::spacing::MD).children((
-            StackPanel::new().spacing(tokens::spacing::SM).children((
-                m3::section_heading(
-                    "Swarm",
-                    "",
-                    Some(
-                        m3::text_button(palette)
-                            .is_enabled(
-                                self.settings.quotas_loading == 0 && !self.settings.fleet_loading,
-                            )
-                            .automation_name("Read the limits again")
-                            .on_click(context.message(Message::Settings(SettingsMsg::UsageRefresh)))
-                            .content(m3::label("Refresh")),
+        StackPanel::new()
+            .spacing(tokens::spacing::MD)
+            .children((
+                StackPanel::new().spacing(tokens::spacing::SM).children((
+                    m3::section_heading(
+                        "Swarm",
+                        "",
+                        Some(
+                            m3::text_button(palette)
+                                .is_enabled(
+                                    self.settings.quotas_loading == 0
+                                        && !self.settings.fleet_loading,
+                                )
+                                .automation_name("Read the limits again")
+                                .on_click(
+                                    context.message(Message::Settings(SettingsMsg::UsageRefresh)),
+                                )
+                                .content(m3::label("Refresh"))
+                                .into(),
+                        ),
                     ),
-                ),
-                totals,
-            )),
-            StackPanel::new()
-                .spacing(tokens::spacing::SM)
-                .keyed_children(cards),
-        ))
+                    totals,
+                )),
+                StackPanel::new()
+                    .spacing(tokens::spacing::SM)
+                    .keyed_children(cards),
+            ))
+            .into()
     }
 
     /// Advanced's storage row: the store's size and what retention prunes,
@@ -191,7 +198,7 @@ impl DesktopApp {
             ),
             Some(Ok(fleet)) => retention_lines(fleet.retention.as_ref()),
         };
-        m3::setting_row("Storage and history", &note, m3::body(value).into())
+        m3::setting_row("Storage and history", &note, View::from(m3::body(value)))
     }
 }
 
@@ -203,7 +210,7 @@ fn agents(count: usize) -> String {
 fn unknown_limits(note: &str) -> Vec<KeyedView> {
     vec![KeyedView::new(
         format!("unknown:{note}"),
-        m3::setting_row("Quota unknown", note, View::empty()),
+        m3::setting_row("Quota unknown", note, None),
     )]
 }
 
@@ -217,6 +224,7 @@ fn limit_value(palette: Palette, remaining: i64) -> View {
             m3::body(format!("{remaining}%")).vertical_alignment(VerticalAlignment::Center),
             m3::status_ring(status),
         ))
+        .into()
 }
 
 /// `1234567` as `1,234,567`.
