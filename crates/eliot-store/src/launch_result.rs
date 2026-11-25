@@ -163,7 +163,16 @@ impl Store {
             "passed"
         };
         if !settle_project_check_obligation_tx(&tx, &retained, obligation_outcome, now)? {
-            return Ok(empty);
+            let obligation_exists: bool = tx
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM project_check_obligations WHERE completion_seq=?1)",
+                    [retained.seq],
+                    |row| row.get(0),
+                )
+                .map_err(sql_error)?;
+            if obligation_exists {
+                return Ok(empty);
+            }
         }
         commit_transaction(tx, &self.write_faulted)?;
         Ok(Change {
