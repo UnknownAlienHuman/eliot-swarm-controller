@@ -224,10 +224,23 @@ impl GitProbe {
         let mut edited = BTreeSet::new();
         let mut input = Vec::new();
         let mut hint_bytes = 0;
+        #[cfg(windows)]
+        let hint_root = (!edited_paths.is_empty())
+            .then(|| crate::platform::script_file::Directory::open(root).ok())
+            .flatten();
         for path in edited_paths {
             if Instant::now() >= deadline {
                 return Err(unavailable("Git observation deadline elapsed"));
             }
+            #[cfg(windows)]
+            let path = if let Some(anchor) = &hint_root
+                && let Some(relative) = anchor.canonical_edit_hint(path)?
+            {
+                git_path(&relative)?
+            } else {
+                git_path(&edit_root.normalize(path)?)?
+            };
+            #[cfg(not(windows))]
             let path = git_path(&edit_root.normalize(path)?)?;
             if edited.insert(path.clone()) {
                 hint_bytes += path.len() + 1;
@@ -247,6 +260,8 @@ impl GitProbe {
         if !edited_paths.is_empty() && canonical_root(workspace)? != root {
             return Err(unavailable("Git worktree root changed during hint read"));
         }
+        #[cfg(windows)]
+        drop(hint_root);
         let ignored = if input.is_empty() {
             BTreeSet::new()
         } else {
