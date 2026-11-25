@@ -2432,7 +2432,8 @@ fn snapshot_from_entry(
         &[
             (
                 "local_provider",
-                !ProfileCapabilities::of(harness).local_provider && entry.local_provider.is_some(),
+                ProfileCapabilities::of(harness).local_provider.is_none()
+                    && entry.local_provider.is_some(),
                 "local providers have no mapping on this harness",
             ),
             (

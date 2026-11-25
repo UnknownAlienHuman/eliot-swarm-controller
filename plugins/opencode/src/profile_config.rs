@@ -71,8 +71,7 @@ fn route(
     if let Some(provider) = entry.local_provider {
         let field_error =
             |field, message: &str| NativeProfileRefusal::new(field, message, "profile_error");
-        provider
-            .validate(pass_env)
+        crate::local_provider::validate(provider, pass_env)
             .map_err(|message| field_error("local_provider", &message))?;
         if !entry
             .model

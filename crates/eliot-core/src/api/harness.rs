@@ -327,12 +327,15 @@ pub struct ProfileCapabilities {
     pub latest_cmd: bool,
     pub script_wrapper_cmd: bool,
     pub command_refusal: Option<fn(&str) -> Option<&'static str>>,
-    pub local_provider: bool,
+    pub local_provider: Option<LocalProviderValidator>,
     pub project_doc_max_bytes: bool,
     /// Native approval selector in profile summaries. The default field is `approval_policy`.
     pub approval_field: Option<&'static str>,
     pub native_subagents_policy: Option<super::native_profile::NativeSubagentsPolicy>,
 }
+
+type LocalProviderValidator =
+    fn(&crate::local_provider::LocalProvider, &[String]) -> std::result::Result<(), String>;
 
 impl ProfileCapabilities {
     pub fn of(harness: &str) -> Self {

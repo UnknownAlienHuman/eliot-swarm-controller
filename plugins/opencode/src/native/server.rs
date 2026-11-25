@@ -80,8 +80,7 @@ pub(crate) fn validate_local_provider(
             )
         })?
         .unwrap_or_default();
-    provider
-        .validate(&pass_env)
+    crate::local_provider::validate(provider, &pass_env)
         .map_err(|message| Error::new("profile_error", message))
 }
 
