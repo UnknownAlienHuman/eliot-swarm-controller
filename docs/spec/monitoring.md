@@ -1459,8 +1459,9 @@ snapshots outside the Store writer lock. Compact list requests wait for a reader
 slot before scheduling blocking work, with up to four snapshots active at once.
 Debug logs include attention sweep
 duration and Store lock wait and hold times for retention and native event batches.
-The `daemon.wal_checkpoint` debug record gives frame and backfill counts,
-busy state, and execution and elapsed times for each maintenance checkpoint.
+When maintenance receives checkpoint statistics, the `daemon.wal_checkpoint`
+debug record gives frame and backfill counts, busy state, and execution and
+elapsed times. A failed call produces `daemon.retention_checkpoint_failed`.
 The retention view reports the `eliot.db` main and WAL sizes, the configured
 windows and `pruned_through`, along with the SQLite auto-vacuum mode,
 total pages and reusable pages. The disk usage view reports logical bytes under
