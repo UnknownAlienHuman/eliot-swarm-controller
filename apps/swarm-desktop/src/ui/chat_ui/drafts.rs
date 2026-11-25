@@ -7,7 +7,7 @@ impl DesktopApp {
         reason = "The operation's distinct inputs remain explicit at its established call boundary."
     )]
     pub(super) fn spawn_draft(
-        &self,
+        &mut self,
         action: DraftAction,
         mutation_id: String,
         ledger_key: String,
@@ -19,6 +19,15 @@ impl DesktopApp {
         let Ok(data_dir) = self.data_dir.clone() else {
             return;
         };
+        // Kept by its command id until the turn takes or refuses it,
+        // whichever conversation is open by then.
+        if let DraftAction::Steer(bound) = &action
+            && !blank
+        {
+            self.chat
+                .steers_sent
+                .note(&mutation_id, &bound.agent, &text);
+        }
         let agent_id = action.agent().to_owned();
         let what = action.label();
         let _task = context.spawn_background(move |_| {
@@ -125,8 +134,6 @@ impl DesktopApp {
                 {
                     keep_admitted_input(convo, &outcome, &harness);
                 }
-                // A refusal the feed delivered before this reply.
-                self.report_refused_steers();
                 self.rebuild_items();
                 self.set_status(format!(
                     "{} {} ({}){}{}.",
@@ -188,7 +195,9 @@ impl DesktopApp {
                 } else {
                     // A definite refusal settles the action: drop its
                     // snapshot (releasing its key) so a later Send mints
-                    // fresh identity.
+                    // fresh identity. No steer was admitted, so no turn
+                    // refuses it later: its kept text goes.
+                    self.chat.steers_sent.take(&failure.mutation_id);
                     if self
                         .chat
                         .pending_retry
@@ -215,32 +224,35 @@ impl DesktopApp {
         let Some(convo) = self.chat.convo.as_mut() else {
             return;
         };
-        let agent = convo.agent().to_owned();
-        // A steer to this Agent still waits for its reply, which brings
-        // its command and text.
-        let sending = self.in_flight_key.as_deref().is_some_and(|key| {
-            let mut fields = key.split(':');
-            fields.next() == Some("steer") && fields.next() == Some(agent.as_str())
-        });
-        for steer in convo.take_refused_steers(sending) {
-            // Only a steer this window sent has its exact text; another's
-            // refusal is said with its reason alone.
-            let Some(text) = steer.text else {
-                self.alert(format!(
-                    "Steer not applied: {}.",
-                    steer.reason.trim_end_matches('.')
-                ));
-                continue;
-            };
-            let restored = {
-                let mut drafts = self.chat.drafts.borrow_mut();
-                let empty = drafts.text(Some(&agent)).trim().is_empty();
-                if empty {
-                    drafts.set(Some(&agent), text);
+        let (refused, applied) = convo.take_settled();
+        // An applied steer's text is kept no longer.
+        for command in &applied {
+            self.chat.steers_sent.take(command);
+        }
+        for refusal in refused {
+            match self.chat.steers_sent.take(&refusal.command) {
+                // This window's steer, live or found in history on coming
+                // back: its text goes to its Agent's empty composer.
+                Some((agent, text)) => {
+                    let restored = {
+                        let mut drafts = self.chat.drafts.borrow_mut();
+                        let current = drafts.text(Some(&agent));
+                        // An unconfirmed reply may have put it back already.
+                        let restored = current.trim().is_empty() || current == text;
+                        if restored {
+                            drafts.set(Some(&agent), text);
+                        }
+                        restored
+                    };
+                    self.alert(steer_refused(&refusal.reason, restored));
                 }
-                empty
-            };
-            self.alert(steer_refused(&steer.reason, restored));
+                // Another's steer, refused now: its reason alone.
+                None if refusal.steer && refusal.live => self.alert(format!(
+                    "Steer not applied: {}.",
+                    refusal.reason.trim_end_matches('.')
+                )),
+                None => {}
+            }
         }
     }
 }
@@ -298,13 +310,10 @@ fn keep_admitted_input(convo: &mut Conversation, outcome: &SendOutcome, harness:
             outcome.command_id.as_str(),
             format!("Waiting for {harness}…"),
         ),
-        ("Steer", _) => {
-            convo.note_steer_text(&outcome.command_id, &outcome.text);
-            (
-                outcome.command_id.as_str(),
-                "Sent to the running turn".to_owned(),
-            )
-        }
+        ("Steer", _) => (
+            outcome.command_id.as_str(),
+            "Sent to the running turn".to_owned(),
+        ),
         ("Resume", Some(linked)) => (linked, format!("Starting {harness}…")),
         _ => return,
     };

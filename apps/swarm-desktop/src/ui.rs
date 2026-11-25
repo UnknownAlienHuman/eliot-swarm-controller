@@ -1058,6 +1058,7 @@ impl Component for DesktopApp {
                 opened_from_search: false,
                 drafts: Rc::default(),
                 pending_retry: HashMap::new(),
+                steers_sent: crate::chat::SentSteers::default(),
                 answers: HashMap::new(),
                 confirm_force: None,
                 control_failures: HashSet::new(),

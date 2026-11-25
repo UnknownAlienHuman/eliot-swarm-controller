@@ -438,6 +438,8 @@ pub(super) struct ChatState {
     /// Retry (or the next identical Send) instead of rederiving a fresh
     /// mutation id. Bounded, and abandoned on draft edits and Agent removal.
     pub(super) pending_retry: HashMap<String, PendingRetry>,
+    /// The steers this window submitted, kept until settled.
+    pub(super) steers_sent: crate::chat::SentSteers,
     pub(super) answers: HashMap<String, eliot_core::requests::Answers>,
     /// The Force stop awaiting confirmation, bound at its menu click, with
     /// the title shown in the question.
@@ -633,6 +635,9 @@ impl DesktopApp {
                             });
                         }
                         self.rebuild_items();
+                        // A refusal of this window's steer found on coming
+                        // back puts its text back now.
+                        self.report_refused_steers();
                         // After the history is in place: the panel's read
                         // looks at its unconfirmed turns (a restart showed
                         // no Resolve card when this ran on the empty one).
