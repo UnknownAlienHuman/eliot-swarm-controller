@@ -1100,13 +1100,8 @@ impl Store {
     ) -> Result<Vec<core::api::harness::QuotaObservation>> {
         self.ensure_committed_reads()?;
         const MAX_ROLLING_UPDATES: i64 = 64;
-        let limit = if read_bound.is_some() {
-            MAX_ROLLING_UPDATES + 1
-        } else {
-            1
-        };
-        let (login_changed_at, observed_after) = read_bound.unzip();
-        let mut query = self.connection.prepare_cached(
+        let Some((login_changed_at, observed_after)) = read_bound else {
+            let mut query = self.connection.prepare_cached(
                 "SELECT e.data FROM events e JOIN agents a ON a.id=e.agent
              WHERE e.kind='quota.observed' AND a.harness=?1 AND a.generation=e.generation
                AND json_extract(a.profile_snapshot,'$.native_route_identity')=?2
@@ -1116,48 +1111,87 @@ impl Store {
                AND json_extract(a.profile_snapshot,'$.literal_env') IS json_extract(?3,'$.literal_env')
                AND json_extract(a.profile_snapshot,'$.route_binding') IS json_extract(?3,'$.route_binding')
                AND json_extract(e.data,'$.observation.observedAtMs') <= ?4
-               AND (?6 IS NULL OR json_extract(e.data,'$.observation.observedAtMs')>?6)
+             ORDER BY json_extract(e.data,'$.observation.observedAtMs') DESC,e.seq DESC LIMIT 1",
+            ).map_err(sql_error)?;
+            let rows = query
+                .query_map(
+                    params![harness, route_identity, encode_json(snapshot)?, now,],
+                    |row| row.get::<_, String>(0),
+                )
+                .map_err(sql_error)?
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(sql_error)?;
+            return rows
+                .into_iter()
+                .rev()
+                .map(decode_quota_observation)
+                .collect();
+        };
+        // Page ascending from the read bound so every sparse update applies in
+        // order, however many follow the full read. The cursor is the last
+        // returned (observedAtMs, seq) pair; seq is globally unique, so pages
+        // neither overlap nor skip. Starting past every sequence at the bound
+        // timestamp keeps the read bound strict on the first page.
+        let mut observations = Vec::new();
+        let mut cursor_ms = observed_after;
+        let mut cursor_seq = i64::MAX;
+        loop {
+            let mut query = self.connection.prepare_cached(
+                "SELECT e.data, e.seq FROM events e JOIN agents a ON a.id=e.agent
+             WHERE e.kind='quota.observed' AND a.harness=?1 AND a.generation=e.generation
+               AND json_extract(a.profile_snapshot,'$.native_route_identity')=?2
+               AND json_extract(a.profile_snapshot,'$.account') IS json_extract(?3,'$.account')
+               AND json_extract(a.profile_snapshot,'$.pass_env') IS json_extract(?3,'$.pass_env')
+               AND json_extract(a.profile_snapshot,'$.api_key_env') IS json_extract(?3,'$.api_key_env')
+               AND json_extract(a.profile_snapshot,'$.literal_env') IS json_extract(?3,'$.literal_env')
+               AND json_extract(a.profile_snapshot,'$.route_binding') IS json_extract(?3,'$.route_binding')
+               AND json_extract(e.data,'$.observation.observedAtMs') <= ?4
+               AND (json_extract(e.data,'$.observation.observedAtMs')>?6
+                    OR (json_extract(e.data,'$.observation.observedAtMs')=?6 AND e.seq>?7))
                AND (?5 IS NULL OR EXISTS (
                  SELECT 1 FROM events ready INDEXED BY events_agent
                   WHERE ready.agent=e.agent AND ready.generation=e.generation
                     AND ready.kind='session.ready' AND ready.source='stream'
                     AND ready.seq<e.seq AND ready.ts>?5))
-             ORDER BY json_extract(e.data,'$.observation.observedAtMs') DESC,e.seq DESC LIMIT ?7",
+             ORDER BY json_extract(e.data,'$.observation.observedAtMs') ASC,e.seq ASC LIMIT ?8",
             ).map_err(sql_error)?;
-        let rows = query
-            .query_map(
-                params![
-                    harness,
-                    route_identity,
-                    encode_json(snapshot)?,
-                    now,
-                    login_changed_at,
-                    observed_after,
-                    limit
-                ],
-                |row| row.get::<_, String>(0),
-            )
-            .map_err(sql_error)?
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .map_err(sql_error)?;
-        if rows.len() > MAX_ROLLING_UPDATES as usize {
-            // The on-demand result is still usable. Never apply an incomplete
-            // range of sparse updates that may miss the first value in a pair.
-            return Ok(Vec::new());
-        }
-        rows.into_iter()
-            .rev()
-            .map(|data| {
-                let value: Value = decode_json(&data)?;
-                let observation: core::api::harness::QuotaObservation = serde_json::from_value(
-                    value.get("observation").cloned().unwrap_or(Value::Null),
+            let rows = query
+                .query_map(
+                    params![
+                        harness,
+                        route_identity,
+                        encode_json(snapshot)?,
+                        now,
+                        login_changed_at,
+                        cursor_ms,
+                        cursor_seq,
+                        MAX_ROLLING_UPDATES
+                    ],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
                 )
-                .map_err(|_| {
-                    Error::new("source_integrity", "retained quota observation invalid")
-                })?;
-                observation.validate()?;
-                Ok(observation)
-            })
-            .collect()
+                .map_err(sql_error)?
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(sql_error)?;
+            let page_full = rows.len() >= MAX_ROLLING_UPDATES as usize;
+            for (data, seq) in rows {
+                let observation = decode_quota_observation(data)?;
+                cursor_ms = observation.observed_at_ms;
+                cursor_seq = seq;
+                observations.push(observation);
+            }
+            if !page_full {
+                break;
+            }
+        }
+        Ok(observations)
     }
+}
+
+fn decode_quota_observation(data: String) -> Result<core::api::harness::QuotaObservation> {
+    let value: Value = decode_json(&data)?;
+    let observation: core::api::harness::QuotaObservation =
+        serde_json::from_value(value.get("observation").cloned().unwrap_or(Value::Null))
+            .map_err(|_| Error::new("source_integrity", "retained quota observation invalid"))?;
+    observation.validate()?;
+    Ok(observation)
 }

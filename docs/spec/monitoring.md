@@ -1115,10 +1115,10 @@ automatic model probes for these holds. Unresolved probes remain fenced.
 Passive release is limited to providers that declare `retained_quota`; the
 Store repeats that capability check and requires fresh provider evidence newer
 than the exact unchanged hold. Codex sparse account-window observations can
-decorate quota readbacks for routing and display. Store reads at most 65
-matching updates to detect overflow. With 64 or fewer, the daemon applies the
-complete range oldest first. A larger range leaves the full read intact so a
-burst cannot lose one window's latest update. A projection requires an
+decorate quota readbacks for routing and display. Store pages the matching
+updates oldest first in bounded pages from the read bound and the daemon
+applies the complete range, so every window contributes its latest value
+however many sparse updates follow the full read. A projection requires an
 object-valued full read. Codex has no retained quota capability and cannot use
 passive quota-readback release. Codex holds
 retain the existing reset-deadline and explicit Owner correction paths; when a

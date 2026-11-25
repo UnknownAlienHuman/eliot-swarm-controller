@@ -812,6 +812,8 @@ truncating it. The schema has no code field, so uncoded notifications use
 bounded display `other` bucket, and the full redacted message before the 1,024
 byte display truncation. Its deterministic content digest excludes the
 process-local count; persisted warning fields and credentials are unchanged.
+A repeated identical notice advances the retained row to the highest observed
+occurrence count instead of writing a second event.
 A matching retained warning on the same Agent's `stream` is acknowledged by
 its original sequence without a second event, including across generations
 when the same native thread is reattached. The lookback ends when the warning

@@ -1212,6 +1212,21 @@ impl Store {
                         "warning identity collides with different retained content",
                     ));
                 }
+                // The wire carries no per-notice sequence, so identical warnings
+                // merge into this row. Count occurrences in the retained row by
+                // keeping the highest observed count; a retried batch carries
+                // the same count and leaves the row unchanged.
+                if incoming.count > retained.count {
+                    let mut stored: Value = decode_json(&data)?;
+                    if let Some(object) = stored.as_object_mut() {
+                        object.insert("count".to_owned(), json!(incoming.count));
+                    }
+                    tx.execute(
+                        "UPDATE events SET data=?1 WHERE seq=?2",
+                        params![encode_json(&stored)?, seq],
+                    )
+                    .map_err(sql_error)?;
+                }
                 return Ok(BatchCommit {
                     ack: BatchAck {
                         first_seq: seq,
@@ -1223,6 +1238,7 @@ impl Store {
                         native_wake_cancel: None,
                     },
                     events: Vec::new(),
+                    replayed: true,
                 });
             }
         }

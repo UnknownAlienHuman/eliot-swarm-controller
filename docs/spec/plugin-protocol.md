@@ -1195,6 +1195,8 @@ the current thread. A matching retained row for the same Agent and
 `stream` source returns its original one-event sequence as the acknowledgement without
 republishing, including when the same thread is reattached in a later
 generation. Count changes and the `other` display bucket do not alter identity.
+The retained row advances to the highest observed occurrence count, so repeated
+identical notices are counted in place without a second event.
 Legacy warning IDs keep their existing receipt behavior. Deduplication lasts
 only while the matching warning row is retained under the configured event-retention
 window; pruning that row permits a later identical warning to be admitted again. Different Agents, native threads,
