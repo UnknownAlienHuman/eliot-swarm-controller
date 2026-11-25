@@ -1614,10 +1614,10 @@ An unchanged Stuck candidate becomes reportable after two consecutive sweeps.
 Swarm logs `daemon.liveness_stuck` once per episode and exposes the current
 subject in the Owner inbox. Each command has at most one current command item.
 An active Goal with a running turn on its bound Agent generation waits for that
-turn while the native source is open or an owned process is running. This
-applies when a cadence slot becomes due during a long tool call. A start with
-neither a dispatcher nor running custody still qualifies for Stuck after
-confirmation.
+turn while the native source is open or an owned process is running and the
+Goal has no unresolved round. This applies when a cadence slot becomes due
+during a long tool call. A start with neither a dispatcher nor running custody
+still qualifies for Stuck after confirmation.
 The `swarm status` liveness summary includes the number of confirmed commands
 without a dispatcher and the oldest command's ID and age, including snoozed
 items (#929, #883).

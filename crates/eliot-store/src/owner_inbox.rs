@@ -1827,7 +1827,7 @@ fn project_goals(
                 owner_item: status == GoalStatus::Blocked || deferral_paused,
                 round_active: round_active
                     || (!turn_active && reconciler_active && timer_due.is_none()),
-                turn_active,
+                turn_active: turn_active && reconciler_active,
                 timer_due: timer_due.filter(|_| reconciler_active),
             },
             now,
