@@ -40,10 +40,10 @@ pub(crate) fn read_counters(
                 sum(outcome.delivered), sum(outcome.moved), sum(outcome.cancelled),
                     sum(CASE WHEN outcome.delivered AND (
                         (c.principal = 'swarm_note:no_check_before_end' AND EXISTS (
-                            SELECT 1 FROM events AS checked INDEXED BY events_agent
+                            SELECT 1 FROM events AS checked INDEXED BY autonomy_activity_events_window
                             WHERE checked.agent = c.target AND checked.generation = c.generation
                             AND checked.ts > c.updated_at AND checked.ts <= ?2
-                            AND checked.kind IN ('goal.round', 'project.check.finished')
+                            AND (checked.kind = 'goal.round' OR checked.kind = 'project.check.finished')
                             AND json_type(checked.data, '$.exit_code') = 'integer'
                         )) OR (c.principal = 'swarm_note:outside_scope' AND EXISTS (
                             SELECT 1 FROM events AS restored INDEXED BY events_agent
@@ -56,19 +56,19 @@ pub(crate) fn read_counters(
                         )) OR (c.principal = 'swarm_note:repeated_command_failure' AND EXISTS (
                             SELECT 1 FROM events AS admitted INDEXED BY events_agent
                             JOIN events AS failed ON failed.seq = json_extract(admitted.data, '$.trigger_seq')
-                            JOIN events AS original INDEXED BY events_agent
+                            JOIN events AS original INDEXED BY events_tool_turn
                               ON original.agent = c.target AND original.generation = c.generation
                               AND original.source = failed.source AND original.kind = 'tool.started'
                               AND original.seq < failed.seq AND original.native_id IS NOT NULL
                               AND json_extract(original.data, '$.item_id') = json_extract(failed.data, '$.item_id')
                               AND json_extract(original.data, '$.turn_id') = json_extract(failed.data, '$.turn_id')
-                            JOIN events AS succeeded INDEXED BY events_agent
+                            JOIN events AS succeeded INDEXED BY events_tool_turn
                               ON succeeded.agent = c.target AND succeeded.generation = c.generation
                               AND succeeded.ts > c.updated_at AND succeeded.ts <= ?2 AND succeeded.kind = 'tool.completed'
                               AND succeeded.native_id IS NOT NULL
                               AND json_extract(succeeded.data, '$.status') = 'completed'
                               AND json_extract(succeeded.data, '$.exit_code') = 0
-                            JOIN events AS retried INDEXED BY events_agent
+                            JOIN events AS retried INDEXED BY events_tool_turn
                               ON retried.agent = c.target AND retried.generation = c.generation
                               AND retried.kind = 'tool.started' AND retried.native_id IS NOT NULL
                               AND retried.source = succeeded.source AND retried.seq < succeeded.seq

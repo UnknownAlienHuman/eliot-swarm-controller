@@ -106,7 +106,7 @@ use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, 
 use serde::de::DeserializeOwned;
 use serde_json::{Map, Value, json};
 use std::{
-    cell::Cell,
+    cell::{Cell, RefCell},
     collections::{BTreeMap, HashSet},
     path::Path,
     time::Duration,
@@ -497,6 +497,9 @@ struct StoredOwnerRulesDelivery {
 pub struct Store {
     connection: Connection,
     write_faulted: Cell<bool>,
+    /// One exact autonomy response for this pooled connection. SQLite's
+    /// connection-local data_version invalidates it; no TTL is involved.
+    autonomy_cache: RefCell<Option<autonomy::AutonomyCache>>,
     /// Persistent keyset cursor for retention command pruning: the last
     /// examined expired root `(created_at, id)`, or `None` at the oldest.
     /// Successive passes resume here instead of restarting at the oldest
@@ -571,6 +574,7 @@ impl Store {
         Ok(Self {
             connection,
             write_faulted: Cell::new(false),
+            autonomy_cache: RefCell::new(None),
             retention_commands_cursor: None,
             retention_processes_cursor: None,
             retention_attention_advisory_cursor: None,
@@ -655,6 +659,7 @@ impl Store {
         let mut store = Self {
             connection,
             write_faulted: Cell::new(false),
+            autonomy_cache: RefCell::new(None),
             retention_commands_cursor: None,
             retention_processes_cursor: None,
             retention_attention_advisory_cursor: None,
@@ -2366,12 +2371,20 @@ impl Store {
         generation: i64,
         turn_id: &str,
     ) -> Result<Option<Event>> {
-        let record = self.connection.query_row(
-            "SELECT seq, ts, kind, agent, generation, source, native_id, data, subject, cause FROM events
+        let record = self
+            .connection
+            .query_row(
+                "SELECT seq, ts, kind, agent, generation, source, native_id, data, subject, cause
+             FROM events INDEXED BY owner_inbox_turn_events
              WHERE agent = ?1 AND generation = ?2 AND kind IN ('turn.completed', 'turn.unknown')
-               AND json_extract(data, '$.turn_id') = ?3 ORDER BY seq DESC LIMIT 1",
-            params![parse_agent_id(agent)?, generation, turn_id], event_record_from_row,
-        ).optional().map_err(sql_error)?;
+               AND json_type(data, '$.turn_id') = 'text'
+               AND CAST(json_extract(data, '$.turn_id') AS TEXT) = ?3
+             ORDER BY seq DESC LIMIT 1",
+                params![parse_agent_id(agent)?, generation, turn_id],
+                event_record_from_row,
+            )
+            .optional()
+            .map_err(sql_error)?;
         record.map(event_from_record).transpose()
     }
 
@@ -2666,11 +2679,13 @@ impl Store {
             .connection
             .prepare(
                 "SELECT seq, ts, kind, agent, generation, source, native_id, data, subject, cause
-                 FROM events
-                 WHERE agent = ?1 AND generation = ?2
-                   AND (kind IN ('agent.lost', 'agent.failed')
-                        OR (kind = 'agent.stopped'
-                            AND json_extract(data, '$.reason') = 'owned_exit_before_restart'))
+                 FROM events INDEXED BY autonomy_fleet_agent_state_event
+                 WHERE agent = ?1 AND generation = ?2 AND kind IN ('agent.failed', 'agent.lost')
+                 UNION ALL
+                 SELECT seq, ts, kind, agent, generation, source, native_id, data, subject, cause
+                 FROM events INDEXED BY events_kind
+                 WHERE agent = ?1 AND generation = ?2 AND kind = 'agent.stopped'
+                   AND json_extract(data, '$.reason') = 'owned_exit_before_restart'
                  ORDER BY seq DESC LIMIT ?3",
             )
             .map_err(sql_error)?;
@@ -6146,6 +6161,12 @@ fn insert_event(tx: &Transaction<'_>, mut event: EventInsert<'_>) -> Result<Even
         cause_json,
     ]));
     let seq = tx.last_insert_rowid();
+    if event.kind == "session.usage"
+        && let (Some(agent), Some(generation)) = (event.agent, event.generation)
+    {
+        usage::context::record(tx, seq, agent, generation, event.ts, &event.data)?;
+    }
+
     Ok(Event {
         seq,
         ts: event.ts,

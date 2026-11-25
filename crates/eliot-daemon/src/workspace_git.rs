@@ -117,6 +117,7 @@ fn verify_source_common_dir(source: &Repository, preparation: &WorkspacePreparat
     Ok(())
 }
 
+#[derive(Clone)]
 struct WorktreeEntry {
     path: PathBuf,
     branch: Option<String>,
@@ -177,7 +178,7 @@ impl WorkspaceGit {
         let root = canonical_root(common_dir).ok()?;
         let output = self
             .git
-            .workspace_command_bound(
+            .project_git_metadata(
                 &root,
                 &[
                     "config",
@@ -186,10 +187,10 @@ impl WorkspaceGit {
                     "--get",
                     "remote.origin.url",
                 ],
-                GitBinding {
+                Some(GitBinding {
                     git_dir: &root,
                     common_dir: &root,
-                },
+                }),
                 deadline,
             )
             .await
@@ -1907,7 +1908,11 @@ impl WorkspaceGit {
         let bytes = self
             .read(root, &["worktree", "list", "--porcelain", "-z"], deadline)
             .await?;
-        let text = std::str::from_utf8(&bytes)
+        Self::parse_worktree_entries(&bytes)
+    }
+
+    fn parse_worktree_entries(bytes: &[u8]) -> Result<Vec<WorktreeEntry>> {
+        let text = std::str::from_utf8(bytes)
             .map_err(|_| problem("unavailable", "worktree registry is not UTF-8"))?;
         if !text.ends_with("\0\0") {
             return Err(problem(

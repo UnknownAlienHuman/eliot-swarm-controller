@@ -1145,15 +1145,43 @@ impl GitProbe {
     ) -> Result<PatchRead> {
         let root = canonical_root(workspace)?;
         let deadline = Instant::now() + PROBE_TIME;
-        let overrides = self.safe_overrides(&root, deadline).await?;
-        self.require_exact_root(&root, &overrides, deadline).await?;
+        let overrides = if include_fingerprint {
+            let overrides = self.safe_overrides(&root, deadline).await?;
+            self.require_exact_root(&root, &overrides, deadline).await?;
+            overrides
+        } else {
+            // rev-parse uses no filters or aliases. Probe the root and read
+            // the overrides concurrently, then require both before diff/status.
+            let (overrides, exact_root) = tokio::join!(
+                self.safe_overrides(&root, deadline),
+                self.require_exact_root(&root, &[], deadline),
+            );
+            let overrides = overrides?;
+            exact_root?;
+            overrides
+        };
         let fingerprint_status = status_args("--untracked-files=all");
         let args = if include_fingerprint {
             &fingerprint_status[..]
         } else {
             SCOPE_STATUS_ARGS
         };
-        let status = parse_status(&self.checked(&root, args, &overrides, &[], deadline).await?)?;
+        let base = base.filter(|oid| is_git_oid(oid)).map(ToOwned::to_owned);
+        let status_read = self.checked(&root, args, &overrides, &[], deadline);
+        // With an explicit base, neither read needs the other's output.
+        // Fingerprints used for rule admission retain status-before-diff.
+        let (status_bytes, prefetched_patch) = if let Some(from) = base.as_deref()
+            && !include_fingerprint
+        {
+            let (status, patch) = tokio::join!(
+                status_read,
+                self.read_tracked_patch(&root, from, &overrides, deadline),
+            );
+            (status?, Some(patch))
+        } else {
+            (status_read.await?, None)
+        };
+        let status = parse_status(&status_bytes)?;
         let fingerprint = if include_fingerprint {
             let (dirty_digest, _) = dirty_worktree_digest(&root, &status.dirty)
                 .map_err(|reason| unavailable(&format!("workspace fingerprint: {reason}")))?;
@@ -1170,17 +1198,41 @@ impl GitProbe {
             .filter(|entry| entry.status == "??")
             .map(|entry| entry.path.clone())
             .collect();
-        let base = base.filter(|oid| is_git_oid(oid)).map(ToOwned::to_owned);
         let from = base
             .clone()
             .or_else(|| status.head.clone())
             .ok_or_else(|| unavailable("the patch needs a base commit or a HEAD"))?;
+        let (diff, complete) = match prefetched_patch {
+            Some(patch) => patch?,
+            None => {
+                self.read_tracked_patch(&root, &from, &overrides, deadline)
+                    .await?
+            }
+        };
+        Ok(PatchRead {
+            root,
+            base,
+            head: status.head,
+            fingerprint,
+            diff,
+            untracked,
+            complete,
+        })
+    }
+
+    async fn read_tracked_patch(
+        &self,
+        root: &Path,
+        from: &str,
+        overrides: &[(String, String)],
+        deadline: Instant,
+    ) -> Result<(String, bool)> {
         // Non-ASCII paths stay readable instead of octal-quoted.
-        let mut overrides = overrides;
+        let mut overrides = overrides.to_vec();
         overrides.push(("core.quotepath".to_owned(), "false".to_owned()));
         let (diff, complete) = match self
             .run(
-                &root,
+                root,
                 &[
                     "diff",
                     "--no-ext-diff",
@@ -1188,7 +1240,7 @@ impl GitProbe {
                     "--no-color",
                     "--no-renames",
                     "-U0",
-                    &from,
+                    from,
                     "--",
                 ],
                 &overrides,
@@ -1211,8 +1263,8 @@ impl GitProbe {
             // Even the name list may exceed the bound: then no paths.
             if let Ok(names) = self
                 .checked(
-                    &root,
-                    &["diff", "--name-only", "--no-renames", "-z", &from, "--"],
+                    root,
+                    &["diff", "--name-only", "--no-renames", "-z", from, "--"],
                     &overrides,
                     &[],
                     deadline,
@@ -1224,15 +1276,7 @@ impl GitProbe {
                 }
             }
         }
-        Ok(PatchRead {
-            root,
-            base,
-            head: status.head,
-            fingerprint,
-            diff,
-            untracked,
-            complete,
-        })
+        Ok((diff, complete))
     }
 
     /// Paths whose content differs between two commits of a Goal's workspace.
@@ -1493,6 +1537,36 @@ impl GitProbe {
             ));
         }
         self.run_scoped(root, args, &overrides, &[], deadline, Some(binding))
+            .await
+    }
+
+    /// These built-in metadata reads do not run filters, aliases, or merge
+    /// drivers. Use the ordinary owned leaf and deadlines without inventorying
+    /// executable configuration for each repository and checkout.
+    pub(crate) async fn project_git_metadata(
+        &self,
+        root: &Path,
+        args: &[&str],
+        binding: Option<GitBinding<'_>>,
+        deadline: Instant,
+    ) -> Result<Captured> {
+        if !matches!(
+            args,
+            [
+                "config",
+                "--local",
+                "--no-includes",
+                "--get",
+                "remote.origin.url"
+            ] | ["worktree", "list", "--porcelain", "-z"]
+                | ["symbolic-ref", "--quiet", "--no-recurse", "HEAD"]
+        ) {
+            return Err(Error::new(
+                "invalid",
+                "unsupported project Git metadata read",
+            ));
+        }
+        self.run_scoped(root, args, &[], &[], deadline, binding)
             .await
     }
 

@@ -53,11 +53,11 @@ impl Router {
             .clone()
             .try_acquire_owned()
             .map_err(|_| Error::new("unavailable", "an autonomy report is already running"))?;
-        let path = self.inner.data_root.join("eliot.db");
+        let readers = self.inner.projection_readers.clone();
         let confirmed = self.confirmed_stuck();
         let report = tokio::task::spawn_blocking(move || {
             let _permit = permit;
-            eliot_store::Store::read_autonomy(&path, since, until, &confirmed)
+            readers.read(|store| store.autonomy_from_snapshot(since, until, &confirmed))
         })
         .await
         .map_err(|_| Error::new("internal", "autonomy reader failed"))??;

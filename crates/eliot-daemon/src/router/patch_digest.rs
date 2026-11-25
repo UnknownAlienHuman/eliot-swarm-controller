@@ -272,11 +272,7 @@ impl Router {
                 .map(|claims| claims.claims);
             let exclusively_bound = !current.state.is_terminal()
                 && current.workspace.as_deref().is_some_and(|workspace| {
-                    store
-                        .workspace_owner_counts()
-                        .ok()
-                        .and_then(|counts| counts.get(workspace).copied())
-                        == Some(1)
+                    store.workspace_singly_owned(workspace).unwrap_or(false)
                 });
             let attributed = if exclusively_bound {
                 None

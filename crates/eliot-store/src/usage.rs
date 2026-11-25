@@ -15,6 +15,7 @@
 //! retained-event watermark names the retention floor instead of implying
 //! full totals.
 
+pub(crate) mod context;
 mod role;
 
 pub(crate) use role::{RoleUsage, manager_at_sql};
@@ -555,6 +556,22 @@ impl Store {
         Ok(bindings)
     }
 
+    /// Revision of this Store writer's committed database view. The pair is
+    /// sampled on the same connection so local writes and external commits
+    /// both invalidate usage read memoization.
+    pub fn usage_revision(&self) -> Result<(i64, i64)> {
+        self.ensure_committed_reads()?;
+        let total_changes = self
+            .connection
+            .query_row("SELECT total_changes()", [], |row| row.get(0))
+            .map_err(sql_error)?;
+        let data_version = self
+            .connection
+            .query_row("PRAGMA data_version", [], |row| row.get(0))
+            .map_err(sql_error)?;
+        Ok((total_changes, data_version))
+    }
+
     /// Resolve one usage scope to its retained (agent, generation) pairs.
     /// Agent scope covers every retained generation unless the request names
     /// one, and the native descendants observed under those generations.
@@ -656,6 +673,7 @@ impl Store {
         agents_included: usize,
         truncated: bool,
     ) -> Result<UsageSummaryResponse> {
+        self.ensure_committed_reads()?;
         let pruned_through = retention::coverage_pruned_through(&self.connection)?;
         let history_complete = pruned_through == 0;
         let history_reason = if history_complete {
@@ -736,7 +754,7 @@ impl Store {
                 Ok(())
             })?;
         }
-        self.accumulate_usage_context(&wanted, &agent_ids, &mut role_usage)?;
+        self.accumulate_usage_context(pairs, &mut role_usage)?;
         let sessions = self.summarize_sessions(&wanted)?;
         let (swarm_mcp, swarm_mcp_truncated) = self.swarm_mcp_turn_usage(pairs)?;
         let by_role = role_usage.finish();
@@ -1245,47 +1263,38 @@ fn normalize_baseline_source(source: Option<&str>) -> String {
 impl Store {
     fn accumulate_usage_context(
         &self,
-        wanted: &std::collections::HashSet<(i64, i64)>,
-        agents: &BTreeSet<i64>,
+        pairs: &[(i64, i64)],
         role_usage: &mut RoleUsage,
     ) -> Result<()> {
-        if agents.is_empty() {
+        if pairs.is_empty() {
             return Ok(());
         }
-        let placeholders = agents.iter().map(|_| "?").collect::<Vec<_>>().join(",");
-        let manager = manager_at_sql("e.agent", "e.ts");
-        let sql = format!(
-            "SELECT e.agent, e.generation, e.data, {manager}
-             FROM events e
-             WHERE e.kind = 'session.usage' AND e.agent IN ({placeholders})
-             ORDER BY e.seq"
-        );
-        let mut statement = self.connection.prepare(&sql).map_err(sql_error)?;
-        let rows = statement
-            .query_map(params_from_iter(agents.iter()), |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, i64>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, bool>(3)?,
-                ))
-            })
-            .map_err(sql_error)?;
-        for row in rows {
-            let (agent, generation, data, manager) = row.map_err(sql_error)?;
-            if !wanted.contains(&(agent, generation)) {
-                continue;
+        let sql = "WITH wanted AS MATERIALIZED (
+                 SELECT DISTINCT json_extract(value, '$[0]') AS agent,
+                                 json_extract(value, '$[1]') AS generation FROM json_each(?1)
+             ), roles AS MATERIALIZED (
+                 SELECT w.agent, w.generation,
+                        (SELECT MIN(child.created_at)
+                         FROM agents AS child INDEXED BY autonomy_child_creation
+                         WHERE child.parent = w.agent) AS first_child
+                 FROM wanted AS w
+             )
+             SELECT o.tokens, o.error, COALESCE(r.first_child <= o.ts, 0)
+             FROM roles AS r CROSS JOIN usage_context_observations AS o
+               ON o.agent = r.agent AND o.generation = r.generation
+             ORDER BY o.seq";
+        let mut statement = self.connection.prepare_cached(sql).map_err(sql_error)?;
+        let mut rows = statement.query([encode_json(&pairs)?]).map_err(sql_error)?;
+        while let Some(row) = rows.next().map_err(sql_error)? {
+            if let Some(error) = row.get::<_, Option<String>>(1).map_err(sql_error)? {
+                return Err(serde_json::from_str(&error).map_err(|_| {
+                    Error::new("source_integrity", "invalid context projection error")
+                })?);
             }
-            let event: serde_json::Value = serde_json::from_str(&data)
-                .map_err(|_| Error::new("internal", "retained session usage event is malformed"))?;
-            let mut usage: SessionUsage =
-                serde_json::from_value(event.get("usage").cloned().ok_or_else(|| {
-                    Error::new("internal", "retained session usage event has no usage")
-                })?)
-                .map_err(|_| Error::new("internal", "retained session usage data is malformed"))?;
-            usage.validate()?;
-            usage.retain_valid_context();
-            role_usage.observe_context(manager, usage.context_used_tokens);
+            role_usage.observe_context(
+                row.get(2).map_err(sql_error)?,
+                row.get(0).map_err(sql_error)?,
+            );
         }
         Ok(())
     }

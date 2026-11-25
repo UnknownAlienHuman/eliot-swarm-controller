@@ -1,6 +1,6 @@
 use super::*;
 
-pub(super) const CURRENT_SCHEMA_VERSION: i64 = FLUENT_READ_REVISIONS_VERSION;
+pub(super) const CURRENT_SCHEMA_VERSION: i64 = DESKTOP_USAGE_LOOKUP_VERSION;
 const HARNESS_CHECK_SCHEMA_VERSION: i64 = 112;
 const WORK_TRUTH_VERSION: i64 = 113;
 const WORK_TRUTH_INTENT_VERSION: i64 = 114;
@@ -35,6 +35,7 @@ const CHILD_DIGEST_ASSIGNMENT_VERSION: i64 = 142;
 const OWNER_PROJECTION_LOOKUP_VERSION: i64 = 143;
 const AGENT_RESULT_READS_VERSION: i64 = 144;
 const FLUENT_READ_REVISIONS_VERSION: i64 = 145;
+const DESKTOP_USAGE_LOOKUP_VERSION: i64 = 146;
 
 fn has_restart_continuation_brief_column(connection: &Connection) -> Result<bool> {
     connection
@@ -318,6 +319,31 @@ impl Store {
                 include_str!("../migrations/fluent_read_revisions.sql"),
                 Some(FLUENT_READ_REVISIONS_VERSION),
             )?;
+        }
+        if current < DESKTOP_USAGE_LOOKUP_VERSION {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            tx.execute_batch(
+                "CREATE INDEX usage_daemon_tool_pairs ON events(
+                      agent, generation, json_extract(data, '$.turn_id'),
+                      json_extract(data, '$.call_id'), kind, json_extract(data, '$.status'), seq)
+                 WHERE source = 'daemon' AND kind IN ('tool.started', 'tool.completed')
+                   AND json_extract(data, '$.origin') = 'swarm_mcp'
+                   AND json_extract(data, '$.tool') = 'swarm'
+                   AND json_type(data, '$.turn_id') = 'text';",
+            )
+            .map_err(sql_error)?;
+            tx.execute_batch(autonomy::SHELL_COVERING_INDEX)
+                .map_err(sql_error)?;
+            usage::context::backfill(&tx)?;
+            tx.execute(
+                "INSERT INTO schema_migrations(version) VALUES (?1)",
+                [DESKTOP_USAGE_LOOKUP_VERSION],
+            )
+            .map_err(sql_error)?;
+            commit_transaction(tx, &self.write_faulted)?;
         }
         Ok(())
     }
