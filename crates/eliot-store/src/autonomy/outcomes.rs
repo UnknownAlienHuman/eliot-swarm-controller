@@ -118,7 +118,31 @@ pub(super) fn idle_queue(
     if rows.next().map_err(sql_error)?.is_some() {
         row.limit_coverage("the launch intent scan reached its 10,000-row cap");
     }
+    if commands_window_pruned(tx, since)? || writes_window_pruned(tx, since)? {
+        row.limit_coverage(
+            "command or write retention may have pruned rows in the requested window",
+        );
+    }
     Ok(row)
+}
+
+/// True when command retention may have removed rows the window would have
+/// covered. Pruned rows are indistinguishable from rows that never existed
+/// once the earliest retained command postdates the window start.
+fn commands_window_pruned(tx: &Connection, since: i64) -> Result<bool> {
+    let first: Option<i64> = tx
+        .query_row("SELECT MIN(created_at) FROM commands", [], |row| row.get(0))
+        .map_err(sql_error)?;
+    Ok(first.is_none_or(|ts| ts >= since))
+}
+
+/// True when write retention may have removed rows the window would have
+/// covered, by the same earliest-retained-row argument as commands.
+fn writes_window_pruned(tx: &Connection, since: i64) -> Result<bool> {
+    let first: Option<i64> = tx
+        .query_row("SELECT MIN(created_at) FROM writes", [], |row| row.get(0))
+        .map_err(sql_error)?;
+    Ok(first.is_none_or(|ts| ts >= since))
 }
 
 #[derive(Default)]
@@ -129,7 +153,14 @@ pub(super) struct WindowTokens {
 
 impl WindowTokens {
     pub(super) fn observe(&mut self, usage: &TurnUsage) -> Result<()> {
-        self.incomplete |= usage.total_tokens.is_none();
+        // The window sum folds `reported_total`, which subtotals whichever of
+        // uncached input, cache-read input and output are present. A partial
+        // subtotal must never read as a complete count, so any missing
+        // counter marks the window incomplete even when a vendor total survives.
+        self.incomplete |= usage.input_tokens.is_none()
+            || usage.cache_read_tokens.is_none()
+            || usage.output_tokens.is_none()
+            || usage.total_tokens.is_none();
         if let Some(total) = usage.reported_total() {
             let total = u64::try_from(total)
                 .map_err(|_| Error::new("source_integrity", "negative autonomy token total"))?;
@@ -190,6 +221,9 @@ pub(super) fn accepted_change_cost(
     }
     if capped {
         row.limit_coverage("the integration scan reached its 10,000-row cap");
+    }
+    if commands_window_pruned(tx, since)? {
+        row.limit_coverage("command retention may have pruned rows in the requested window");
     }
     Ok(row)
 }
