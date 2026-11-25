@@ -38,6 +38,7 @@ use eliot_plugin::{
         is_blank_native_text, native_terminal_inactivity, next_input_outcomes,
         redact_request_details_for_commit, with_claimed_context,
     },
+    turn_readback::{HistoryMessage, HistoryPage, TurnHistory, read_turn_history},
 };
 
 use crate::context_hooks::{self, ContextHookSignal};
@@ -65,7 +66,6 @@ use crate::native::{
 };
 
 const CONTROL_QUEUE: usize = 16;
-const MAX_MESSAGE_PAGES: usize = 4;
 const MAX_PENDING_REQUESTS: usize = 128;
 const MAX_RESOLVED_REQUESTS: usize = 128;
 const MAX_STEER_WATCHES: usize = 128;
@@ -3808,89 +3808,53 @@ pub(crate) async fn read_turn_messages(
     inbox_id: &str,
     deadline: Instant,
 ) -> Result<TurnReadback> {
-    let mut cursor: Option<String> = None;
-    let mut seen_cursors = HashSet::new();
-    let mut user_position: Option<usize> = None;
-    let mut idle: Option<(String, String, Option<StructuredError>, usize)> = None;
-    let mut assistant_messages: Vec<(usize, Vec<String>)> = Vec::new();
-    let mut usages: HashMap<String, (usize, Option<AssistantTokens>)> = HashMap::new();
-    let mut position: usize = 0;
-    for _ in 0..MAX_MESSAGE_PAGES {
+    let history = read_turn_history("OpenCode", inbox_id, |cursor: Option<String>| async move {
         let page = http
             .list_messages(session_id, cursor.as_deref(), deadline)
             .await?;
-        if page.data.is_empty() {
-            break;
-        }
-        for message in &page.data {
-            match message {
-                Message::User(user) if user.id == inbox_id => {
-                    user_position = Some(position);
-                    break;
-                }
-                Message::Assistant(assistant) => {
-                    let mut message_text = Vec::new();
-                    for part in &assistant.content {
-                        match part {
-                            AssistantContent::Text(text) => {
-                                if let Some(body) = text.text.as_deref() {
-                                    message_text.push(body.to_owned());
-                                }
-                            }
-                            AssistantContent::Tool => message_text.clear(),
-                            AssistantContent::Other => {}
-                        }
-                    }
-                    assistant_messages.push((position, message_text));
-                    usages
-                        .entry(assistant.id.clone())
-                        .or_insert_with(|| (position, assistant.tokens.clone()));
-                }
-                Message::Idle(idle_message) if idle.is_none() => {
-                    // Newest-first: the first idle seen before our
-                    // user message is the newest idle after it.
-                    idle = Some((
-                        idle_message.id.clone(),
-                        idle_message.outcome.clone(),
-                        idle_message.error.clone(),
-                        position,
-                    ));
-                }
-                _ => {}
-            }
-            position += 1;
-        }
-        if user_position.is_some() {
-            break;
-        }
-        match page.cursor.next {
-            Some(next) if !next.is_empty() && seen_cursors.insert(next.clone()) => {
-                cursor = Some(next)
-            }
-            Some(_) => {
-                return Err(Error::new(
-                    "native_readback",
-                    "OpenCode message cursor did not advance",
-                ));
-            }
-            None => break,
-        }
-    }
-    let Some(user_position) = user_position else {
-        return Err(Error::new(
-            "unknown",
-            "OpenCode terminal readback found no exact user message",
-        ));
-    };
-    let Some((idle_id, outcome, idle_error, idle_position)) = idle else {
+        let messages = page
+            .data
+            .into_iter()
+            .map(|message| match message {
+                Message::User(user) => HistoryMessage::Input(user.id),
+                Message::Assistant(assistant) => HistoryMessage::Assistant(assistant),
+                Message::Idle(idle) => HistoryMessage::Terminal(idle),
+                _ => HistoryMessage::Other,
+            })
+            .collect();
+        Ok(HistoryPage {
+            messages,
+            next: page.cursor.next,
+        })
+    })
+    .await?;
+    let TurnHistory::Terminal(history) = history else {
         return Ok(TurnReadback::Running);
     };
+    let idle_position = history.terminal_position;
+    let user_position = history.input_position;
+    let mut assistant_messages = Vec::new();
+    let mut usages = HashMap::new();
+    for (position, assistant) in history.assistants {
+        let mut message_text = Vec::new();
+        for part in assistant.content {
+            match part {
+                AssistantContent::Text(text) => message_text.extend(text.text),
+                AssistantContent::Tool => message_text.clear(),
+                AssistantContent::Other => {}
+            }
+        }
+        assistant_messages.push((position, message_text));
+        usages
+            .entry(assistant.id)
+            .or_insert((position, assistant.tokens));
+    }
     // The newest assistant message strictly between our input and selected
     // idle supplies final_text; earlier messages remain separate events.
     let final_text = project_terminal_text(assistant_messages, idle_position, user_position);
     Ok(TurnReadback::Terminal(Box::new(TerminalReadback {
-        idle_id,
-        outcome: match outcome.as_str() {
+        idle_id: history.terminal.id,
+        outcome: match history.terminal.outcome.as_str() {
             "succeeded" => "completed".to_owned(),
             "failed" => "failed".to_owned(),
             "interrupted" => "interrupted".to_owned(),
@@ -3901,7 +3865,7 @@ pub(crate) async fn read_turn_messages(
                 ));
             }
         },
-        idle_error,
+        idle_error: history.terminal.error,
         final_text,
         usage: main_loop_usage(&usages, idle_position, user_position),
         context_used_tokens: latest_call_context_tokens(&usages, idle_position, user_position),

@@ -30,7 +30,7 @@ use eliot_core::local_provider::LocalProvider;
 use eliot_core::{Error, FailureOrigin, Result, SecretPolicy};
 use eliot_plugin::{
     StderrCapture,
-    retry::{Retry, RetryFact, RetryOperation},
+    retry::{NATIVE_READINESS_BUDGET, RetryOperation, poll_idempotent},
     session::paths_equal,
     skill, spawn_stderr,
 };
@@ -663,7 +663,7 @@ impl OwnedServer {
         // Readiness shares the start envelope: a loaded cold start gets the
         // full 60 s bound, but the whole launch still answers inside the
         // daemon agent.start budget.
-        let ready_deadline = (Instant::now() + READINESS_TIMEOUT).min(envelope);
+        let ready_deadline = (Instant::now() + NATIVE_READINESS_BUDGET).min(envelope);
         if let Err(error) = server.await_ready(ready_deadline).await {
             // Bounded best-effort cleanup: the generation Job reaps anything
             // left once the daemon retires the plugin on the failed value,
@@ -683,20 +683,26 @@ impl OwnedServer {
     /// per-Agent config file. An early child exit fails fast with the
     /// retained stderr tail attached.
     async fn await_ready(&mut self, deadline: Instant) -> Result<()> {
-        let mut retry = Retry::new(RetryOperation::ReadinessPoll);
-        loop {
-            if let Some(status) = self.child.try_wait().map_err(|error| {
+        use std::ops::ControlFlow;
+
+        poll_idempotent(RetryOperation::ReadinessPoll, deadline, async || {
+            let status = self.child.try_wait().map_err(|error| {
                 Error::new(
                     "native_spawn",
                     format!("OpenCode serve exit readback failed: {error}"),
                 )
-            })? {
+            });
+            let status = match status {
+                Ok(status) => status,
+                Err(error) => return ControlFlow::Break(Err(error)),
+            };
+            if let Some(status) = status {
                 let tail = self
                     .stderr
                     .as_ref()
                     .map(|stderr| stderr.snapshot().text)
                     .unwrap_or_default();
-                return Err(Error::new(
+                return ControlFlow::Break(Err(Error::new(
                     "native_spawn",
                     format!(
                         "OpenCode serve exited during startup ({status}){}",
@@ -712,20 +718,22 @@ impl OwnedServer {
                 .with_origin(
                     FailureOrigin::Environment,
                     "native serve process exited during startup",
-                ));
+                )));
             }
             match self.http.get_config(deadline).await {
-                Ok(documents) if serves_our_config(&self.config_dir, &documents) => return Ok(()),
-                Ok(_) => {}
-                Err(_) => {}
+                Ok(documents) if serves_our_config(&self.config_dir, &documents) => {
+                    ControlFlow::Break(Ok(()))
+                }
+                _ => ControlFlow::Continue(()),
             }
-            if !retry.wait(RetryFact::Idempotent, Some(deadline)).await {
-                return Err(Error::new(
-                    "native_spawn",
-                    "OpenCode serve did not become ready before its deadline",
-                ));
-            }
-        }
+        })
+        .await
+        .unwrap_or_else(|| {
+            Err(Error::new(
+                "native_spawn",
+                "OpenCode serve did not become ready before its deadline",
+            ))
+        })
     }
 
     pub fn pid(&self) -> Option<u32> {
@@ -856,7 +864,7 @@ impl OwnedServer {
             config_dir,
             data_dir,
         };
-        let ready_deadline = (Instant::now() + READINESS_TIMEOUT).min(envelope);
+        let ready_deadline = (Instant::now() + NATIVE_READINESS_BUDGET).min(envelope);
         if let Err(error) = server.await_ready(ready_deadline).await {
             let _ = server
                 .terminate(true, Instant::now() + Duration::from_secs(5))
@@ -957,14 +965,6 @@ impl OwnedServer {
         }
     }
 }
-
-/// Bound for one `serve` readiness wait: poll the real signal (`GET
-/// /api/config` proving the live server is ours) until this deadline. Under
-/// CPU contention a cold `serve` needs well over the old 30 s, so the bound
-/// is 60 s; the caller start envelope still caps the whole launch under the
-/// daemon `agent.start` budget, and a slow start settles as a definite
-/// failed start (no native session exists yet), never `unknown`.
-pub(crate) const READINESS_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// The per-Agent session store: `opencode-{agent_id}/data` next to the
 /// host-owned `store_root` (the old `instance_dir` parent, `{data_root}/plugins`).

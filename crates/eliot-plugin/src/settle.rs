@@ -7,7 +7,19 @@
 //! own cancel and readback into the removal proof; the settlement policy and
 //! its diagnostic wording live here.
 
-use eliot_core::Error;
+use eliot_core::{Error, ProviderRestrictionKind, TurnOutcome};
+
+/// A turn can end normally after a definitive billing/quota refusal. The
+/// terminal reason still describes the native lifecycle; the task failed.
+pub fn terminal_outcome(
+    reported: TurnOutcome,
+    restriction: Option<ProviderRestrictionKind>,
+) -> TurnOutcome {
+    match (reported, restriction) {
+        (TurnOutcome::Success, Some(ProviderRestrictionKind::Quota)) => TurnOutcome::Failure,
+        _ => reported,
+    }
+}
 
 /// One settled unknown outcome for an input whose consumption is unproven.
 pub struct UnprovenInputSettlement {

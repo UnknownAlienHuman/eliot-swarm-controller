@@ -876,6 +876,16 @@ impl TurnOutcome {
         }
     }
 
+    /// The universal readback status of a known terminal outcome.
+    pub fn terminal_status(self) -> Option<&'static str> {
+        match self {
+            Self::Success => Some("completed"),
+            Self::Failure => Some("failed"),
+            Self::Interrupted => Some("interrupted"),
+            Self::Unknown => None,
+        }
+    }
+
     pub fn parse(value: &str) -> Option<Self> {
         match value {
             "success" => Some(Self::Success),

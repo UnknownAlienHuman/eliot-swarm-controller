@@ -7,7 +7,7 @@ use self::hooks::{
 
 use eliot_core::{
     ContextEditPath, ContextItem, ContextOutcome, Error, InjectPoint, NativeEvent, Result,
-    SecretPolicy, TurnUsage,
+    SecretPolicy, TurnOutcome as TerminalOutcome, TurnUsage,
     limits::{MAX_COMMAND_ID_BYTES, MAX_TOOL_COMMAND_BYTES, NATIVE_TERMINAL_DEADLINE_REASON},
     requests::{ApprovalChoice, ApprovalDecision, ApprovalRequest},
 };
@@ -195,14 +195,6 @@ struct PendingNativeRequest {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum NativeTerminalReason {
-    Success,
-    Interrupted,
-    Failure,
-    Other,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum NativeControlRequestSubtype {
     CanUseTool,
     HookCallback,
@@ -222,13 +214,13 @@ impl NativeControlRequestSubtype {
 /// Classify one Claude terminal reason without assigning an outcome to a new
 /// native value. The raw reason remains available for the neutral diagnostic
 /// and `native_status` readback.
-fn native_terminal_reason(reason: &str) -> NativeTerminalReason {
+fn native_terminal_reason(reason: &str) -> TerminalOutcome {
     match reason.trim() {
-        "success" | "completed" => NativeTerminalReason::Success,
+        "success" | "completed" => TerminalOutcome::Success,
         "cancelled" | "interrupted" | "aborted_streaming" | "aborted_tools" => {
-            NativeTerminalReason::Interrupted
+            TerminalOutcome::Interrupted
         }
-        "error" | "failed" | "failure" => NativeTerminalReason::Failure,
+        "error" | "failed" | "failure" => TerminalOutcome::Failure,
         reason => {
             let lower = reason.to_lowercase();
             if lower.starts_with("api_error")
@@ -236,56 +228,12 @@ fn native_terminal_reason(reason: &str) -> NativeTerminalReason {
                 || lower.starts_with("failed")
                 || lower.starts_with("failure")
             {
-                NativeTerminalReason::Failure
+                TerminalOutcome::Failure
             } else {
-                NativeTerminalReason::Other
+                TerminalOutcome::Unknown
             }
         }
     }
-}
-
-/// Canonical outcome for one Claude terminal reason, decided here at the
-/// plugin boundary; unrecognized reasons remain explicitly unknown.
-fn claude_outcome(reason: &str) -> &'static str {
-    match native_terminal_reason(reason) {
-        NativeTerminalReason::Success => "success",
-        NativeTerminalReason::Interrupted => "interrupted",
-        NativeTerminalReason::Failure => "failure",
-        NativeTerminalReason::Other => "unknown",
-    }
-}
-
-/// The universal terminal status of a canonical outcome; `unknown` has none.
-fn universal_status(outcome: &str) -> Option<String> {
-    match outcome {
-        "success" => Some("completed"),
-        "interrupted" => Some("interrupted"),
-        "failure" => Some("failed"),
-        _ => None,
-    }
-    .map(str::to_owned)
-}
-
-/// Classify the original terminal reason first, then redact recognized values
-/// for persistence: a configured secret must not change its outcome. An
-/// unrecognized value is persisted only as `other`; its bounded diagnostic is
-/// emitted separately.
-fn terminal_outcome_and_status(
-    reason: &str,
-    secrets: &SecretPolicy,
-    failure: Option<&Error>,
-) -> (&'static str, String) {
-    let terminal_reason = native_terminal_reason(reason);
-    let mut outcome = claude_outcome(reason);
-    if outcome == "success" && failure.is_some_and(|error| error.code == "quota_exhausted") {
-        outcome = "failure";
-    }
-    let status = if terminal_reason == NativeTerminalReason::Other {
-        "other".to_owned()
-    } else {
-        secrets.redact_text(reason)
-    };
-    (outcome, status)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -3417,27 +3365,34 @@ impl EventProcessor {
         {
             return Ok(());
         }
-        if native_terminal_reason(&parsed.terminal_reason) == NativeTerminalReason::Other {
+        let reported = native_terminal_reason(&parsed.terminal_reason);
+        if reported == TerminalOutcome::Unknown {
             self.record_unclassified("claude.result.terminal_reason", &parsed.terminal_reason)
                 .await?;
         }
         let secrets = SecretPolicy::new(self.secrets.iter().cloned());
-        let (outcome, terminal_reason) = terminal_outcome_and_status(
-            &parsed.terminal_reason,
-            &secrets,
-            self.native_failure.as_ref(),
+        let terminal_reason = if reported == TerminalOutcome::Unknown {
+            "other".to_owned()
+        } else {
+            secrets.redact_text(&parsed.terminal_reason)
+        };
+        let outcome = eliot_plugin::settle::terminal_outcome(
+            reported,
+            self.native_provider_restriction
+                .as_ref()
+                .map(|restriction| restriction.kind),
         );
         let mut data = json!({
             "command_id": command_id.clone(),
             "turn_id": turn_id.clone(),
-            "status": if outcome == "failure" { "failed" } else { &terminal_reason },
+            "status": if outcome == TerminalOutcome::Failure { "failed" } else { &terminal_reason },
             "outcome": outcome,
             "native_status": terminal_reason.clone(),
         });
         self.scope_turn_command(&mut data);
         let mut provider_restriction = self.native_provider_restriction.take();
         let rate_limit_event = self.native_rate_limit_event.take();
-        if outcome == "failure" {
+        if outcome == TerminalOutcome::Failure {
             let error = self.native_failure.take();
             if let Some(rate_limit_event) = rate_limit_event.filter(|event| {
                 self.status.session_id.as_deref() == Some(event.session_id.as_str())
@@ -3569,7 +3524,7 @@ impl EventProcessor {
         self.status.last_turn = Some(TurnFacts {
             command_id,
             turn_id,
-            status: universal_status(outcome),
+            status: outcome.terminal_status().map(str::to_owned),
             native_status: Some(terminal_reason),
             final_text: data
                 .get("final_text")

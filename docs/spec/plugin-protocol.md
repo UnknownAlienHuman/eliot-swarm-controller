@@ -6,6 +6,18 @@ decisions and diagnostic redaction. The daemon owns durable command settlement a
 SQLite writes. The host and plugin share wire types and use vendor types only inside
 the adapter.
 
+For exact-turn history readback, the adapter decodes native pages into input,
+assistant and terminal facts. Shared Rust owns the page limit and cursor
+progress. In newest-first history, a terminal binds only an input in the same
+segment. Each intervening input clears the candidate terminal. An exact input
+without a terminal in its segment reports running. Missing input or readback
+failure leaves the result unknown. The readback retains newer assistant IDs for
+counter deduplication. Text and usage come from the exact terminal-to-input
+interval. Shared settlement also combines the
+translated terminal status with a definitive billing or quota refusal. A
+native success with that refusal is a failed task, and the original native
+status remains available.
+
 ## First harness subset
 
 L1/L2 implement `initialize`, `agent.start`, `agent.command`, `agent.stop`,
@@ -114,6 +126,9 @@ immediately. A failed hook read waits 250 ms before the next read. A polled nati
 readback that becomes observable asynchronously (installed MCP inventory) settles on
 the shared readiness-settle backoff: 50 ms doubling to 1 s, with the final
 observation taken at the settle cap.
+Shared Rust runs readiness and session-binding polls. Adapters supply the
+native observation, including whether the result confirms readiness, refuses
+the request or remains pending.
 
 Read-only native CLI helpers bound stdout and process exit under the caller's deadline.
 Claude auth status can consume its JSON result on either exit status. The same shared

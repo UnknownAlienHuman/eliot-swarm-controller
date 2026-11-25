@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::{ops::ControlFlow, time::Duration};
 
 use tokio::time::Instant;
 
@@ -37,6 +37,54 @@ pub enum RetryOperation {
 
 const READINESS_SETTLE_FIRST: Duration = Duration::from_millis(50);
 const READINESS_SETTLE_MAX: Duration = Duration::from_secs(1);
+const READINESS_SETTLE_BUDGET: Duration = Duration::from_secs(20);
+pub const NATIVE_READINESS_BUDGET: Duration = Duration::from_secs(60);
+
+/// Poll a native read or an explicitly idempotent bind. A break carries
+/// the translated observation (including a definite refusal, if any).
+pub async fn poll_idempotent<T>(
+    operation: RetryOperation,
+    deadline: Instant,
+    mut observe: impl AsyncFnMut() -> ControlFlow<T>,
+) -> Option<T> {
+    let mut retry = Retry::new(operation);
+    loop {
+        if let ControlFlow::Break(value) = observe().await {
+            return Some(value);
+        }
+        if !retry.wait(RetryFact::Idempotent, Some(deadline)).await {
+            return None;
+        }
+    }
+}
+
+pub enum Readiness<T> {
+    Pending(T),
+    Settled(T),
+    Unavailable,
+}
+
+/// Preserve the last successful pending observation if no terminal
+/// observation is available, including on the final read at the cap.
+pub async fn settle_readiness<T>(
+    deadline: Instant,
+    mut observe: impl AsyncFnMut(Instant) -> Readiness<T>,
+) -> Option<T> {
+    let cap = (Instant::now() + READINESS_SETTLE_BUDGET).min(deadline);
+    let mut retry = Retry::new(RetryOperation::ReadinessSettle);
+    let mut last = None;
+    loop {
+        match observe(cap).await {
+            Readiness::Settled(value) => return Some(value),
+            Readiness::Pending(value) => last = Some(value),
+            Readiness::Unavailable => {}
+        }
+        if Instant::now() >= cap {
+            return last;
+        }
+        retry.wait_settle(cap).await;
+    }
+}
 
 fn readiness_settle_delay(retries: u32) -> Duration {
     READINESS_SETTLE_FIRST
@@ -130,7 +178,7 @@ impl Retry {
     /// readback never runs past its budget. The caller re-reads after every
     /// wait, including the wait that lands exactly on the deadline, because
     /// the observation at the settle cap decides the result.
-    pub async fn wait_settle(&mut self, deadline: Instant) {
+    async fn wait_settle(&mut self, deadline: Instant) {
         debug_assert!(matches!(self.operation, RetryOperation::ReadinessSettle));
         let delay = readiness_settle_delay(self.retries);
         wait_until(Some((Instant::now() + delay).min(deadline))).await;
