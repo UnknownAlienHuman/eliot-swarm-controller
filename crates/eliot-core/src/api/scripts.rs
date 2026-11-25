@@ -448,41 +448,19 @@ impl ScriptInputContext {
         Ok(input)
     }
 
-    pub fn rule(&self) -> &ScriptRuleContext {
-        match self {
-            Self::Event { rule, .. } | Self::Timer { rule, .. } => rule,
-        }
-    }
-
-    pub fn event(&self) -> Option<&Event> {
-        match self {
-            Self::Event { event, .. } => Some(event.as_ref()),
-            Self::Timer { .. } => None,
-        }
-    }
-
-    pub fn subject(&self) -> Option<&EventSubject> {
-        match self {
-            Self::Event { subject, .. } => subject.as_ref(),
-            Self::Timer { .. } => None,
-        }
-    }
-
-    pub fn timer(&self) -> Option<&ScriptTimerContext> {
-        match self {
-            Self::Event { .. } => None,
-            Self::Timer { timer, .. } => Some(timer),
-        }
-    }
-
     pub fn validate(&self) -> Result<()> {
-        self.rule().validate()?;
-        if let Some(timer) = self.timer() {
+        let (rule, timer, command) = match self {
+            Self::Event { rule, command, .. } => (rule, None, command),
+            Self::Timer {
+                timer,
+                rule,
+                command,
+            } => (rule, Some(timer), command),
+        };
+        rule.validate()?;
+        if let Some(timer) = timer {
             timer.validate()?;
         }
-        let command = match self {
-            Self::Event { command, .. } | Self::Timer { command, .. } => command,
-        };
         CommandGetRequest::new(command.id.clone()).validate()?;
         if command.verb != "run" {
             return Err(invalid("script stdin command verb must be run"));

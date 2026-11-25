@@ -4,7 +4,10 @@
 //! never join it. A child being idle is not success; each entry reports the
 //! terminal outcome of its exact captured command or turn.
 
-use super::ChildRunFacts;
+use super::{
+    ChildRunFacts,
+    reads::{generation, validate_generation, validate_identifier},
+};
 use crate::{Error, Result, TurnResolutionSource};
 use serde::{Deserialize, Serialize};
 
@@ -443,23 +446,7 @@ pub fn truncate_bytes(text: &str, bound: usize) -> (String, bool) {
 }
 
 fn validate_id(value: &str) -> Result<()> {
-    if value.trim().is_empty() {
-        return Err(Error::new(
-            "invalid",
-            "wait identifiers must be non-empty strings",
-        ));
-    }
-    Ok(())
-}
-
-fn validate_generation(value: i64) -> Result<()> {
-    if value < 0 {
-        return Err(Error::new(
-            "invalid",
-            "generation must be a nonnegative integer",
-        ));
-    }
-    Ok(())
+    validate_identifier(value, "wait identifiers must be non-empty strings")
 }
 
 fn required_id<'de, D: serde::Deserializer<'de>>(
@@ -468,14 +455,6 @@ fn required_id<'de, D: serde::Deserializer<'de>>(
     let id = String::deserialize(deserializer)?;
     validate_id(&id).map_err(serde::de::Error::custom)?;
     Ok(id)
-}
-
-fn generation<'de, D: serde::Deserializer<'de>>(
-    deserializer: D,
-) -> std::result::Result<i64, D::Error> {
-    let value = i64::deserialize(deserializer)?;
-    validate_generation(value).map_err(serde::de::Error::custom)?;
-    Ok(value)
 }
 
 fn wait_ms<'de, D: serde::Deserializer<'de>>(

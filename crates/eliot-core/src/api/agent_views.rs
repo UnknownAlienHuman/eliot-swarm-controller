@@ -2956,7 +2956,7 @@ fn object<'de, D: serde::Deserializer<'de>, T: DeserializeOwned>(
     serde_json::from_value(Value::Object(value)).map_err(serde::de::Error::custom)
 }
 
-fn objects<'de, D: serde::Deserializer<'de>, T: DeserializeOwned>(
+pub(super) fn objects<'de, D: serde::Deserializer<'de>, T: DeserializeOwned>(
     deserializer: D,
 ) -> std::result::Result<Vec<T>, D::Error> {
     let values = Vec::<Map<String, Value>>::deserialize(deserializer)?;
