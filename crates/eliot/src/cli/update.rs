@@ -43,6 +43,9 @@ fn print_update_value(value: &Value, json_output: bool) {
             ("previous_pid", "Previous daemon PID"),
             ("pid", "Daemon PID"),
             ("candidate_pid", "Published candidate PID"),
+            ("candidate_state", "Candidate process"),
+            ("candidate_admission", "Candidate admission"),
+            ("health_decision_error", "Health decision write error"),
             ("admission", "Admission"),
             ("deadline_policy", "Drain deadline policy"),
             ("version", "Release"),
@@ -403,12 +406,12 @@ async fn run_update(
         None if startup_health.is_ready() => "ready",
         None => "partial",
     };
-    let health_record = json!({
+    let mut health_record = json!({
         "restart_id": prepare.id, "state": decision, "candidate_pid": replacement.pid,
         "startup_health": startup_health, "backup": backup.retained(),
     });
-    record_update_health_decision(&startup_path, &prepare.id, &health_record)
-        .map_err(Failure::for_read)?;
+    let decision_failed = decision != "rollback_requested"
+        && persist_health_decision(&startup_path, &prepare.id, &mut health_record);
     if decision == "rollback_held" {
         print_update_value(&health_record, json_output);
         return Ok(4);
@@ -450,10 +453,10 @@ async fn run_update(
     let (desktop, desktop_failed) = start_companion(&data_dir, desktop);
     #[cfg(not(windows))]
     let (desktop, desktop_failed) = (None::<Value>, false);
-    print_update_value(
-        &json!({
-            "state": if desktop_failed || backup_cleanup.is_some() || resume_failed || health_uncertain { "partial" } else { "ready" },
+    let reply = json!({
+            "state": if desktop_failed || backup_cleanup.is_some() || resume_failed || health_uncertain || decision_failed { "partial" } else { "ready" },
             "startup_health": startup_health, "restart_id": prepare.id,
+            "health_decision_error": health_record["health_decision_error"],
             "previous_pid": old.pid, "pid": replacement.pid,
             "deadline_policy": mode, "interrupted_agents": interruptions,
             "commit_reply_uncertain": commit_reply_uncertain,
@@ -462,11 +465,14 @@ async fn run_update(
             "backup": backup.retained(), "backup_cleanup_error": backup_cleanup.as_ref().map(ToString::to_string),
             "agents_before": before, "agents_after": observe_agents(&data_dir, &before).await,
             "continuation": "boot recovery applies the configured on_restart policy",
-        }),
-        json_output,
-    );
+    });
+    print_update_value(&reply, json_output);
     Ok(u8::from(
-        desktop_failed || backup_cleanup.is_some() || resume_failed || health_uncertain,
+        desktop_failed
+            || backup_cleanup.is_some()
+            || resume_failed
+            || health_uncertain
+            || decision_failed,
     ))
 }
 
@@ -1125,6 +1131,48 @@ async fn resume_stopped(
     Ok(())
 }
 
+/// Failure to retain operator evidence cannot hide or stop the decision.
+fn persist_health_decision(path: &Path, id: &str, report: &mut Value) -> bool {
+    match record_update_health_decision(path, id, report) {
+        Ok(()) => false,
+        Err(error) => {
+            let error = match report["health_decision_error"].as_str() {
+                Some(previous) => format!("{previous}. Final decision write failed: {error}"),
+                None => error.to_string(),
+            };
+            report["health_decision_error"] = json!(error);
+            true
+        }
+    }
+}
+
+async fn observe_rollback_candidate(
+    path: &Path,
+    candidate: &DaemonInfo,
+) -> (&'static str, Option<String>) {
+    match daemon_alive(candidate) {
+        Ok(false) => ("exited", None),
+        Ok(true) => {
+            let admission = if check_same_daemon(path, candidate).is_ok() {
+                match timeout(Duration::from_secs(2), status(path)).await {
+                    Ok(Ok(observed)) if check_same_daemon(path, candidate).is_ok() => {
+                        Some(observed.admission)
+                    }
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            match daemon_alive(candidate) {
+                Ok(true) => ("alive", admission),
+                Ok(false) => ("exited", None),
+                Err(_) => ("unconfirmed", None),
+            }
+        }
+        Err(_) => ("unconfirmed", None),
+    }
+}
+
 async fn rollback(
     path: &Path,
     previous: &PreviousRelease<'_>,
@@ -1135,10 +1183,19 @@ async fn rollback(
     json_output: bool,
 ) -> u8 {
     let mut store_restored = false;
-    let retained_candidate = match store {
-        RollbackStore::Published(candidate, _) => Some(candidate.pid),
+    let published = match store {
+        RollbackStore::Published(candidate, _) => Some(candidate),
         _ => None,
     };
+    let retained_candidate = published.map(|candidate| candidate.pid);
+    let mut pending = json!({
+        "restart_id": backup.restart_id, "state": "rollback_requested",
+        "candidate_pid": retained_candidate, "startup_health": agents_at_update.health,
+        "backup": backup.retained(), "update_error": update_error,
+    });
+    if published.is_some() {
+        persist_health_decision(path, backup.restart_id, &mut pending);
+    }
     let restored = async {
         if binary_sha256(previous.binary).map_err(Failure::for_read)? != previous.sha256 {
             return Err(Failure::new(
@@ -1163,10 +1220,15 @@ async fn rollback(
         start_owned(path, previous.binary).await
     }
     .await;
+    let (candidate_state, candidate_admission) = match (published, &restored) {
+        (Some(candidate), Err(_)) => observe_rollback_candidate(path, candidate).await,
+        (Some(_), Ok(_)) => ("exited", None),
+        (None, _) => ("unpublished", None),
+    };
     let (state, pid, rollback_error) = match restored {
         Ok(pid) => ("rolled_back", Some(pid), None),
         Err(error) => (
-            if error.code.as_deref() == Some("rollback_held") {
+            if candidate_state == "alive" || error.code.as_deref() == Some("rollback_held") {
                 "rollback_held"
             } else {
                 "rollback_failed"
@@ -1200,6 +1262,8 @@ async fn rollback(
         "startup_health": agents_at_update.health,
         "store_restored": store_restored, "backup": backup.retained(), "backup_cleanup_error": cleanup,
         "candidate_pid": retained_candidate.filter(|_| pid.is_none()),
+        "candidate_state": candidate_state, "candidate_admission": candidate_admission,
+        "health_decision_error": pending["health_decision_error"],
         "agents_after": if pid.is_some() { observe_agents(path, &agents_at_update.before).await } else { Value::Null },
         "continuation": if state == "rollback_held" {
             "candidate work is retained for normal settlement"
@@ -1207,15 +1271,16 @@ async fn rollback(
             "run swarm daemon update with a healthy release that supports the current Store schema"
         } else { "boot recovery applies the configured on_restart policy" },
     });
-    if agents_at_update.health.is_some() {
-        let record = json!({
-            "restart_id": backup.restart_id, "state": state,
-            "candidate_pid": retained_candidate, "startup_health": agents_at_update.health,
-            "backup": reply["backup"], "rollback_error": rollback_error,
+    if published.is_some() {
+        let mut record = json!({
+            "restart_id": backup.restart_id, "state": state, "startup_health": agents_at_update.health,
+            "candidate_state": candidate_state, "candidate_admission": candidate_admission,
+            "candidate_pid": reply["candidate_pid"], "previous_pid": previous.daemon.pid, "pid": pid,
+            "backup": reply["backup"], "rollback_error": rollback_error, "update_error": update_error,
+            "health_decision_error": pending["health_decision_error"],
         });
-        if let Err(error) = record_update_health_decision(path, backup.restart_id, &record) {
-            reply["health_decision_error"] = json!(error.to_string());
-        }
+        persist_health_decision(path, backup.restart_id, &mut record);
+        reply["health_decision_error"] = record["health_decision_error"].clone();
     }
     print_update_value(&reply, json_output);
     if pid.is_some() { 1 } else { 4 }

@@ -3456,8 +3456,11 @@ backup remain available for compatible recovery. Provider, transient and uncerta
 outcomes leave the release running.
 
 The CLI records the startup evidence and decision in the private data directory
-under the update preparation ID before requesting rollback. Read it without a
-running daemon using `swarm daemon update --health-decision PREPARE_ID`.
+under the update preparation ID, including a candidate health failure before
+boot evidence exists. A record write failure appears in the update report.
+Rollback reports a candidate with proven surviving process custody as held
+and names its observed admission when available. Read the retained decision
+without a daemon using `swarm daemon update --health-decision PREPARE_ID`.
 
 After commit, the old daemon retires its owned Agent processes and leaves
 the existing Store recovery facts for the next boot. Startup and rollback
