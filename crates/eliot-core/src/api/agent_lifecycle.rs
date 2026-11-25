@@ -68,8 +68,8 @@ impl AgentDeleteRequest {
 
 #[derive(schemars::JsonSchema, Clone, Debug, Serialize, Deserialize)]
 pub struct AgentTreeResponse {
-    pub agent: String,
     pub affected: usize,
+    pub agent: String,
     pub archived: Option<bool>,
     pub deleted: bool,
 }

@@ -1,6 +1,7 @@
 //! Explicit cleanup jobs outlive their admission RPC, while the Store owns
 //! the original binding, every attempt fence and the visible progress.
 use super::*;
+use eliot_store::CleanupJobReceipt;
 
 const APPLY: &str = "cleanup.apply";
 const APPLY_ALL: &str = "cleanup.apply_all";
@@ -33,18 +34,16 @@ impl Router {
         let name = principal_name(principal);
         let payload = encoded(&request)?;
         let mut store = self.inner.store.lock().await;
-        if store
-            .cleanup_replay(&name, &request.id, APPLY, &payload)?
-            .is_some()
+        if let Some(mut retained) =
+            store.cleanup_replay::<CleanupApplyResponse>(&name, &request.id, APPLY, &payload)?
         {
             let active = self.cleanup_worker_is_live(&request.id);
             if !active {
                 // The exact retry can also reconcile a previously dispatched
                 // worktree command whose durable applied result arrived late.
-                store.begin_cleanup_apply(&name, &request, now_ms(), true)?;
+                (_, retained, _) = store.begin_cleanup_apply(&name, &request, now_ms(), true)?;
             }
-            let (_, retained) = store.cleanup_job_receipt(&name, &request.id)?;
-            return encoded(visible_apply(decode_receipt(retained)?, active));
+            return encoded(visible_apply(retained, active));
         }
         self.check_cleanup_admission()?;
         let (plan, mut response, _) = store.begin_cleanup_apply(&name, &request, now_ms(), true)?;
@@ -88,11 +87,15 @@ impl Router {
         )?;
         let payload = encoded(&request)?;
         let mut store = self.inner.store.lock().await;
-        if store
-            .cleanup_replay(OWNER, &request.id, APPLY_ALL, &payload)?
-            .is_some()
+        if let Some(status) =
+            store.cleanup_replay::<CleanupJobStatus>(OWNER, &request.id, APPLY_ALL, &payload)?
         {
-            return encoded(self.read_cleanup_status(&store, OWNER, &request.id)?);
+            return encoded(self.visible_bulk_status(
+                &store,
+                OWNER,
+                status,
+                self.cleanup_worker_is_live(&request.id),
+            )?);
         }
         self.check_cleanup_admission()?;
         let mut status = CleanupJobStatus {
@@ -162,22 +165,34 @@ impl Router {
         principal: &str,
         id: &str,
     ) -> Result<CleanupJobStatus> {
-        let (method, value) = store.cleanup_job_receipt(principal, id)?;
         let live = self.cleanup_worker_is_live(id);
-        if method == APPLY {
-            return page_status(id, value, live);
+        match store.cleanup_job_receipt(principal, id)? {
+            CleanupJobReceipt::Apply(apply) => Ok(page_status(id, apply, live)),
+            CleanupJobReceipt::Bulk(status) => {
+                self.visible_bulk_status(store, principal, status, live)
+            }
         }
-        let mut status: CleanupJobStatus = decode_receipt(value)?;
+    }
+
+    fn visible_bulk_status(
+        &self,
+        store: &eliot_store::Store,
+        principal: &str,
+        mut status: CleanupJobStatus,
+        live: bool,
+    ) -> Result<CleanupJobStatus> {
         if status.state == CleanupJobState::Running && !live {
             status.state = CleanupJobState::Interrupted;
             status.reason = Some("cleanup_worker_lost".to_owned());
         }
         if let Some(page) = status.current_apply_id.take() {
             match store.cleanup_job_receipt(principal, &page) {
-                Ok((_, value)) => status.tally.count(
-                    &decode_receipt(value)?,
-                    status.state == CleanupJobState::Running,
-                ),
+                Ok(CleanupJobReceipt::Apply(apply)) => status
+                    .tally
+                    .count(&apply, status.state == CleanupJobState::Running),
+                Ok(CleanupJobReceipt::Bulk(_)) => {
+                    return Err(Error::new("source_integrity", "invalid cleanup receipt"));
+                }
                 Err(error) if error.code == "not_found" => {}
                 Err(error) => return Err(error),
             }
@@ -444,11 +459,6 @@ fn settlement_state(result: &Result<()>) -> CleanupJobState {
     }
 }
 
-fn decode_receipt<T: serde::de::DeserializeOwned>(value: Value) -> Result<T> {
-    serde_json::from_value(value)
-        .map_err(|_| Error::new("source_integrity", "invalid cleanup receipt"))
-}
-
 fn visible_apply(mut apply: CleanupApplyResponse, live: bool) -> CleanupApplyResponse {
     if apply.state == Some(CleanupJobState::Running) {
         if live {
@@ -464,8 +474,7 @@ fn visible_apply(mut apply: CleanupApplyResponse, live: bool) -> CleanupApplyRes
     apply
 }
 
-fn page_status(id: &str, value: Value, live: bool) -> Result<CleanupJobStatus> {
-    let apply: CleanupApplyResponse = decode_receipt(value)?;
+fn page_status(id: &str, apply: CleanupApplyResponse, live: bool) -> CleanupJobStatus {
     let mut tally = CleanupTally {
         pages: 1,
         ..CleanupTally::default()
@@ -473,7 +482,7 @@ fn page_status(id: &str, value: Value, live: bool) -> Result<CleanupJobStatus> {
     tally.count(&apply, live);
     let apply = visible_apply(apply, live);
     let state = apply.state.unwrap_or(CleanupJobState::Completed);
-    Ok(CleanupJobStatus {
+    CleanupJobStatus {
         id: id.to_owned(),
         state,
         tally,
@@ -484,5 +493,5 @@ fn page_status(id: &str, value: Value, live: bool) -> Result<CleanupJobStatus> {
             CleanupJobState::Interrupted => Some("cleanup_worker_interrupted".to_owned()),
             _ => None,
         },
-    })
+    }
 }

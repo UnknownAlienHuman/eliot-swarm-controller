@@ -11,20 +11,27 @@
 use super::{Principal, Router, contains_known_secret_including_keys, principal_name};
 use crate::common::now_ms;
 use eliot_core::{
-    AgentState, Error, Result,
+    AgentState, Error, Event, Result,
     api::{
         MailAckRequest, MailDelivery, MailInboxRequest, MailReadRequest, MailSendRequest,
-        MailSendResponse, VarGetRequest, VarSetRequest,
+        MailSendResponse, VarGetRequest, VarSetRequest, VarSetResponse,
     },
 };
 use eliot_plugin::sync::LockExt;
 use eliot_store::{MailSendOutcome, MailSendResult};
-use serde::de::DeserializeOwned;
+use serde::{Deserialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use tokio::{
     sync::{oneshot, watch},
     time::{Duration, MissedTickBehavior, interval},
 };
+
+pub(super) fn changed_var(event: &Event) -> Option<VarSetResponse> {
+    if event.kind != "var.changed" {
+        return None;
+    }
+    VarSetResponse::deserialize(&event.data).ok()
+}
 
 pub(super) struct PendingVarWrite {
     principal: String,
@@ -381,11 +388,9 @@ impl Router {
                 .is_none_or(|baseline| version != baseline)
                 || !poll
                     .wake(|event| {
-                        event.kind == "var.changed"
-                            && event.data.get("scope").and_then(Value::as_str)
-                                == Some(scope.as_str())
-                            && event.data.get("key").and_then(Value::as_str)
-                                == Some(request.key.as_str())
+                        changed_var(event).is_some_and(|change| {
+                            change.scope == scope && change.key == request.key
+                        })
                     })
                     .await?
             {

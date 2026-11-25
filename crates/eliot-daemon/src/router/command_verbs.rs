@@ -72,7 +72,7 @@ impl Router {
                 return;
             }
         };
-        let mut execution = crate::git_integration::execute(
+        let execution = crate::git_integration::execute(
             &self.inner.data_root,
             &self.inner.store,
             id,
@@ -82,9 +82,12 @@ impl Router {
             self.secret_policy_snapshot(),
         )
         .await;
-        self.redact_native_value(&mut execution.outcome);
-        self.settle(id, execution.state, Some(execution.outcome))
-            .await;
+        self.settle(
+            id,
+            execution.state,
+            super::SettlementPayload::Git(Box::new(execution.outcome)),
+        )
+        .await;
         self.signal_progress();
     }
 

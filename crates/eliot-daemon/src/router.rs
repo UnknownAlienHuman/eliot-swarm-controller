@@ -295,6 +295,17 @@ pub(crate) struct RpcLogContext {
     pub(crate) method: String,
 }
 
+pub(crate) enum SettlementPayload {
+    Native(Option<Value>),
+    Git(Box<eliot_core::api::GitIntegrateOutcome>),
+}
+
+impl From<Option<Value>> for SettlementPayload {
+    fn from(outcome: Option<Value>) -> Self {
+        Self::Native(outcome)
+    }
+}
+
 struct EventFilter {
     agents: HashSet<String>,
     kinds: HashSet<String>,
@@ -813,12 +824,14 @@ impl Router {
                 let request: eliot_core::api::AgentArchiveRequest =
                     eliot_core::api::discovery::decode_params(params.clone())?;
                 request.validate()?;
-                self.inner.store.lock().await.change_agent_tree(
+                let response = self.inner.store.lock().await.archive_agent_tree(
                     &request.id,
                     &request.agent,
-                    Some(request.archived),
+                    request.archived,
                     now_ms(),
-                )
+                )?;
+                serde_json::to_value(response)
+                    .map_err(|_| Error::new("internal", "Agent tree result encoding failed"))
             }
             "agent.delete" => self.agent_delete(&params, &principal).await,
             "agent.list" => self.agent_list(&params, &principal).await,
@@ -7121,8 +7134,17 @@ impl Router {
         &self,
         id: &str,
         state: CommandState,
-        mut outcome: Option<Value>,
+        outcome: impl Into<SettlementPayload>,
     ) -> Option<Command> {
+        let mut outcome = match outcome.into() {
+            SettlementPayload::Native(outcome) => outcome,
+            SettlementPayload::Git(outcome) => {
+                let mut value = serde_json::to_value(outcome)
+                    .unwrap_or_else(|_| json!({"code":"git_integrate_result_encode_failed"}));
+                self.redact_native_value(&mut value);
+                Some(value)
+            }
+        };
         if let Some(outcome) = outcome.as_mut() {
             let envelope = json!({"command_id": id, "state": state, "outcome": null});
             let overhead = serde_json::to_vec(&envelope)
@@ -7389,12 +7411,8 @@ impl EventFilter {
                 .as_ref()
                 .is_some_and(|agent| self.agents.contains(agent))
             || (event.agent.is_none()
-                && event.kind == "var.changed"
-                && event
-                    .data
-                    .get("scope")
-                    .and_then(Value::as_str)
-                    .is_some_and(|scope| self.var_scopes.contains(scope))))
+                && coordination::changed_var(event)
+                    .is_some_and(|change| self.var_scopes.contains(&change.scope))))
             && (self.kinds.is_empty() || self.kinds.contains(&event.kind))
             && (self.sources.is_empty() || self.sources.contains(&event.source))
     }

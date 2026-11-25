@@ -109,8 +109,8 @@ pub use coordination::{
     MAX_CLAIM_NOTE_BYTES, MAX_CLAIM_TTL_SECS, MAX_CLAIMS_PER_AGENT, MAX_MAIL_ACK_IDS,
     MAX_MAIL_INBOX_ROWS, MAX_MAIL_RECIPIENTS, MAX_MAIL_TEXT_BYTES, MAX_MAIL_THREAD_BYTES,
     MAX_VAR_KEY_BYTES, MAX_VAR_NOTE_BYTES, MAX_VAR_SCOPE_BYTES, MAX_VAR_VALUE_BYTES, MAX_WHO_PATHS,
-    MAX_WHO_WORKERS, MailAckRequest, MailAckResponse, MailDefinitionArgs, MailDelivery,
-    MailDeliverySummary, MailInboxRequest, MailInboxResponse, MailLimits, MailMode,
+    MAX_WHO_WORKERS, MailAckRequest, MailAckResponse, MailDefinitionArgs, MailDeliveredEvent,
+    MailDelivery, MailDeliverySummary, MailInboxRequest, MailInboxResponse, MailLimits, MailMode,
     MailReadRequest, MailSendRequest, MailSendResponse, SWARM_MAIL_SENDER, VarDefinitionArgs,
     VarGetRequest, VarGetResponse, VarScope, VarSetRequest, VarSetResponse, WhoRequest,
     WhoResponse, WhoSharedWorkspace, WhoWorker, advisory_claim_matches, claim_glob_matches,
@@ -130,9 +130,10 @@ pub use git::{
 pub use git_integrate::{
     DEFAULT_GIT_INTEGRATE_TIMEOUT_MS, FrozenGitIntegrate, GitIntegrateBranchPin,
     GitIntegrateCaller, GitIntegrateCheckClassification, GitIntegrateCheckFailure,
-    GitIntegrateDefinitionArgs, GitIntegrateOutcome, GitIntegrateRefUpdate, GitIntegrateStatus,
-    GitIntegrateTargetPin, MAX_GIT_INTEGRATE_BRANCHES, MAX_GIT_INTEGRATE_CHECK_TAIL_BYTES,
-    MAX_GIT_INTEGRATE_CONFLICT_PATHS, validate_integration_branch,
+    GitIntegrateDefinitionArgs, GitIntegrateOutcome, GitIntegrateRefUpdate, GitIntegrateSettlement,
+    GitIntegrateStatus, GitIntegrateTargetPin, MAX_GIT_INTEGRATE_BRANCHES,
+    MAX_GIT_INTEGRATE_CHECK_TAIL_BYTES, MAX_GIT_INTEGRATE_CONFLICT_PATHS,
+    validate_integration_branch,
 };
 pub use goals::{
     AssignmentGoal, CHECK_SPAWN_RETRYABLE, DEFAULT_GOAL_CHECK_TIMEOUT_MS, GOAL_CHECK_HISTORY_LIMIT,

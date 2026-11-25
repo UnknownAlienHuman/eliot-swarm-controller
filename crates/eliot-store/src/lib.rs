@@ -24,7 +24,7 @@ mod launch_result;
 mod online_backup;
 pub use launch_queue::{ArbitratedTimer, LAUNCH_SOURCE_SNAPSHOT_ARG, PendingLaunch, TimerWait};
 mod cleanup;
-pub use cleanup::{CleanupInventoryPage, cleanup_worktree_command_id};
+pub use cleanup::{CleanupInventoryPage, CleanupJobReceipt, cleanup_worktree_command_id};
 mod git_integration_custody;
 mod projects;
 pub use git_integration_custody::IntegrationCustody;

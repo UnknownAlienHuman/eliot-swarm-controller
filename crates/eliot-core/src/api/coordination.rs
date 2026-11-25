@@ -260,7 +260,6 @@ impl MailDefinitionArgs {
 }
 
 #[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct MailDeliverySummary {
     pub delivery_id: String,
     pub recipient: String,
@@ -268,9 +267,17 @@ pub struct MailDeliverySummary {
 }
 
 #[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct MailSendResponse {
     pub deliveries: Vec<MailDeliverySummary>,
+}
+
+/// Bodyless event emitted for each concrete mail recipient.
+#[derive(Serialize)]
+pub struct MailDeliveredEvent<'a> {
+    pub recipient: &'a str,
+    pub delivery_id: &'a str,
+    pub sender: &'a str,
+    pub thread: Option<&'a str>,
 }
 
 #[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -556,7 +563,6 @@ impl MailAckRequest {
 }
 
 #[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct MailAckResponse {
     pub acked: Vec<String>,
 }
@@ -713,7 +719,6 @@ impl VarDefinitionArgs {
 }
 
 #[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct VarSetResponse {
     pub scope: String,
     pub key: String,

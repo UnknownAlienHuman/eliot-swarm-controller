@@ -111,10 +111,7 @@ impl Store {
         self.ensure_committed_reads()?;
         let payload = serde_json::to_value(request)
             .map_err(|_| Error::new("invalid", "invalid custody resolution"))?;
-        self.cleanup_replay("owner", &request.id, RESOLVE_METHOD, &payload)?
-            .map(serde_json::from_value)
-            .transpose()
-            .map_err(|_| Error::new("source_integrity", "invalid custody resolution receipt"))
+        self.cleanup_replay("owner", &request.id, RESOLVE_METHOD, &payload)
     }
 
     pub fn resolve_failed_custody(
