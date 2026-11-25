@@ -1,12 +1,11 @@
 use super::*;
-use crate::platform::script_file::{canonical_cleanup_path, cleanup_canonical_path_in_root};
 use crate::workspaces::require_managed_cleanup_path;
 
 impl Router {
     pub(super) async fn require_cleanup_ownership(
         &self,
         artifact: &ArtifactView,
-    ) -> Result<Option<PathBuf>> {
+    ) -> Result<Option<CleanupPath>> {
         let data_root = &self.inner.data_root;
         match artifact.kind {
             ArtifactKind::Worktree => {
@@ -40,9 +39,9 @@ impl Router {
         }
         let path = Path::new(&artifact.path);
         validate_cleanup_path(path)?;
-        let path = canonical_cleanup_path(path)?;
+        let path = CleanupPath::open(path)?;
         for local in ["artifacts", "plugins"] {
-            if cleanup_canonical_path_in_root(&path, &data_root.join(local))? {
+            if path.in_root(&data_root.join(local))? {
                 return Ok(Some(path));
             }
         }
@@ -50,7 +49,7 @@ impl Router {
         // A shared configured chat root is only usable through a bound row.
         if artifact.purpose == "Swarm chat directory"
             && let Ok(root) = crate::config::validate_chats_location(data_root, None)
-            && cleanup_canonical_path_in_root(&path, &root)?
+            && path.in_root(&root)?
         {
             return Ok(Some(path));
         }
@@ -66,7 +65,7 @@ impl Router {
             }
         };
         if let Some(root) = root
-            && cleanup_canonical_path_in_root(&path, Path::new(&root.path))?
+            && path.in_root(Path::new(&root.path))?
         {
             return Ok(Some(path));
         }

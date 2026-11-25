@@ -38,26 +38,73 @@ pub(crate) struct Directory {
 /// Resolve a cleanup directory with no links in its existing ancestry.
 /// Missing suffixes are retained so absence cannot waive path custody.
 pub(crate) fn canonical_cleanup_path(path: &Path) -> Result<PathBuf> {
-    if !path.is_absolute()
-        || path
-            .components()
-            .any(|part| matches!(part, Component::CurDir | Component::ParentDir))
-    {
-        return Err(refused());
-    }
-    for prefix in path.ancestors() {
-        match std::fs::symlink_metadata(prefix) {
-            Ok(_) => {
-                let _directory = Directory::open(prefix)?;
-                let resolved = std::fs::canonicalize(prefix).map_err(|_| refused())?;
-                let suffix = path.strip_prefix(prefix).map_err(|_| refused())?;
-                return Ok(resolved.join(suffix));
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(_) => return Err(refused()),
+    Ok(CleanupPath::open(path)?.path)
+}
+
+/// Canonical cleanup location and the handles used to establish its ancestry.
+pub(crate) struct CleanupPath {
+    path: PathBuf,
+    directory: Directory,
+}
+
+impl CleanupPath {
+    pub(crate) fn open(path: &Path) -> Result<Self> {
+        if !path.is_absolute()
+            || path
+                .components()
+                .any(|part| matches!(part, Component::CurDir | Component::ParentDir))
+        {
+            return Err(refused());
         }
+        for prefix in path.ancestors() {
+            match std::fs::symlink_metadata(prefix) {
+                Ok(_) => {
+                    let mut directory = Directory::open(prefix)?;
+                    let resolved = directory.canonical_path()?;
+                    #[cfg(windows)]
+                    if resolved.components().count() != prefix.components().count() {
+                        // A substituted drive can start inside the volume. Pin its
+                        // full canonical ancestry and verify the held object.
+                        let canonical = Directory::open(&resolved)?;
+                        if canonical.identity()? != directory.identity()? {
+                            return Err(refused());
+                        }
+                        directory = canonical;
+                    }
+                    let suffix = path.strip_prefix(prefix).map_err(|_| refused())?;
+                    let path = resolved.join(suffix);
+                    directory.path = resolved;
+                    return Ok(Self { path, directory });
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => return Err(refused()),
+            }
+        }
+        Err(refused())
     }
-    Err(refused())
+
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub(crate) fn in_root(&self, root: &Path) -> Result<bool> {
+        if self.path != root && self.directory.path.starts_with(root) {
+            // The no-follow walk has already pinned and normalized this ancestor.
+            return Ok(true);
+        }
+        cleanup_canonical_path_in_root(&self.path, root)
+    }
+
+    pub(crate) fn into_parent(mut self) -> Result<(Directory, PathBuf)> {
+        if self.directory.path != self.path || self.directory.chain.len() < 2 {
+            return Err(refused());
+        }
+        // Release only the leaf read handle so the relative delete open can
+        // request DELETE access. Every ancestor remains pinned.
+        self.directory.chain.pop();
+        self.directory.path.pop();
+        Ok((self.directory, self.path))
+    }
 }
 
 pub(crate) fn cleanup_canonical_path_in_root(path: &Path, root: &Path) -> Result<bool> {
@@ -66,8 +113,10 @@ pub(crate) fn cleanup_canonical_path_in_root(path: &Path, root: &Path) -> Result
         Err(_) => return Err(refused()),
         Ok(_) => {}
     }
-    let _directory = Directory::open(root).map_err(|_| unsafe_cleanup_root())?;
-    let canonical = std::fs::canonicalize(root).map_err(|_| unsafe_cleanup_root())?;
+    let directory = Directory::open(root).map_err(|_| unsafe_cleanup_root())?;
+    let canonical = directory
+        .canonical_path()
+        .map_err(|_| unsafe_cleanup_root())?;
     if eliot_core::workspace_path_key(&root.to_string_lossy())
         != eliot_core::workspace_path_key(&canonical.to_string_lossy())
     {
@@ -170,6 +219,14 @@ impl Directory {
 
     fn handle(&self) -> &File {
         self.chain.last().unwrap()
+    }
+
+    fn canonical_path(&self) -> Result<PathBuf> {
+        #[cfg(windows)]
+        let path = eliot_plugin::file_final_path(self.handle());
+        #[cfg(not(windows))]
+        let path = self.path.canonicalize();
+        path.map_err(|_| refused())
     }
 
     /// Enumerate the current no-follow directory while its chain stays open.
@@ -605,7 +662,7 @@ fn conflict() -> Error {
 /// No pathname unlink fallback is available on Unix.
 #[cfg(windows)]
 pub(crate) struct CleanupTree {
-    _parent: Directory,
+    _parent: std::sync::Arc<Directory>,
     entries: Vec<CleanupEntry>,
     scanned: usize,
     pub(crate) identity: String,
@@ -625,6 +682,7 @@ enum CleanupEntry {
 #[cfg(windows)]
 impl CleanupTree {
     pub(crate) fn open(
+        parent: std::sync::Arc<Directory>,
         path: &Path,
         deadline: std::time::Instant,
         cargo_links: bool,
@@ -632,7 +690,9 @@ impl CleanupTree {
         if let Some(name) = path.file_name().and_then(|name| name.to_str()) {
             cleanup_name(name)?;
         }
-        let parent = Directory::open(path.parent().ok_or_else(refused)?)?;
+        if path.parent() != Some(parent.path.as_path()) {
+            return Err(refused());
+        }
         let name = path.file_name().ok_or_else(refused)?;
         let root = native::open_cleanup(parent.handle(), name, true).map_err(cleanup_open_error)?;
         check(&root, true)?;

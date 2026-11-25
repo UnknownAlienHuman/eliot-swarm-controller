@@ -121,9 +121,10 @@ the local generation custody binding. Managed checkout cleanup is limited to
 `<data-dir>/worktrees`. A Git registration outside that root does not authorize
 checkout removal. Only safe items contribute to removable bytes.
 Cleanup resolves candidate aliases before comparing containment. The owning
-root must be a plain directory at its canonical location. Apply opens the
-authorized directory again without following links, checks its identity and
-retains the tree handles through deletion, including for Cargo targets.
+root must be a plain directory at its canonical location. Windows retains the
+ancestors opened during custody verification and opens the authorized directory
+relative to its held parent without following links. Apply checks its identity
+and retains the tree handles through deletion, including for Cargo targets.
 Internal recursive cleanup requires a direct child of a pinned parent from
 the current daemon's operation or validated stand registration. Updater
 images are single files removed through the pinned staging directory. Pruning
@@ -133,6 +134,8 @@ a retained artifact can surface as `safe(already_absent)`. Apply confirms
 absence twice across the 15-second grace interval before settling
 `removed(already_absent)` with zero bytes, including when the directory was
 present in the plan.
+If an ancestor of a directory observed present during planning is missing at
+apply, the absence check refuses the item with `identity_changed`.
 For a worktree, apply uses the existing
 missing-worktree reconciliation and preserves the local branch. A manager can
 reconcile absence only for the exact safe item in its own reserved job.
