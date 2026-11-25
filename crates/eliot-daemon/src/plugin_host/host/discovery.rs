@@ -1039,7 +1039,7 @@ impl PluginHost {
             };
         };
         let opened = self
-            .open_reader_with_cleanup(
+            .open_reader_with_policy(
                 &AgentKey {
                     id: "discovery".to_owned(),
                     generation: 0,
@@ -1048,6 +1048,7 @@ impl PluginHost {
                 &profile,
                 &environment,
                 None,
+                true,
             )
             .await;
         let mut reader = match opened.result {

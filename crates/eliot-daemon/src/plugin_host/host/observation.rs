@@ -340,7 +340,7 @@ impl PluginHost {
             }
             spawn_attempted = true;
             transport = Some(
-                self.open_reader(
+                self.open_observation_reader(
                     &AgentKey {
                         id: entry.agent.id.clone(),
                         generation: entry.agent.generation,
@@ -348,7 +348,7 @@ impl PluginHost {
                     &entry.agent.harness,
                     &entry.agent.profile_snapshot,
                     &environment,
-                    Some(&entry.agent),
+                    &entry.agent,
                 )
                 .await?,
             );

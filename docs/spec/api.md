@@ -3485,7 +3485,10 @@ ordinary paths, while store checks compare canonical paths. A linked home or con
 or a retained binding to a different native store, refuses before starting a
 workspace setup command or app-server. Agents frozen without a stand home
 require a fresh launch. Stand setup copies no Codex configuration or credential
-files. Direct ChatGPT/OAuth profiles fail at admission with
+files. Owner `agent.discover` and observe-only attachment and history read the
+verified private store without inference credentials. Quota, catalogue,
+profile-store and native archive operations still require an adopted proxy.
+Direct ChatGPT/OAuth profiles fail at controlled launch or route-bound admission with
 `stand_codex_login_unsupported`. An adopted Responses proxy, such as
 [OpenCodex](../harnesses/opencodex.md), can authenticate through its own
 credentials or an explicitly admitted client-key environment variable.

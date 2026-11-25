@@ -58,15 +58,15 @@ impl ReaderOpen {
 }
 
 impl PluginHost {
-    pub(super) async fn open_reader(
+    pub(super) async fn open_observation_reader(
         &self,
         key: &AgentKey,
         harness: &str,
         profile: &Value,
         environment: &Value,
-        observation: Option<&Agent>,
+        observation: &Agent,
     ) -> Result<ReaderTransport> {
-        self.open_reader_with_cleanup(key, harness, profile, environment, observation)
+        self.open_reader_with_policy(key, harness, profile, environment, Some(observation), true)
             .await
             .result
     }
@@ -79,7 +79,25 @@ impl PluginHost {
         environment: &Value,
         observation: Option<&Agent>,
     ) -> ReaderOpen {
-        if let Err(error) = crate::config::verify_stand_native_route(
+        self.open_reader_with_policy(key, harness, profile, environment, observation, false)
+            .await
+    }
+
+    pub(super) async fn open_reader_with_policy(
+        &self,
+        key: &AgentKey,
+        harness: &str,
+        profile: &Value,
+        environment: &Value,
+        observation: Option<&Agent>,
+        observing: bool,
+    ) -> ReaderOpen {
+        let verify_policy = if observing {
+            crate::config::verify_stand_observation_store
+        } else {
+            crate::config::verify_stand_native_route
+        };
+        if let Err(error) = verify_policy(
             self.state.stand_store_root.as_deref(),
             harness,
             profile,
