@@ -153,7 +153,7 @@ fn classify_auth_status(code: Option<i32>, stdout: &[u8], _: &[u8]) -> NativeAut
 }
 
 fn decode_auth_ids(stdout: &[u8]) -> Option<Vec<String>> {
-    let entries: Vec<Value> = serde_json::from_slice(stdout).ok()?;
+    let entries: Vec<serde_json::Value> = serde_json::from_slice(stdout).ok()?;
     Some(
         entries
             .iter()

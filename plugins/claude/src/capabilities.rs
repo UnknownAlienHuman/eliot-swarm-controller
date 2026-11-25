@@ -14,6 +14,11 @@ use serde_json::Value;
 
 pub fn declaration() -> HarnessCapabilities {
     HarnessCapabilities {
+        skill_wrapper: Some(eliot_core::api::harness::NativeSkillWrapper {
+            directory: ".claude-plugin",
+            filename: "plugin.json",
+            manifest: skill_manifest,
+        }),
         catalogue_provider: eliot_core::api::harness::CatalogueProvider::Fixed("anthropic"),
         instruction_inventory: crate::instructions::INSTRUCTION_INVENTORY,
         model_login_source: Some(eliot_core::api::harness::ModelLoginSource::Files {
@@ -211,3 +216,13 @@ pub(crate) const EXTERNAL_ROUTE_MARKERS: &[&str] = &[
     "CLAUDE_CODE_USE_FOUNDRY",
     "CLAUDE_CODE_USE_MANTLE",
 ];
+
+fn skill_manifest() -> eliot_core::Result<String> {
+    serde_json::to_string_pretty(&serde_json::json!({
+        "name": eliot_plugin::skill::SKILL_NAME,
+        "version": env!("CARGO_PKG_VERSION"),
+        "description": "Eliot Swarm coordination: identity, mail, claims, shared variables, children and handoff.",
+        "skills": ["./skills/eliot-swarm"],
+    }))
+    .map_err(|_| eliot_core::Error::new("internal", "skill plugin manifest could not be encoded"))
+}

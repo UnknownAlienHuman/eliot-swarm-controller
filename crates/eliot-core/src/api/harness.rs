@@ -302,6 +302,13 @@ pub struct NativeMcpSources {
     pub http_keys: &'static [&'static str],
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct NativeSkillWrapper {
+    pub directory: &'static str,
+    pub filename: &'static str,
+    pub manifest: fn() -> Result<String>,
+}
+
 /// Adapter-specific diagnostic vocabulary retained by older turn and gap records.
 #[derive(Clone, Copy, Debug)]
 pub struct ViewProjectionRecovery {
@@ -492,6 +499,7 @@ pub struct HarnessCapabilities {
     pub defer_harness_check: bool,
     /// Writes a prepared MCP configuration before start.
     pub prepared_mcp_config: Option<NativeMcpSources>,
+    pub skill_wrapper: Option<NativeSkillWrapper>,
     /// Resolves the launch executable through reader discovery.
     pub reader_executable_discovery: bool,
     /// Resumes with a command-scoped config overlay.
