@@ -294,7 +294,7 @@ impl Store {
                 let command = load_command_record(&tx, &id)?.ok_or_else(|| {
                     Error::new("source_integrity", "project check context disappeared")
                 })?;
-                reject_pending_context(
+                settle_pending_context_refusal(
                     &tx,
                     &command,
                     agent_num,
@@ -405,7 +405,7 @@ impl Store {
             if let Some(previous) = previous
                 && let Some(record) = load_command_record(&tx, &previous)?
             {
-                reject_pending_context(
+                settle_pending_context_refusal(
                     &tx,
                     &record,
                     agent_num,
@@ -888,7 +888,7 @@ pub(super) fn claim_next_input_tx(
                 .expires_at_ms
                 .is_some_and(|expires_at| expires_at <= now)
             {
-                reject_pending_context(
+                settle_pending_context_refusal(
                     tx,
                     &record,
                     agent_num,
@@ -900,7 +900,7 @@ pub(super) fn claim_next_input_tx(
                 continue;
             }
             if args.text.len() > MAX_TEXT_BYTES {
-                reject_pending_context(
+                settle_pending_context_refusal(
                     tx,
                     &record,
                     agent_num,
@@ -921,7 +921,7 @@ pub(super) fn claim_next_input_tx(
             match check_rpc_frame("agent.command", &lone_frame) {
                 Ok(()) => {}
                 Err(error) if error.code == "frame_too_large" => {
-                    reject_pending_context(
+                    settle_pending_context_refusal(
                         tx,
                         &record,
                         agent_num,
@@ -1151,7 +1151,7 @@ impl Store {
                     .expires_at_ms
                     .is_some_and(|expires_at| expires_at <= now)
                 {
-                    reject_pending_context(
+                    settle_pending_context_refusal(
                         &tx,
                         &record,
                         agent_num,
@@ -1197,7 +1197,7 @@ impl Store {
                         &mut events,
                     )?;
                 } else {
-                    reject_pending_context(
+                    settle_pending_context_refusal(
                         &tx,
                         &record,
                         agent_num,
@@ -2465,11 +2465,18 @@ fn reject_unauthorized_context(
     now: i64,
     events: &mut Vec<Event>,
 ) -> Result<bool> {
-    match check_context_authority(tx, record, agent) {
+    let authority = check_context_authority(tx, record, agent).or_else(|error| {
+        if error.code == "internal" && !tx.is_autocommit() {
+            check_context_authority(tx, record, agent)
+        } else {
+            Err(error)
+        }
+    });
+    match authority {
         Ok(()) => Ok(false),
-        Err(error) if matches!(error.code.as_str(), "internal" | "busy") => Err(error),
+        Err(error) if error.code == "busy" || tx.is_autocommit() => Err(error),
         Err(error) => {
-            reject_pending_context(
+            settle_pending_context_refusal(
                 tx,
                 record,
                 agent_num,
@@ -2483,7 +2490,7 @@ fn reject_unauthorized_context(
     }
 }
 
-fn reject_pending_context(
+fn settle_pending_context_refusal(
     tx: &Transaction<'_>,
     record: &CommandRecord,
     agent_num: i64,
@@ -2492,9 +2499,14 @@ fn reject_pending_context(
     now: i64,
     events: &mut Vec<Event>,
 ) -> Result<()> {
+    let (state, kind) = if code == "internal" {
+        (CommandState::Failed, "command.failed")
+    } else {
+        (CommandState::Rejected, "command.rejected")
+    };
     let mut outcome = json!({"code": code, "delivery": "cancelled"});
     if let Some(reason) = reason {
-        outcome["reason"] = json!(reason);
+        outcome["reason"] = json!(&reason[..reason.floor_char_boundary(512)]);
     }
     if record
         .command
@@ -2504,22 +2516,15 @@ fn reject_pending_context(
     {
         outcome["moved"] = json!(true);
     }
-    update_command_state(
-        tx,
-        &record.command.id,
-        CommandState::Rejected,
-        Some(&outcome),
-        None,
-        now,
-    )?;
+    update_command_state(tx, &record.command.id, state, Some(&outcome), None, now)?;
     events.push(insert_daemon_command_event(
         tx,
         now,
-        "command.rejected",
+        kind,
         Some(agent_num),
         Some(generation),
         &record.command.id,
-        json!({"command_id": record.command.id, "state": "rejected", "outcome": outcome}),
+        json!({"command_id": record.command.id, "state": state, "outcome": outcome}),
     )?);
     Ok(())
 }

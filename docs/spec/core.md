@@ -579,10 +579,14 @@ no turn binding and is eligible only for the next send in that same generation.
 Queued pending contexts (`next_input`, `turn_safe_point`) are claimed FIFO from
 existing command rows for the target's current generation. At claim, Store
 rechecks project assignment and transfer fences, the frozen project binding for
-project rules, and live issuer generation and control scope for Agent principals.
-Owner and Swarm notes have no issuer generation. Store settles a definite
-refusal with its reason and continues the claim. Internal Store errors and
-SQLite lock conflicts abort the transaction and leave queued items pending.
+project rules via `validate_project_command_dispatch_tx`, and live issuer
+generation and control scope for Agent principals. Owner, Swarm notes and
+project rule principals carry no issuer generation. Store settles a definite
+refusal with its reason and continues the claim. It rechecks an internal
+authorization error once within the open transaction. A second internal error
+fails that item with its cause and the claim proceeds. SQLite lock conflicts
+and failures that abort the transaction or prevent settlement leave queued
+items pending.
 The ordinary router dispatches each `active_turn` command as
 one immediate native effect with no queue consumer. Admission or queue acceptance
 does not establish application.
