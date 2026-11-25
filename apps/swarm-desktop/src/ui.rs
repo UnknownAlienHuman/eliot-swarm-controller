@@ -143,6 +143,9 @@ struct AgentPage {
     total: usize,
     /// The archived Agents the default list leaves out (first page only).
     archived: nav::Archived,
+    /// Every lifecycle state's total in the page's scope, when the request
+    /// named states (`state_totals`).
+    totals: Option<Vec<eliot_core::api::AgentStateTotal>>,
 }
 
 /// UI copy of one pending request with its exact control binding.
@@ -644,28 +647,18 @@ fn load_agents_blocking(
             })?;
         // The default list leaves archived Agents out; the fleet line still
         // counts the live ones (an archived chat may be idle, not stopped).
-        // Only the history pages take this second read: branch and
-        // attention loads carry their own filters.
+        // Only a full load of the history takes this second read: branch,
+        // attention, search and refresh reads carry their own filters (the
+        // refresh reads it only when its totals moved, see `refresh_head`).
         let archived = if archived.is_none()
             && request.after.is_none()
             && request.parent.is_none()
             && request.states.is_none()
+            && request.query.is_none()
         {
-            let only = AgentListRequest {
-                limit: request.limit,
-                ..AgentListRequest::default()
-            };
-            match client::list_agents_flagged(data_dir, &only, Some("only")).await {
-                Ok((page, _)) => {
-                    let rows: Vec<UiAgent> = page
-                        .agents
-                        .iter()
-                        .map(|row| UiAgent::from_summary(&row.summary))
-                        .collect();
-                    nav::Archived::of(&rows, page.total)
-                }
-                Err(_) => nav::Archived::default(),
-            }
+            read_archived(data_dir, request.limit)
+                .await
+                .unwrap_or_default()
         } else {
             nav::Archived::default()
         };
@@ -685,8 +678,27 @@ fn load_agents_blocking(
             next: reply.next,
             total: reply.total,
             archived,
+            totals: reply.state_totals,
         })
     })
+}
+
+/// The archived Agents the default list leaves out, counted over one
+/// `agent.list {archived: only}` page and its total.
+async fn read_archived(data_dir: &Path, limit: usize) -> Fallible<nav::Archived> {
+    let only = AgentListRequest {
+        limit,
+        ..AgentListRequest::default()
+    };
+    let (page, _) = client::list_agents_flagged(data_dir, &only, Some("only"))
+        .await
+        .map_err(|error| error.to_string())?;
+    let rows: Vec<UiAgent> = page
+        .agents
+        .iter()
+        .map(|row| UiAgent::from_summary(&row.summary))
+        .collect();
+    Ok(nav::Archived::of(&rows, page.total))
 }
 
 /// One Agent by id, whatever page it is on: `agent.get` decides whether it
@@ -935,6 +947,9 @@ impl Component for DesktopApp {
                 agents_loading: false,
                 paging: false,
                 list_epoch: 0,
+                list_totals: None,
+                attention_due: false,
+                archived_due: false,
                 pending_select: None,
                 collapsed: HashSet::new(),
                 unfolded: HashSet::new(),

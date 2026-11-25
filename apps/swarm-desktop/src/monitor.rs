@@ -43,6 +43,10 @@ use crate::client::{self, MAX_CONCURRENT_READS};
 
 /// Refresh period while the monitor is open.
 pub const PERIOD_MS: u64 = 2_000;
+/// A refresh that reads a list (the fleet, the task's tree) starts at least
+/// this long after the last one: the sidebar's cadence, so the one list
+/// read that feeds both is never more frequent than the sidebar's own.
+pub const LIST_PERIOD_MS: u64 = 10_000;
 /// Without an event, the fleet (its CPU and memory samples) is read again
 /// after this long; an event reads it at once (no sooner than
 /// [`PERIOD_MS`] after the last read).
@@ -2042,6 +2046,33 @@ pub async fn refresh(
         .groups
         .sort_by_key(|(state, _)| attention_rank(*state));
     Some(snapshot)
+}
+
+/// The fleet read's rows (and the stopped rows read with it) for the
+/// sidebar, when every part of it was read.
+pub fn sidebar_rows(snapshot: &MonitorSnapshot) -> Option<Vec<crate::nav::UiAgent>> {
+    if !snapshot.fleet || snapshot.groups.iter().any(|(_, page)| page.is_err()) {
+        return None;
+    }
+    let stopped = match &snapshot.stopped {
+        Some(Ok(page)) => page.agents.as_slice(),
+        _ => &[],
+    };
+    Some(
+        snapshot
+            .groups
+            .iter()
+            .filter_map(|(_, page)| page.as_ref().ok())
+            .flat_map(|page| page.agents.iter())
+            .chain(stopped)
+            .map(|row| {
+                let mut agent = crate::nav::UiAgent::from_summary(&row.summary);
+                agent.chat = row.summary.chat;
+                agent.archived = row.summary.archived;
+                agent
+            })
+            .collect(),
+    )
 }
 
 /// How old cached panel data must be before a panel says when it was

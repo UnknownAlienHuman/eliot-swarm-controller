@@ -76,6 +76,8 @@ async fn run() {
     let mut attempts = Vec::<Attempt>::new();
     let mut next_probe = HashMap::<(String, String), Instant>::new();
     let mut previous_data_dir = None;
+    // Failed polls in a row (no daemon answering): the next waits longer.
+    let mut pace = crate::live::Pace::default();
     loop {
         interval.tick().await;
         let mut index = 0;
@@ -95,8 +97,11 @@ async fn run() {
         }
         let pending = crate::client::auth_desktop_poll(&data_dir).await;
         let Ok(pending) = pending else {
+            let poll_ms = u64::try_from(POLL_INTERVAL.as_millis()).unwrap_or(u64::MAX);
+            interval.reset_after(Duration::from_millis(pace.fail(poll_ms)));
             continue;
         };
+        pace.reset();
         next_probe.retain(|(harness, revision), _| {
             pending
                 .pending

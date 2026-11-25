@@ -145,6 +145,8 @@ pub(super) enum ShellMsg {
     /// The live and attention rows, fetched independently of the history
     /// page: merge them into the loaded Agents.
     AttentionLoaded(u64, Fallible<AgentPage>),
+    /// The archived counts a refresh read (its list epoch).
+    ArchivedLoaded(u64, Fallible<nav::Archived>),
     /// The Monitor's attention reports, read on the sidebar's cadence
     /// while the panel is closed (the cursor the read started from).
     AttentionReports(Option<i64>, Fallible<monitor::AttentionRead>),
@@ -253,6 +255,7 @@ impl ShellMsg {
             Self::HeadLoaded(_, page)
             | Self::AttentionLoaded(_, page)
             | Self::SearchLoaded(_, _, _, page) => page.is_err(),
+            Self::ArchivedLoaded(_, read) => read.is_err(),
             Self::AttentionReports(_, read) => read.is_err(),
             Self::OrganizationLoaded(read) => read.stale,
             Self::QueueLoaded(read) => !read.errors.is_empty(),
@@ -367,6 +370,14 @@ pub(super) struct ShellState {
     pub(super) paging: bool,
     /// Tags agent-list loads; a reply for an older request is dropped.
     pub(super) list_epoch: u64,
+    /// The state totals the last refresh read (`state_totals` over the
+    /// sidebar's scope): a change says what the next refreshes read.
+    pub(super) list_totals: Option<Vec<eliot_core::api::AgentStateTotal>>,
+    /// The next refresh reads the attention rows (an attention state's
+    /// total moved, and not all of them are on the first page).
+    pub(super) attention_due: bool,
+    /// The next refresh reads the archived counts (the list's total moved).
+    pub(super) archived_due: bool,
     pub(super) pending_select: Option<UiAgent>,
     /// Section keys of collapsed projects (`[desktop] collapsed_projects`,
     /// written from [`DesktopApp::collapsed_projects_changed`]).
@@ -674,11 +685,13 @@ impl DesktopApp {
                 self.nav.agents_loading = false;
                 match page {
                     Ok(page) => {
+                        if let Some(totals) = page.totals.clone() {
+                            self.note_totals(&page.rows, totals);
+                        }
                         merge_head_rows(&mut self.nav.agents, page.rows);
                         self.nav.agents_total = page.total;
                         if self.nav.agents.len() <= AGENT_PAGE {
                             self.nav.agents_next = page.next;
-                            self.nav.archived = page.archived;
                         }
                         self.refresh_search();
                     }
@@ -700,6 +713,16 @@ impl DesktopApp {
                     Err(error) => {
                         self.read_failed(format!("Agents not read: {error}"), context);
                     }
+                }
+            }
+            ShellMsg::ArchivedLoaded(list_epoch, read) => {
+                if list_epoch != self.nav.list_epoch {
+                    return;
+                }
+                self.nav.agents_loading = false;
+                match read {
+                    Ok(archived) => self.nav.archived = archived,
+                    Err(error) => self.read_failed(format!("Agents not read: {error}"), context),
                 }
             }
             ShellMsg::Refreshed(replies) => {
@@ -1206,7 +1229,10 @@ impl DesktopApp {
                     self.read_project(context);
                 }
                 self.nav.batch = Some(Vec::new());
-                if self.preferences_loaded && !self.nav.agents_loading {
+                // While the Agents page shows, its fleet read (the Monitor's
+                // chain) feeds the sidebar's rows instead (`take_fleet_rows`).
+                if self.preferences_loaded && !self.nav.agents_loading && self.main != Main::Agents
+                {
                     self.refresh_head(context);
                 }
                 // An open search re-reads its first page too, so a match
@@ -2214,28 +2240,113 @@ impl DesktopApp {
         });
     }
 
-    /// Re-read the first recent page and the live and attention rows, then
-    /// merge them into the loaded history without dropping appended older
-    /// pages: a launch or a state change while the desktop is open arrives
-    /// on the next poll, even after Show more.
+    /// One `agent.list` per refresh (#826): normally the first recent page
+    /// with every state's total, merged into the loaded history without
+    /// dropping appended older pages, so a launch or a state change while
+    /// the desktop is open arrives on the next poll, even after Show more.
+    /// When the last totals moved, that refresh reads instead what they
+    /// said is stale: the attention rows beyond the first page (an old
+    /// waiting Agent is never cut off by newer history), or the archived
+    /// counts.
     pub(super) fn refresh_head(&mut self, context: &ComponentContext<Self>) {
         let Ok(data_dir) = self.data_dir.clone() else {
             return;
         };
+        self.load_attention_reports(context);
+        if std::mem::take(&mut self.nav.attention_due) {
+            self.nav.list_epoch += 1;
+            self.nav.agents_loading = true;
+            self.load_attention(context);
+            return;
+        }
         self.nav.list_epoch += 1;
         let list_epoch = self.nav.list_epoch;
         self.nav.agents_loading = true;
+        if std::mem::take(&mut self.nav.archived_due) && !self.nav.show_archived {
+            self.spawn_read(context, move || {
+                ShellMsg::ArchivedLoaded(
+                    list_epoch,
+                    client::block_on(read_archived(&data_dir, AGENT_PAGE)),
+                )
+            });
+            return;
+        }
         let archived = self.nav.show_archived.then_some("include");
         let head = AgentListRequest {
             limit: AGENT_PAGE,
             order: AgentListOrder::Recent,
+            states: Some(eliot_core::api::AGENT_LIST_STATES.to_vec()),
             ..Default::default()
         };
         self.spawn_read(context, move || {
             ShellMsg::HeadLoaded(list_epoch, load_agents_blocking(&data_dir, &head, archived))
         });
-        self.load_attention(context);
-        self.load_attention_reports(context);
+    }
+
+    /// A refresh read these totals with these first-page rows: the next
+    /// refresh reads the attention rows when an attention state's total
+    /// moved and not all of them are on the page, and the archived counts
+    /// when the list's total moved. The first totals only set the mark (a
+    /// full load read both).
+    fn note_totals(&mut self, rows: &[UiAgent], totals: Vec<eliot_core::api::AgentStateTotal>) {
+        let attention = |totals: &[eliot_core::api::AgentStateTotal]| -> Vec<usize> {
+            ATTENTION_STATES
+                .iter()
+                .map(|state| {
+                    totals
+                        .iter()
+                        .find(|entry| entry.state == *state)
+                        .map_or(0, |entry| entry.total)
+                })
+                .collect()
+        };
+        let sum = |totals: &[eliot_core::api::AgentStateTotal]| -> usize {
+            totals.iter().map(|entry| entry.total).sum()
+        };
+        if let Some(last) = self.nav.list_totals.as_deref() {
+            let shown = rows
+                .iter()
+                .filter(|row| ATTENTION_STATES.contains(&row.state))
+                .count();
+            let now = attention(&totals);
+            if now != attention(last) && now.iter().sum::<usize>() > shown {
+                self.nav.attention_due = true;
+            }
+            if sum(&totals) != sum(last) {
+                self.nav.archived_due = true;
+            }
+        }
+        self.nav.list_totals = Some(totals);
+    }
+
+    /// The Agents page's fleet read (live rows) and its stopped rows feed
+    /// the sidebar while that page shows, instead of a second list read:
+    /// attention rows join the list as the attention read's would, and any
+    /// other row updates a row already listed. Archived rows stay out
+    /// unless Show archived lists them.
+    pub(super) fn take_fleet_rows(&mut self, rows: Vec<UiAgent>) {
+        let mut changed = false;
+        for row in rows {
+            if row.archived && !self.nav.show_archived {
+                continue;
+            }
+            match self.nav.agents.iter_mut().find(|agent| agent.id == row.id) {
+                Some(known) => {
+                    if *known != row {
+                        *known = row;
+                        changed = true;
+                    }
+                }
+                None if ATTENTION_STATES.contains(&row.state) => {
+                    self.nav.agents.push(row);
+                    changed = true;
+                }
+                None => {}
+            }
+        }
+        if changed {
+            self.refresh_search();
+        }
     }
 
     /// The Monitor's attention reports for the sidebar's rows: while the
