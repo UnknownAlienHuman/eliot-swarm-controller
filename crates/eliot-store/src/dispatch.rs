@@ -505,10 +505,10 @@ fn dispatch_worktree_remove_tx(
     }
     let old = workspace.clone();
     workspace.phase = WorkspacePhase::Removing;
-    workspace.outcome = Some(
-        json!({"stage": "removal", "command_id": id, "previous_phase": old.phase,
-            "native_git_write_dispatched": false}),
-    );
+    let mut marker = json!({"stage": "removal", "command_id": id, "previous_phase": old.phase,
+        "native_git_write_dispatched": false});
+    workspace::preserve_workspace_stop_id(old.outcome.as_ref(), &mut marker);
+    workspace.outcome = Some(marker);
     workspace.updated_at = now;
     workspace::persist_workspace(tx, &old, &workspace)?;
     update_command_state(tx, id, CommandState::Dispatched, None, None, now)?;

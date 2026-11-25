@@ -1157,6 +1157,12 @@ pub(super) fn preserve_native_git_write_marker(previous: Option<&Value>, outcome
     }
 }
 
+pub(super) fn preserve_workspace_stop_id(previous: Option<&Value>, outcome: &mut Value) {
+    if let Some(id) = previous.and_then(|value| value["stop_command_id"].as_str()) {
+        outcome["stop_command_id"] = json!(id);
+    }
+}
+
 fn removal_marker(
     tx: &Transaction<'_>,
     agent: i64,
@@ -1189,6 +1195,7 @@ fn removal_marker(
             last_available_git_observation(tx, agent, workspace)?;
     }
     preserve_native_git_write_marker(previous, &mut marker);
+    preserve_workspace_stop_id(previous, &mut marker);
     Ok(marker)
 }
 

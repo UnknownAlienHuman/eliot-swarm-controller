@@ -2222,7 +2222,7 @@ impl CodexPlugin {
                     .as_ref()
                     .filter(|progress| progress.command_id == command_id);
                 let (stage, message) = progress
-                    .and_then(|progress| progress.native_error.as_deref())
+                    .and_then(|progress| progress.native_error_for(&command_id))
                     .map_or((Lifecycle, error.message.as_str()), |error| {
                         (NativeEvent, error)
                     });
@@ -2248,7 +2248,7 @@ impl CodexPlugin {
                 state,
                 progress.turn_id.as_deref(),
                 NativeEvent,
-                progress.native_error.as_deref().unwrap_or(reason),
+                progress.native_error_for(&command_id).unwrap_or(reason),
             );
             outcome["reason"] = json!(reason);
             outcome["native_session_failure"] =
@@ -2264,17 +2264,15 @@ impl CodexPlugin {
                 "Codex compaction did not report a native turn ID",
             ));
         };
-        let incomplete_turn = |state, stage, message: &str| {
+        let incomplete_turn = |state, message: &str| {
             let (stage, message) = progress
-                .native_error
-                .as_deref()
-                .map_or((stage, message), |error| (NativeEvent, error));
+                .native_error_for(&command_id)
+                .map_or((Lifecycle, message), |error| (NativeEvent, error));
             incomplete(state, Some(turn_id), stage, message)
         };
         match progress.terminal_status.as_deref() {
             Some(status @ ("failed" | "interrupted")) => Ok(incomplete_turn(
                 "failed",
-                Lifecycle,
                 &format!("Codex reported native compaction {status}"),
             )),
             Some("completed")
@@ -2289,7 +2287,12 @@ impl CodexPlugin {
                     Ok(thread) => thread,
                     Err(error) => {
                         session.phase = SessionPhase::Unknown;
-                        return Ok(incomplete_turn("unknown", Readback, &error.message));
+                        return Ok(incomplete(
+                            "unknown",
+                            Some(turn_id),
+                            Readback,
+                            &error.message,
+                        ));
                     }
                 };
                 let latest = match read_latest_native_turn_status(
@@ -2301,7 +2304,12 @@ impl CodexPlugin {
                     Ok(latest) => latest,
                     Err(error) => {
                         session.phase = SessionPhase::Unknown;
-                        return Ok(incomplete_turn("unknown", Readback, &error.message));
+                        return Ok(incomplete(
+                            "unknown",
+                            Some(turn_id),
+                            Readback,
+                            &error.message,
+                        ));
                     }
                 };
                 if thread_state(&thread) == "idle"
@@ -2316,8 +2324,9 @@ impl CodexPlugin {
                     }))
                 } else {
                     session.phase = SessionPhase::Unknown;
-                    Ok(incomplete_turn(
+                    Ok(incomplete(
                         "unknown",
+                        Some(turn_id),
                         Readback,
                         "Codex readback did not confirm a completed compaction on the owned idle thread",
                     ))
@@ -2327,7 +2336,6 @@ impl CodexPlugin {
                 session.phase = SessionPhase::Unknown;
                 Ok(incomplete_turn(
                     "unknown",
-                    Lifecycle,
                     "Codex did not report a complete native compaction lifecycle",
                 ))
             }

@@ -1089,11 +1089,14 @@ impl WorkspaceManager {
         } else {
             outcome
         };
+        // Bound and redact all removal text, including a Git drain error, before
+        // it reaches the retained command, events or Owner inbox.
+        let outcome = self.redact_removal(outcome);
         let mut store = self.inner.store.lock().await;
         let change = store.settle_workspace_removal(
             &command.id,
             preparation.target_generation,
-            self.redact_removal(outcome),
+            outcome,
             now_ms(),
         )?;
         self.publish(&change.events);
