@@ -21,27 +21,6 @@ fn warning_batch_id(native_id: &str, batch_id: &str) -> bool {
         })
 }
 
-/// Last batch identity that incremented one warning row. An exact resend
-/// carries the recorded identity and merges without incrementing; every new
-/// notice mints a fresh nonce and counts.
-fn record_warning_batch(
-    tx: &Transaction<'_>,
-    agent: i64,
-    generation: i64,
-    native_id: &str,
-    batch_id: &str,
-) -> Result<()> {
-    tx.execute(
-        "INSERT INTO warning_merge_state(agent, generation, native_id, last_batch_id)
-         VALUES (?1, ?2, ?3, ?4)
-         ON CONFLICT (agent, generation, native_id)
-         DO UPDATE SET last_batch_id = excluded.last_batch_id",
-        params![agent, generation, native_id, batch_id],
-    )
-    .map_err(sql_error)?;
-    Ok(())
-}
-
 /// A merged warning is acknowledged by its original sequence without a
 /// second event.
 fn warning_replay(seq: i64, refused: Vec<usize>) -> BatchCommit {
@@ -1046,6 +1025,19 @@ impl Store {
         }
         require_nonempty(&batch.batch_id, "batch_id")?;
         require_nonempty(&batch.source, "source")?;
+        // Stamp the committing batch identity into a warning singleton up
+        // front, so the ordinary insert path persists the merge record with
+        // the first row. The stamp travels with an exact resend, while every
+        // new notice mints a fresh nonce.
+        if batch.source == "stream"
+            && batch.events.len() == 1
+            && batch.events[0].kind == core::NATIVE_WARNING_EVENT
+            && core::NativeWarning::has_stable_id_shape(&batch.events[0].native_id)
+            && warning_batch_id(&batch.events[0].native_id, &batch.batch_id)
+            && let Some(object) = batch.events[0].data.as_object_mut()
+        {
+            object.insert("last_batch_id".to_owned(), json!(batch.batch_id.as_str()));
+        }
         if batch.events.is_empty() {
             return Err(Error::new("invalid", "native batch must contain an event"));
         }
@@ -1253,16 +1245,8 @@ impl Store {
             // The increment is idempotent per submission: the producer mints
             // one batch nonce per notice, so an exact resend carries the batch
             // identity that already incremented the row while a later notice
-            // never does.
-            let last_batch: Option<String> = tx
-                .query_row(
-                    "SELECT last_batch_id FROM warning_merge_state
-                     WHERE agent=?1 AND generation=?2 AND native_id=?3",
-                    params![agent_num, batch.generation, event.native_id],
-                    |row| row.get(0),
-                )
-                .optional()
-                .map_err(sql_error)?;
+            // never does. The identity lives in the retained row itself, so
+            // event retention prunes the record with it.
             if let Some((seq, data)) = retained {
                 let retained: core::NativeWarning = serde_json::from_value(decode_json(&data)?)
                     .map_err(|_| Error::new("source_integrity", "retained warning is invalid"))?;
@@ -1278,21 +1262,21 @@ impl Store {
                         "warning identity collides with different retained content",
                     ));
                 }
-                if last_batch.as_deref() == Some(batch.batch_id.as_str()) {
+                if retained.last_batch_id.as_deref() == Some(batch.batch_id.as_str()) {
                     return Ok(warning_replay(seq, refused));
                 }
                 // Each new batch carries one occurrence, so identical warnings
                 // merge into this row by adding the incoming increment to the
                 // retained total. The total lives in the Store, never in
-                // process memory, so it survives producer restarts. Retained
-                // rows are annotated in place, like other retained-row
-                // annotations; the per-warning submission record below keeps
-                // resends from incrementing twice.
+                // process memory, so it survives producer restarts. The row
+                // is annotated in place, like other retained-row annotations,
+                // and records the incrementing batch identity with it.
                 let total = retained.count.saturating_add(incoming.count);
                 if total > retained.count {
                     let mut stored: Value = decode_json(&data)?;
                     if let Some(object) = stored.as_object_mut() {
                         object.insert("count".to_owned(), json!(total));
+                        object.insert("last_batch_id".to_owned(), json!(batch.batch_id.as_str()));
                     }
                     tx.execute(
                         "UPDATE events SET data=?1 WHERE seq=?2",
@@ -1300,25 +1284,11 @@ impl Store {
                     )
                     .map_err(sql_error)?;
                 }
-                record_warning_batch(
-                    tx,
-                    agent_num,
-                    batch.generation,
-                    &event.native_id,
-                    &batch.batch_id,
-                )?;
                 return Ok(warning_replay(seq, refused));
             }
-            // First occurrence takes the ordinary insert path below; record
-            // its batch identity first so a resend merges instead of
-            // inserting a second row.
-            record_warning_batch(
-                tx,
-                agent_num,
-                batch.generation,
-                &event.native_id,
-                &batch.batch_id,
-            )?;
+            // First occurrence takes the ordinary insert path below; it
+            // already carries the stamped batch identity, so a resend merges
+            // instead of inserting a second row.
         }
         if source.last_batch_id.as_deref() == Some(batch.batch_id.as_str()) {
             if source.cursor == batch.cursor

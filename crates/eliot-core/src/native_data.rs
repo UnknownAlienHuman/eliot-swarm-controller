@@ -18,6 +18,11 @@ pub struct NativeWarning {
     pub count: u64,
     pub message: String,
     pub truncated: bool,
+    /// Last submission batch that incremented the retained row. Store merge
+    /// bookkeeping, never producer input: the producer always omits it and
+    /// the Store stamps the committing batch identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_batch_id: Option<String>,
 }
 
 impl NativeWarning {

@@ -1190,7 +1190,8 @@ retains no warning text. Malformed warning and startup-status payloads increment
 identity for these notifications. The adapter assigns a content ID from the
 exact thread and a deterministic digest of the full redacted native code and
 message before display aggregation or truncation; the occurrence count is
-excluded and no extra fields enter the persisted warning. Store accepts the neutral
+excluded from identity. The Store stamps the last incrementing batch identity
+as merge bookkeeping in the retained row. Store accepts the neutral
 `native-warning-content:` marker only for a typed singleton stream warning on
 the current thread. A matching retained row for the same Agent and
 `stream` source returns its original one-event sequence as the acknowledgement without
@@ -1199,8 +1200,11 @@ generation. Count changes and the `other` display bucket do not alter identity.
 The retained row adds each incoming unit count in place, like other
 retained-row annotations, so repeated identical notices are counted without a
 second event and the total survives restarts. Each notice carries a
-per-submission batch nonce, and the Store records the last batch identity per
-warning ID, so an exact resend merges without incrementing twice.
+per-submission batch nonce, and the retained row records the last batch
+identity that incremented it, so an exact resend merges without incrementing
+twice. Only the last uncommitted batch is ever resent, so a resend of an older
+batch after a newer commit cannot happen; a re-observation by the adapter
+counts again.
 Legacy warning IDs keep their existing receipt behavior. Deduplication lasts
 only while the matching warning row is retained under the configured event-retention
 window; pruning that row permits a later identical warning to be admitted again. Different Agents, native threads,

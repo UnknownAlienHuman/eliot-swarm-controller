@@ -152,6 +152,7 @@ impl Warnings {
             count: 1,
             message,
             truncated,
+            last_batch_id: None,
         };
         let data = serde_json::to_value(warning)
             .map_err(|_| Error::new("internal", "Codex warning could not be encoded"))?;

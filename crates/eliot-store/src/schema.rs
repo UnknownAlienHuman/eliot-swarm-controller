@@ -1,6 +1,6 @@
 use super::*;
 
-pub(super) const CURRENT_SCHEMA_VERSION: i64 = WARNING_MERGE_STATE_VERSION;
+pub(super) const CURRENT_SCHEMA_VERSION: i64 = AUTONOMY_OUTCOMES_VERSION;
 const HARNESS_CHECK_SCHEMA_VERSION: i64 = 112;
 const WORK_TRUTH_VERSION: i64 = 113;
 const WORK_TRUTH_INTENT_VERSION: i64 = 114;
@@ -44,7 +44,6 @@ const PROJECT_CHECK_OBLIGATIONS_VERSION: i64 = 151;
 const ASSIGNMENT_USAGE_VERSION: i64 = 152;
 const REMOTE_MANAGERS_VERSION: i64 = 153;
 const AUTONOMY_OUTCOMES_VERSION: i64 = 154;
-const WARNING_MERGE_STATE_VERSION: i64 = 155;
 
 fn has_restart_continuation_brief_column(connection: &Connection) -> Result<bool> {
     connection
@@ -2829,18 +2828,6 @@ impl Store {
         }
         if current < AUTONOMY_OUTCOMES_VERSION {
             self.migrate_sql(autonomy::OUTCOME_INDEXES, Some(AUTONOMY_OUTCOMES_VERSION))?;
-        }
-        if current < WARNING_MERGE_STATE_VERSION {
-            self.migrate_sql(
-                "CREATE TABLE warning_merge_state (
-                     agent INTEGER NOT NULL REFERENCES agents(id),
-                     generation INTEGER NOT NULL,
-                     native_id TEXT NOT NULL,
-                     last_batch_id TEXT NOT NULL,
-                     PRIMARY KEY (agent, generation, native_id)
-                 );",
-                Some(WARNING_MERGE_STATE_VERSION),
-            )?;
         }
         Ok(())
     }
