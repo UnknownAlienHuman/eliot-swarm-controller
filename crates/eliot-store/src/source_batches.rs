@@ -680,6 +680,60 @@ impl Store {
         result
     }
 
+    /// Commit ready tool observations in one FULL-WAL transaction. Each
+    /// source keeps its own acknowledgement or rejection in input order.
+    pub fn put_tool_batch_group(
+        &mut self,
+        batches: Vec<SourceBatch>,
+        now: i64,
+    ) -> Vec<Result<BatchCommit>> {
+        let count = batches.len();
+        let result = (|| {
+            self.ensure_writer_healthy()?;
+            let mut keys = HashSet::with_capacity(count.min(8));
+            if !(1..=8).contains(&count)
+                || batches.iter().any(|batch| {
+                    batch.source != "stream"
+                        || !(1..=16).contains(&batch.events.len())
+                        || batch.events.iter().any(|event| {
+                            !matches!(event.kind.as_str(), "tool.started" | "tool.completed")
+                        })
+                        || !keys.insert((batch.agent_id.as_str(), batch.generation))
+                })
+            {
+                return Err(Error::new("invalid", "invalid ready tool batch group"));
+            }
+            drop(keys);
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            let mut outcomes = Vec::with_capacity(count);
+            for batch in batches {
+                tx.execute_batch("SAVEPOINT ready_tool_batch")
+                    .map_err(sql_error)?;
+                let outcome = Self::put_batch_tx(&tx, batch, None, None, None, None, now);
+                if let Err(error) = &outcome {
+                    if matches!(error.code.as_str(), "internal" | "unknown") {
+                        return Err(error.clone());
+                    }
+                    tx.execute_batch("ROLLBACK TO ready_tool_batch")
+                        .map_err(sql_error)?;
+                }
+                tx.execute_batch("RELEASE ready_tool_batch")
+                    .map_err(sql_error)?;
+                outcomes.push(outcome);
+            }
+            commit_source_batch(tx, &self.write_faulted)?;
+            Ok(outcomes)
+        })();
+        self.fault_on_persistence_error(&result);
+        match result {
+            Ok(outcomes) => outcomes,
+            Err(error) => (0..count).map(|_| Err(error.clone())).collect(),
+        }
+    }
+
     pub fn put_batch_with_completion_capture(
         &mut self,
         batch: SourceBatch,
@@ -727,6 +781,37 @@ impl Store {
 
     fn put_batch_inner(
         &mut self,
+        batch: SourceBatch,
+        expected_subject: Option<(&str, &str)>,
+        native_producer: Option<(&str, i64)>,
+        completion_worktree: Option<CompletionWorktreeCapture>,
+        project_check: Option<bool>,
+        now: i64,
+    ) -> Result<BatchCommit> {
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sql_error)?;
+        let result = Self::put_batch_tx(
+            &tx,
+            batch,
+            expected_subject,
+            native_producer,
+            completion_worktree,
+            project_check,
+            now,
+        );
+        match result {
+            Ok(commit) => {
+                commit_source_batch(tx, &self.write_faulted)?;
+                Ok(commit)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn put_batch_tx(
+        tx: &Transaction<'_>,
         mut batch: SourceBatch,
         expected_subject: Option<(&str, &str)>,
         native_producer: Option<(&str, i64)>,
@@ -757,7 +842,7 @@ impl Store {
                 "native batch exceeds 1,000 events",
             ));
         }
-        if encode_json(&batch)?.len() > MAX_PAGE_BYTES {
+        if encode_json(&batch)?.len() > core::limits::MAX_SOURCE_BATCH_BYTES {
             return Err(Error::new(
                 "frame_too_large",
                 "native batch exceeds 900 KiB",
@@ -820,11 +905,7 @@ impl Store {
             publication.push(published);
         }
 
-        let tx = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(sql_error)?;
-        let mut projection = load_agent_by_num(&tx, agent_num)?.ok_or_else(|| {
+        let mut projection = load_agent_by_num(tx, agent_num)?.ok_or_else(|| {
             Error::new(
                 "not_found",
                 format!("Agent {} was not found", batch.agent_id),
@@ -832,7 +913,7 @@ impl Store {
         })?;
         if let Some((producer, generation)) = native_producer {
             native_children::require_grant(
-                &tx,
+                tx,
                 producer,
                 generation,
                 &projection,
@@ -859,7 +940,7 @@ impl Store {
                 }
             }
         } else if let Some(subject) = expected_subject {
-            observer::require_live_subject(&tx, &projection, batch.generation, subject)?;
+            observer::require_live_subject(tx, &projection, batch.generation, subject)?;
             let families = batch
                 .events
                 .iter()
@@ -874,7 +955,7 @@ impl Store {
                     Ok(family.to_owned())
                 })
                 .collect::<Result<Vec<_>>>()?;
-            observer_live::require_transcript_families(&tx, &projection, &batch.source, &families)?;
+            observer_live::require_transcript_families(tx, &projection, &batch.source, &families)?;
         } else {
             observer::require_controlled(&projection)?;
         }
@@ -901,7 +982,7 @@ impl Store {
                 ),
             ));
         }
-        let source = load_source_state(&tx, agent_num, batch.generation, &batch.source)?
+        let source = load_source_state(tx, agent_num, batch.generation, &batch.source)?
             .ok_or_else(|| Error::new("source_integrity", "source has no committed state"))?;
 
         if source.last_batch_id.as_deref() == Some(batch.batch_id.as_str()) {
@@ -909,7 +990,7 @@ impl Store {
                 && source.cursor == batch.cursor
             {
                 let mut native_wake_cancel = read_native_wake_cancellation(
-                    &tx,
+                    tx,
                     agent_num,
                     batch.generation,
                     source.last_batch_first_seq.unwrap_or_default(),
@@ -929,7 +1010,7 @@ impl Store {
                     ).map_err(sql_error)?;
                     if !already_recorded {
                         events.push(insert_daemon_event(
-                            &tx,
+                            tx,
                             now,
                             "turn.native_wake_cancel_dropped",
                             "turn",
@@ -952,7 +1033,6 @@ impl Store {
                     permission_refusal: None,
                     native_wake_cancel,
                 };
-                commit_source_batch(tx, &self.write_faulted)?;
                 return Ok(BatchCommit { ack, events });
             }
             return Err(Error::new(
@@ -1027,7 +1107,7 @@ impl Store {
         for (index, (source_event, published)) in batch.events.iter().zip(&publication).enumerate()
         {
             if source_event.kind == core::UNCLASSIFIED_NATIVE_EVENT
-                && !admit_native_diagnostic(&tx, &projection)?
+                && !admit_native_diagnostic(tx, &projection)?
             {
                 dropped_unclassified += 1;
                 continue;
@@ -1040,7 +1120,7 @@ impl Store {
                 && source_event.data["command_id"].is_null()
                 && let Some(turn_id) = source_event.data["turn_id"].as_str()
                 && let Some(cancellation) =
-                    native_events::native_wake_cancellation(&tx, agent_num, &projection, turn_id)?
+                    native_events::native_wake_cancellation(tx, agent_num, &projection, turn_id)?
             {
                 let mut event = published.as_ref().clone();
                 event.data["native_wake_cancel"] = json!(cancellation);
@@ -1093,7 +1173,7 @@ impl Store {
             let native_event = enriched.as_ref().unwrap_or_else(|| published.as_ref());
             if !observed {
                 validate_resume_ready_subject_tx(
-                    &tx,
+                    tx,
                     &projection,
                     agent_num,
                     batch.generation,
@@ -1105,14 +1185,14 @@ impl Store {
             // refused as inactive.
             let resolves_recovered = !observed
                 && turn_recovery::resolves_recovered_turn_tx(
-                    &tx,
+                    tx,
                     &projection,
                     agent_num,
                     batch.generation,
                     native_event,
                 )?;
             let (mut next, effects) = if observed {
-                observer_live::persist_turn_fact(&tx, &projection, native_event)?;
+                observer_live::persist_turn_fact(tx, &projection, native_event)?;
                 (projection.clone(), Vec::new())
             } else if resolves_recovered
                 && projection.active_turn.as_deref() != native_event.data["turn_id"].as_str()
@@ -1133,7 +1213,7 @@ impl Store {
             let event_digest = &event_payload_digests[index];
             let cause = if !observed {
                 verified_native_event_cause_tx(
-                    &tx,
+                    tx,
                     &projection,
                     agent_num,
                     batch.generation,
@@ -1149,7 +1229,7 @@ impl Store {
                 None
             };
             let stored = insert_native_event(
-                &tx,
+                tx,
                 NativeEventInsert {
                     ts: native_event.ts.unwrap_or(now),
                     native_event,
@@ -1164,7 +1244,7 @@ impl Store {
                 },
             )?;
             let (effects, hold_events) = persist_effects(
-                &tx,
+                tx,
                 &effects,
                 agent_num,
                 batch.generation,
@@ -1173,7 +1253,7 @@ impl Store {
                 &next,
             )?;
             if let Some(event) = provider_response_route_event_tx(
-                &tx,
+                tx,
                 &next,
                 native_event,
                 &batch.source,
@@ -1203,7 +1283,7 @@ impl Store {
             command_events.extend(effects);
             if resolves_recovered {
                 provider_events.push(turn_recovery::insert_native_resolution_tx(
-                    &tx,
+                    tx,
                     agent_num,
                     batch.generation,
                     native_event,
@@ -1214,7 +1294,7 @@ impl Store {
             }
             if let Some(cause) = cause.as_ref() {
                 for mut event in hold_events {
-                    annotate_new_event_cause_tx(&tx, &mut event, cause.clone())?;
+                    annotate_new_event_cause_tx(tx, &mut event, cause.clone())?;
                     provider_events.push(event);
                 }
             } else {
@@ -1222,20 +1302,20 @@ impl Store {
             }
             if next.is_terminal() {
                 command_events.extend(terminalize_generation_commands(
-                    &tx,
+                    tx,
                     agent_num,
                     batch.generation,
                     now,
                     "session_ended",
                     native_event.kind == "session.ended",
                 )?);
-                stale_generation_requests(&tx, agent_num, batch.generation)?;
+                stale_generation_requests(tx, agent_num, batch.generation)?;
             }
             if !observed {
-                update_agent_projection(&tx, &next)?;
+                update_agent_projection(tx, &next)?;
                 if !resolves_recovered && batch.source == "stream" {
                     switch::reserve_provider_switch_tx(
-                        &tx,
+                        tx,
                         &next,
                         native_event,
                         now,
@@ -1253,7 +1333,7 @@ impl Store {
         // event follows those rows but commits in the same transaction.
         for command_event in command_events {
             committed_events.push(insert_daemon_command_event(
-                &tx,
+                tx,
                 now,
                 &command_event.kind(),
                 Some(agent_num),
@@ -1266,7 +1346,7 @@ impl Store {
         if !observed {
             if projection.state == AgentState::Stopped {
                 goals::pause_for_stop_tx(
-                    &tx,
+                    tx,
                     agent_num,
                     batch.generation,
                     now,
@@ -1275,7 +1355,7 @@ impl Store {
             }
             if projection.is_terminal() {
                 native_children::end_native_children_with_parent_tx(
-                    &tx,
+                    tx,
                     Some((agent_num, batch.generation)),
                     now,
                     &mut committed_events,
@@ -1285,7 +1365,7 @@ impl Store {
                 .iter()
                 .any(|event| matches!(event.kind.as_str(), "session.ready" | "turn.completed"))
             {
-                goals::continue_stop_paused_goal_tx(&tx, agent_num, now, &mut committed_events)?;
+                goals::continue_stop_paused_goal_tx(tx, agent_num, now, &mut committed_events)?;
             }
         }
         committed_events.sort_by_key(|event| event.seq);
@@ -1317,8 +1397,7 @@ impl Store {
             ],
         ));
         let native_wake_cancel =
-            read_native_wake_cancellation(&tx, agent_num, batch.generation, first_seq, last_seq)?;
-        commit_source_batch(tx, &self.write_faulted)?;
+            read_native_wake_cancellation(tx, agent_num, batch.generation, first_seq, last_seq)?;
         Ok(BatchCommit {
             ack: BatchAck {
                 first_seq,

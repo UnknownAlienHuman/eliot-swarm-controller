@@ -388,6 +388,15 @@ not a parallel live producer. No proven replay cursor means gap + exact current
 readback, never full-history republishing. Child completion needs exact tool/task
 provenance, not parent idle. Resumed cumulative cost is session scope, not a turn delta.
 
+Claude stdout uses lossless bounded backpressure: when the event queue fills, the
+reader holds the current complete frame and waits for queue space while continuing
+to honor the existing post-exit drain deadline. If that deadline expires before the
+held frame and remaining stdout coverage are delivered, the stream becomes `Overflow`,
+pending outcomes become `unknown`, and the consumer records the existing stream gap.
+Recovery is a fresh exact current readback where available; transcript inspection is
+observation only. With no proven replay cursor, do not resend input or republish
+transcript history automatically.
+
 ## Login
 
 The standalone CLI uses its own authentication. Before launch or resume,

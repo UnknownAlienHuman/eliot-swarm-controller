@@ -14,6 +14,7 @@
 
 use std::{ffi::OsString, path::Path, time::Duration};
 
+use eliot_core::limits::MAX_SOURCE_BATCH_BYTES;
 use eliot_core::{
     ContextItem, ContextOutcome, Error, InjectPoint, NativeEvent, PermissionRefusal, ProcessRecord,
     ProcessState, ProviderRestriction, Result, SecretPolicy, SessionUsage, SourceBatch, SourceGap,
@@ -1200,6 +1201,57 @@ impl StreamSource<'_> {
             .map(|_| ())
     }
 
+    /// Commit contiguous tool facts from one native frame in order. These
+    /// observations carry no control-specific acknowledgement.
+    pub async fn commit_tool_events(&mut self, mut events: Vec<NativeEvent>) -> Result<()> {
+        const MAX_TOOL_EVENTS_PER_BATCH: usize = 16;
+        if events
+            .iter()
+            .any(|event| !matches!(event.kind.as_str(), "tool.started" | "tool.completed"))
+        {
+            return Err(Error::new(
+                "internal",
+                "tool batch contains a non-tool event",
+            ));
+        }
+        if events.len() == 1 {
+            let event = events.pop().expect("one tool event");
+            return self
+                .commit_event(&event.kind, event.native_id, event.data)
+                .await;
+        }
+
+        let mut events = events.into_iter().peekable();
+        while let Some(first) = events.next() {
+            let mut batch = self.event_batch(vec![first]);
+            let mut size = serde_json::to_vec(&batch)
+                .map_err(|_| Error::new("internal", "tool event batch could not be encoded"))?
+                .len();
+            if size > MAX_SOURCE_BATCH_BYTES {
+                return Err(Error::new(
+                    "frame_too_large",
+                    "tool event exceeds the native batch byte limit",
+                ));
+            }
+            while batch.events.len() < MAX_TOOL_EVENTS_PER_BATCH {
+                let Some(next) = events.peek() else {
+                    break;
+                };
+                let added = serde_json::to_vec(next)
+                    .map_err(|_| Error::new("internal", "tool event could not be encoded"))?
+                    .len()
+                    + 1;
+                if size + added > MAX_SOURCE_BATCH_BYTES {
+                    break;
+                }
+                size += added;
+                batch.events.push(events.next().expect("peeked tool event"));
+            }
+            self.commit_batch_ack(batch).await?;
+        }
+        Ok(())
+    }
+
     /// Send a best-effort usage sample. Terminal events use the ordinary
     /// acknowledged source batch independently of this readback.
     pub async fn report_session_usage_sample(
@@ -1253,35 +1305,44 @@ impl StreamSource<'_> {
         native_id: String,
         data: Value,
     ) -> Result<eliot_core::BatchAck> {
+        let batch = self.event_batch(vec![NativeEvent {
+            kind: kind.to_owned(),
+            native_id,
+            data,
+            ts: None,
+        }]);
+        self.commit_batch_ack(batch).await
+    }
+
+    fn event_batch(&self, events: Vec<NativeEvent>) -> SourceBatch {
+        SourceBatch {
+            batch_id: format!("{}:batch", events[0].native_id),
+            agent_id: self.agent_id.to_owned(),
+            generation: self.generation,
+            source: "stream".to_owned(),
+            events,
+            cursor: None,
+        }
+    }
+
+    async fn commit_batch_ack(&mut self, batch: SourceBatch) -> Result<eliot_core::BatchAck> {
         if *self.writes_blocked {
             return Err(Error::new(
                 "unknown",
                 format!("{} event acknowledgement is unresolved", self.harness),
             ));
         }
-        let request_id = data
-            .get("request_id")
-            .and_then(Value::as_str)
-            .map(str::to_owned);
-        let turn_id = data
-            .get("turn_id")
-            .and_then(Value::as_str)
-            .map(str::to_owned);
-        let native_wake = kind == "turn.started"
-            && data["native_trigger"].is_string()
-            && data["command_id"].is_null();
-        let batch = SourceBatch {
-            batch_id: format!("{native_id}:batch"),
-            agent_id: self.agent_id.to_owned(),
-            generation: self.generation,
-            source: "stream".to_owned(),
-            events: vec![NativeEvent {
-                kind: kind.to_owned(),
-                native_id,
-                data,
-                ts: None,
-            }],
-            cursor: None,
+        let (request_id, turn_id, native_wake) = match batch.events.as_slice() {
+            [event] => (
+                (event.kind == "request.opened")
+                    .then(|| event.data["request_id"].as_str().map(str::to_owned))
+                    .flatten(),
+                event.data["turn_id"].as_str().map(str::to_owned),
+                event.kind == "turn.started"
+                    && event.data["native_trigger"].is_string()
+                    && event.data["command_id"].is_null(),
+            ),
+            _ => (None, None, false),
         };
         let ack = match self
             .sink
@@ -1290,7 +1351,11 @@ impl StreamSource<'_> {
         {
             Ok(ack) => ack,
             Err(error) if crate::is_definite_batch_rejection(&error.code) => {
-                return Err(error.with_where("plugin.events.put"));
+                if error.failure_where.as_deref() != Some("plugin.events.put") {
+                    self.note_event_failure(&error, "native batch could not reach Store")
+                        .await;
+                }
+                return Err(error);
             }
             Err(error) => {
                 *self.writes_blocked = true;
@@ -1304,8 +1369,7 @@ impl StreamSource<'_> {
             }
         };
         if ack.permission_refusal.as_ref().is_some_and(|refusal| {
-            kind != "request.opened"
-                || refusal.agent_id != self.agent_id
+            refusal.agent_id != self.agent_id
                 || refusal.generation != self.generation
                 || request_id.as_deref() != Some(refusal.request_id.as_str())
                 || turn_id.as_deref() != Some(refusal.turn_id.as_str())

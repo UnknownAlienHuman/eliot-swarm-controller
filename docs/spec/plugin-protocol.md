@@ -573,6 +573,16 @@ Host validates generation/owner/correlations and accepts either a wholly new bat
 an exact duplicate of its last committed batch. Commit events, current projections,
 derived facts, cursor and last-batch acknowledgement together before replying/publishing.
 The next commit replaces only that last-batch acknowledgement in `source_state`.
+Claude batches contiguous tool facts within one native frame, up to 16 facts
+and the source batch byte limit. Each group keeps native order and gets one
+durable acknowledgement. It submits the group immediately. Permission calls
+and exact turn terminals keep their individual acknowledgements.
+At the Store writer, a caller may commit up to eight already-queued tool
+batches from distinct Agent generations in one FULL-WAL transaction. A
+savepoint isolates each definite source rejection. The host publishes
+committed facts in Store order and releases the individual acknowledgements
+after that transaction commits. A full ready queue uses ordinary single-batch
+admission. There is no timer or separate worker.
 
 Same id with another semantic payload/cursor, or mixed new/duplicate events, is a
 source-integrity rejection. The host replies with the committed acknowledgement or
@@ -582,12 +592,15 @@ Store cannot establish. After an unusable acknowledgement or broken channel, the
 adapter stops publishing and the daemon retires the reader and records the missing
 coverage. Adapters do not reconcile or retry event writes through `source.state`.
 
-The host records gaps and health from rejected batches for authorized source owners.
+The host commits coverage gaps for rejected batches from authorized sources
+before returning a definitive rejection. If the gap cannot commit within the
+reply deadline, coverage stays unknown and the reader is retired.
 A buffered processing failure marks the source outcome unknown. When the host rejects
-the commit at `plugin.events.put`, the adapter retains the original structured error
-where it propagates the failure and leaves gap settlement to the host. Other
-processing failures attempt a gap if publication is still possible. The adapter does
-not replay the failed fact.
+the commit at `plugin.events.put`, the adapter retains the structured error
+and leaves gap settlement to the host. Local failures before dispatch, including
+request queue admission, attempt an adapter gap when publication remains possible.
+An unconfirmed gap leaves coverage unknown. The adapter does not replay the failed
+fact.
 A rejected `session.ready` before input can fail the start definitively. A rejected
 write after native input dispatch leaves the native outcome unknown unless separately
 proven. The exact dispatched command/turn binding still fences fresh input until
