@@ -3,7 +3,8 @@ use eliot_core::api::{
     AutonomyChecks, AutonomyExecutorProfile, AutonomyExecutorSwarm, AutonomyNotes, AutonomyRow,
     AutonomySteer, AutonomyWaits, AutonomyWorkInGit, SWARM_MAIL_SENDER,
 };
-use rusqlite::{Connection, params};
+use rusqlite::{params, Connection};
+use std::collections::HashMap;
 
 const MAX_INPUT_ROWS: usize = 10_000;
 const INPUT_PROBE_ROWS: i64 = MAX_INPUT_ROWS as i64 + 1;
@@ -218,7 +219,7 @@ fn read_shell_activity(
 ) -> eliot_core::Result<(AutonomyRow<AutonomyChecks>, AutonomyRow<AutonomyWaits>)> {
     let mut statement = tx
         .prepare(concat!(
-            "SELECT json_extract(e.data, '$.tool'), json_extract(e.data, '$.command'),
+            "SELECT e.agent, json_extract(e.data, '$.tool'), json_extract(e.data, '$.command'),
                     COALESCE(json_extract(e.data, '$.command_truncated'), 0),
                     (SELECT json_extract(c.args, '$._project_check_goal.check')
                      FROM commands c INDEXED BY autonomy_activity_launch
@@ -234,15 +235,19 @@ fn read_shell_activity(
     let rows = statement
         .query_map(params![since, until, INPUT_PROBE_ROWS], |row| {
             Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, Option<String>>(1)?,
-                row.get::<_, bool>(2)?,
-                row.get::<_, Option<String>>(3)?,
+                row.get::<_, Option<i64>>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, bool>(3)?,
+                row.get::<_, Option<String>>(4)?,
             ))
         })
         .map_err(crate::sql_error)?;
     let mut manual = 0;
     let mut waits = 0;
+    // A generation's frozen launch check is repeated for every shell start it
+    // produces. Decode it once per Agent instead of once per retained event.
+    let mut project_checks = HashMap::new();
     let mut reasons =
         vec!["native command capture depends on the adapter and can be redacted".into()];
     let mut missing_command = false;
@@ -251,11 +256,12 @@ fn read_shell_activity(
             add_cap_reason(&mut reasons, "shell tool starts");
             break;
         }
-        let (tool, command, truncated, project_check) = row.map_err(crate::sql_error)?;
+        let (agent, tool, command, truncated, project_check) = row.map_err(crate::sql_error)?;
         missing_command |= truncated || command.is_none();
         let Some(command) = command else { continue };
-        let check: Option<Vec<String>> =
-            project_check.and_then(|argv| serde_json::from_str(&argv).ok());
+        let check = project_checks
+            .entry(agent)
+            .or_insert_with(|| project_check.and_then(|argv| serde_json::from_str(&argv).ok()));
         let (check_runs, is_wait) = super::shell::matches(&command, check.as_deref(), &tool);
         manual += check_runs;
         waits += u64::from(is_wait);
