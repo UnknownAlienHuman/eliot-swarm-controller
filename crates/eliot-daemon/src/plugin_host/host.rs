@@ -3185,14 +3185,20 @@ async fn resolve_send_config(
 /// Git roots for a sandboxed harness on a managed worktree, including the
 /// managed branch's ref and reflog parents needed by native Git.
 async fn resolve_commit_roots(actor: &AgentActorConfig) -> Vec<String> {
-    if !crate::work_truth::needs_commit_roots(&actor.agent.harness, &actor.agent.profile_snapshot) {
-        return Vec::new();
-    }
-    let (Some(workspace), Some(state)) = (actor.agent.workspace.as_deref(), actor.state.upgrade())
-    else {
+    let Some(state) = actor.state.upgrade() else {
         return Vec::new();
     };
-    let managed = state.store.lock().await.worktree_branch_base(workspace);
+    commit_roots_for(&actor.agent, &state.store).await
+}
+
+async fn commit_roots_for(agent: &Agent, store: &crate::rpc_latency::StoreHandle) -> Vec<String> {
+    if !crate::work_truth::needs_commit_roots(&agent.harness, &agent.profile_snapshot) {
+        return Vec::new();
+    }
+    let Some(workspace) = agent.workspace.as_deref() else {
+        return Vec::new();
+    };
+    let managed = store.lock().await.worktree_branch_base(workspace);
     let Ok(Some((branch, _))) = managed else {
         return Vec::new();
     };
@@ -3875,7 +3881,16 @@ fn data_root_only_mcp_environment(environment: &Value) -> Result<Value> {
     Ok(Value::Object(scoped))
 }
 
-pub(crate) fn validate_managed_start_profile(agent: &Agent) -> Result<Map<String, Value>> {
+fn start_wire_profile(agent: &Agent) -> Value {
+    let mut profile = agent.profile_snapshot.clone();
+    if let Some(values) = profile.as_object_mut() {
+        values.remove(crate::command_guard::SNAPSHOT_FIELD);
+        values.remove("pass_agent_identity_to_shell");
+    }
+    profile
+}
+
+fn validate_managed_start_profile(agent: &Agent) -> Result<Map<String, Value>> {
     let refusal = |message: String| {
         Error::new("profile_error", message)
             .with_where("plugin_host.start.profile")

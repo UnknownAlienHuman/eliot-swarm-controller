@@ -372,14 +372,7 @@ async fn run_agent_startup(
             .and_then(|state| state.agent_mcp_url.clone()),
         command_id: actor.start_command.id.clone(),
         owner_rules: actor.owner_rules.clone(),
-        profile: Some({
-            let mut profile = actor.agent.profile_snapshot.clone();
-            if let Some(values) = profile.as_object_mut() {
-                values.remove(crate::command_guard::SNAPSHOT_FIELD);
-                values.remove("pass_agent_identity_to_shell");
-            }
-            profile
-        }),
+        profile: Some(super::start_wire_profile(&actor.agent)),
         workspace: actor.agent.workspace.clone(),
         target_environment: Some(actor.target_environment.clone()),
         mcp_environment: actor.mcp_environment.clone(),

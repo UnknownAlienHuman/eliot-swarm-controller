@@ -1,21 +1,28 @@
-//! Read-only validation of the same retained inputs used for a managed start.
+//! Bounded validation in an owned adapter reader, before native dispatch.
 
-use super::{Router, plugin_host, validate_retained_resume_subject};
-use eliot_core::{Agent, Error, FailureOrigin, Result, api::UpdateProbeKind};
+use super::{Router, command::retained_resume_source, validate_retained_resume_subject};
+use eliot_core::{Agent, Result, api::UpdateProbeKind};
 
 impl Router {
-    pub(super) fn probe_retained_start(&self, agent: &Agent, kind: UpdateProbeKind) -> Result<()> {
-        plugin_host::validate_managed_start_profile(agent)?;
-        if kind == UpdateProbeKind::Resume {
-            validate_retained_resume_subject(agent)?;
-        }
-        if !eliot_core::api::is_supported_harness(&agent.harness) {
-            return Err(Error::new(
-                "implementation_gate",
-                "managed start adapter is unsupported",
-            )
-            .with_origin(FailureOrigin::Swarm, "local adapter availability"));
-        }
-        Ok(())
+    pub(super) async fn probe_retained_start(
+        &self,
+        agent: Agent,
+        kind: UpdateProbeKind,
+    ) -> Result<()> {
+        let source_state = if kind == UpdateProbeKind::Resume {
+            validate_retained_resume_subject(&agent)?;
+            let mut snapshot = {
+                let store = self.inner.store.lock().await;
+                retained_resume_source(&store, &agent)?
+            };
+            self.redact_native_value(&mut snapshot);
+            Some(snapshot)
+        } else {
+            None
+        };
+        self.inner
+            .plugin_host
+            .validate_retained_start(agent, source_state)
+            .await
     }
 }

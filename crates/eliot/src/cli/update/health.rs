@@ -71,14 +71,16 @@ async fn probes(
         tasks.spawn(async move {
             match read(
                 &path,
-                &UpdateHealthRequest::Probe {
+                &UpdateHealthRequest::AdapterProbe {
                     subject: subject.clone(),
                 },
                 deadline,
             )
             .await
             {
-                Some(UpdateHealthResponse::Probe { evidence }) if evidence.subject == subject => {
+                Some(UpdateHealthResponse::AdapterProbe { evidence })
+                    if evidence.subject == subject =>
+                {
                     evidence
                 }
                 _ => UpdateStartEvidence {

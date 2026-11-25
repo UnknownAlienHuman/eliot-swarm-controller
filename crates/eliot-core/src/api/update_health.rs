@@ -27,12 +27,12 @@ pub struct UpdateStartSubject {
 pub enum UpdateHealthRequest {
     Inventory,
     Boot,
-    Probe { subject: UpdateStartSubject },
+    AdapterProbe { subject: UpdateStartSubject },
 }
 
 impl UpdateHealthRequest {
     pub fn validate(&self) -> Result<()> {
-        if let Self::Probe { subject } = self {
+        if let Self::AdapterProbe { subject } = self {
             crate::parse_agent_id(&subject.agent)?;
             if subject.generation < 1
                 || !super::is_supported_harness(&subject.harness)
@@ -75,13 +75,7 @@ impl UpdateStartEvidence {
             && self.origin == Some(FailureOrigin::Swarm)
             && matches!(
                 self.code.as_deref(),
-                Some(
-                    "profile_error"
-                        | "invalid_settings"
-                        | "invalid_schema"
-                        | "schema_mismatch"
-                        | "implementation_gate"
-                )
+                Some("profile_error" | "invalid_settings")
             )
     }
 }
@@ -100,7 +94,7 @@ pub enum UpdateHealthResponse {
         requested: usize,
         attempts: Vec<UpdateStartEvidence>,
     },
-    Probe {
+    AdapterProbe {
         evidence: UpdateStartEvidence,
     },
 }

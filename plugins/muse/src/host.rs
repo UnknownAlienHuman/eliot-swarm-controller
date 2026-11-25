@@ -369,6 +369,7 @@ impl MusePlugin {
             "initialize" => self.initialize(&request.params),
             "model.list" => self.model_list(&request.params).await,
             "quota.read" => self.quota_read(&request.params).await,
+            "agent.validate_start" => self.validate_start(&request.params),
             "agent.start" => self.start(&request.params, client).await,
             "agent.command" => self.command(&request.params, deadline).await,
             "agent.snapshot" => self.snapshot(&request.params).await,
@@ -416,6 +417,22 @@ impl MusePlugin {
         }
         serde_json::to_value(muse_manifest())
             .map_err(|_| Error::new("internal", "Muse plugin manifest could not be encoded"))
+    }
+
+    fn validate_start(&self, raw: &Value) -> Result<Value> {
+        let params: AgentStartParams = decode(raw, "Muse agent.start params are invalid")?;
+        validate_identity(
+            &params.agent_id,
+            params.generation,
+            &params.command_id,
+            "Muse",
+        )?;
+        let initialized = self
+            .initialized
+            .as_ref()
+            .ok_or_else(|| not_initialized("Muse"))?;
+        start::prepare_profile(&params, initialized)?;
+        Ok(serde_json::json!({"validated": true}))
     }
 
     /// Settle a failed start: the settled marker refuses any second

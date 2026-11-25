@@ -3426,8 +3426,10 @@ backup over them.
 After the replacement becomes ready, the CLI reads the initial `on_restart`
 continuation outcomes for up to 30 seconds. When that pass requested no
 continuations, it checks one retained managed subject per harness against
-the local Resume or Launch validators. These readiness probes create no
-Agent, start no native process, and submit no model input. The exact retained
+the same adapter start-plan validator used by Resume or Launch, through a
+bounded adapter reader. These probes create no Agent, dispatch no native
+session, and submit no model input. Adapters without an equivalent planner
+report unknown. The exact retained
 generation and startup inputs bind the comparison to the previous daemon's
 accepted validation. The report exposes that binding, the outcomes, and
 any incomplete coverage under `startup_health`.

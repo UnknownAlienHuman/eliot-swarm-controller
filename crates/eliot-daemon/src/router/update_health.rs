@@ -73,7 +73,7 @@ impl Router {
                     attempts: boot.attempts.clone(),
                 }
             }
-            UpdateHealthRequest::Probe { subject: expected } => {
+            UpdateHealthRequest::AdapterProbe { subject: expected } => {
                 let agent = self.inner.store.lock().await.get_agent(&expected.agent)?;
                 let Some(agent) = agent else {
                     return Err(Error::new(
@@ -90,20 +90,22 @@ impl Router {
                         "update readiness subject changed",
                     ));
                 }
-                let (state, code, origin) = match self.probe_retained_start(&agent, expected.kind) {
-                    Ok(()) => (UpdateStartState::Ready, None, None),
-                    Err(error) => {
-                        let state =
-                            if matches!(error.code.as_str(), "unknown" | "unavailable" | "timeout")
-                            {
+                let (state, code, origin) =
+                    match self.probe_retained_start(agent, expected.kind).await {
+                        Ok(()) => (UpdateStartState::Ready, None, None),
+                        Err(error) => {
+                            let state = if matches!(
+                                error.code.as_str(),
+                                "unknown" | "unavailable" | "timeout" | "unsupported"
+                            ) {
                                 UpdateStartState::Unknown
                             } else {
                                 UpdateStartState::Refused
                             };
-                        (state, Some(error.code), error.origin)
-                    }
-                };
-                UpdateHealthResponse::Probe {
+                            (state, Some(error.code), error.origin)
+                        }
+                    };
+                UpdateHealthResponse::AdapterProbe {
                     evidence: UpdateStartEvidence {
                         subject: expected,
                         state,
