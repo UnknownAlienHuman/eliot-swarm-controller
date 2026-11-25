@@ -1700,11 +1700,13 @@ the ordinary revision-bound actions and cursor.
 | Project policy | Retained Swarm Agent creation, project policy applied flag and explicit opt-out reason from admission (#868). |
 | Steers | Retained steer commands classified by caller and automation cause. |
 | Checks | Captured shell invocations and recorded Swarm Goal or fast project check runs. `checks.counts.goal_rounds` reports completed, blocked, and unknown round outcomes from retained daemon `goal.round` events, including outcomes without a checker exit. Continued and retryable rounds do not contribute to those counts. Goal round coverage uses its own event bound and retention evidence. |
-| Waits | Captured shell invocations matching wait commands. |
+| Waits | Captured shell invocations matching wait commands. `waits.counts.idle_queue` counts interactive launch intents enqueued in the window, with total wait milliseconds from enqueue to admission, or to the window end for intents still queued. This measures time waiting for an Agent to be admitted. Timer waits and rejected intents lack a retained wait interval and are excluded. Receipt and command retention can leave gaps. |
 | Swarm fact notes | Deliveries, moves and cancellations of retained fact notes, with counts and confirmed corrections by kind. |
 | Owner backlog | All current decision subjects, including snoozed revisions, with per-kind counts and ages from each source row's recorded transition time. |
 | Usage | Retained normalized turn input and measured first-call context. The role is evaluated at turn completion. |
 | Work in Git | Retained `git.checkpoint` turn-end facts: turns whose whole state is in Git by commit or snapshot, snapshots and unrecorded turns. Applied `handoff.settled` facts, with the automatic ones counted. |
+| Unknown turns | `work_in_git.counts.unknown_turns` counts retained `turn.unknown` settlements in the window. Later resolution leaves the historical settlement in the count. |
+| Accepted-change cost | `work_in_git.counts.accepted_change_cost` reports observed normalized input, cached input and output tokens on completed managed turns, divided by the number of applied `git.integrate` commands that changed their pinned fast-forward target in the same window. This is fleet-level token usage per observed acceptance. It has no per-change attribution, billing amounts or evidence for changes accepted outside Swarm. With no observed tokens, no acceptance, or a capped acceptance scan, the ratio is unavailable. |
 | Executors calling Swarm | Retained turn starts and authenticated Swarm MCP starts attributed to executor activity, grouped by profile. |
 
 The attention worker samples liveness on startup and every three minutes (#871).

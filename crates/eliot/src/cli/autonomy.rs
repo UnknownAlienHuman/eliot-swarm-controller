@@ -117,6 +117,19 @@ fn print_report(report: &AutonomyResponse) {
     row("Shell waits", &report.waits, |counts| {
         println!("  {} calls", counts.calls)
     });
+    if let Some(queue) = report
+        .waits
+        .counts
+        .as_ref()
+        .and_then(|waits| waits.idle_queue.as_ref())
+    {
+        row("Interactive launch queue", queue, |counts| {
+            println!(
+                "  {} admitted, {} ms total waiting. {} pending, {} ms total waiting",
+                counts.admitted, counts.admitted_wait_ms, counts.pending, counts.pending_wait_ms
+            );
+        });
+    }
     row("Swarm fact notes", &report.notes, |counts| {
         println!(
             "  {} delivered, {} moved, {} cancelled, {} expired",
@@ -180,6 +193,27 @@ fn print_report(report: &AutonomyResponse) {
             counts.handoffs, counts.automatic_handoffs
         );
     });
+    if let Some(work) = &report.work_in_git.counts {
+        if let Some(unknown) = &work.unknown_turns {
+            row("Unknown turns", unknown, |counts| {
+                println!("  {} unknown settlements", counts.unknown);
+            });
+        }
+        if let Some(cost) = &work.accepted_change_cost {
+            row("Accepted-change cost", cost, |counts| {
+                let total = counts
+                    .observed_tokens
+                    .map_or_else(|| "unavailable".into(), |total| total.to_string());
+                let rate = counts
+                    .observed_tokens_per_accepted_change
+                    .map_or_else(|| "unavailable".into(), |rate| format!("{rate:.1}"));
+                println!(
+                    "  {} accepted changes, {total} observed tokens, {rate} tokens per accepted change",
+                    counts.accepted_changes
+                );
+            });
+        }
+    }
     row(
         "Executors calling Swarm",
         &report.executor_swarm,

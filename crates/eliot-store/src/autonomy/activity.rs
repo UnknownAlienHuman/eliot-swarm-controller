@@ -126,6 +126,8 @@ fn read_work_in_git(
         not_in_git: 0,
         handoffs: 0,
         automatic_handoffs: 0,
+        unknown_turns: Some(super::outcomes::unknown_turns(tx, since, until)?),
+        accepted_change_cost: None,
     };
     let mut statement = tx
         .prepare(
@@ -317,7 +319,10 @@ fn read_shell_activity(
     let wait_row = coverage_row(
         "native tool.started",
         reasons.clone(),
-        AutonomyWaits { calls: waits },
+        AutonomyWaits {
+            calls: waits,
+            idle_queue: None,
+        },
     );
 
     let (examined, goal_checks, completed, blocked, unknown, classified) = tx.query_row(
