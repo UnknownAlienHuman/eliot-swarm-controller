@@ -3283,7 +3283,12 @@ A writable Store rejects the affected queued SENDs with
 `restart_preparation_abandoned` and `native_dispatched: false`.
 Startup also settles SENDs parked by an unsealed preparation this way, before
 ordinary admission opens. The restart transaction marks its preparation sealed
-so those parked SENDs can continue through the matching Resume path. At its deadline the CLI cancels by
+so those parked SENDs can continue through the matching Resume path. Handoff,
+archive, and an applied fresh native start settle remaining sealed SENDs
+with `native_dispatched: false` and remove their markers in the same
+transaction. A Resume retains custody until its applied outcome commits,
+including a restart Resume that requests a fresh native session. At its
+deadline the CLI cancels by
 default. The CLI prints the preparation ID; the Owner can cancel immediately
 with Ctrl-C (Ctrl-Break also works on Windows) or with
 `swarm daemon update --cancel PREPARE_ID` on the same data directory.

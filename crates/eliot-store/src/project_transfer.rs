@@ -369,6 +369,10 @@ fn blockers(
                 AND (a.root IN (?1,?2) OR EXISTS (
                   SELECT 1 FROM json_each(c.assignment_binding) b
                   WHERE json_extract(b.value,'$.project')=?4)))
+         ) AND NOT (
+             c.target=?1 AND c.generation<=a.generation AND c.verb='send' AND c.turn_id IS NULL
+             AND c.state IN ('accepted','queued')
+             AND EXISTS (SELECT 1 FROM restart_deferred_sends d WHERE d.command_id=c.id AND d.sealed=1)
          ) ORDER BY c.created_at,c.id LIMIT ?5",
     ).map_err(sql_error)?;
     let rows = commands
@@ -688,6 +692,14 @@ fn commit_transfer(
         }
     }
     let mut events = moved.events;
+    events.extend(super::restart_queue::retire_sealed(
+        tx,
+        parse_agent_id(&from.id)?,
+        from.generation,
+        None,
+        "restart_agent_handed_off",
+        now,
+    )?);
     let to_num = parse_agent_id(&to.id)?;
     capacity::require_reservation_tx(tx, to_num, to.generation)?;
     if source_custody_closed(tx, from)? {

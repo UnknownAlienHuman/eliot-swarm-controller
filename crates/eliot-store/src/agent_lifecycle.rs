@@ -209,8 +209,11 @@ fn current_agent_tree_tx(
                 "SELECT id,state,generation FROM commands WHERE target=?1
                AND (state IN ('accepted','queued','dispatched') OR (state='unknown' AND NOT ?2))
                  AND NOT (?3 AND state='unknown' AND (verb IN ('launch','stop') OR (verb='send' AND probe=1)))
+                 AND NOT (?4 AND generation<=?5 AND verb='send' AND turn_id IS NULL
+                          AND state IN ('accepted','queued') AND EXISTS (
+                              SELECT 1 FROM restart_deferred_sends d WHERE d.command_id=commands.id AND d.sealed=1))
              ORDER BY created_at,id LIMIT 1",
-                params![num, allow_drained_unknowns, probe_cleanup],
+                params![num, allow_drained_unknowns, probe_cleanup, archived == Some(true), row.generation],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .optional()
@@ -680,12 +683,15 @@ impl Store {
         agent: &str,
         archived: bool,
         now: i64,
-    ) -> Result<AgentTreeResponse> {
+    ) -> Result<Change<AgentTreeResponse>> {
         const METHOD: &str = "agent.archive";
         self.ensure_committed_reads()?;
         let payload = json!({"agent":agent,"archived":archived});
         if let Some(result) = self.cleanup_replay("owner", id, METHOD, &payload)? {
-            return Ok(result);
+            return Ok(Change {
+                value: result,
+                events: Vec::new(),
+            });
         }
         self.ensure_writer_healthy()?;
         let result = (|| {
@@ -699,11 +705,25 @@ impl Store {
             if let Some(result) =
                 super::cleanup::replay_cleanup_write(&tx, "owner", id, METHOD, &digest)?
             {
-                return Ok(result);
+                return Ok(Change {
+                    value: result,
+                    events: Vec::new(),
+                });
             }
             validate_id_age(id, now)?;
-            let (members, _) = current_agent_tree_tx(&tx, root, Some(archived), false)?;
-            for num in &members {
+            let (members, agents) = current_agent_tree_tx(&tx, root, Some(archived), false)?;
+            let mut events = Vec::new();
+            for (num, member) in members.iter().zip(agents) {
+                if archived {
+                    events.extend(super::restart_queue::retire_sealed(
+                        &tx,
+                        *num,
+                        member.generation,
+                        None,
+                        "restart_agent_archived",
+                        now,
+                    )?);
+                }
                 db!(tx.execute(
                     "UPDATE agents SET archived=?1,updated_at=?2 WHERE id=?3",
                     params![archived, now, num],
@@ -725,7 +745,10 @@ impl Store {
                 now
             ));
             commit_transaction(tx, &self.write_faulted)?;
-            Ok(result)
+            Ok(Change {
+                value: result,
+                events,
+            })
         })();
         self.fault_on_persistence_error(&result);
         result

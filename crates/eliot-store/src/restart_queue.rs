@@ -212,6 +212,52 @@ fn clear_parked(tx: &Transaction<'_>, id: &str) -> Result<()> {
     Ok(())
 }
 
+/// Settle never-dispatched sealed input when this generation loses its
+/// continuation. A Resume may keep only the exact captured native subject.
+pub(super) fn retire_sealed(
+    tx: &Transaction<'_>,
+    agent: i64,
+    generation: i64,
+    retained_subject: Option<(&str, &str)>,
+    code: &str,
+    now: i64,
+) -> Result<Vec<Event>> {
+    let mut statement = tx
+        .prepare_cached(
+            "SELECT c.id, c.generation
+         FROM commands c JOIN restart_deferred_sends d ON d.command_id=c.id
+         WHERE c.target=?1 AND c.generation<=?2 AND c.verb='send'
+           AND c.state IN ('accepted','queued') AND c.turn_id IS NULL AND d.sealed=1
+           AND (?3 IS NULL OR d.native_scope IS NOT ?3 OR d.native_ref IS NOT ?4)",
+        )
+        .map_err(sql_error)?;
+    let (scope, reference) = retained_subject.map_or((None, None), |(scope, reference)| {
+        (Some(scope), Some(reference))
+    });
+    let candidates = statement
+        .query_map(params![agent, generation, scope, reference], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })
+        .map_err(sql_error)?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(sql_error)?;
+    let mut events = Vec::with_capacity(candidates.len());
+    for (id, original_generation) in candidates {
+        events.push(reject_parked(
+            tx, &id, Some(agent), Some(original_generation), code,
+            "The Agent no longer has a matching continuation. This parked input was never dispatched.",
+            now,
+        )?);
+    }
+    tx.execute(
+        "DELETE FROM restart_deferred_sends WHERE sealed=1 AND command_id IN (
+           SELECT id FROM commands WHERE target=?1 AND generation<=?2 AND state NOT IN ('accepted','queued')
+         )",
+        params![agent, generation],
+    ).map_err(sql_error)?;
+    Ok(events)
+}
+
 /// Rebind the original receipts only after this Resume settled applied on
 /// the same native subject. A failed or unknown Resume leaves the rows parked.
 pub(super) fn release_after_resume(

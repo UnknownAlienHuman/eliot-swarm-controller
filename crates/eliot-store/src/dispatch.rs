@@ -113,6 +113,14 @@ fn dispatch_launch_tx(
     }
     workspace::gate_workspace_start(tx, agent, &command.command, 1)?;
     capacity::require_reservation_tx(tx, agent_num, 1)?;
+    events.extend(super::restart_queue::retire_sealed(
+        tx,
+        agent_num,
+        agent.generation,
+        None,
+        "restart_native_subject_changed",
+        now,
+    )?);
     let snapshot = native_store
         .map(|(expected, binding, startup)| {
             workspace::launch_snapshot_with_native_store(agent, expected, binding, startup, id)
