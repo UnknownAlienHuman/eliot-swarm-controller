@@ -2442,7 +2442,10 @@ async fn require_empty_stand_scratch(stand_root: &Path) -> Result<()> {
             ][..],
             "",
         ),
-        (&["rev-list", "--all", "--count", "HEAD"][..], "1"),
+        (
+            &["rev-list", "--all", "--reflog", "--count", "HEAD"][..],
+            "1",
+        ),
         (&["ls-tree", "-r", "HEAD"][..], ""),
     ] {
         let result = probe.workspace_command(&scratch, args, deadline).await?;

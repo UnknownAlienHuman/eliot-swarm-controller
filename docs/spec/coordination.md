@@ -338,8 +338,9 @@ generations' custody and outcomes have settled. A running or unknown Goal
 round keeps the cache because a Goal checker can hold the artifact root
 independently of the Agent process. Stand cleanup also checks the
 stand's own custody and retains internal managed worktrees pending guarded removal.
-Automatic stand removal also requires an untouched scratch repository and
-fresh merge proof for external worktrees before their guarded removal.
+Automatic stand removal requires a clean scratch repository with one empty
+commit across its refs and retained reflogs. Incomplete Git inspection keeps
+the stand. External worktrees need fresh merge proof before guarded removal.
 A generation root can be
 removed when its creation identity is still bound, its registered descendants are
 settled, and the guarded scan of its contents succeeds. Branches, project registrations
