@@ -321,13 +321,29 @@ impl Store {
             )?;
         }
         if current < DESKTOP_USAGE_LOOKUP_VERSION {
-            self.migrate_sql(
-                "CREATE INDEX usage_context_pairs ON events(agent, generation, seq)
-                   WHERE kind = 'session.usage';
-                 CREATE INDEX usage_daemon_tool_pairs ON events(agent, generation, kind, seq)
-                   WHERE source = 'daemon' AND kind IN ('tool.started', 'tool.completed');",
-                Some(DESKTOP_USAGE_LOOKUP_VERSION),
-            )?;
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            tx.execute_batch(
+                "CREATE INDEX usage_daemon_tool_pairs ON events(
+                      agent, generation, json_extract(data, '$.turn_id'),
+                      json_extract(data, '$.call_id'), kind, json_extract(data, '$.status'), seq)
+                 WHERE source = 'daemon' AND kind IN ('tool.started', 'tool.completed')
+                   AND json_extract(data, '$.origin') = 'swarm_mcp'
+                   AND json_extract(data, '$.tool') = 'swarm'
+                   AND json_type(data, '$.turn_id') = 'text';",
+            )
+            .map_err(sql_error)?;
+            tx.execute_batch(autonomy::SHELL_COVERING_INDEX)
+                .map_err(sql_error)?;
+            usage::context::backfill(&tx)?;
+            tx.execute(
+                "INSERT INTO schema_migrations(version) VALUES (?1)",
+                [DESKTOP_USAGE_LOOKUP_VERSION],
+            )
+            .map_err(sql_error)?;
+            commit_transaction(tx, &self.write_faulted)?;
         }
         Ok(())
     }

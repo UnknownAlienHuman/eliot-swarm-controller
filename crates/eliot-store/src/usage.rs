@@ -15,6 +15,7 @@
 //! retained-event watermark names the retention floor instead of implying
 //! full totals.
 
+pub(crate) mod context;
 mod role;
 
 pub(crate) use role::{RoleUsage, manager_at_sql};
@@ -1251,50 +1252,32 @@ impl Store {
         if pairs.is_empty() {
             return Ok(());
         }
-        let manager = manager_at_sql("e.agent", "e.ts");
-        let sql = format!(
-            "WITH wanted AS (
+        let sql = "WITH wanted AS MATERIALIZED (
                  SELECT DISTINCT json_extract(value, '$[0]') AS agent,
                                  json_extract(value, '$[1]') AS generation FROM json_each(?1)
+             ), roles AS MATERIALIZED (
+                 SELECT w.agent, w.generation,
+                        (SELECT MIN(child.created_at)
+                         FROM agents AS child INDEXED BY autonomy_child_creation
+                         WHERE child.parent = w.agent) AS first_child
+                 FROM wanted AS w
              )
-             SELECT json_type(e.data, '$.usage'), json_extract(e.data, '$.usage'), {manager}
-             FROM wanted w CROSS JOIN events e INDEXED BY usage_context_pairs
-               ON e.agent = w.agent AND e.generation = w.generation
-             WHERE e.kind = 'session.usage'
-             ORDER BY e.seq"
-        );
-        let mut statement = self.connection.prepare_cached(&sql).map_err(sql_error)?;
-        let rows = statement
-            .query_map([encode_json(&pairs)?], |row| {
-                let kind: Option<String> = row.get(0)?;
-                Ok((
-                    if matches!(kind.as_deref(), Some("object" | "array")) {
-                        Some(row.get::<_, String>(1)?)
-                    } else {
-                        None
-                    },
-                    kind.is_some(),
-                    row.get::<_, bool>(2)?,
-                ))
-            })
-            .map_err(sql_error)?;
-        for row in rows {
-            let (raw, present, manager) = row.map_err(sql_error)?;
-            let raw = raw.ok_or_else(|| {
-                Error::new(
-                    "internal",
-                    if present {
-                        "retained session usage data is malformed"
-                    } else {
-                        "retained session usage event has no usage"
-                    },
-                )
-            })?;
-            let mut usage: SessionUsage = serde_json::from_str(&raw)
-                .map_err(|_| Error::new("internal", "retained session usage data is malformed"))?;
-            usage.validate()?;
-            usage.retain_valid_context();
-            role_usage.observe_context(manager, usage.context_used_tokens);
+             SELECT o.tokens, o.error, COALESCE(r.first_child <= o.ts, 0)
+             FROM roles AS r CROSS JOIN usage_context_observations AS o
+               ON o.agent = r.agent AND o.generation = r.generation
+             ORDER BY o.seq";
+        let mut statement = self.connection.prepare_cached(sql).map_err(sql_error)?;
+        let mut rows = statement.query([encode_json(&pairs)?]).map_err(sql_error)?;
+        while let Some(row) = rows.next().map_err(sql_error)? {
+            if let Some(error) = row.get::<_, Option<String>>(1).map_err(sql_error)? {
+                return Err(serde_json::from_str(&error).map_err(|_| {
+                    Error::new("source_integrity", "invalid context projection error")
+                })?);
+            }
+            role_usage.observe_context(
+                row.get(2).map_err(sql_error)?,
+                row.get(0).map_err(sql_error)?,
+            );
         }
         Ok(())
     }

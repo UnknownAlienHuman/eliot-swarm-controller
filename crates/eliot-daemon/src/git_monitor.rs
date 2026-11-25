@@ -1145,8 +1145,21 @@ impl GitProbe {
     ) -> Result<PatchRead> {
         let root = canonical_root(workspace)?;
         let deadline = Instant::now() + PROBE_TIME;
-        let overrides = self.safe_overrides(&root, deadline).await?;
-        self.require_exact_root(&root, &overrides, deadline).await?;
+        let overrides = if include_fingerprint {
+            let overrides = self.safe_overrides(&root, deadline).await?;
+            self.require_exact_root(&root, &overrides, deadline).await?;
+            overrides
+        } else {
+            // rev-parse uses no filters or aliases. Probe the root and read
+            // the overrides concurrently, then require both before diff/status.
+            let (overrides, exact_root) = tokio::join!(
+                self.safe_overrides(&root, deadline),
+                self.require_exact_root(&root, &[], deadline),
+            );
+            let overrides = overrides?;
+            exact_root?;
+            overrides
+        };
         let fingerprint_status = status_args("--untracked-files=all");
         let args = if include_fingerprint {
             &fingerprint_status[..]

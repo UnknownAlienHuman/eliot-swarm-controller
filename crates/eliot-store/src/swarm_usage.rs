@@ -1,7 +1,6 @@
 use super::*;
 use eliot_core::api::{
-    MAX_SWARM_MCP_TURNS, SWARM_MCP_EVENT_ORIGIN, SWARM_MCP_EVENT_TOOL, SwarmMcpToolEventData,
-    SwarmMcpToolStatus, SwarmMcpTurnUsage,
+    MAX_SWARM_MCP_TURNS, SwarmMcpToolEventData, SwarmMcpToolStatus, SwarmMcpTurnUsage,
 };
 use rusqlite::OptionalExtension;
 const SWARM_MCP_SOURCE: &str = "daemon";
@@ -288,56 +287,37 @@ impl Store {
                 SELECT CAST(json_extract(value, '$[0]') AS INTEGER) AS agent,
                        CAST(json_extract(value, '$[1]') AS INTEGER) AS generation
                 FROM json_each(?1)
-            ),
-            per_turn AS (
-                SELECT e.agent,
-                       e.generation,
-                       json_extract(e.data, '$.turn_id') AS turn_id,
-                       COUNT(DISTINCT CASE WHEN e.kind = 'tool.started'
-                           THEN json_extract(e.data, '$.call_id') END) AS calls,
-                       COUNT(DISTINCT CASE
-                           WHEN e.kind = 'tool.completed'
-                            AND json_extract(e.data, '$.status') = 'refused'
-                            AND EXISTS (
-                                SELECT 1 FROM events AS started INDEXED BY usage_daemon_tool_pairs
-                                WHERE started.agent = e.agent
-                                  AND started.generation = e.generation
-                                  AND started.source = 'daemon'
-                                  AND started.kind = 'tool.started'
-                                  AND started.kind IN ('tool.started', 'tool.completed')
-                                  AND json_extract(started.data, '$.origin') = ?2
-                                  AND json_extract(started.data, '$.tool') = ?3
-                                  AND json_extract(started.data, '$.call_id') =
-                                      json_extract(e.data, '$.call_id')
-                                  AND json_extract(started.data, '$.turn_id') =
-                                      json_extract(e.data, '$.turn_id')
-                            )
-                           THEN json_extract(e.data, '$.call_id') END) AS refusals,
+            ), per_call AS (
+                SELECT e.agent, e.generation, json_extract(e.data, '$.turn_id') AS turn_id,
+                       json_extract(e.data, '$.call_id') AS call_id,
+                       MAX(e.kind = 'tool.started') AS started,
+                       MAX(CASE WHEN e.kind = 'tool.completed'
+                                     AND json_extract(e.data, '$.status') = 'refused'
+                                THEN 1 ELSE 0 END) AS refused,
                        MAX(e.seq) AS latest
                 FROM wanted AS w CROSS JOIN events AS e INDEXED BY usage_daemon_tool_pairs
                   ON w.agent = e.agent AND w.generation = e.generation
                 WHERE e.source = 'daemon'
                   AND e.kind IN ('tool.started', 'tool.completed')
-                  AND json_extract(e.data, '$.origin') = ?2
-                  AND json_extract(e.data, '$.tool') = ?3
+                  AND json_extract(e.data, '$.origin') = 'swarm_mcp'
+                  AND json_extract(e.data, '$.tool') = 'swarm'
                   AND json_type(e.data, '$.turn_id') = 'text'
-                GROUP BY e.agent, e.generation, json_extract(e.data, '$.turn_id')
-                HAVING COUNT(DISTINCT CASE WHEN e.kind = 'tool.started'
-                    THEN json_extract(e.data, '$.call_id') END) > 0
+                GROUP BY e.agent, e.generation, turn_id, call_id
+            ), per_turn AS (
+                SELECT agent, generation, turn_id,
+                       SUM(CASE WHEN call_id IS NOT NULL THEN started ELSE 0 END) AS calls,
+                       SUM(CASE WHEN call_id IS NOT NULL THEN started * refused ELSE 0 END) AS refusals,
+                       MAX(latest) AS latest
+                FROM per_call
+                GROUP BY agent, generation, turn_id
+                HAVING calls > 0
             )
             SELECT agent, generation, turn_id, calls, refusals
-            FROM per_turn
-            ORDER BY latest DESC
-            LIMIT ?4";
-        let mut statement = self.connection.prepare(sql).map_err(sql_error)?;
+            FROM per_turn ORDER BY latest DESC LIMIT ?2";
+        let mut statement = self.connection.prepare_cached(sql).map_err(sql_error)?;
         let rows = statement
             .query_map(
-                rusqlite::params![
-                    pair_json,
-                    SWARM_MCP_EVENT_ORIGIN,
-                    SWARM_MCP_EVENT_TOOL,
-                    (MAX_SWARM_MCP_TURNS + 1) as i64
-                ],
+                rusqlite::params![pair_json, (MAX_SWARM_MCP_TURNS + 1) as i64],
                 |row| {
                     Ok((
                         row.get::<_, i64>(0)?,

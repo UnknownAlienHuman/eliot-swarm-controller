@@ -244,28 +244,60 @@ impl WorkspaceGit {
                     if Instant::now() >= deadline {
                         return;
                     }
-                    let origin = git.origin_name(&common_dir, deadline).await;
-                    let mut checkouts = Vec::new();
-                    if let Ok(common) = canonical_root(&common_dir) {
-                        let main = registrations
-                            .iter()
-                            .find_map(|registration| {
-                                main_checkout(&common, Path::new(&registration.checkout))
-                            })
-                            .or_else(|| {
-                                let parent = common.parent()?;
-                                main_checkout(&common, parent)
-                            });
-                        let repositories = main.into_iter().chain(linked_checkouts(&common));
-                        let inventory = git.entries(&common, deadline).await.unwrap_or_default();
-                        let inventory = &inventory;
-                        checkouts = stream::iter(repositories.take(MAX_CHECKOUTS))
-                            .map(|repo| git.checkout_readback(repo, inventory, deadline))
-                            .buffered(4)
-                            .filter_map(std::future::ready)
-                            .collect()
-                            .await;
-                    }
+                    let (origin, checkouts) =
+                        tokio::join!(git.origin_name(&common_dir, deadline), async {
+                            let Ok(common) = canonical_root(&common_dir) else {
+                                return Vec::new();
+                            };
+                            let registered: Vec<_> = registrations
+                                .iter()
+                                .map(|registration| registration.checkout.clone())
+                                .collect();
+                            let (repositories, inventory) = tokio::join!(
+                                tokio::task::spawn_blocking({
+                                    let common = common.clone();
+                                    move || {
+                                        let main = registered
+                                            .iter()
+                                            .find_map(|checkout| {
+                                                main_checkout(&common, Path::new(checkout))
+                                            })
+                                            .or_else(|| main_checkout(&common, common.parent()?));
+                                        let linked = linked_checkouts(&common);
+                                        main.into_iter()
+                                            .chain(linked)
+                                            .take(MAX_CHECKOUTS)
+                                            .collect::<Vec<_>>()
+                                    }
+                                }),
+                                git.entries(&common, deadline),
+                            );
+                            let inventory = inventory.unwrap_or_default();
+                            let mut by_path = BTreeMap::new();
+                            for entry in &inventory {
+                                if let Some(path) = entry.path.to_str() {
+                                    by_path
+                                        .entry(eliot_core::workspace_path_key(path))
+                                        .and_modify(|value| *value = None)
+                                        .or_insert(Some(entry));
+                                }
+                            }
+                            stream::iter(repositories.unwrap_or_default())
+                                .map(|repo| {
+                                    let entry = repo.root.to_str().and_then(|path| {
+                                        by_path
+                                            .get(&eliot_core::workspace_path_key(path))
+                                            .copied()
+                                            .flatten()
+                                    });
+                                    git.checkout_readback(repo, entry, deadline)
+                                })
+                                .buffered(4)
+                                .filter_map(std::future::ready)
+                                .collect()
+                                .await
+                        });
+                    let mut checkouts = checkouts;
                     // One registration carries the shared inventory. Keep the
                     // response bounded when several registrations share a repo.
                     for registration in registrations {
@@ -293,7 +325,7 @@ impl WorkspaceGit {
     async fn checkout_readback(
         &self,
         repo: Repository,
-        inventory: &[WorktreeEntry],
+        entry: Option<&WorktreeEntry>,
         deadline: Instant,
     ) -> Option<ProjectCheckoutView> {
         let head = repo.git_dir.join("HEAD");
@@ -301,7 +333,7 @@ impl WorkspaceGit {
         if !fs::symlink_metadata(&head).is_ok_and(|metadata| metadata.is_file()) {
             return None;
         }
-        let branch = match inventory_head(&repo, &head, inventory) {
+        let branch = match entry.and_then(|entry| inventory_head(&repo, &head, entry)) {
             Some(branch) => branch,
             None => {
                 let binding = GitBinding {
@@ -354,21 +386,8 @@ impl WorkspaceGit {
 /// reference from the already bound checkout so its result also agrees with
 /// `symbolic-ref --no-recurse`. Unborn, changed or ambiguous entries use Git
 /// directly for that checkout.
-fn inventory_head(
-    repo: &Repository,
-    head: &Path,
-    inventory: &[WorktreeEntry],
-) -> Option<Option<String>> {
-    let key = eliot_core::workspace_path_key(repo.root.to_str()?);
-    let mut matches = inventory.iter().filter(|entry| {
-        entry
-            .path
-            .to_str()
-            .is_some_and(|path| eliot_core::workspace_path_key(path) == key)
-    });
-    let entry = matches.next()?;
-    if matches.next().is_some()
-        || entry.incomplete
+fn inventory_head(repo: &Repository, head: &Path, entry: &WorktreeEntry) -> Option<Option<String>> {
+    if entry.incomplete
         || entry.prunable
         || !matches!(fs::symlink_metadata(repo.git_dir.join("config.worktree")), Err(error)
             if error.kind() == std::io::ErrorKind::NotFound)
@@ -414,6 +433,7 @@ fn linked_checkouts(common: &Path) -> Vec<Repository> {
     let Ok(entries) = fs::read_dir(&registry) else {
         return Vec::new();
     };
+    let mut pinned = Directory::open(&registry).ok();
     entries
         .take(MAX_CHECKOUTS)
         .filter_map(|entry| {
@@ -422,11 +442,23 @@ fn linked_checkouts(common: &Path) -> Vec<Repository> {
                 return None;
             }
             let admin = entry.path();
-            let common_pointer = metadata_line(&admin.join("commondir")).ok()?;
+            let pointers = pinned.as_mut().and_then(|directory| {
+                directory.push_entry_directory(&entry).ok()?;
+                let read = |name| line(&read_diff_metadata(directory.file(name)?, METADATA_BYTES)?);
+                let pointers = read("commondir").ok().zip(read("gitdir").ok());
+                directory.pop_entry_directory();
+                pointers
+            });
+            let (common_pointer, gitdir) = match pointers {
+                Some(pointers) => pointers,
+                None => (
+                    metadata_line(&admin.join("commondir")).ok()?,
+                    metadata_line(&admin.join("gitdir")).ok()?,
+                ),
+            };
             if !same_path(&pointer_path(&admin, &common_pointer)?, common) {
                 return None;
             }
-            let gitdir = metadata_line(&admin.join("gitdir")).ok()?;
             let gitfile = pointer_path(&admin, &gitdir)?;
             if gitfile.file_name()?.to_str()? != ".git" {
                 return None;

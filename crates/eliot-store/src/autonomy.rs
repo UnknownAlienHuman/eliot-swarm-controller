@@ -4,6 +4,8 @@ mod activity;
 mod fleet;
 mod shell;
 
+pub(super) use activity::SHELL_COVERING_INDEX;
+
 use super::{Result, Store, sql_error};
 use eliot_core::api::AutonomyResponse;
 use rusqlite::{Connection, OptionalExtension};

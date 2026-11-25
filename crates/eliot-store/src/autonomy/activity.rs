@@ -3,7 +3,7 @@ use eliot_core::api::{
     AutonomyChecks, AutonomyExecutorProfile, AutonomyExecutorSwarm, AutonomyNotes, AutonomyRow,
     AutonomySteer, AutonomyWaits, AutonomyWorkInGit, SWARM_MAIL_SENDER,
 };
-use rusqlite::{params, Connection};
+use rusqlite::{Connection, OptionalExtension, params};
 use std::collections::HashMap;
 
 const MAX_INPUT_ROWS: usize = 10_000;
@@ -57,6 +57,17 @@ CREATE INDEX autonomy_activity_inject_window ON events(ts, seq) WHERE ",
 CREATE INDEX autonomy_activity_commands_window ON commands(created_at, id) WHERE verb = 'steer';
 CREATE INDEX autonomy_activity_launch ON commands(target, created_at, id) WHERE verb = 'launch';
 "
+);
+
+// Cover the bounded shell scan without seeking the full native event payload.
+pub(crate) const SHELL_COVERING_INDEX: &str = concat!(
+    "DROP INDEX autonomy_activity_shell_window;
+     CREATE INDEX autonomy_activity_shell_window ON events(
+         ts, seq, agent, json_extract(data, '$.tool'), json_extract(data, '$.command'),
+         COALESCE(json_extract(data, '$.command_truncated'), 0))
+     WHERE ",
+    shell_start!(),
+    ";",
 );
 
 pub(super) struct Activity {
@@ -220,11 +231,7 @@ fn read_shell_activity(
     let mut statement = tx
         .prepare(concat!(
             "SELECT e.agent, json_extract(e.data, '$.tool'), json_extract(e.data, '$.command'),
-                    COALESCE(json_extract(e.data, '$.command_truncated'), 0),
-                    (SELECT json_extract(c.args, '$._project_check_goal.check')
-                     FROM commands c INDEXED BY autonomy_activity_launch
-                     WHERE c.verb = 'launch' AND c.target = e.agent
-                     ORDER BY c.created_at, c.id LIMIT 1)
+                    COALESCE(json_extract(e.data, '$.command_truncated'), 0)
              FROM events e INDEXED BY autonomy_activity_shell_window
              WHERE ",
             shell_start!(),
@@ -239,13 +246,20 @@ fn read_shell_activity(
                 row.get::<_, String>(1)?,
                 row.get::<_, Option<String>>(2)?,
                 row.get::<_, bool>(3)?,
-                row.get::<_, Option<String>>(4)?,
             ))
         })
         .map_err(crate::sql_error)?;
     let mut manual = 0;
     let mut waits = 0;
-    // A generation's frozen launch check is repeated for every shell start it
+    let mut load_check = tx
+        .prepare_cached(
+            "SELECT json_extract(c.args, '$._project_check_goal.check')
+         FROM commands c INDEXED BY autonomy_activity_launch
+         WHERE c.verb = 'launch' AND c.target = ?1
+         ORDER BY c.created_at, c.id LIMIT 1",
+        )
+        .map_err(crate::sql_error)?;
+    // The frozen launch check is repeated for every shell start it
     // produces. Decode it once per Agent instead of once per retained event.
     let mut project_checks = HashMap::new();
     let mut reasons =
@@ -256,12 +270,20 @@ fn read_shell_activity(
             add_cap_reason(&mut reasons, "shell tool starts");
             break;
         }
-        let (agent, tool, command, truncated, project_check) = row.map_err(crate::sql_error)?;
+        let (agent, tool, command, truncated) = row.map_err(crate::sql_error)?;
+        let check = match project_checks.entry(agent) {
+            std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                let argv: Option<String> = load_check
+                    .query_row([agent], |row| row.get(0))
+                    .optional()
+                    .map_err(crate::sql_error)?
+                    .flatten();
+                entry.insert(argv.and_then(|argv| serde_json::from_str::<Vec<String>>(&argv).ok()))
+            }
+        };
         missing_command |= truncated || command.is_none();
         let Some(command) = command else { continue };
-        let check = project_checks
-            .entry(agent)
-            .or_insert_with(|| project_check.and_then(|argv| serde_json::from_str(&argv).ok()));
         let (check_runs, is_wait) = super::shell::matches(&command, check.as_deref(), &tool);
         manual += check_runs;
         waits += u64::from(is_wait);

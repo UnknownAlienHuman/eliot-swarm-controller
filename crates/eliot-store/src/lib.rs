@@ -6156,6 +6156,12 @@ fn insert_event(tx: &Transaction<'_>, mut event: EventInsert<'_>) -> Result<Even
         cause_json,
     ]));
     let seq = tx.last_insert_rowid();
+    if event.kind == "session.usage"
+        && let (Some(agent), Some(generation)) = (event.agent, event.generation)
+    {
+        usage::context::record(tx, seq, agent, generation, event.ts, &event.data)?;
+    }
+
     Ok(Event {
         seq,
         ts: event.ts,
