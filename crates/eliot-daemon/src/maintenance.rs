@@ -50,6 +50,7 @@ pub(crate) async fn run(
             data_root,
             Arc::clone(&policy),
             initial,
+            router.clone(),
             shutdown.clone()
         ),
         run_provider_maintenance(
@@ -299,10 +300,12 @@ async fn run_retention(
     data_root: PathBuf,
     policy: Arc<SecretPolicy>,
     initial: config::DaemonConfig,
+    router: crate::router::Router,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<()> {
     let mut config = initial;
     let mut checkpoint_cursor = None;
+    let mut retirement_cursor = None;
     let mut interval_seconds = config.retention.maintenance_interval_seconds();
     let mut ticker = tokio::time::interval(Duration::from_secs(interval_seconds));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -342,6 +345,24 @@ async fn run_retention(
                     Some(&error),
                 );
             }
+        }
+        let retirement_deadline = time::Instant::now() + RETENTION_TICK_TIME_BUDGET;
+        while !*shutdown.borrow() && time::Instant::now() < retirement_deadline {
+            match router
+                .retire_agent_page(&config.agent_retirement, retirement_cursor)
+                .await
+            {
+                Ok(next) if next == retirement_cursor => break,
+                Ok(next) => retirement_cursor = next,
+                Err(error) => {
+                    logging::record(&policy, "daemon.agent_retirement_failed", &[], Some(&error));
+                    break;
+                }
+            }
+            if retirement_cursor.is_none() {
+                break;
+            }
+            tokio::task::yield_now().await;
         }
         // Retention catch-up: while an epoch spends a budget, run another
         // instead of leaving eligible backlog until the next configured wake.

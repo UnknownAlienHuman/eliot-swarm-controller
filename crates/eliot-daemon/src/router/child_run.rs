@@ -281,6 +281,17 @@ impl Router {
             facts,
         };
         response.validate()?;
+        if matches!(
+            response.status,
+            ChildRunStatus::Succeeded | ChildRunStatus::Failed
+        ) && let (Some(child), Some(generation), Some(turn)) = (
+            response.agent.as_deref(),
+            response.generation,
+            response.turn_id.as_deref(),
+        ) {
+            self.note_child_result_read(principal, child, generation, turn)
+                .await;
+        }
         encode_child_run(response)
     }
 

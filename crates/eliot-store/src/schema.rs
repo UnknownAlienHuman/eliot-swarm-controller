@@ -1,6 +1,6 @@
 use super::*;
 
-pub(super) const CURRENT_SCHEMA_VERSION: i64 = OWNER_PROJECTION_LOOKUP_VERSION;
+pub(super) const CURRENT_SCHEMA_VERSION: i64 = AGENT_RESULT_READS_VERSION;
 const HARNESS_CHECK_SCHEMA_VERSION: i64 = 112;
 const WORK_TRUTH_VERSION: i64 = 113;
 const WORK_TRUTH_INTENT_VERSION: i64 = 114;
@@ -33,6 +33,7 @@ const NEXT_INPUT_CONTEXT_EXPIRY_VERSION: i64 = 140;
 const SOURCE_REPLAY_COMPARISON_VERSION: i64 = 141;
 const CHILD_DIGEST_ASSIGNMENT_VERSION: i64 = 142;
 const OWNER_PROJECTION_LOOKUP_VERSION: i64 = 143;
+const AGENT_RESULT_READS_VERSION: i64 = 144;
 
 fn has_restart_continuation_brief_column(connection: &Connection) -> Result<bool> {
     connection
@@ -297,6 +298,18 @@ impl Store {
             self.migrate_sql(
                 include_str!("../migrations/owner_projection_lookup.sql"),
                 Some(OWNER_PROJECTION_LOOKUP_VERSION),
+            )?;
+        }
+        if current < AGENT_RESULT_READS_VERSION {
+            self.migrate_sql(
+                "CREATE TABLE agent_result_reads (
+                     child INTEGER NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+                     generation INTEGER NOT NULL,
+                     parent INTEGER NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+                     turn_id TEXT NOT NULL,
+                     PRIMARY KEY(child,generation)
+                 ) WITHOUT ROWID;",
+                Some(AGENT_RESULT_READS_VERSION),
             )?;
         }
         Ok(())
