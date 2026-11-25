@@ -1169,6 +1169,12 @@ fn removal_marker(
         "stage": "removal", "command_id": command_id, "result": outcome,
         "previous_phase": previous.and_then(|value| value.get("previous_phase"))
     });
+    if matches!(outcome, WorkspaceRemovalOutcome::Unknown { code, .. }
+        if code == "workspace_git_drain_unknown")
+    {
+        marker["result"]["where"] = json!("workspace.remove.git_drain");
+        marker["result"]["origin"] = json!(core::FailureOrigin::Swarm);
+    }
     if let Some(tip) = previous.and_then(|value| value.get("branch_tip_before_remove")) {
         marker["branch_tip_before_remove"] = tip.clone();
     }
@@ -3040,10 +3046,21 @@ pub(super) fn request_workspace_cancel_tx(
         ));
     }
     if workspace_cancel_requested(workspace) {
-        return Err(Error::new(
-            "unknown",
-            "cancellation was already requested; read back instead of replaying stop",
-        ));
+        let message = workspace
+            .outcome
+            .as_ref()
+            .and_then(|outcome| outcome.get("stop_command_id"))
+            .and_then(Value::as_str)
+            .map_or_else(
+                || "A Stop already requested workspace cancellation. Read back the workspace state.".to_owned(),
+                |id| format!("Stop {id} already requested workspace cancellation. Read back that command."),
+            );
+        return Err(Error::new("unknown", message)
+            .with_where("store.dispatch.workspace_cancel")
+            .with_origin(
+                core::FailureOrigin::Swarm,
+                "workspace cancellation was already committed",
+            ));
     }
     if rules::gate_rule_action_dispatch_tx(tx, stop_id, now, events)?
         != rules::RuleActionDispatchGate::Ready

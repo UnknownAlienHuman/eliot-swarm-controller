@@ -529,7 +529,12 @@ fn project_unknown_commands(
                   AND s.source NOT IN ('daemon','os','git','workspace_process') AND s.state='open'),
                 EXISTS(SELECT 1 FROM commands parent
                   WHERE parent.id=c.parent_command AND c.link_kind='handoff'
-                    AND parent.method='swarm.handoff')
+                    AND parent.method='swarm.handoff'),
+                CASE WHEN c.state='unknown' THEN substr(
+                    CASE c.verb
+                        WHEN 'compact' THEN json_extract(c.outcome,'$.message')
+                        WHEN 'worktree.remove' THEN json_extract(c.outcome,'$.result.message')
+                    END,1,1024) END
          FROM commands c WHERE c.state IN ('accepted','queued','dispatched','unknown')
            AND NOT EXISTS (SELECT 1 FROM agents check_agent WHERE check_agent.id=c.target
                  AND json_type(check_agent.profile_snapshot, '$._harness_check') IS NOT NULL)", "c.id=?1", bindings)?;
@@ -551,6 +556,7 @@ fn project_unknown_commands(
                 r.get::<_, bool>(12)?,
                 r.get::<_, bool>(13)?,
                 r.get::<_, bool>(14)?,
+                r.get::<_, Option<String>>(15)?,
             ))
         })
         .map_err(sql_error)?;
@@ -571,6 +577,7 @@ fn project_unknown_commands(
             process_active,
             source_open,
             owner_handoff_send,
+            detail,
         ) = row.map_err(sql_error)?;
         let state = match raw_state.as_str() {
             "accepted" => eliot_core::CommandState::Accepted,
@@ -691,10 +698,11 @@ fn project_unknown_commands(
             recommended,
             choices,
         );
+        projected.detail = detail;
         if let (Some(agent), Some(generation)) = (target, generation) {
             let queued = queued_sends_blocked_by(db, agent, generation, &projected.subject)?;
             if !queued.is_empty() {
-                projected.detail = Some(format!(
+                let fence = format!(
                     "Unknown command {} ({verb}) closes the SEND outcome gate for queued SENDs: {}",
                     projected.subject,
                     queued
@@ -702,7 +710,11 @@ fn project_unknown_commands(
                         .map(|(id, verb)| format!("{id} ({verb})"))
                         .collect::<Vec<_>>()
                         .join(", ")
-                ));
+                );
+                projected.detail = Some(match projected.detail {
+                    Some(message) => format!("{message}\n{fence}"),
+                    None => fence,
+                });
             }
         }
         items.push(projected);

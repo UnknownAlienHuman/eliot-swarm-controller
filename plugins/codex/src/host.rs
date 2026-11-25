@@ -25,8 +25,8 @@ use eliot_core::api::native_profile::{
     CodexCollaborationMode, CodexPermissions, CodexProfileFields,
 };
 use eliot_core::{
-    ContextOutcome, Error, InjectArgs, InjectPoint, McpPolicy, NativeStoreBinding, Result,
-    SecretPolicy,
+    CompactionFailure, CompactionFailureStage, ContextOutcome, Error, InjectArgs, InjectPoint,
+    McpPolicy, NativeStoreBinding, Result, SecretPolicy,
 };
 use eliot_plugin::{
     AgentCommandParams, AgentSnapshotParams, AgentStartParams, AgentStopParams, DiscoverParams,
@@ -2119,6 +2119,26 @@ impl CodexPlugin {
         let compact_params = NativeThreadCompactStartParams {
             thread_id: thread_id.clone(),
         };
+        use CompactionFailureStage::{Lifecycle, NativeEvent, NativeReply, Readback};
+        let secrets = SecretPolicy::new(session.secrets.iter().cloned());
+        let incomplete = |state, receipt_id, stage, message: &str| {
+            let message = secrets
+                .redact_text(message)
+                .trim()
+                .chars()
+                .take(768)
+                .collect();
+            let mut value = json!({
+                "state": state,
+                "command_id": command_id,
+                "compaction": {"completed": false},
+                "compaction_failure": CompactionFailure { stage, message },
+            });
+            if let Some(receipt_id) = receipt_id {
+                value["compaction"]["receipt_id"] = json!(receipt_id);
+            }
+            value
+        };
         let response = match session
             .native_client
             .call(
@@ -2157,11 +2177,12 @@ impl CodexPlugin {
                     .is_err()
                 {
                     session.phase = SessionPhase::Unknown;
-                    return Ok(json!({
-                        "state": "unknown",
-                        "command_id": command_id,
-                        "compaction": {"completed": false},
-                    }));
+                    let stage = if error.code == "native_rejected" {
+                        NativeReply
+                    } else {
+                        Lifecycle
+                    };
+                    return Ok(incomplete("unknown", None, stage, &error.message));
                 }
                 return Ok(json!({
                     "state": "rejected",
@@ -2169,35 +2190,23 @@ impl CodexPlugin {
                     "reason": "Codex rejected native compaction before acceptance",
                 }));
             }
-            Err(_) => {
+            Err(error) => {
                 session.phase = SessionPhase::Unknown;
-                return Ok(json!({
-                    "state": "unknown",
-                    "command_id": command_id,
-                    "compaction": {"completed": false},
-                }));
+                return Ok(incomplete("unknown", None, Lifecycle, &error.message));
             }
         };
         if serde_json::from_value::<NativeThreadCompactStartResponse>(response).is_err() {
             session.phase = SessionPhase::Unknown;
-            return Ok(json!({
-                "state": "unknown",
-                "command_id": command_id,
-                "compaction": {"completed": false},
-            }));
+            return Ok(incomplete(
+                "unknown",
+                None,
+                Lifecycle,
+                "Codex compact/start reply did not match its native schema",
+            ));
         }
-        if session
-            .events
-            .accept_compaction(command_id.clone())
-            .await
-            .is_err()
-        {
+        if let Err(error) = session.events.accept_compaction(command_id.clone()).await {
             session.phase = SessionPhase::Unknown;
-            return Ok(json!({
-                "state": "unknown",
-                "command_id": command_id,
-                "compaction": {"completed": false},
-            }));
+            return Ok(incomplete("unknown", None, Lifecycle, &error.message));
         }
         let progress = match session
             .events
@@ -2205,19 +2214,20 @@ impl CodexPlugin {
             .await
         {
             Ok(progress) => progress,
-            Err(_) => {
+            Err(error) => {
                 session.phase = SessionPhase::Unknown;
-                let mut outcome = json!({
-                    "state": "unknown",
-                    "command_id": command_id,
-                    "compaction": {"completed": false},
-                });
-                if session
-                    .events
-                    .status()
+                let status = session.events.status();
+                let progress = status
                     .compaction
-                    .is_some_and(|progress| progress.history_missing_tool_output)
-                {
+                    .as_ref()
+                    .filter(|progress| progress.command_id == command_id);
+                let (stage, message) = progress
+                    .and_then(|progress| progress.native_error.as_deref())
+                    .map_or((Lifecycle, error.message.as_str()), |error| {
+                        (NativeEvent, error)
+                    });
+                let mut outcome = incomplete("unknown", None, stage, message);
+                if progress.is_some_and(|progress| progress.history_missing_tool_output) {
                     outcome["native_session_failure"] =
                         json!(eliot_core::limits::NATIVE_HISTORY_MISSING_TOOL_OUTPUT);
                 }
@@ -2233,28 +2243,40 @@ impl CodexPlugin {
             } else {
                 "unknown"
             };
-            return Ok(json!({
-                "state": state,
-                "command_id": command_id,
-                "reason": "Codex reported incomplete native tool history during compaction",
-                "compaction": {"completed": false, "receipt_id": progress.turn_id},
-                "native_session_failure": eliot_core::limits::NATIVE_HISTORY_MISSING_TOOL_OUTPUT,
-            }));
+            let reason = "Codex reported incomplete native tool history during compaction";
+            let mut outcome = incomplete(
+                state,
+                progress.turn_id.as_deref(),
+                NativeEvent,
+                progress.native_error.as_deref().unwrap_or(reason),
+            );
+            outcome["reason"] = json!(reason);
+            outcome["native_session_failure"] =
+                json!(eliot_core::limits::NATIVE_HISTORY_MISSING_TOOL_OUTPUT);
+            return Ok(outcome);
         }
         let Some(turn_id) = progress.turn_id.as_deref() else {
             session.phase = SessionPhase::Unknown;
-            return Ok(json!({
-                "state": "unknown",
-                "command_id": command_id,
-                "compaction": {"completed": false},
-            }));
+            return Ok(incomplete(
+                "unknown",
+                None,
+                Lifecycle,
+                "Codex compaction did not report a native turn ID",
+            ));
+        };
+        let incomplete_turn = |state, stage, message: &str| {
+            let (stage, message) = progress
+                .native_error
+                .as_deref()
+                .map_or((stage, message), |error| (NativeEvent, error));
+            incomplete(state, Some(turn_id), stage, message)
         };
         match progress.terminal_status.as_deref() {
-            Some("failed" | "interrupted") => Ok(json!({
-                "state": "failed",
-                "command_id": command_id,
-                "compaction": {"completed": false, "receipt_id": turn_id},
-            })),
+            Some(status @ ("failed" | "interrupted")) => Ok(incomplete_turn(
+                "failed",
+                Lifecycle,
+                &format!("Codex reported native compaction {status}"),
+            )),
             Some("completed")
                 if progress.item_started
                     && progress.item_completed
@@ -2265,13 +2287,9 @@ impl CodexPlugin {
             {
                 let thread = match read_owned_thread(&session.native_client, &thread_id).await {
                     Ok(thread) => thread,
-                    Err(_) => {
+                    Err(error) => {
                         session.phase = SessionPhase::Unknown;
-                        return Ok(json!({
-                            "state": "unknown",
-                            "command_id": command_id,
-                            "compaction": {"completed": false, "receipt_id": turn_id},
-                        }));
+                        return Ok(incomplete_turn("unknown", Readback, &error.message));
                     }
                 };
                 let latest = match read_latest_native_turn_status(
@@ -2281,13 +2299,9 @@ impl CodexPlugin {
                 .await
                 {
                     Ok(latest) => latest,
-                    Err(_) => {
+                    Err(error) => {
                         session.phase = SessionPhase::Unknown;
-                        return Ok(json!({
-                            "state": "unknown",
-                            "command_id": command_id,
-                            "compaction": {"completed": false, "receipt_id": turn_id},
-                        }));
+                        return Ok(incomplete_turn("unknown", Readback, &error.message));
                     }
                 };
                 if thread_state(&thread) == "idle"
@@ -2302,20 +2316,20 @@ impl CodexPlugin {
                     }))
                 } else {
                     session.phase = SessionPhase::Unknown;
-                    Ok(json!({
-                        "state": "unknown",
-                        "command_id": command_id,
-                        "compaction": {"completed": false, "receipt_id": turn_id},
-                    }))
+                    Ok(incomplete_turn(
+                        "unknown",
+                        Readback,
+                        "Codex readback did not confirm a completed compaction on the owned idle thread",
+                    ))
                 }
             }
             _ => {
                 session.phase = SessionPhase::Unknown;
-                Ok(json!({
-                    "state": "unknown",
-                    "command_id": command_id,
-                    "compaction": {"completed": false, "receipt_id": turn_id},
-                }))
+                Ok(incomplete_turn(
+                    "unknown",
+                    Lifecycle,
+                    "Codex did not report a complete native compaction lifecycle",
+                ))
             }
         }
     }

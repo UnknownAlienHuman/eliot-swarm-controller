@@ -1114,12 +1114,14 @@ impl WorkspaceManager {
         if slot.removal_may_have_begun(&command.id, preparation) {
             return removal_unknown("workspace_removal_may_have_begun");
         }
-        if self
+        if let Err(error) = self
             .wait_git_sources_closed(preparation, command, slot, deadline)
             .await
-            .is_err()
         {
-            return removal_unknown("workspace_git_drain_unknown");
+            return WorkspaceRemovalOutcome::Unknown {
+                code: "workspace_git_drain_unknown".to_owned(),
+                message: *error.message,
+            };
         }
         let expected_tip = command.args.get("expected_tip").and_then(Value::as_str);
         let mut outcome = match git

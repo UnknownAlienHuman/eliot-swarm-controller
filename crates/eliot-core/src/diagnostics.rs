@@ -2,6 +2,57 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Where an adapter obtained evidence for an incomplete native compaction.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompactionFailureStage {
+    NativeReply,
+    NativeEvent,
+    Lifecycle,
+    Readback,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct CompactionFailure {
+    pub stage: CompactionFailureStage,
+    pub message: String,
+}
+
+impl CompactionFailure {
+    /// Attribute the observed failure without changing the adapter's effect state.
+    pub fn diagnostic(&self) -> crate::Error {
+        let (code, where_, origin, evidence) = match self.stage {
+            CompactionFailureStage::NativeReply => (
+                "native_compaction_reply",
+                "native.compaction.reply",
+                crate::FailureOrigin::Harness,
+                "native compaction request returned an error",
+            ),
+            CompactionFailureStage::NativeEvent => (
+                "native_compaction_error",
+                "native.compaction.events",
+                crate::FailureOrigin::Harness,
+                "native error bound to the exact compaction turn",
+            ),
+            CompactionFailureStage::Lifecycle => (
+                "compaction_lifecycle_unconfirmed",
+                "plugin.command.compact.lifecycle",
+                crate::FailureOrigin::Unknown,
+                "the adapter could not verify the native compaction lifecycle",
+            ),
+            CompactionFailureStage::Readback => (
+                "compaction_readback_unconfirmed",
+                "plugin.command.compact.readback",
+                crate::FailureOrigin::Unknown,
+                "native readback did not prove completion of this compaction",
+            ),
+        };
+        crate::Error::new(code, self.message.clone())
+            .with_where(where_)
+            .with_origin(origin, evidence)
+    }
+}
+
 pub const MAX_STDERR_BYTES: usize = 16 * 1024;
 /// Aggregate encoded JSON budget, including source/flags and JSON escaping.
 pub const MAX_STDERR_DIAGNOSTIC_BYTES: usize = 16 * 1024;

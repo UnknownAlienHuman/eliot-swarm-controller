@@ -79,6 +79,7 @@ pub(crate) struct CompactionProgress {
     pub item_completed: bool,
     pub terminal_status: Option<String>,
     pub history_missing_tool_output: bool,
+    pub native_error: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -1065,7 +1066,6 @@ impl EventProcessor {
                     self.record_unclassified_native("codex.native_rpc.turn_status", native_tag)
                         .await?;
                 }
-                let progress = self.status.compaction.as_mut().unwrap();
                 let status = match &notification.turn.status {
                     NativeTurnStatus::Completed => "completed",
                     NativeTurnStatus::Failed => "failed",
@@ -1073,10 +1073,10 @@ impl EventProcessor {
                     NativeTurnStatus::InProgress => "unknown",
                     NativeTurnStatus::Other => "unknown",
                 };
-                progress.history_missing_tool_output |= status == "failed"
-                    && notification.turn.error.as_ref().is_some_and(|error| {
-                        crate::native::types::history_missing_tool_output(&error.message)
-                    });
+                if let Some(error) = notification.turn.error.as_ref() {
+                    self.note_compaction_error(&error.message, status == "failed");
+                }
+                let progress = self.status.compaction.as_mut().unwrap();
                 progress.terminal_status =
                     Some(
                         if status == "completed"
@@ -1089,25 +1089,36 @@ impl EventProcessor {
                         .to_owned(),
                     );
             }
-            "error"
-                if serde_json::from_value::<NativeErrorNotification>(params.clone()).is_ok_and(
-                    |notification| {
-                        notification.will_retry == Some(false)
-                            && notification.error.as_ref().is_some_and(|error| {
-                                crate::native::types::history_missing_tool_output(&error.message)
-                            })
-                    },
-                ) =>
-            {
-                self.status
-                    .compaction
-                    .as_mut()
-                    .unwrap()
-                    .history_missing_tool_output = true;
+            "error" => {
+                if let Ok(notification) =
+                    serde_json::from_value::<NativeErrorNotification>(params.clone())
+                    && notification.will_retry == Some(false)
+                    && let Some(error) = notification.error
+                {
+                    self.note_compaction_error(&error.message, true);
+                }
             }
             _ => {}
         }
         Ok(true)
+    }
+
+    fn note_compaction_error(&mut self, message: &str, detect_broken_history: bool) {
+        let history_missing_tool_output =
+            detect_broken_history && crate::native::types::history_missing_tool_output(message);
+        let secrets = SecretPolicy::new(self.secrets.iter().cloned());
+        let message: String = secrets
+            .redact_text(message)
+            .trim()
+            .chars()
+            .take(768)
+            .collect();
+        if !message.is_empty()
+            && let Some(progress) = self.status.compaction.as_mut()
+        {
+            progress.native_error = Some(message);
+            progress.history_missing_tool_output |= history_missing_tool_output;
+        }
     }
 
     async fn flush_buffer(&mut self) -> Result<()> {

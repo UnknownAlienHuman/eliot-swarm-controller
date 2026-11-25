@@ -59,8 +59,8 @@ pub use context::{
     STEER_DELIVERY_FIELD, TrustedReviewLabels, decode_retained_inject_args, turn_started_data,
 };
 pub use diagnostics::{
-    MAX_STDERR_BYTES, MAX_STDERR_DIAGNOSTIC_BYTES, StderrDiagnostic, StderrSnapshot, StderrSource,
-    bound_stderr_diagnostics,
+    CompactionFailure, CompactionFailureStage, MAX_STDERR_BYTES, MAX_STDERR_DIAGNOSTIC_BYTES,
+    StderrDiagnostic, StderrSnapshot, StderrSource, bound_stderr_diagnostics,
 };
 pub use harness_check::{
     CHECK_STEPS, HARNESS_CHECK_BATCH_LIMIT, HARNESS_CHECK_INVENTORY_SECS, HARNESS_CHECK_LAUNCH_ARG,

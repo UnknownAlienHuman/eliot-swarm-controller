@@ -472,7 +472,7 @@ impl Router {
             && let Some(workspace) = store.get_workspace(agent)?
             && workspace.target_generation == generation
             && let Some(step) =
-                worktree_removal_refusal(workspace.outcome.as_ref(), workspace.updated_at)
+                worktree_removal_problem(workspace.outcome.as_ref(), workspace.updated_at)
         {
             steps.push(step);
         }
@@ -703,7 +703,7 @@ fn chain_origin(steps: &[DiagnoseStep]) -> String {
 
 fn command_step(command: &Command) -> DiagnoseStep {
     if command.verb == "worktree.remove"
-        && let Some(step) = worktree_removal_refusal(command.outcome.as_ref(), command.updated_at)
+        && let Some(step) = worktree_removal_problem(command.outcome.as_ref(), command.updated_at)
     {
         return step;
     }
@@ -714,10 +714,12 @@ fn command_step(command: &Command) -> DiagnoseStep {
     step
 }
 
-fn worktree_removal_refusal(outcome: Option<&Value>, at: i64) -> Option<DiagnoseStep> {
+fn worktree_removal_problem(outcome: Option<&Value>, at: i64) -> Option<DiagnoseStep> {
     let outcome = outcome?;
     let result = outcome.get("result")?;
-    if outcome["stage"].as_str() != Some("removal") || result["state"].as_str() != Some("failed") {
+    if outcome["stage"].as_str() != Some("removal")
+        || !matches!(result["state"].as_str(), Some("failed" | "unknown"))
+    {
         return None;
     }
     let mut step = command_outcome_step(Some(result), at);
@@ -784,7 +786,9 @@ fn turn_step(turn: &Turn, terminal: Option<&Event>) -> DiagnoseStep {
         .map(|message| bound_chars(message, 1024))
         .or_else(|| {
             let reason = terminal?.data.get("reason")?.as_str()?;
-            eliot_core::swarm_loss_location(reason).map(|_| eliot_core::reason_words(reason))
+            (reason == "stopped_without_terminal_result"
+                || eliot_core::swarm_loss_location(reason).is_some())
+            .then(|| eliot_core::reason_words(reason))
         })
         .or_else(|| {
             turn.native_status
