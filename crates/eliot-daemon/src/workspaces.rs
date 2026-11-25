@@ -1113,10 +1113,16 @@ impl WorkspaceManager {
         if slot.removal_may_have_begun(&command.id, preparation) {
             return removal_unknown("workspace_removal_may_have_begun");
         }
-        if let Err(error) = require_managed_cleanup_path(
-            &self.inner.data_root,
-            Path::new(&preparation.worktree_path),
-        ) {
+        let path = Path::new(&preparation.worktree_path);
+        let parent = path
+            .parent()
+            .ok_or_else(|| problem("invalid", "managed worktree has no parent"))
+            .and_then(crate::platform::script_file::Directory::open);
+        let _parent = match parent {
+            Ok(parent) => parent,
+            Err(error) => return removal_preflight_error(&error, "path_custody"),
+        };
+        if let Err(error) = require_managed_cleanup_path(&self.inner.data_root, path) {
             return removal_preflight_error(&error, "path_custody");
         }
         if let Err(error) = self
@@ -2775,7 +2781,11 @@ fn native_removal_may_have_begun(preparation: &WorkspacePreparation) -> bool {
 }
 
 pub(crate) fn require_managed_cleanup_path(data_root: &Path, path: &Path) -> Result<()> {
-    if !crate::platform::script_file::cleanup_path_in_root(path, &data_root.join("worktrees"))? {
+    let path = crate::platform::script_file::canonical_cleanup_path(path)?;
+    if !crate::platform::script_file::cleanup_canonical_path_in_root(
+        &path,
+        &data_root.join("worktrees"),
+    )? {
         return Err(problem(
             "worktree_root_foreign",
             "worktree is outside this daemon's managed root",

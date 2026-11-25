@@ -82,7 +82,20 @@ async fn open_cleanup_tree(
     clippy::disallowed_methods,
     reason = "Recursive directory removal is centralized in daemon cleanup."
 )]
-pub(crate) fn remove_dir_all(path: &Path) -> std::io::Result<()> {
+pub(crate) fn remove_dir_all(parent: &Directory, path: &Path) -> std::io::Result<()> {
+    let path = parent.direct_child_path(path)?;
+    let metadata = std::fs::symlink_metadata(&path)?;
+    if !metadata.is_dir()
+        || metadata.file_type().is_symlink()
+        || crate::platform::is_reparse_point(&metadata)
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "recursive cleanup requires a plain directory inside its pinned parent",
+        ));
+    }
+    // The standard recursive remover opens children without following links.
+    // Its absolute ancestors are pinned on Windows, and Linux uses the directory fd.
     std::fs::remove_dir_all(path)
 }
 
@@ -2474,7 +2487,7 @@ impl Router {
         artifact: &ArtifactView,
         scan_budget: Duration,
     ) -> Result<(u64, bool)> {
-        self.require_cleanup_ownership(artifact).await?;
+        let owned_path = self.require_cleanup_ownership(artifact).await?;
         if artifact.kind == ArtifactKind::NativeSession {
             // The archive itself runs at apply through the harness native
             // API; the plan verdict already gated harness and quiescence.
@@ -2517,6 +2530,7 @@ impl Router {
         let path = self
             .checked_cleanup_artifact_path(&agent, artifact, false)
             .await?;
+        require_same_cleanup_path(owned_path.as_deref(), &path)?;
         self.cleanup_check_git(&agent, &path, artifact.is_owned_cleanup_child())
             .await?;
         if is_stand_artifact(artifact) {
@@ -2763,7 +2777,7 @@ impl Router {
         automatic: bool,
     ) -> Result<CleanupRemoval> {
         let artifact = &item.artifact;
-        self.require_cleanup_ownership(artifact).await?;
+        let owned_path = self.require_cleanup_ownership(artifact).await?;
         if artifact.kind == ArtifactKind::Branch {
             let git = artifact
                 .git
@@ -2949,6 +2963,7 @@ impl Router {
         let path = self
             .checked_cleanup_artifact_path(&agent, artifact, true)
             .await?;
+        require_same_cleanup_path(owned_path.as_deref(), &path)?;
         self.cleanup_check_git(&agent, &path, artifact.is_owned_cleanup_child())
             .await?;
         if is_stand_artifact(artifact) {
@@ -4104,6 +4119,16 @@ fn cleanup_operation_failed(code: &str) -> bool {
         code,
         "internal" | "platform_io" | "store_io" | "source_integrity"
     )
+}
+
+fn require_same_cleanup_path(owned_path: Option<&Path>, checked: &Path) -> Result<()> {
+    if owned_path != Some(checked) {
+        return Err(Error::new(
+            "identity_changed",
+            "cleanup path changed after custody verification",
+        ));
+    }
+    Ok(())
 }
 
 fn cleanup_plan_refusal(candidate: &mut CleanupCandidate, bulk: bool, error: Error) {

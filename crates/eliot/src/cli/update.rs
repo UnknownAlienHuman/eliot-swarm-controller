@@ -1473,20 +1473,26 @@ fn release_binary(source: &Path) -> Result<PathBuf, Failure> {
 
 /// Create or verify a versioned launch image in the private updater directory.
 /// The caller separately preserves the selected release's working directory.
-fn prepare_update_release(source: &Path, directory: &Path) -> Result<(PathBuf, String), Failure> {
+fn prepare_update_release(
+    source: &Path,
+    directory: &eliot_daemon::operator::UpdateImagesDirectory,
+) -> Result<(PathBuf, String), Failure> {
     prepare_update_image(source, directory, ".swarm-release-")
 }
 
 fn prepare_update_image(
     source: &Path,
-    directory: &Path,
+    directory: &eliot_daemon::operator::UpdateImagesDirectory,
     prefix: &str,
 ) -> Result<(PathBuf, String), Failure> {
     let digest = binary_sha256(source).map_err(Failure::for_read)?;
-    let artifact = directory.join(format!("{prefix}{digest}{}", std::env::consts::EXE_SUFFIX));
+    let artifact = directory
+        .path()
+        .join(format!("{prefix}{digest}{}", std::env::consts::EXE_SUFFIX));
     let artifact_metadata = match std::fs::symlink_metadata(&artifact) {
         Ok(metadata) if metadata.file_type().is_file() => Some(metadata),
         Ok(metadata) if metadata.file_type().is_symlink() => {
+            // This unlinks the leaf itself within the pinned directory.
             std::fs::remove_file(&artifact).map_err(|error| {
                 Failure::new(
                     4,
@@ -1517,7 +1523,7 @@ fn prepare_update_image(
         eliot_daemon::operator::validate_update_image(&artifact).map_err(Failure::for_read)?;
         let staged_digest = binary_sha256(&artifact).map_err(Failure::for_read)?;
         if staged_digest != digest {
-            remove_incomplete_release(&artifact).map_err(|error| {
+            directory.remove_image(&artifact, None).map_err(|error| {
                 Failure::new(
                     4,
                     format!(
@@ -1572,7 +1578,7 @@ fn prepare_update_image(
     if created_by_attempt {
         match staged {
             Err(mut failure) => {
-                if let Err(error) = remove_incomplete_release(&artifact) {
+                if let Err(error) = directory.remove_image(&artifact, None) {
                     failure.exit_code = 4;
                     failure.message = format!(
                         "{}; incomplete release image cleanup failed for {}: {error}",
@@ -1586,36 +1592,6 @@ fn prepare_update_image(
         }
     } else {
         staged
-    }
-}
-
-fn remove_incomplete_release(path: &Path) -> std::io::Result<()> {
-    #[cfg(windows)]
-    let was_readonly = std::fs::metadata(path).map(|metadata| metadata.permissions().readonly());
-    #[cfg(windows)]
-    if let Ok(metadata) = std::fs::metadata(path) {
-        let mut permissions = metadata.permissions();
-        #[expect(
-            clippy::permissions_set_readonly_false,
-            reason = "Windows must clear the read-only attribute before deleting the failed image"
-        )]
-        permissions.set_readonly(false);
-        std::fs::set_permissions(path, permissions)?;
-    }
-    match std::fs::remove_file(path) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => {
-            #[cfg(windows)]
-            if let Ok(was_readonly) = was_readonly
-                && let Ok(metadata) = std::fs::metadata(path)
-            {
-                let mut permissions = metadata.permissions();
-                permissions.set_readonly(was_readonly);
-                let _ = std::fs::set_permissions(path, permissions);
-            }
-            Err(error)
-        }
-        Ok(()) => Ok(()),
     }
 }
 
@@ -1761,7 +1737,10 @@ async fn release_info(binary: &Path) -> Result<ReleaseInfo, Failure> {
 }
 
 #[cfg(windows)]
-fn desktop_binary(binary: &Path, directory: &Path) -> Result<Option<(PathBuf, String)>, Failure> {
+fn desktop_binary(
+    binary: &Path,
+    directory: &eliot_daemon::operator::UpdateImagesDirectory,
+) -> Result<Option<(PathBuf, String)>, Failure> {
     let desktop = binary.with_file_name("swarm-desktop.exe");
     if !desktop.is_file() {
         return Ok(None);

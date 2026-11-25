@@ -547,10 +547,14 @@ fn birth_time(info: &DaemonInfo, prefix: &str) -> Result<u64> {
 }
 
 pub fn binary_sha256(path: &Path) -> Result<String> {
-    use sha2::{Digest, Sha256};
-    use std::io::{BufRead, BufReader};
     let file = std::fs::File::open(path)
         .map_err(|error| Error::new("platform_io", format!("open release binary: {error}")))?;
+    binary_reader_sha256(file)
+}
+
+pub(crate) fn binary_reader_sha256(file: impl std::io::Read) -> Result<String> {
+    use sha2::{Digest, Sha256};
+    use std::io::{BufRead, BufReader};
     let mut reader = BufReader::new(file);
     let mut hash = Sha256::new();
     loop {
@@ -571,10 +575,33 @@ pub fn binary_sha256(path: &Path) -> Result<String> {
         .collect())
 }
 
-/// Private, reparse-checked updater staging directory beneath the selected data
-/// root. The CLI caller holds the updater transition lock.
-pub fn update_images_directory(path: &Path) -> Result<PathBuf> {
-    DataDir::open_existing(path)?.update_images_directory()
+/// Private updater staging and deletion within the selected data directory.
+pub struct UpdateImagesDirectory(crate::platform::script_file::Directory);
+
+impl UpdateImagesDirectory {
+    pub fn path(&self) -> &Path {
+        &self.0.path
+    }
+
+    pub fn remove_image(&self, path: &Path, expected_digest: Option<&str>) -> Result<bool> {
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .filter(|_| path.parent() == Some(self.path()))
+            .ok_or_else(|| {
+                Error::new("not_allowed", "update image is outside its owned directory")
+            })?;
+        self.0.remove_update_image(name, expected_digest)
+    }
+}
+
+/// The CLI holds the updater transition lock and the opened directory
+/// retains its no-follow ancestry through staging and pruning.
+pub fn update_images_directory(path: &Path) -> Result<UpdateImagesDirectory> {
+    let directory = DataDir::open_existing(path)?.update_images_directory()?;
+    Ok(UpdateImagesDirectory(
+        crate::platform::script_file::Directory::open(&directory)?,
+    ))
 }
 
 /// Refuse updater image paths that are not regular files or traverse a

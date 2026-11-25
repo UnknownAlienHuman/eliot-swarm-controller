@@ -1001,7 +1001,8 @@ pub(crate) fn cleanup_after_settlement(data_root: &Path, view: &Path) {
     let Ok(root) = canonical_root(data_root.to_str().unwrap_or_default()) else {
         return;
     };
-    let Ok(base) = canonical_root(&root.join("git-fetch").to_string_lossy()) else {
+    let base = root.join("git-fetch");
+    let Ok(parent) = crate::platform::script_file::Directory::open(&base) else {
         return;
     };
     if view.parent() != Some(base.as_path())
@@ -1012,7 +1013,7 @@ pub(crate) fn cleanup_after_settlement(data_root: &Path, view: &Path) {
     {
         return;
     }
-    let _ = crate::router::remove_dir_all(view);
+    let _ = crate::router::remove_dir_all(&parent, view);
 }
 
 /// Merge the pinned commits in a private bare directory. The source object
