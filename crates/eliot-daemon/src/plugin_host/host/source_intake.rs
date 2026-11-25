@@ -61,12 +61,18 @@ enum ToolBatchOutcome {
     Committed {
         result: Result<BatchCommit>,
         wait: Duration,
-        held: Duration,
+        write_timing: Option<SourceWriteTiming>,
         batches: usize,
         group_bytes: usize,
     },
     RestartCutoff(String),
     Unsettled(Error),
+}
+
+#[derive(Clone, Copy)]
+struct SourceWriteTiming {
+    elapsed: Duration,
+    held: Duration,
 }
 
 impl ReadyToolBatches {
@@ -136,29 +142,47 @@ impl ReadyToolBatches {
                             replies.push((job.queued, job.reply));
                         }
                     }
-                    if !batches.is_empty() {
-                        let count = batches.len();
-                        let group_bytes = batches.iter().map(ReadyToolBatch::encoded_bytes).sum();
-                        let results = if count == 1 {
-                            vec![writer.put_batch(batches.pop().expect("one ready batch").into_batch(), now_ms())]
-                        } else {
-                            writer.put_tool_batch_group(batches, now_ms())
-                        };
-                        for commit in results.iter().filter_map(|result| result.as_ref().ok()) {
-                            bus.publish(&commit.events);
-                        }
-                        let held = acquired.elapsed();
-                        for ((queued_at, reply), result) in replies.into_iter().zip(results) {
-                            let _ = reply.send(ToolBatchOutcome::Committed {
-                                result,
-                                wait: acquired - queued_at,
-                                held,
-                                batches: count,
-                                group_bytes,
-                            });
-                        }
+                    if batches.is_empty() {
+                        drop(writer);
+                        return received.await;
                     }
+                    let count = batches.len();
+                    let group_bytes = batches.iter().map(ReadyToolBatch::encoded_bytes).sum();
+                    let now = now_ms();
+                    let started = Instant::now();
+                    let results = if count == 1 {
+                        vec![writer.put_batch(batches.pop().expect("one ready batch").into_batch(), now)]
+                    } else {
+                        writer.put_tool_batch_group(batches, now)
+                    };
+                    let elapsed = started.elapsed();
+                    for commit in results.iter().filter_map(|result| result.as_ref().ok()) {
+                        bus.publish(&commit.events);
+                    }
+                    let timing = SourceWriteTiming { elapsed, held: acquired.elapsed() };
                     drop(writer);
+                    for ((queued_at, reply), result) in replies.into_iter().zip(results) {
+                        let _ = reply.send(ToolBatchOutcome::Committed {
+                            result,
+                            wait: acquired - queued_at,
+                            write_timing: (count == 1).then_some(timing),
+                            batches: count,
+                            group_bytes,
+                        });
+                    }
+                    if count > 1 && crate::logging::is_debug() {
+                        crate::logging::record_debug(
+                            &SecretPolicy::default(),
+                            "store.source_batch_group",
+                            &[],
+                            &[
+                                ("store_elapsed_us", timing.elapsed.as_micros() as u64),
+                                ("lock_hold_us", timing.held.as_micros() as u64),
+                                ("commit_batches", count as u64),
+                                ("commit_batch_bytes", group_bytes as u64),
+                            ],
+                        );
+                    }
                     received.await
                 }
             }
@@ -892,25 +916,32 @@ async fn put_events(
         ToolBatchOutcome::Committed {
             result,
             wait,
-            held,
+            write_timing,
             batches,
             group_bytes,
         } => {
             if crate::logging::is_debug()
                 && let Ok(commit) = &result
             {
+                let mut fields = vec![
+                    ("lock_wait_us", wait.as_micros() as u64),
+                    ("events", commit.events.len() as u64),
+                    ("native_events", native_events),
+                    ("replayed", u64::from(commit.replayed)),
+                    ("commit_batches", batches as u64),
+                    ("commit_batch_bytes", group_bytes as u64),
+                ];
+                if let Some(timing) = write_timing {
+                    fields.extend([
+                        ("lock_hold_us", timing.held.as_micros() as u64),
+                        ("store_elapsed_us", timing.elapsed.as_micros() as u64),
+                    ]);
+                }
                 crate::logging::record_debug(
                     &SecretPolicy::new(credentials),
                     "store.source_batch",
                     &[("agent", &gap.agent_id), ("source", &gap.source)],
-                    &[
-                        ("lock_wait_us", wait.as_micros() as u64),
-                        ("lock_hold_us", held.as_micros() as u64),
-                        ("events", commit.events.len() as u64),
-                        ("native_events", native_events),
-                        ("commit_batches", batches as u64),
-                        ("commit_batch_bytes", group_bytes as u64),
-                    ],
+                    &fields,
                 );
             }
             result
@@ -937,6 +968,7 @@ async fn put_events(
                         return Err(planned_restart_cutoff_error(&cutoff));
                     }
                     let now = now_ms();
+                    let started = Instant::now();
                     let result = if is_child {
                         store.put_native_child_batch(
                             binding.agent_id,
@@ -954,6 +986,7 @@ async fn put_events(
                             now,
                         )
                     };
+                    let store_elapsed = started.elapsed();
                     if let Ok(commit) = &result {
                         bus.publish(&commit.events);
                     }
@@ -981,6 +1014,8 @@ async fn put_events(
                                 ("lock_hold_us", held.as_micros() as u64),
                                 ("events", commit.events.len() as u64),
                                 ("native_events", native_events),
+                                ("replayed", u64::from(commit.replayed)),
+                                ("store_elapsed_us", store_elapsed.as_micros() as u64),
                             ],
                         );
                     }

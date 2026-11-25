@@ -1588,8 +1588,13 @@ read fresh blockers, including current readers and workers. Compact
 `agent.list` reads and history-derived attention thresholds use SQLite read
 snapshots outside the Store writer lock. Compact list requests wait for a reader
 slot before scheduling blocking work, with up to four snapshots active at once.
-Debug logs include attention sweep
-duration and Store lock wait and hold times for retention and native event batches.
+Debug logs include attention sweep duration and Store timing for retention
+and native event batches. In `store.source_batch`, `events` counts newly
+committed Store rows, `native_events` counts submitted native records and
+`replayed` marks a retained batch receipt. Count committed rows from `events`.
+`store_elapsed_us` covers the Store call, including its transaction, separate
+from lock wait and hold. When several batches share a transaction, the daemon
+records write and lock hold time once in `store.source_batch_group`.
 When maintenance receives checkpoint statistics, the `daemon.wal_checkpoint`
 debug record gives frame and backfill counts, busy state, and execution and
 elapsed times. A failed call produces `daemon.retention_checkpoint_failed`.
