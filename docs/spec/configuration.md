@@ -830,6 +830,12 @@ ignored content within these frozen directories, never tracked dirt.
 
 ## Daemon and automation settings
 
+Built-in attention, recovery and completion workers use the defaults below.
+The project launch policy, profile context ceiling and quota reserve, shared
+Owner rules, and rule recipes each require their own Owner input.
+Use `swarm autonomy` to check retained actions and their coverage. A worker
+can be enabled throughout a window with zero eligible actions.
+
 Backlog and automatic cleanup are root-level automation options. Local Git
 base movement notices have their own automation table.
 
@@ -879,9 +885,17 @@ interval_seconds = 300
 compact_on_start = false
 ```
 
-Swarm writes the four history windows shown into the config it creates for a
-new Store. Existing configs and existing Stores without a config keep their
-settings. An omitted history window disables deletion for that class.
+The four history windows above come from the bootstrap config template.
+Daemon bootstrap writes the template only when both `eliot.db` and `config.toml`
+are absent. Fresh private stands use the same template. The config loader
+otherwise leaves any omitted history window unset. In particular, an existing
+Store with no retention section has no age cutoff for events, exited child
+processes, commands or mail.
+
+`swarm daemon status` prints `Store retention off` when the active config was
+read successfully and all four history windows are unset. Periodic maintenance
+still runs, including cleanup of reclaimable metadata and SQLite space
+maintenance.
 `interval_seconds` defaults to 300. `events_seconds` can specify the event
 window in seconds instead of `events_days`. Set at most one of the two. The event
 and exited-child process windows are positive integers. `interval_seconds` allows
