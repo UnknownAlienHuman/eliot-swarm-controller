@@ -500,6 +500,7 @@ impl Router {
             monitoring.clone(),
             Arc::clone(&acl_notices),
         );
+        let catalog_cache = Mutex::new(catalog::CatalogCache::new(&data_root));
         Ok(Self {
             inner: Arc::new(RouterInner {
                 acl_notices,
@@ -526,7 +527,7 @@ impl Router {
                 rule_definitions: Mutex::new(HashMap::new()),
                 assignment_observations: Mutex::default(),
                 rule_source_files: Mutex::new(HashMap::new()),
-                catalog_cache: Mutex::new(catalog::CatalogCache::default()),
+                catalog_cache,
                 allowance_reads: Mutex::new(quota::AllowanceReads::default()),
                 profile_cache: Mutex::new(crate::config::ProfileCache::default()),
                 catalog_refresh: tokio::sync::Notify::new(),

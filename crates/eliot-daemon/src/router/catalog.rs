@@ -19,6 +19,7 @@ use eliot_core::api::{
 use eliot_core::{Error, Result};
 use eliot_plugin::protocol::ModelCatalogue;
 use eliot_plugin::sync::LockExt;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::{
@@ -1023,44 +1024,53 @@ impl Router {
             return Ok(response);
         }
         let mut updates = self.inner.catalog_updates.subscribe();
-        let snapshot = {
+        let (snapshot, can_restore, retry) = {
             let mut cache = self.inner.catalog_cache.lock_recover();
             cache.aggregate_requested_at = Some(Instant::now());
-            if let Some(error) = cache.aggregate_retry_error() {
-                return Err(error);
-            }
-            cache.aggregate.clone()
+            (
+                cache.aggregate.clone(),
+                cache.seed.is_some(),
+                cache.aggregate_retry_error(),
+            )
         };
-        let key = if snapshot.is_some() {
+        let mut key = if snapshot.is_some() || can_restore {
             self.catalog_key(deadline).await.ok()
         } else {
             None
         };
-        let snapshot = match snapshot {
-            Some(snapshot)
-                if key.as_ref() == Some(&snapshot.key)
-                    && snapshot.is_usable()
-                    && !snapshot.refresh_due() =>
-            {
-                snapshot
-            }
-            _ => {
+        if let Some(snapshot) =
+            snapshot.filter(|snapshot| key.as_ref() == Some(&snapshot.key) && snapshot.is_usable())
+        {
+            if snapshot.refresh_due() {
                 self.inner.catalog_refresh.notify_one();
-                tokio::time::timeout_at(deadline.into(), updates.changed())
-                    .await
-                    .map_err(|_| crate::adhoc::discovery_timeout())?
-                    .map_err(|_| Error::new("unknown", "model catalogue refresh worker stopped"))?;
-                let snapshot = updates.borrow_and_update().clone().ok_or_else(|| {
-                    Error::new("unknown", "model catalogue refresh produced no outcome")
-                })??;
-                if key.as_ref() != Some(&snapshot.key)
-                    && snapshot.key != self.catalog_key(deadline).await?
-                {
-                    return Err(catalog_source_changed());
-                }
-                snapshot
             }
-        };
+            return self.catalog_page(request, &snapshot, deadline).await;
+        }
+        if can_restore && let Some(current) = key.take() {
+            let snapshot = {
+                let mut cache = self.inner.catalog_cache.lock_recover();
+                cache.restore_seed(current)
+            };
+            if let Some(snapshot) = snapshot {
+                self.inner.catalog_refresh.notify_one();
+                return self.catalog_page(request, &snapshot, deadline).await;
+            }
+        }
+        if let Some(error) = retry {
+            return Err(error);
+        }
+        self.inner.catalog_refresh.notify_one();
+        tokio::time::timeout_at(deadline.into(), updates.changed())
+            .await
+            .map_err(|_| crate::adhoc::discovery_timeout())?
+            .map_err(|_| Error::new("unknown", "model catalogue refresh worker stopped"))?;
+        let snapshot = updates.borrow_and_update().clone().ok_or_else(|| {
+            Error::new("unknown", "model catalogue refresh produced no outcome")
+        })??;
+        if key.as_ref() != Some(&snapshot.key) && snapshot.key != self.catalog_key(deadline).await?
+        {
+            return Err(catalog_source_changed());
+        }
         self.catalog_page(request, &snapshot, deadline).await
     }
 
@@ -1137,21 +1147,29 @@ impl Router {
                 .build_catalog(key, deadline - Duration::from_secs(5))
                 .await?;
             key = self.catalog_key(deadline).await?;
-            let mut cache = self.inner.catalog_cache.lock_recover();
-            if key != snapshot.key || cache.auth_revision != snapshot.key.auth_revision {
-                continue;
-            }
-            if self.inner.mode.load(Ordering::SeqCst) != MODE_OPEN {
-                return Err(catalog_shutting_down());
-            }
             let snapshot = Arc::new(snapshot);
-            cache.aggregate = Some(snapshot.clone());
+            {
+                let mut cache = self.inner.catalog_cache.lock_recover();
+                if key != snapshot.key || cache.auth_revision != snapshot.key.auth_revision {
+                    continue;
+                }
+                if self.inner.mode.load(Ordering::SeqCst) != MODE_OPEN {
+                    return Err(catalog_shutting_down());
+                }
+                cache.aggregate = Some(snapshot.clone());
+                cache.seed = None;
+            }
+            self.persist_catalogue(snapshot.clone()).await;
             return Ok(snapshot);
         }
         Err(catalog_source_changed())
     }
 
     async fn catalog_key(&self, deadline: Instant) -> Result<catalog::CatalogKey> {
+        let durable_auth = tokio::time::timeout_at(deadline.into(), self.inner.store.lock())
+            .await
+            .map_err(|_| crate::adhoc::discovery_timeout())?
+            .catalogue_auth_fingerprint()?;
         let router = self.clone();
         crate::adhoc::blocking_discovery(deadline, move || {
             let root = &router.inner.data_root;
@@ -1211,10 +1229,31 @@ impl Router {
                 installations,
                 adhoc,
                 previews,
+                durable_auth,
                 auth_revision,
             })
         })
         .await?
+    }
+
+    async fn persist_catalogue(&self, snapshot: Arc<CachedAggregate>) {
+        let root = self.inner.data_root.clone();
+        let policy = self.secret_policy_snapshot();
+        let result = tokio::task::spawn_blocking(move || -> Result<()> {
+            if let Some(bytes) = PersistedCatalogue::encode(&snapshot, &policy) {
+                crate::platform::data_dir::replace_private_file(&root, CATALOG_SEED_FILE, &bytes)?;
+            }
+            Ok(())
+        })
+        .await;
+        if let Ok(Err(error)) = result {
+            crate::logging::record(
+                &self.secret_policy_snapshot(),
+                "catalog.seed_write_failed",
+                &[],
+                Some(&error),
+            );
+        }
     }
 
     fn cached_catalog(&self, key: &catalog::CatalogKey) -> Option<Arc<catalog::CachedAggregate>> {
@@ -1465,6 +1504,7 @@ impl Router {
             completed_at: Instant::now(),
             retry_delay,
             hard_expires_at,
+            restored: false,
         })
     }
 
@@ -1485,7 +1525,8 @@ impl Router {
             ));
         }
         let query = request.query.as_deref().unwrap_or("");
-        let stale = !quota_fresh(snapshot.fetched_at_ms, snapshot.ttl_ms, now_ms());
+        let stale =
+            snapshot.restored || !quota_fresh(snapshot.fetched_at_ms, snapshot.ttl_ms, now_ms());
         let limit = request.effective_limit();
         let mut matched = snapshot
             .models
@@ -1551,6 +1592,8 @@ impl Router {
 const MAX_CACHED_SCOPES: usize = 32;
 const CATALOG_REFRESH_INTERVAL: Duration = Duration::from_secs(15);
 const CATALOG_INTEREST: Duration = Duration::from_secs(5 * 60);
+const CATALOG_SEED_FILE: &str = "model-catalogue-last-good.json";
+const MAX_CATALOG_SEED_BYTES: usize = 4 * 1024 * 1024;
 // Allow a complete discovery pass and one scheduler tick before expiry.
 const CATALOG_REFRESH_LEAD_MS: u64 = 105_000;
 
@@ -1642,13 +1685,13 @@ fn model_source_identity(
     Some(ModelSourceIdentity { scope, login })
 }
 
-#[derive(PartialEq, Eq, Clone, Hash)]
+#[derive(PartialEq, Eq, Clone, Hash, Serialize)]
 struct ModelSourceIdentity {
     scope: String,
     login: NativeLoginRevision,
 }
 
-#[derive(PartialEq, Eq, Clone, Hash)]
+#[derive(PartialEq, Eq, Clone, Hash, Serialize)]
 enum NativeLoginRevision {
     Untracked,
     Files(Vec<(std::path::PathBuf, Option<crate::adhoc::VersionKey>)>),
@@ -1967,6 +2010,7 @@ pub(crate) struct CatalogCache {
     discovery: HashMap<(String, CatalogDiscoverySource), DiscoveryGate>,
     quotas: HashMap<ModelSourceIdentity, HarnessQuotaResponse>,
     aggregate: Option<Arc<CachedAggregate>>,
+    seed: Option<PersistedCatalogue>,
     aggregate_failure: Option<DiscoveryFailure>,
     aggregate_requested_at: Option<Instant>,
     auth_revision: u64,
@@ -2012,6 +2056,7 @@ pub(super) struct CachedAggregate {
     completed_at: Instant,
     retry_delay: Duration,
     hard_expires_at: Option<i64>,
+    restored: bool,
 }
 
 impl CachedAggregate {
@@ -2021,6 +2066,9 @@ impl CachedAggregate {
     }
 
     fn refresh_due(&self) -> bool {
+        if self.restored {
+            return true;
+        }
         let now = now_ms();
         if self.failures.is_empty() {
             !quota_fresh(
@@ -2040,19 +2088,7 @@ impl CachedAggregate {
         harness: &str,
         profile: Option<&str>,
     ) -> bool {
-        let scope = match profile {
-            Some(name) => self
-                .key
-                .previews
-                .iter()
-                .find(|preview| preview.name == name)
-                .and_then(|preview| preview.scope.as_ref()),
-            None => SUPPORTED_HARNESSES
-                .iter()
-                .position(|name| *name == harness)
-                .and_then(|index| self.key.adhoc[index].as_ref()),
-        };
-        if !scope.is_some_and(|scope| scope.login.is_tracked()) {
+        if !self.key.tracked_source(harness, profile) {
             return false;
         }
         let count = models.len();
@@ -2066,20 +2102,128 @@ impl CachedAggregate {
     }
 }
 
-#[derive(PartialEq, Eq)]
+#[derive(PartialEq, Eq, Serialize)]
 struct CatalogKey {
     settings_revision: Option<String>,
     installations: Vec<Option<crate::adhoc::InstallationFingerprint>>,
     adhoc: Vec<Option<ModelSourceIdentity>>,
     previews: Vec<PreviewSource>,
+    durable_auth: String,
+    #[serde(skip)]
     auth_revision: u64,
 }
 
-#[derive(PartialEq, Eq)]
+impl CatalogKey {
+    fn digest(&self) -> Option<[u8; 32]> {
+        eliot_core::canonical_json_sha256(&serde_json::to_value(self).ok()?).ok()
+    }
+
+    fn tracked_source(&self, harness: &str, profile: Option<&str>) -> bool {
+        let scope = match profile {
+            Some(name) => self
+                .previews
+                .iter()
+                .find(|preview| preview.name == name)
+                .and_then(|preview| preview.scope.as_ref()),
+            None => SUPPORTED_HARNESSES
+                .iter()
+                .position(|name| *name == harness)
+                .and_then(|index| self.adhoc.get(index)?.as_ref()),
+        };
+        scope.is_some_and(|scope| scope.login.is_tracked())
+    }
+}
+
+#[derive(PartialEq, Eq, Serialize)]
 struct PreviewSource {
     name: String,
     scope: Option<ModelSourceIdentity>,
     executable: Option<crate::adhoc::VersionKey>,
+}
+
+/// Disk stores metadata and a digest, never route environments or quota.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PersistedCatalogue {
+    version: u8,
+    source: [u8; 32],
+    fetched_at_ms: i64,
+    ttl_ms: u64,
+    harnesses: Vec<HarnessEntry>,
+    models: Vec<ModelsCatalogEntry>,
+}
+
+impl PersistedCatalogue {
+    fn read(root: &std::path::Path) -> Option<Self> {
+        let path = root.join(CATALOG_SEED_FILE);
+        let bytes =
+            crate::platform::data_dir::read_private_bytes(&path, MAX_CATALOG_SEED_BYTES).ok()?;
+        let seed: Self = serde_json::from_slice(&bytes).ok()?;
+        (seed.version == 1
+            && !seed.models.is_empty()
+            && seed.fetched_at_ms >= 0
+            && seed.fetched_at_ms <= now_ms()
+            && (1..=eliot_core::api::harness::MAX_HARNESS_READ_TTL_MS).contains(&seed.ttl_ms)
+            && seed.models.iter().all(|row| row.validate().is_ok()))
+        .then_some(seed)
+    }
+
+    fn encode(snapshot: &CachedAggregate, policy: &eliot_core::SecretPolicy) -> Option<Vec<u8>> {
+        if snapshot.restored {
+            return None;
+        }
+        let models: Vec<_> = snapshot
+            .models
+            .iter()
+            .filter(|row| {
+                snapshot
+                    .key
+                    .tracked_source(&row.harness, row.profile.as_deref())
+            })
+            .cloned()
+            .map(|mut row| {
+                row.availability = "unknown".to_owned();
+                row
+            })
+            .collect();
+        if models.is_empty() {
+            return None;
+        }
+        let seed = serde_json::to_value(Self {
+            version: 1,
+            source: snapshot.key.digest()?,
+            fetched_at_ms: snapshot.fetched_at_ms,
+            ttl_ms: snapshot.ttl_ms,
+            harnesses: snapshot.harnesses.clone(),
+            models,
+        })
+        .ok()?;
+        if policy.contains_value(&seed) {
+            return None;
+        }
+        let bytes = serde_json::to_vec(&seed).ok()?;
+        (bytes.len() <= MAX_CATALOG_SEED_BYTES).then_some(bytes)
+    }
+
+    fn restore(self, key: CatalogKey) -> Option<CachedAggregate> {
+        if self.source != key.digest()? {
+            return None;
+        }
+        Some(CachedAggregate {
+            key,
+            revision: ulid::Ulid::new().to_string(),
+            harnesses: self.harnesses,
+            models: self.models,
+            quotas: HashMap::new(),
+            failures: Vec::new(),
+            fetched_at_ms: self.fetched_at_ms,
+            ttl_ms: self.ttl_ms,
+            completed_at: Instant::now(),
+            retry_delay: DISCOVERY_RETRY_INTERVAL,
+            hard_expires_at: None,
+            restored: true,
+        })
+    }
 }
 
 #[derive(Clone, Hash, PartialEq, Eq)]
@@ -2092,6 +2236,25 @@ struct ModelsCacheKey {
 }
 
 impl CatalogCache {
+    pub(super) fn new(root: &std::path::Path) -> Self {
+        Self {
+            seed: PersistedCatalogue::read(root),
+            ..Self::default()
+        }
+    }
+
+    fn restore_seed(&mut self, key: CatalogKey) -> Option<Arc<CachedAggregate>> {
+        if let Some(aggregate) = self.cached_catalog(&key) {
+            return aggregate.is_usable().then_some(aggregate);
+        }
+        if self.auth_revision != key.auth_revision || self.aggregate.is_some() {
+            return None;
+        }
+        let restored = Arc::new(self.seed.take()?.restore(key)?);
+        self.aggregate = Some(restored.clone());
+        Some(restored)
+    }
+
     fn aggregate_retry_error(&self) -> Option<Error> {
         self.aggregate_failure
             .as_ref()

@@ -917,7 +917,7 @@ pub(crate) fn harness_installation(harness: &str, deadline: Instant) -> Value {
     read().unwrap_or_else(|error| installation_error(harness, error))
 }
 
-#[derive(PartialEq, Eq)]
+#[derive(PartialEq, Eq, serde::Serialize)]
 pub(crate) struct InstallationFingerprint {
     executables: Vec<VersionKey>,
     metadata_version: Option<String>,
@@ -971,7 +971,7 @@ const VERSION_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(30
 /// Bound on memoized executable identities.
 const VERSION_CACHE_MAX: usize = 64;
 
-#[derive(Clone, Hash, PartialEq, Eq)]
+#[derive(Clone, Hash, PartialEq, Eq, serde::Serialize)]
 pub(crate) struct VersionKey {
     program: String,
     modified: Option<std::time::SystemTime>,

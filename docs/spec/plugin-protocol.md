@@ -236,10 +236,6 @@ quota decisions, routing, and hold settlement.
 | `initialize` | protocol, frozen plugin config, private instance directory, optional `store_root` (required by OpenCode) | return actual manifest |
 | `agent.start` | agent/generation, profile, workspace, target environment, note, source plan/state, optional resume subject/linked initial input | establish session; input/result settle separately; a proven startup refusal returns a bound `"state": "failed"` with a short non-secret `reason` |
 | `agent.command` | agent/generation, command id, verb/args, exact turn/request where required | applied/rejected/failed/unknown, native mechanism and application point |
-
-The native command envelope carries the stable verb spelling. Host and adapter
-dispatch use the shared typed verb. The frozen launch model and effort share one
-projection for adapters that apply retained effort overrides at turn time.
 | `agent.stop` | agent/generation, command id | gracefully close the bound controlled native session and drain its events |
 | `agent.snapshot` | controlled command/turn binding, or exact subject plus `observation` page query | bounded readback; private history never acknowledges controlled effects |
 | `model.list` | [`ModelListParams`](../../crates/eliot-plugin/src/protocol.rs) | Read a dedicated reader's normalized `ModelCatalogue`. OpenCode can return optional metadata for the primary inventory from a second owned reader. |
@@ -250,6 +246,10 @@ projection for adapters that apply retained effort overrides at turn time.
 | `native.archive` | shared [`NativeArchiveParams`](../../crates/eliot-plugin/src/protocol.rs): frozen profile, exact native reference, and for OpenCode the Agent id, retained native scope and workspace | archive or delete exactly one retained native session of a terminal Swarm-created Agent through the documented native call (Codex `thread/archive`, OpenCode `DELETE /api/session/{id}` on an owned reader server bound to the retained store). OpenCode returns `native_archive_refused` for a confirmed refusal and reports uncertainty if exact readback is unavailable after an ambiguous response. The daemon owns all cleanup policy and keeps raw store files out of cleanup. Other harnesses return `unsupported` |
 | `profile.store` (L3) | shared [`ProfileStoreParams`](../../crates/eliot-plugin/src/protocol.rs) | Return [`ProfileStoreResult`](../../crates/eliot-plugin/src/protocol.rs): the effective `NativeStoreBinding` and optional plugin-owned startup projection, using the caller's actual prepared workspace and one bounded, owned metadata reader. Store freezes both with the exact launch dispatch; success requires confirmed reader cleanup. It creates no model or thread, performs no native control and publishes no Agent events. This is outside the L1/L2 first-harness subset. |
 | `shutdown` | none | close owned paths, drain, exit; never kill an adopted service |
+
+The native command envelope carries the stable verb spelling. Host and adapter
+dispatch use the shared typed verb. The frozen launch model and effort share one
+projection for adapters that apply retained effort overrides at turn time.
 
 An ordinary stop attempts `agent.command` with `interrupt` for the captured
 active or uncertain turn under the stop's authority, then sends `agent.stop` to
