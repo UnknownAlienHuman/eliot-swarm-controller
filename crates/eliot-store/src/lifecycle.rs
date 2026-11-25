@@ -67,18 +67,31 @@ impl Store {
         &mut self,
         id: &str,
         state: CommandState,
+        outcome: Option<Value>,
+        now: i64,
+        start_not_spawned: bool,
+    ) -> Result<Change<Command>> {
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sql_error)?;
+        let change = Self::settle_command_tx(&tx, id, state, outcome, now, start_not_spawned)?;
+        commit_transaction(tx, &self.write_faulted)?;
+        Ok(change)
+    }
+
+    pub(super) fn settle_command_tx(
+        tx: &Transaction<'_>,
+        id: &str,
+        state: CommandState,
         mut outcome: Option<Value>,
         now: i64,
         start_not_spawned: bool,
     ) -> Result<Change<Command>> {
         validate_settle_outcome(state, &outcome)?;
-        let tx = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(sql_error)?;
-        let mut record = load_command_record(&tx, id)?
+        let mut record = load_command_record(tx, id)?
             .ok_or_else(|| Error::new("not_found", format!("command {id} was not found")))?;
-        check_settle_verb_guards(&tx, &record, state, &outcome, id)?;
+        check_settle_verb_guards(tx, &record, state, &outcome, id)?;
         if record.command.verb == "inject" {
             let args = context::decode_inject_args(&record.command.args)?;
             if state == CommandState::Rejected
@@ -87,13 +100,13 @@ impl Store {
                 && args.fallback_to_next_input
                 && args.expires_at_ms.is_none_or(|expires| expires > now)
                 && let Some(target) = record.target
-                && let Some(agent) = load_agent_by_num(&tx, target)?
+                && let Some(agent) = load_agent_by_num(tx, target)?
                 && Some(agent.generation) == record.command.generation
                 && context::next_input_available(&agent)
             {
-                let outcome = context::move_context_to_next_input(&tx, id, now)?;
+                let outcome = context::move_context_to_next_input(tx, id, now)?;
                 let event = insert_daemon_command_event(
-                    &tx,
+                    tx,
                     now,
                     "context.moved",
                     Some(target),
@@ -101,9 +114,8 @@ impl Store {
                     id,
                     json!({"command_id": id, "outcome": outcome}),
                 )?;
-                let value = load_command(&tx, id)?
+                let value = load_command(tx, id)?
                     .ok_or_else(|| Error::new("source_integrity", "moved context disappeared"))?;
-                commit_transaction(tx, &self.write_faulted)?;
                 return Ok(Change {
                     value,
                     events: vec![event],
@@ -121,7 +133,6 @@ impl Store {
             }
         }
         if let Some(command) = check_settle_idempotent(&record, state, outcome.as_ref())? {
-            commit_transaction(tx, &self.write_faulted)?;
             return Ok(Change {
                 value: command,
                 events: Vec::new(),
@@ -141,7 +152,7 @@ impl Store {
                 .command
                 .generation
                 .ok_or_else(|| Error::new("bad_state", "unspawned start has no generation"))?;
-            let agent = load_agent_by_num(&tx, agent_num)?
+            let agent = load_agent_by_num(tx, agent_num)?
                 .ok_or_else(|| Error::new("not_found", "unspawned Agent was not found"))?;
             let has_processes: bool = tx
                 .query_row(
@@ -175,7 +186,7 @@ impl Store {
                 params![agent_num, generation],
             )
             .map_err(sql_error)?;
-            capacity::release_unstarted_tx(&tx, agent_num, generation, id)?;
+            capacity::release_unstarted_tx(tx, agent_num, generation, id)?;
         }
         if state == CommandState::Applied
             && record.command.verb == "send"
@@ -197,16 +208,16 @@ impl Store {
             && matches!(record.state, CommandState::Accepted | CommandState::Queued)
             && let Some(agent_num) = target
         {
-            load_agent_by_num(&tx, agent_num)?
+            load_agent_by_num(tx, agent_num)?
                 .is_some_and(|agent| agent.generation == 0 && agent.state == AgentState::Created)
         } else {
             false
         };
-        update_command_state(&tx, id, state, outcome.as_ref(), None, now)?;
+        update_command_state(tx, id, state, outcome.as_ref(), None, now)?;
         let mut events = Vec::new();
         let state_name = command_state_name(state);
         events.push(insert_daemon_command_event(
-            &tx,
+            tx,
             now,
             &format!("command.{state_name}"),
             target,
@@ -215,21 +226,21 @@ impl Store {
             json!({"command_id": id, "state": state_name, "outcome": outcome}),
         )?);
         events.extend(super::native_session_failure::record_broken_session(
-            &tx,
+            tx,
             &record,
             state,
             outcome.as_ref(),
             now,
         )?);
         if state == CommandState::Rejected && record.command.method == "swarm.switch" {
-            if super::switch::release_rejected_switch_fence_tx(&tx, &record.command, now)? {
+            if super::switch::release_rejected_switch_fence_tx(tx, &record.command, now)? {
                 events.push(insert_daemon_command_event(
-                    &tx, now, "switch.checkout_released", None, None, id,
+                    tx, now, "switch.checkout_released", None, None, id,
                     json!({"command_id":id,"state":"rejected","reason":"Rejected switch reservation released."}),
                 )?);
             }
             if let Some(event) = super::switch::rejected_switch_waiting_tx(
-                &tx,
+                tx,
                 &record.command,
                 outcome.as_ref(),
                 now,
@@ -246,7 +257,7 @@ impl Store {
                 (target, generation, record.command.turn_id.as_deref())
         {
             settle_owner_interrupted_turn_tx(
-                &tx,
+                tx,
                 (agent, generation, turn_id),
                 id,
                 "interrupted_by_owner",
@@ -256,15 +267,15 @@ impl Store {
         }
 
         if record.command.verb == "send" && state != CommandState::Applied {
-            context::settle_send_claims_tx(&tx, &record, state, now, &mut events)?;
+            context::settle_send_claims_tx(tx, &record, state, now, &mut events)?;
         }
 
         if is_attachment_verb(record.command.verb.as_str()) {
-            observer::settle_failure(&tx, &record.command, now, &mut events)?;
+            observer::settle_failure(tx, &record.command, now, &mut events)?;
         }
 
         release_settle_capacity(
-            &tx,
+            tx,
             &record,
             state,
             id,
@@ -274,7 +285,7 @@ impl Store {
         )?;
 
         apply_settle_agent_transition(
-            &tx,
+            tx,
             &record,
             state,
             id,
@@ -285,7 +296,7 @@ impl Store {
         )?;
         if start_not_spawned && let (Some(agent), Some(generation)) = (target, generation) {
             events.extend(super::failed_custody::record_failed_exit(
-                &tx,
+                tx,
                 agent,
                 generation,
                 super::failed_custody::NEVER_SPAWNED,
@@ -294,9 +305,8 @@ impl Store {
             )?);
         }
 
-        record = load_command_record(&tx, id)?
+        record = load_command_record(tx, id)?
             .ok_or_else(|| Error::new("internal", "settled command disappeared"))?;
-        commit_transaction(tx, &self.write_faulted)?;
         Ok(Change {
             value: record.command,
             events,
