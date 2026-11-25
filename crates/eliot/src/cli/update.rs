@@ -14,9 +14,10 @@ use eliot_core::api::{
 };
 use eliot_core::{Agent, AgentState, CommandState};
 use eliot_daemon::operator::{
-    DaemonInfo, binary_sha256, continue_after_restart, copy_store_for_update_check, daemon_alive,
-    discard_update_backup, lock_offline, lock_transition, replacement_data_dir,
-    restore_update_backup, running_binary, supports_restart_continuation_brief, update_backup_path,
+    DaemonInfo, RESTART_CONTINUATION_BRIEF_SCHEMA, binary_sha256, continue_after_restart,
+    copy_store_for_update_check, daemon_alive, discard_update_backup, lock_offline,
+    lock_transition, replacement_data_dir, restore_update_backup, running_binary,
+    update_backup_path,
 };
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
@@ -253,7 +254,12 @@ async fn run_update(
                     None
                 };
                 let (interruptions, resume_failed) = if recovered {
-                    Box::pin(resume_interrupted(&data_dir, &stopped)).await
+                    Box::pin(resume_interrupted(
+                        &data_dir,
+                        &stopped,
+                        previous.store_schema,
+                    ))
+                    .await
                 } else {
                     hold_interrupted(&stopped, "daemon admission unconfirmed")
                 };
@@ -346,7 +352,12 @@ async fn run_update(
         .await);
     }
     let backup_cleanup = discard_update_backup(&startup_path, backup.id).err();
-    let (interruptions, resume_failed) = Box::pin(resume_interrupted(&data_dir, &stopped)).await;
+    let (interruptions, resume_failed) = Box::pin(resume_interrupted(
+        &data_dir,
+        &stopped,
+        candidate.store_schema,
+    ))
+    .await;
 
     #[cfg(windows)]
     let (desktop, desktop_failed) = start_companion(&data_dir, desktop);
@@ -769,17 +780,17 @@ fn hold_interrupted(stopped: &[StoppedAgent], reason: &str) -> (Vec<Value>, bool
     )
 }
 
-async fn resume_interrupted(path: &Path, stopped: &[StoppedAgent]) -> (Vec<Value>, bool) {
+async fn resume_interrupted(
+    path: &Path,
+    stopped: &[StoppedAgent],
+    store_schema: i64,
+) -> (Vec<Value>, bool) {
     if stopped.is_empty() {
         return (Vec::new(), false);
     }
-    let continuation_brief = match continue_after_restart(path).and_then(|allowed| {
-        allowed
-            .then(|| supports_restart_continuation_brief(path))
-            .transpose()
-    }) {
-        Ok(Some(supported)) => supported,
-        Ok(None) => return hold_interrupted(stopped, "held by on_restart"),
+    match continue_after_restart(path) {
+        Ok(true) => {}
+        Ok(false) => return hold_interrupted(stopped, "held by on_restart"),
         Err(error) => {
             return (
                 stopped
@@ -790,6 +801,7 @@ async fn resume_interrupted(path: &Path, stopped: &[StoppedAgent]) -> (Vec<Value
             );
         }
     };
+    let continuation_brief = store_schema >= RESTART_CONTINUATION_BRIEF_SCHEMA;
     let deadline = Instant::now() + RESUME_WAIT;
     let mut failed = BTreeSet::new();
     let mut results = Vec::new();
@@ -922,7 +934,12 @@ async fn rollback(
         None
     };
     let (interruptions, _) = if pid.is_some() {
-        Box::pin(resume_interrupted(path, &agents_at_update.stopped)).await
+        Box::pin(resume_interrupted(
+            path,
+            &agents_at_update.stopped,
+            previous.store_schema,
+        ))
+        .await
     } else {
         hold_interrupted(&agents_at_update.stopped, "rollback unavailable")
     };

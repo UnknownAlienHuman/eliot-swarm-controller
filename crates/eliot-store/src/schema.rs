@@ -44,9 +44,7 @@ fn has_restart_continuation_brief_column(connection: &Connection) -> Result<bool
 impl Store {
     pub const SCHEMA_VERSION: i64 = CURRENT_SCHEMA_VERSION;
 
-    pub fn supports_restart_continuation_brief(&self) -> Result<bool> {
-        has_restart_continuation_brief_column(&self.connection)
-    }
+    pub const RESTART_CONTINUATION_BRIEF_SCHEMA: i64 = RESTART_CONTINUATION_BRIEF_VERSION;
 
     pub(super) fn migrate(&mut self) -> Result<()> {
         self.connection

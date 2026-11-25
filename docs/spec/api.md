@@ -3221,6 +3221,9 @@ committing the restart, the writer checks free space, creates an online
 SQLite backup next to `eliot.db`, and verifies SQLite integrity and the
 source page count. The restart receipt commits only after the old Store
 connection has been sealed. Confirmed cancellation discards its backup.
+The updater selects interrupted-turn continuation from the confirmed running
+release's Store schema. A supporting release builds the continuation from
+the exact stopped turn. Older releases use the existing restart notice.
 
 Immediately before a planned `restart`, under the Store writer lock, the
 daemon records one generation-bound native `source.gap` per currently
