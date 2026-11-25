@@ -143,9 +143,8 @@ pub(super) type Outcome = Result<(), (bool, String)>;
 
 #[derive(Clone, Debug)]
 pub(super) enum BulkMsg {
-    /// The Projects label's "…" menu: the action whose label Reactor
-    /// reported (`menu_ui::Action::from_label`; Reactor 0.100.0 reports a
-    /// native menu item by its label, not its key), if any.
+    /// The Projects label's "…" menu: the action whose key Reactor
+    /// reported (`menu_ui::Action::from_key`), if any.
     Menu(Option<super::menu_ui::Action>),
     /// Read what an action would touch (the action, what, its scope).
     Start(BulkOp, Pick, String),

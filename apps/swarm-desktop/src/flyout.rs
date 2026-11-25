@@ -151,9 +151,7 @@ struct MenuFlyoutItemVtbl {
     base: InspectableSlots,
     /// 6 `get_Text`.
     text: TextGetter,
-    /// 7 `put_Text(String)`.
-    put_text: Setter,
-    _8_11: [usize; 4],
+    _7_11: [usize; 5],
     /// 12 `get_Icon`.
     icon: Getter,
     /// 13 `put_Icon(IconElement)`.
@@ -161,7 +159,6 @@ struct MenuFlyoutItemVtbl {
 }
 const _: () = {
     assert!(offset_of!(MenuFlyoutItemVtbl, text) == 6 * SLOT);
-    assert!(offset_of!(MenuFlyoutItemVtbl, put_text) == 7 * SLOT);
     assert!(offset_of!(MenuFlyoutItemVtbl, icon) == 12 * SLOT);
     assert!(offset_of!(MenuFlyoutItemVtbl, put_icon) == 13 * SLOT);
 };
@@ -345,20 +342,11 @@ pub fn show(anchor: &str, epoch: u64) -> Result<(), String> {
     Ok(())
 }
 
-/// One menu item's look: the item labelled `label` shows `glyph`, and
-/// `display` in place of its label when given (display only: its click still reports `label`).
+/// One menu item's look: the item showing `text` shows `glyph` (a click
+/// reports the item's key, never its text).
 pub struct MenuLook {
-    pub label: &'static str,
-    pub display: Option<String>,
+    pub text: String,
     pub glyph: &'static str,
-}
-
-impl MenuLook {
-    /// Whether a native item showing `text` is this one (before or after
-    /// its display text replaced the label).
-    fn shows(&self, text: &str) -> bool {
-        self.label == text || self.display.as_deref() == Some(text)
-    }
 }
 
 /// What [`show_menu_at`] gives a menu before it opens.
@@ -467,24 +455,20 @@ fn dress_items(items: &ItemVector, dress: &MenuDress<'_>) -> windows_core::Resul
         // SAFETY: as above.
         let item = unsafe { IInspectable::from_raw(out) };
         if let Ok(item) = item.cast::<IMenuFlyoutItem>() {
-            // SAFETY: slots 6, 7, 12 and 13 of IMenuFlyoutItem are
-            // get_Text, put_Text, get_Icon and put_Icon.
+            // SAFETY: slots 6, 12 and 13 of IMenuFlyoutItem are get_Text,
+            // get_Icon and put_Icon.
             let text = unsafe { text_of(item.as_raw(), item.vtable().text) }?;
-            if let Some(look) = dress.items.iter().find(|look| look.shows(&text)) {
-                if let Some(display) = look.display.as_deref().filter(|shown| *shown != text) {
-                    let display = HSTRING::from(display);
-                    unsafe { (item.vtable().put_text)(item.as_raw(), abi(&display)) }.ok()?;
-                }
-                if unsafe { get(&item, item.vtable().icon) }.is_err() {
-                    let icon = font_icon(look.glyph)?;
-                    unsafe { (item.vtable().put_icon)(item.as_raw(), icon.as_raw()) }.ok()?;
-                }
+            if let Some(look) = dress.items.iter().find(|look| look.text == text)
+                && unsafe { get(&item, item.vtable().icon) }.is_err()
+            {
+                let icon = font_icon(look.glyph)?;
+                unsafe { (item.vtable().put_icon)(item.as_raw(), icon.as_raw()) }.ok()?;
             }
         } else if let Ok(sub) = item.cast::<IMenuFlyoutSubItem>() {
             // SAFETY: slots 6, 7, 9 and 10 of IMenuFlyoutSubItem are
             // get_Items, get_Text, get_Icon and put_Icon.
             let text = unsafe { text_of(sub.as_raw(), sub.vtable().text) }?;
-            if let Some(look) = dress.items.iter().find(|look| look.shows(&text))
+            if let Some(look) = dress.items.iter().find(|look| look.text == text)
                 && unsafe { get(&sub, sub.vtable().icon) }.is_err()
             {
                 let icon = font_icon(look.glyph)?;

@@ -26,6 +26,40 @@ pub const HARNESSES: [&str; 5] = ["codex", "claude", "opencode", "muse", "antigr
 /// `models.catalog` availability of a model under a provider hold.
 const HELD: &str = eliot_core::api::harness::CATALOG_HELD;
 
+/// Whether a model row can run now, as `models.catalog` knows it
+/// (`available`, `held`, `unknown`): a row is Ready only when the catalogue
+/// says so, never by default (brand book §8.3).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Availability {
+    Ready,
+    /// No quota or hold signal is known (or it is stale).
+    Unknown,
+    /// A provider hold covers the harness scope.
+    Held,
+    /// Not a model row (Auto, a preset).
+    NotModel,
+}
+
+impl Availability {
+    fn of(catalog: &str) -> Self {
+        match catalog {
+            eliot_core::api::harness::CATALOG_AVAILABLE => Self::Ready,
+            HELD => Self::Held,
+            _ => Self::Unknown,
+        }
+    }
+
+    /// The row's own label for it.
+    pub fn label(self) -> Option<&'static str> {
+        match self {
+            Self::Ready => Some("Ready"),
+            Self::Unknown => Some("Quota unknown"),
+            Self::Held => Some("On hold"),
+            Self::NotModel => None,
+        }
+    }
+}
+
 /// A harness code in the owner's words.
 pub fn harness_label(code: &str) -> &str {
     match code {
@@ -238,6 +272,10 @@ pub struct Item {
     pub disabled: Option<String>,
     /// Hidden by Manage models (shown only because a search found it).
     pub hidden: bool,
+    /// The model's provider in the owner's words (empty for Auto and a
+    /// preset).
+    pub provider: String,
+    pub availability: Availability,
 }
 
 impl Item {
@@ -389,6 +427,8 @@ pub fn rows(inputs: &Inputs) -> Vec<Row> {
             favorite: false,
             disabled: None,
             hidden: false,
+            provider: String::new(),
+            availability: Availability::NotModel,
         }));
     }
 
@@ -472,6 +512,8 @@ pub fn rows(inputs: &Inputs) -> Vec<Row> {
                     .unwrap_or_else(|| "cannot start now".to_owned())
             }),
             hidden: false,
+            provider: String::new(),
+            availability: Availability::NotModel,
         })
         .collect();
     if !presets.is_empty() {
@@ -691,6 +733,8 @@ fn claude_rows(
             default: false,
             disabled: None,
             hidden: false,
+            provider: provider_label("anthropic"),
+            availability: Availability::Unknown,
         }
     };
     if named {
@@ -782,6 +826,11 @@ fn remembered_item(
                 default: false,
                 disabled: None,
                 hidden: false,
+                provider: provider_label(&eliot_core::api::catalog_provider(
+                    &known.harness,
+                    &known.model,
+                )),
+                availability: Availability::Unknown,
             }
         }
     };
@@ -857,6 +906,8 @@ fn catalog_item(
         disabled: (model.availability == HELD)
             .then(|| "on hold: provider limit or outage".to_owned()),
         hidden: false,
+        provider: provider_label(&model.provider),
+        availability: Availability::of(&model.availability),
         key,
     }
 }

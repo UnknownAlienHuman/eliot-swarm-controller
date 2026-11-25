@@ -35,6 +35,9 @@ impl DesktopApp {
                     self.move_update(super::move_ui::MoveMsg::Open(agent), context);
                 }
             }
+            Action::Goal => {
+                self.goal_update(super::goal_ui::GoalMsg::Open(binding.agent), context);
+            }
             Action::Handoff => self.handoff_update(
                 handoff_ui::HandoffMsg::Open {
                     agent: binding.agent,
@@ -129,78 +132,45 @@ impl DesktopApp {
         Some(agent)
     }
 
-    /// The header's "…" entries, in the skeleton's order (5.2): Rename,
-    /// Tags…, Attach to project… or Detach from project, Hand off or
-    /// switch model…, Move under another task…, Resume, Stop Agent, Force
-    /// stop…, Archive or Unarchive, Delete…, Copy Agent ID, Open folder,
-    /// Copy branch name. Each is offered when its action applies; while an
-    /// action settles, the ones that submit are left out.
+    /// The header's "…" entries: the task menu of the open Agent
+    /// ([`DesktopApp::task_entries`], brand book §7.4), bound to the
+    /// generation the header shows. Without a sidebar row only what the
+    /// readback proves is offered: no placement, tags, archive or delete.
     fn header_menu(&self, agent: &str, detail: &UiDetail) -> Vec<MenuItem> {
-        let ended = matches!(
-            detail.state,
-            eliot_core::AgentState::Stopped
-                | eliot_core::AgentState::Failed
-                | eliot_core::AgentState::Lost
-        );
-        let row = self.find_agent(agent).map(|agent| {
-            let target = menu_ui::Target::Agent(agent.clone());
-            let mut actions = Vec::new();
-            for entry in self.menu_entries(&target) {
-                match entry {
-                    menu_ui::Entry::Item { action, .. } => actions.push(action),
-                    menu_ui::Entry::Submenu { items, .. } => {
-                        actions.extend(items.into_iter().map(|item| item.action()));
-                    }
-                }
+        let binding = MenuBinding {
+            agent: agent.to_owned(),
+            generation: detail.generation,
+        };
+        let entries = match self.find_agent(agent) {
+            Some(row) => {
+                let mut row = row.clone();
+                row.generation = detail.generation;
+                self.task_entries(&row, Some(detail))
             }
-            actions
-        });
-        let row = row.unwrap_or_default();
-        let busy = self.submitting();
-        let mut entries = Vec::new();
-        for action in [
-            Action::Rename,
-            Action::EditTags,
-            Action::AttachMenu,
-            Action::Detach,
-        ] {
-            if row.contains(&action) {
-                entries.push(action);
-            }
-        }
-        if !busy {
-            entries.push(Action::Handoff);
-        }
-        if row.contains(&Action::MoveUnder) {
-            entries.push(Action::MoveUnder);
-        }
-        if !busy && row.contains(&Action::Resume) {
-            entries.push(Action::Resume);
-        }
-        let controllable = !detail.observe_only && !ended;
-        if !busy && controllable && self.stop_button(agent, detail.generation).is_some() {
-            entries.push(Action::Stop);
-            entries.push(Action::ForceStop);
-        }
-        if !busy && detail.observe_only {
-            entries.push(Action::DetachObserver);
-        }
-        for action in [Action::Archive, Action::Unarchive, Action::Delete] {
-            if row.contains(&action) {
-                entries.push(action);
-            }
-        }
-        entries.push(Action::CopyId);
-        if row.contains(&Action::OpenFolder) {
-            entries.push(Action::OpenFolder);
-        }
-        if detail.branch.is_some() {
-            entries.push(Action::CopyBranch);
-        }
-        entries
-            .into_iter()
-            .map(|action| MenuItem::item(action.label(), action.label()))
-            .collect()
+            None => self
+                .header_agent(&binding)
+                .map(|agent| {
+                    self.task_entries(&agent, Some(detail))
+                        .into_iter()
+                        .filter(|entry| {
+                            !matches!(
+                                entry,
+                                menu_ui::Entry::Item {
+                                    action: Action::EditTags
+                                        | Action::AttachMenu
+                                        | Action::Detach
+                                        | Action::Archive
+                                        | Action::Unarchive
+                                        | Action::Delete,
+                                    ..
+                                }
+                            )
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
+        };
+        menu_ui::menu_items(&entries)
     }
 
     /// The conversation's header ([`Header`]): the window reads what it
@@ -553,7 +523,7 @@ impl Component for Header {
                         OPEN_AGENTS => Message::Shell(ShellMsg::PanelToggled(Panel::Agents)),
                         OPEN_DETAILS => Message::Shell(ShellMsg::PanelToggled(Panel::Details)),
                         OPEN_TERMINAL => Message::Shell(ShellMsg::PanelToggled(Panel::Terminal)),
-                        label => Action::from_label(label)
+                        key => Action::from_key(key)
                             .map_or(Message::Menu(menu_ui::MenuMsg::Ignored), |action| {
                                 Message::Chat(ChatMsg::AgentMenu(action))
                             }),

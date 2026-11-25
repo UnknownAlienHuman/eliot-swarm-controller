@@ -44,6 +44,7 @@ mod bulk_ui;
 mod chat_ui;
 mod configure_ui;
 mod dialog_ui;
+mod goal_ui;
 mod handoff_ui;
 mod inbox_ui;
 mod launch_ui;
@@ -193,9 +194,9 @@ struct UiDetail {
     created_at: i64,
     /// The hold on the Agent's frozen account or profile, if any.
     provider_hold: Option<eliot_core::api::AgentProviderHold>,
-    /// The session's context fill: tokens used and the window, when the
-    /// harness reports both.
-    context: Option<(i64, i64)>,
+    /// The session's context fill, when the harness reports the tokens
+    /// used.
+    context: Option<ContextFill>,
 }
 
 /// Admission of one draft submission (Send, Steer or Resume): bound Agent,
@@ -280,6 +281,8 @@ enum Message {
     Menu(MenuMsg),
     Move(MoveMsg),
     Bulk(BulkMsg),
+    /// The Goal dialog.
+    Goal(goal_ui::GoalMsg),
     /// The right pane: its tabs, width, Changes, Agents and Terminal.
     Pane(pane_ui::PaneMsg),
     /// Open a path in File Explorer (any path row's click).
@@ -414,6 +417,8 @@ struct DesktopApp {
     pane: pane_ui::PaneState,
     /// The open bulk action (remove projects, archive or delete tasks).
     bulk: Option<bulk_ui::BulkDialog>,
+    /// The open Goal dialog.
+    goal: goal_ui::GoalState,
     /// Dialog epochs handed out by [`Self::start_bulk`]: each dialog's
     /// replies carry the epoch of the dialog that started them (#682).
     bulk_seq: u64,
@@ -767,11 +772,30 @@ fn detail_from(reply: &AgentGetResponse) -> UiDetail {
         created_at: reply.agent.created_at,
         provider_hold: reply.provider_hold.clone(),
         context: reply.session_usage.as_ref().and_then(|usage| {
-            usage
-                .context_used_tokens
-                .zip(usage.context_window_tokens)
-                .filter(|(used, window)| *used >= 0 && *window > 0)
+            Some(ContextFill {
+                used: usage.context_used_tokens.filter(|used| *used >= 0)?,
+                window: usage.context_window_tokens.filter(|window| *window > 0),
+                observed_at: usage.observed_at,
+            })
         }),
+    }
+}
+
+/// A session's context as its harness reports it (`session_usage`, brand
+/// book §9.5): the tokens in the context, the window when the harness
+/// names it (only then is there a share), and when it was observed.
+#[derive(Clone, Debug, PartialEq)]
+struct ContextFill {
+    used: i64,
+    window: Option<i64>,
+    observed_at: Option<i64>,
+}
+
+impl ContextFill {
+    /// The share of the window in use, when the window is known.
+    fn percent(&self) -> Option<f64> {
+        self.window
+            .map(|window| (self.used as f64 / window as f64 * 100.0).clamp(0.0, 100.0))
     }
 }
 
@@ -1042,6 +1066,7 @@ impl Component for DesktopApp {
             menu: menu_ui::MenuState::default(),
             pane: pane_ui::PaneState::default(),
             bulk: None,
+            goal: goal_ui::GoalState::default(),
             bulk_seq: 0,
             missing_cleanup: HashMap::new(),
             revealed: None,
@@ -1091,6 +1116,7 @@ impl Component for DesktopApp {
             Message::Menu(msg) => self.menu_update(msg, context),
             Message::Move(msg) => self.move_update(msg, context),
             Message::Bulk(msg) => self.bulk_update(msg, context),
+            Message::Goal(msg) => self.goal_update(msg, context),
             Message::Pane(msg) => self.pane_update(msg, context),
             Message::Reveal(item, path) => self.reveal_path(item, path),
         }

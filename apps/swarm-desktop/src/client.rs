@@ -147,6 +147,7 @@ checked! {
     eliot_core::api::AgentPatchDigestRequest => eliot_core::api::AgentPatchDigestResponse, "agent.patch_digest";
     eliot_core::api::AgentProcessesRequest => eliot_core::api::AgentProcessesResponse, "agent.processes";
     eliot_core::api::MailInboxRequest => eliot_core::api::MailInboxResponse, "mail.inbox";
+    eliot_core::api::GoalSetRequest => eliot_core::api::GoalView, "goal.set";
     eliot_core::api::GoalPauseRequest => eliot_core::api::GoalView, "goal.pause";
     eliot_core::api::GoalResumeRequest => eliot_core::api::GoalView, "goal.resume";
     eliot_core::api::GoalClearRequest => eliot_core::api::GoalView, "goal.clear";
@@ -1827,7 +1828,17 @@ pub async fn mail_inbox(
     Ok(reply)
 }
 
-/// A Goal control from Details › Goal, with its retained mutation id.
+/// `goal.set`: the Agent's Eliot Goal replaced by the request's definition
+/// (the Goal dialog's Save, which checked the request first); the Goal as
+/// the daemon left it. A retry carries the same id.
+pub async fn goal_set(
+    data_dir: &Path,
+    request: &eliot_core::api::GoalSetRequest,
+) -> Result<eliot_core::api::GoalView> {
+    call(data_dir, request).await
+}
+
+/// A Goal control from the Goal dialog.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GoalControl {
     Pause,
@@ -1861,7 +1872,7 @@ pub async fn goal_control(
                 id: mutation_id,
                 agent,
                 mode: GoalMode::Eliot,
-                reason: Some("Paused by the owner from Details.".to_owned()),
+                reason: Some("Paused by the owner from the desktop.".to_owned()),
             };
             let reply = call(data_dir, &request).await?;
             Ok(reply)

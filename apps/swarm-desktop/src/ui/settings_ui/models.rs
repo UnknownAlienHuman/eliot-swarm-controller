@@ -11,6 +11,7 @@ impl DesktopApp {
             .spacing(tokens::spacing::MD)
             .keyed_children(crate::views::slots([
                 Some(self.profiles_view(context)),
+                Some(self.manage_models(context)),
                 if raw {
                     Some(self.save_bar(Page::Models, dirty, context))
                 } else {

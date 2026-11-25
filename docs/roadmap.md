@@ -1267,6 +1267,20 @@ of the explicitly selected release scope.
       budget used, the daemon's actions), read from `owner.inbox` by the
       daemon's counts after the history loads, so a restart rebuilds the
       Resolve card; a turn's end typed on its part, not told by its label.
+    - [ ] **M2c Menus, Goal dialog, model picker, context.** §7.4 task and
+      project menus dispatch by each action's stable MenuItem key, in the
+      table's groups, with an often-needed action that cannot run now
+      disabled with its reason and no unsupported feature shown; the
+      header's "…" is the same task menu. §18.1 one Goal ContentDialog from
+      the task menu's Goal… and Details › Goal: text, the check argv and
+      round/turn limits in their source units, Save/Pause/Resume/Clear by
+      the goal's status over the existing `goal.*` calls, errors in the
+      dialog, Save named and never the Enter default. §8.3 the model
+      picker within the flyout's content width (no sideways scroll), rows
+      with name, provider, effort and their own Ready/Quota unknown/On hold
+      label, the current model's ID and effort ComboBox, Manage models in
+      Settings › Models. §9.5 "Context 54%", the token count or "Context
+      unavailable", with scope and freshness in the tooltip.
   - [ ] **M3 Context and projects.** Real diff, Agents, Details and Terminal,
     project assignment and transfer, fleet and Inbox.
   - [ ] **M4 Management.** Settings, model, routing and auth, Automations and
