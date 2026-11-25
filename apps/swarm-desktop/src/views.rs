@@ -1189,18 +1189,13 @@ struct Leaving {
     parts: usize,
 }
 
-/// Build more of the shown conversation, or remove more of the left ones;
-/// the view's scroll metrics; Jump to latest.
+/// Build more of the shown conversation, or remove more of the left ones.
 #[derive(Clone, Copy, Debug)]
 pub enum TranscriptStep {
     /// The conversation (its serial) the next older parts were planned
     /// for.
     Grow(u64),
     Drain,
-    /// The view's offsets, viewport or extent changed (`observe_view`).
-    Scrolled(ScrollViewMetrics),
-    /// Jump to latest: one scroll to the real end.
-    Jump,
 }
 
 /// How far from the far edge the view still counts as at the end (DIPs):
@@ -1250,16 +1245,9 @@ pub struct Transcript {
     shown: TranscriptInput,
     /// Conversations left, the latest first.
     leaving: Vec<Leaving>,
-    /// The view's last metrics, as WinUI reports them.
-    metrics: Option<ScrollViewMetrics>,
-    /// The owner reads higher up: the item that was last when the view
-    /// left the end, and its part count then (Jump to latest counts what
-    /// came after).
-    away: Option<(String, usize)>,
-    /// Parts were built above while read higher up: the extent before, so
-    /// the next extent change keeps the text in view where it was.
-    above: Option<f64>,
-    _observation: ElementObservation,
+    /// Counts the times parts were built above the oldest drawn one
+    /// ([`Follow`] keeps the reading position over them).
+    built_above: u64,
 }
 
 fn part_count(items: &[Rc<RenderedItem>]) -> usize {
@@ -1274,17 +1262,6 @@ fn step_later(step: TranscriptStep, context: &ComponentContext<Transcript>) {
 }
 
 impl Transcript {
-    /// Parts are about to be built above the oldest drawn one: while the
-    /// owner reads higher up, remember the extent, so the offset follows
-    /// what was inserted (the view has no anchor element of its own).
-    fn building_above(&mut self) {
-        if self.away.is_some() {
-            self.above = self
-                .above
-                .or(self.metrics.map(|metrics| metrics.extent_height));
-        }
-    }
-
     fn settle(&mut self, input: &TranscriptInput, context: &ComponentContext<Self>) {
         if input.conversation == self.shown.conversation
             && let Some(first) = first_built(&self.shown.items.0, self.hidden)
@@ -1296,11 +1273,9 @@ impl Transcript {
                 .any(|item| item.parts.iter().any(|part| part.key == first))
         {
             // An older page arrived above the oldest drawn part.
-            self.building_above();
+            self.built_above += 1;
         }
         if input.conversation != self.shown.conversation {
-            self.away = None;
-            self.above = None;
             let left = std::mem::replace(&mut self.shown, input.clone());
             let parts = part_count(&left.items.0);
             if parts > self.hidden {
@@ -1338,20 +1313,13 @@ impl Component for Transcript {
     type Message = TranscriptStep;
 
     fn create(input: &TranscriptInput, context: &ComponentContext<Self>) -> Self {
-        let scrolled = context.callback(TranscriptStep::Scrolled);
-        let observation = input
-            .scroll
-            .observe_view(move |metrics| scrolled.call(metrics));
         let mut transcript = Self {
             serial: 0,
             filled: false,
             hidden: 0,
             shown: input.clone(),
             leaving: Vec::new(),
-            metrics: None,
-            away: None,
-            above: None,
-            _observation: observation,
+            built_above: 0,
         };
         transcript.settle(input, context);
         transcript
@@ -1367,7 +1335,7 @@ impl Component for Transcript {
                 if serial != self.serial || self.hidden == 0 {
                     return;
                 }
-                self.building_above();
+                self.built_above += 1;
                 self.hidden = self.hidden.saturating_sub(GROW_PARTS);
                 if self.hidden > 0 {
                     step_later(step, context);
@@ -1384,46 +1352,10 @@ impl Component for Transcript {
                     step_later(step, context);
                 }
             }
-            TranscriptStep::Scrolled(metrics) => {
-                let before = self.metrics.replace(metrics);
-                if let Some(extent) = self.above
-                    && metrics.extent_height != extent
-                {
-                    self.above = None;
-                    let _ = self.shown.scroll.request_scroll_to(
-                        0.0,
-                        metrics.vertical_offset + (metrics.extent_height - extent),
-                        false,
-                        |_| {},
-                    );
-                    return;
-                }
-                if at_end(&metrics) {
-                    self.away = None;
-                } else if self.away.is_none()
-                    && before.is_some_and(|before| metrics.vertical_offset < before.vertical_offset)
-                {
-                    // The owner scrolled up: content growing at the end
-                    // only moves the end, never the offset back.
-                    self.away = self
-                        .shown
-                        .items
-                        .0
-                        .last()
-                        .map(|item| (item.key.clone(), item.parts.len()));
-                }
-            }
-            TranscriptStep::Jump => {
-                // WinUI clamps the offset to the end of the content.
-                let _ = self
-                    .shown
-                    .scroll
-                    .request_scroll_to(0.0, f64::MAX, false, |_| {});
-            }
         }
     }
 
-    fn view(&self, input: &TranscriptInput, context: &mut ViewContext<Self>) -> View {
+    fn view(&self, input: &TranscriptInput, _context: &mut ViewContext<Self>) -> View {
         let boundary: Option<View> = input.boundary.as_ref().map(|line| {
             crate::controls::secondary(line.clone())
                 .horizontal_alignment(HorizontalAlignment::Center)
@@ -1489,28 +1421,151 @@ impl Component for Transcript {
                     ])),
             )
             .into();
-        // Read higher up: Jump to latest over the transcript's foot, with
-        // the count of parts added since the view left the end.
-        let jump: Option<View> = self.away.as_ref().map(|(last, seen)| {
-            let words = match new_parts(&input.items.0, last, *seen) {
-                Some(fresh) if fresh > 0 => format!("Jump to latest \u{b7} {fresh} new"),
-                _ => "Jump to latest".to_owned(),
-            };
-            crate::controls::outlined()
+        // Over the transcript's foot: Jump to latest while it is read
+        // higher up, in its own component, so a scroll redraws only it.
+        let follow = View::component::<Follow>(FollowInput {
+            scroll: input.scroll.clone(),
+            conversation: input.conversation.clone(),
+            items: input.items.clone(),
+            built_above: self.built_above,
+        });
+        Grid::new().grid_row(1).children((scroll, follow)).into()
+    }
+}
+
+/// What [`Follow`] watches: the transcript's view, the open conversation
+/// and its items, and how often parts were built above the oldest one.
+#[derive(Clone, PartialEq)]
+pub struct FollowInput {
+    pub scroll: ElementRef<ScrollView>,
+    pub conversation: String,
+    pub items: Shared<Vec<Rc<RenderedItem>>>,
+    pub built_above: u64,
+}
+
+/// The view's metrics changed, or Jump to latest was pressed.
+#[derive(Clone, Copy, Debug)]
+pub enum FollowStep {
+    Scrolled(ScrollViewMetrics),
+    Jump,
+}
+
+/// Whether the owner reads at the end of the transcript (§9.3), from the
+/// ScrollView's own metrics (`observe_view`), never from wheel events or
+/// timers: at the end the far-edge anchor (`VerticalAnchorRatio=1`)
+/// carries new events into view; read higher up, Jump to latest shows with
+/// the count of parts added since, and parts built above keep the text in
+/// view where it was (the view has no anchor element of its own).
+pub struct Follow {
+    /// The input last seen: the view to scroll, the items whose last one
+    /// marks where the owner left the end.
+    shown: FollowInput,
+    metrics: Option<ScrollViewMetrics>,
+    /// Read higher up: the item that was last when the view left the end,
+    /// and its part count then.
+    away: Option<(String, usize)>,
+    /// Parts are being built above while read higher up: the extent
+    /// before, so the next extent change moves the offset by as much.
+    above: Option<f64>,
+    _observation: ElementObservation,
+}
+
+impl Component for Follow {
+    type Input = FollowInput;
+    type Message = FollowStep;
+
+    fn create(input: &FollowInput, context: &ComponentContext<Self>) -> Self {
+        let scrolled = context.callback(FollowStep::Scrolled);
+        Self {
+            shown: input.clone(),
+            metrics: None,
+            away: None,
+            above: None,
+            _observation: input
+                .scroll
+                .observe_view(move |metrics| scrolled.call(metrics)),
+        }
+    }
+
+    fn input_changed(&mut self, input: &FollowInput, _context: &ComponentContext<Self>) {
+        if input.conversation != self.shown.conversation {
+            // Another conversation opens at its end.
+            self.away = None;
+            self.above = None;
+        } else if input.built_above != self.shown.built_above && self.away.is_some() {
+            // Called before the new tree reaches WinUI: the metrics still
+            // hold the extent before the parts built above.
+            self.above = self
+                .above
+                .or(self.metrics.map(|metrics| metrics.extent_height));
+        }
+        self.shown = input.clone();
+    }
+
+    fn update(&mut self, step: FollowStep, _context: &ComponentContext<Self>) {
+        match step {
+            FollowStep::Scrolled(metrics) => {
+                let before = self.metrics.replace(metrics);
+                if let Some(extent) = self.above
+                    && metrics.extent_height != extent
+                {
+                    self.above = None;
+                    let _ = self.shown.scroll.request_scroll_to(
+                        0.0,
+                        metrics.vertical_offset + (metrics.extent_height - extent),
+                        false,
+                        |_| {},
+                    );
+                    return;
+                }
+                if at_end(&metrics) {
+                    self.away = None;
+                } else if self.away.is_none()
+                    && before.is_some_and(|before| metrics.vertical_offset < before.vertical_offset)
+                {
+                    // The owner scrolled up: content growing at the end
+                    // moves only the end, never the offset back.
+                    self.away = self
+                        .shown
+                        .items
+                        .0
+                        .last()
+                        .map(|item| (item.key.clone(), item.parts.len()));
+                }
+            }
+            FollowStep::Jump => {
+                // WinUI clamps the offset to the end of the content.
+                let _ = self
+                    .shown
+                    .scroll
+                    .request_scroll_to(0.0, f64::MAX, false, |_| {});
+            }
+        }
+    }
+
+    fn view(&self, input: &FollowInput, context: &mut ViewContext<Self>) -> View {
+        let Some((last, seen)) = self.away.as_ref() else {
+            // Nothing over the transcript at the end (no background: the
+            // pointer reaches the view below).
+            return Border::new()
                 .horizontal_alignment(HorizontalAlignment::Center)
                 .vertical_alignment(VerticalAlignment::Bottom)
-                .margin(Thickness::new(0.0, 0.0, 0.0, tokens::spacing::MD))
-                .automation_name(words.clone())
-                .on_click(context.message(TranscriptStep::Jump))
-                .content(crate::controls::icon_label(
-                    crate::controls::glyph::ARROW_DOWN,
-                    &words,
-                ))
-                .into()
-        });
-        Grid::new()
-            .grid_row(1)
-            .keyed_children(crate::views::slots([Some(scroll), jump]))
+                .into();
+        };
+        let words = match new_parts(&input.items.0, last, *seen) {
+            Some(fresh) if fresh > 0 => format!("Jump to latest \u{b7} {fresh} new"),
+            _ => "Jump to latest".to_owned(),
+        };
+        crate::controls::outlined()
+            .horizontal_alignment(HorizontalAlignment::Center)
+            .vertical_alignment(VerticalAlignment::Bottom)
+            .margin(Thickness::new(0.0, 0.0, 0.0, tokens::spacing::MD))
+            .automation_name(words.clone())
+            .on_click(context.message(FollowStep::Jump))
+            .content(crate::controls::icon_label(
+                crate::controls::glyph::ARROW_DOWN,
+                &words,
+            ))
             .into()
     }
 }
