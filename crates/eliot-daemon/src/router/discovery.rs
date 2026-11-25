@@ -529,7 +529,7 @@ fn visible(method: &Method, principal: &Principal) -> bool {
     }
     match principal {
         Principal::Owner => true,
-        Principal::Agent { .. } => !method.owner_only,
+        Principal::Agent { .. } | Principal::RemoteManager(_) => !method.owner_only,
         // These principals have no discovery RPC authority. Keep the helper
         // conservative even when used internally; do not broaden their gate.
         Principal::Run { .. }
@@ -615,6 +615,11 @@ impl Router {
                 principal:"owner".to_owned(), agent_id:None, generation:None,
                 allowed_scopes:vec!["global".to_owned(), "project:<name>".to_owned(), "mailbox:<agent>".to_owned()],
                 limits:"Owner authority; native actions still require the target generation's advertised capabilities.".to_owned(),
+            }),
+            Principal::RemoteManager(grant) => Ok(IdentityResponse {
+                principal: "remote_manager".to_owned(), agent_id: None, generation: None,
+                allowed_scopes: vec![format!("project:{}", grant.project)],
+                limits: format!("Grant {} revision {}. Agent control requires the current assignment.", grant.instance, grant.revision),
             }),
             Principal::Agent { id, generation } => {
                 let agent = self.inner.store.lock().await.get_agent(id)?

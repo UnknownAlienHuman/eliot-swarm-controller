@@ -102,7 +102,14 @@ The snapshot exposes no child PID and does not create a local Agent, fake
 cloud-Agent PID, persistence table, or generic service registry.
 
 Cloudflare Access authenticates the remote caller and forwards its signed assertion.
-The HTTP verifier binds the verified subject to the SDK session and carries nonsecret
+Configure a separate Access application audience per delegated manager in
+`[cloud_mcp.manager_grants.INSTANCE]`, with `audience`, `subject`, `project`, and
+positive `revision`. The owner audience and grant audiences are distinct. The
+origin selects one configured audience from signed claims. Requests that match
+multiple configured audiences are rejected. Advance the grant revision when
+changing its authority. The Owner assigns it using the project assignment API.
+
+The HTTP verifier binds the verified subject and audience to the SDK session and carries nonsecret
 connection/call provenance through the existing authenticated Router path, as owned
 by [the API](api.md#mcp-streamablehttp-server). It does not derive identity from
 `clientInfo` or process metadata. The process module owns custody, not an OAuth or

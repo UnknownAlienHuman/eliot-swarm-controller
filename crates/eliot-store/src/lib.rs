@@ -344,6 +344,7 @@ mod processes;
 mod project_assignment;
 mod project_broadcast;
 mod project_transfer;
+mod remote_managers;
 mod resolution;
 mod retention;
 mod schema;
@@ -408,7 +409,7 @@ fn validate_remote_command_context(
 ) -> Result<()> {
     if let Some(remote) = remote {
         remote.validate()?;
-        if principal != "owner" {
+        if principal != "owner" && !remote_managers::is_remote(principal) {
             return Err(Error::new(
                 "not_allowed",
                 "remote provenance requires the authenticated owner bridge",
@@ -524,6 +525,7 @@ pub struct Store {
     goal_holder: String,
     hierarchy_limits: core::api::HierarchyLimits,
     capacity_policy: Option<std::sync::Arc<capacity::PolicyLoader>>,
+    remote_manager_policy: Option<std::sync::Arc<remote_managers::PolicyLoader>>,
     /// Live readback watermark, including unchanged probes. This is not a
     /// durable heartbeat; committed Git views and HEAD transitions fence restart.
     git_observed_at: BTreeMap<String, i64>,
@@ -592,6 +594,7 @@ impl Store {
             goal_holder: String::new(),
             hierarchy_limits: core::api::HierarchyLimits::default(),
             capacity_policy: None,
+            remote_manager_policy: None,
             git_observed_at: BTreeMap::new(),
         })
     }
@@ -678,6 +681,7 @@ impl Store {
             goal_holder: Ulid::new().to_string(),
             hierarchy_limits: core::api::HierarchyLimits::default(),
             capacity_policy: None,
+            remote_manager_policy: None,
         };
         store.migrate()?;
         store.bind_custody_namespace(path)?;
@@ -824,6 +828,24 @@ impl Store {
             if restart_send.is_some() {
                 restart_queue::validate_new_send(submission.request())?;
             }
+            let request = submission.request();
+            if remote_managers::is_remote(principal)
+                && (request.selector.is_some() || request.probe)
+            {
+                return Err(Error::new(
+                    "not_allowed",
+                    "remote managers require a single explicit target",
+                ));
+            }
+            remote_managers::check_command(
+                &tx,
+                self.remote_manager_policy.as_deref(),
+                principal,
+                &request.verb,
+                request.target.as_deref(),
+                request.expected_generation,
+                remote,
+            )?;
             let previous_command_rowid = remote.map(|_| latest_command_rowid(&tx)).transpose()?;
             let mut admission = admission::submit_tx(
                 &tx,

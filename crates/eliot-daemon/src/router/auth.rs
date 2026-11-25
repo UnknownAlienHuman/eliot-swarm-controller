@@ -120,7 +120,6 @@ impl Router {
                         let (issuer, audience) =
                             crate::config::load_cloud_access_config(&self.inner.data_root)?;
                         if remote.identity.issuer != issuer
-                            || remote.identity.audience != audience
                             || remote.expires_at.saturating_mul(1_000)
                                 <= crate::common::now_ms().max(0) as u64
                         {
@@ -128,6 +127,22 @@ impl Router {
                                 "not_allowed",
                                 "remote context is expired or has a different Access binding",
                             ));
+                        }
+                        if remote.identity.audience != audience {
+                            let grant =
+                                crate::config::load_remote_manager_grants(&self.inner.data_root)?
+                                    .into_iter()
+                                    .find(|grant| {
+                                        grant.audience == remote.identity.audience
+                                            && secure_eq(&grant.subject, &remote.identity.subject)
+                                    })
+                                    .ok_or_else(|| {
+                                        Error::new(
+                                            "not_allowed",
+                                            "Access identity has no matching remote manager grant",
+                                        )
+                                    })?;
+                            return Ok((Principal::RemoteManager(grant), payload, owner_peer));
                         }
                     }
                     Ok((Principal::Owner, payload))
@@ -254,6 +269,25 @@ pub(super) fn authorize_rpc_method(principal: &Principal, method: &str) -> Resul
         return Err(Error::new(
             "not_allowed",
             "Run credentials may call only command.get",
+        ));
+    }
+    if matches!(principal, Principal::RemoteManager(_))
+        && !matches!(
+            method,
+            "api.identity"
+                | "api.methods"
+                | "api.help"
+                | "project.assignment.get"
+                | "project.assignment.claim"
+                | "command.submit"
+                | "command.get"
+                | "agent.get"
+                | "turn.get"
+        )
+    {
+        return Err(Error::new(
+            "not_allowed",
+            "method is outside the remote manager grant",
         ));
     }
     Ok(())
@@ -437,6 +471,14 @@ pub(super) fn authorize_command(principal: &Principal, request: &mut SubmitComma
 }
 
 pub(super) fn authorize_command_read_self(principal: &Principal, command: &Command) -> Result<()> {
+    if matches!(principal, Principal::RemoteManager(_))
+        && super::principal_name(principal) != command.principal
+    {
+        return Err(Error::new(
+            "not_allowed",
+            "command is outside the remote manager grant",
+        ));
+    }
     if matches!(principal, Principal::ProjectRule { .. }) {
         return Err(Error::new(
             "not_allowed",

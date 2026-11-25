@@ -1,8 +1,8 @@
 use super::*;
 use eliot_core::api::{
     ProjectAssignmentClaimRequest, ProjectAssignmentGetRequest, ProjectAssignmentLaunchRequest,
-    ProjectAssignmentReleaseRequest, ProjectAssignmentUsageRequest, ProjectTransferAction,
-    ProjectTransferOutcome, ProjectTransferRequest, ProjectTransferResult,
+    ProjectAssignmentReleaseRequest, ProjectAssignmentUsageRequest, ProjectManagerIdentity,
+    ProjectTransferAction, ProjectTransferOutcome, ProjectTransferRequest, ProjectTransferResult,
     discovery::decode_params,
 };
 use eliot_store::Store;
@@ -137,6 +137,9 @@ impl Router {
         let request: ProjectAssignmentGetRequest = decode_params(params.clone())?;
         request.validate()?;
         let store = self.inner.store.lock().await;
+        if let Principal::RemoteManager(grant) = principal {
+            return encode_assignment(store.remote_project_assignment(grant, &request.project)?);
+        }
         encode_assignment(store.project_assignment(&principal_name(principal), &request.project)?)
     }
 
@@ -147,7 +150,26 @@ impl Router {
     ) -> Result<Value> {
         let request: ProjectAssignmentClaimRequest = decode_params(params.clone())?;
         let mut store = self.inner.store.lock().await;
-        let change = store.claim_project_manager(&principal_name(principal), &request, now_ms())?;
+        let name = principal_name(principal);
+        let change = if matches!(
+            request.manager.as_ref(),
+            Some(ProjectManagerIdentity::Remote { .. })
+        ) || matches!(principal, Principal::RemoteManager(_))
+        {
+            let grant = match principal {
+                Principal::Owner => None,
+                Principal::RemoteManager(grant) => Some(grant),
+                _ => {
+                    return Err(Error::new(
+                        "not_allowed",
+                        "remote claims require Owner or the verified grant",
+                    ));
+                }
+            };
+            store.claim_remote_project_manager(&name, grant, &request, now_ms())?
+        } else {
+            store.claim_project_manager(&name, &request, now_ms())?
+        };
         self.publish_locked(&change.events);
         self.signal_progress();
         self.signal_launch_arbitration();

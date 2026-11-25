@@ -85,10 +85,22 @@ impl ProjectTransferRequest {
                     }
                     super::handoff::validate_send_selection(commands)
                 }
-                ProjectManagerIdentity::Remote { .. } => Err(Error::new(
-                    "unsupported",
-                    "remote transfer requires verified manager grants",
-                )),
+                ProjectManagerIdentity::Remote {
+                    instance,
+                    grant_revision,
+                } => {
+                    super::project_assignment::validate_name(
+                        instance,
+                        "params.action.destination.instance",
+                    )?;
+                    if *grant_revision < 1 || task_command.is_some() || !commands.is_empty() {
+                        return Err(Error::new(
+                            "invalid",
+                            "remote transfer requires an exact grant revision and no native delivery input",
+                        ));
+                    }
+                    Ok(())
+                }
             },
             _ => Ok(()),
         }

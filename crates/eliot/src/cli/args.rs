@@ -2099,9 +2099,18 @@ pub(crate) enum ProjectTransferCommand {
     /// Atomically move the assignment to the exact destination generation.
     Commit {
         intent: String,
-        destination: String,
-        #[arg(long, value_parser = clap::value_parser!(i64).range(1..))]
-        generation: i64,
+        #[arg(
+            required_unless_present = "remote",
+            requires = "generation",
+            conflicts_with = "remote"
+        )]
+        destination: Option<String>,
+        #[arg(long, requires = "destination", value_parser = clap::value_parser!(i64).range(1..))]
+        generation: Option<i64>,
+        #[arg(long, requires = "grant_revision", conflicts_with = "destination")]
+        remote: Option<String>,
+        #[arg(long, requires = "remote", value_parser = clap::value_parser!(i64).range(1..))]
+        grant_revision: Option<i64>,
         /// Retained source task SEND for the continuation brief.
         #[arg(long)]
         task_command: Option<String>,
@@ -2141,6 +2150,10 @@ pub(crate) enum ProjectAssignmentCommand {
         revision: Option<i64>,
         #[arg(long, requires = "agent", value_parser = clap::value_parser!(i64).range(1..))]
         generation: Option<i64>,
+        #[arg(long, requires_all = ["grant_revision", "revision"], conflicts_with = "agent")]
+        remote: Option<String>,
+        #[arg(long, requires = "remote", value_parser = clap::value_parser!(i64).range(1..))]
+        grant_revision: Option<i64>,
     },
     /// Reserve and launch the manager using an approved profile.
     Launch {
