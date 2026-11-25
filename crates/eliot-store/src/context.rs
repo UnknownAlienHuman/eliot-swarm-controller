@@ -294,12 +294,12 @@ impl Store {
                 let command = load_command_record(&tx, &id)?.ok_or_else(|| {
                     Error::new("source_integrity", "project check context disappeared")
                 })?;
-                reject_pending_context(
+                settle_pending_context_refusal(
                     &tx,
                     &command,
                     agent_num,
                     generation,
-                    "project_check_superseded",
+                    ("project_check_superseded", None),
                     now,
                     &mut events,
                 )?;
@@ -405,12 +405,12 @@ impl Store {
             if let Some(previous) = previous
                 && let Some(record) = load_command_record(&tx, &previous)?
             {
-                reject_pending_context(
+                settle_pending_context_refusal(
                     &tx,
                     &record,
                     agent_num,
                     generation,
-                    "task_card_superseded",
+                    ("task_card_superseded", None),
                     now,
                     &mut events,
                 )?;
@@ -881,31 +881,31 @@ pub(super) fn claim_next_input_tx(
             if args.point != InjectPoint::NextInput {
                 continue;
             }
-            if reject_stale_assignment(tx, &record, agent_num, agent.generation, now, events)? {
+            if reject_unauthorized_context(tx, &record, agent_num, agent, now, events)? {
                 continue;
             }
             if args
                 .expires_at_ms
                 .is_some_and(|expires_at| expires_at <= now)
             {
-                reject_pending_context(
+                settle_pending_context_refusal(
                     tx,
                     &record,
                     agent_num,
                     agent.generation,
-                    "expired",
+                    ("expired", None),
                     now,
                     events,
                 )?;
                 continue;
             }
             if args.text.len() > MAX_TEXT_BYTES {
-                reject_pending_context(
+                settle_pending_context_refusal(
                     tx,
                     &record,
                     agent_num,
                     agent.generation,
-                    "frame_too_large",
+                    ("frame_too_large", None),
                     now,
                     events,
                 )?;
@@ -921,12 +921,12 @@ pub(super) fn claim_next_input_tx(
             match check_rpc_frame("agent.command", &lone_frame) {
                 Ok(()) => {}
                 Err(error) if error.code == "frame_too_large" => {
-                    reject_pending_context(
+                    settle_pending_context_refusal(
                         tx,
                         &record,
                         agent_num,
                         agent.generation,
-                        "frame_too_large",
+                        ("frame_too_large", None),
                         now,
                         events,
                     )?;
@@ -1144,19 +1144,19 @@ impl Store {
                 if args.point != InjectPoint::TurnSafePoint {
                     continue;
                 }
-                if reject_stale_assignment(&tx, &record, agent_num, generation, now, &mut events)? {
+                if reject_unauthorized_context(&tx, &record, agent_num, &agent, now, &mut events)? {
                     continue;
                 }
                 if args
                     .expires_at_ms
                     .is_some_and(|expires_at| expires_at <= now)
                 {
-                    reject_pending_context(
+                    settle_pending_context_refusal(
                         &tx,
                         &record,
                         agent_num,
                         generation,
-                        "expired",
+                        ("expired", None),
                         now,
                         &mut events,
                     )?;
@@ -1197,12 +1197,12 @@ impl Store {
                         &mut events,
                     )?;
                 } else {
-                    reject_pending_context(
+                    settle_pending_context_refusal(
                         &tx,
                         &record,
                         agent_num,
                         generation,
-                        "frame_too_large",
+                        ("frame_too_large", None),
                         now,
                         &mut events,
                     )?;
@@ -2401,6 +2401,16 @@ fn check_pending_steer_dispatch(
     record: &CommandRecord,
     agent: &Agent,
 ) -> Result<()> {
+    check_context_authority(tx, record, agent)?;
+    provider_holds::require_dispatch_tx(tx, agent, &record.command)?;
+    Ok(())
+}
+
+fn check_context_authority(
+    tx: &Transaction<'_>,
+    record: &CommandRecord,
+    agent: &Agent,
+) -> Result<()> {
     project_assignment::check_dispatch(tx, record)?;
     projects::validate_project_command_dispatch_tx(tx, record)?;
     admission::require_reply_authority(&record.command.principal, &record.command.verb, agent)?;
@@ -2408,7 +2418,6 @@ fn check_pending_steer_dispatch(
         let caller = hierarchy::parse_caller(tx, &record.command.principal)?;
         hierarchy::caller_may_command(tx, &caller, agent)?;
     }
-    provider_holds::require_dispatch_tx(tx, agent, &record.command)?;
     Ok(())
 }
 
@@ -2447,39 +2456,58 @@ fn reject_pending_steer(
     Ok(())
 }
 
-fn reject_stale_assignment(
+/// Check the retained issuer before the queued item enters a native input.
+fn reject_unauthorized_context(
     tx: &Transaction<'_>,
     record: &CommandRecord,
     agent_num: i64,
-    generation: i64,
+    agent: &Agent,
     now: i64,
     events: &mut Vec<Event>,
 ) -> Result<bool> {
-    match project_assignment::check_dispatch(tx, record) {
+    let authority = check_context_authority(tx, record, agent).or_else(|error| {
+        if error.code == "internal" && !tx.is_autocommit() {
+            check_context_authority(tx, record, agent)
+        } else {
+            Err(error)
+        }
+    });
+    match authority {
         Ok(()) => Ok(false),
-        Err(error)
-            if matches!(
-                error.code.as_str(),
-                "stale_assignment" | "not_allowed" | "stale_generation"
-            ) =>
-        {
-            reject_pending_context(tx, record, agent_num, generation, &error.code, now, events)?;
+        Err(error) if error.code == "busy" || tx.is_autocommit() => Err(error),
+        Err(error) => {
+            settle_pending_context_refusal(
+                tx,
+                record,
+                agent_num,
+                agent.generation,
+                (&error.code, Some(&error.message)),
+                now,
+                events,
+            )?;
             Ok(true)
         }
-        Err(error) => Err(error),
     }
 }
 
-fn reject_pending_context(
+fn settle_pending_context_refusal(
     tx: &Transaction<'_>,
     record: &CommandRecord,
     agent_num: i64,
     generation: i64,
-    code: &str,
+    (code, reason): (&str, Option<&str>),
     now: i64,
     events: &mut Vec<Event>,
 ) -> Result<()> {
+    let (state, kind) = if code == "internal" {
+        (CommandState::Failed, "command.failed")
+    } else {
+        (CommandState::Rejected, "command.rejected")
+    };
     let mut outcome = json!({"code": code, "delivery": "cancelled"});
+    if let Some(reason) = reason {
+        outcome["reason"] = json!(&reason[..reason.floor_char_boundary(512)]);
+    }
     if record
         .command
         .outcome
@@ -2488,22 +2516,15 @@ fn reject_pending_context(
     {
         outcome["moved"] = json!(true);
     }
-    update_command_state(
-        tx,
-        &record.command.id,
-        CommandState::Rejected,
-        Some(&outcome),
-        None,
-        now,
-    )?;
+    update_command_state(tx, &record.command.id, state, Some(&outcome), None, now)?;
     events.push(insert_daemon_command_event(
         tx,
         now,
-        "command.rejected",
+        kind,
         Some(agent_num),
         Some(generation),
         &record.command.id,
-        json!({"command_id": record.command.id, "state": "rejected", "outcome": outcome}),
+        json!({"command_id": record.command.id, "state": state, "outcome": outcome}),
     )?);
     Ok(())
 }

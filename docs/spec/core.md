@@ -577,10 +577,19 @@ Store binds each admitted context command to the target's current generation. A
 admission; it cannot float to another turn or fall back to a send. `next_input` has
 no turn binding and is eligible only for the next send in that same generation.
 Queued pending contexts (`next_input`, `turn_safe_point`) are claimed FIFO from
-existing command rows; they do not add a table or journal. An `active_turn`
-command is dispatched directly through the ordinary router: one command is one
-immediate native effect with no queue consumer. Admission or queue acceptance is
-not application.
+existing command rows for the target's current generation. At claim, Store
+rechecks project assignment and transfer fences, the frozen project binding for
+project rules via `validate_project_command_dispatch_tx`, and live issuer
+generation and control scope for Agent principals. Owner, Swarm notes and
+project rule principals carry no issuer generation. Store settles a definite
+refusal with its reason and continues the claim. It rechecks an internal
+authorization error once within the open transaction. A second internal error
+fails that item with its cause and the claim proceeds. SQLite lock conflicts
+and failures that abort the transaction or prevent settlement leave queued
+items pending.
+The ordinary router dispatches each `active_turn` command as
+one immediate native effect with no queue consumer. Admission or queue acceptance
+does not establish application.
 
 For `next_input`, the router claims eligible, unexpired items as part of dispatching the
 next ordinary SEND and the adapter prepends them inside that same native send. An item that
