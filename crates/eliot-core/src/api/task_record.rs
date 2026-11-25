@@ -5,6 +5,54 @@ use serde::{Deserialize, Serialize};
 
 pub const TASK_RECORD_PAGE_SIZE: usize = 100;
 pub const TASK_RECORD_TEXT_PAGE_BYTES: usize = 32 * 1024;
+pub const MAX_TASK_SOURCES: usize = 8;
+
+/// A source selector addresses a numbered entry in the pinned snapshot manifest.
+pub fn task_source_index(section: &str) -> Option<usize> {
+    let digit = section.strip_prefix("source:")?.as_bytes();
+    if let [index @ b'0'..=b'9'] = digit {
+        return Some(usize::from(index - b'0')).filter(|index| *index < MAX_TASK_SOURCES);
+    }
+    None
+}
+
+fn valid_section(section: &str) -> bool {
+    matches!(
+        section,
+        "task.md" | "card.json" | "instructions.json" | "journal.md" | "manifest"
+    ) || task_source_index(section).is_some()
+}
+
+/// The contents of the `manifest` section. Coverage describes this stored
+/// revision only, independently of later commands or the original filesystem.
+#[derive(JsonSchema, Clone, Debug, Serialize, Deserialize)]
+pub struct TaskSnapshotManifest {
+    pub original: Option<TaskSnapshotOrigin>,
+    pub task_saved: bool,
+    pub instructions_saved: bool,
+    pub corrections_retained: usize,
+    pub corrections_omitted_at_least: usize,
+    pub correction_history_incomplete: bool,
+    pub correction_history_unresolved: bool,
+    pub references_without_saved_content: Option<usize>,
+    pub sources: Vec<TaskSnapshotSource>,
+}
+
+#[derive(JsonSchema, Clone, Debug, Serialize, Deserialize)]
+pub struct TaskSnapshotOrigin {
+    pub command_id: String,
+    pub agent: String,
+    pub generation: i64,
+    pub principal: String,
+    pub verb: String,
+    pub state: crate::CommandState,
+}
+
+#[derive(JsonSchema, Clone, Debug, Serialize, Deserialize)]
+pub struct TaskSnapshotSource {
+    pub section: String,
+    pub name: String,
+}
 
 #[derive(JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -140,10 +188,8 @@ impl TaskGetRequest {
         if self.generation < 0
             || validate_command_id(&self.task_command).is_err()
             || self.task_command.contains('\0')
-            || !matches!(
-                self.section.as_str(),
-                "task.md" | "card.json" | "instructions.json" | "journal.md"
-            )
+            || !valid_section(&self.section)
+            || task_source_index(&self.section).is_some() && self.revision.is_none()
             || self
                 .revision
                 .as_ref()
@@ -207,10 +253,7 @@ impl TaskGetResponse {
         if self.generation < 0
             || validate_command_id(&self.task_command).is_err()
             || self.task_command.contains('\0')
-            || !matches!(
-                self.section.as_str(),
-                "task.md" | "card.json" | "instructions.json" | "journal.md"
-            )
+            || !valid_section(&self.section)
             || !matches!(self.revision.len(), 40 | 64)
             || !valid_hex(&self.revision)
             || self.content_digest.len() != 64

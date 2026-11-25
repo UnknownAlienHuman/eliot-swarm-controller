@@ -16,7 +16,7 @@ use tokio::sync::broadcast;
 
 const JOURNAL_TEXT_BYTES: usize = 4 * 1024;
 const JOURNAL_BATCH: usize = 32;
-const MAX_TASK_SOURCES: usize = 8;
+use eliot_core::api::MAX_TASK_SOURCES;
 const MAX_TASK_SOURCE_BYTES: u64 = 256 * 1024;
 /// A task text this short is a pointer: the file it names is the task.
 const MAX_POINTER_TASK_BYTES: usize = 512;

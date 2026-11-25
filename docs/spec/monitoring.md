@@ -957,13 +957,23 @@ retention. Agents sharing a branch can hold different task records. The daemon k
 these refs outside the project repository, including for mirror pushes.
 
 `task.list` pages retained Store bindings for one exact Agent generation in
-command ID order. Its cursor is bound to the binding revision. `task.get`
+command ID order. Its cursor is bound to the binding revision. Command
+retention leaves these bindings and their Git snapshots available. `task.get`
 resolves the exact command through that binding and reads one allowlisted
 text section of the current pinned Git snapshot. Continue with the returned
 Git revision, redacted-section digest and next UTF-8 offset. A changed
 revision or digest requires restarting the read. Neither method accepts an
 arbitrary Git ref or filesystem path. They use the same read authority as
 `checkpoint.list`. See the [task DTOs](../../crates/eliot-core/src/api/task_record.rs).
+
+The `manifest` section names the original provenance, saved task and instruction
+presence, retained correction count, lower bound on omissions, and incomplete or
+unresolved history flags. It lists the saved source selectors and counts recorded
+references without saved text when that information exists. Coverage describes
+only that Git revision. Read a listed `source:N` section with the manifest's
+exact `revision` to page the saved blob. The daemon resolves `N` in the pinned
+Git tree. These reads require the caller's authorized Store binding, including
+after handoff. A lineage link alone never grants access.
 
 **Signals.** A turn-end note, or a note during a turn older than ten minutes, reminds the
 Agent to commit. That long turn also takes a checkpoint, at most once per ten minutes.

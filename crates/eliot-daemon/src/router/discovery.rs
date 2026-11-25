@@ -54,7 +54,7 @@ const METHODS: &[Method] = &[
     method!("checkpoint.list", CheckpointListRequest, CheckpointListResponse, false, false, "Page retained Git checkpoints for one Agent generation.", {"agent":"a1","generation":1,"limit":10}),
     method!("checkpoint.get", CheckpointGetRequest, CheckpointGetResponse, false, false, "Read bounded metadata for one retained checkpoint at its exact Git object ID.", {"agent":"a1","generation":1,"checkpoint_ref":"refs/eliot/checkpoints/a1/g1/0000000000000001-01ARZ3NDEKTSV4RRFFQ69G5FAV","oid":"0000000000000000000000000000000000000001"}),
     method!("task.list", TaskListRequest, TaskListResponse, false, false, "Page retained Store task bindings for one Agent generation.", {"agent":"a1","generation":1,"limit":10}),
-    method!("task.get", TaskGetRequest, TaskGetResponse, false, false, "Read a bounded section of an exact retained Git task record.", {"agent":"a1","generation":1,"task_command":EXAMPLE_ID,"section":"task.md"}),
+    method!("task.get", TaskGetRequest, TaskGetResponse, false, false, "Read retained task text, coverage manifest or a numbered source in a pinned revision.", {"agent":"a1","generation":1,"task_command":EXAMPLE_ID,"section":"manifest"}),
     method!(
         "owner.inbox",
         OwnerInboxRequest,

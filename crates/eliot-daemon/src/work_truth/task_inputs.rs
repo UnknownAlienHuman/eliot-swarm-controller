@@ -29,7 +29,7 @@ async fn task_blob(
         .map_err(|_| Error::new("source_integrity", "saved task entry is not valid UTF-8"))
 }
 
-async fn entries(
+pub(super) async fn entries(
     git: &GitProbe,
     root: &Path,
     tree: &str,
@@ -115,7 +115,7 @@ pub(crate) async fn read_handoff_task(
     })
 }
 
-async fn read_inputs(
+pub(super) async fn read_inputs(
     git: &GitProbe,
     root: &Path,
     commit: &str,
