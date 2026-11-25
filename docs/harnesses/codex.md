@@ -795,7 +795,6 @@ retained as a bounded diagnostic on its exact owned thread.
 | Native input | Durable evidence |
 | --- | --- |
 | `reasoning` item | Keep ordinary item binding and the retained native history projection. No separate reasoning event is persisted. |
-| `account/rateLimits/updated` | Quota uses `account/rateLimits/read`. Provider holds require the authoritative restriction evidence. |
 | `thread/status/changed` | Exact thread and turn readback or lifecycle events establish state and settlement. |
 | `turn/diff/updated` | Keep existing active-turn activity handling. File changes and Git readback supply retained change facts. |
 | `item/commandExecution/terminalInteraction` | Keep existing active-turn activity handling, and use the exact tool item for lifecycle and outcome. Terminal input stays native. |
@@ -810,6 +809,14 @@ truncating it. The schema has no code field, so uncoded notifications use
 `warning`. The diagnostic remains thread-scoped and visible in retained events
 after the turn ends. Missing or mismatched thread bindings increment
 `unbound_warnings_dropped` in the native snapshot; their message is discarded.
+
+The installed schema describes `account/rateLimits/updated` as a sparse rolling
+update. An owned direct account stream translates the primary and secondary
+account windows into the shared `quota.observed` fact. Eliot checks the frozen
+route and tracked sign-in before using fresher windows to update an existing
+`account/rateLimits/read` result. Missing fields preserve readback values. The
+update does not supply a model-window table, refresh the full read's timestamp,
+or create a provider hold. Those decisions keep their existing evidence rules.
 
 If the Codex stream could not commit its final tool records, exact turn
 settlement or generation loss closes retained tool starts as `unknown`.

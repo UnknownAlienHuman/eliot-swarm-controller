@@ -193,6 +193,9 @@ impl Router {
             if let Some(hold) = holds.get(&candidate.scope)
                 && hold.uses_passive_quota_readback()
             {
+                // This path is capability-gated to retained quota readers.
+                // Codex declares only stream projection; its hold stays on the
+                // native SEND probe path.
                 match self.recheck_quota_hold(hold).await {
                     Ok(true) => continue,
                     Ok(false) => {}

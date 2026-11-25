@@ -111,6 +111,7 @@ pub(crate) struct EventConfig {
     pub generation: i64,
     pub secrets: Vec<String>,
     pub native_scope: String,
+    pub publish_account_quota: bool,
 }
 
 pub(crate) struct EventHandle {
@@ -233,6 +234,8 @@ struct EventProcessor {
     /// Unique native id sequence for transient retry/error notices.
     notice_seq: u64,
     warnings: warnings::Warnings,
+    publish_account_quota: bool,
+    last_quota: Option<eliot_core::api::harness::QuotaObservation>,
     native_scope: String,
     child_bindings: HashMap<String, ChildBinding>,
     child_states: HashMap<String, ChildState>,
@@ -441,6 +444,8 @@ impl EventProcessor {
             session_usage_turn: None,
             notice_seq: 0,
             warnings: warnings::Warnings::default(),
+            publish_account_quota: config.publish_account_quota,
+            last_quota: None,
             native_scope: config.native_scope.clone(),
             child_bindings: HashMap::new(),
             child_states: HashMap::new(),
@@ -707,6 +712,9 @@ impl EventProcessor {
         // folded and committed immediately, even while idle.
         if method == "thread/tokenUsage/updated" {
             return !self.status.ready;
+        }
+        if method == "account/rateLimits/updated" {
+            return self.publish_account_quota && !self.status.ready;
         }
         if method == "warning" {
             return !self.status.ready && params.get("threadId").is_some_and(Value::is_string);
@@ -1559,6 +1567,39 @@ impl EventProcessor {
         .await
     }
 
+    async fn observe_account_quota(&mut self, params: &Value) -> Result<()> {
+        if !self.publish_account_quota || !self.status.ready {
+            return Ok(());
+        }
+        let Some(now) = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .and_then(|elapsed| i64::try_from(elapsed.as_millis()).ok())
+        else {
+            return Ok(());
+        };
+        let Some(observation) = crate::discovery::quota_observation(params, now) else {
+            return Ok(());
+        };
+        // Refresh an unchanged observation before its ordinary TTL expires.
+        let refresh_ms = eliot_core::api::HARNESS_READ_TTL_MS as i64 / 2;
+        if self.last_quota.as_ref().is_some_and(|previous| {
+            previous.windows == observation.windows
+                && now >= previous.observed_at_ms
+                && now - previous.observed_at_ms < refresh_ms
+        }) {
+            return Ok(());
+        }
+        self.commit_event(
+            "quota.observed",
+            ulid::Ulid::new().to_string(),
+            json!({"observation": observation}),
+        )
+        .await?;
+        self.last_quota = Some(observation);
+        Ok(())
+    }
+
     async fn process_notification(&mut self, method: &str, params: Value) -> Result<()> {
         if self
             .process_compaction_notification(method, &params)
@@ -1749,6 +1790,7 @@ impl EventProcessor {
             "thread/tokenUsage/updated" => {
                 self.note_token_usage(&params).await?;
             }
+            "account/rateLimits/updated" => self.observe_account_quota(&params).await?,
             "serverRequest/resolved" => {
                 self.resolve_server_request(params).await?;
             }
@@ -2385,8 +2427,7 @@ fn turn_activity_notification(method: &str) -> bool {
 fn is_advisory_notification(method: &str) -> bool {
     matches!(
         method,
-        "account/rateLimits/updated"
-            | "thread/status/changed"
+        "thread/status/changed"
             | "turn/diff/updated"
             | "mcpServer/startupStatus/updated"
             | "item/commandExecution/terminalInteraction"

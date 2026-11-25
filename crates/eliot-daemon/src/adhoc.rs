@@ -980,6 +980,11 @@ pub(crate) struct VersionKey {
 }
 
 impl VersionKey {
+    pub(crate) fn modified_at_ms(&self) -> Option<i64> {
+        let since_epoch = self.modified?.duration_since(std::time::UNIX_EPOCH).ok()?;
+        i64::try_from(since_epoch.as_millis()).ok()
+    }
+
     pub(crate) fn for_reader(program: &str, harness: &str) -> Option<Self> {
         Self::read(&resolve_native_executable(program, harness).ok()?, None)
     }

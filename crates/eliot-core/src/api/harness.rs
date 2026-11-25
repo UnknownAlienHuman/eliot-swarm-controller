@@ -201,6 +201,32 @@ pub type ProviderResponseRouteIdentity = fn(&serde_json::Value) -> Option<serde_
 pub type RouteClientKeyEnvSelector = fn(&str) -> bool;
 pub type QuotaUsageWindows = fn(&serde_json::Value, i64) -> Vec<QuotaWindowBounds>;
 
+#[derive(Clone, Copy, Debug)]
+pub enum QuotaResetUnit {
+    Milliseconds,
+    Seconds,
+}
+
+/// Adapter-declared mapping from typed observation labels to provider detail slots.
+#[derive(Clone, Copy, Debug)]
+pub struct QuotaWindowSlot {
+    pub label: &'static str,
+    pub selector_key: &'static str,
+    pub used_percent_key: &'static str,
+    pub reset_key: Option<&'static str>,
+    pub reset_unit: QuotaResetUnit,
+    pub duration_mins_key: Option<&'static str>,
+}
+
+/// Provider detail keys needed to merge typed sparse observations without
+/// exposing provider wire names to the daemon.
+#[derive(Clone, Copy, Debug)]
+pub struct QuotaWindowProjection {
+    pub container_key: &'static str,
+    pub observed_at_key: &'static str,
+    pub slots: &'static [QuotaWindowSlot],
+}
+
 type QuotaRouteRefusal = fn(&serde_json::Value, &serde_json::Value) -> Option<&'static str>;
 
 /// Adapter readback shape and route preflight for provider quota.
@@ -213,6 +239,8 @@ pub struct NativeQuotaReadback {
     pub description: fn(&serde_json::Value) -> &'static str,
     pub unsupported_note: Option<&'static str>,
     pub route_refusal: Option<QuotaRouteRefusal>,
+    /// Adapter-declared mapping for typed sparse window observations.
+    pub window_projection: Option<QuotaWindowProjection>,
 }
 
 /// Native account scope and diagnostics for a reader with retained turn evidence.

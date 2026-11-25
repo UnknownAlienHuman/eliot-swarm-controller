@@ -3,7 +3,7 @@
 use eliot_core::api::harness::{
     AdhocEffort, LaunchDefaultPolicy, NativeAccessBounds, NativeAuthCapability, NativeAuthCheck,
     NativeAuthCommand, NativeAuthInvocation, NativeAuthState, NativeQuotaReadback, NativeRoute,
-    ProfileCapabilities,
+    ProfileCapabilities, QuotaResetUnit, QuotaWindowProjection, QuotaWindowSlot,
 };
 use eliot_core::api::native_profile::NativeSubagentsPolicy;
 use eliot_core::api::{HarnessCapabilities, InputTokenAccounting};
@@ -17,6 +17,28 @@ const CODEX_LOGIN_ENV: &str = "CODEX_HOME";
 const ROUTE_KIND_RESPONSES: &str = "codex_responses";
 const ROUTE_KIND_CHATGPT: &str = "codex_chatgpt";
 const CODEX_PROXY_SELECTOR_ENV_NAMES: &[&str] = &["CODEX_HOME", "CODEX_SQLITE_HOME"];
+const CODEX_QUOTA_WINDOW_PROJECTION: QuotaWindowProjection = QuotaWindowProjection {
+    container_key: "rateLimits",
+    observed_at_key: "liveWindowsObservedAtMs",
+    slots: &[
+        QuotaWindowSlot {
+            label: "Primary",
+            selector_key: "primary",
+            used_percent_key: "usedPercent",
+            reset_key: Some("resetsAt"),
+            reset_unit: QuotaResetUnit::Seconds,
+            duration_mins_key: Some("windowDurationMins"),
+        },
+        QuotaWindowSlot {
+            label: "Secondary",
+            selector_key: "secondary",
+            used_percent_key: "usedPercent",
+            reset_key: Some("resetsAt"),
+            reset_unit: QuotaResetUnit::Seconds,
+            duration_mins_key: Some("windowDurationMins"),
+        },
+    ],
+};
 
 /// Extracts only the nonsecret fields declared above and in Codex's frozen
 /// route binding. Core owns canonical serialization and digesting.
@@ -109,6 +131,7 @@ pub fn declaration() -> HarnessCapabilities {
         },
         quota_readback: Some(NativeQuotaReadback {
             method: "account/rateLimits/read",
+            window_projection: Some(CODEX_QUOTA_WINDOW_PROJECTION),
             unsupported_note: Some(
                 "Installed Codex app-server does not support account/rateLimits/read",
             ),
