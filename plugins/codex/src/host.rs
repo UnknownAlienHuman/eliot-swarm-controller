@@ -265,13 +265,12 @@ fn validate_start_plan(
     let frozen_profile = params
         .profile
         .as_ref()
-        .ok_or_else(|| Error::new("profile_error", "Codex requires a frozen profile object"))?;
+        .ok_or_else(|| local_start_plan_profile_error("Codex requires a frozen profile object"))?;
     let profile = frozen_profile
         .as_object()
-        .ok_or_else(|| Error::new("profile_error", "Codex requires a frozen profile object"))?;
+        .ok_or_else(|| local_start_plan_profile_error("Codex requires a frozen profile object"))?;
     if profile.get("harness").and_then(Value::as_str) != Some("codex") {
-        return Err(Error::new(
-            "profile_error",
+        return Err(local_start_plan_profile_error(
             "Codex plugin received a profile for another harness",
         ));
     }
@@ -286,10 +285,7 @@ fn validate_start_plan(
                 .filter(|digest| eliot_core::is_lowercase_hex(digest, 64))
                 .map(str::to_owned)
                 .ok_or_else(|| {
-                    Error::new(
-                        "profile_error",
-                        "Codex frozen catalogue digest is malformed",
-                    )
+                    local_start_plan_profile_error("Codex frozen catalogue digest is malformed")
                 })
         })
         .transpose()?;
@@ -297,10 +293,7 @@ fn validate_start_plan(
     // vocabulary; that decode is the boundary check.
     let fields: ProfileFields =
         serde_json::from_value(frozen_profile.clone()).map_err(|error| {
-            Error::new(
-                "profile_error",
-                format!("Codex frozen profile is invalid: {error}"),
-            )
+            local_start_plan_profile_error(format!("Codex frozen profile is invalid: {error}"))
         })?;
     let non_blank = |value: Option<String>| value.filter(|value| !value.trim().is_empty());
     let native_subagents = fields.native_subagents;
@@ -316,8 +309,7 @@ fn validate_start_plan(
     if let (Some(requested), Some(frozen)) = (&requested_model, &daemon_model)
         && requested != frozen
     {
-        return Err(Error::new(
-            "profile_error",
+        return Err(local_start_plan_profile_error(
             "Codex frozen daemon model does not match the requested model",
         ));
     }
@@ -345,8 +337,7 @@ fn validate_start_plan(
             || mcp_policy != McpPolicy::Minimal
             || !mcp_allow.is_empty())
     {
-        return Err(Error::new(
-            "profile_error",
+        return Err(local_start_plan_profile_error(
             "Codex provider probe permissions are invalid",
         ));
     }
@@ -355,10 +346,9 @@ fn validate_start_plan(
         .as_deref()
         .filter(|path| !path.trim().is_empty())
         .map(PathBuf::from)
-        .ok_or_else(|| Error::new("profile_error", "Codex requires an existing workspace"))?;
+        .ok_or_else(|| local_start_plan_profile_error("Codex requires an existing workspace"))?;
     if !workspace.is_dir() {
-        return Err(Error::new(
-            "profile_error",
+        return Err(local_start_plan_profile_error(
             "Codex workspace must be an existing directory",
         ));
     }
@@ -370,10 +360,7 @@ fn validate_start_plan(
                 .filter(|program| !program.trim().is_empty())
                 .map(OsString::from)
                 .ok_or_else(|| {
-                    Error::new(
-                        "profile_error",
-                        "Codex profile cmd must be one executable path",
-                    )
+                    local_start_plan_profile_error("Codex profile cmd must be one executable path")
                 })
         })
         .transpose()?
@@ -423,8 +410,7 @@ fn validate_start_plan(
         .map(PathBuf::from)
         .filter(|path| path.is_absolute() && path.is_dir())
         .ok_or_else(|| {
-            Error::new(
-                "profile_error",
+            local_start_plan_profile_error(
                 "Codex Agent MCP requires an absolute owned Eliot data directory",
             )
         })?;
@@ -435,8 +421,7 @@ fn validate_start_plan(
         )
     })?;
     let mcp_cwd = std::fs::canonicalize(&workspace).map_err(|_| {
-        Error::new(
-            "profile_error",
+        local_start_plan_profile_error(
             "Codex Agent workspace could not be resolved for its MCP cwd",
         )
     })?;
@@ -476,6 +461,13 @@ fn validate_start_plan(
         credential: initialized.credential.clone(),
         profile: profile.clone(),
     })
+}
+
+fn local_start_plan_profile_error(message: impl Into<String>) -> Error {
+    Error::new("profile_error", message).with_origin(
+        eliot_core::FailureOrigin::Swarm,
+        "local Codex start-plan validation",
+    )
 }
 
 pub(crate) async fn run() -> Result<()> {
@@ -610,6 +602,7 @@ impl CodexPlugin {
             "native.turn_evidence" => crate::history::read(&request.params).await,
             "agent.attach" => self.attach(&request.params).await,
             "agent.detach" => self.detach(&request.params).await,
+            "agent.validate_start" => self.validate_start(&request.params),
             "agent.start" => Box::pin(self.start(&request.params, client)).await,
             "agent.command" => self.command(&request.params).await,
             "agent.snapshot" => self.snapshot(&request.params).await,
@@ -992,6 +985,22 @@ impl CodexPlugin {
             .ok_or_else(|| Error::new("unsupported", "Codex plugin has no observation attachment"))?
             .detach(&params, Instant::now() + crate::discovery::READ_TIMEOUT)
             .await
+    }
+
+    fn validate_start(&self, raw: &Value) -> Result<Value> {
+        let params: AgentStartParams = decode(raw, "Codex agent.start params are invalid")?;
+        validate_identity(
+            &params.agent_id,
+            params.generation,
+            &params.command_id,
+            "Codex",
+        )?;
+        let initialized = self
+            .initialized
+            .as_ref()
+            .ok_or_else(|| not_initialized("Codex"))?;
+        validate_start_plan(&params, initialized)?;
+        Ok(json!({"validated": true}))
     }
 
     async fn start(&mut self, raw: &Value, peer: &PeerClient) -> Result<Value> {

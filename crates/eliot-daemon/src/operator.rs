@@ -815,3 +815,45 @@ fn powershell(script: &str, request: &impl serde::Serialize) -> Result<std::proc
     sent.map_err(|error| Error::new("platform_io", format!("write WMI launch request: {error}")))?;
     Ok(output)
 }
+
+fn update_health_decision_name(restart_id: &str) -> Result<String> {
+    let id: ulid::Ulid = restart_id
+        .parse()
+        .map_err(|_| Error::new("invalid", "restart id must be a ULID"))?;
+    if id.to_string() != restart_id {
+        return Err(Error::new("invalid", "restart id must be a canonical ULID"));
+    }
+    Ok(format!("update-health-{id}.json"))
+}
+
+/// Persist one update decision independently of the replaceable Store.
+pub fn record_update_health_decision(
+    path: &Path,
+    restart_id: &str,
+    decision: &serde_json::Value,
+) -> Result<()> {
+    crate::daemon::require_local_store_owner("record update health decision")?;
+    let name = update_health_decision_name(restart_id)?;
+    let dir = DataDir::open_existing(path)?;
+    let bytes = serde_json::to_vec(decision)
+        .map_err(|_| Error::new("internal", "encode update health decision"))?;
+    if bytes.len() > crate::daemon::MAX_RPC_FRAME_BYTES {
+        return Err(Error::new(
+            "frame_too_large",
+            "update health decision exceeds its read limit",
+        ));
+    }
+    crate::platform::data_dir::replace_file_atomically(dir.path(), &name, &bytes, true)
+}
+
+pub fn read_update_health_decision(path: &Path, restart_id: &str) -> Result<serde_json::Value> {
+    crate::daemon::require_local_store_owner("read update health decision")?;
+    let dir = DataDir::open_existing(path)?;
+    let name = update_health_decision_name(restart_id)?;
+    let bytes = crate::platform::data_dir::read_private_bytes(
+        &dir.path().join(name),
+        crate::daemon::MAX_RPC_FRAME_BYTES,
+    )?;
+    serde_json::from_slice(&bytes)
+        .map_err(|_| Error::new("source_integrity", "invalid update health decision"))
+}

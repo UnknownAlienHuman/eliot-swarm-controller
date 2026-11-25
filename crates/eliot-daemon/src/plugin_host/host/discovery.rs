@@ -285,6 +285,167 @@ impl PluginHost {
             .map_err(|_| Error::new("unavailable", "archive reader stopped"))?
     }
 
+    /// Reuse the native adapter's exact start-plan validator in a tracked
+    /// reader. This lane cannot publish Agent facts or dispatch a native start.
+    pub(crate) async fn validate_retained_start(
+        &self,
+        mut agent: eliot_core::Agent,
+        source_state: Option<Value>,
+    ) -> Result<()> {
+        let is_resume = source_state.is_some();
+        let caps = HarnessCapabilities::of(&agent.harness);
+        let (overlay, rules_receipt) = {
+            let store = self.state.store.lock().await;
+            let overlay = if is_resume && caps.resume_config {
+                store.get_agent_config_current(&agent.id, agent.generation)?
+            } else {
+                None
+            };
+            let rules = if caps.owner_rules_delivery
+                != eliot_core::api::OwnerRulesDeliveryMethod::FirstInput
+            {
+                store.get_agent_owner_rules_delivery(&agent.id)?
+            } else {
+                None
+            };
+            (overlay, rules)
+        };
+        let owner_rules = rules_receipt
+            .map(|receipt| {
+                let policy = SecretPolicy::new(self.state.secrets.lock_recover().iter());
+                crate::config::settings::owner_rules_for_delivery(
+                    &self.state.data_root,
+                    &receipt.digest,
+                    &policy,
+                )
+            })
+            .transpose()?;
+        if is_resume {
+            agent.generation = agent.generation.checked_add(1).ok_or_else(|| {
+                Error::new("unknown", "no successor generation for readiness probe")
+            })?;
+        }
+        let (environment, mcp) = super::build_target_environment(
+            &self.state.data_root,
+            self.state.stand_store_root.as_deref(),
+            &agent,
+            &Ulid::new().to_string(),
+        )?;
+        let mut params =
+            eliot_core::AgentStartParams::new(&agent.id, agent.generation, Ulid::new().to_string());
+        params.profile = Some(super::start_wire_profile(&agent));
+        params.workspace = agent.workspace.clone();
+        params.target_environment = Some(environment.clone());
+        params.mcp_environment = if caps.data_root_only_mcp {
+            Some(super::data_root_only_mcp_environment(&mcp)?)
+        } else {
+            Some(mcp)
+        };
+        params.agent_mcp_url = self.state.agent_mcp_url.clone();
+        params.owner_rules = owner_rules;
+        params.pass_agent_identity_to_shell = Some(
+            agent
+                .profile_snapshot
+                .get("pass_agent_identity_to_shell")
+                .and_then(Value::as_bool)
+                .unwrap_or(true),
+        );
+        if is_resume {
+            params.resume_from =
+                Some(json!({"native_scope":agent.native_scope,"native_ref":agent.native_ref}));
+            params.source_state = source_state;
+        }
+        if let Some(overlay) = overlay {
+            params.model_override = overlay.model;
+            params.effort_override = if caps.effort { overlay.effort } else { None };
+            params.config_revision = Some(overlay.revision);
+        }
+        params.commit_roots = super::commit_roots_for(&agent, &self.state.store).await;
+        let (id, stop_rx, done_tx) = self.wait_metadata_reader().await?;
+        let host = self.clone();
+        let (reply, response) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let completion = host
+                .read_start_plan(agent.harness, environment, params, is_resume, stop_rx)
+                .await;
+            host.finish_metadata_reader(&id, done_tx, completion.cleanup);
+            let _ = reply.send(completion.result);
+        });
+        response
+            .await
+            .map_err(|_| Error::new("unknown", "start-plan reader stopped"))?
+    }
+
+    async fn read_start_plan(
+        &self,
+        harness: String,
+        environment: Value,
+        mut params: eliot_core::AgentStartParams,
+        is_resume: bool,
+        mut stop: watch::Receiver<Option<Instant>>,
+    ) -> MetadataRead<()> {
+        let method = "agent.validate_start";
+        if stop.borrow().is_some() {
+            return MetadataRead {
+                result: Err(Error::new(
+                    "unknown",
+                    "start-plan reader cancelled before opening",
+                )),
+                cleanup: ReaderCleanup::Confirmed,
+            };
+        }
+        let profile = params.profile.clone().unwrap_or_default();
+        let opened = self
+            .open_reader_with_cleanup(
+                &AgentKey {
+                    id: "update-plan".to_owned(),
+                    generation: 0,
+                },
+                &harness,
+                &profile,
+                &environment,
+                None,
+            )
+            .await;
+        let mut reader = match opened.result {
+            Ok(reader) => reader,
+            Err(error) => return failed_metadata_open(error, opened.cleanup_confirmed, method),
+        };
+        let until = Instant::now() + READER_DEADLINE;
+        let result = tokio::select! {
+            result = async {
+                let manifest = reader.initialize(&harness, until).await?;
+                require_proxy_capability(&profile, &manifest)?;
+                let verb = if is_resume { "resume" } else { "launch" };
+                if !manifest.verbs.iter().any(|value| value == verb) {
+                    return Err(Error::new("unsupported", "adapter has no matching managed start verb"));
+                }
+                params.source_plan = Some(super::manifest_source_plan(&manifest, &harness)?);
+                let wire = serde_json::to_value(params).map_err(|_| Error::new("unknown", "cannot encode start plan"))?;
+                let reply = reader.client.call(method, wire, until).await?;
+                if reply != json!({"validated":true}) {
+                    return Err(Error::new("unknown", "adapter did not confirm startup validation"));
+                }
+                Ok(())
+            } => result,
+            _ = stop.changed() => Err(Error::new("unknown", "start-plan reader cancelled")),
+        };
+        let secrets = reader.secrets.clone();
+        let closure = reader
+            .close_until(self, None, metadata_reader_close_deadline(&stop))
+            .await;
+        let result = require_reader_cleanup(result, closure.closed, method)
+            .map_err(|error| redact_native_error(error, &secrets));
+        MetadataRead {
+            result,
+            cleanup: if closure.closed {
+                ReaderCleanup::Confirmed
+            } else {
+                ReaderCleanup::Unknown
+            },
+        }
+    }
+
     pub(crate) async fn profile_store(
         &self,
         profile: Value,

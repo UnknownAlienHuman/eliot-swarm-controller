@@ -3423,6 +3423,30 @@ be restored only before a replacement can admit writes; after admission, rollbac
 uses the current Store and retains its writes rather than restoring the older
 backup over them.
 
+After the replacement becomes ready, the CLI reads the initial `on_restart`
+continuation outcomes for up to 30 seconds. When that pass requested no
+continuations, it checks one retained managed subject per harness against
+the same adapter start-plan validator used by Resume or Launch, through a
+bounded adapter reader. These probes create no Agent, dispatch no native
+session, and submit no model input. Adapters without an equivalent planner
+report unknown. The exact retained
+generation, retained subject, workspace, profile name and startup kind bind the
+comparison to the previous daemon's accepted validation. A boot attempt skipped
+before dispatch is reported as `not_dispatched` with its evidence.
+
+A deterministic Swarm validation refusal for a previously accepted matching
+subject requests rollback only when boot evidence is complete and all attempts
+have settled. A published candidate must pass the lossless restart drain before
+exiting. If in-flight work outlasts the rollback drain, cancellation leaves the
+candidate serving and the original backup retained. A same-schema rollback uses
+the current Store. If the replacement advanced the schema, the current Store and
+backup remain available for compatible recovery. Provider, transient and uncertain
+outcomes leave the release running.
+
+The CLI records the startup evidence and decision in the private data directory
+under the update preparation ID before requesting rollback. Read it without a
+running daemon using `swarm daemon update --health-decision PREPARE_ID`.
+
 After commit, the old daemon retires its owned Agent processes and leaves
 the existing Store recovery facts for the next boot. Startup and rollback
 both honor `on_restart` and continue eligible Agents with interrupted work,
@@ -3611,6 +3635,7 @@ swarm daemon install [--dry-run] | uninstall [--dry-run]
 swarm daemon stop [--drain|--force]
 swarm daemon update <RELEASE> [--wait-seconds N] [--interrupt-on-deadline]
 swarm daemon update --cancel PREPARE_ID
+swarm daemon update --health-decision PREPARE_ID
 swarm stand up [--root PATH] [--settings FILE] [--profile NAME]... [--binary PATH] [--ttl DURATION]
 swarm stand up [--root PATH] --read-only-copy DATA_DIR [--ttl DURATION]
 swarm stand down <PATH>

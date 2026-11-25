@@ -552,6 +552,7 @@ impl OpenCodePlugin {
             "model.list" => self.model_list(&request.params).await,
             "quota.read" => crate::quota::read(&request.params).await,
             "native.archive" => self.native_archive(&request.params).await,
+            "agent.validate_start" => self.validate_start(&request.params),
             "agent.start" => self.start(&request.params, client).await,
             "agent.command" => self.command(&request.params).await,
             "agent.models" => self.session_models(&request.params).await,
@@ -1067,6 +1068,11 @@ impl OpenCodePlugin {
             // release capacity on proven exit.
             CreateOutcome::ProvenFailed(value) => Ok(value),
         }
+    }
+
+    fn validate_start(&self, raw: &Value) -> Result<Value> {
+        self.parse_start_request(raw)?;
+        Ok(json!({"validated": true}))
     }
 
     /// Start phase 1, admission: the once-only guard, decode and

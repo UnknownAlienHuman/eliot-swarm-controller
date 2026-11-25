@@ -3185,14 +3185,20 @@ async fn resolve_send_config(
 /// Git roots for a sandboxed harness on a managed worktree, including the
 /// managed branch's ref and reflog parents needed by native Git.
 async fn resolve_commit_roots(actor: &AgentActorConfig) -> Vec<String> {
-    if !crate::work_truth::needs_commit_roots(&actor.agent.harness, &actor.agent.profile_snapshot) {
-        return Vec::new();
-    }
-    let (Some(workspace), Some(state)) = (actor.agent.workspace.as_deref(), actor.state.upgrade())
-    else {
+    let Some(state) = actor.state.upgrade() else {
         return Vec::new();
     };
-    let managed = state.store.lock().await.worktree_branch_base(workspace);
+    commit_roots_for(&actor.agent, &state.store).await
+}
+
+async fn commit_roots_for(agent: &Agent, store: &crate::rpc_latency::StoreHandle) -> Vec<String> {
+    if !crate::work_truth::needs_commit_roots(&agent.harness, &agent.profile_snapshot) {
+        return Vec::new();
+    }
+    let Some(workspace) = agent.workspace.as_deref() else {
+        return Vec::new();
+    };
+    let managed = store.lock().await.worktree_branch_base(workspace);
     let Ok(Some((branch, _))) = managed else {
         return Vec::new();
     };
@@ -3875,24 +3881,60 @@ fn data_root_only_mcp_environment(environment: &Value) -> Result<Value> {
     Ok(Value::Object(scoped))
 }
 
-fn build_target_environment(
-    data_root: &Path,
-    stand_store_root: Option<&Path>,
-    agent: &Agent,
-    agent_token: &str,
-) -> Result<(Value, Value)> {
+fn start_wire_profile(agent: &Agent) -> Value {
+    let mut profile = agent.profile_snapshot.clone();
+    if let Some(values) = profile.as_object_mut() {
+        values.remove(crate::command_guard::SNAPSHOT_FIELD);
+        values.remove("pass_agent_identity_to_shell");
+    }
+    profile
+}
+
+fn validate_managed_start_profile(agent: &Agent) -> Result<Map<String, Value>> {
+    let refusal = |message: String| {
+        Error::new("profile_error", message)
+            .with_where("plugin_host.start.profile")
+            .with_origin(
+                eliot_core::FailureOrigin::Swarm,
+                "local frozen profile validation",
+            )
+    };
+    if agent
+        .profile_snapshot
+        .get("harness")
+        .and_then(Value::as_str)
+        != Some(agent.harness.as_str())
+    {
+        return Err(refusal(
+            "retained profile does not match its Agent harness".to_owned(),
+        ));
+    }
     if HarnessCapabilities::of(&agent.harness).requires_pass_env
         && !agent
             .profile_snapshot
             .get("pass_env")
             .is_some_and(Value::is_array)
     {
-        return Err(Error::new(
-            "invalid",
-            "frozen profile pass_env must be an array of names",
+        return Err(refusal(
+            "frozen profile pass_env must be an array of names".to_owned(),
         ));
     }
-    let mut environment = build_process_environment(&agent.profile_snapshot)?;
+    build_process_environment(&agent.profile_snapshot).map_err(|error| {
+        if error.code == "invalid" {
+            refusal(*error.message)
+        } else {
+            error
+        }
+    })
+}
+
+fn build_target_environment(
+    data_root: &Path,
+    stand_store_root: Option<&Path>,
+    agent: &Agent,
+    agent_token: &str,
+) -> Result<(Value, Value)> {
+    let mut environment = validate_managed_start_profile(agent)?;
     let mut mcp_environment = Map::new();
     let home = data_root
         .to_str()

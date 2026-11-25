@@ -158,6 +158,7 @@ const METHODS: &[Method] = &[
     ),
     method!("daemon.shutdown", DaemonShutdownRequest, DaemonShutdownResponse, true, true, "Request drain or force shutdown; acknowledgement is not process-exit proof.", {"id":EXAMPLE_ID,"mode":"drain"}),
     method!("daemon.restart_status", DaemonRestartStatusRequest, DaemonRestartStatusResponse, true, false, "Read blockers and renew the in-memory lease for an exact restart preparation.", {"restart_id":EXAMPLE_ID}),
+    method!("daemon.update.health", UpdateHealthRequest, UpdateHealthResponse, false, true, "Read boot continuation evidence or validate a retained managed start without dispatch.", {"action":"boot"}),
     method!(
         "daemon.sidebar",
         DaemonSidebarRequest,

@@ -66,6 +66,16 @@ pub(crate) async fn run_daemon(
     }
     match args.action {
         Some(DaemonAction::Update {
+            health_decision: Some(restart_id),
+            ..
+        }) => {
+            if id.is_some() {
+                return Err(Failure::new(2, "--id is invalid with --health-decision"));
+            }
+            super::update::read_health_decision(&data_dir, &restart_id, json_output)
+        }
+
+        Some(DaemonAction::Update {
             cancel: Some(restart_id),
             ..
         }) => {
@@ -89,7 +99,7 @@ pub(crate) async fn run_daemon(
         }
         Some(DaemonAction::Update { .. }) => Err(Failure::new(
             2,
-            "daemon update requires a release or --cancel",
+            "daemon update requires a release, --cancel or --health-decision",
         )),
         Some(DaemonAction::Stop(args)) => {
             if args.drain == args.force {

@@ -557,6 +557,7 @@ impl ClaudePlugin {
             "initialize" => self.initialize(&request.params),
             "quota.read" => crate::quota::read(&request.params).await,
             "model.list" => self.model_list(&request.params).await,
+            "agent.validate_start" => self.validate_start(&request.params),
             "agent.start" => self.start(&request.params, client).await,
             "agent.command" => self.command(request).await,
             "agent.snapshot" => self.snapshot(&request.params).await,
@@ -1151,6 +1152,19 @@ impl ClaudePlugin {
         let (session, effective) = self.read_effective_profile(session, &plan).await?;
         self.commit_readiness(session, &params, &plan, effective)
             .await
+    }
+
+    fn validate_start(&self, raw: &Value) -> Result<Value> {
+        self.guard_start()?;
+        let params: AgentStartParams = decode(raw, "Claude agent.start params are invalid")?;
+        validate_identity(
+            &params.agent_id,
+            params.generation,
+            &params.command_id,
+            "Claude",
+        )?;
+        self.plan_start(&params)?;
+        Ok(json!({"validated": true}))
     }
 
     /// The daemon sends agent.start exactly once per freshly spawned plugin

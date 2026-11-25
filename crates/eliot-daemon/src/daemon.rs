@@ -918,11 +918,12 @@ async fn spawn_workers(
                 Some(&error),
             );
         }
-        if let Err(error) = capacity
+        let boot = capacity
             .router
             .recover_restart_agents(capacity.on_restart)
-            .await
-        {
+            .await;
+        capacity.router.finish_update_boot(boot.is_ok());
+        if let Err(error) = boot {
             logging::record(
                 &capacity.policy,
                 "daemon.restart_agent_recovery_failed",

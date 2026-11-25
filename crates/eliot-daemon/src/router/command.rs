@@ -1781,7 +1781,7 @@ impl Router {
         &self,
         command_id: &str,
     ) -> Result<(Value, Value)> {
-        let (profile, generation, source, latest_turn) = {
+        let (profile, mut source_state) = {
             let store = self.inner.store.lock().await;
             let command = store
                 .get_command(command_id)?
@@ -1795,41 +1795,47 @@ impl Router {
             let agent = store
                 .get_agent(&agent_id)?
                 .ok_or_else(|| Error::new("not_found", "resume Agent was not found"))?;
-            let generation = validate_retained_resume_agent(&agent, &command)?;
-            let source =
-                store.read_source_state(&agent_id, generation, CONTROLLED_PLUGIN_SOURCE)?;
-            // A promptless resume can open the same native subject in a new generation.
-            // Its newest native turn can still belong to an earlier generation.
-            let turn_generation = if HarnessCapabilities::of(&agent.harness).resume_previous_turn {
-                store
-                    .latest_retained_turn_generation(&agent_id, generation)?
-                    .unwrap_or(generation)
-            } else {
-                generation
-            };
-            let latest_turn = store
-                .list_turns(&agent_id, turn_generation, 1)?
-                .into_iter()
-                .next()
-                .map(|turn| {
-                    json!({
-                        "turn_id": turn.turn_id,
-                        "state": turn.state,
-                        "status": turn.status,
-                        "started_at": turn.started_at,
-                        "completed_at": turn.completed_at,
-                    })
-                });
-            (agent.profile_snapshot, generation, source, latest_turn)
+            validate_retained_resume_agent(&agent, &command)?;
+            let source_state = retained_resume_source(&store, &agent)?;
+            (agent.profile_snapshot, source_state)
         };
-        let mut source_state = json!({
-            "retained_generation": generation,
-            "retained_source": source,
-            "current_turn": latest_turn,
-        });
         self.redact_native_value(&mut source_state);
         Ok((profile, source_state))
     }
+}
+
+/// The exact retained inputs used by both real resume dispatch and readiness validation.
+pub(super) fn retained_resume_source(store: &eliot_store::Store, agent: &Agent) -> Result<Value> {
+    let agent_id = agent.id.as_str();
+    let generation = agent.generation;
+    let source = store.read_source_state(agent_id, generation, CONTROLLED_PLUGIN_SOURCE)?;
+    // A promptless resume can open the same native subject in a new generation.
+    // Its newest native turn can still belong to an earlier generation.
+    let turn_generation = if HarnessCapabilities::of(&agent.harness).resume_previous_turn {
+        store
+            .latest_retained_turn_generation(agent_id, generation)?
+            .unwrap_or(generation)
+    } else {
+        generation
+    };
+    let latest_turn = store
+        .list_turns(agent_id, turn_generation, 1)?
+        .into_iter()
+        .next()
+        .map(|turn| {
+            json!({
+                "turn_id": turn.turn_id,
+                "state": turn.state,
+                "status": turn.status,
+                "started_at": turn.started_at,
+                "completed_at": turn.completed_at,
+            })
+        });
+    Ok(json!({
+        "retained_generation": generation,
+        "retained_source": source,
+        "current_turn": latest_turn,
+    }))
 }
 
 impl Router {
