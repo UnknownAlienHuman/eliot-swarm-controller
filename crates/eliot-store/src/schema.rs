@@ -29,8 +29,23 @@ const BROKEN_NATIVE_SESSION_VERSION: i64 = 136;
 const CHILD_CLEANUP_VERSION: i64 = 137;
 const RESTART_CONTINUATION_BRIEF_VERSION: i64 = 139;
 
+fn has_restart_continuation_brief_column(connection: &Connection) -> Result<bool> {
+    connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('restart_resume_intents')
+                           WHERE name='continuation_brief')",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(sql_error)
+}
+
 impl Store {
     pub const SCHEMA_VERSION: i64 = CURRENT_SCHEMA_VERSION;
+
+    pub fn supports_restart_continuation_brief(&self) -> Result<bool> {
+        has_restart_continuation_brief_column(&self.connection)
+    }
 
     pub(super) fn migrate(&mut self) -> Result<()> {
         self.connection
@@ -247,11 +262,16 @@ impl Store {
                 .connection
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(sql_error)?;
+            if !has_restart_continuation_brief_column(&tx)? {
+                tx.execute_batch(
+                    "ALTER TABLE restart_resume_intents ADD COLUMN continuation_brief INTEGER NOT NULL
+                         DEFAULT 0 CHECK (continuation_brief IN (0, 1));",
+                )
+                .map_err(sql_error)?;
+            }
             tx.execute_batch(
-                "ALTER TABLE restart_resume_intents ADD COLUMN continuation_brief INTEGER NOT NULL
-                    DEFAULT 0 CHECK (continuation_brief IN (0, 1));
-                 UPDATE restart_resume_intents AS r SET continuation_brief=1
-                 WHERE EXISTS (
+                "UPDATE restart_resume_intents AS r SET continuation_brief=1
+                 WHERE continuation_brief=0 AND EXISTS (
                    SELECT 1 FROM commands c JOIN events e
                      ON e.agent=c.target AND e.generation=c.expected_generation
                    WHERE c.id=r.command_id AND e.kind='agent.lost'
