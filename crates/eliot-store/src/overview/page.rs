@@ -63,6 +63,11 @@ impl Cursor {
 
 struct PageBudget(usize);
 
+struct OverviewLimits<'a> {
+    capacity: &'a ScopeLimits,
+    usage_agents: i64,
+}
+
 impl PageBudget {
     fn take(&mut self, item: &impl serde::Serialize) -> Result<bool> {
         let bytes = encode_json(item)?.len() + 1;
@@ -134,7 +139,10 @@ impl Store {
                     &tx,
                     filter,
                     &access,
-                    limits,
+                    &OverviewLimits {
+                        capacity: limits,
+                        usage_agents: self.hierarchy_limits.max_selector_targets,
+                    },
                     cursor,
                     &mut budget,
                     &mut response.projects,
@@ -157,7 +165,7 @@ fn page_projects(
     conn: &Connection,
     filter: Option<&str>,
     access: &DetailAccess,
-    limits: &ScopeLimits,
+    limits: &OverviewLimits<'_>,
     cursor: Option<Cursor>,
     budget: &mut PageBudget,
     page: &mut Vec<ProjectOverviewEntry>,
@@ -176,8 +184,8 @@ fn page_projects(
         _ => None,
     };
     let keys = list_overview_projects(conn, filter, after)?;
-    for (index, project) in keys.into_iter().enumerate() {
-        if index == MAX_PAGE_ENTRIES {
+    for project in keys {
+        if page.len() == PROJECTS_PER_PAGE {
             return Ok(page.last().map(|last| Cursor::Projects {
                 after: last.project.clone(),
             }));
@@ -200,7 +208,7 @@ fn page_projects(
 fn page_team(
     conn: &Connection,
     project: &str,
-    limits: &ScopeLimits,
+    limits: &OverviewLimits<'_>,
     access: &DetailAccess,
     offsets: TeamOffsets,
     budget: &mut PageBudget,
@@ -209,7 +217,8 @@ fn page_team(
     let mut team = project_team(
         conn,
         project,
-        limits,
+        limits.capacity,
+        limits.usage_agents,
         access,
         offsets.workers,
         offsets.workspaces,

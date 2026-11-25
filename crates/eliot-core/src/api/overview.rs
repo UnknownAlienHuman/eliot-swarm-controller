@@ -239,6 +239,53 @@ pub struct LifecycleTotals {
     pub retained_unknown: usize,
 }
 
+/// Coverage of distinct retained execution workspaces inside the caller's team scope.
+#[derive(JsonSchema, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectDirtyView {
+    pub state: ProjectDirtyState,
+    pub clean: usize,
+    pub dirty: usize,
+    pub unknown: usize,
+    /// Oldest observation among workspaces with a complete retained Git view.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oldest_observed_at: Option<i64>,
+}
+
+#[derive(JsonSchema, Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProjectDirtyState {
+    Clean,
+    Dirty,
+    #[default]
+    Unknown,
+}
+
+impl ProjectDirtyView {
+    pub fn observed_state(&self) -> ProjectDirtyState {
+        if self.dirty > 0 {
+            ProjectDirtyState::Dirty
+        } else if self.clean > 0 && self.unknown == 0 {
+            ProjectDirtyState::Clean
+        } else {
+            ProjectDirtyState::Unknown
+        }
+    }
+}
+
+/// Token expenditure over the current team's retained turn history.
+#[derive(JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectUsageView {
+    pub agents_included: usize,
+    pub generations_included: usize,
+    pub truncated: bool,
+    pub history_complete: bool,
+    /// Zero when no event history was pruned.
+    pub pruned_through: i64,
+    pub turns: super::TurnExpenditure,
+}
+
 /// One project entry: the team in full (`detail: true`) or aggregates only.
 #[derive(JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -262,6 +309,11 @@ pub struct ProjectOverviewEntry {
     pub workspaces: Vec<crate::api::ManagedWorkspaceView>,
     pub workspace_total: usize,
     pub workspaces_truncated: bool,
+    /// Retained Git status for authorized execution workspaces.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dirty: Option<ProjectDirtyView>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<ProjectUsageView>,
     #[schemars(description = "Queued work for this project.")]
     pub queue: usize,
     pub totals: ProjectTotals,
@@ -295,6 +347,8 @@ impl ProjectOverviewEntry {
                     || self.assignment.is_some()
                     || !self.workers.is_empty()
                     || !self.workspaces.is_empty()
+                    || self.dirty.is_some()
+                    || self.usage.is_some()
                     || self.workers_truncated
                     || self.workspaces_truncated))
             || self
@@ -309,6 +363,27 @@ impl ProjectOverviewEntry {
                 "unknown",
                 "project.overview response is invalid",
             ));
+        }
+        if let Some(dirty) = &self.dirty
+            && (dirty.state != dirty.observed_state()
+                || dirty.oldest_observed_at.is_some() != (dirty.clean > 0 || dirty.dirty > 0))
+        {
+            return Err(Error::new(
+                "unknown",
+                "project overview dirty coverage is invalid",
+            ));
+        }
+        if let Some(usage) = &self.usage {
+            if usage.pruned_through < 0
+                || usage.history_complete != (usage.pruned_through == 0)
+                || usage.generations_included < usage.agents_included
+            {
+                return Err(Error::new(
+                    "unknown",
+                    "project overview usage coverage is invalid",
+                ));
+            }
+            usage.turns.validate()?;
         }
         for scope in &self.capacity {
             scope.validate()?;

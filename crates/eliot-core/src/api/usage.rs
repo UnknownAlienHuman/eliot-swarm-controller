@@ -286,6 +286,46 @@ pub struct TurnExpenditure {
 }
 
 impl TurnExpenditure {
+    pub(super) fn validate(&self) -> Result<()> {
+        let scoped: usize = self.by_scope.iter().map(|scope| scope.turns_counted).sum();
+        if scoped + self.turns_without_usage != self.turns_counted {
+            return Err(invalid_response());
+        }
+        let mut scopes = std::collections::BTreeSet::new();
+        for scope in &self.by_scope {
+            if scope.scope.trim().is_empty() || !scopes.insert(scope.scope.as_str()) {
+                return Err(invalid_response());
+            }
+            for missing in [
+                scope.turns_missing.input_tokens,
+                scope.turns_missing.output_tokens,
+                scope.turns_missing.reasoning_tokens,
+                scope.turns_missing.thinking_tokens,
+                scope.turns_missing.cache_read_tokens,
+                scope.turns_missing.cache_write_tokens,
+                scope.turns_missing.total_tokens,
+            ] {
+                if missing > scope.turns_counted {
+                    return Err(invalid_response());
+                }
+            }
+        }
+        for missing in [
+            self.turns_missing.input_tokens,
+            self.turns_missing.output_tokens,
+            self.turns_missing.reasoning_tokens,
+            self.turns_missing.thinking_tokens,
+            self.turns_missing.cache_read_tokens,
+            self.turns_missing.cache_write_tokens,
+            self.turns_missing.total_tokens,
+        ] {
+            if missing > self.turns_counted {
+                return Err(invalid_response());
+            }
+        }
+        Ok(())
+    }
+
     pub fn reported_total(&self) -> Option<i64> {
         self.by_scope
             .iter()
@@ -463,47 +503,7 @@ impl UsageSummaryResponse {
         {
             return Err(invalid_response());
         }
-        let scoped: usize = self
-            .turns
-            .by_scope
-            .iter()
-            .map(|scope| scope.turns_counted)
-            .sum();
-        if scoped + self.turns.turns_without_usage != self.turns.turns_counted {
-            return Err(invalid_response());
-        }
-        let mut scopes = std::collections::BTreeSet::new();
-        for scope in &self.turns.by_scope {
-            if scope.scope.trim().is_empty() || !scopes.insert(scope.scope.as_str()) {
-                return Err(invalid_response());
-            }
-            for missing in [
-                scope.turns_missing.input_tokens,
-                scope.turns_missing.output_tokens,
-                scope.turns_missing.reasoning_tokens,
-                scope.turns_missing.thinking_tokens,
-                scope.turns_missing.cache_read_tokens,
-                scope.turns_missing.cache_write_tokens,
-                scope.turns_missing.total_tokens,
-            ] {
-                if missing > scope.turns_counted {
-                    return Err(invalid_response());
-                }
-            }
-        }
-        for missing in [
-            self.turns.turns_missing.input_tokens,
-            self.turns.turns_missing.output_tokens,
-            self.turns.turns_missing.reasoning_tokens,
-            self.turns.turns_missing.thinking_tokens,
-            self.turns.turns_missing.cache_read_tokens,
-            self.turns.turns_missing.cache_write_tokens,
-            self.turns.turns_missing.total_tokens,
-        ] {
-            if missing > self.turns.turns_counted {
-                return Err(invalid_response());
-            }
-        }
+        self.turns.validate()?;
         let mut units = std::collections::BTreeSet::new();
         for cost in &self.sessions.cost_by_unit {
             if cost.unit.trim().is_empty()

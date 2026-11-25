@@ -512,7 +512,7 @@ command id frozen at claim. The settled event's persisted `kind` is exactly
 | `launch.intent.get` | Read the exact intent and its current state |
 | `launch.queue` | Read one page of scoped interactive intents and assignment waits |
 | `project.budget.set` | Current manager adjusts free budget or priority within the Owner's grant |
-| `project.overview` | Owner or Agent read of one project team or every team with workspaces, queue, capacity and whole-fleet totals; a manager sees its own team in full and aggregates for other projects |
+| `project.overview` | Owner or Agent read of project teams with workspace Git status, token usage, queue, capacity and whole-fleet totals; a manager sees its own team in full and aggregates for other projects |
 | `rule.list/get/catch_up` | Owner-only paged rule state and definition list, one loaded rule state, and finite committed-history catch-up |
 | `rule.read/save/delete` | Owner-only rule source read, revision-guarded create or replace, and revision-guarded delete through the [rule file editor](automation.md#rule-file-editing) |
 | `profile.list` | owner-only sanitized configured-profile summaries with launch-time resolvability |
@@ -589,11 +589,13 @@ omitted. See [coordination](coordination.md#project-manager-assignment) for
 generation, epoch and dispatch behavior.
 
 `project.overview` returns exact fleet totals beside authorized project and
-native-child detail. A `project` filter scopes the returned detail. Each
+native-child detail. Each project with authorized detail includes `dirty` and
+`usage` from the same Store snapshot. A `project` filter scopes the returned detail. Each
 reply has an event watermark from its committed Store snapshot and a separate
 native observation coverage label. When `next_cursor` is present, pass it as
 `after` with the same filter. Each page applies current read authority and
-reports its own snapshot watermark. CLI callers use
+reports its own snapshot watermark. A page contains at most 16 projects and
+may contain fewer when the detail reaches a page bound. CLI callers use
 `swarm project overview [--project ID] [--after CURSOR]`. See
 [project manager assignment](coordination.md#project-manager-assignment) for
 detail visibility and capacity semantics.
@@ -1434,11 +1436,18 @@ the pending page. The queue reports the wait code, scope and actor who can
 change that scope. `project.overview` reports live harnesses, active turns, queued
 work and retained unknown reservations as distinct counts.
 
-A direct `launch` either admits immediately or returns `capacity_unavailable`
-before creating a command, Agent or event. Fairness covers scheduled assignments
-and explicit interactive intents admitted by the arbiter. A direct Owner launch may
-use `--owner-override` to mark the command and its admission event as outside that
-fair ordering. It still checks all admission limits.
+An ordinary direct `launch` joins the same daemon-wide project arbitration
+as scheduled assignments and explicit interactive intents. The worker admits
+each request under its submitting principal and original command ID. If the
+worker is unavailable, direct launches receive an immediate `unavailable`.
+A direct request denied by capacity or earlier retained work in its project
+receives `capacity_unavailable` for that request alone, before creating a
+command, Agent, or reservation. Expiry while still waiting also gives a
+definite capacity refusal. An admission decision already in progress settles
+before the RPC replies. Use `--queue` for a durable intent and retry a lost
+reply with the same ID. An Owner can explicitly use
+`--owner-override` to bypass fair ordering while still checking every
+admission limit.
 
 A manager uses `swarm project budget PROJECT --revision REV` with `--max-live`,
 `--priority`, `--pause` or `--resume` to apply an Owner-granted change to its current

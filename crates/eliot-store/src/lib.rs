@@ -716,22 +716,30 @@ impl Store {
         let SubmissionContext {
             remote,
             owner_process,
+            direct_launch,
             ..
         } = context;
         if remote.is_some() || owner_process.is_some() {
             context.validate(principal)?;
         }
         self.ensure_writer_healthy()?;
+        let mut submission = request.into();
+        if direct_launch.is_some() {
+            submission.request.args["admission_mode"] = json!("arbitrated_direct");
+        }
         let result = (|| {
             let tx = self
                 .connection
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(sql_error)?;
+            if let Some(pass) = direct_launch {
+                launch_queue::check_arbitrated_project(&tx, pass.project)?;
+            }
             let previous_command_rowid = remote.map(|_| latest_command_rowid(&tx)).transpose()?;
             let mut admission = admission::submit_tx(
                 &tx,
                 principal,
-                request,
+                submission,
                 preparation,
                 now,
                 false,
@@ -739,6 +747,31 @@ impl Store {
                 self.capacity_policy.as_deref(),
             )?;
             if admission.is_new {
+                if let Some(pass) = direct_launch {
+                    let admitted_project = admission
+                        .command
+                        .target
+                        .as_deref()
+                        .map(parse_agent_id)
+                        .transpose()?
+                        .map(|agent| load_agent_by_num(&tx, agent))
+                        .transpose()?
+                        .flatten()
+                        .map(|agent| agent.project);
+                    if admitted_project.as_deref() != Some(pass.project) {
+                        return Err(Error::new(
+                            "bad_state",
+                            "direct launch project identity changed during arbitration",
+                        ));
+                    }
+                    capacity::reject_if_uses_blocked_scope_tx(
+                        &tx,
+                        admission.command.target.as_deref(),
+                        self.capacity_policy.as_deref(),
+                        pass.blocked_scopes,
+                    )?;
+                    launch_queue::advance_cursor(&tx, pass.project)?;
+                }
                 if let Some((remote, rowid)) = remote.zip(previous_command_rowid) {
                     annotate_remote_submission(&tx, &mut admission, remote, rowid)?;
                 }
@@ -5272,7 +5305,7 @@ fn annotate_new_event_cause_tx(
 }
 
 /// OS-reported peer information for an authenticated Owner submission.
-#[derive(Debug, serde::Deserialize, serde::Serialize)]
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
 pub struct OwnerProcess {
     pub pid: Option<u32>,
     pub image_path: Option<String>,
@@ -5284,6 +5317,13 @@ pub struct SubmissionContext<'a> {
     pub owner_process: Option<&'a OwnerProcess>,
     /// Internal admission provenance for a deferred launch.
     pub owner_automation: bool,
+    pub direct_launch: Option<DirectLaunchArbitration<'a>>,
+}
+
+#[derive(Clone, Copy)]
+pub struct DirectLaunchArbitration<'a> {
+    pub project: &'a str,
+    pub blocked_scopes: &'a std::collections::HashSet<String>,
 }
 
 /// A durable envelope with any local event already decoded at preflight.

@@ -256,6 +256,7 @@ struct RouterInner {
     /// budget, settings, assignment, hold clear, or admitted slot) so `stop`
     /// acceptance never wakes arbitration ahead of committed `capacity.released`.
     launch_arbitration: watch::Sender<u64>,
+    direct_launches: Mutex<launch_queue::DirectLaunches>,
 }
 
 #[derive(Default)]
@@ -533,6 +534,7 @@ impl Router {
                 digest_sweep_end: Mutex::new(None),
                 goal_reconcile,
                 launch_arbitration,
+                direct_launches: Mutex::new(launch_queue::DirectLaunches::default()),
             }),
         })
     }
@@ -576,6 +578,7 @@ impl Router {
             remote: remote.as_ref(),
             owner_process: owner_process.as_ref(),
             owner_automation: false,
+            ..SubmissionContext::default()
         };
         let result = self
             .handle_authorized(method, params, principal, context)
@@ -1759,7 +1762,12 @@ impl Router {
                 return Err(error);
             }
         };
-        let submitted = {
+        let direct_launch = submission.request().verb == "launch"
+            && submission.request().args["owner_override"] != true;
+        let submitted = if direct_launch {
+            self.arbitrate_direct_launch(principal, submission, workspace, context)
+                .await
+        } else {
             let mut store = self.inner.store.lock().await;
             let principal = principal_name(principal);
             let submitted =
@@ -1789,7 +1797,7 @@ impl Router {
         };
         self.note_unknown_command(&admission.command);
 
-        if admission.is_new && command_needs_worker(&admission.command) {
+        if !direct_launch && admission.is_new && command_needs_worker(&admission.command) {
             self.schedule_admission(&admission);
         }
         self.signal_progress();

@@ -285,7 +285,7 @@ const METHODS: &[Method] = &[
     method!("project.assignment.release", ProjectAssignmentReleaseRequest, ProjectAssignmentResult, false, true, "Release the current manager by expected epoch.", {"id":EXAMPLE_ID,"project":"project-1","expected_epoch":1}),
     method!("project.broadcast", ProjectBroadcastRequest, ProjectBroadcastResponse, false, true, "Queue soonest context for each visible working Agent in a project; Owner or current manager.", {"id":EXAMPLE_ID,"project":"project-1","text":"Please report progress."}),
     method!("project.get", ProjectGetRequest, ProjectRegistrationView, true, false, "Read one approved project registration.", {"id":"project-1"}),
-    method!("project.overview", ProjectOverviewRequest, ProjectOverviewResponse, false, false, "Read one project team or every team with workspaces, queue, capacity and whole-fleet totals.", {"project":"project-1"}),
+    method!("project.overview", ProjectOverviewRequest, ProjectOverviewResponse, false, false, "Read project teams with authorized workspace Git status and token usage, queue, capacity and whole-fleet totals.", {"project":"project-1"}),
     method!("workspace.list", WorkspaceListRequest, WorkspaceListResponse, true, false, "Page the managed worktrees Swarm created, with total and cursor.", {"limit":100}),
     method!(
         "project.list",

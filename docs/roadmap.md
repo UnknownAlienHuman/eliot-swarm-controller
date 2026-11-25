@@ -206,6 +206,8 @@ Checked layers record delivered increments, not full crash/load qualification.
   later through the existing switch/handoff path (#657).
 - [x] **4b. Fair queue.** Arbitrate automation assignments across projects and support
   explicit queued interactive launch, wait readback and scoped manager budgets.
+  Ordinary direct launches share the same project rotation and capacity
+  reservations, with an explicit Owner override.
 - [x] **5. Desktop and migration.** The sidebar's projects are the `chat.organization`
   groups, read in one bounded read (manager, standard worktree branch, assignment
   and transfer state, "Needs assignment", roots competing with an assigned manager,
@@ -214,6 +216,8 @@ Checked layers record delivered increments, not full crash/load qualification.
   detaches and tags under the link revision it read; a capacity refusal offers Queue
   it, and a lost Queue it reply resolves its intent before the draft returns.
   Legacy path labels stay in the no-project bucket; history is not reinterpreted.
+- [x] **6. Project overview.** Read scoped workspace Git status and retained
+  turn usage coverage with project and fleet totals in one Store snapshot.
 
 ## L0 — Archive and smallest workspace
 

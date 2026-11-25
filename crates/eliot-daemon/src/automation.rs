@@ -2123,6 +2123,7 @@ async fn reconcile_due_timers_with_arbitration(
     enum Head {
         Timer(Box<TimerHead>),
         Interactive(Box<eliot_store::PendingLaunch>),
+        Direct(u64),
     }
 
     for attempt in 0..MAX_ARBITRATION_RETRIES {
@@ -2241,6 +2242,29 @@ async fn reconcile_due_timers_with_arbitration(
                 }
             }
         }
+        if principal == "owner" && arbitrate_launches {
+            // The global pass owns the shared queue, including launches made
+            // by authenticated Agents. Each job retains its submitting principal.
+            for (project, ready_at, sequence) in router.direct_launch_heads() {
+                match heads.entry(project) {
+                    std::collections::btree_map::Entry::Vacant(entry) => {
+                        entry.insert((ready_at, Head::Direct(sequence)));
+                    }
+                    std::collections::btree_map::Entry::Occupied(mut entry)
+                        if ready_at < entry.get().0 =>
+                    {
+                        if let (_, Head::Timer(previous)) =
+                            entry.insert((ready_at, Head::Direct(sequence)))
+                        {
+                            deferred_timers.push(previous.index);
+                        }
+                    }
+                    std::collections::btree_map::Entry::Occupied(entry) => {
+                        router.refuse_direct_behind_queued(entry.key(), sequence);
+                    }
+                }
+            }
+        }
         for &index in &deferred_timers {
             if let Some(timer) = rules[index].timer.as_mut() {
                 timer.blocked = true;
@@ -2258,6 +2282,20 @@ async fn reconcile_due_timers_with_arbitration(
         let mut retry_pass = false;
         for (project, (_, head)) in heads {
             match head {
+                Head::Direct(sequence) => match router
+                    .try_direct_launch_in_pass(&project, sequence, &blocked_scopes)
+                    .await
+                {
+                    crate::router::launch_queue::LaunchArbitrationAttempt::CapacityWait(scope) => {
+                        blocked_scopes.insert(scope);
+                    }
+                    crate::router::launch_queue::LaunchArbitrationAttempt::RetryPass => {
+                        retry_pass = true;
+                        break;
+                    }
+                    crate::router::launch_queue::LaunchArbitrationAttempt::Admitted
+                    | crate::router::launch_queue::LaunchArbitrationAttempt::Other => {}
+                },
                 Head::Interactive(intent) => {
                     if intent.view.reason.as_ref().is_some_and(|reason| {
                         intent.route.is_some()
