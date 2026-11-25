@@ -259,8 +259,11 @@ missing, the stop remains unknown with the missing proof named. The daemon never
 reissues an uncertain native call.
 
 The [shared session runtime](../../crates/eliot-plugin/src/session.rs) sequences
-plugin-side cleanup and drain. Adapters supply their native close and readback
-steps. Antigravity waits for notification of its exact turn's settlement after
+plugin-side cleanup. The [shared Stop drain](../../crates/eliot-plugin/src/event_actor.rs)
+tracks the planned stop, drained frames and the pending settlement receipt.
+The shared stream source requires a committed terminal before the receipt
+confirms a native session end. Adapters supply native close, reader drain,
+and local readback. Antigravity waits for notification of its exact turn's settlement after
 dispatching cancellation. Only an observed cancellation terminal confirms it.
 
 Steer on harnesses with a direct native steer RPC uses an ordered, bounded write followed

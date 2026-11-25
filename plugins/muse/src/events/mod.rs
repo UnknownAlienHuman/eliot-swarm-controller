@@ -8,7 +8,7 @@ use eliot_core::{
 };
 use eliot_plugin::{
     CommitSink, MAX_EVENT_BYTES, PeerClient,
-    event_actor::EventActor,
+    event_actor::{EventActor, StopDrain, StopRequest},
     event_buffer::{BufferedRpcFrame as BufferedNativeFrame, EarlyEventBuffer},
     native_child::{ChildAction, binding_from_ack, is_admission_rejection, register_child},
     native_data::{UNCLASSIFIED_NATIVE_EVENT, unclassified},
@@ -545,10 +545,8 @@ struct EventProcessor {
     pending_completion_usage: Option<(String, eliot_core::TurnUsage)>,
     gap_number: u64,
     accept_frames: bool,
-    planned_stop: bool,
     loss_reason: Option<String>,
-    frames_drained: bool,
-    pending_end_stop: Option<oneshot::Sender<Result<()>>>,
+    stop_drain: StopDrain,
     writes_blocked: bool,
     gap_reported: bool,
     /// The native transport itself was lost (queue overflow, unplanned close,
@@ -879,10 +877,8 @@ impl EventProcessor {
             pending_completion_usage: None,
             gap_number: 0,
             accept_frames: true,
-            planned_stop: false,
             loss_reason: None,
-            frames_drained: false,
-            pending_end_stop: None,
+            stop_drain: StopDrain::default(),
             writes_blocked: false,
             gap_reported: false,
             transport_loss: false,
@@ -1034,21 +1030,13 @@ impl EventProcessor {
                 true
             }
             Control::BeginStop { reply } => {
-                self.planned_stop = true;
+                self.stop_drain.begin();
                 let _ = reply.send(Ok(()));
                 true
             }
             Control::EndStop { reply } => {
-                if self.frames_drained {
-                    let result = self.finish_stop().await;
-                    let _ = reply.send(result);
-                } else if self.pending_end_stop.is_some() {
-                    let _ = reply.send(Err(Error::new(
-                        "bad_state",
-                        "Muse stop is already waiting for native output drain",
-                    )));
-                } else {
-                    self.pending_end_stop = Some(reply);
+                if let StopRequest::Ready(receipt) = self.stop_drain.request(reply, "Muse") {
+                    receipt.finish(self.finish_stop().await);
                 }
                 true
             }
@@ -1068,12 +1056,7 @@ impl EventProcessor {
                 true
             }
             Control::Close { reply } => {
-                if let Some(pending) = self.pending_end_stop.take() {
-                    let _ = pending.send(Err(Error::new(
-                        "unknown",
-                        "Muse native event queue closed before stop settlement",
-                    )));
-                }
+                self.stop_drain.fail_pending("Muse");
                 let _ = reply.send(());
                 false
             }
@@ -1086,7 +1069,7 @@ impl EventProcessor {
         }
         match current {
             StreamState::Closed => {
-                if !self.planned_stop {
+                if !self.stop_drain.is_planned() {
                     self.defer_gap("Muse session host event stream closed");
                     self.transport_loss = true;
                 }
@@ -1237,7 +1220,7 @@ impl EventProcessor {
                 }
             }
             None => {
-                self.frames_drained = true;
+                self.stop_drain.mark_drained();
                 self.accept_frames = false;
                 if !self.buffer.is_empty() {
                     self.buffer.clear();
@@ -1246,15 +1229,17 @@ impl EventProcessor {
                 if !self.pending_requests.is_empty() {
                     self.defer_gap("Muse native requests remained unresolved at stream end");
                 }
-                if !self.planned_stop && self.loss_reason.is_none() {
+                if !self.stop_drain.is_planned() && self.loss_reason.is_none() {
                     self.defer_gap("Muse native event reader closed");
                 }
-                if !self.planned_stop {
+                if !self.stop_drain.is_planned() {
                     self.transport_loss = true;
                 }
                 self.settle_workflow_children().await;
                 self.report_gap_if_queue_empty(true).await;
-                self.finish_pending_end_stop().await;
+                if let Some(receipt) = self.stop_drain.take_ready() {
+                    receipt.finish(self.finish_stop().await);
+                }
             }
         }
         true
@@ -3016,7 +3001,7 @@ impl EventProcessor {
                         )
                     })?;
                 if self.status.session_id.as_deref() == Some(notification.session_id.as_str())
-                    && !self.planned_stop
+                    && !self.stop_drain.is_planned()
                 {
                     return self
                         .record_gap("Muse session closed outside a planned stop")
@@ -4123,20 +4108,13 @@ impl EventProcessor {
     }
 
     async fn finish_stop(&mut self) -> Result<()> {
-        if self.status.stopped {
+        let stopped = self.status.stopped;
+        if !self.stream_source().needs_stop_settlement(stopped)? {
             return Ok(());
         }
-        if self.writes_blocked {
-            return Err(Error::new(
-                "unknown",
-                "Muse source acknowledgement is unresolved",
-            ));
-        }
-        let native_id = format!(
-            "muse:{}:session.ended",
-            self.status.session_id.as_deref().unwrap_or("unresolved")
-        );
-        self.commit_event("session.ended", native_id, json!({}))
+        let session = self.status.session_id.clone();
+        self.stream_source()
+            .commit_session_end(session.as_deref())
             .await?;
         if let Some(turn_id) = self.status.active_turn_id.clone() {
             self.status.last_turn = Some(TurnFacts {
@@ -4156,16 +4134,6 @@ impl EventProcessor {
         self.turn_completion_usage = None;
         self.messages = TurnMessages::default();
         Ok(())
-    }
-
-    async fn finish_pending_end_stop(&mut self) {
-        if !self.frames_drained {
-            return;
-        }
-        if let Some(reply) = self.pending_end_stop.take() {
-            let result = self.finish_stop().await;
-            let _ = reply.send(result);
-        }
     }
 
     /// Fold one workflow-item revision: every `children[]` entry drives its
@@ -4792,7 +4760,7 @@ async fn run(
                 }
             }
         }
-        processor.status.native_drained = processor.frames_drained;
+        processor.status.native_drained = processor.stop_drain.is_drained();
         let _ = status_tx.send(processor.status.clone());
     }
 }

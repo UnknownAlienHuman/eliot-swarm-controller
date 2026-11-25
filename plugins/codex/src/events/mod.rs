@@ -14,7 +14,7 @@ use eliot_core::{
 };
 use eliot_plugin::{
     CommitSink, MAX_EVENT_BYTES, PeerClient,
-    event_actor::EventActor,
+    event_actor::{EventActor, StopDrain, StopRequest},
     event_buffer::{BufferedRpcFrame as BufferedNativeFrame, EarlyEventBuffer},
     native_data::{UNCLASSIFIED_NATIVE_EVENT, unclassified},
     protocol::MAX_COMMAND_ID_BYTES,
@@ -203,10 +203,8 @@ struct EventProcessor {
     resolved_transport_order: VecDeque<String>,
     gap_number: u64,
     accept_frames: bool,
-    planned_stop: bool,
     loss_reason: Option<String>,
-    frames_drained: bool,
-    pending_end_stop: Option<oneshot::Sender<Result<()>>>,
+    stop_drain: StopDrain,
     writes_blocked: bool,
     gap_reported: bool,
     final_text: Option<String>,
@@ -425,10 +423,8 @@ impl EventProcessor {
             resolved_transport_order: VecDeque::new(),
             gap_number: 0,
             accept_frames: true,
-            planned_stop: false,
             loss_reason: None,
-            frames_drained: false,
-            pending_end_stop: None,
+            stop_drain: StopDrain::default(),
             writes_blocked: false,
             gap_reported: false,
             final_text: None,
@@ -501,21 +497,13 @@ impl EventProcessor {
                 true
             }
             Control::BeginStop { reply } => {
-                self.planned_stop = true;
+                self.stop_drain.begin();
                 let _ = reply.send(Ok(()));
                 true
             }
             Control::EndStop { reply } => {
-                if self.frames_drained {
-                    let result = self.finish_stop().await;
-                    let _ = reply.send(result);
-                } else if self.pending_end_stop.is_some() {
-                    let _ = reply.send(Err(Error::new(
-                        "bad_state",
-                        "Codex stop is already waiting for native output drain",
-                    )));
-                } else {
-                    self.pending_end_stop = Some(reply);
+                if let StopRequest::Ready(receipt) = self.stop_drain.request(reply, "Codex") {
+                    receipt.finish(self.finish_stop().await);
                 }
                 true
             }
@@ -534,12 +522,7 @@ impl EventProcessor {
                 true
             }
             Control::Close { reply } => {
-                if let Some(pending) = self.pending_end_stop.take() {
-                    let _ = pending.send(Err(Error::new(
-                        "unknown",
-                        "Codex native event queue closed before stop settlement",
-                    )));
-                }
+                self.stop_drain.fail_pending("Codex");
                 let _ = reply.send(());
                 false
             }
@@ -552,7 +535,7 @@ impl EventProcessor {
         }
         match current {
             StreamState::Closed => {
-                if !self.planned_stop {
+                if !self.stop_drain.is_planned() {
                     self.defer_gap("Codex app-server event stream closed");
                     self.transport_loss = true;
                 }
@@ -626,9 +609,9 @@ impl EventProcessor {
                 }
             }
             None => {
-                self.frames_drained = true;
+                self.stop_drain.mark_drained();
                 self.accept_frames = false;
-                if !self.planned_stop {
+                if !self.stop_drain.is_planned() {
                     // Unplanned reader end: the transport is over.
                     self.transport_loss = true;
                 }
@@ -639,12 +622,14 @@ impl EventProcessor {
                 if !self.pending_requests.is_empty() {
                     self.defer_gap("Codex native requests remained unresolved at stream end");
                 }
-                if !self.planned_stop && self.loss_reason.is_none() {
+                if !self.stop_drain.is_planned() && self.loss_reason.is_none() {
                     self.defer_gap("Codex native event reader closed");
                 }
                 self.settle_child_tracking();
                 self.report_gap_if_queue_empty(true).await;
-                self.finish_pending_end_stop().await;
+                if let Some(receipt) = self.stop_drain.take_ready() {
+                    receipt.finish(self.finish_stop().await);
+                }
             }
         }
     }
@@ -2272,14 +2257,9 @@ impl EventProcessor {
     }
 
     async fn finish_stop(&mut self) -> Result<()> {
-        if self.status.stopped {
+        let stopped = self.status.stopped;
+        if !self.stream_source().needs_stop_settlement(stopped)? {
             return Ok(());
-        }
-        if self.writes_blocked {
-            return Err(Error::new(
-                "unknown",
-                "Codex source acknowledgement is unresolved",
-            ));
         }
         if let (Some(turn_id), Some(command_id)) = (
             self.status.active_turn_id.clone(),
@@ -2287,11 +2267,9 @@ impl EventProcessor {
         ) {
             self.close_open_tools(&turn_id, &command_id).await?;
         }
-        let native_id = format!(
-            "codex:{}:session.ended",
-            self.status.thread_id.as_deref().unwrap_or("unresolved")
-        );
-        self.commit_event("session.ended", native_id, json!({}))
+        let session = self.status.thread_id.clone();
+        self.stream_source()
+            .commit_session_end(session.as_deref())
             .await?;
         if let (Some(command_id), Some(turn_id)) = (
             self.status.active_command_id.clone(),
@@ -2330,16 +2308,6 @@ impl EventProcessor {
         }
         self.commit_event("session.context.compacted", native_id, data)
             .await
-    }
-
-    async fn finish_pending_end_stop(&mut self) {
-        if !self.frames_drained {
-            return;
-        }
-        if let Some(reply) = self.pending_end_stop.take() {
-            let result = self.finish_stop().await;
-            let _ = reply.send(result);
-        }
     }
 
     async fn commit_event(&mut self, kind: &str, native_id: String, data: Value) -> Result<()> {
@@ -2439,7 +2407,7 @@ async fn run(
                 processor.report_gap_if_queue_empty(frames.is_empty()).await;
             }
         }
-        processor.status.native_drained = processor.frames_drained;
+        processor.status.native_drained = processor.stop_drain.is_drained();
         let _ = status_tx.send(processor.status.clone());
     }
 }

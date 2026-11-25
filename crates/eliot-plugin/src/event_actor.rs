@@ -6,6 +6,89 @@ use tokio::{
     time::{Instant, timeout_at},
 };
 
+/// One event actor's native frame drain and pending Stop settlement.
+#[derive(Default)]
+pub struct StopDrain {
+    planned: bool,
+    drained: bool,
+    pending: Option<StopReceipt>,
+}
+
+pub enum StopRequest {
+    Ready(StopReceipt),
+    Waiting,
+    Refused,
+}
+
+pub struct StopReceipt(oneshot::Sender<Result<()>>);
+
+impl StopReceipt {
+    pub fn finish(self, result: Result<()>) {
+        let _ = self.0.send(result);
+    }
+}
+
+impl StopDrain {
+    pub fn begin(&mut self) {
+        self.planned = true;
+    }
+
+    pub fn is_planned(&self) -> bool {
+        self.planned
+    }
+
+    pub fn is_drained(&self) -> bool {
+        self.drained
+    }
+
+    pub fn mark_drained(&mut self) {
+        self.drained = true;
+    }
+
+    pub fn request(&mut self, reply: oneshot::Sender<Result<()>>, harness: &str) -> StopRequest {
+        self.request_with_conflict(reply, || {
+            Error::new(
+                "bad_state",
+                format!("{harness} stop is already waiting for native output drain"),
+            )
+        })
+    }
+
+    pub fn request_with_conflict(
+        &mut self,
+        reply: oneshot::Sender<Result<()>>,
+        duplicate: impl FnOnce() -> Error,
+    ) -> StopRequest {
+        let receipt = StopReceipt(reply);
+        if self.drained {
+            StopRequest::Ready(receipt)
+        } else if self.pending.is_some() {
+            receipt.finish(Err(duplicate()));
+            StopRequest::Refused
+        } else {
+            self.pending = Some(receipt);
+            StopRequest::Waiting
+        }
+    }
+
+    pub fn take_ready(&mut self) -> Option<StopReceipt> {
+        if self.drained {
+            self.pending.take()
+        } else {
+            None
+        }
+    }
+
+    pub fn fail_pending(&mut self, harness: &str) {
+        if let Some(receipt) = self.pending.take() {
+            receipt.finish(Err(Error::new(
+                "unknown",
+                format!("{harness} native event queue closed before stop settlement"),
+            )));
+        }
+    }
+}
+
 /// Observe a matching publication without polling. Keep the last retained
 /// value visible if the publisher closes or the deadline arrives with it.
 pub async fn wait_for_status<S, T>(
