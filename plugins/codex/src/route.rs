@@ -8,7 +8,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
     ffi::{OsStr, OsString},
-    io::Read,
+    io::{self, Read},
     path::Path,
 };
 use tokio::time::{Instant, timeout_at};
@@ -318,7 +318,9 @@ impl CodexRoute {
             if old != new {
                 return Err(Error::new(
                     "model_catalogue_changed",
-                    format!("Codex model catalogue digest changed: old {old}, new {new}"),
+                    format!(
+                        "Codex model catalogue digest changed (old {old}, new {new}). Restore the previous catalogue bytes to resume this Agent, or start a new Agent to adopt the new catalogue."
+                    ),
                 )
                 .with_where("plugin.codex.route.model_catalog_json"));
             }
@@ -500,11 +502,9 @@ fn quote_path(path: &Path) -> Result<String> {
 /// Hash the effective catalogue. The prefix distinguishes the provider
 /// default (0) from a configured file's exact bytes (1).
 pub(crate) async fn model_catalogue_digest(config: &Value, deadline: Instant) -> Result<String> {
-    let failed = || {
-        route_error("Codex model catalogue identity could not be read")
-            .with_where("plugin.codex.route.model_catalog_json")
-    };
-    let config = config.as_object().ok_or_else(failed)?;
+    let config = config
+        .as_object()
+        .ok_or_else(|| catalogue_read_error("effective config is missing or malformed"))?;
     let Some(selected) = config
         .get("model_catalog_json")
         .filter(|value| !value.is_null())
@@ -514,24 +514,36 @@ pub(crate) async fn model_catalogue_digest(config: &Value, deadline: Instant) ->
     let path = selected
         .as_str()
         .map(Path::new)
-        .filter(|path| path.is_absolute())
-        .ok_or_else(failed)?
-        .to_path_buf();
+        .ok_or_else(|| catalogue_read_error("model_catalog_json must be a path string"))?;
+    if !path.is_absolute() {
+        return Err(catalogue_read_error(
+            "model_catalog_json is relative; configure an absolute file path",
+        ));
+    }
+    let path = path.to_path_buf();
     timeout_at(
         deadline,
-        tokio::task::spawn_blocking(move || -> std::io::Result<String> {
-            if !std::fs::metadata(&path)?.is_file() {
-                return Err(std::io::Error::from(std::io::ErrorKind::InvalidInput));
+        tokio::task::spawn_blocking(move || -> Result<String> {
+            let metadata = std::fs::metadata(&path).map_err(catalogue_io_error)?;
+            if metadata.is_dir() {
+                return Err(catalogue_read_error(
+                    "model_catalog_json points to a directory; configure a file",
+                ));
             }
-            let mut file = std::fs::File::open(path)?;
+            if !metadata.is_file() {
+                return Err(catalogue_read_error(
+                    "model_catalog_json does not point to a regular file",
+                ));
+            }
+            let mut file = std::fs::File::open(path).map_err(catalogue_io_error)?;
             let mut digest = Sha256::new();
             digest.update([1]);
             let mut bytes = [0_u8; 16 * 1024];
             loop {
                 if Instant::now() >= deadline {
-                    return Err(std::io::Error::from(std::io::ErrorKind::TimedOut));
+                    return Err(catalogue_read_error("reading model_catalog_json timed out"));
                 }
-                let read = file.read(&mut bytes)?;
+                let read = file.read(&mut bytes).map_err(catalogue_io_error)?;
                 if read == 0 {
                     return Ok(format_digest(&digest.finalize()));
                 }
@@ -540,9 +552,24 @@ pub(crate) async fn model_catalogue_digest(config: &Value, deadline: Instant) ->
         }),
     )
     .await
-    .map_err(|_| failed())?
-    .map_err(|_| failed())?
-    .map_err(|_| failed())
+    .map_err(|_| catalogue_read_error("reading model_catalog_json timed out"))?
+    .map_err(|_| catalogue_read_error("model_catalog_json reader stopped unexpectedly"))?
+}
+
+fn catalogue_io_error(error: io::Error) -> Error {
+    catalogue_read_error(match error.kind() {
+        io::ErrorKind::NotFound => "the configured model_catalog_json file is missing",
+        io::ErrorKind::TimedOut => "reading model_catalog_json timed out",
+        _ => "the configured model_catalog_json file is unreadable",
+    })
+}
+
+fn catalogue_read_error(reason: &str) -> Error {
+    Error::new(
+        "profile_error",
+        format!("Codex model catalogue identity could not be read: {reason}"),
+    )
+    .with_where("plugin.codex.route.model_catalog_json")
 }
 
 fn format_digest(bytes: &[u8]) -> String {
