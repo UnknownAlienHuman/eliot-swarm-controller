@@ -255,6 +255,7 @@ impl Router {
             owner_automation,
             continuation,
             requested_by,
+            enters_assignment,
         }) = work
         else {
             return;
@@ -597,7 +598,7 @@ impl Router {
             let same_checkout = source_checkout_key
                 .as_deref()
                 .is_some_and(|key| key == target_checkout_key);
-            if !same_checkout && source_clean != Some(true) {
+            if !same_checkout && !enters_assignment && source_clean != Some(true) {
                 return Err(Error::new(
                     "dirty",
                     "switch to a different checkout requires a fully verified clean source worktree",
@@ -751,7 +752,7 @@ impl Router {
                 if let Some(handoff) = &change.value.handoff {
                     // A provider retry must leave the successor with one
                     // input. The frozen brief already carries its task.
-                    if provider_failure.is_none() {
+                    if provider_failure.is_none() && !enters_assignment {
                         self.queue_handoff_task_card(
                             &mut store,
                             handoff,

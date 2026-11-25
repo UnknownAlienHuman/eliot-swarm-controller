@@ -504,9 +504,9 @@ adds the switch's `continued_from` pointer).
   `organization.changed` event in the same transaction, naming each written
   Agent's resulting group, tags and revision, so the projection's event
   watermark advances and clients refresh loaded rows by id.
-- Continuing work in another project stays a separate, authorized execution
-  operation through the existing switch/handoff path, not an organization
-  mutation: a running Agent cannot change execution scope through an edit.
+- The Owner continues a projectless chat through `swarm switch --project` and
+  the existing switch/handoff path. A chat's placement, tags, and original
+  execution scope stay attached to its original identity.
 
 Migration keeps every ID and all history. Links are derived only from
 unambiguous retained facts (registration, common directory, parent); never
@@ -1531,18 +1531,25 @@ rules. A ready B from an interrupted orchestration can receive an explicit
 ordinary Owner handoff after the Owner checks its generation and the retained
 transfer outcome.
 
-Continuing a chat in a project is an ordinary switch with `launch.project` set to
-the registered target: the worker prepares the target's standard worktree (or
-verifies an explicit workspace against the target repository identity) through the
-same preparation, admission, revision, readiness and unknown handling above, with
-no new tables or state machine. The frozen preparation is bound to the target
-registration while B keeps A's authorization scope, so the handoff stays in one
-namespace; the H2 brief carries the source reference, and the switch completion
-records `continued_from` (A) on B's existing organization link as an ordinary
-overlay write (a new link revision and its `organization.changed` row), which
-attach/detach/tag preserve and `chat.organization` reads back. Source history and
-usage attribution never change, and a deleted source leaves the plain-text pointer
-dangling without faulting the Store.
+For an explicit Owner switch with `launch.project`, the switch receipt binds
+the target registration revision and assignment epoch. An active local
+assignment accepts a projectless root chat with no controlled children or
+transferable SENDs. Its successor is a new worker of the recorded manager
+generation, in a separate prepared worktree of the target repository and
+under that project's profile and capacity gates. The Owner supplies a
+project-approved named profile at reservation. The switch rechecks the
+binding during preparation, before launch, at dispatch and before handoff.
+Worktree and capacity reservations commit with launch admission. A refusal
+rolls them back before Git creates the worktree.
+A changed binding or open transfer refuses the affected phase. A vacant
+project still gets a new worktree and retains the source authorization scope.
+
+The projectless-chat path delivers the existing bounded handoff brief. The
+source directory, history, attribution, claims, Goal, and command receipts stay
+with the source. Unknown effects remain unresolved. Completion records
+`continued_from` on the successor's revisioned organization link and publishes
+`organization.changed`. Attach, detach, and tag preserve the pointer. It is
+plain text so it remains readable if the source is deleted.
 
 ## Prompt guidance
 
