@@ -120,9 +120,10 @@ pub fn backoff_ms(attempt: u32) -> u64 {
 }
 
 /// One retry or poll loop's consecutive failures: every loop of the desktop
-/// (the conversation's reads and feed, the waiting-input check, the
-/// Monitor, the sidebar's refresh, the daemon link's probes, the catalogue
-/// watch and Swarm autonomy) waits through it.
+/// that retries a failed read (the conversation's reads and feed, the
+/// waiting-input check, the Monitor, the sidebar's refresh and the daemon
+/// screen's watch, the daemon link's probes, the catalogue watch and Run
+/// now's readback) waits through it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Pace {
     failures: u32,

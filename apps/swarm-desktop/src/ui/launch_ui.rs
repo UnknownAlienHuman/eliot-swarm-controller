@@ -67,6 +67,9 @@ const FIELD_FOCUS_TRIES: u8 = 5;
 const FIELD_FOCUS_RETRY_MS: u64 = 50;
 /// Re-check for the render that bound the highlighted row, one frame later.
 const REVEAL_RETRY_MS: u64 = 16;
+/// A failed catalogue read waits at least this long before the watch asks
+/// again (longer after repeated failures, see [`live::Pace`]).
+const CATALOG_RETRY_MS: u64 = 10_000;
 
 #[derive(Clone, Debug)]
 pub(super) enum LaunchMsg {
@@ -251,6 +254,8 @@ pub(super) struct LaunchState {
     pub(super) catalog_data_dir: Option<PathBuf>,
     pub(super) catalog_watch_pending: bool,
     pub(super) catalog_watch_revision: Option<String>,
+    /// Failed catalogue reads in a row: the watch's next try waits longer.
+    pub(super) catalog_pace: live::Pace,
     /// A failed refresh stays visible with the last successful catalogue.
     pub(super) catalog_refresh_error: Option<String>,
     /// What routing would pick for a new task now (advisory).
@@ -546,6 +551,10 @@ impl DesktopApp {
             LaunchMsg::WorkspaceChanged(text) => self.launch.workspace = text,
             LaunchMsg::CatalogLoaded(data_dir, reply) => {
                 self.launch.catalog_loading = false;
+                let _ = self
+                    .launch
+                    .catalog_pace
+                    .next(reply.is_ok(), CATALOG_RETRY_MS);
                 if self.data_dir.as_ref().ok() != Some(&data_dir) {
                     self.ensure_catalog_watch(context);
                     return;
@@ -568,6 +577,10 @@ impl DesktopApp {
             }
             LaunchMsg::CatalogWatchLoaded(data_dir, reply) => {
                 self.launch.catalog_watch_pending = false;
+                let _ = self
+                    .launch
+                    .catalog_pace
+                    .next(reply.is_ok(), CATALOG_RETRY_MS);
                 if self.data_dir.as_ref().ok() == Some(&data_dir)
                     && self.unified_catalog_picker_visible()
                     && !self.launch.catalog_loading
@@ -1326,16 +1339,25 @@ impl DesktopApp {
             self.launch.catalog_watch_revision = None;
         }
         self.launch.catalog_loading = true;
+        let failed_wait = self.catalog_failed_wait();
         let _task = context.spawn_background(move |cancel| {
             let result = client::block_on(config_client::models_catalog(&data_dir))
                 .map_err(|error| error.to_string());
             // A transient page read must leave the revision pending, without
             // immediately requesting the same revision again in a loop.
             if from_watch && result.is_err() {
-                let _ = feed::backoff(10_000, &|| cancel.is_cancelled());
+                let _ = feed::backoff(failed_wait, &|| cancel.is_cancelled());
             }
             Message::Launch(LaunchMsg::CatalogLoaded(data_dir, Box::new(result)))
         });
+    }
+
+    /// How long a failed catalogue read waits before its reply (and so
+    /// before the watch asks again): one more failure on the catalogue's
+    /// pace.
+    fn catalog_failed_wait(&self) -> u64 {
+        let mut pace = self.launch.catalog_pace;
+        pace.fail(CATALOG_RETRY_MS)
     }
 
     fn unified_catalog_picker_visible(&self) -> bool {
@@ -1360,11 +1382,12 @@ impl DesktopApp {
         }
         let revision = self.launch.catalog_watch_revision.clone();
         self.launch.catalog_watch_pending = true;
+        let failed_wait = self.catalog_failed_wait();
         let _task = context.spawn_background(move |cancel| {
             let result = client::block_on(config_client::models_catalog_watch(&data_dir, revision))
                 .map_err(|error| error.to_string());
             if result.is_err() {
-                let _ = crate::feed::backoff(10_000, &|| cancel.is_cancelled());
+                let _ = crate::feed::backoff(failed_wait, &|| cancel.is_cancelled());
             }
             Message::Launch(LaunchMsg::CatalogWatchLoaded(data_dir, Box::new(result)))
         });
