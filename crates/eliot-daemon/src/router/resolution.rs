@@ -183,7 +183,7 @@ impl Router {
             .inner
             .turn_history_unsupported
             .lock_recover()
-            .contains(&key)
+            .contains_key(&key)
         {
             return None;
         }
