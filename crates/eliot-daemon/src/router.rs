@@ -111,8 +111,8 @@ use eliot_core::{
         ProjectRegistrationView, ProviderClearHoldRequest, ProviderHoldsRequest, RuleGetRequest,
         RuleStateView, SWITCH_BLANK_SCOPE_ARG, SWITCH_PROJECT_REVISION_ARG, SessionGrowthView,
         ShutdownMode, SourceState, SwarmWaitRequest, SwarmWaitResponse, TimerGetRequest,
-        TimerStateView, TurnGetRequest, UsageScopeView, UsageSummaryRequest, WaitEntryResult,
-        WorkSummaryView, WorkerTaskHealth, WorkerTaskStatus, fair_excerpt_cap,
+        TimerStateView, TurnGetRequest, UsageScopeView, UsageSummaryRequest, UsageSummaryResponse,
+        WaitEntryResult, WorkSummaryView, WorkerTaskHealth, WorkerTaskStatus, fair_excerpt_cap,
         is_supported_harness,
     },
 };
@@ -322,9 +322,7 @@ impl UsageSummaryCache {
         key: &UsageSummaryCacheKey,
         revision: (i64, i64),
     ) -> Option<UsageSummaryResponse> {
-        let Some((total_changes, data_version, response)) = self.entries.get(key) else {
-            return None;
-        };
+        let (total_changes, data_version, response) = self.entries.get(key)?;
         if (*total_changes, *data_version) != revision {
             self.entries.remove(key);
             self.order.retain(|entry| entry != key);
@@ -5939,12 +5937,12 @@ impl Router {
                 truncated,
             };
             let revision = store.usage_revision()?;
-            if let Some(response) = self
+            let cached = self
                 .inner
                 .usage_summary_cache
                 .lock_recover()
-                .get(&key, revision)
-            {
+                .get(&key, revision);
+            if let Some(response) = cached {
                 response
             } else {
                 let response = store.summarize_usage(
