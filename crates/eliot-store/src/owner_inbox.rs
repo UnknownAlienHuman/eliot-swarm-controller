@@ -815,7 +815,8 @@ fn project_unknown_turns(
                 COALESCE((SELECT MAX(e.seq) FROM events e WHERE e.agent=t.agent AND e.generation=t.generation
                   AND json_type(e.data,'$.turn_id')='text'
                   AND CAST(json_extract(e.data,'$.turn_id') AS TEXT)=t.turn_id),0)
-         FROM turns t JOIN agents a ON a.id=t.agent WHERE t.state='unknown' AND json_type(a.profile_snapshot, '$._harness_check') IS NULL", "t.agent=?1 AND t.generation=?2 AND t.turn_id=?3", bindings)?;
+         FROM turns t CROSS JOIN agents a INDEXED BY owner_inbox_ordinary_agent ON a.id=t.agent
+         WHERE t.state='unknown' AND json_type(a.profile_snapshot, '$._harness_check') IS NULL", "t.agent=?1 AND t.generation=?2 AND t.turn_id=?3", bindings)?;
     let rows = stmt
         .query_map(bindings, |r| {
             Ok((
@@ -1412,7 +1413,16 @@ fn project_agents(
     bindings: &[&dyn ToSql],
 ) -> eliot_core::Result<()> {
     let mut stmt = projection_query(db,
-        "SELECT a.id,a.generation,a.state,a.updated_at,a.active_turn,a.archived,
+        "WITH candidates(id) AS (
+             SELECT id FROM agents INDEXED BY agents_list_archived_state
+             WHERE archived=0 AND state IN ('created','starting','idle','busy','waiting','failed','lost','unknown')
+             UNION ALL
+             SELECT DISTINCT c.target FROM commands c INDEXED BY owner_inbox_resume_tip
+             CROSS JOIN agents stopped ON stopped.id=c.target AND stopped.generation=c.generation
+             WHERE c.verb='resume' AND c.principal='owner' AND c.state<>'cancelled'
+               AND c.state IN ('failed','rejected') AND stopped.state='stopped' AND stopped.archived=0
+         )
+         SELECT a.id,a.generation,a.state,a.updated_at,a.active_turn,a.archived,
                 a.native_scope,a.native_ref,a.observe_only,
                 CASE WHEN a.state IN ('created','starting','failed','lost') THEN EXISTS(SELECT 1 FROM commands c
                   WHERE c.target=a.id AND (c.generation=a.generation OR c.expected_generation=a.generation)
@@ -1440,7 +1450,7 @@ fn project_agents(
                     AND p.role='plugin' AND p.state='running') ELSE 0 END,
                 aw.expires_at,aw.created_at,json_extract(aw.condition,'$.kind'),
                 json_extract(aw.condition,'$.seconds'), resume.id, resume.updated_at
-         FROM agents a
+         FROM candidates CROSS JOIN agents a ON a.id=candidates.id
          LEFT JOIN commands resume ON resume.id = CASE WHEN a.state IN ('failed','lost','stopped') THEN (
              SELECT newest.id FROM commands newest INDEXED BY owner_inbox_resume_tip
              WHERE newest.target=a.id AND newest.generation=a.generation

@@ -119,7 +119,10 @@ impl Store {
         next_cursor: impl Fn(&AgentSummary) -> String,
     ) -> Result<AgentListPage> {
         let records = {
-            let mut statement = self.connection.prepare(&page.sql).map_err(sql_error)?;
+            let mut statement = self
+                .connection
+                .prepare_cached(&page.sql)
+                .map_err(sql_error)?;
             let rows = statement
                 .query_map(
                     rusqlite::params_from_iter(page.params.iter()),
@@ -136,8 +139,9 @@ impl Store {
         let total_page = select_page(filter, AgentListProjection::Count)?;
         let total: i64 = self
             .connection
+            .prepare_cached(&total_page.sql)
+            .map_err(sql_error)?
             .query_row(
-                &total_page.sql,
                 rusqlite::params_from_iter(total_page.params.iter()),
                 |row| row.get(0),
             )
@@ -146,7 +150,10 @@ impl Store {
             let mut all_states = filter.clone();
             all_states.states = None;
             let select = select_page(&all_states, AgentListProjection::StateTotals)?;
-            let mut statement = self.connection.prepare(&select.sql).map_err(sql_error)?;
+            let mut statement = self
+                .connection
+                .prepare_cached(&select.sql)
+                .map_err(sql_error)?;
             let rows = statement
                 .query_map(rusqlite::params_from_iter(select.params.iter()), |row| {
                     Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
@@ -474,7 +481,7 @@ impl Store {
                  AND source.health NOT IN ('error', 'stale') AND source.last_store_seq IS NOT NULL",
             organization::organization_group()
         );
-        let mut statement = self.connection.prepare(&sql).map_err(sql_error)?;
+        let mut statement = self.connection.prepare_cached(&sql).map_err(sql_error)?;
         statement
             .query_map(
                 params![

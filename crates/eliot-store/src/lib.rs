@@ -28,7 +28,9 @@ pub use cleanup::{CleanupInventoryPage, CleanupJobReceipt, cleanup_worktree_comm
 mod git_integration_custody;
 mod projects;
 pub use git_integration_custody::IntegrationCustody;
+mod projection_readers;
 mod provider_holds;
+pub use projection_readers::ProjectionReaders;
 mod restart_queue;
 mod result_page;
 mod rules;

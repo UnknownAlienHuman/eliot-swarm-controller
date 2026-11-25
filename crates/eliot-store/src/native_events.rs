@@ -14,7 +14,9 @@ const AGENT_NOTICE_BATCH_SQL: &str = "WITH request AS (
                COALESCE(r.active_turn,
                         CASE WHEN json_type(t.data, '$.turn_id') = 'text'
                              THEN json_extract(t.data, '$.turn_id') END) AS turn_id,
-               t.kind AS latest_kind, t.ts AS latest_ts, t.data AS latest_data
+               t.kind AS latest_kind, t.ts AS latest_ts,
+               CASE WHEN t.kind IS NOT 'turn.completed' OR json_extract(t.data, '$.outcome') = 'failure'
+                    THEN t.data END AS latest_data
         FROM request AS r
         LEFT JOIN events AS t ON t.seq = (
             SELECT e.seq FROM events AS e INDEXED BY events_turn_lifecycle
@@ -31,6 +33,7 @@ const AGENT_NOTICE_BATCH_SQL: &str = "WITH request AS (
     LEFT JOIN events AS n ON n.seq = (
         SELECT e.seq FROM events AS e INDEXED BY events_turn_notice
         WHERE t.turn_id IS NOT NULL AND e.agent = t.agent AND e.generation = t.generation
+          AND (t.latest_kind IS NOT 'turn.completed' OR t.latest_data IS NOT NULL)
           AND e.kind = 'turn.notice'
           AND json_extract(e.data, '$.turn_id') = t.turn_id
         ORDER BY e.seq DESC LIMIT 1
@@ -63,7 +66,7 @@ pub(super) fn agent_native_notices(
         .collect();
     let encoded = encode_json(&request_rows)?;
     let mut statement = connection
-        .prepare(AGENT_NOTICE_BATCH_SQL)
+        .prepare_cached(AGENT_NOTICE_BATCH_SQL)
         .map_err(sql_error)?;
     let rows = statement
         .query_map(params![encoded], |row| {
@@ -96,20 +99,16 @@ pub(super) fn agent_native_notices(
             notice_ts,
             notice_data,
         ) = row.map_err(sql_error)?;
+        let completed = active_turn.is_none() && latest_kind.as_deref() == Some("turn.completed");
+        if completed && latest_data.is_none() {
+            notices.insert((agent_num, generation), None);
+            continue;
+        }
         let latest_turn_data = if active_turn.is_none() {
             latest_data.as_deref().map(decode_json).transpose()?
         } else {
             None
         };
-        let completed = active_turn.is_none() && latest_kind.as_deref() == Some("turn.completed");
-        let terminal_outcome = latest_turn_data
-            .as_ref()
-            .and_then(|data| data.get("outcome"))
-            .and_then(Value::as_str);
-        if completed && terminal_outcome != Some("failure") {
-            notices.insert((agent_num, generation), None);
-            continue;
-        }
         let mut notice = None;
         if let Some(turn_id) = turn_id.as_deref() {
             if completed

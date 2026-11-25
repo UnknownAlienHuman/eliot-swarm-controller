@@ -69,6 +69,8 @@ impl Router {
         &self,
         request: eliot_core::api::DaemonStatusRequest,
     ) -> Result<Value> {
+        let (projection, (blockers, drain)) =
+            tokio::try_join!(self.read_owner_projection(None), self.blockers_and_drain(),)?;
         let eliot_store::OwnerProjection {
             owner_inbox,
             liveness,
@@ -76,12 +78,11 @@ impl Router {
             goals_without_progress,
             repeated_failure_inbox_items,
             ..
-        } = self.read_owner_projection(None).await?;
+        } = projection;
         let DaemonSidebarResponse {
             owner_inbox,
             profile_command_issues,
         } = self.sidebar_fields(owner_inbox);
-        let (blockers, drain) = self.blockers_and_drain().await?;
         let retention = Some(self.retention_view().await?);
         let (automatic_cleanup, owner_decision_count) = self.automatic_cleanup_view();
         let mut disk_usage = self

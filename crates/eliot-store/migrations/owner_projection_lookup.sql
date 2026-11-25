@@ -12,3 +12,5 @@ CREATE INDEX agents_list_visible ON agents(archived, id)
 CREATE INDEX artifacts_ledger_state ON artifacts(json_extract(body, '$.state'));
 CREATE INDEX commands_pending_send_page ON commands(target, generation, created_at, id)
   WHERE verb = 'send' AND state IN ('accepted', 'queued');
+CREATE INDEX owner_inbox_ordinary_agent ON agents(id, updated_at)
+  WHERE json_type(profile_snapshot, '$._harness_check') IS NULL;

@@ -41,10 +41,12 @@ impl Router {
         &self,
         page: Option<OwnerInboxPage>,
     ) -> Result<OwnerProjection> {
-        let path = self.inner.data_root.join("eliot.db");
+        let readers = Arc::clone(&self.inner.projection_readers);
         let confirmed = self.confirmed_stuck();
         tokio::task::spawn_blocking(move || {
-            Store::read_owner_projection(&path, super::now_ms(), &confirmed, page)
+            readers.read(|store| {
+                store.owner_projection_from_snapshot(super::now_ms(), &confirmed, page)
+            })
         })
         .await
         .map_err(|_| Error::new("internal", "owner projection reader failed"))?

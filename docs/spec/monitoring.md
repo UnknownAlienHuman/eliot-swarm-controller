@@ -1588,6 +1588,11 @@ blocking on them; the stored outcome stays `unknown`.
 
 ## Local RPC latency
 
+Owner and fleet reads can reuse up to four idle SQLite readers per daemon.
+Each read starts a fresh read-only transaction and releases its snapshot
+before returning the connection. The pool retains page and statement caches,
+while the projections are recomputed from committed rows.
+
 The daemon keeps a process-local rolling sample of authenticated local RPCs
 with successfully written replies. A sample measures transport acceptance
 through reply encoding and write. It also records the sum of waits for the

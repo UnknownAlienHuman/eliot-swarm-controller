@@ -175,7 +175,7 @@ pub(super) fn native_progress_for_page(
     }
     let encoded = encode_json(&agents)?;
     let mut statement = connection
-        .prepare(NATIVE_PROGRESS_PAGE_SQL)
+        .prepare_cached(NATIVE_PROGRESS_PAGE_SQL)
         .map_err(sql_error)?;
     statement
         .query_map([encoded], |row| row.get(0))

@@ -208,6 +208,7 @@ struct RouterInner {
     store: StoreHandle,
     autonomy_reader: Arc<tokio::sync::Semaphore>,
     agent_list_readers: Arc<tokio::sync::Semaphore>,
+    projection_readers: Arc<eliot_store::ProjectionReaders>,
     confirmed_stuck: Mutex<Arc<eliot_store::StuckStates>>,
     integration_cleanup: AsyncMutex<()>,
     bus: Bus,
@@ -504,6 +505,9 @@ impl Router {
         let catalog_cache = Mutex::new(catalog::CatalogCache::new(&data_root));
         Ok(Self {
             inner: Arc::new(RouterInner {
+                projection_readers: Arc::new(eliot_store::ProjectionReaders::new(
+                    data_root.join("eliot.db"),
+                )),
                 rpc_latencies: Default::default(),
                 acl_notices,
                 data_root,
@@ -5853,20 +5857,21 @@ impl Router {
                 .acquire_owned()
                 .await
                 .map_err(|_| Error::new("unavailable", "agent list readers are closed"))?;
-            let db_path = self.inner.data_root.join("eliot.db");
+            let readers = Arc::clone(&self.inner.projection_readers);
             let filter_clone = filter.clone();
             tokio::task::spawn_blocking(move || {
                 let _permit = permit;
-                let store = eliot_store::Store::open_read_only(&db_path)?;
-                Self::read_agent_list_page_from_store(
-                    &store,
-                    agent_caller.as_deref(),
-                    &filter_clone,
-                    after.as_deref(),
-                    limit,
-                    now_ms(),
-                    &growth,
-                )
+                readers.read(|store| {
+                    Self::read_agent_list_page_from_store(
+                        store,
+                        agent_caller.as_deref(),
+                        &filter_clone,
+                        after.as_deref(),
+                        limit,
+                        now_ms(),
+                        &growth,
+                    )
+                })
             })
             .await
             .map_err(|_| Error::new("internal", "agent list reader failed"))??
