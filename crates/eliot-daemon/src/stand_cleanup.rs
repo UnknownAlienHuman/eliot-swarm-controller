@@ -2330,6 +2330,65 @@ fn verify_stand_stopped(
     Ok(Some(daemon.pid))
 }
 
+/// Recover the artifact metadata only when this daemon issued the registry
+/// binding and the same stand still occupies the directory.
+pub(crate) fn owned_stand_artifact_times(
+    daemon_data_root: &Path,
+    stand_root: &Path,
+    expected_identity: &str,
+) -> Result<Option<(i64, i64)>> {
+    if crate::platform::script_file::Directory::open(stand_root)?
+        .file(STAND_MARKER)
+        .is_err()
+    {
+        return Ok(None);
+    }
+    let registry = stand_registry(false)?;
+    ensure_registry_is_external(stand_root, &registry)?;
+    let reg_name = registry_name(stand_root);
+    let registration = read_stand_registration(&registry, &reg_name, stand_root)?;
+    if registration.root_identity.as_deref() != Some(expected_identity)
+        || registration
+            .parent_data_dir
+            .as_ref()
+            .is_none_or(|parent| !crate::operator::data_dirs_match(parent, daemon_data_root))
+    {
+        return Ok(None);
+    }
+    verify_stand_marker(stand_root, &registration)?;
+    crate::operator::verify_stand_target(stand_root, &registration)?;
+    Ok(registration
+        .marker
+        .created_at
+        .zip(registration.marker.expires_at))
+}
+
+fn require_stand_cleanup_custody_closed(stand_root: &Path) -> Result<()> {
+    if crate::operator::read_only_stand_exists(stand_root)? {
+        return Ok(());
+    }
+    let store_path = stand_root.join("eliot.db");
+    reject_links(&store_path)?;
+    let store = Store::open_read_only(&store_path)?;
+    if store.stand_has_unsettled_cleanup_work()? {
+        return Err(Error::new(
+            "stand_custody_unsettled",
+            "stand has live custody or unresolved work",
+        ));
+    }
+    for workspace in Store::list_stand_workspaces_readonly(&store_path)? {
+        if workspace.preparation.phase != eliot_core::WorkspacePhase::Removed
+            && !is_external_repo(stand_root, &workspace.preparation.repo_common_dir)?
+        {
+            return Err(Error::new(
+                "stand_workspace_retained",
+                "stand still owns an internal managed worktree",
+            ));
+        }
+    }
+    Ok(())
+}
+
 pub(crate) async fn plan_stand_artifact(
     daemon_data_root: &Path,
     stand_root: &Path,
@@ -2351,6 +2410,7 @@ pub(crate) async fn plan_stand_artifact(
     refuse_parent_root(daemon_data_root, stand_root)?;
     crate::operator::verify_stand_target(stand_root, &registration)?;
     let _ = verify_stand_stopped(stand_root, &registration)?;
+    require_stand_cleanup_custody_closed(stand_root)?;
     Box::pin(plan_external_git(
         stand_root,
         &registry,
@@ -2403,6 +2463,7 @@ pub(crate) async fn apply_stand_artifact(
             "stand daemon state changed before removal",
         ));
     }
+    require_stand_cleanup_custody_closed(stand_root)?;
     let bytes = stand_tree_bytes(stand_root)?;
     let report = Box::pin(cleanup_stand_external_git(
         stand_root,

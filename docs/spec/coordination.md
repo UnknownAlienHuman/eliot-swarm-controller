@@ -302,11 +302,20 @@ sweep of each daemon startup. Each completed paged
 sweep updates aggregate status and sends one Owner `notify` with would-remove and
 kept totals and enablement; intermediate pages do not send notices. Per-item
 `cleanup.automatic` reason events remain available.
+The completed status sweep includes known would-remove, removed and kept
+bytes by class, plus a count of unmeasured entries in each class.
 Eligible paths include managed worktrees, recorded per-generation plugin directories,
 and artifacts under exact Swarm-created generation roots, including archived terminal
 Agents. Automatic worktree removal requires a clean checkout and a local Git ancestry
 proof that the current base contains the branch. Dirty or unmerged worktrees are
 kept with their sizes for the Owner. Disjoint owned artifacts can age out independently.
+Before freezing each automatic inventory, the daemon scans the direct
+children of durable owned artifact roots. A Cargo cache signature, Rust
+metadata and a build profile directory identify a regenerable target.
+A private stand needs the matching registry, identity, issuer and expiry.
+Historical roots remain eligible after the Agent has ended and all its
+generations' custody and outcomes have settled. Stand cleanup also checks the
+stand's own custody and retains internal managed worktrees pending guarded removal.
 A generation root can be
 removed when its creation identity is still bound, its registered descendants are
 settled, and the guarded scan of its contents succeeds. Branches, project registrations

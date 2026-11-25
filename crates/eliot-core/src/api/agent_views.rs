@@ -2350,6 +2350,26 @@ pub struct AutomaticCleanupSweep {
     pub kept: usize,
     pub unknown: usize,
     pub error_code: Option<String>,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub bytes_by_class: std::collections::BTreeMap<String, AutomaticCleanupBytes>,
+}
+
+#[derive(schemars::JsonSchema, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AutomaticCleanupBytes {
+    pub would_remove: u64,
+    pub removed: u64,
+    pub kept: u64,
+    pub unmeasured: usize,
+}
+
+impl AutomaticCleanupBytes {
+    pub fn accumulate(&mut self, other: Self) {
+        self.would_remove = self.would_remove.saturating_add(other.would_remove);
+        self.removed = self.removed.saturating_add(other.removed);
+        self.kept = self.kept.saturating_add(other.kept);
+        self.unmeasured = self.unmeasured.saturating_add(other.unmeasured);
+    }
 }
 
 /// Confirmed commands classified by current Store facts as lacking a

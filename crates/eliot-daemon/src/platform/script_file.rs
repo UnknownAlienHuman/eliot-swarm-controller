@@ -551,7 +551,9 @@ impl CleanupTree {
             let text = name.to_str().ok_or_else(refused)?;
             plain(text)?;
             cleanup_name(text)?;
-            if text.eq_ignore_ascii_case("daemon.lock") {
+            if text.eq_ignore_ascii_case("daemon.lock")
+                || text.eq_ignore_ascii_case(crate::stand_cleanup::STAND_MARKER)
+            {
                 self.contains_daemon_lock = true;
             }
             let child = native::open_cleanup(&directory, &name, is_dir).map_err(|_| refused())?;
