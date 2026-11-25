@@ -3529,14 +3529,14 @@ real directories; symlink or reparse-point paths are refused. On Windows the
 optional desktop companion is staged, hash-verified and pinned by the same
 rules before launch, while retaining the selected release directory as its
 working directory. After startup is ready and the desktop start attempt has
-settled, Windows prunes verified inactive images from this shared directory.
+settled, Windows and Linux prune verified inactive images from this shared directory.
 It retains the active and previous daemon images and the active desktop image.
 The previous desktop image is retained by the exact digest in its private
 `DesktopRecord`; if that record is missing or unresolved, desktop images are
 retained. Windows refuses deletion of a mapped or otherwise in-use image and
-the updater restores its read-only protection. Non-Windows pruning is deferred
-because the updater cannot prove that an old image is not mapped by another
-process.
+the updater restores its read-only protection. Linux unlinks inactive image
+paths; a process that still maps an image keeps its inode until exit. Other
+platforms leave images in place.
 
 The updater binds the reported release hash to the launched process image as
 well as to the staged file. On Windows it opens the staged file with read
@@ -3545,11 +3545,13 @@ validation, denying replacement, writes and deletion for that interval. On
 Linux, after candidate publication and again at healthy admission, it hashes
 `/proc/<published-pid>/exe` while rechecking that PID's recorded daemon identity;
 this reads the inode mapped by that exact process even if the source pathname
-has since changed. If the process image cannot be read or its hash differs, the
+has since changed. Unsupported platforms fail closed when verifying the running
+image and attempt the ordinary candidate rollback. If the process image cannot
+be read or its hash differs, the
 updater does not apply the staged release's Store schema to rollback decisions.
 It first attempts the ordinary lossless drain and waits for confirmed
-candidate exit. If drain or exit is unconfirmed, the candidate remains in
-service and the current Store and backup remain intact. After confirmed exit,
+candidate exit. If drain or exit is unconfirmed, the unconfirmed candidate is
+held for settlement and the current Store and backup remain intact. After confirmed exit,
 it checks the previous executable against a copy of the current Store. Only a
 successful compatibility check permits that executable to restart on the
 current Store; this path never replaces the Store with the older backup.

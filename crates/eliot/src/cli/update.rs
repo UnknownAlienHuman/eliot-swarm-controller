@@ -229,6 +229,8 @@ async fn run_update(
     #[cfg(windows)]
     let previous_desktop_hash =
         eliot_daemon::operator::recorded_desktop_sha256(&data_dir).map_err(Failure::for_read)?;
+    #[cfg(target_os = "linux")]
+    let previous_desktop_hash: Option<String> = None;
     // Stage a content-addressed copy before inspecting it. The original path can
     // change while the update drains; metadata, preflight, and spawn must all use
     // the same staged bytes.
@@ -254,6 +256,8 @@ async fn run_update(
     }
     #[cfg(windows)]
     let desktop = desktop_binary(&binary, &image_directory)?;
+    #[cfg(target_os = "linux")]
+    let desktop: Option<(PathBuf, String)> = None;
     #[cfg(windows)]
     let _desktop_pin = desktop
         .as_ref()
@@ -1320,7 +1324,8 @@ async fn rollback(
         _ => None,
     };
     let published = match store {
-        RollbackStore::Published(candidate, _) | RollbackStore::PublishedIdentityUnknown(candidate) => Some(candidate),
+        RollbackStore::Published(candidate, _)
+        | RollbackStore::PublishedIdentityUnknown(candidate) => Some(candidate),
         _ => None,
     };
     let mut pending = json!({
@@ -1413,7 +1418,7 @@ async fn rollback(
         "health_decision_error": pending["health_decision_error"],
         "agents_after": if pid.is_some() { observe_agents(path, &agents_at_update.before).await } else { Value::Null },
         "continuation": if state == "rollback_held" {
-            "candidate work is retained for normal settlement"
+            "unconfirmed candidate is held for settlement"
         } else if retained_candidate.is_some() && pid.is_none() {
             "run swarm daemon update with a healthy release that supports the current Store schema"
         } else { "boot recovery applies the configured on_restart policy" },

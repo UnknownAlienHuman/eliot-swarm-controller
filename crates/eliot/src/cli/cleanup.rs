@@ -14,9 +14,10 @@ pub(super) fn remove_dir_all(path: &std::path::Path) -> std::io::Result<()> {
 }
 
 /// Remove only verified, inactive images owned by the updater in this release
-/// directory. Windows refuses deletion while a process still has an image
-/// mapped; any uncertain or failed removal is retained and reported.
-#[cfg(windows)]
+/// directory. Linux can unlink a mapped image while its running process keeps
+/// the inode; Windows refuses deletion while a process has the image mapped.
+/// Any uncertain or failed removal is retained and reported.
+#[cfg(any(windows, target_os = "linux"))]
 pub(super) fn prune_update_images(
     data_root: &std::path::Path,
     retained_sha256: &[&str],
@@ -57,20 +58,25 @@ pub(super) fn prune_update_images(
             Ok(hash) if hash == digest => {}
             _ => continue,
         }
-        let mut permissions = metadata.permissions();
-        #[expect(
-            clippy::permissions_set_readonly_false,
-            reason = "Windows requires clearing the read-only attribute before pruning an inactive staged image"
-        )]
-        permissions.set_readonly(false);
-        std::fs::set_permissions(&path, permissions).map_err(|error| {
-            format!(
-                "prepare staged image {} for removal: {error}",
-                path.display()
-            )
-        })?;
+        #[cfg(windows)]
+        {
+            let mut permissions = metadata.permissions();
+            #[expect(
+                clippy::permissions_set_readonly_false,
+                reason = "Windows requires clearing the read-only attribute before pruning an inactive staged image"
+            )]
+            permissions.set_readonly(false);
+            std::fs::set_permissions(&path, permissions).map_err(|error| {
+                format!(
+                    "prepare staged image {} for removal: {error}",
+                    path.display()
+                )
+            })?;
+        }
         if let Err(error) = std::fs::remove_file(&path) {
-            let mut permissions = std::fs::metadata(&path)
+            #[cfg(windows)]
+            {
+                let mut permissions = std::fs::metadata(&path)
                 .map_err(|restore| {
                     format!(
                         "remove inactive staged image {} failed: {error}; cannot restore its permissions: {restore}",
@@ -78,13 +84,14 @@ pub(super) fn prune_update_images(
                     )
                 })?
                 .permissions();
-            permissions.set_readonly(true);
-            std::fs::set_permissions(&path, permissions).map_err(|restore| {
+                permissions.set_readonly(true);
+                std::fs::set_permissions(&path, permissions).map_err(|restore| {
                 format!(
                     "remove inactive staged image {} failed: {error}; cannot restore read-only protection: {restore}",
                     path.display()
                 )
             })?;
+            }
             return Err(format!(
                 "remove inactive staged image {}: {error}",
                 path.display()
