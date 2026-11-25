@@ -90,7 +90,8 @@ impl Router {
     fn verify_discovery_root(&self, root: &ArtifactView) -> Result<PathBuf> {
         let path = Path::new(&root.path);
         validate_cleanup_path(path)?;
-        let identity = directory_identity(path)?;
+        let directory = Directory::open(path)?;
+        let identity = directory.identity()?;
         let canonical = path.canonicalize().map_err(discovery_io)?;
         let config = crate::config::load_daemon_config(&self.inner.data_root)?;
         let parent = config
@@ -127,7 +128,11 @@ impl Router {
         let root = self.verify_discovery_root(&root)?;
         let source = Path::new(&artifact.path);
         validate_cleanup_path(source)?;
-        let identity = directory_identity(source)?;
+        // Hold the original path against renames while normalizing it. The
+        // cleanup tree opens the normalized path again without following links
+        // and checks its pinned identity before the first disposition.
+        let directory = Directory::open(source)?;
+        let identity = directory.identity()?;
         let canonical = source.canonicalize().map_err(discovery_io)?;
         if canonical == root || !canonical.starts_with(&root) || identity != artifact.identity {
             return Err(Error::new(
@@ -137,7 +142,7 @@ impl Router {
         }
         if artifact.purpose == SWARM_CARGO_TARGET_ARTIFACT_PURPOSE {
             check_cargo_ancestors(&canonical, &root)?;
-            if !cargo_target(&Directory::open(&canonical)?) {
+            if !cargo_target(&directory) {
                 return Err(Error::new("not_allowed", "Cargo target evidence changed"));
             }
         }

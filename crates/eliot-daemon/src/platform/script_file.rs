@@ -865,7 +865,8 @@ mod native {
         };
         if status < 0 {
             use windows_sys::Win32::Foundation::{
-                STATUS_OBJECT_NAME_NOT_FOUND, STATUS_OBJECT_PATH_NOT_FOUND,
+                STATUS_FILE_LOCK_CONFLICT, STATUS_LOCK_NOT_GRANTED, STATUS_OBJECT_NAME_NOT_FOUND,
+                STATUS_OBJECT_PATH_NOT_FOUND,
             };
             if matches!(
                 status,
@@ -876,6 +877,11 @@ mod native {
             if status == windows_sys::Win32::Foundation::STATUS_SHARING_VIOLATION {
                 return Err(io::Error::from_raw_os_error(
                     windows_sys::Win32::Foundation::ERROR_SHARING_VIOLATION as i32,
+                ));
+            }
+            if matches!(status, STATUS_FILE_LOCK_CONFLICT | STATUS_LOCK_NOT_GRANTED) {
+                return Err(io::Error::from_raw_os_error(
+                    windows_sys::Win32::Foundation::ERROR_LOCK_VIOLATION as i32,
                 ));
             }
             return Err(io::Error::other(format!("NtCreateFile status {status:#x}")));
