@@ -626,9 +626,17 @@ pub(crate) async fn run_doctor(
                     for project in unconfigured_projects {
                         println!("  {project} needs policy.check.argv");
                     }
-                    let omitted = registered - configured - unconfigured_projects.len();
-                    if omitted > 0 {
-                        println!("  {omitted} additional projects need a check");
+                    if *configured > *registered {
+                        eprintln!(
+                            "project check coverage is invalid: {configured} configured exceeds {registered} registered projects"
+                        );
+                    } else {
+                        let omitted = registered
+                            .saturating_sub(*configured)
+                            .saturating_sub(unconfigured_projects.len());
+                        if omitted > 0 {
+                            println!("  {omitted} additional projects need a check");
+                        }
                     }
                 }
                 ProjectCheckConfiguration::Unavailable => {
