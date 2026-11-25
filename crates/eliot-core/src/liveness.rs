@@ -36,6 +36,7 @@ pub enum LivenessObject {
         since: i64,
         owner_item: bool,
         round_active: bool,
+        turn_active: bool,
         timer_due: Option<i64>,
     },
     Hold {
@@ -302,11 +303,14 @@ pub fn mover(object: &LivenessObject, now: i64) -> Mover {
             since,
             owner_item,
             round_active,
+            turn_active,
             timer_due,
         } => match state {
             GoalStatus::Active => {
                 if *round_active {
                     moving_or_long(*since, now, 7 * DAY_MS, "active_goal_round", None)
+                } else if *turn_active {
+                    moving_or_long(*since, now, 7 * DAY_MS, "goal_waiting_for_turn", *timer_due)
                 } else if let Some(due) = (*timer_due).filter(|due| *due > now) {
                     moving_or_long(*since, now, 7 * DAY_MS, "goal_timer", Some(due))
                 } else if *owner_item {

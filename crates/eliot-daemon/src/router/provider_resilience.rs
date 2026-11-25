@@ -417,7 +417,7 @@ impl Router {
                     .finish_provider_probe(
                         ProviderProbeWork {
                             send_command_id: None,
-                            agent_id,
+                            agent_id: agent_id.clone(),
                         },
                         shutdown.clone(),
                     )
@@ -426,7 +426,7 @@ impl Router {
                     crate::logging::record(
                         &self.secret_policy_snapshot(),
                         "daemon.provider_probe_recovery_failed",
-                        &[],
+                        &[("agent_id", &agent_id)],
                         Some(&error),
                     );
                 }

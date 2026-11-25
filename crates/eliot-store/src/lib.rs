@@ -679,7 +679,8 @@ impl Store {
             return Err(Error::new(
                 "unavailable",
                 "Store writer is faulted; reopen the Store before writing or dispatching",
-            ));
+            )
+            .with_where("store.writer_fence"));
         }
         Ok(())
     }

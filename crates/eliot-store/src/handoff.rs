@@ -1273,7 +1273,7 @@ pub(crate) fn require_not_handed_off(connection: &Connection, agent: i64) -> Res
 pub(super) fn session_exit_blocker(tx: &Connection, agent: &Agent) -> Result<Option<String>> {
     let num = parse_agent_id(&agent.id)?;
     if let Some(blocker) = agent_lifecycle::custody_blocker_tx(tx, num, false, None)? {
-        return Ok(Some(blocker));
+        return Ok(Some(blocker.detail));
     }
     if super::failed_custody::failed_generation_exit_basis_tx(tx, num, agent.generation)?.is_some()
     {

@@ -403,10 +403,17 @@ impl Store {
             {
                 return Err(Error::new("busy", "provider probe has not ended"));
             }
-            if super::agent_lifecycle::custody_blocker_tx(&tx, num, false, None)?.is_some() {
+            if let Some(blocker) =
+                super::agent_lifecycle::custody_blocker_tx(&tx, num, false, None)?
+            {
+                let code = if blocker.unknown_artifact {
+                    "provider_probe_artifact_unknown"
+                } else {
+                    "busy"
+                };
                 return Err(Error::new(
-                    "busy",
-                    "provider probe custody is still draining",
+                    code,
+                    format!("provider probe cleanup blocked by {}", blocker.detail),
                 ));
             }
             let linked: Option<(String, String, i64)> = tx.query_row(
