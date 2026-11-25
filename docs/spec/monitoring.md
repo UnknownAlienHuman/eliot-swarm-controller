@@ -469,15 +469,18 @@ verify Git and worktree identity again before native dispatch.
 A terminal Agent may resume its retained managed worktree after a local branch switch
 only when the exact registered path still belongs to that workspace, the repository
 and reciprocal Git registration still match, and the registry branch agrees with
-symbolic `HEAD`. A changed branch must be clean and have a successful Codex native
-`commandExecution` for one simple `git switch` in that exact workspace, paired by
-item, turn and generation with its start event. The latest HEAD checkout reflog entry
+symbolic `HEAD`. A changed branch must be clean and have a successful native checkout
+in that exact workspace, paired by item, turn and generation with its start event.
+The Store accepts retained structured `git switch` facts from Codex. For a native
+shell result with a confirmed working directory, the Store recognizes one direct
+`git switch` or `git checkout` with a literal branch operand. The two Claude
+tool hooks must agree on the working directory for that exact foreground invocation.
+The latest HEAD checkout reflog entry
 must name the same transition and fall within that tool's start-to-completion window,
 allowing one second for reflog timestamp precision. The prior branch is the branch in
 the preceding generation's durable ready outcome; the requested branch remains the
-frozen cleanup identity. Codex `commandActions` are preferred; raw command text is
-accepted only for the exact direct safe grammar. This evidence currently covers Codex
-and simple `git switch` only. A matching different Agent is named with its generation;
+frozen cleanup identity. Shell wrappers, chains, background tools, and file hints
+alone cannot establish authorship. A matching different Agent is named with its generation;
 OS Git changes without a matching native principal remain explicitly external or
 unattributed. A dirty checkout, detached or inconsistent HEAD, duplicate or incomplete
 registration, or changed owner or path remains refused, with both branch names in the

@@ -67,6 +67,103 @@ pub(super) fn workspace_from_row(
     })
 }
 
+pub(super) struct NativeBranchCheckout<'a> {
+    pub branch: &'a str,
+    pub cwd: &'a str,
+    pub started_at_ms: i64,
+    pub completed_at_ms: i64,
+}
+
+/// Both recovery discovery and the transactional workspace gate use the same
+/// retained tool proof. Older events carry the adapter's structured checkout
+/// fact. A shell execution receipt carries the native working directory and
+/// leaves command interpretation to this shared layer.
+pub(super) fn native_branch_checkout<'a>(
+    start: &'a Value,
+    terminal: &'a Value,
+    start_ts: i64,
+) -> Option<NativeBranchCheckout<'a>> {
+    let item = start["item_id"].as_str().filter(|id| !id.is_empty())?;
+    let turn = start["turn_id"].as_str().filter(|id| !id.is_empty())?;
+    let tool = start["tool"].as_str()?;
+    if terminal["item_id"].as_str() != Some(item)
+        || terminal["turn_id"].as_str() != Some(turn)
+        || terminal["tool"].as_str() != Some(tool)
+        || terminal["status"].as_str() != Some("completed")
+        || start["native_background"].as_bool() == Some(true)
+    {
+        return None;
+    }
+
+    let fact = &terminal["git_branch_switch"];
+    let (branch, cwd, started_at_ms, completed_at_ms) = if !fact.is_null() {
+        let cwd = fact["cwd"].as_str()?;
+        if tool != "commandExecution"
+            || terminal["exit_code"].as_i64() != Some(0)
+            || fact["item_id"].as_str() != Some(item)
+            || fact["turn_id"].as_str() != Some(turn)
+            || core::workspace_path_key(start["cwd"].as_str()?) != core::workspace_path_key(cwd)
+        {
+            return None;
+        }
+        (
+            fact["branch"].as_str()?,
+            cwd,
+            start["native_at_ms"].as_i64().unwrap_or(start_ts),
+            fact["native_at_ms"].as_i64()?,
+        )
+    } else {
+        if start["command_truncated"].as_bool() != Some(false)
+            || terminal["exit_code"].as_i64().is_some_and(|exit| exit != 0)
+        {
+            return None;
+        }
+        (
+            direct_git_checkout_branch(start["command"].as_str()?)?,
+            terminal["shell_execution_cwd"].as_str()?,
+            start["native_at_ms"].as_i64()?,
+            terminal["native_at_ms"].as_i64()?,
+        )
+    };
+    (std::path::Path::new(cwd).is_absolute()
+        && started_at_ms > 0
+        && started_at_ms <= completed_at_ms)
+        .then_some(NativeBranchCheckout {
+            branch,
+            cwd,
+            started_at_ms,
+            completed_at_ms,
+        })
+}
+
+/// Accept a single direct command with a literal local branch operand.
+fn direct_git_checkout_branch(command: &str) -> Option<&str> {
+    if command
+        .chars()
+        .any(|ch| !ch.is_alphanumeric() && !matches!(ch, ' ' | '\t' | '.' | '-' | '_' | '/'))
+    {
+        return None;
+    }
+    let mut words = command.split_ascii_whitespace();
+    if !matches!(words.next()?, "git" | "git.exe") {
+        return None;
+    }
+    let operation = words.next()?;
+    let operand = words.next()?;
+    let branch = match (operation, operand) {
+        ("switch", "-c" | "--create" | "--") | ("checkout", "-b") => words.next()?,
+        ("switch" | "checkout", name) if !name.starts_with('-') => name,
+        _ => return None,
+    };
+    if words.next().is_some()
+        || branch.starts_with('-')
+        || core::api::validate_integration_branch(branch).is_err()
+    {
+        return None;
+    }
+    Some(branch)
+}
+
 fn valid_native_branch_switch_evidence(
     tx: &Transaction<'_>,
     agent: i64,
@@ -94,60 +191,38 @@ fn valid_native_branch_switch_evidence(
     if start_seq >= terminal_seq || from_branch == drift.observed_branch {
         return Ok(false);
     }
-    let terminal: Option<String> = tx
+    let pair: Option<(String, i64, String)> = tx
         .query_row(
-            "SELECT data FROM events WHERE seq = ?1 AND agent = ?2 AND generation = ?3
-             AND source = 'stream' AND kind = 'tool.completed'",
-            params![terminal_seq, agent, generation],
-            |row| row.get(0),
+            "SELECT s.data, s.ts, c.data FROM events s JOIN events c
+               ON s.agent = c.agent AND s.generation = c.generation
+             WHERE s.seq = ?1 AND c.seq = ?2 AND s.agent = ?3 AND s.generation = ?4
+               AND s.source = 'stream' AND c.source = 'stream'
+               AND s.native_id IS NOT NULL AND c.native_id IS NOT NULL
+               AND s.kind = 'tool.started' AND c.kind = 'tool.completed'",
+            params![start_seq, terminal_seq, agent, generation],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .optional()
         .map_err(sql_error)?;
-    let Some(terminal) = terminal else {
-        return Ok(false);
-    };
-    let terminal: Value = serde_json::from_str(&terminal)
-        .map_err(|_| Error::new("source_integrity", "invalid persisted native tool event"))?;
-    let fact = &terminal["git_branch_switch"];
-    let item_id = fact["item_id"].as_str();
-    let turn_id = fact["turn_id"].as_str();
-    if terminal["status"].as_str() != Some("completed")
-        || terminal["exit_code"].as_i64() != Some(0)
-        || terminal["item_id"].as_str() != item_id
-        || terminal["turn_id"].as_str() != turn_id
-        || fact["branch"].as_str() != Some(drift.observed_branch.as_str())
-        || !fact["cwd"]
-            .as_str()
-            .is_some_and(|cwd| core::workspace_path_key(cwd) == core::workspace_path_key(workspace))
-        || fact["native_at_ms"].as_i64() != Some(completed_at)
-        || item_id.is_none()
-        || turn_id.is_none()
-    {
-        return Ok(false);
-    }
-    let start: Option<(String, i64)> = tx
-        .query_row(
-            "SELECT data, ts FROM events WHERE seq = ?1 AND agent = ?2 AND generation = ?3
-             AND source = 'stream' AND kind = 'tool.started'",
-            params![start_seq, agent, generation],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .optional()
-        .map_err(sql_error)?;
-    let Some((start, event_ts)) = start else {
+    let Some((start, start_ts, terminal)) = pair else {
         return Ok(false);
     };
     let start: Value = serde_json::from_str(&start)
-        .map_err(|_| Error::new("source_integrity", "invalid persisted native tool event"))?;
-    let observed_started_at = start["native_at_ms"].as_i64().unwrap_or(event_ts);
-    Ok(start["item_id"].as_str() == item_id
-        && start["turn_id"].as_str() == turn_id
-        && start["cwd"].as_str().is_some_and(|cwd| {
-            core::workspace_path_key(cwd) == core::workspace_path_key(workspace)
-        })
-        && start["tool"].as_str() == Some("commandExecution")
-        && observed_started_at == started_at
-        && observed_started_at <= completed_at)
+        .map_err(|_| Error::new("source_integrity", "invalid persisted native tool start"))?;
+    let terminal: Value = serde_json::from_str(&terminal).map_err(|_| {
+        Error::new(
+            "source_integrity",
+            "invalid persisted native tool completion",
+        )
+    })?;
+    Ok(
+        native_branch_checkout(&start, &terminal, start_ts).is_some_and(|checkout| {
+            checkout.branch == drift.observed_branch
+                && core::workspace_path_key(checkout.cwd) == core::workspace_path_key(workspace)
+                && checkout.started_at_ms == started_at
+                && checkout.completed_at_ms == completed_at
+        }),
+    )
 }
 
 pub(super) fn load_workspace(

@@ -28,7 +28,7 @@ use serde::Serialize;
 use serde_json::{Value, json};
 use std::{
     collections::{HashMap, HashSet},
-    path::PathBuf,
+    path::{Path, PathBuf},
     time::Duration,
 };
 use tokio::{
@@ -331,6 +331,8 @@ struct ToolUseBinding {
     before_consumer_id: Option<String>,
     after_hook_state: HookConsumerState,
     after_consumer_id: Option<String>,
+    shell_cwd: Option<String>,
+    shell_cwd_confirmed: bool,
 }
 
 impl ToolUseBinding {
@@ -1975,6 +1977,13 @@ impl EventProcessor {
             if let Some(at) = eliot_plugin::quota::rfc3339_ms(record.get("timestamp")) {
                 data["native_at_ms"] = json!(at);
             }
+            if result.is_error != Some(true)
+                && let Some(binding) = self.tool_use_turns.get(&result.tool_use_id)
+                && binding.shell_cwd_confirmed
+                && let Some(cwd) = &binding.shell_cwd
+            {
+                data["shell_execution_cwd"] = json!(cwd);
+            }
             if result.is_error == Some(true) {
                 attach_native_error(
                     &mut data,
@@ -2104,6 +2113,8 @@ impl EventProcessor {
                     before_consumer_id: None,
                     after_hook_state: HookConsumerState::Available,
                     after_consumer_id: None,
+                    shell_cwd: None,
+                    shell_cwd_confirmed: false,
                 },
             );
         }
@@ -2342,6 +2353,14 @@ impl EventProcessor {
         // matched invocation id is already proven above; the name, operation
         // and path are optional and stay absent when the hook omits them.
         let policy = SecretPolicy::new(self.secrets.iter().cloned());
+        let shell_cwd = body.input.get("cwd").and_then(Value::as_str).filter(|cwd| {
+            body.input["tool_name"].as_str() == Some("Bash")
+                && self.tool_names.get(&tool_use_id).map(String::as_str) == Some("Bash")
+                && cwd.len() <= MAX_TOOL_COMMAND_BYTES
+                && Path::new(cwd).is_absolute()
+                && !cwd.chars().any(char::is_control)
+                && policy.redact_text(cwd) == *cwd
+        });
         let tool = hook_tool_facts(
             &body.input,
             &tool_use_id,
@@ -2373,6 +2392,14 @@ impl EventProcessor {
             Value::String(self.credential.clone()),
         );
         if let Some(binding) = self.tool_use_turns.get_mut(&tool_use_id) {
+            // The two native callbacks bracket this exact foreground invocation.
+            match hook {
+                HookPoint::BeforeTool => binding.shell_cwd = shell_cwd.map(str::to_owned),
+                HookPoint::AfterTool => {
+                    binding.shell_cwd_confirmed =
+                        shell_cwd.is_some() && binding.shell_cwd.as_deref() == shell_cwd;
+                }
+            }
             binding.start_hook(hook, consumer_id.clone());
         } else {
             return self.write_hook_pass(&native, request_id, deadline).await;

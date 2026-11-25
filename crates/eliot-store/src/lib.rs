@@ -2792,46 +2792,40 @@ impl Store {
         let verbatim_workspace = core::verbatim_path(std::path::Path::new(workspace))
             .to_string_lossy()
             .into_owned();
-        let start_path = if cfg!(windows) {
-            "lower(json_extract(s.data, '$.cwd')) IN (lower(?1), lower(?2), lower(?3))"
+        let cwd = "COALESCE(json_extract(c.data, '$.git_branch_switch.cwd'),
+                           json_extract(c.data, '$.shell_execution_cwd'))";
+        let workspace_filter = if cfg!(windows) {
+            format!(
+                "lower(replace({cwd}, char(92), '/')) IN (
+                    lower(replace(?1, char(92), '/')), lower(replace(?2, char(92), '/')),
+                    lower(replace(?3, char(92), '/')))"
+            )
         } else {
-            "json_extract(s.data, '$.cwd') IN (?1, ?2, ?3)"
-        };
-        let terminal_path = if cfg!(windows) {
-            "lower(json_extract(c.data, '$.git_branch_switch.cwd')) IN (lower(?1), lower(?2), lower(?3))"
-        } else {
-            "json_extract(c.data, '$.git_branch_switch.cwd') IN (?1, ?2, ?3)"
+            format!("{cwd} IN (?1, ?2, ?3)")
         };
         let mut statement = self
             .connection
-            .prepare(
-                &format!("SELECT c.agent, c.generation, c.seq, s.seq, s.ts, s.data, c.data
+            .prepare(&format!(
+                "SELECT c.agent, c.generation, c.seq, s.seq, s.ts, s.data, c.data
                  FROM events c JOIN events s
                    ON s.agent = c.agent AND s.generation = c.generation AND s.seq < c.seq
-                  AND s.source = 'stream' AND s.kind = 'tool.started'
-                  AND json_extract(s.data, '$.item_id') = json_extract(c.data, '$.git_branch_switch.item_id')
-                  AND json_extract(s.data, '$.turn_id') = json_extract(c.data, '$.git_branch_switch.turn_id')
-                  AND {start_path}
-                  AND json_extract(s.data, '$.tool') = 'commandExecution'
-                 WHERE c.source = 'stream' AND c.kind = 'tool.completed'
+                  AND s.source = 'stream' AND s.kind = 'tool.started' AND s.native_id IS NOT NULL
+                  AND json_extract(s.data, '$.item_id') = json_extract(c.data, '$.item_id')
+                  AND json_extract(s.data, '$.turn_id') = json_extract(c.data, '$.turn_id')
+                 WHERE c.source = 'stream' AND c.kind = 'tool.completed' AND c.native_id IS NOT NULL
                    AND c.generation IS NOT NULL
-                   AND (?5 IS NULL OR c.generation = ?5)
+                   AND (?4 IS NULL OR c.generation = ?4)
                    AND json_extract(c.data, '$.status') = 'completed'
-                   AND json_extract(c.data, '$.exit_code') = 0
-                   AND {terminal_path}
-                   AND (?4 IS NULL OR json_extract(c.data, '$.git_branch_switch.branch') = ?4)
-                 ORDER BY c.seq DESC LIMIT 65")
-            )
+                   AND {workspace_filter}
+                   AND (json_extract(c.data, '$.git_branch_switch.branch') IS NOT NULL
+                        OR json_extract(s.data, '$.command') LIKE 'git%switch%'
+                        OR json_extract(s.data, '$.command') LIKE 'git%checkout%')
+                 ORDER BY c.seq DESC LIMIT 65"
+            ))
             .map_err(sql_error)?;
         let rows = statement
             .query_map(
-                params![
-                    workspace,
-                    display_workspace,
-                    verbatim_workspace,
-                    branch,
-                    generation
-                ],
+                params![workspace, display_workspace, verbatim_workspace, generation],
                 |row| {
                     Ok((
                         row.get::<_, i64>(0)?,
@@ -2846,7 +2840,13 @@ impl Store {
             )
             .map_err(sql_error)?;
         let mut candidates = Vec::new();
-        for row in rows {
+        for (offset, row) in rows.enumerate() {
+            if offset == 64 {
+                return Err(Error::new(
+                    "workspace_branch_unattributed",
+                    "native checkout evidence reached its read bound",
+                ));
+            }
             let (
                 agent_num,
                 generation,
@@ -2861,42 +2861,24 @@ impl Store {
             let terminal: Value = serde_json::from_str(&terminal_data).map_err(|_| {
                 Error::new("source_integrity", "invalid native tool terminal event")
             })?;
-            let fact = &terminal["git_branch_switch"];
-            let (
-                Some(item_id),
-                Some(turn_id),
-                Some(branch_value),
-                Some(workspace_value),
-                Some(completed_at),
-            ) = (
-                fact["item_id"].as_str(),
-                fact["turn_id"].as_str(),
-                fact["branch"].as_str(),
-                fact["cwd"].as_str(),
-                fact["native_at_ms"].as_i64(),
-            )
+            let Some(checkout) = workspace::native_branch_checkout(&start, &terminal, start_ts)
             else {
                 continue;
             };
-            if start["item_id"].as_str() != Some(item_id)
-                || start["turn_id"].as_str() != Some(turn_id)
-                || !start["cwd"].as_str().is_some_and(|cwd| {
-                    core::workspace_path_key(cwd) == core::workspace_path_key(workspace_value)
-                })
-                || branch.is_some_and(|branch| branch_value != branch)
-                || core::workspace_path_key(workspace_value) != core::workspace_path_key(workspace)
+            if branch.is_some_and(|branch| checkout.branch != branch)
+                || core::workspace_path_key(checkout.cwd) != core::workspace_path_key(workspace)
             {
                 continue;
             }
             candidates.push(NativeBranchSwitchCandidate {
                 agent: format!("a{agent_num}"),
                 generation,
-                branch: branch_value.to_owned(),
-                workspace: workspace_value.to_owned(),
+                branch: checkout.branch.to_owned(),
+                workspace: checkout.cwd.to_owned(),
                 start_seq,
                 terminal_seq,
-                started_at_ms: start["native_at_ms"].as_i64().unwrap_or(start_ts),
-                completed_at_ms: completed_at,
+                started_at_ms: checkout.started_at_ms,
+                completed_at_ms: checkout.completed_at_ms,
             });
         }
         Ok(candidates)
