@@ -307,6 +307,21 @@ pub fn deliver(
     })
 }
 
+/// [`backoff`] inside a runtime that is already running (an `async`
+/// block on a reader's worker): false when cancelled first.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "This helper owns the bounded wait of a running read."
+)]
+pub async fn pause(delay_ms: u64, cancelled: &dyn Fn() -> bool) -> bool {
+    cancellable(
+        tokio::time::sleep(Duration::from_millis(delay_ms)),
+        cancelled,
+    )
+    .await
+    .is_some()
+}
+
 /// Sleep for a reconnect backoff, giving up promptly on cancellation.
 #[expect(
     clippy::disallowed_methods,

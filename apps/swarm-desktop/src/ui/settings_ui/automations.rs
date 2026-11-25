@@ -1,30 +1,19 @@
-//! Settings › Automations: one card per automation in plain words (the
-//! Codex/Antigravity settings pattern), the short form that creates or
-//! edits an assignment, and the Scripts card. The card model and Run now
+//! The Automations page (`Automations.dc.html`): its rows in plain words
+//! by group beside the editor of the row chosen (a rule's sentence, or the
+//! short form of a brief queue), and the Scripts tab. The card model and Run now
 //! are in [`super::super::automation_ui`]; the assignment writes are here,
 //! beside the settings draft they change, and save at once.
 
 use super::super::automation_ui::{
-    AssignmentForm, AssignmentView, AutomationMsg, Card, CardInputs, FormField, TimerKey, cards,
-    interval_ms, unmatched_editing_form,
+    AssignmentForm, AssignmentView, AutoGroup, AutomationMsg, Card, EditorField, FormField,
+    RuleEditor, RuleMsg, WhenKind, action_labels, interval_ms, when_labels,
 };
+use super::super::page_ui;
 use super::*;
 
 impl DesktopApp {
-    pub(super) fn automation_section(
-        &self,
-        context: &mut ViewContext<Self>,
-        palette: Palette,
-    ) -> View {
-        StackPanel::new().spacing(tokens::spacing::MD).children((
-            self.automations_view(context, palette),
-            m3::card_title("Scripts"),
-            self.scripts_view(context, palette),
-        ))
-    }
-
     /// Saved assignments. The timer's effective state comes from rule.list.
-    fn assignment_views(&self) -> Vec<AssignmentView> {
+    pub(in crate::ui) fn assignment_views(&self) -> Vec<AssignmentView> {
         let automation = &self.settings.base(Section::Automation);
         model::assignment_keys(automation)
             .into_iter()
@@ -40,35 +29,8 @@ impl DesktopApp {
             .collect()
     }
 
-    /// The names of one project's automations: assignments that work in its
-    /// checkout and the rules of its namespace.
-    pub(in crate::ui) fn project_automations(&self, id: &str, checkout: &str) -> Vec<String> {
-        let automation = self.settings.base(Section::Automation);
-        let key = nav::path_key(checkout);
-        let mut names: Vec<String> = model::assignment_keys(&automation)
-            .into_iter()
-            .filter(|name| {
-                nav::path_key(&model::assignment_text(
-                    &automation,
-                    name,
-                    AssignmentField::Workspace,
-                )) == key
-            })
-            .collect();
-        names.extend(
-            self.automation
-                .rules
-                .iter()
-                .filter(|namespace| namespace.project.as_deref() == Some(id))
-                .filter_map(|namespace| namespace.rules.as_ref().ok())
-                .flatten()
-                .map(|entry| entry.state.id.clone()),
-        );
-        names
-    }
-
     /// Registered projects: (id, checkout, label).
-    fn automation_projects(&self) -> Vec<(String, String, String)> {
+    pub(in crate::ui) fn automation_projects(&self) -> Vec<(String, String, String)> {
         self.nav
             .projects
             .iter()
@@ -233,260 +195,233 @@ impl DesktopApp {
 
     /// The cards, the form, and an empty state that says what automations
     /// are for.
-    fn automations_view(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
-        let projects = self.automation_projects();
-        let data_dir = self.data_dir.as_ref().ok().map(PathBuf::as_path);
-        let cards = cards(&CardInputs {
-            assignments: self.assignment_views(),
-            worker: &self.automation.worker,
-            namespaces: &self.automation.rules,
-            global_rules_current: self.automation.global_rules_current,
-            projects: &projects,
-            data_dir,
-        });
-        let form = self.automation.form.as_ref();
-        let new_button = |context: &mut ViewContext<Self>| -> View {
-            m3::filled(palette)
-                .horizontal_alignment(HorizontalAlignment::Left)
-                .automation_name("New automation")
-                .on_click(context.message(Message::Automation(AutomationMsg::FormOpened(None))))
-                .content(m3::label("New automation"))
-        };
-        let mut parts: Vec<KeyedView> = Vec::new();
-        if cards.is_empty() && form.is_none() {
-            parts.push(KeyedView::new(
-                "empty",
-                m3::card(palette).content(
-                    // Before the first read lands only; a later re-read keeps
-                    // the page as it is.
-                    StackPanel::new().spacing(tokens::spacing::MD).children((
-                        m3::body(if self.automation.read() {
-                            "Automations start work for you: Swarm takes the briefs in a folder one by one and starts a task for each."
-                        } else {
-                            "Reading automations…"
-                        })
-                        .text_wrapping(TextWrapping::Wrap),
-                        if self.automation.read() {
-                            new_button(context)
-                        } else {
-                            View::empty()
-                        },
-                    )),
-                ),
-            ));
-        } else {
-            parts.push(KeyedView::new(
-                "heading",
-                m3::section_heading(
-                    "Your automations",
-                    "Each one starts tasks for you. Pause one to stop new tasks; tasks already running finish.",
-                    Some(
-                        StackPanel::new()
-                            .orientation(Orientation::Horizontal)
-                            .spacing(tokens::spacing::SM)
-                            .children((
-                                m3::text_button(palette)
-                                    .automation_name("Refresh automations")
-                                    .on_click(context.message(Message::Automation(
-                                        AutomationMsg::AutomationRefreshRequested,
-                                    )))
-                                    .content(m3::label("Refresh")),
-                                if form.is_none() {
-                                    new_button(context)
-                                } else {
-                                    View::empty()
-                                },
-                            )),
-                    ),
-                ),
-            ));
-        }
-        if let Some(form) = form.filter(|form| form.editing.is_none()) {
-            parts.push(KeyedView::new(
-                "form:new",
-                self.assignment_form_view(form, context, palette),
-            ));
-        }
-        for card in &cards {
-            let editing = form.filter(|form| {
-                form.editing.is_some()
-                    && card.assignment.as_ref().map(|(key, _)| key) == form.editing.as_ref()
-            });
-            parts.push(KeyedView::new(
-                card.key.clone(),
-                match editing {
-                    Some(form) => self.assignment_form_view(form, context, palette),
-                    None => self.automation_card(card, context, palette),
-                },
-            ));
-        }
-        // Another writer may have removed the edited assignment while its
-        // form was open: no card matches, so the form renders after the
-        // cards with its retained inputs and refusal.
-        if let Some(unmatched) = unmatched_editing_form(form, &cards)
-            && let Some(editing) = unmatched.editing.as_ref()
-        {
-            parts.push(KeyedView::new(
-                format!("form:editing:{editing}"),
-                self.assignment_form_view(unmatched, context, palette),
-            ));
-        }
-        for namespace in &self.automation.rules {
-            let note = match &namespace.rules {
-                Err(error) => format!(
-                    "{}: not read ({})",
-                    namespace.label,
-                    crate::state::plain_error(error)
-                ),
-                Ok(_) if namespace.more => {
-                    format!(
-                        "{}: more rules exist than this page shows.",
-                        namespace.label
-                    )
-                }
-                Ok(_) => continue,
-            };
-            parts.push(KeyedView::new(
-                format!("note:{}", namespace.label),
-                m3::secondary(note)
-                    .foreground(palette.attention())
-                    .text_wrapping(TextWrapping::Wrap)
-                    .is_text_selection_enabled(true),
-            ));
-        }
-        StackPanel::new()
-            .spacing(tokens::spacing::SM)
-            .keyed_children(parts)
-    }
-
-    /// One automation: what it does, its state, last and next run, its
-    /// folders, the actions the daemon supports and its technical details.
-    fn automation_card(
+    /// The Automations page (`Automations.dc.html`): the title and New
+    /// automation, the Automations / Scripts tabs, then the groups (Checks,
+    /// Reactions, After work, Schedules) beside the editor of the row
+    /// chosen. The project check itself stays in Settings › Projects.
+    pub(in crate::ui) fn automations_page(
         &self,
-        card: &Card,
         context: &mut ViewContext<Self>,
         palette: Palette,
     ) -> View {
-        let mut lines: Vec<KeyedView> = vec![
-            KeyedView::new(
-                "title",
-                Grid::new()
-                    .columns([GridLength::STAR, GridLength::Auto])
-                    .column_spacing(tokens::spacing::SM)
-                    .children((
-                        m3::section_title(card.title.clone())
-                            .text_trimming(TextTrimming::CharacterEllipsis)
-                            .vertical_alignment(VerticalAlignment::Center),
-                        StackPanel::new()
-                            .grid_column(1)
-                            .orientation(Orientation::Horizontal)
-                            .spacing(tokens::spacing::XS)
-                            .vertical_alignment(VerticalAlignment::Center)
-                            .children((
-                                m3::status_mark(palette, card.state.tone(), tokens::layout::DOT),
-                                m3::secondary(card.state.label())
-                                    .vertical_alignment(VerticalAlignment::Center),
-                            )),
-                    )),
-            ),
-            KeyedView::new(
-                "sentence",
-                m3::body(card.sentence.clone())
-                    .text_wrapping(TextWrapping::Wrap)
-                    .is_text_selection_enabled(true),
-            ),
-        ];
-        if let Some(reason) = card.state.reason() {
-            lines.push(KeyedView::new(
-                "reason",
-                m3::secondary(reason.to_owned())
-                    .foreground(palette.attention())
-                    .text_wrapping(TextWrapping::Wrap)
-                    .is_text_selection_enabled(true),
-            ));
-        }
-        if !card.times.is_empty() {
-            lines.push(KeyedView::new("times", m3::secondary(card.times.clone())));
-        }
-        for (label, path) in &card.paths {
-            lines.push(KeyedView::new(
-                format!("path:{label}"),
-                Grid::new()
-                    .columns([
-                        GridLength::Pixel(tokens::layout::PATH_LABEL_WIDTH),
-                        GridLength::STAR,
-                    ])
-                    .children((
-                        m3::secondary(label.to_string())
-                            .vertical_alignment(VerticalAlignment::Center),
-                        Border::new()
-                            .grid_column(1)
-                            .content(self.path_link(context, palette, path)),
-                    )),
-            ));
-        }
-        let mut actions: Vec<KeyedView> = Vec::new();
-        if let Some((key, on)) = &card.assignment {
-            let label = if *on { "Pause" } else { "Resume" };
-            let button = if *on {
-                m3::outlined(palette)
-            } else {
-                m3::filled(palette)
-            };
-            actions.push(KeyedView::new(
-                format!("pause:{on}"),
-                button
-                    .automation_name(format!("{label} {}", card.title))
-                    .on_click(context.message(Message::Automation(AutomationMsg::Enabled(
-                        key.clone(),
-                        !on,
-                    ))))
-                    .content(m3::label(label)),
-            ));
-        }
-        let run = card
-            .run
+        let scripts = self.automation.scripts_tab;
+        let busy = self
+            .automation
+            .editor
             .as_ref()
-            .map(|key| (key, self.automation.runs.get(key)));
-        if let Some((TimerKey(project, rule), line)) = &run {
-            actions.push(KeyedView::new(
-                "run",
-                m3::outlined(palette)
-                    .is_enabled(!line.is_some_and(|line| line.busy) && !self.submitting())
-                    .automation_name(format!("Run {} now", card.title))
-                    .on_click(context.message(Message::Automation(AutomationMsg::RunNow(
-                        project.clone(),
-                        rule.clone(),
-                    ))))
-                    .content(m3::label("Run now")),
-            ));
-        }
-        if let Some((key, _)) = &card.assignment {
-            actions.push(KeyedView::new(
-                "edit",
-                m3::text_button(palette)
-                    .automation_name(format!("Edit {}", card.title))
-                    .on_click(
-                        context.message(Message::Automation(AutomationMsg::FormOpened(Some(
-                            key.clone(),
-                        )))),
-                    )
-                    .content(m3::label("Edit")),
-            ));
-        }
-        let open = self.automation.technical.contains(&card.key);
-        lines.push(KeyedView::new(
-            "actions",
-            Grid::new()
-                .columns([GridLength::STAR, GridLength::Auto])
-                .column_spacing(tokens::spacing::SM)
-                .children((
+            .is_some_and(|editor| editor.saving)
+            || self
+                .automation
+                .form
+                .as_ref()
+                .is_some_and(|form| form.saving);
+        let new_menu = vec![
+            MenuItem::item("rule", "New rule…"),
+            MenuItem::item("queue", "New brief queue…"),
+        ];
+        let mut items: Vec<KeyedView> = vec![KeyedView::new(
+            "title",
+            page_ui::toolbar(
+                page_ui::title("Automations"),
+                vec![
+                    KeyedView::new(
+                        "refresh",
+                        m3::icon_button(palette)
+                            .automation_name("Refresh automations")
+                            .on_click(context.message(Message::Automation(
+                                AutomationMsg::AutomationRefreshRequested,
+                            )))
+                            .content(m3::icon(m3::glyph::REFRESH))
+                            .tooltip("Refresh automations"),
+                    ),
+                    KeyedView::new(
+                        format!("new:{busy}"),
+                        m3::filled(palette)
+                            .is_enabled(!busy)
+                            .automation_name("New automation")
+                            .content(m3::icon_label(m3::glyph::NEW_TASK, "New automation"))
+                            .menu(Menu::new(
+                                new_menu,
+                                context.callback(|key: String| {
+                                    if key == "queue" {
+                                        Message::Automation(AutomationMsg::FormOpened(None))
+                                    } else {
+                                        Message::Automation(AutomationMsg::Rule(RuleMsg::New))
+                                    }
+                                }),
+                            )),
+                    ),
+                ],
+            ),
+        )];
+        let tabs: Vec<KeyedView> = [("Automations", false), ("Scripts", true)]
+            .into_iter()
+            .map(|(label, tab)| {
+                let selected = scripts == tab;
+                KeyedView::new(
+                    format!("{label}:{selected}"),
+                    m3::pane_tab(palette, selected)
+                        .automation_name(if selected {
+                            format!("{label} (shown)")
+                        } else {
+                            format!("Show {label}")
+                        })
+                        .on_click(context.message(Message::Automation(AutomationMsg::Rule(
+                            RuleMsg::TabChosen(tab),
+                        ))))
+                        .content(m3::pane_tab_label(label)),
+                )
+            })
+            .collect();
+        items.push(KeyedView::new(
+            "tabs",
+            Border::new()
+                .border_brush(palette.outline())
+                .border_thickness(Thickness::new(0.0, 0.0, 0.0, tokens::layout::HAIRLINE))
+                .padding(Thickness::new(0.0, 0.0, 0.0, tokens::spacing::XS))
+                .content(
                     StackPanel::new()
                         .orientation(Orientation::Horizontal)
-                        .spacing(tokens::spacing::SM)
-                        .keyed_children(actions),
+                        .keyed_children(tabs),
+                ),
+        ));
+        if scripts {
+            items.push(KeyedView::new(
+                "scripts",
+                self.scripts_view(context, palette),
+            ));
+            return page_ui::page("Automations", self.page_width(tokens::page::WIDTH), items);
+        }
+        let cards = self.automation_cards();
+        let mut left: Vec<KeyedView> = vec![KeyedView::new(
+            "intro",
+            page_ui::quiet(
+                "Each automation starts work for you. Switch one off to stop new work; work already running finishes.",
+            ),
+        )];
+        if !self.automation.read() {
+            left.push(KeyedView::new(
+                "reading",
+                page_ui::quiet("Reading automations…"),
+            ));
+        } else if cards.is_empty() {
+            left.push(KeyedView::new(
+                "empty",
+                page_ui::quiet(
+                    "No automations yet. A brief queue takes the briefs in a folder one by one and starts a task for each.",
+                ),
+            ));
+        }
+        for namespace in &self.automation.rules {
+            match &namespace.rules {
+                Err(error) => left.push(KeyedView::new(
+                    format!("error:{}", namespace.label),
+                    page_ui::read_failed(
+                        palette,
+                        format!(
+                            "{}: not read ({})",
+                            namespace.label,
+                            crate::state::plain_error(error)
+                        ),
+                        "Retry",
+                        true,
+                        context.message(Message::Automation(
+                            AutomationMsg::AutomationRefreshRequested,
+                        )),
+                    ),
+                )),
+                Ok(_) if namespace.more => left.push(KeyedView::new(
+                    format!("more:{}", namespace.label),
+                    page_ui::quiet(format!(
+                        "{}: more rules exist than this page shows.",
+                        namespace.label
+                    )),
+                )),
+                Ok(_) => {}
+            }
+        }
+        for group in AutoGroup::ALL {
+            let rows: Vec<KeyedView> = cards
+                .iter()
+                .filter(|card| card.group == group)
+                .map(|card| {
+                    KeyedView::new(
+                        card.key.clone(),
+                        self.automation_row(card, context, palette),
+                    )
+                })
+                .collect();
+            if rows.is_empty() {
+                continue;
+            }
+            left.push(KeyedView::new(
+                format!("group:{}", group.title()),
+                page_ui::heading(group.title()),
+            ));
+            left.push(KeyedView::new(
+                format!("rows:{}", group.title()),
+                m3::settings_card(palette, rows),
+            ));
+        }
+        let mut right: Vec<KeyedView> = Vec::new();
+        if let Some(form) = self.automation.form.as_ref() {
+            right.push(KeyedView::new(
+                format!("queue:{:?}", form.editing),
+                self.assignment_form_view(form, context, palette),
+            ));
+        } else if let Some(editor) = self.automation.editor.as_ref() {
+            right.push(KeyedView::new(
+                format!("editor:{:?}:{}", editor.card, editor.toml.is_some()),
+                self.rule_editor_view(editor, context, palette),
+            ));
+        } else {
+            right.push(KeyedView::new(
+                "pick",
+                page_ui::panel(
+                    palette,
+                    tokens::spacing::SM,
+                    vec![KeyedView::new(
+                        "hint",
+                        page_ui::quiet("Choose an automation to see and edit it."),
+                    )],
+                ),
+            ));
+        }
+        // A brief queue saves into the settings: its save line.
+        if let Some(note) = self
+            .settings
+            .notes
+            .get(&Page::Automations)
+            .filter(|_| self.automation.form.is_some())
+        {
+            right.push(KeyedView::new(
+                format!("note:{}", note.text),
+                if note.error {
+                    page_ui::error_line(palette, note.text.clone())
+                } else {
+                    page_ui::quiet(note.text.clone())
+                },
+            ));
+        }
+        // The open row's technical details (its keys, revisions, cursor).
+        let open_card = self
+            .automation
+            .open
+            .as_ref()
+            .and_then(|key| cards.iter().find(|card| &card.key == key))
+            .or_else(|| {
+                let editing = self.automation.form.as_ref()?.editing.as_ref()?;
+                cards
+                    .iter()
+                    .find(|card| card.assignment.as_ref().map(|(key, _)| key) == Some(editing))
+            });
+        if let Some(card) = open_card {
+            let open = self.automation.technical.contains(&card.key);
+            right.push(KeyedView::new(
+                format!("technical:{}:{open}", card.key),
+                StackPanel::new().spacing(tokens::spacing::XS).children((
                     m3::text_button(palette)
-                        .grid_column(1)
+                        .horizontal_alignment(HorizontalAlignment::Left)
                         .automation_name(format!(
                             "Technical details of {} ({})",
                             card.title,
@@ -503,36 +438,584 @@ impl DesktopApp {
                             },
                             "Technical details",
                         )),
+                    if open {
+                        m3::secondary(card.technical.join("\n"))
+                            .text_wrapping(TextWrapping::Wrap)
+                            .is_text_selection_enabled(true)
+                            .into()
+                    } else {
+                        View::empty()
+                    },
                 )),
+            ));
+        }
+        right.push(KeyedView::new(
+            "check",
+            page_ui::quiet(
+                "The project check itself is set in the project's policy: Settings › Projects.",
+            ),
         ));
-        if let Some((_, Some(line))) = &run {
-            let text = m3::secondary(line.text.clone())
-                .text_wrapping(TextWrapping::Wrap)
-                .is_text_selection_enabled(true);
-            lines.push(KeyedView::new(
-                "run-line",
-                if line.error {
-                    text.foreground(palette.attention())
+        items.push(KeyedView::new(
+            "columns",
+            page_ui::columns(left, tokens::spacing::SM, right),
+        ));
+        page_ui::page("Automations", self.page_width(tokens::page::WIDTH), items)
+    }
+
+    /// One row (`.srow.arow`): its plain name, the trigger with the last
+    /// outcome or refusal (the next run for a timer), the state pill, the
+    /// switch and the menu (Run now for a timer, Edit, Remove).
+    fn automation_row(
+        &self,
+        card: &Card,
+        context: &mut ViewContext<Self>,
+        palette: Palette,
+    ) -> View {
+        let selected = self.automation.open.as_deref() == Some(card.key.as_str())
+            || self
+                .automation
+                .form
+                .as_ref()
+                .and_then(|form| form.editing.as_ref())
+                .is_some_and(|key| card.assignment.as_ref().map(|(own, _)| own) == Some(key));
+        let status = card
+            .rule
+            .as_ref()
+            .and_then(|rule| self.automation.status.get(&rule.key));
+        let last = match status {
+            Some(Ok(show)) => match (&show.last_outcome, &show.last_refusal) {
+                (outcome, Some(refusal))
+                    if outcome
+                        .as_ref()
+                        .is_none_or(|outcome| refusal.at >= outcome.settled_at) =>
+                {
+                    format!(
+                        "last refusal: {} {}",
+                        refusal.reason,
+                        crate::config_view::local_time(refusal.at)
+                    )
+                }
+                (Some(outcome), _) => format!(
+                    "last: {} {}",
+                    format!("{:?}", outcome.state).to_lowercase(),
+                    crate::config_view::local_time(outcome.settled_at)
+                ),
+                (None, _) => "last: no runs yet".to_owned(),
+            },
+            Some(Err(error)) => format!("last outcome not read ({error})"),
+            None => String::new(),
+        };
+        let mut line = card.trigger.clone();
+        for part in [last, card.times.clone()] {
+            if !part.is_empty() {
+                line = format!("{line} · {part}");
+            }
+        }
+        let toggle_error = self.automation.toggle_errors.get(&card.key);
+        let mut text: Vec<KeyedView> = Vec::new();
+        if let Some(reason) = card.state.reason() {
+            text.push(KeyedView::new(
+                "reason",
+                page_ui::error_line(palette, reason),
+            ));
+        }
+        if let Some(error) = toggle_error {
+            text.push(KeyedView::new(
+                "toggle",
+                page_ui::error_line(palette, format!("Not switched: {error}")),
+            ));
+        }
+        if let Some(run) = card
+            .run
+            .as_ref()
+            .and_then(|key| self.automation.runs.get(key))
+        {
+            text.push(KeyedView::new(
+                "run",
+                if run.error {
+                    page_ui::error_line(palette, run.text.clone())
                 } else {
-                    text
+                    page_ui::quiet(run.text.clone())
                 },
             ));
         }
-        if open {
-            lines.push(KeyedView::new(
-                "technical",
-                m3::secondary(card.technical.join("\n"))
-                    .text_wrapping(TextWrapping::Wrap)
-                    .is_text_selection_enabled(true),
+        // The switch: an assignment's or a file rule's `enabled`; a rule
+        // Swarm generates from the settings has no file to switch.
+        let (on, switchable, why) = match (&card.assignment, &card.rule) {
+            (Some((_, on)), _) => (*on, true, None),
+            (None, Some(rule)) if rule.file.is_some() => (rule.enabled, true, None),
+            (None, Some(rule)) => (
+                rule.enabled,
+                false,
+                Some("Swarm makes this rule from the settings; change it in Settings"),
+            ),
+            (None, None) => (false, false, None),
+        };
+        let toggling = self.automation.toggling.contains(&card.key);
+        let key = card.key.clone();
+        let switch: View = Grid::new().keyed_children(vec![KeyedView::new(
+            format!("switch:{on}:{switchable}:{toggling}"),
+            ToggleSwitch::new()
+                .is_on(on)
+                .is_enabled(switchable && !toggling)
+                .min_width(0.0)
+                .automation_name(match why {
+                    Some(why) => format!("{} enabled: {why}", card.title),
+                    None => format!("{} enabled", card.title),
+                })
+                .on_toggled(context.callback(move |on: bool| {
+                    Message::Automation(AutomationMsg::Rule(RuleMsg::Toggled(key.clone(), on)))
+                })),
+        )]);
+        let switch = match why {
+            Some(why) => Border::new()
+                .background(Brush::Solid(Color::argb(0, 0, 0, 0)))
+                .content(switch)
+                .tooltip(why),
+            None => switch,
+        };
+        let mut menu: Vec<MenuItem> = Vec::new();
+        if card.run.is_some() {
+            menu.push(MenuItem::item(format!("run\u{1f}{}", card.key), "Run now"));
+        }
+        menu.push(MenuItem::item(format!("edit\u{1f}{}", card.key), "Edit"));
+        if card.assignment.is_some() || card.rule.as_ref().is_some_and(|rule| rule.file.is_some()) {
+            menu.push(MenuItem::item(
+                format!("remove\u{1f}{}", card.key),
+                "Remove",
             ));
         }
-        m3::card(palette)
-            .automation_name(format!("Automation {}", card.title))
-            .content(
+        let content = Grid::new()
+            .columns([
+                GridLength::STAR,
+                GridLength::Auto,
+                GridLength::Auto,
+                GridLength::Auto,
+            ])
+            .column_spacing(tokens::spacing::SM)
+            .children((
+                m3::row(palette, false)
+                    .height(tokens::height::CONTROL + tokens::spacing::LG)
+                    .automation_name(format!("Edit {}: {line}", card.title))
+                    .on_click(context.message(Message::Automation(AutomationMsg::Rule(
+                        RuleMsg::Opened(card.key.clone()),
+                    ))))
+                    .content(page_ui::two_lines(&card.title, &line)),
+                Border::new()
+                    .grid_column(1)
+                    .vertical_alignment(VerticalAlignment::Center)
+                    .content(m3::status_pill(
+                        palette,
+                        card.state.tone(),
+                        &card.state.label(),
+                        tokens::page::FLEET_NUMBER * 2.0,
+                    )),
+                Border::new()
+                    .grid_column(2)
+                    .vertical_alignment(VerticalAlignment::Center)
+                    .content(switch),
+                m3::icon_button(palette)
+                    .grid_column(3)
+                    .vertical_alignment(VerticalAlignment::Center)
+                    .automation_name(format!("Actions for {}", card.title))
+                    .content(m3::icon(m3::glyph::MORE_VERTICAL))
+                    .menu(Menu::new(
+                        menu,
+                        context.callback(|key: String| {
+                            Message::Automation(AutomationMsg::Rule(RuleMsg::Menu(key)))
+                        }),
+                    )),
+            ));
+        let row: View = if text.is_empty() {
+            content
+        } else {
+            StackPanel::new().children((
+                content,
                 StackPanel::new()
-                    .spacing(tokens::spacing::SM)
-                    .keyed_children(lines),
-            )
+                    .margin(Thickness::new(
+                        tokens::spacing::ROW,
+                        0.0,
+                        0.0,
+                        tokens::spacing::SM,
+                    ))
+                    .keyed_children(text),
+            ))
+        };
+        if selected {
+            // The ring spans the card's row (`.arow.sel`): out over the
+            // card's side padding.
+            Border::new()
+                .border_brush(palette.primary())
+                .border_thickness(Thickness::uniform(2.0 * tokens::layout::HAIRLINE))
+                .corner_radius(tokens::radius::CONTAINER)
+                .margin(Thickness::xy(-tokens::spacing::MD, 0.0))
+                .padding(Thickness::xy(
+                    tokens::spacing::MD - 2.0 * tokens::layout::HAIRLINE,
+                    0.0,
+                ))
+                .content(row)
+        } else {
+            row
+        }
+    }
+
+    /// The rule editor (`.panel.editor`): the sentence When · Only if · Do
+    /// · Repeat, the last outcome and refusal, then Delete, Edit as TOML,
+    /// Cancel and Save; check errors under their field.
+    fn rule_editor_view(
+        &self,
+        editor: &RuleEditor,
+        context: &mut ViewContext<Self>,
+        palette: Palette,
+    ) -> View {
+        let title = match &editor.rule {
+            Some(rule) => rule.key.1.clone(),
+            None => "New rule".to_owned(),
+        };
+        let enabled = !editor.saving && !editor.reading;
+        let generated = editor.rule.as_ref().is_some_and(|rule| rule.file.is_none());
+        let mut parts: Vec<KeyedView> =
+            vec![KeyedView::new("head", page_ui::panel_head(&title, None))];
+        let field_error = |field: EditorField| -> View {
+            match &editor.field_error {
+                Some((at, error)) if *at == field => page_ui::error_line(palette, error.clone()),
+                _ => View::empty(),
+            }
+        };
+        let word = |text: &str, row: i32| -> View {
+            m3::muted(text.to_owned(), tokens::page::HEADING)
+                .grid_row(row)
+                .vertical_alignment(VerticalAlignment::Center)
+                .into()
+        };
+        if generated {
+            parts.push(KeyedView::new(
+                "generated",
+                page_ui::quiet(
+                    "Swarm makes this rule from the settings (an attention reaction or a brief queue). Change it there.",
+                ),
+            ));
+        } else if editor.reading {
+            parts.push(KeyedView::new(
+                "reading",
+                page_ui::quiet("Reading the rule…"),
+            ));
+        } else if let Some(toml) = &editor.toml {
+            parts.push(KeyedView::new(
+                "toml",
+                m3::field()
+                    .text(toml.clone())
+                    .accepts_return(true)
+                    .text_wrapping(TextWrapping::Wrap)
+                    .min_height(tokens::layout::SOURCE_MIN_HEIGHT)
+                    .max_height(tokens::layout::SOURCE_MAX_HEIGHT)
+                    .is_enabled(enabled)
+                    .automation_name(format!("{title} as TOML"))
+                    .on_text_changed(context.callback(|text| {
+                        Message::Automation(AutomationMsg::Rule(RuleMsg::TomlText(text)))
+                    })),
+            ));
+        } else {
+            let sentence = &editor.sentence;
+            let mut rows: Vec<KeyedView> = Vec::new();
+            let mut row = 0;
+            if editor.rule.is_none() {
+                rows.push(KeyedView::new("name-word", word("Name", row)));
+                rows.push(KeyedView::new(
+                    "name",
+                    StackPanel::new().grid_row(row).grid_column(1).children((
+                        m3::field()
+                            .text(editor.id.clone())
+                            .placeholder_text("check-after-turn")
+                            .is_enabled(enabled)
+                            .automation_name("Rule name")
+                            .on_text_changed(context.callback(|text| {
+                                Message::Automation(AutomationMsg::Rule(RuleMsg::Id(text)))
+                            })),
+                        field_error(EditorField::Name),
+                    )),
+                ));
+                row += 1;
+            }
+            let when_labels = when_labels();
+            let when_index = sentence.when_index();
+            let mut when: Vec<KeyedView> = vec![KeyedView::new(
+                format!("when:{when_index}"),
+                ComboBox::new()
+                    .items_source(when_labels)
+                    .selected_index(Some(when_index))
+                    .horizontal_alignment(HorizontalAlignment::Stretch)
+                    .is_enabled(enabled)
+                    .automation_name("When")
+                    .on_selection_changed(context.callback(|index| {
+                        Message::Automation(AutomationMsg::Rule(RuleMsg::When(index)))
+                    })),
+            )];
+            if sentence.when_typed() {
+                when.push(KeyedView::new(
+                    "when-value",
+                    m3::field()
+                        .text(sentence.when_value.clone())
+                        .placeholder_text(match sentence.when {
+                            WhenKind::Event => "turn.completed",
+                            WhenKind::Every => "30m",
+                            WhenKind::Cron => "0 9 * * 1-5",
+                            WhenKind::Once => "2026-12-01T09:00:00Z",
+                        })
+                        .is_enabled(enabled)
+                        .automation_name("When, typed")
+                        .on_text_changed(context.callback(|text| {
+                            Message::Automation(AutomationMsg::Rule(RuleMsg::WhenValue(text)))
+                        })),
+                ));
+            }
+            if sentence.when == WhenKind::Cron {
+                when.push(KeyedView::new(
+                    "zone",
+                    m3::field()
+                        .text(sentence.zone.clone())
+                        .placeholder_text("Time zone (UTC when empty)")
+                        .is_enabled(enabled)
+                        .automation_name("Time zone")
+                        .on_text_changed(context.callback(|text| {
+                            Message::Automation(AutomationMsg::Rule(RuleMsg::Zone(text)))
+                        })),
+                ));
+            }
+            when.push(KeyedView::new("when-error", field_error(EditorField::When)));
+            rows.push(KeyedView::new("when-word", word("When", row)));
+            rows.push(KeyedView::new(
+                "when",
+                StackPanel::new()
+                    .grid_row(row)
+                    .grid_column(1)
+                    .spacing(tokens::spacing::XS)
+                    .keyed_children(when),
+            ));
+            row += 1;
+            rows.push(KeyedView::new("if-word", word("Only if", row)));
+            rows.push(KeyedView::new(
+                "if",
+                StackPanel::new().grid_row(row).grid_column(1).children((
+                    m3::field()
+                        .text(sentence.only_if.clone())
+                        .placeholder_text("Always")
+                        .is_enabled(enabled)
+                        .automation_name("Only if")
+                        .on_text_changed(context.callback(|text| {
+                            Message::Automation(AutomationMsg::Rule(RuleMsg::OnlyIf(text)))
+                        })),
+                    field_error(EditorField::OnlyIf),
+                )),
+            ));
+            row += 1;
+            let action_labels = action_labels(sentence);
+            let action_index = sentence.action_index();
+            let mut act: Vec<KeyedView> = vec![KeyedView::new(
+                format!("do:{action_index}:{}", action_labels.len()),
+                ComboBox::new()
+                    .items_source(action_labels)
+                    .selected_index(Some(action_index))
+                    .horizontal_alignment(HorizontalAlignment::Stretch)
+                    .is_enabled(enabled)
+                    .automation_name("Do")
+                    .on_selection_changed(context.callback(|index| {
+                        Message::Automation(AutomationMsg::Rule(RuleMsg::Action(index)))
+                    })),
+            )];
+            if let Some(text) = &sentence.text {
+                act.push(KeyedView::new(
+                    "text",
+                    m3::field()
+                        .text(text.clone())
+                        .placeholder_text("The text it sends")
+                        .is_enabled(enabled)
+                        .automation_name("Text")
+                        .on_text_changed(context.callback(|text| {
+                            Message::Automation(AutomationMsg::Rule(RuleMsg::Text(text)))
+                        })),
+                ));
+            }
+            if sentence.more_actions > 0 {
+                act.push(KeyedView::new(
+                    "more",
+                    m3::secondary(format!(
+                        "and {} more (Edit as TOML)",
+                        eliot_core::count_words(sentence.more_actions as u64, "action", "actions")
+                    )),
+                ));
+            }
+            act.push(KeyedView::new("do-error", field_error(EditorField::Do)));
+            rows.push(KeyedView::new("do-word", word("Do", row)));
+            rows.push(KeyedView::new(
+                "do",
+                StackPanel::new()
+                    .grid_row(row)
+                    .grid_column(1)
+                    .spacing(tokens::spacing::XS)
+                    .keyed_children(act),
+            ));
+            row += 1;
+            rows.push(KeyedView::new("repeat-word", word("Repeat", row)));
+            let repeat: View = match (sentence.repeat, &sentence.limit_words) {
+                (Some(max), words) => StackPanel::new().spacing(tokens::spacing::XS).children((
+                    NumberBox::new()
+                        .width(tokens::page::REPEAT_FIELD)
+                        .horizontal_alignment(HorizontalAlignment::Left)
+                        .minimum(1.0)
+                        .value(Some(max as f64))
+                        .is_enabled(enabled)
+                        .automation_name("Repeat at most")
+                        .on_value_changed(context.callback(|value| {
+                            Message::Automation(AutomationMsg::Rule(RuleMsg::Repeat(value)))
+                        })),
+                    m3::secondary(match words {
+                        Some(words) if !words.is_empty() => {
+                            format!("times at most ({words}), then it waits")
+                        }
+                        _ => "times at most, then it waits".to_owned(),
+                    })
+                    .text_wrapping(TextWrapping::Wrap),
+                    field_error(EditorField::Repeat),
+                )),
+                (None, _) => m3::secondary("No limit · Edit as TOML to add one")
+                    .vertical_alignment(VerticalAlignment::Center)
+                    .into(),
+            };
+            rows.push(KeyedView::new(
+                "repeat",
+                Border::new().grid_row(row).grid_column(1).content(repeat),
+            ));
+            row += 1;
+            parts.push(KeyedView::new(
+                "sentence",
+                Grid::new()
+                    .columns([
+                        GridLength::Pixel(tokens::page::SENTENCE_WORD),
+                        GridLength::STAR,
+                    ])
+                    .rows((0..row).map(|_| GridLength::Auto).collect::<Vec<_>>())
+                    .column_spacing(tokens::spacing::INSET)
+                    .row_spacing(tokens::spacing::SM)
+                    .keyed_children(rows),
+            ));
+        }
+        if let Some(rule) = &editor.rule {
+            let (outcome, refusal) = match self.automation.status.get(&rule.key) {
+                Some(Ok(show)) => (
+                    show.last_outcome.as_ref().map_or_else(
+                        || "None yet".to_owned(),
+                        |outcome| {
+                            format!(
+                                "{:?} · {}",
+                                outcome.state,
+                                crate::config_view::local_time(outcome.settled_at)
+                            )
+                        },
+                    ),
+                    show.last_refusal.as_ref().map_or_else(
+                        || "None".to_owned(),
+                        |refusal| {
+                            format!(
+                                "{} · {}",
+                                refusal.reason,
+                                crate::config_view::local_time(refusal.at)
+                            )
+                        },
+                    ),
+                ),
+                Some(Err(error)) => (format!("Not read ({error})"), String::new()),
+                None => ("Reading…".to_owned(), String::new()),
+            };
+            parts.push(KeyedView::new(
+                "outcome",
+                page_ui::kv_text("Last outcome", outcome),
+            ));
+            if !refusal.is_empty() {
+                parts.push(KeyedView::new(
+                    "refusal",
+                    page_ui::kv_text("Last refusal", refusal),
+                ));
+            }
+        }
+        if let Some((note, error)) = &editor.note {
+            parts.push(KeyedView::new(
+                "note",
+                if *error {
+                    page_ui::error_line(palette, note.clone())
+                } else {
+                    page_ui::quiet(note.clone())
+                },
+            ));
+        }
+        let can_edit = enabled && !generated;
+        let mut left: Vec<KeyedView> = Vec::new();
+        if editor.rule.as_ref().is_some_and(|rule| rule.file.is_some()) {
+            left.push(KeyedView::new(
+                "delete",
+                m3::destructive(palette)
+                    .is_enabled(can_edit && editor.revision.is_some())
+                    .automation_name(format!("Delete {title}"))
+                    .on_click(
+                        context.message(Message::Automation(AutomationMsg::Rule(RuleMsg::Delete))),
+                    )
+                    .content(m3::label("Delete")),
+            ));
+            left.push(KeyedView::new(
+                format!("toml:{}", editor.toml.is_some()),
+                m3::text_button(palette)
+                    .is_enabled(can_edit)
+                    .automation_name(if editor.toml.is_some() {
+                        "Edit as a sentence"
+                    } else {
+                        "Edit as TOML"
+                    })
+                    .on_click(context.message(Message::Automation(AutomationMsg::Rule(
+                        RuleMsg::TomlToggled,
+                    ))))
+                    .content(m3::label(if editor.toml.is_some() {
+                        "Edit as a sentence"
+                    } else {
+                        "Edit as TOML"
+                    })),
+            ));
+        }
+        parts.push(KeyedView::new(
+            "actions",
+            page_ui::toolbar(
+                StackPanel::new()
+                    .orientation(Orientation::Horizontal)
+                    .spacing(tokens::spacing::XS)
+                    .keyed_children(left),
+                vec![
+                    KeyedView::new(
+                        "cancel",
+                        m3::outlined(palette)
+                            .is_enabled(!editor.saving)
+                            .automation_name("Cancel")
+                            .on_click(
+                                context.message(Message::Automation(AutomationMsg::Rule(
+                                    RuleMsg::Cancel,
+                                ))),
+                            )
+                            .content(m3::label("Cancel")),
+                    ),
+                    KeyedView::new(
+                        "save",
+                        m3::filled(palette)
+                            .is_enabled(can_edit && (editor.dirty() || editor.rule.is_none()))
+                            .automation_name(format!("Save {title}"))
+                            .on_click(
+                                context.message(Message::Automation(AutomationMsg::Rule(
+                                    RuleMsg::Save,
+                                ))),
+                            )
+                            .content(m3::label(if editor.saving { "Saving…" } else { "Save" })),
+                    ),
+                ],
+            ),
+        ));
+        page_ui::panel(palette, tokens::spacing::SM, parts)
     }
 
     /// The short form: labelled fields with a line of help each.
@@ -742,10 +1225,6 @@ impl DesktopApp {
                 ))
                 .keyed_children(buttons),
         ));
-        m3::card(palette).content(
-            StackPanel::new()
-                .spacing(tokens::spacing::SM)
-                .keyed_children(rows),
-        )
+        page_ui::panel(palette, tokens::spacing::SM, rows)
     }
 }

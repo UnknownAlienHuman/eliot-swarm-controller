@@ -1099,6 +1099,46 @@ of the explicitly selected release scope.
       daemon its owner stopped), Repair settings, Open config.toml, Open
       log, Open data folder and the data-directory choices; the sidebar
       stays dimmed with the last list.
+    - [ ] **Project page.** `Project.dc.html`: path with Open folder, New
+      task and the project's menu; two columns. The manager from the
+      sidebar's `chat.organization` header (no manager, a hand-over in
+      progress, competing top-level tasks), tasks by Working, Waiting for
+      you, Ready (with queued launches and their reason), Finished and
+      Detached (a detached-HEAD checkout) with Show more, the project check
+      (Edit opens its policy); Who works where from `who` (uncommitted files,
+      commits against the base, claims, shared checkouts), branches and
+      worktrees with their folders, capacity read only (Edit opens
+      config.toml) and the project's automations with Manage.
+    - [x] **Inbox.** `Inbox.dc.html` as a page: group filter chips with the
+      daemon's counts, items with kind, age, one-line reason, the
+      recommended action, other choices in a menu and Snooze; Select with
+      Apply recommended and Snooze (one `owner.decide` per item, a stop
+      confirmed first, "Applied N · skipped N · failed N", "Outcome unknown"
+      kept for the same-ID retry); restore commands with Copy; the page
+      states.
+    - [x] **Agents.** `Agents.dc.html` as a page: search, By state / By
+      project with "shown of total", the summary (working, waiting,
+      provider holds, tokens today), filter chips with counts, the wait
+      classes (`daemon.status` liveness, read on open and Refresh), the tree
+      (state mark, task, project, model, activity, CPU, memory, Resume or
+      Stop, workers nested) and Autonomy (24 hours / 7 days, three numbers,
+      completeness, the lines by source).
+    - [x] **Automations.** `Automations.dc.html` as a top-level page with
+      Automations / Scripts tabs: Checks, Reactions, After work and
+      Schedules; rows with plain name, trigger, state, last outcome or
+      refusal (`rule.get`), next run, switch (a rule's `enabled` saved
+      against its file revision, a brief queue's `enabled`) and menu (Run
+      now, Edit, Remove); the sentence editor (When, Only if, Do, Repeat;
+      Every, cron with zone, Once; Save, Cancel, Edit as TOML, Delete,
+      errors at their field) over `rule.read/save/delete`; a brief queue's
+      form. The project check stays in Settings › Projects.
+    - [x] **Settings.** `Settings.dc.html`: the skeleton's groups and pages
+      where the daemon exposes the setting (General with theme cards,
+      startup and default access; Keyboard shortcuts; Models & presets;
+      Routing; Usage; Owner rules; Projects; Worktrees & cleanup;
+      Attention; Accounts & proxies; Cloud MCP; Daemon; Retention; Settings
+      file & history), cards of rows, and the save line (Saved, Saving…,
+      Not saved with Reload).
   - [ ] **Owner-level review.** All six themes on a private stand, side by side
     with Codex, Claude Code Desktop and OpenCode; response, alignment, color,
     type and shadows checked.

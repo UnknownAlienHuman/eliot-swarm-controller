@@ -18,10 +18,10 @@
 
 use std::collections::{BTreeMap, HashMap};
 
-mod access;
 mod advanced;
 mod automations;
 mod cloud_mcp;
+mod daemon;
 mod general;
 mod models;
 mod projects;
@@ -41,39 +41,45 @@ use eliot_core::api::{
 use serde_json::{Value, json};
 use shortcuts::shortcuts_page;
 
-/// The Settings pages.
+/// The Settings pages (the skeleton's table, where the daemon exposes the
+/// setting).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(super) enum Page {
-    /// Appearance and startup on one page.
+    /// Appearance, startup and default access on one page.
     General,
     Shortcuts,
     Models,
-    Access,
-    Usage,
-    Projects,
-    Automations,
-    Worktrees,
-    CloudMcp,
     Routing,
+    Usage,
+    OwnerRules,
+    Projects,
+    Worktrees,
+    Attention,
+    Accounts,
+    CloudMcp,
+    Daemon,
+    Retention,
     Advanced,
+    /// The Automations page's brief queues (`[automation]`): a save scope
+    /// of the one settings store, shown on that page, not in Settings.
+    Automations,
 }
 
-/// The navigation's groups and their pages, in order: the everyday pages
-/// first, Routing and the settings file under Advanced.
+/// The navigation's groups and their pages, in order.
 const GROUPS: [(&str, &[Page]); 5] = [
     ("General", &[Page::General, Page::Shortcuts]),
-    ("Agents", &[Page::Models, Page::Access, Page::Usage]),
     (
-        "Work",
-        &[Page::Projects, Page::Automations, Page::Worktrees],
+        "Agents",
+        &[Page::Models, Page::Routing, Page::Usage, Page::OwnerRules],
     ),
-    ("Integrations", &[Page::CloudMcp]),
-    ("Advanced", &[Page::Routing, Page::Advanced]),
+    ("Work", &[Page::Projects, Page::Worktrees, Page::Attention]),
+    ("Integrations", &[Page::Accounts, Page::CloudMcp]),
+    ("Advanced", &[Page::Daemon, Page::Retention, Page::Advanced]),
 ];
 
 /// What the Search field finds: one entry per setting, `(page, name,
 /// words it also answers to)`.
-const INDEX: [(Page, &str, &str); 18] = [
+const INDEX: &[(Page, &str, &str)] = &[
     (
         Page::General,
         "Theme",
@@ -81,19 +87,19 @@ const INDEX: [(Page, &str, &str); 18] = [
     ),
     (
         Page::General,
-        "Reopen the last task",
-        "startup start conversation open",
+        "On startup",
+        "startup start conversation open reopen last task",
+    ),
+    (
+        Page::General,
+        "Default access",
+        "access permission approval full ask auto sandbox",
     ),
     (Page::Shortcuts, "Keyboard shortcuts", "keys ctrl hotkey"),
     (
         Page::Models,
         "Presets",
         "model profile harness effort preset",
-    ),
-    (
-        Page::Access,
-        "Default access",
-        "access permission approval full ask auto sandbox",
     ),
     (
         Page::Routing,
@@ -106,19 +112,14 @@ const INDEX: [(Page, &str, &str); 18] = [
         "Running Agents and tokens",
         "usage swarm totals",
     ),
+    (
+        Page::OwnerRules,
+        "Owner rules",
+        "instructions rules agents text",
+    ),
     (Page::Projects, "Projects", "checkout folder repository"),
     (Page::Projects, "Add a project", "new checkout"),
-    (
-        Page::Automations,
-        "Automations",
-        "assignment brief busy folder schedule rule timer pause resume run now",
-    ),
-    (
-        Page::Automations,
-        "New automation",
-        "add create assignment queue briefs",
-    ),
-    (Page::Automations, "Scripts", "automation script run"),
+    (Page::Projects, "Project check", "policy check rounds goal"),
     (
         Page::Worktrees,
         "Managed worktrees",
@@ -130,9 +131,29 @@ const INDEX: [(Page, &str, &str); 18] = [
         "cleanup remove delete disk space merged branch temp target archive",
     ),
     (
+        Page::Attention,
+        "Attention",
+        "no progress stuck lost refusal session growth monitoring reaction",
+    ),
+    (
+        Page::Accounts,
+        "Accounts & proxies",
+        "account proxy opencodex provider",
+    ),
+    (
         Page::CloudMcp,
         "Cloud MCP",
         "cloudflare tunnel remote access mcp",
+    ),
+    (
+        Page::Daemon,
+        "Daemon",
+        "restart continue hold log level debug chats folder",
+    ),
+    (
+        Page::Retention,
+        "Retention",
+        "events commands mail history days prune compact",
     ),
     (
         Page::Advanced,
@@ -148,49 +169,38 @@ impl Page {
             Self::General => "General",
             Self::Shortcuts => "Keyboard shortcuts",
             Self::Models => "Models & presets",
-            Self::Access => "Default access",
             Self::Routing => "Routing",
             Self::Usage => "Usage",
+            Self::OwnerRules => "Owner rules",
             Self::Projects => "Projects",
-            Self::Automations => "Automations",
             Self::Worktrees => "Worktrees & cleanup",
+            Self::Attention => "Attention",
+            Self::Accounts => "Accounts & proxies",
             Self::CloudMcp => "Cloud MCP",
+            Self::Daemon => "Daemon",
+            Self::Retention => "Retention",
             Self::Advanced => "Settings file & history",
-        }
-    }
-
-    /// The page's one-line subtitle.
-    fn subtitle(self) -> &'static str {
-        match self {
-            Self::General => "How Swarm looks and what it opens with on this computer.",
-            Self::Shortcuts => "Keys that work anywhere in the window.",
-            Self::Models => {
-                "Saved model and access combinations; a new task picks its model in the composer."
-            }
-            Self::Access => "What new tasks may do without asking you first.",
-            Self::Routing => "How Auto chooses a preset when a task starts.",
-            Self::Usage => "Remaining quota of each agent app, and what Swarm is running.",
-            Self::Projects => "The checkouts tasks start in.",
-            Self::Automations => "Work Swarm starts for you: briefs from a folder, on a schedule.",
-            Self::Worktrees => "Worktrees Swarm created for tasks, by project.",
-            Self::CloudMcp => "Reach Swarm's MCP endpoint from the cloud.",
-            Self::Advanced => "Every section of config.toml as JSON, and who changed what.",
+            Self::Automations => "Automations",
         }
     }
 
     fn glyph(self) -> &'static str {
         match self {
-            Self::General => m3::glyph::SETTINGS,
+            Self::General => m3::glyph::SLIDERS,
             Self::Shortcuts => m3::glyph::KEYBOARD,
             Self::Models => m3::glyph::MODEL,
-            Self::Access => m3::glyph::SHIELD,
             Self::Routing => m3::glyph::ROUTING,
             Self::Usage => m3::glyph::USAGE,
+            Self::OwnerRules => m3::glyph::GAVEL,
             Self::Projects => m3::glyph::FOLDER,
-            Self::Automations => m3::glyph::AUTOMATION,
-            Self::Worktrees => m3::glyph::WORKTREE,
+            Self::Worktrees => m3::glyph::CLEANUP,
+            Self::Attention => m3::glyph::ATTENTION,
+            Self::Accounts => m3::glyph::KEY,
             Self::CloudMcp => m3::glyph::CLOUD,
-            Self::Advanced => m3::glyph::CODE,
+            Self::Daemon => m3::glyph::DAEMON,
+            Self::Retention => m3::glyph::HISTORY,
+            Self::Advanced => m3::glyph::FILE,
+            Self::Automations => m3::glyph::AUTOMATION,
         }
     }
 
@@ -199,11 +209,14 @@ impl Page {
         matches!(
             self,
             Self::Models
-                | Self::Access
                 | Self::Routing
+                | Self::OwnerRules
                 | Self::Projects
-                | Self::Automations
+                | Self::Attention
+                | Self::Accounts
                 | Self::CloudMcp
+                | Self::Daemon
+                | Self::Retention
                 | Self::Advanced
         )
     }
@@ -219,14 +232,11 @@ fn settings_issue_visible(page: Page, section: Option<Section>) -> bool {
         Some(Section::Projects) => page == Page::Projects,
         Some(Section::Automation) => page == Page::Automations,
         Some(Section::CloudMcp) => page == Page::CloudMcp,
-        Some(Section::Desktop) => matches!(page, Page::General | Page::Access),
-        Some(
-            Section::Daemon
-            | Section::Mail
-            | Section::Accounts
-            | Section::Proxies
-            | Section::OwnerRules,
-        ) => false,
+        Some(Section::Desktop) => page == Page::General,
+        Some(Section::Daemon) => matches!(page, Page::Attention | Page::Daemon | Page::Retention),
+        Some(Section::Accounts | Section::Proxies) => page == Page::Accounts,
+        Some(Section::OwnerRules) => page == Page::OwnerRules,
+        Some(Section::Mail) => false,
         None => page.has_config(),
     }
 }
@@ -280,6 +290,12 @@ pub(super) enum SettingsMsg {
         )>,
     ),
     PageSelected(Page),
+    /// One field of the `[daemon]` section (Attention, Daemon, Retention).
+    DaemonEdit(model::DaemonEdit),
+    /// The owner rules text as typed (saved with Save).
+    OwnerRulesText(String),
+    /// The daemon page's confirmation: save (true) or not.
+    DaemonConfirmed(bool),
     Loaded(Fallible<SettingsReadResponse>),
     Reload,
     RemoveInvalidSections(Vec<Section>),
@@ -526,6 +542,15 @@ pub(super) struct SettingsState {
     projects: Value,
     automation: Value,
     cloud: Value,
+    /// The `[daemon]` section (Attention, Daemon and Retention edit it)
+    /// and `[owner_rules]`.
+    pub(super) daemon: Value,
+    pub(super) owner_rules: Value,
+    /// The daemon page whose Save waits for its confirmation.
+    pub(super) daemon_confirm: Option<Page>,
+    /// The `[daemon]` draft the owner confirmed and that has not been sent
+    /// yet: only this exact content saves.
+    daemon_confirmed: Option<Value>,
     /// Advanced: every section as pretty JSON, and its read form.
     all: String,
     all_base: String,
@@ -666,6 +691,12 @@ impl SettingsState {
         follow(&mut self.projects, Section::Projects, Page::Projects);
         follow(&mut self.automation, Section::Automation, Page::Automations);
         follow(&mut self.cloud, Section::CloudMcp, Page::CloudMcp);
+        follow(&mut self.daemon, Section::Daemon, Page::Daemon);
+        follow(&mut self.owner_rules, Section::OwnerRules, Page::OwnerRules);
+        // The three pages of `[daemon]` share its draft and its refusal.
+        if refused.contains(&Page::Daemon) {
+            refused.extend([Page::Attention, Page::Retention]);
+        }
         for page in refused {
             self.typing.remove(&page);
             self.notes.insert(page, Note::error(CHANGED_ELSEWHERE));
@@ -756,7 +787,14 @@ impl SettingsState {
                 }
                 Ok(sections)
             }
-            Page::General | Page::Access => Err("This page saves as you choose.".to_owned()),
+            Page::Attention | Page::Daemon | Page::Retention => {
+                one(Section::Daemon, self.daemon.clone())
+            }
+            Page::OwnerRules => one(Section::OwnerRules, self.owner_rules.clone()),
+            Page::General => Err("This page saves as you choose.".to_owned()),
+            Page::Accounts => {
+                Err("Accounts and proxies are edited in Settings file & history.".to_owned())
+            }
             Page::Shortcuts | Page::Usage | Page::Worktrees => {
                 Err("Nothing to save on this page.".to_owned())
             }
@@ -802,8 +840,12 @@ impl SettingsState {
             Page::Automations => self.automation != self.base(Section::Automation),
             Page::CloudMcp => self.cloud != self.base(Section::CloudMcp),
             Page::Advanced => self.all != self.all_base,
+            Page::Attention | Page::Daemon | Page::Retention => {
+                self.daemon != self.base(Section::Daemon)
+            }
+            Page::OwnerRules => self.owner_rules != self.base(Section::OwnerRules),
             Page::General
-            | Page::Access
+            | Page::Accounts
             | Page::Shortcuts
             | Page::Models
             | Page::Usage
@@ -824,8 +866,12 @@ impl SettingsState {
                 self.all = self.all_base.clone();
                 self.all_from = self.base.clone();
             }
+            Page::Attention | Page::Daemon | Page::Retention => {
+                self.daemon = self.base(Section::Daemon);
+            }
+            Page::OwnerRules => self.owner_rules = self.base(Section::OwnerRules),
             Page::General
-            | Page::Access
+            | Page::Accounts
             | Page::Models
             | Page::Shortcuts
             | Page::Usage
@@ -1439,6 +1485,32 @@ impl DesktopApp {
                 }
             }
             SettingsMsg::HistoryToggled => s.history_open = !s.history_open,
+            // The daemon's own pages keep their changes as a draft: Save
+            // asks first (Retention deletes history; Attention and Daemon
+            // apply at the daemon's next start).
+            SettingsMsg::DaemonEdit(edit) => {
+                if !s.busy() && model::apply_daemon_edit(&mut s.daemon, edit) {
+                    let page = self.settings_page;
+                    s.notes.remove(&page);
+                }
+            }
+            SettingsMsg::DaemonConfirmed(save) => {
+                if let Some(page) = s.daemon_confirm.take()
+                    && save
+                {
+                    // Exactly this draft may go (now or, queued, later).
+                    s.daemon_confirmed = Some(s.daemon.clone());
+                    self.save_page(page, false, context);
+                }
+            }
+            SettingsMsg::OwnerRulesText(text) => {
+                if !s.busy() {
+                    model::set_owner_rules(
+                        &mut s.owner_rules,
+                        &profiles::normalize_newlines(&text),
+                    );
+                }
+            }
             SettingsMsg::AccessChosen(index) => {
                 // The composer's writer: `[desktop] last_access`, at once;
                 // the level the list already shows (Ask while unset) is no
@@ -1452,7 +1524,7 @@ impl DesktopApp {
                     self.prefs_rev += 1;
                     self.settings
                         .notes
-                        .insert(Page::Access, Note::info("Saving…"));
+                        .insert(Page::General, Note::info("Saving…"));
                     self.save_preferences(context);
                 }
             }
@@ -1692,11 +1764,27 @@ impl DesktopApp {
         if !self.settings.loaded {
             return;
         }
+        // The daemon's pages save only the draft the owner confirmed: a
+        // save of anything else (a later edit, a queued save whose draft
+        // moved since) asks again.
+        let daemon_page = matches!(page, Page::Attention | Page::Daemon | Page::Retention);
+        if daemon_page
+            && !dry_run
+            && self.settings.daemon_confirmed.as_ref() != Some(&self.settings.daemon)
+        {
+            self.settings.daemon_confirmed = None;
+            self.settings.daemon_confirm = Some(page);
+            return;
+        }
         if self.settings.busy() || self.prefs_saving {
             if !dry_run && !self.settings.queued.contains(&page) {
                 self.settings.queued.push(page);
             }
             return;
+        }
+        if daemon_page && !dry_run {
+            // Sent now: a later edit needs its own confirmation.
+            self.settings.daemon_confirmed = None;
         }
         if !dry_run && self.settings.refuse_if_changed(page) {
             self.reprime_fields(context);
@@ -2017,14 +2105,18 @@ impl DesktopApp {
                 Page::General => self.general_page(context, palette),
                 Page::Shortcuts => shortcuts_page(palette),
                 Page::Models => self.models_section(context, palette),
-                Page::Access => self.access_page(context, palette),
                 Page::Routing => self.routing_section(context, palette),
                 Page::Usage => self.usage_page(context, palette),
+                Page::OwnerRules => self.owner_rules_page(context, palette),
                 Page::Projects => self.projects_section(context, palette),
-                Page::Automations => self.automation_section(context, palette),
                 Page::Worktrees => self.worktrees_page(context, palette),
+                Page::Attention => self.attention_page(context, palette),
+                Page::Accounts => self.accounts_page(context, palette),
                 Page::CloudMcp => self.cloud_section(context, palette),
+                Page::Daemon => self.daemon_page(context, palette),
+                Page::Retention => self.retention_page(context, palette),
                 Page::Advanced => self.advanced_section(context, palette),
+                Page::Automations => self.automations_page(context, palette),
             }
         } else if self.settings.error.is_none() {
             m3::secondary("Reading settings…").into()
@@ -2046,43 +2138,47 @@ impl DesktopApp {
         let width = self.settings_column_width();
         // The page's tree is keyed by page, so its editors are new controls
         // (see `reprime_fields`).
-        let scroll =
-            ScrollViewer::new()
-                .vertical_scroll_bar_visibility(ScrollBarVisibility::Auto)
-                .content(
-                    StackPanel::new()
-                        .width(width)
-                        .horizontal_alignment(HorizontalAlignment::Center)
-                        .margin(Thickness::uniform(tokens::spacing::LG))
-                        .spacing(tokens::spacing::MD)
-                        .keyed_children(vec![
-                            KeyedView::new(
-                                format!("title:{}", page.label()),
-                                m3::page_header(
-                                    page.label(),
-                                    page.subtitle(),
-                                    page.has_config().then(|| {
-                                        m3::text_button(palette)
-                                            .automation_name("Open config.toml")
-                                            .on_click(context.message(Message::Settings(
-                                                SettingsMsg::OpenConfig,
-                                            )))
-                                            .content(m3::link_content("Open config.toml"))
-                                    }),
-                                ),
+        let scroll = ScrollViewer::new()
+            .vertical_scroll_bar_visibility(ScrollBarVisibility::Auto)
+            .content(
+                StackPanel::new()
+                    .width(width)
+                    .horizontal_alignment(HorizontalAlignment::Center)
+                    .margin(Thickness::uniform(tokens::spacing::LG))
+                    .spacing(tokens::spacing::MD)
+                    .keyed_children(vec![
+                        KeyedView::new(
+                            format!("title:{}", page.label()),
+                            page_ui::toolbar(
+                                page_ui::title(page.label()),
+                                page.has_config()
+                                    .then(|| {
+                                        KeyedView::new(
+                                            "config",
+                                            m3::text_button(palette)
+                                                .automation_name("Open config.toml")
+                                                .on_click(context.message(Message::Settings(
+                                                    SettingsMsg::OpenConfig,
+                                                )))
+                                                .content(m3::link_content("Open config.toml")),
+                                        )
+                                    })
+                                    .into_iter()
+                                    .collect(),
                             ),
-                            KeyedView::new("settings-read-status", status),
-                            KeyedView::new(
-                                "repair-startup-retry",
-                                self.repair_startup_retry_view(context, palette),
-                            ),
-                            KeyedView::new(
-                                "settings-section-issues",
-                                self.settings_issues_view(page, context, palette),
-                            ),
-                            KeyedView::new(format!("body:{}", page.label()), body),
-                        ]),
-                );
+                        ),
+                        KeyedView::new("settings-read-status", status),
+                        KeyedView::new(
+                            "repair-startup-retry",
+                            self.repair_startup_retry_view(context, palette),
+                        ),
+                        KeyedView::new(
+                            "settings-section-issues",
+                            self.settings_issues_view(page, context, palette),
+                        ),
+                        KeyedView::new(format!("body:{}", page.label()), body),
+                    ]),
+            );
         // The save status stays in view below the page, however far the
         // page is scrolled.
         Grid::new()
@@ -2098,7 +2194,7 @@ impl DesktopApp {
                     }),
                 Border::new()
                     .grid_row(2)
-                    .content(self.save_status(page, width, palette)),
+                    .content(self.save_status(page, context, palette)),
             ))
     }
 
@@ -2195,7 +2291,7 @@ impl DesktopApp {
     pub(super) fn settings_column_width(&self) -> Option<f64> {
         self.main_width().map(|width| {
             (width - 2.0 * tokens::spacing::LG)
-                .clamp(tokens::layout::MIN_COLUMN, tokens::layout::SETTINGS_WIDTH)
+                .clamp(tokens::layout::MIN_COLUMN, tokens::page::SETTINGS_WIDTH)
         })
     }
 
@@ -2203,7 +2299,11 @@ impl DesktopApp {
     /// every editable page but the raw editors.
     fn autosaves(&self, page: Page) -> bool {
         match page {
-            Page::Advanced => false,
+            Page::Advanced
+            | Page::OwnerRules
+            | Page::Attention
+            | Page::Daemon
+            | Page::Retention => false,
             Page::Models => !self.editor.source_open && !self.editor.raw_dirty,
             _ => true,
         }
@@ -2212,7 +2312,11 @@ impl DesktopApp {
     /// The page's save status in one line under the page: "Saving…",
     /// "Saved" or why not (in the error colour, selectable). Empty until a
     /// change is made, and on the raw editors (their save bar says it).
-    fn save_status(&self, page: Page, width: Option<f64>, palette: Palette) -> View {
+    /// The save line under the page (`.savebar`): "Saved" with its check,
+    /// "Saving…", or why not (in the error color, selectable) with Reload
+    /// when the settings changed elsewhere. Empty until a change is made,
+    /// and on the raw editors (their save bar says it).
+    fn save_status(&self, page: Page, context: &mut ViewContext<Self>, palette: Palette) -> View {
         let Some(note) = self
             .settings
             .notes
@@ -2230,17 +2334,37 @@ impl DesktopApp {
         .is_text_selection_enabled(true)
         .automation_name(format!("{} status: {}", page.label(), note.text))
         .vertical_alignment(VerticalAlignment::Center);
+        let mark: View = if !note.error && note.text.starts_with("Saved") {
+            Border::new()
+                .vertical_alignment(VerticalAlignment::Center)
+                .content(m3::small_icon(m3::glyph::CHECK))
+        } else {
+            View::empty()
+        };
+        let reload: View = if note.error && note.text.contains("changed somewhere else") {
+            m3::text_button(palette)
+                .is_enabled(!self.settings.reading)
+                .automation_name("Reload the settings")
+                .on_click(context.message(Message::Settings(SettingsMsg::Reload)))
+                .content(m3::label("Reload"))
+        } else {
+            View::empty()
+        };
         Border::new()
-            .grid_row(1)
-            .width(width)
-            .horizontal_alignment(HorizontalAlignment::Center)
-            .padding(Thickness::new(
-                0.0,
-                tokens::spacing::SM,
-                0.0,
-                tokens::spacing::MD,
-            ))
-            .content(text)
+            .min_height(tokens::height::CONTROL)
+            .border_brush(palette.outline())
+            .border_thickness(Thickness::new(0.0, tokens::layout::HAIRLINE, 0.0, 0.0))
+            .padding(Thickness::xy(tokens::spacing::LG, 0.0))
+            .content(
+                Grid::new()
+                    .columns([GridLength::Auto, GridLength::STAR, GridLength::Auto])
+                    .column_spacing(tokens::spacing::CHIP_GAP)
+                    .children((
+                        mark,
+                        Border::new().grid_column(1).content(text),
+                        Border::new().grid_column(2).content(reload),
+                    )),
+            )
     }
 
     fn read_error(&self, error: &str, context: &mut ViewContext<Self>, palette: Palette) -> View {

@@ -1,5 +1,6 @@
-//! Swarm autonomy in the Monitor: `autonomy.get` (Owner) as one compact
-//! row per Store source, with its numbers, its source and its coverage
+//! Swarm autonomy on the Agents page: `autonomy.get` (Owner) as three
+//! numbers and how complete they are, then one compact row per Store
+//! source, with its numbers, its source and its coverage
 //! (complete, partial or unavailable with the daemon's reason), for the
 //! last 24 hours or 7 days. Numbers only: no thresholds and no judgement
 //! (`docs/spec/monitoring.md`, Swarm autonomy). The rows are built once per
@@ -226,25 +227,81 @@ pub fn lines(
     ]
 }
 
-/// What the section shows.
+/// One read as the page shows it: the headline numbers, every source's
+/// lines and whether every source is complete.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Read {
+    /// The panel's numbers: the value ("—" when its source is
+    /// unavailable) and its label.
+    pub stats: Vec<(String, &'static str)>,
+    pub lines: Vec<Line>,
+    /// The sources that are not complete, by title.
+    pub incomplete: Vec<&'static str>,
+    /// When the read landed (ms since the epoch).
+    pub read_at: i64,
+}
+
+/// A read for the page: [`lines`] and the headline numbers.
+pub fn read(
+    reply: &AutonomyResponse,
+    title: impl Fn(&str) -> String,
+    project_name: impl Fn(&str) -> String,
+    now_ms: i64,
+) -> Read {
+    let value = |count: Option<u64>| count.map_or_else(|| "—".to_owned(), n);
+    let lines = lines(reply, title, project_name, now_ms);
+    let incomplete = lines
+        .iter()
+        .filter(|line| line.coverage != AutonomyCoverage::Complete)
+        .map(|line| line.title)
+        .collect();
+    Read {
+        stats: vec![
+            (
+                value(reply.checks.counts.as_ref().map(|counts| counts.swarm)),
+                "Checks run by Swarm",
+            ),
+            (
+                value(reply.steer.counts.as_ref().map(|counts| counts.swarm)),
+                "Steers by Swarm automation",
+            ),
+            (
+                value(
+                    reply
+                        .project_policy
+                        .counts
+                        .as_ref()
+                        .map(|counts| counts.applied),
+                ),
+                "Launches with project policy",
+            ),
+        ],
+        lines,
+        incomplete,
+        read_at: now_ms,
+    }
+}
+
+/// What the panel shows.
 #[derive(Clone, PartialEq)]
 pub enum Report {
     /// Not read yet (or reading for the first time).
     Reading,
-    Read(Shared<Vec<Line>>),
+    Read(Shared<Read>),
     Failed(String),
 }
 
 #[derive(Clone, PartialEq)]
 pub struct AutonomyInput {
+    /// The lines by source are shown.
     pub open: bool,
     /// The 7-day window (else 24 hours).
     pub week: bool,
     pub report: Report,
-    /// A read is running (the shown rows stay until it lands).
+    /// A read is running (the shown numbers stay until it lands).
     pub reading: bool,
     pub palette: Palette,
-    /// Show or hide the section.
+    /// Show or hide the lines by source.
     pub toggle: Callback<()>,
     /// Choose the window: 7 days (true) or 24 hours.
     pub window: Callback<bool>,
@@ -252,8 +309,9 @@ pub struct AutonomyInput {
     pub refresh: Callback<()>,
 }
 
-/// The Monitor's Swarm autonomy section: a toggle row, then (open) the
-/// window choice and one row per source.
+/// The Agents page's Autonomy panel (`Agents.dc.html`): its head (the read
+/// time, Refresh, 24 hours / 7 days), three numbers, how complete the data
+/// is, then the lines by source behind a toggle.
 pub struct Autonomy;
 
 impl Component for Autonomy {
@@ -267,34 +325,18 @@ impl Component for Autonomy {
     fn view(&self, input: &AutonomyInput, _context: &mut ViewContext<Self>) -> View {
         let palette = input.palette;
         let window = if input.week {
-            "last 7 days"
+            "the last 7 days"
         } else {
-            "last 24 h"
+            "the last 24 hours"
         };
-        let label = format!("Swarm autonomy · {window}");
-        let toggle = input.toggle.clone();
-        let header = crate::m3::sub_row(palette, false)
-            .automation_name(format!(
-                "{label} ({})",
-                if input.open { "shown" } else { "hidden" }
-            ))
-            .on_click(move || {
-                let _ = toggle.call(());
-            })
-            .content(crate::m3::row_content(
-                Some(if input.open {
-                    crate::m3::glyph::CHEVRON_DOWN
-                } else {
-                    crate::m3::glyph::CHEVRON_RIGHT
-                }),
-                &label,
-                "",
-                View::empty(),
-            ));
-        if !input.open {
-            return header;
-        }
-        let segments: Vec<KeyedView> = [(false, "24 h"), (true, "7 days")]
+        let updated = match &input.report {
+            Report::Read(read) => {
+                format!("Updated {}", crate::config_view::local_time(read.0.read_at))
+            }
+            _ if input.reading => "Reading…".to_owned(),
+            _ => String::new(),
+        };
+        let segments: Vec<KeyedView> = [(false, "24 hours"), (true, "7 days")]
             .into_iter()
             .map(|(week, text)| {
                 let selected = input.week == week;
@@ -304,7 +346,7 @@ impl Component for Autonomy {
                 KeyedView::new(
                     format!("{text}:{selected}"),
                     crate::m3::segment(palette, selected)
-                        .automation_name(format!("Swarm autonomy for the {text}"))
+                        .automation_name(format!("Autonomy for {text}"))
                         .on_click(move || {
                             let _ = choose.call(week);
                         })
@@ -313,48 +355,131 @@ impl Component for Autonomy {
             })
             .collect();
         let refresh = input.refresh.clone();
-        let controls = Grid::new()
-            .columns([GridLength::STAR, GridLength::Auto])
+        let head = Grid::new()
+            .columns([
+                GridLength::STAR,
+                GridLength::Auto,
+                GridLength::Auto,
+                GridLength::Auto,
+            ])
             .column_spacing(tokens::spacing::SM)
             .children((
-                crate::m3::segmented(palette, segments),
-                crate::m3::text_button(palette)
+                crate::m3::muted("Autonomy", tokens::page::HEADING)
+                    .automation_heading_level(AutomationHeadingLevel::Level2)
+                    .vertical_alignment(VerticalAlignment::Center),
+                crate::m3::secondary(updated)
                     .grid_column(1)
+                    .vertical_alignment(VerticalAlignment::Center),
+                crate::m3::icon_button(palette)
+                    .grid_column(2)
                     .is_enabled(!input.reading)
-                    .automation_name("Read Swarm autonomy again")
+                    .automation_name("Refresh autonomy")
                     .on_click(move || {
                         let _ = refresh.call(());
                     })
-                    .content(crate::m3::label(if input.reading {
-                        "Reading…"
-                    } else {
-                        "Read again"
-                    })),
+                    .content(crate::m3::icon(crate::m3::glyph::REFRESH)),
+                Border::new()
+                    .grid_column(3)
+                    .vertical_alignment(VerticalAlignment::Center)
+                    .content(crate::m3::segmented(palette, segments)),
             ));
-        let body: Vec<KeyedView> = match &input.report {
-            Report::Reading => vec![KeyedView::new("reading", crate::m3::secondary("Reading…"))],
-            Report::Failed(error) => vec![KeyedView::new(
+        let mut parts: Vec<KeyedView> = vec![KeyedView::new("head", head)];
+        match &input.report {
+            Report::Reading => parts.push(KeyedView::new(
+                "reading",
+                crate::m3::secondary("Reading autonomy…"),
+            )),
+            Report::Failed(error) => parts.push(KeyedView::new(
                 "failed",
-                crate::m3::secondary(format!("Swarm autonomy could not be read: {error}"))
+                crate::m3::secondary(format!("Autonomy could not be read: {error}"))
                     .foreground(palette.attention())
                     .text_wrapping(TextWrapping::Wrap)
                     .is_text_selection_enabled(true),
-            )],
-            Report::Read(lines) => lines
-                .0
-                .iter()
-                .map(|line| KeyedView::new(line.title, line_view(line, palette)))
-                .collect(),
-        };
-        StackPanel::new().spacing(tokens::spacing::ROW).children((
-            header,
-            controls,
-            crate::m3::card(palette).content(
+            )),
+            Report::Read(read) => {
+                let read = &read.0;
+                let stats: Vec<KeyedView> = read
+                    .stats
+                    .iter()
+                    .enumerate()
+                    .map(|(index, (value, label))| {
+                        KeyedView::new(
+                            format!("stat:{index}"),
+                            StackPanel::new()
+                                .grid_column(index as i32)
+                                .automation_name(format!("{label}: {value}"))
+                                .children((
+                                    crate::m3::text(value.clone(), tokens::page::STAT),
+                                    crate::m3::secondary(*label).text_wrapping(TextWrapping::Wrap),
+                                )),
+                        )
+                    })
+                    .collect();
+                parts.push(KeyedView::new(
+                    "stats",
+                    Grid::new()
+                        .columns([GridLength::STAR, GridLength::STAR, GridLength::STAR])
+                        .column_spacing(tokens::spacing::MD)
+                        .keyed_children(stats),
+                ));
+                let complete = if read.incomplete.is_empty() {
+                    format!("Complete for {window}.")
+                } else {
+                    format!(
+                        "Partial for {window}: {} not complete.",
+                        read.incomplete.join(", ")
+                    )
+                };
+                let toggle = input.toggle.clone();
+                parts.push(KeyedView::new(
+                    format!("complete:{}", input.open),
+                    Grid::new()
+                        .columns([GridLength::STAR, GridLength::Auto])
+                        .column_spacing(tokens::spacing::SM)
+                        .children((
+                            crate::m3::secondary(complete)
+                                .text_wrapping(TextWrapping::Wrap)
+                                .vertical_alignment(VerticalAlignment::Center),
+                            crate::m3::text_button(palette)
+                                .grid_column(1)
+                                .automation_name(if input.open {
+                                    "Hide the lines by source"
+                                } else {
+                                    "Show the lines by source"
+                                })
+                                .on_click(move || {
+                                    let _ = toggle.call(());
+                                })
+                                .content(crate::m3::label(if input.open {
+                                    "Hide sources"
+                                } else {
+                                    "Show sources"
+                                })),
+                        )),
+                ));
+                if input.open {
+                    parts.extend(
+                        read.lines
+                            .iter()
+                            .map(|line| KeyedView::new(line.title, line_view(line, palette))),
+                    );
+                }
+            }
+        }
+        Border::new()
+            .background(palette.tonal())
+            .border_brush(palette.outline())
+            .border_thickness(Thickness::uniform(tokens::layout::HAIRLINE))
+            .corner_radius(tokens::radius::CONTAINER)
+            .padding(Thickness::xy(
+                tokens::spacing::MD - tokens::layout::HAIRLINE,
+                tokens::spacing::INSET - tokens::layout::HAIRLINE,
+            ))
+            .content(
                 StackPanel::new()
-                    .spacing(tokens::spacing::MD)
-                    .keyed_children(body),
-            ),
-        ))
+                    .spacing(tokens::spacing::SM)
+                    .keyed_children(parts),
+            )
     }
 }
 

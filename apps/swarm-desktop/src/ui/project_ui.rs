@@ -1,11 +1,15 @@
-//! The project page, as in the Codex app: the project's tasks by state read
-//! from the daemon (`agent.list` with `project`, paged, so a project is never
-//! limited to the sidebar's loaded rows), its branches and worktrees, its
-//! check and automations, and New task. A project's name opens it; Back
-//! returns to where the owner came from.
+//! The project page (`Project.dc.html`): its header (path, Open folder,
+//! New task, the project's menu), then two columns. Left: the manager
+//! (`project.assignment` as the sidebar's `chat.organization` read carries
+//! it, with a hand-over in progress and competing top-level tasks), the
+//! tasks by state read from the daemon (`agent.list` with `project`,
+//! paged, so a project is never limited to the sidebar's loaded rows) with
+//! queued launches, and the project check. Right: who works where (`who`,
+//! by Git), branches and worktrees, capacity (read only) and the project's
+//! automations. A project's name opens it; Back returns.
 
+use super::menu_ui::{MenuMsg, Target as MenuTarget};
 use super::*;
-use crate::theme::StatusTone;
 use crate::theme::winui::Palette;
 use eliot_core::AgentState;
 
@@ -21,17 +25,29 @@ pub(super) enum Group {
     Waiting,
     Ready,
     Finished,
+    /// Tasks working in a checkout on a detached HEAD (Git's word), from
+    /// the groups above.
+    Detached,
 }
 
 impl Group {
-    const ALL: [Self; 4] = [Self::Working, Self::Waiting, Self::Ready, Self::Finished];
+    const ALL: [Self; 5] = [
+        Self::Working,
+        Self::Waiting,
+        Self::Ready,
+        Self::Finished,
+        Self::Detached,
+    ];
+    /// The groups read from the daemon (one list each).
+    const LISTED: [Self; 4] = [Self::Working, Self::Waiting, Self::Ready, Self::Finished];
 
     fn title(self) -> &'static str {
         match self {
             Self::Working => "Working",
-            Self::Waiting => "Waiting for a decision",
+            Self::Waiting => "Waiting for you",
             Self::Ready => "Ready",
             Self::Finished => "Finished",
+            Self::Detached => "Detached",
         }
     }
 
@@ -46,6 +62,7 @@ impl Group {
             ],
             Self::Ready => vec![AgentState::Idle],
             Self::Finished => vec![AgentState::Stopped],
+            Self::Detached => Vec::new(),
         }
     }
 }
@@ -58,6 +75,14 @@ pub(super) enum ProjectMsg {
     More(Group),
     /// Open this project's check in Settings › Projects.
     EditCheck,
+    /// Who works where (`who`): the read's epoch and its reply.
+    WhoLoaded(u64, Box<Fallible<eliot_core::api::WhoResponse>>),
+    /// Show or hide the finished tasks.
+    FinishedToggled,
+    /// Show or hide the tasks competing with the manager.
+    CompetingToggled,
+    /// Read the page again after a failed read.
+    Retry,
 }
 
 /// One state group as read.
@@ -81,6 +106,11 @@ pub(super) struct ProjectState {
     /// Tags reads: a reply for an older project or refresh is dropped.
     epoch: u64,
     lists: [GroupList; 4],
+    /// Who works where, as last read.
+    who: Option<Fallible<eliot_core::api::WhoResponse>>,
+    who_reading: bool,
+    finished_open: bool,
+    competing_open: bool,
 }
 
 impl DesktopApp {
@@ -118,6 +148,19 @@ impl DesktopApp {
                     self.read_group(group, after, context);
                 }
             }
+            ProjectMsg::WhoLoaded(epoch, read) => {
+                if epoch == self.project.epoch {
+                    self.project.who_reading = false;
+                    self.project.who = Some(*read);
+                }
+            }
+            ProjectMsg::FinishedToggled => {
+                self.project.finished_open = !self.project.finished_open;
+            }
+            ProjectMsg::CompetingToggled => {
+                self.project.competing_open = !self.project.competing_open;
+            }
+            ProjectMsg::Retry => self.read_project(context),
             ProjectMsg::EditCheck => {
                 let id = self.project.id.clone();
                 self.shell_update(ShellMsg::SettingsPage(Page::Projects), context);
@@ -160,7 +203,7 @@ impl DesktopApp {
                 id,
                 checkout,
                 epoch: self.project.epoch + 1,
-                lists: Default::default(),
+                ..ProjectState::default()
             };
         }
         if self.main != Main::Project {
@@ -181,11 +224,12 @@ impl DesktopApp {
     /// A group whose read is still running keeps it: on a busy daemon a read
     /// slower than the poll still lands instead of being replaced.
     pub(super) fn read_project(&mut self, context: &ComponentContext<Self>) {
-        for group in Group::ALL {
+        for group in Group::LISTED {
             if !self.project.lists[group as usize].reading {
                 self.read_group(group, None, context);
             }
         }
+        self.read_who(context);
     }
 
     fn read_group(
@@ -224,13 +268,46 @@ impl DesktopApp {
         });
     }
 
+    /// Read who works where in the project (`who`), with its groups.
+    fn read_who(&mut self, context: &ComponentContext<Self>) {
+        let Ok(data_dir) = self.data_dir.clone() else {
+            return;
+        };
+        if self.project.who_reading {
+            return;
+        }
+        self.project.who_reading = true;
+        let (epoch, id) = (self.project.epoch, self.project.id.clone());
+        let _task = context.spawn_background(move |_| {
+            let read = client::block_on(config_client::who(&data_dir, id))
+                .map_err(|error| error.user_message());
+            Message::Project(ProjectMsg::WhoLoaded(epoch, Box::new(read)))
+        });
+    }
+
     /// One group's rows: the daemon's, plus loaded chats attached to this
-    /// project (their own project label differs, so the filter misses them).
-    fn project_lines(&self, group: Group) -> Vec<TaskLine> {
+    /// project (their own project label differs, so the filter misses them),
+    /// less those working in a detached checkout (their own group).
+    fn project_lines(&self, group: Group, detached: &HashSet<String>) -> Vec<TaskLine> {
+        let now = crate::handoff::now_ms();
+        let line = |agent: &UiAgent| TaskLine {
+            agent: agent.clone(),
+            title: self.agent_label(agent),
+            line: task_line(agent),
+            trailing: change_words(agent).unwrap_or_else(|| nav::short_age(now, agent.updated_at)),
+        };
+        if group == Group::Detached {
+            let mut seen: HashSet<&str> = HashSet::new();
+            return Group::LISTED
+                .iter()
+                .flat_map(|listed| self.project.lists[*listed as usize].rows.iter())
+                .filter(|agent| in_detached(agent, detached) && seen.insert(agent.id.as_str()))
+                .map(line)
+                .collect();
+        }
         let list = &self.project.lists[group as usize];
         let states = group.states();
         let mut seen: HashSet<&str> = HashSet::new();
-        let now = crate::handoff::now_ms();
         list.rows
             .iter()
             .chain(self.nav.agents.iter().filter(|agent| {
@@ -238,13 +315,12 @@ impl DesktopApp {
                     && agent.project_id != self.project.id
                     && states.contains(&agent.state)
             }))
-            .filter(|agent| !agent.native_child && seen.insert(agent.id.as_str()))
-            .map(|agent| TaskLine {
-                agent: agent.clone(),
-                title: self.agent_label(agent),
-                trailing: change_words(agent)
-                    .unwrap_or_else(|| nav::short_age(now, agent.updated_at)),
+            .filter(|agent| {
+                !agent.native_child
+                    && !in_detached(agent, detached)
+                    && seen.insert(agent.id.as_str())
             })
+            .map(line)
             .collect()
     }
 
@@ -252,69 +328,183 @@ impl DesktopApp {
     /// what it shows leaves it as it is.
     pub(super) fn project_view(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
         let state = &self.project;
-        let groups: Vec<GroupView> = Group::ALL
-            .into_iter()
-            .map(|group| {
-                let list = &state.lists[group as usize];
-                let rows = self.project_lines(group);
-                GroupView {
-                    group,
-                    total: list.total.max(rows.len()),
-                    // The daemon returns a cursor even on its last page.
-                    more: list.next.is_some() && list.rows.len() < list.total,
-                    reading: list.reading && !list.read,
-                    error: list.error.clone(),
-                    rows,
-                }
-            })
-            .collect();
         let registered = self
             .nav
             .projects
             .iter()
             .find(|project| project.id == state.id);
-        // Counts come from the loaded rows: with rows left to page they are
-        // a lower bound, and the line says so.
-        let partial = groups
-            .iter()
-            .any(|group| group.more || group.reading || group.error.is_some());
-        let mut worktrees: Vec<WorktreeLine> = registered
+        let checkouts = registered
             .map(|project| project.git_checkouts.as_slice())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        let detached: HashSet<String> = checkouts
+            .iter()
+            .filter(|checkout| checkout.branch.is_none())
+            .map(|checkout| nav::path_key(&checkout.path))
+            .collect();
+        let groups: Vec<GroupView> = Group::ALL
+            .into_iter()
+            .map(|group| {
+                let rows = self.project_lines(group, &detached);
+                let (more, reading, error, total) = match group {
+                    Group::Detached => (false, false, None, rows.len()),
+                    listed => {
+                        let list = &state.lists[listed as usize];
+                        (
+                            // The daemon returns a cursor even on its last page.
+                            list.next.is_some() && list.rows.len() < list.total,
+                            list.reading && !list.read,
+                            list.error.clone(),
+                            list.total.max(rows.len()),
+                        )
+                    }
+                };
+                GroupView {
+                    group,
+                    total,
+                    more,
+                    reading,
+                    error,
+                    rows,
+                }
+            })
+            .collect();
+        let org = self
+            .nav
+            .organization
+            .groups
+            .iter()
+            .find(|group| group.project.as_deref() == Some(state.id.as_str()));
+        // The manager card: the assignment the sidebar read carries.
+        let manager = org.map(|group| {
+            let agent = group.manager.as_ref().map(|manager| {
+                let row = self.find_agent(&manager.agent);
+                ManagerLine {
+                    agent: row.cloned(),
+                    title: self.agent_title(&manager.agent),
+                    state: manager.state,
+                    words: [
+                        row.map(|row| {
+                            crate::picker::harness_model_label(&row.harness, row.model.as_deref())
+                        }),
+                        manager.branch.clone(),
+                        Some(crate::monitor::state_words(manager.state).to_owned()),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .collect::<Vec<_>>()
+                    .join(" · "),
+                }
+            });
+            ManagerView {
+                agent,
+                assignment: group
+                    .assignment
+                    .as_ref()
+                    .map(|assignment| format!("{:?}", assignment.state).to_lowercase()),
+                needs: group.needs_assignment,
+                transfer: group.transfer.clone(),
+                competing: group
+                    .conflicting_roots
+                    .iter()
+                    .map(|id| self.agent_title(id))
+                    .collect(),
+            }
+        });
+        // Queued launches and automation waits for this project.
+        let queued: Vec<String> = self
+            .nav
+            .organization
+            .queue
+            .as_ref()
+            .map(|queue| {
+                queue
+                    .interactive
+                    .iter()
+                    .filter(|intent| intent.project == state.id)
+                    .map(|intent| match &intent.reason {
+                        Some(reason) => {
+                            format!("Queued launch · {}", nav::wait_reason_words(reason))
+                        }
+                        None => "Queued launch".to_owned(),
+                    })
+                    .chain(
+                        queue
+                            .assignments
+                            .iter()
+                            .filter(|wait| wait.project == state.id)
+                            .map(|wait| {
+                                format!(
+                                    "{} waits · {}",
+                                    wait.rule,
+                                    nav::wait_reason_words(&wait.reason)
+                                )
+                            }),
+                    )
+                    .collect()
+            })
+            .unwrap_or_default();
+        let task_count = |key: &str| {
+            groups
+                .iter()
+                .flat_map(|group| &group.rows)
+                .filter(|line| {
+                    line.agent
+                        .workspace
+                        .as_deref()
+                        .is_some_and(|workspace| nav::path_key(workspace) == key)
+                })
+                .map(|line| line.title.clone())
+                .collect::<Vec<_>>()
+        };
+        let mut worktrees: Vec<WorktreeLine> = checkouts
             .iter()
             .map(|checkout| {
-                let key = nav::path_key(&checkout.path);
-                let tasks = groups
-                    .iter()
-                    .flat_map(|group| &group.rows)
-                    .filter(|line| {
-                        line.agent
-                            .workspace
-                            .as_deref()
-                            .is_some_and(|workspace| nav::path_key(workspace) == key)
-                    })
-                    .count();
+                let tasks = task_count(&nav::path_key(&checkout.path));
                 WorktreeLine {
                     branch: checkout
                         .branch
                         .clone()
                         .unwrap_or_else(|| "Detached".to_owned()),
-                    folder: nav::folder_name(&nav::display_path(&checkout.path)).to_owned(),
+                    folder: nav::display_path(&checkout.path),
                     path: checkout.path.clone(),
+                    state: if checkout.main {
+                        "Main checkout".to_owned()
+                    } else if checkout.branch.is_none() {
+                        "Detached".to_owned()
+                    } else {
+                        match tasks.len() {
+                            0 => "No task".to_owned(),
+                            1 => "1 task".to_owned(),
+                            count => format!("{count} tasks"),
+                        }
+                    },
                     main: checkout.main,
-                    tasks,
-                    partial,
+                    tasks: tasks.join(", "),
                 }
             })
             .collect();
-        worktrees.sort_by(|a, b| {
-            b.main
-                .cmp(&a.main)
-                .then(b.tasks.cmp(&a.tasks))
-                .then_with(|| a.branch.cmp(&b.branch))
-        });
+        worktrees.sort_by(|a, b| b.main.cmp(&a.main).then_with(|| a.branch.cmp(&b.branch)));
         let fields = self.settings.policy_of(&state.id);
-        let check = (!fields.argv.is_empty()).then(|| fields.argv.join(" "));
+        let check = (!fields.argv.is_empty()).then(|| CheckView {
+            command: fields.argv.join(" "),
+            runs: {
+                let rounds = if fields.max_rounds.trim().is_empty() {
+                    "3 rounds".to_owned()
+                } else {
+                    format!("{} rounds", fields.max_rounds.trim())
+                };
+                if fields.at_turn_end {
+                    format!("When a turn ends · {rounds}")
+                } else {
+                    format!("When asked · {rounds}")
+                }
+            },
+            scope: if fields.scope.is_empty() {
+                "Whole folder".to_owned()
+            } else {
+                fields.scope.join(", ")
+            },
+        });
         let usage = registered.map(|project| {
             let usage = &project.policy_usage;
             if usage.total == 0 {
@@ -326,20 +516,92 @@ impl DesktopApp {
                 )
             }
         });
+        let capacity = org.and_then(|group| group.capacity.as_ref()).map(|scope| {
+            let live: Vec<String> = groups
+                .iter()
+                .filter(|group| group.group == Group::Working)
+                .flat_map(|group| group.rows.iter().map(|line| line.title.clone()))
+                .collect();
+            CapacityView {
+                usage: scope.usage,
+                limit: scope.limit,
+                live: live.join(", "),
+            }
+        });
+        // This project's automations: its rules and the brief queues that
+        // start tasks in its checkout.
+        let key = nav::path_key(&state.checkout);
+        let cards: Vec<(String, crate::theme::StatusTone)> = self
+            .automation_cards()
+            .into_iter()
+            .filter(|card| {
+                card.rule
+                    .as_ref()
+                    .is_some_and(|rule| rule.key.0.as_deref() == Some(state.id.as_str()))
+                    || (card.assignment.is_some()
+                        && card.paths.iter().any(|(label, path)| {
+                            *label == "Works in" && nav::path_key(path) == key
+                        }))
+            })
+            .map(|card| (card.state.label(), card.state.tone()))
+            .collect();
+        let who = state.who.clone().map(|read| {
+            read.map(|reply| WhoView {
+                workers: reply
+                    .workers
+                    .iter()
+                    .map(|worker| who_line(worker, self.agent_title(&worker.agent)))
+                    .collect(),
+                shared: reply
+                    .shared
+                    .iter()
+                    .map(|shared| SharedLine {
+                        folder: nav::display_path(&shared.workspace),
+                        agents: shared
+                            .agents
+                            .iter()
+                            .map(|agent| self.agent_title(agent))
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                        count: shared.agents.len(),
+                        files: path_words(&shared.dirty, 3),
+                    })
+                    .collect(),
+                truncated: reply.truncated,
+            })
+        });
+        let target = self.row_target(&format!("project:{}", state.key));
         View::component::<ProjectView>(ProjectInput {
             palette,
+            width: self.page_width(tokens::page::WIDTH),
             name: self.place_title(&state.checkout),
             checkout: state.checkout.clone(),
+            key: state.key.clone(),
+            missing: registered.is_some_and(|project| project.missing),
             can_launch: self.can_launch_here(&state.checkout),
+            target,
             groups,
+            queued,
+            finished_open: state.finished_open,
+            competing_open: state.competing_open,
+            manager,
             worktrees,
             check,
-            at_turn_end: fields.at_turn_end,
             usage,
-            automations: self.project_automations(&state.id, &state.checkout),
+            capacity,
+            automations: cards,
+            who,
             send: context.forward(),
         })
     }
+}
+
+/// Whether `agent` works in one of the detached checkouts.
+fn in_detached(agent: &UiAgent, detached: &HashSet<String>) -> bool {
+    agent
+        .workspace
+        .as_deref()
+        .is_some_and(|workspace| detached.contains(&nav::path_key(workspace)))
 }
 
 /// What a task changed ("+12 −3"), when Git has reported it.
@@ -349,10 +611,79 @@ fn change_words(agent: &UiAgent) -> Option<String> {
     (added + removed > 0).then(|| format!("+{added} −{removed}"))
 }
 
+/// A task row's supporting line: its model, then its status line.
+fn task_line(agent: &UiAgent) -> String {
+    let model = crate::picker::harness_model_label(&agent.harness, agent.model.as_deref());
+    match &agent.status_line {
+        Some(status) => format!("{model} · {status}"),
+        None => model,
+    }
+}
+
+/// Up to `shown` paths by their file names, then "and N more".
+fn path_words(paths: &[String], shown: usize) -> String {
+    let names: Vec<&str> = paths
+        .iter()
+        .take(shown)
+        .map(|path| path.rsplit(['/', '\\']).next().unwrap_or(path))
+        .collect();
+    match paths.len().saturating_sub(shown) {
+        0 => names.join(" · "),
+        more => format!("{} and {more} more", names.join(" · ")),
+    }
+}
+
+/// One live Agent's entry in Who works where.
+fn who_line(worker: &eliot_core::api::WhoWorker, title: String) -> WhoLine {
+    let mut lines = Vec::new();
+    let edited: Vec<String> = worker
+        .dirty
+        .iter()
+        .chain(&worker.attributed_edits)
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    if !edited.is_empty() {
+        lines.push(format!("Not committed: {}", path_words(&edited, 2)));
+    }
+    if !worker.committed_paths.is_empty() {
+        lines.push(format!(
+            "Committed against the base: {}",
+            path_words(&worker.committed_paths, 2)
+        ));
+    }
+    for claim in &worker.claims {
+        let until = crate::config_view::local_time(claim.expires_at);
+        lines.push(match &claim.note {
+            Some(note) => format!("Claims {} · {note} · until {until}", claim.glob),
+            None => format!("Claims {} · until {until}", claim.glob),
+        });
+    }
+    if !worker.git_available {
+        lines.push("Git facts unavailable for its folder".to_owned());
+    } else if !worker.attribution_complete || worker.edits_truncated {
+        lines.push("Partial: more edits than listed".to_owned());
+    }
+    if lines.is_empty() {
+        lines.push("No changes yet".to_owned());
+    }
+    WhoLine {
+        title,
+        place: if worker.singly_owned {
+            "worktree".to_owned()
+        } else {
+            "shared checkout".to_owned()
+        },
+        lines,
+    }
+}
+
 #[derive(Clone, PartialEq)]
 struct TaskLine {
     agent: UiAgent,
     title: String,
+    line: String,
     trailing: String,
 }
 
@@ -371,25 +702,88 @@ struct WorktreeLine {
     branch: String,
     folder: String,
     path: String,
+    state: String,
     main: bool,
-    tasks: usize,
-    /// More tasks exist than are loaded: `tasks` is a lower bound.
-    partial: bool,
+    tasks: String,
+}
+
+#[derive(Clone, PartialEq)]
+struct ManagerLine {
+    agent: Option<UiAgent>,
+    title: String,
+    state: AgentState,
+    words: String,
+}
+
+#[derive(Clone, PartialEq)]
+struct ManagerView {
+    agent: Option<ManagerLine>,
+    assignment: Option<String>,
+    needs: bool,
+    transfer: Option<String>,
+    competing: Vec<String>,
+}
+
+#[derive(Clone, PartialEq)]
+struct CheckView {
+    command: String,
+    runs: String,
+    scope: String,
+}
+
+#[derive(Clone, PartialEq)]
+struct CapacityView {
+    usage: usize,
+    limit: Option<u64>,
+    live: String,
+}
+
+#[derive(Clone, PartialEq)]
+struct WhoLine {
+    title: String,
+    place: String,
+    lines: Vec<String>,
+}
+
+#[derive(Clone, PartialEq)]
+struct SharedLine {
+    folder: String,
+    agents: String,
+    count: usize,
+    files: String,
+}
+
+#[derive(Clone, PartialEq)]
+struct WhoView {
+    workers: Vec<WhoLine>,
+    shared: Vec<SharedLine>,
+    truncated: bool,
 }
 
 /// What the project page shows, read by the window.
 #[derive(Clone, PartialEq)]
 pub(super) struct ProjectInput {
     palette: Palette,
+    /// The page column's width.
+    width: Option<f64>,
     name: String,
     checkout: String,
+    key: String,
+    missing: bool,
     can_launch: bool,
+    /// The project's row menu (the sidebar's), when the sidebar lists it.
+    target: Option<MenuTarget>,
     groups: Vec<GroupView>,
+    queued: Vec<String>,
+    finished_open: bool,
+    competing_open: bool,
+    manager: Option<ManagerView>,
     worktrees: Vec<WorktreeLine>,
-    check: Option<String>,
-    at_turn_end: bool,
+    check: Option<CheckView>,
     usage: Option<String>,
-    automations: Vec<String>,
+    capacity: Option<CapacityView>,
+    automations: Vec<(String, crate::theme::StatusTone)>,
+    who: Option<Fallible<WhoView>>,
     send: Callback<Message>,
 }
 
@@ -417,204 +811,671 @@ impl Component for ProjectView {
 
     fn view(&self, input: &ProjectInput, context: &mut ViewContext<Self>) -> View {
         let palette = input.palette;
-        let summary = input
-            .groups
-            .iter()
-            .map(|group| format!("{} {}", group.total, group.group.title().to_lowercase()))
-            .collect::<Vec<_>>()
-            .join(" · ");
-        let new_task = m3::filled(palette)
-            .is_enabled(input.can_launch)
-            .automation_name(format!("New task in {}", input.name))
-            .on_click(context.message(Message::Shell(ShellMsg::ProjectPicked(
-                input.checkout.clone(),
-            ))))
-            .content(m3::icon_label(m3::glyph::NEW_TASK, "New task"));
-        let mut items = vec![KeyedView::new(
-            "header",
-            m3::page_header(&input.name, &summary, Some(new_task)),
+        let mut actions: Vec<KeyedView> = vec![KeyedView::new(
+            format!("new:{}", input.can_launch),
+            m3::filled(palette)
+                .is_enabled(input.can_launch)
+                .automation_name(format!("New task in {}", input.name))
+                .on_click(context.message(Message::Shell(ShellMsg::ProjectPicked(
+                    input.checkout.clone(),
+                ))))
+                .content(m3::icon_label(m3::glyph::NEW_TASK, "New task")),
         )];
-        for group in &input.groups {
-            if group.rows.is_empty() && group.error.is_none() && !group.reading {
-                continue;
-            }
-            items.push(KeyedView::new(
-                format!("group:{:?}", group.group),
-                group_view(group, context, palette),
+        if let Some(target) = &input.target {
+            actions.push(KeyedView::new(
+                "more",
+                m3::icon_button(palette)
+                    .automation_id(format!(
+                        "{}project:{}",
+                        super::menu_ui::MORE_ID_PREFIX,
+                        input.key
+                    ))
+                    .automation_name(format!("Project actions for {}", input.name))
+                    .on_click(context.message(Message::Menu(MenuMsg::Opened(target.clone()))))
+                    .content(m3::icon(m3::glyph::MORE))
+                    .tooltip("Project actions"),
             ));
         }
-        items.push(KeyedView::new(
-            "worktrees",
-            worktrees_view(&input.worktrees, context, palette),
-        ));
-        items.push(KeyedView::new("work", work_view(input, context, palette)));
-        ScrollViewer::new()
-            .vertical_scroll_bar_visibility(ScrollBarVisibility::Auto)
-            .automation_name(format!("Project {}", input.name))
-            .content(
+        let path = nav::display_path(&input.checkout);
+        let heading =
+            StackPanel::new().children((
+                page_ui::title(input.name.clone()),
                 StackPanel::new()
-                    .max_width(tokens::layout::SETTINGS_WIDTH)
-                    .horizontal_alignment(HorizontalAlignment::Stretch)
-                    .spacing(tokens::spacing::MD)
-                    .margin(Thickness::new(
-                        tokens::spacing::XL,
-                        tokens::spacing::LG,
-                        tokens::spacing::XL,
-                        tokens::spacing::XL,
-                    ))
-                    .keyed_children(items),
-            )
-    }
-}
-
-fn group_view(group: &GroupView, context: &mut ViewContext<ProjectView>, palette: Palette) -> View {
-    let title = group.group.title();
-    let mut rows: Vec<KeyedView> = vec![KeyedView::new(
-        "title",
-        m3::muted(format!("{title} · {}", group.total), tokens::text::LABEL),
-    )];
-    if group.reading {
-        rows.push(KeyedView::new("reading", m3::secondary("Reading…")));
-    }
-    if let Some(error) = &group.error {
-        rows.push(KeyedView::new(
-            "error",
-            m3::secondary(format!("Not read: {error}"))
-                .foreground(palette.attention())
-                .text_wrapping(TextWrapping::Wrap),
-        ));
-    }
-    for line in &group.rows {
-        let agent = &line.agent;
-        let ended = matches!(agent.state, AgentState::Stopped);
-        let content = Grid::new()
-            .columns([GridLength::Auto, GridLength::STAR])
-            .column_spacing(tokens::spacing::ROW)
-            .children((
-                m3::status_mark(
-                    palette,
-                    StatusTone::of_state(agent.state),
-                    tokens::layout::DOT,
-                ),
-                Border::new().grid_column(1).content(m3::task_content(
-                    0,
-                    &line.title,
-                    ended,
-                    m3::secondary(line.trailing.clone()).into(),
-                    None,
-                )),
+                    .orientation(Orientation::Horizontal)
+                    .spacing(tokens::spacing::XS)
+                    .children((
+                        m3::secondary(format!("{path} ·"))
+                            .vertical_alignment(VerticalAlignment::Center)
+                            .text_trimming(TextTrimming::CharacterEllipsis),
+                        m3::text_button(palette)
+                            .height(tokens::text::CAPTION.line_height)
+                            .min_height(0.0)
+                            .margin(Thickness::new(
+                                -tokens::spacing::ROW,
+                                0.0,
+                                -tokens::spacing::ROW,
+                                0.0,
+                            ))
+                            .automation_name(format!("Open folder {path}"))
+                            .on_click(context.message(Message::Reveal(
+                                input.name.clone(),
+                                input.checkout.clone(),
+                            )))
+                            .content(m3::text("Open folder", tokens::text::CAPTION)),
+                    )),
             ));
-        rows.push(KeyedView::new(
-            agent.id.clone(),
-            m3::row(palette, false)
-                .automation_name(format!("Open {}, {title}", line.title))
-                .on_click(context.message(Message::Shell(ShellMsg::AgentOpened(agent.clone()))))
-                .content(content),
+        let mut items = vec![KeyedView::new("header", page_ui::toolbar(heading, actions))];
+        if input.missing {
+            items.push(KeyedView::new(
+                "missing",
+                page_ui::read_failed(
+                    palette,
+                    "Folder not found: the checkout is gone from disk.",
+                    "Remove",
+                    true,
+                    context.message(Message::Shell(ShellMsg::SettingsPage(Page::Projects))),
+                ),
+            ));
+        }
+        let left = vec![
+            KeyedView::new("manager", manager_panel(input, context, palette)),
+            KeyedView::new("tasks", tasks_panel(input, context, palette)),
+            KeyedView::new("check", check_panel(input, context, palette)),
+        ];
+        let right = vec![
+            KeyedView::new("who", who_panel(input, palette)),
+            KeyedView::new("worktrees", worktrees_panel(input, context, palette)),
+            KeyedView::new("capacity", capacity_panel(input, context, palette)),
+            KeyedView::new("automations", automations_panel(input, context, palette)),
+        ];
+        items.push(KeyedView::new(
+            "columns",
+            page_ui::columns(left, tokens::spacing::MD, right),
         ));
+        page_ui::page(&format!("Project {}", input.name), input.width, items)
     }
-    if group.more {
-        rows.push(KeyedView::new(
-            "more",
-            m3::text_button(palette)
-                .automation_name(format!("Show more {title}"))
-                .on_click(context.message(Message::Project(ProjectMsg::More(group.group))))
-                .content(m3::label("Show more")),
-        ));
-    }
-    StackPanel::new()
-        .spacing(tokens::spacing::ROW_GAP)
-        .keyed_children(rows)
 }
 
-fn worktrees_view(
-    worktrees: &[WorktreeLine],
+/// A row of the Tasks panel (`.item`): the state mark, the title and its
+/// line, the age or +/− at the end; it opens the conversation.
+fn task_row(
+    line: &TaskLine,
+    group: &str,
     context: &mut ViewContext<ProjectView>,
     palette: Palette,
 ) -> View {
-    let mut rows: Vec<KeyedView> = vec![KeyedView::new(
-        "title",
-        m3::muted(
-            format!("Branches and worktrees · {}", worktrees.len()),
-            tokens::text::LABEL,
-        ),
-    )];
-    for line in worktrees {
-        let count = match (line.tasks, line.partial) {
-            (0, _) => String::new(),
-            (tasks, true) => format!("{tasks}+ tasks"),
-            (1, false) => "1 task".to_owned(),
-            (tasks, false) => format!("{tasks} tasks"),
-        };
-        let trailing = match (line.main, count.is_empty()) {
-            (true, true) => "main checkout".to_owned(),
-            (true, false) => format!("main checkout · {count}"),
-            (false, _) => count,
-        };
-        rows.push(KeyedView::new(
-            line.path.clone(),
-            m3::row(palette, false)
-                .automation_name(format!("Open folder of {}", line.branch))
-                .on_click(context.message(Message::Reveal(line.branch.clone(), line.path.clone())))
-                .content(m3::row_content(
-                    Some(m3::glyph::WORKTREE),
-                    &line.branch,
-                    &line.folder,
-                    m3::secondary(trailing).into(),
+    let agent = &line.agent;
+    let waiting = matches!(agent.state, AgentState::Waiting);
+    let content = Grid::new()
+        .columns([GridLength::Auto, GridLength::STAR, GridLength::Auto])
+        .column_spacing(tokens::spacing::INSET)
+        .children((
+            Border::new()
+                .vertical_alignment(VerticalAlignment::Center)
+                .content(page_ui::agent_mark(
+                    palette,
+                    agent.state,
+                    agent.status_line.as_deref(),
                 )),
+            Border::new()
+                .grid_column(1)
+                .content(page_ui::two_lines(&line.title, &line.line)),
+            page_ui::age(line.trailing.clone()).grid_column(2),
         ));
+    let row = m3::row(palette, false)
+        .min_height(tokens::height::TWO_LINE_ROW)
+        .automation_name(format!("Open {}, {group}", line.title))
+        .on_click(context.message(Message::Shell(ShellMsg::AgentOpened(agent.clone()))))
+        .content(content);
+    if waiting {
+        Border::new()
+            .background(palette.tonal())
+            .corner_radius(tokens::radius::CONTAINER)
+            .content(row)
+    } else {
+        row
     }
-    StackPanel::new()
-        .spacing(tokens::spacing::ROW_GAP)
-        .keyed_children(rows)
 }
 
-fn work_view(
+/// A group's label row (`.lab`), with an optional action at its end.
+fn group_label(text: String, action: Option<View>) -> View {
+    Grid::new()
+        .min_height(tokens::height::CONTROL)
+        .columns([GridLength::STAR, GridLength::Auto])
+        .children((
+            m3::muted(text, tokens::text::LABEL)
+                .margin(Thickness::new(tokens::spacing::XS, 0.0, 0.0, 0.0))
+                .vertical_alignment(VerticalAlignment::Center),
+            Border::new()
+                .grid_column(1)
+                .content(action.unwrap_or_else(View::empty)),
+        ))
+}
+
+fn tasks_panel(
     input: &ProjectInput,
     context: &mut ViewContext<ProjectView>,
     palette: Palette,
 ) -> View {
-    let check_title = input.check.as_deref().unwrap_or("No check set");
-    let mut check_note = input.usage.clone().unwrap_or_default();
-    if input.check.is_some() && input.at_turn_end {
-        check_note = format!("Runs when a turn ends · {check_note}");
+    let mut rows: Vec<KeyedView> = vec![KeyedView::new("head", page_ui::panel_head("Tasks", None))];
+    let mut any = false;
+    for group in &input.groups {
+        let title = group.group.title();
+        let queued = if group.group == Group::Ready {
+            input.queued.as_slice()
+        } else {
+            &[]
+        };
+        if group.rows.is_empty() && group.error.is_none() && !group.reading && queued.is_empty() {
+            continue;
+        }
+        any = true;
+        let finished = group.group == Group::Finished;
+        let open = !finished || input.finished_open;
+        let action: Option<View> = finished.then(|| {
+            m3::text_button(palette)
+                .automation_name(format!(
+                    "{} finished tasks",
+                    if open { "Hide" } else { "Show" }
+                ))
+                .on_click(context.message(Message::Project(ProjectMsg::FinishedToggled)))
+                .content(m3::label(if open { "Hide" } else { "Show" }))
+        });
+        rows.push(KeyedView::new(
+            format!("label:{title}:{open}"),
+            group_label(format!("{title} · {}", group.total + queued.len()), action),
+        ));
+        if !open {
+            continue;
+        }
+        if group.reading {
+            rows.push(KeyedView::new(
+                format!("reading:{title}"),
+                page_ui::quiet("Reading…"),
+            ));
+        }
+        if let Some(error) = &group.error {
+            rows.push(KeyedView::new(
+                format!("error:{title}"),
+                page_ui::read_failed(
+                    palette,
+                    format!("Not read: {error}"),
+                    "Retry",
+                    true,
+                    context.message(Message::Project(ProjectMsg::Retry)),
+                ),
+            ));
+        }
+        for line in &group.rows {
+            rows.push(KeyedView::new(
+                line.agent.id.clone(),
+                task_row(line, title, context, palette),
+            ));
+        }
+        for (index, wait) in queued.iter().enumerate() {
+            rows.push(KeyedView::new(
+                format!("queued:{index}"),
+                Grid::new()
+                    .min_height(tokens::height::CONTROL)
+                    .margin(Thickness::xy(tokens::spacing::ROW, 0.0))
+                    .columns([GridLength::Auto, GridLength::STAR])
+                    .column_spacing(tokens::spacing::INSET)
+                    .children((
+                        Border::new()
+                            .vertical_alignment(VerticalAlignment::Center)
+                            .content(m3::row_mark(palette, m3::RowMark::Queued, "Queued")),
+                        m3::secondary(wait.clone())
+                            .grid_column(1)
+                            .vertical_alignment(VerticalAlignment::Center)
+                            .text_wrapping(TextWrapping::Wrap),
+                    )),
+            ));
+        }
+        if group.more {
+            rows.push(KeyedView::new(
+                format!("more:{title}"),
+                m3::text_button(palette)
+                    .horizontal_alignment(HorizontalAlignment::Left)
+                    .automation_name(format!("Show more {title}"))
+                    .on_click(context.message(Message::Project(ProjectMsg::More(group.group))))
+                    .content(m3::label("Show more")),
+            ));
+        }
     }
-    let automations = match input.automations.len() {
+    if !any {
+        rows.push(KeyedView::new(
+            "none",
+            page_ui::quiet("No tasks in the last 24 h"),
+        ));
+    }
+    page_ui::panel(palette, tokens::spacing::ROW_GAP, rows)
+}
+
+fn manager_panel(
+    input: &ProjectInput,
+    context: &mut ViewContext<ProjectView>,
+    palette: Palette,
+) -> View {
+    let mut rows: Vec<KeyedView> =
+        vec![KeyedView::new("head", page_ui::panel_head("Manager", None))];
+    match &input.manager {
+        None => rows.push(KeyedView::new("reading", page_ui::quiet("Reading…"))),
+        Some(manager) => {
+            match &manager.agent {
+                Some(line) => {
+                    let content = Grid::new()
+                        .columns([GridLength::Auto, GridLength::STAR])
+                        .column_spacing(tokens::spacing::INSET)
+                        .children((
+                            Border::new()
+                                .vertical_alignment(VerticalAlignment::Center)
+                                .content(page_ui::state_mark(palette, line.state)),
+                            Border::new()
+                                .grid_column(1)
+                                .content(page_ui::two_lines(&line.title, &line.words)),
+                        ));
+                    let agent: View = match &line.agent {
+                        Some(agent) => m3::row(palette, false)
+                            .min_height(tokens::height::TWO_LINE_ROW)
+                            .automation_name(format!("Open the manager {}", line.title))
+                            .on_click(
+                                context
+                                    .message(Message::Shell(ShellMsg::AgentOpened(agent.clone()))),
+                            )
+                            .content(content),
+                        None => content,
+                    };
+                    rows.push(KeyedView::new("agent", agent));
+                }
+                None => rows.push(KeyedView::new(
+                    "none",
+                    page_ui::quiet(if manager.needs {
+                        "This project has no manager; its top-level tasks wait for one."
+                    } else {
+                        "This project has no manager."
+                    }),
+                )),
+            }
+            if let Some(assignment) = &manager.assignment
+                && assignment != "active"
+            {
+                rows.push(KeyedView::new(
+                    "assignment",
+                    page_ui::quiet(format!("Assignment: {assignment}")),
+                ));
+            }
+            if let Some(transfer) = &manager.transfer {
+                rows.push(KeyedView::new(
+                    "transfer",
+                    strip(
+                        palette,
+                        m3::glyph::MOVE,
+                        &format!("Handing over the project (transfer {transfer})"),
+                        None,
+                    ),
+                ));
+            }
+            if !manager.competing.is_empty() {
+                let count = manager.competing.len();
+                let open = input.competing_open;
+                rows.push(KeyedView::new(
+                    format!("competing:{open}"),
+                    strip(
+                        palette,
+                        m3::glyph::GROUP,
+                        &format!(
+                            "{} compete{} with the manager",
+                            eliot_core::count_words(
+                                count as u64,
+                                "other top-level task",
+                                "other top-level tasks"
+                            ),
+                            if count == 1 { "s" } else { "" }
+                        ),
+                        Some(
+                            m3::text_button(palette)
+                                .automation_name(if open {
+                                    "Hide the competing tasks"
+                                } else {
+                                    "Show the competing tasks"
+                                })
+                                .on_click(
+                                    context.message(Message::Project(ProjectMsg::CompetingToggled)),
+                                )
+                                .content(m3::label(if open { "Hide" } else { "Show" })),
+                        ),
+                    ),
+                ));
+                if open {
+                    rows.push(KeyedView::new(
+                        "competing-list",
+                        m3::secondary(manager.competing.join(", "))
+                            .text_wrapping(TextWrapping::Wrap),
+                    ));
+                }
+            }
+        }
+    }
+    page_ui::panel(palette, tokens::spacing::SM, rows)
+}
+
+/// An attention strip (`.strip`) inside a panel: `tertiary-container`, an
+/// icon, one line and an optional action.
+fn strip(palette: Palette, glyph: &str, text: &str, action: Option<View>) -> View {
+    let (fill, on) = palette.badge();
+    Border::new()
+        .background(fill)
+        .corner_radius(tokens::radius::CONTAINER)
+        .min_height(tokens::height::CONTROL + tokens::spacing::SM)
+        .padding(Thickness::new(
+            tokens::spacing::INSET,
+            0.0,
+            tokens::spacing::XS,
+            0.0,
+        ))
+        .content(
+            Grid::new()
+                .columns([GridLength::Auto, GridLength::STAR, GridLength::Auto])
+                .column_spacing(tokens::spacing::SM)
+                .children((
+                    m3::carrier(
+                        palette,
+                        |scheme| scheme.on_tertiary_container,
+                        "",
+                        tokens::icon::ROW,
+                        m3::small_icon(glyph),
+                    ),
+                    m3::text(text.to_owned(), tokens::text::BODY)
+                        .grid_column(1)
+                        .foreground(on)
+                        .vertical_alignment(VerticalAlignment::Center)
+                        .text_wrapping(TextWrapping::Wrap),
+                    Border::new()
+                        .grid_column(2)
+                        .vertical_alignment(VerticalAlignment::Center)
+                        .content(action.unwrap_or_else(View::empty)),
+                )),
+        )
+}
+
+fn check_panel(
+    input: &ProjectInput,
+    context: &mut ViewContext<ProjectView>,
+    palette: Palette,
+) -> View {
+    let edit: View = m3::text_button(palette)
+        .automation_name("Edit project check")
+        .on_click(context.message(Message::Project(ProjectMsg::EditCheck)))
+        .content(m3::label("Edit"));
+    let mut rows = vec![KeyedView::new(
+        "head",
+        page_ui::panel_head("Project check", Some(edit)),
+    )];
+    match &input.check {
+        Some(check) => {
+            rows.push(KeyedView::new(
+                "command",
+                page_ui::kv_text("Command", check.command.clone()),
+            ));
+            rows.push(KeyedView::new(
+                "runs",
+                page_ui::kv_text("Runs", check.runs.clone()),
+            ));
+            rows.push(KeyedView::new(
+                "scope",
+                page_ui::kv_text("Can change", check.scope.clone()),
+            ));
+        }
+        None => rows.push(KeyedView::new("none", page_ui::quiet("No check set"))),
+    }
+    if let Some(usage) = &input.usage {
+        rows.push(KeyedView::new("usage", page_ui::quiet(usage.clone())));
+    }
+    page_ui::panel(palette, tokens::spacing::SM, rows)
+}
+
+fn who_panel(input: &ProjectInput, palette: Palette) -> View {
+    let mut rows = vec![KeyedView::new(
+        "head",
+        page_ui::panel_head("Who works where", None),
+    )];
+    match &input.who {
+        None => rows.push(KeyedView::new("reading", page_ui::quiet("Reading…"))),
+        Some(Err(error)) => rows.push(KeyedView::new(
+            "error",
+            page_ui::error_line(palette, format!("Not read: {error}")),
+        )),
+        Some(Ok(who)) => {
+            if who.workers.is_empty() && who.shared.is_empty() {
+                rows.push(KeyedView::new(
+                    "none",
+                    page_ui::quiet("No Agent works here now."),
+                ));
+            }
+            for (index, worker) in who.workers.iter().enumerate() {
+                let mut parts: Vec<KeyedView> = vec![KeyedView::new(
+                    "head",
+                    Grid::new()
+                        .columns([GridLength::STAR, GridLength::Auto])
+                        .column_spacing(tokens::spacing::SM)
+                        .children((
+                            m3::text(worker.title.clone(), tokens::page::HEADING)
+                                .text_trimming(TextTrimming::CharacterEllipsis),
+                            m3::secondary(worker.place.clone()).grid_column(1),
+                        )),
+                )];
+                for (line_index, line) in worker.lines.iter().enumerate() {
+                    parts.push(KeyedView::new(
+                        line_index,
+                        m3::secondary(line.clone())
+                            .text_wrapping(TextWrapping::Wrap)
+                            .is_text_selection_enabled(true),
+                    ));
+                }
+                rows.push(KeyedView::new(
+                    format!("worker:{index}"),
+                    who_entry(palette, parts),
+                ));
+            }
+            for (index, shared) in who.shared.iter().enumerate() {
+                let mut parts: Vec<KeyedView> = vec![KeyedView::new(
+                    "head",
+                    Grid::new()
+                        .columns([GridLength::STAR, GridLength::Auto])
+                        .column_spacing(tokens::spacing::SM)
+                        .children((
+                            m3::text("Shared checkout", tokens::page::HEADING),
+                            m3::secondary(format!("{} Agents", shared.count)).grid_column(1),
+                        )),
+                )];
+                parts.push(KeyedView::new(
+                    "agents",
+                    m3::secondary(format!("{} · {}", shared.agents, shared.folder))
+                        .text_wrapping(TextWrapping::Wrap),
+                ));
+                if !shared.files.is_empty() {
+                    parts.push(KeyedView::new(
+                        "files",
+                        m3::secondary(format!("Not committed: {}", shared.files))
+                            .text_wrapping(TextWrapping::Wrap),
+                    ));
+                }
+                rows.push(KeyedView::new(
+                    format!("shared:{index}"),
+                    who_entry(palette, parts),
+                ));
+            }
+            if who.truncated {
+                rows.push(KeyedView::new(
+                    "truncated",
+                    page_ui::quiet("More Agents work here than listed."),
+                ));
+            }
+            rows.push(KeyedView::new(
+                "source",
+                page_ui::quiet("From Git, not from what agents say."),
+            ));
+        }
+    }
+    page_ui::panel(palette, tokens::spacing::SM, rows)
+}
+
+/// One entry of Who works where (`.who`): a hairline under it.
+fn who_entry(palette: Palette, parts: Vec<KeyedView>) -> View {
+    Border::new()
+        .border_brush(palette.outline())
+        .border_thickness(Thickness::new(0.0, 0.0, 0.0, tokens::layout::HAIRLINE))
+        .padding(Thickness::xy(0.0, tokens::spacing::CHIP_GAP))
+        .content(
+            StackPanel::new()
+                .spacing(tokens::spacing::ROW_GAP)
+                .keyed_children(parts),
+        )
+}
+
+fn worktrees_panel(
+    input: &ProjectInput,
+    context: &mut ViewContext<ProjectView>,
+    palette: Palette,
+) -> View {
+    let mut rows = vec![KeyedView::new(
+        "head",
+        page_ui::panel_head("Branches & worktrees", None),
+    )];
+    if input.worktrees.is_empty() {
+        rows.push(KeyedView::new(
+            "none",
+            page_ui::quiet("No checkouts read yet."),
+        ));
+    }
+    for line in &input.worktrees {
+        let caption = if line.tasks.is_empty() {
+            line.folder.clone()
+        } else {
+            format!("{} · {}", line.tasks, line.folder)
+        };
+        rows.push(KeyedView::new(
+            line.path.clone(),
+            m3::row(palette, false)
+                .min_height(tokens::height::TWO_LINE_ROW)
+                .automation_name(format!("Open folder of {}: {}", line.branch, line.folder))
+                .on_click(context.message(Message::Reveal(line.branch.clone(), line.path.clone())))
+                .content(
+                    StackPanel::new()
+                        .vertical_alignment(VerticalAlignment::Center)
+                        .children((
+                            Grid::new()
+                                .columns([
+                                    GridLength::STAR,
+                                    GridLength::Pixel(tokens::page::BRANCH_STATE),
+                                ])
+                                .column_spacing(tokens::spacing::SM)
+                                .children((
+                                    m3::body(line.branch.clone())
+                                        .text_trimming(TextTrimming::CharacterEllipsis),
+                                    m3::secondary(line.state.clone())
+                                        .grid_column(1)
+                                        .horizontal_alignment(HorizontalAlignment::Right)
+                                        .text_trimming(TextTrimming::CharacterEllipsis),
+                                )),
+                            m3::secondary(caption).text_trimming(TextTrimming::CharacterEllipsis),
+                        )),
+                )
+                .tooltip("Open in Explorer"),
+        ));
+    }
+    page_ui::panel(palette, tokens::spacing::ROW_GAP, rows)
+}
+
+fn capacity_panel(
+    input: &ProjectInput,
+    context: &mut ViewContext<ProjectView>,
+    palette: Palette,
+) -> View {
+    let edit: View = m3::text_button(palette)
+        .automation_name("Edit capacity in config.toml")
+        .on_click(context.message(Message::Settings(SettingsMsg::OpenConfig)))
+        .content(m3::link_content("Edit"))
+        .tooltip("Capacity is set in config.toml ([capacity])");
+    let mut rows = vec![KeyedView::new(
+        "head",
+        page_ui::panel_head("Capacity", Some(edit)),
+    )];
+    match &input.capacity {
+        None => rows.push(KeyedView::new("none", page_ui::quiet("Not read yet."))),
+        Some(capacity) => {
+            let at_once = match capacity.limit {
+                Some(0) => "Closed: new launches wait".to_owned(),
+                Some(limit) => format!("{} of {limit}", capacity.usage),
+                None => format!("{} · no limit", capacity.usage),
+            };
+            let at_once = if capacity.live.is_empty() {
+                at_once
+            } else {
+                format!("{at_once} · {}", capacity.live)
+            };
+            rows.push(KeyedView::new(
+                "at-once",
+                page_ui::kv_text("At once", at_once),
+            ));
+            if let Some(limit) = capacity.limit.filter(|limit| *limit > 0) {
+                let share = capacity.usage as f64 * 100.0 / limit as f64;
+                rows.push(KeyedView::new(
+                    format!("meter:{}", share.round()),
+                    m3::meter(palette, share, false),
+                ));
+            }
+        }
+    }
+    page_ui::panel(palette, tokens::spacing::SM, rows)
+}
+
+fn automations_panel(
+    input: &ProjectInput,
+    context: &mut ViewContext<ProjectView>,
+    palette: Palette,
+) -> View {
+    let manage: View = m3::text_button(palette)
+        .automation_name("Manage automations")
+        .on_click(context.message(Message::Shell(ShellMsg::PlaceOpened(
+            super::page_ui::Place::Automations,
+        ))))
+        .content(m3::label("Manage"));
+    let running = input
+        .automations
+        .iter()
+        .filter(|(label, _)| label == "Running")
+        .count();
+    let attention = input
+        .automations
+        .iter()
+        .filter(|(_, tone)| {
+            matches!(
+                tone,
+                crate::theme::StatusTone::Attention | crate::theme::StatusTone::Failed
+            )
+        })
+        .count();
+    let summary = match input.automations.len() {
         0 => "None for this project".to_owned(),
-        count if count <= 3 => input.automations.join(", "),
-        count => format!(
-            "{} and {} more",
-            input.automations[..3].join(", "),
-            count - 3
-        ),
+        total => {
+            let mut parts = vec![format!("{running} running")];
+            if attention > 0 {
+                parts.push(format!("{attention} need attention"));
+            }
+            let rest = total - running - attention;
+            if rest > 0 {
+                parts.push(format!("{rest} off or paused"));
+            }
+            parts.join(" · ")
+        }
     };
-    m3::settings_card(
+    page_ui::panel(
         palette,
+        tokens::spacing::SM,
         vec![
-            KeyedView::new(
-                "check",
-                m3::setting_row(
-                    "Project check",
-                    &format!("{check_title}\n{check_note}"),
-                    m3::text_button(palette)
-                        .automation_name("Edit project check")
-                        .on_click(context.message(Message::Project(ProjectMsg::EditCheck)))
-                        .content(m3::label("Edit")),
-                ),
-            ),
-            KeyedView::new(
-                "automation",
-                m3::setting_row(
-                    "Automations",
-                    &automations,
-                    m3::text_button(palette)
-                        .automation_name("Manage automations")
-                        .on_click(
-                            context
-                                .message(Message::Shell(ShellMsg::SettingsPage(Page::Automations))),
-                        )
-                        .content(m3::label("Manage")),
-                ),
-            ),
+            KeyedView::new("head", page_ui::panel_head("Automations", Some(manage))),
+            KeyedView::new(format!("summary:{summary}"), m3::body(summary)),
         ],
     )
 }

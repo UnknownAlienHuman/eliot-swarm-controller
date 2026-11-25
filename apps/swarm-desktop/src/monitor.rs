@@ -41,6 +41,41 @@ use crate::client::{self, MAX_CONCURRENT_READS};
 
 /// Refresh period while the monitor is open.
 pub const PERIOD_MS: u64 = 2_000;
+/// Without an event, the fleet (its CPU and memory samples) is read again
+/// after this long; an event reads it at once (no sooner than
+/// [`PERIOD_MS`] after the last read).
+pub const QUIET_PERIOD_MS: u64 = 10_000;
+/// While the window is minimized or hidden the reads pause; it is checked
+/// this often, locally (no daemon request).
+pub const HIDDEN_CHECK_MS: u64 = 500;
+/// The events that change what the fleet shows: lifecycle, turns,
+/// requests and attention reports (not tool or token traffic).
+pub const FLEET_KINDS: [&str; 14] = [
+    "agent.created",
+    "agent.failed",
+    "agent.lost",
+    "agent.stopped",
+    "session.ready",
+    "session.ended",
+    "turn.started",
+    "turn.completed",
+    "turn.unknown",
+    "turn.resolved",
+    "request.opened",
+    "request.closed",
+    "request.resolved",
+    ATTENTION_KIND,
+];
+
+/// The event filter the fleet follows: every Agent's [`FLEET_KINDS`], or
+/// one Agent's while only its Details show.
+pub fn fleet_filter(agent: Option<&str>) -> eliot_core::api::EventsFilter {
+    eliot_core::api::EventsFilter {
+        agents: agent.map(str::to_owned).into_iter().collect(),
+        kinds: FLEET_KINDS.iter().map(|kind| (*kind).to_owned()).collect(),
+        sources: Vec::new(),
+    }
+}
 /// Rows displayed per live state from the bounded fleet page.
 pub const ROWS_PER_STATE: usize = 100;
 /// Total live rows read in one page; per-state counts reveal any shortfall.
@@ -89,27 +124,6 @@ pub enum Group {
     Idle,
     UnparentedSubagents,
     Stopped,
-}
-
-impl Group {
-    /// The state filter's word for the group.
-    pub fn filter_label(self) -> &'static str {
-        match self {
-            Self::Attention => "Attention",
-            Self::Stopped => "Stopped",
-            other => other.title(),
-        }
-    }
-
-    pub fn title(self) -> &'static str {
-        match self {
-            Self::Attention => "Needs attention",
-            Self::Working => "Working",
-            Self::Idle => "Idle",
-            Self::UnparentedSubagents => "Subagents without a visible parent",
-            Self::Stopped => "Recently stopped",
-        }
-    }
 }
 
 /// One open attention report: its incident and reason code.
@@ -973,6 +987,9 @@ pub struct DetailRead {
     pub agent: AgentGetResponse,
     pub usage: Result<UsageSummaryResponse, String>,
     pub diagnosis: Result<DiagnoseResponse, String>,
+    /// Usage and diagnosis were read this time (a selection change); else
+    /// the last ones of the same generation stay.
+    pub fresh: bool,
 }
 
 /// Last successful reads of the selected Agent and its supplemental data.
@@ -1047,6 +1064,10 @@ pub struct MonitorSnapshot {
     /// `swarm why` summaries of the lost or failed generations it read.
     pub losses: Vec<((String, i64), Result<DiagnoseResponse, String>)>,
     pub read_at_ms: i64,
+    /// The fleet was read (the Agents page shows); else only Details.
+    pub fleet: bool,
+    /// The event cursor the next wait starts from.
+    pub event_cursor: Option<i64>,
 }
 
 /// One monitor section: its top-level rows (each with its nested
@@ -1227,35 +1248,15 @@ pub struct ProjectRef {
     pub name: String,
 }
 
-/// One Agent the overview counts: its row, its own live group and its
-/// project.
-#[derive(Clone, Debug)]
-pub struct Counted<'a> {
-    pub row: &'a MonitorRow,
-    pub group: Group,
-    pub project: ProjectRef,
-}
-
-/// What the list below the overview is narrowed to: the state the owner
-/// chose (kept while no Agent is in it: the list says so) and the search.
+/// The Agents page's search.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Filter {
-    pub group: Option<Group>,
     /// The search field's text: a row matches when its title, id, harness,
     /// model or project contains it, case-insensitively (k195 P3-2).
     pub text: String,
 }
 
-/// The states the Monitor's state filter offers, in its order (`None`:
-/// every state).
-/// The Monitor's state filter; what needs the owner is the Inbox pane.
-pub const STATE_FILTERS: [Option<Group>; 3] = [None, Some(Group::Working), Some(Group::Idle)];
-
 impl Filter {
-    pub fn is_active(&self) -> bool {
-        self.group.is_some() || !self.text.trim().is_empty()
-    }
-
     /// Whether `row`, in the project named `project`, matches the search
     /// text (an empty search matches every row).
     pub fn matches_text(&self, row: &MonitorRow, project: &str) -> bool {
@@ -1273,68 +1274,6 @@ impl Filter {
         ]
         .iter()
         .any(|field| field.to_lowercase().contains(&wanted))
-    }
-
-    /// Whether a recently stopped `row` stays under this filter: the state
-    /// filter is every state or Stopped and the text matches.
-    pub fn keeps_stopped(&self, row: &MonitorRow, project: &ProjectRef) -> bool {
-        self.group.is_none_or(|group| group == Group::Stopped)
-            && self.matches_text(row, &project.name)
-    }
-
-    fn keeps(&self, counted: &Counted) -> bool {
-        self.group.is_none_or(|group| counted.group == group)
-            && self.matches_text(counted.row, &counted.project.name)
-    }
-}
-
-/// The Monitor overview at one instant: the counted rows and whether the
-/// bounded read left live Agents out.
-#[derive(Clone, Debug)]
-pub struct Overview<'a> {
-    pub rows: Vec<Counted<'a>>,
-    /// A live state holds more Agents than the read returned (its
-    /// `state_totals` count exceeds its rows): every count is partial.
-    /// Those totals include native children the chart leaves out, so no
-    /// number of missing Agents is claimed.
-    pub partial: bool,
-}
-
-impl<'a> Overview<'a> {
-    /// Keep the selected filter on a partial read, but show all loaded
-    /// chart rows if none match it.
-    pub fn list_for_filter(&self, filter: &Filter) -> (Vec<Section<'a>>, bool) {
-        let showing_loaded = self.partial && !self.rows.iter().any(|row| filter.keeps(row));
-        let sections = if showing_loaded {
-            self.filtered(&Filter::default())
-        } else {
-            self.filtered(filter)
-        };
-        (sections, showing_loaded)
-    }
-
-    /// The list under a filter: exactly the counted rows it keeps, flat,
-    /// in the list's section order (attention by urgency, the others by
-    /// id), so the list always matches the number that was clicked.
-    fn filtered(&self, filter: &Filter) -> Vec<Section<'a>> {
-        [Group::Attention, Group::Working, Group::Idle]
-            .into_iter()
-            .map(|group| {
-                let mut rows: Vec<&'a MonitorRow> = self
-                    .rows
-                    .iter()
-                    .filter(|counted| counted.group == group && filter.keeps(counted))
-                    .map(|counted| counted.row)
-                    .collect();
-                rows.sort_by(|a, b| match group {
-                    Group::Attention => attention_rank(a.state)
-                        .cmp(&attention_rank(b.state))
-                        .then_with(|| id_order(&a.id, &b.id)),
-                    _ => id_order(&a.id, &b.id),
-                });
-                Section { group, rows }
-            })
-            .collect()
     }
 }
 
@@ -1500,37 +1439,25 @@ impl Monitor {
         tree
     }
 
-    /// The overview: every shown controlled Agent in a live group, by its
-    /// own state (workers nested under a row included, native subagents
-    /// not, as the sidebar's fleet line counts them), with its project from
-    /// `project_of` (the sidebar's name), which a filtered list reads.
-    pub fn overview(
-        &self,
-        now_ms: i64,
-        project_of: &dyn Fn(&MonitorRow) -> ProjectRef,
-    ) -> Overview<'_> {
-        let rows: Vec<Counted> = self
-            .all_rows()
-            .filter(|row| !row.native_child && visible(row, now_ms))
-            .filter_map(|row| {
-                let group = row.group(self.incident(row));
-                (group != Group::Stopped).then(|| Counted {
-                    row,
-                    group,
-                    project: project_of(row),
-                })
-            })
-            .collect();
-        // A live state with more Agents than the bounded read returned,
-        // including one with no rows in the page at all.
-        let partial = self.counts.iter().any(|count| {
+    /// Whether a live state holds more Agents than the bounded read
+    /// returned (its `state_totals` count exceeds its rows), including one
+    /// with no rows in the page at all: every count is then partial.
+    pub fn partial(&self) -> bool {
+        self.counts.iter().any(|count| {
             count.state != AgentState::Stopped
                 && count.total.is_some_and(|total| total > count.shown)
-        });
-        Overview { rows, partial }
+        })
     }
 
     pub fn apply(&mut self, snapshot: MonitorSnapshot) {
+        if !snapshot.fleet {
+            // Only Details were read: the fleet, its reports and the
+            // stopped rows stay as last read.
+            if let Some(detail) = snapshot.detail {
+                self.take_detail(detail, snapshot.read_at_ms);
+            }
+            return;
+        }
         self.refreshes += 1;
         self.errors.clear();
         match snapshot.stopped {
@@ -1646,18 +1573,34 @@ impl Monitor {
                 return;
             }
         };
-        if let Err(error) = &read.usage {
-            self.detail_errors.push(format!("usage: {error}"));
-        }
-        if let Err(error) = &read.diagnosis {
-            self.detail_errors.push(format!("diagnosis: {error}"));
-        }
         let identity = &read.agent.agent;
         let previous = self.detail.take().filter(|last| {
             last.read.agent.agent.id == identity.id
                 && last.read.agent.agent.generation == identity.generation
         });
         let (mut usage_ms, mut diagnosis_ms) = (read_at_ms, read_at_ms);
+        if !read.fresh {
+            // Not read this time: the last ones of this generation stay.
+            if let Some(last) = previous {
+                read.usage = last.read.usage;
+                read.diagnosis = last.read.diagnosis;
+                usage_ms = last.usage_ms;
+                diagnosis_ms = last.diagnosis_ms;
+            }
+            self.detail = Some(CachedDetail {
+                read,
+                identity_ms: read_at_ms,
+                usage_ms,
+                diagnosis_ms,
+            });
+            return;
+        }
+        if let Err(error) = &read.usage {
+            self.detail_errors.push(format!("usage: {error}"));
+        }
+        if let Err(error) = &read.diagnosis {
+            self.detail_errors.push(format!("diagnosis: {error}"));
+        }
         if let Some(last) = previous {
             if read.usage.is_err() && last.read.usage.is_ok() {
                 read.usage = last.read.usage;
@@ -1832,7 +1775,13 @@ fn take_fleet(snapshot: &mut MonitorSnapshot, page: Result<AgentListResponse, St
 /// What one refresh reads besides the fixed live set.
 #[derive(Clone, Debug, Default)]
 pub struct RefreshPlan {
+    /// The Agents page shows: read the fleet, its attention reports and
+    /// (now and then) the stopped rows.
+    pub fleet: bool,
     pub selected: Option<String>,
+    /// Read the selected Agent's usage and diagnosis too (its selection or
+    /// generation changed); else only `agent.get`.
+    pub detail_full: bool,
     pub stopped: bool,
     pub attention_cursor: Option<i64>,
     /// Lost or failed generations whose loss origin to read.
@@ -1847,13 +1796,15 @@ pub async fn refresh(
 ) -> Option<MonitorSnapshot> {
     let read_at_ms = crate::handoff::now_ms();
     let RefreshPlan {
+        fleet,
         selected,
+        detail_full,
         stopped,
         attention_cursor,
         losses,
     } = plan;
     let mut reads: Vec<ReadFuture<'_>> = Vec::new();
-    if stopped {
+    if fleet && stopped {
         reads.push(Box::pin(async move {
             if cancelled() {
                 return Read::Cancelled;
@@ -1866,22 +1817,24 @@ pub async fn refresh(
             )
         }));
     }
-    reads.push(Box::pin(async move {
-        if cancelled() {
-            return Read::Cancelled;
-        }
-        Read::Attention(read_attention(data_dir, attention_cursor, read_at_ms, cancelled).await)
-    }));
-    reads.push(Box::pin(async move {
-        if cancelled() {
-            return Read::Cancelled;
-        }
-        Read::Fleet(
-            client::list_agents(data_dir, &fleet_request())
-                .await
-                .map_err(|error| error.to_string()),
-        )
-    }));
+    if fleet {
+        reads.push(Box::pin(async move {
+            if cancelled() {
+                return Read::Cancelled;
+            }
+            Read::Attention(read_attention(data_dir, attention_cursor, read_at_ms, cancelled).await)
+        }));
+        reads.push(Box::pin(async move {
+            if cancelled() {
+                return Read::Cancelled;
+            }
+            Read::Fleet(
+                client::list_agents(data_dir, &fleet_request())
+                    .await
+                    .map_err(|error| error.to_string()),
+            )
+        }));
+    }
     if let Some(agent) = selected {
         reads.push(Box::pin(async move {
             if cancelled() {
@@ -1891,6 +1844,14 @@ pub async fn refresh(
                 Ok(read) => read,
                 Err(error) => return Read::Detail(Box::new(Err(error.to_string()))),
             };
+            if !detail_full {
+                return Read::Detail(Box::new(Ok(DetailRead {
+                    agent: read,
+                    usage: Err(String::new()),
+                    diagnosis: Err(String::new()),
+                    fresh: false,
+                })));
+            }
             if cancelled() {
                 return Read::Cancelled;
             }
@@ -1907,6 +1868,7 @@ pub async fn refresh(
                 agent: read,
                 usage,
                 diagnosis,
+                fresh: true,
             })))
         }));
     }
@@ -1933,6 +1895,8 @@ pub async fn refresh(
         detail: None,
         losses: Vec::new(),
         read_at_ms,
+        fleet,
+        event_cursor: None,
     };
     if cancelled() || results.iter().any(|read| matches!(read, Read::Cancelled)) {
         return None;

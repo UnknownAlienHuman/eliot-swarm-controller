@@ -498,6 +498,27 @@ pub async fn events_wake(
     Ok(reply)
 }
 
+/// Long-poll for the first event after `after` matching `filter`, waiting
+/// at most `wait_ms`: the reply's `next` is the cursor to wait from next.
+pub async fn events_wait(
+    data_dir: &Path,
+    after: i64,
+    filter: &EventsFilter,
+    wait_ms: u64,
+) -> Result<EventsSubscribeResponse> {
+    let params = EventsSubscribeRequest {
+        after,
+        limit: 1,
+        wait_ms,
+        filter: filter.clone(),
+    };
+    params.validate()?;
+    let reply: EventsSubscribeResponse =
+        eliot_daemon::client_call_typed(data_dir, "events.subscribe", &params).await?;
+    reply.validate(after)?;
+    Ok(reply)
+}
+
 /// Read `(from, through]` for the filter to the end. Events above `through`
 /// are dropped: live delivery continues from `through` and will carry them,
 /// so nothing is applied twice or skipped. An agent filter keeps the work to

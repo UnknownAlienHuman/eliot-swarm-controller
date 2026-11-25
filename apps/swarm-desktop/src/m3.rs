@@ -425,59 +425,6 @@ pub fn nav_content(glyph: &str, label: &str, hint: &str) -> View {
     )
 }
 
-/// A nested row's content: indented `depth` steps of 28 DIPs, so its title
-/// starts under its parent's label; ended tasks in the variant tone; a
-/// trailing view (a dot, an age). A running task's work line runs under
-/// the title and the trailing mark in the muted caption, one line, trimmed
-/// (the row is then [`height::TWO_LINE_ROW`] tall).
-pub fn task_content(
-    depth: usize,
-    title: &str,
-    ended: bool,
-    trailing: View,
-    line: Option<(String, bool)>,
-) -> View {
-    let title = TextBlock::new()
-        .text(title.to_owned())
-        .vertical_alignment(VerticalAlignment::Center)
-        .text_trimming(TextTrimming::CharacterEllipsis);
-    let title = if ended {
-        title.foreground(palette().variant())
-    } else {
-        title
-    };
-    let indent = Thickness::new(layout::TREE_INDENT * depth as f64, 0.0, 0.0, 0.0);
-    let top = Grid::new()
-        .columns([GridLength::STAR, GridLength::Auto])
-        .column_spacing(spacing::ROW);
-    let top = |title: TextBlock, trailing: View| {
-        top.children((
-            title,
-            Border::new()
-                .grid_column(1)
-                .vertical_alignment(VerticalAlignment::Center)
-                .content(trailing),
-        ))
-    };
-    match line {
-        // The second line: the work line, or what needs attention in the
-        // attention tone (as the Monitor's row says it).
-        Some((line, attention)) => {
-            let line = secondary(line).text_trimming(TextTrimming::CharacterEllipsis);
-            let line = if attention {
-                line.foreground(palette().attention())
-            } else {
-                line
-            };
-            StackPanel::new()
-                .margin(indent)
-                .vertical_alignment(VerticalAlignment::Center)
-                .children((top(title, trailing), line))
-        }
-        None => Border::new().margin(indent).content(top(title, trailing)),
-    }
-}
-
 /// A chip: 28 DIPs, outlined in the border tone (`.content(chip_content(..))`
 /// last, then a menu or click).
 pub fn chip(palette: Palette) -> Button {
@@ -942,27 +889,11 @@ pub fn divider(palette: Palette) -> Border {
         .background(palette.outline())
 }
 
-/// A settings page's header: the title, its one-line subtitle and an
-/// optional action on the right (a link).
-pub fn page_header(title: &str, subtitle: &str, action: Option<View>) -> View {
-    Grid::new()
-        .columns([GridLength::STAR, GridLength::Auto])
-        .column_spacing(spacing::SM)
-        .children((
-            StackPanel::new().spacing(spacing::XS).children((
-                page_title(title.to_owned()),
-                secondary(subtitle.to_owned()).text_wrapping(TextWrapping::Wrap),
-            )),
-            Border::new()
-                .grid_column(1)
-                .vertical_alignment(VerticalAlignment::Bottom)
-                .content(action.unwrap_or_else(View::empty)),
-        ))
-}
-
-/// The title above a settings card ("Permissions").
+/// The heading above a settings card ("Appearance"): `title-small` in the
+/// variant tone, 8 DIPs below the group above.
 pub fn card_title(title: &str) -> View {
-    section_title(title.to_owned())
+    muted(title.to_owned(), crate::brand::TITLE_SMALL)
+        .automation_heading_level(AutomationHeadingLevel::Level3)
         .margin(Thickness::new(0.0, spacing::SM, 0.0, 0.0))
         .into()
 }

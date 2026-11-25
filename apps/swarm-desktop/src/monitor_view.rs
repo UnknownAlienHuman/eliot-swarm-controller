@@ -106,16 +106,6 @@ fn small(text: impl Into<String>) -> TextBlock {
         .is_text_selection_enabled(true)
 }
 
-/// What a list row says beyond its state: why a lost or failed Agent ended
-/// (from its loss origin), what an Agent that needs attention needs, or the
-/// task a top-level worker runs under.
-#[derive(Clone, PartialEq)]
-pub enum RowNote {
-    Ended(String),
-    Attention(String),
-    Under(String),
-}
-
 /// How a Stop Agent button shows now.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StopButton {
@@ -125,193 +115,6 @@ pub enum StopButton {
     Waiting,
     /// This Agent's Stop was sent and has not settled.
     Stopping,
-}
-
-/// What a row does: the row itself opens the conversation; a resumable
-/// one also offers Resume (its callback and whether it is enabled).
-pub struct RowActions {
-    pub open: Callback<()>,
-    pub resume: Option<(Callback<()>, bool)>,
-    /// Stop for a live controlled row, idle included.
-    pub stop: Option<(Callback<()>, StopButton)>,
-}
-
-/// What one list row shows besides its Agent.
-pub struct RowLook<'a> {
-    pub title: &'a str,
-    /// How long it has been quiet ([`MonitorRow::quiet`]), as shown
-    /// ("3 min", "no progress yet") and in words for its accessible name
-    /// ("last progress 3 min ago").
-    pub elapsed: &'a str,
-    pub elapsed_words: &'a str,
-    /// The row's status: its group's tone, with a failure, an unconfirmed
-    /// outcome or a start told apart by the mark's shape.
-    pub tone: crate::theme::StatusTone,
-    /// The open Agent's row.
-    pub selected: bool,
-    /// In the Working group (or working without writing code): its
-    /// trailing word is the model.
-    pub working: bool,
-    /// The second line: the work line, or the attention sentence of an
-    /// Agent working without writing code.
-    pub line: Option<RowLine>,
-}
-
-/// A row's second line ([`crate::monitor::work_line`]), what a screen
-/// reader hears for it, and whether it is in the attention tone.
-#[derive(Clone, PartialEq)]
-pub struct RowLine {
-    pub text: String,
-    pub words: String,
-    pub attention: bool,
-}
-
-/// One Monitor list row (`Conversation.dc.html`'s `mrow`): the status dot
-/// in its group's color, the title and one trailing word: what it needs
-/// (in the attention color), the model it works on, or how long it has
-/// been quiet. A live controlled Agent adds its work line under them
-/// (a two-line row), or, working without writing code, that sentence in
-/// the attention color. Why it ended or the task it runs under stay in its tooltip
-/// and accessible name; its measures live in Details, which the row opens
-/// with the conversation; Resume sits beside it.
-pub fn list_row(
-    row: &MonitorRow,
-    look: RowLook,
-    note: Option<&RowNote>,
-    actions: RowActions,
-    palette: Palette,
-) -> View {
-    let status = row.status_words();
-    let harness = crate::picker::harness_model_label(&row.harness, row.model.as_deref());
-    let note_name = match note {
-        Some(RowNote::Ended(text)) => format!(", {text}"),
-        Some(RowNote::Attention(text)) => format!(", needs attention: {text}"),
-        Some(RowNote::Under(parent)) => format!(", under {parent}"),
-        None => String::new(),
-    };
-    let trailing = match note {
-        Some(RowNote::Attention(text)) => {
-            crate::m3::text(text.clone(), tokens::text::CAPTION).foreground(palette.attention())
-        }
-        _ if look.working => crate::m3::secondary(row.model.as_deref().map_or_else(
-            || harness.clone(),
-            |model| crate::picker::model_short(model).to_owned(),
-        )),
-        _ => crate::m3::secondary(look.elapsed.to_owned()),
-    };
-    let title = crate::m3::text(look.title.to_owned(), tokens::text::CHIP)
-        .vertical_alignment(VerticalAlignment::Center)
-        .text_trimming(TextTrimming::CharacterEllipsis);
-    let trailing = trailing
-        .grid_column(1)
-        .max_width(tokens::layout::MONITOR_TRAILING_WIDTH)
-        .text_trimming(TextTrimming::CharacterEllipsis)
-        .vertical_alignment(VerticalAlignment::Center);
-    // The work line runs under the title and the trailing word, one line,
-    // trimmed to the row; its whole text is in the tooltip and the name.
-    let (text_column, line_name, line_tip): (View, String, String) = match &look.line {
-        None => (
-            Grid::new()
-                .grid_column(1)
-                .columns([GridLength::STAR, GridLength::Auto])
-                .column_spacing(tokens::spacing::ROW)
-                .children((title, trailing)),
-            String::new(),
-            String::new(),
-        ),
-        Some(line) => {
-            let text = crate::m3::text(line.text.clone(), tokens::text::CAPTION)
-                .text_trimming(TextTrimming::CharacterEllipsis);
-            let text = if line.attention {
-                text.foreground(palette.attention())
-            } else {
-                text.foreground(palette.muted())
-            };
-            (
-                StackPanel::new()
-                    .grid_column(1)
-                    .vertical_alignment(VerticalAlignment::Center)
-                    .children((
-                        Grid::new()
-                            .columns([GridLength::STAR, GridLength::Auto])
-                            .column_spacing(tokens::spacing::ROW)
-                            .children((title, trailing)),
-                        text,
-                    )),
-                format!(", {}", line.words),
-                format!(" · {}", line.text),
-            )
-        }
-    };
-    let content = Grid::new()
-        .columns([GridLength::Auto, GridLength::STAR])
-        .column_spacing(tokens::spacing::ROW)
-        .children((
-            crate::m3::status_mark(palette, look.tone, tokens::layout::DOT),
-            text_column,
-        ));
-    let tooltip = format!("{} · {status} · {harness}{note_name}{line_tip}", look.title);
-    let button = crate::m3::row(palette, look.selected);
-    let button = if look.line.is_some() {
-        button
-            .height(tokens::height::TWO_LINE_ROW)
-            .min_height(tokens::height::TWO_LINE_ROW)
-    } else {
-        button
-    };
-    let button = button
-        .automation_name(format!(
-            "{}, {status}, {harness}, {}{note_name}{line_name}",
-            look.title, look.elapsed_words
-        ))
-        .on_click(actions.open)
-        .content(content)
-        .tooltip(tooltip);
-    // Resume and Stop are their own buttons beside the row (a button inside
-    // a button would swallow the click).
-    let mut beside: Vec<KeyedView> = Vec::new();
-    if let Some((resume, enabled)) = actions.resume {
-        beside.push(KeyedView::new(
-            "resume",
-            crate::m3::text_button(palette)
-                .is_enabled(enabled)
-                .automation_name(format!("Resume {} (run {})", look.title, row.generation))
-                .on_click(resume)
-                .content(crate::m3::label("Resume")),
-        ));
-    }
-    if let Some((stop, state)) = actions.stop {
-        let view: View = if state == StopButton::Stopping {
-            crate::m3::text_button(palette)
-                .is_enabled(false)
-                .automation_name(format!("Stopping {}", look.title))
-                .content(crate::m3::label("Stopping…"))
-        } else {
-            crate::m3::icon_button(palette)
-                .is_enabled(state == StopButton::Ready)
-                .automation_name(format!(
-                    "Stop Agent {} (run {})",
-                    look.title, row.generation
-                ))
-                .on_click(stop)
-                .content(crate::m3::icon(crate::m3::glyph::STOP))
-        };
-        beside.push(KeyedView::new("stop", view));
-    }
-    if beside.is_empty() {
-        return button;
-    }
-    Grid::new()
-        .columns([GridLength::STAR, GridLength::Auto])
-        .column_spacing(tokens::spacing::XS)
-        .children((
-            button,
-            StackPanel::new()
-                .grid_column(1)
-                .orientation(Orientation::Horizontal)
-                .vertical_alignment(VerticalAlignment::Center)
-                .keyed_children(beside),
-        ))
 }
 
 /// Plot height in DIPs; the bars stretch across the card width.
@@ -734,48 +537,52 @@ pub fn resource_views(monitor: &Monitor, id: &str, palette: Palette) -> Vec<Keye
     views
 }
 
-/// One entry of the Monitor list, computed by the window from the last
-/// snapshot (at its read time, not the clock's), so the list
+/// One entry of the Agents tree, computed by the window from the last
+/// snapshot (at its read time, not the clock's), so the tree
 /// ([`MonitorList`]) is redrawn only when a snapshot or a choice changes it.
 #[derive(Clone, PartialEq)]
 pub enum MonitorEntry {
-    /// A group's label ("Working · 2") and its key.
+    /// A group's label ("Working · 3 of 3") and its key.
     Section(String, String),
     /// Recently stopped's toggle: its label and whether it is open.
     Stopped(String, bool),
     Row(Box<RowEntry>),
-    /// A row's children (workers and subagents) toggle.
-    Children {
-        id: String,
-        label: String,
-        title: String,
-        open: bool,
-        indent: f64,
-    },
-    /// The closing line ("No Agents to show.").
+    /// The closing line ("No Agents to show").
     Note(String),
 }
 
-/// One Agent row of the Monitor list: what [`list_row`] draws.
+/// One row of the Agents tree (`Agents.dc.html` `.trow`): its Agent and
+/// what its columns say.
 #[derive(Clone, PartialEq)]
 pub struct RowEntry {
     pub row: MonitorRow,
     pub title: String,
-    pub elapsed: String,
-    pub elapsed_words: String,
-    pub tone: crate::theme::StatusTone,
+    /// The project it works in (a top-level row only).
+    pub project: String,
+    /// `Harness · model`.
+    pub model: String,
+    /// What it does now, why it ended, or what it needs.
+    pub activity: String,
+    /// The activity is an attention report (the warning mark, `tertiary`).
+    pub attention: bool,
+    pub cpu: String,
+    pub memory: String,
+    /// The tooltip and accessible name's extra words.
+    pub words: String,
     pub selected: bool,
-    pub working: bool,
-    pub line: Option<RowLine>,
-    pub note: Option<RowNote>,
+    /// Its children's toggle: whether they are shown (none: no children).
+    pub children: Option<bool>,
+    /// Nested under its parent.
+    pub kid: bool,
+    /// A native subagent (observed, not controlled).
+    pub observed: bool,
     /// Resume for a resumable row: whether it is enabled.
     pub resume: Option<bool>,
     /// Stop for a live controlled row, as it shows now.
     pub stop: Option<StopButton>,
-    pub indent: f64,
 }
 
-/// The Monitor list's input: its entries and the callbacks (each from a
+/// The tree's input: its entries and the callbacks (each from a
 /// captureless mapper, so equal across window renders).
 #[derive(Clone, PartialEq)]
 pub struct MonitorListInput {
@@ -793,9 +600,8 @@ pub struct MonitorListInput {
     pub stopped: Callback<()>,
 }
 
-/// The Monitor's sections and rows as their own component: a window render
-/// for anything but a snapshot or a Monitor choice compares equal and
-/// leaves the list as it is.
+/// The Agents tree as its own component: a window render for anything but
+/// a snapshot or a choice compares equal and leaves the tree as it is.
 pub struct MonitorList;
 
 impl Component for MonitorList {
@@ -807,22 +613,242 @@ impl Component for MonitorList {
     }
 
     fn view(&self, input: &MonitorListInput, _context: &mut ViewContext<Self>) -> View {
-        let entries: Vec<KeyedView> = input
-            .entries
-            .iter()
-            .map(|entry| entry_view(entry, input))
-            .collect();
-        StackPanel::new()
-            .spacing(tokens::spacing::ROW)
-            .keyed_children(entries)
+        let mut entries: Vec<KeyedView> = vec![KeyedView::new("head", head_row(input.palette))];
+        entries.extend(input.entries.iter().map(|entry| entry_view(entry, input)));
+        StackPanel::new().keyed_children(entries)
     }
 }
 
-fn chevron(open: bool) -> &'static str {
-    if open {
-        crate::m3::glyph::CHEVRON_DOWN
+/// The tree's columns inside a row's button: Task, Model, Activity, CPU,
+/// Memory.
+fn row_columns() -> [GridLength; 5] {
+    [
+        GridLength::STAR,
+        GridLength::Pixel(tokens::page::FLEET_MODEL),
+        GridLength::Pixel(tokens::page::FLEET_ACTIVITY),
+        GridLength::Pixel(tokens::page::FLEET_NUMBER),
+        GridLength::Pixel(tokens::page::FLEET_NUMBER),
+    ]
+}
+
+/// A row's outer columns: the chevron, the row's button, its action.
+fn outer_columns() -> [GridLength; 3] {
+    [
+        GridLength::Pixel(tokens::height::CONTROL),
+        GridLength::STAR,
+        GridLength::Pixel(tokens::height::CONTROL),
+    ]
+}
+
+/// A number cell (CPU, Memory): right-aligned, the variant tone.
+fn number(text: &str, column: i32) -> View {
+    crate::m3::muted(text.to_owned(), tokens::text::BODY)
+        .grid_column(column)
+        .horizontal_alignment(HorizontalAlignment::Right)
+        .vertical_alignment(VerticalAlignment::Center)
+        .into()
+}
+
+/// The header row (`.trow.head`): the column names in `label-medium`, a
+/// hairline under them.
+fn head_row(palette: Palette) -> View {
+    let label = |text: &str, column: i32, right: bool| -> View {
+        crate::m3::muted(text.to_owned(), tokens::text::LABEL)
+            .grid_column(column)
+            .horizontal_alignment(if right {
+                HorizontalAlignment::Right
+            } else {
+                HorizontalAlignment::Left
+            })
+            .vertical_alignment(VerticalAlignment::Center)
+            .into()
+    };
+    Border::new()
+        .height(tokens::height::CONTROL)
+        .border_brush(palette.outline())
+        .border_thickness(Thickness::new(0.0, 0.0, 0.0, tokens::layout::HAIRLINE))
+        .automation_name("Columns: Task, Model, Activity, CPU, Memory")
+        .content(
+            Grid::new().columns(outer_columns()).children((
+                View::empty(),
+                Grid::new()
+                    .grid_column(1)
+                    .margin(Thickness::xy(tokens::spacing::ROW, 0.0))
+                    .columns(row_columns())
+                    .column_spacing(tokens::spacing::SM)
+                    .children((
+                        label("Task", 0, false),
+                        label("Model", 1, false),
+                        label("Activity", 2, false),
+                        label("CPU", 3, true),
+                        label("Memory", 4, true),
+                    )),
+            )),
+        )
+}
+
+/// One tree row (`.trow`): the chevron of its children, then the row (its
+/// state mark, title and project; model; activity; CPU; memory), which
+/// opens its conversation, then Resume or Stop.
+fn fleet_row(entry: &RowEntry, input: &MonitorListInput) -> View {
+    let palette = input.palette;
+    let row = &entry.row;
+    let mut task: Vec<KeyedView> = vec![
+        KeyedView::new(
+            "mark",
+            Border::new()
+                .vertical_alignment(VerticalAlignment::Center)
+                .content(crate::ui::page_ui::agent_mark(
+                    palette,
+                    row.state,
+                    row.status_line.as_deref(),
+                )),
+        ),
+        KeyedView::new(
+            "title",
+            crate::m3::text(entry.title.clone(), tokens::page::HEADING)
+                .grid_column(1)
+                .foreground(if row.state == eliot_core::AgentState::Stopped {
+                    palette.muted()
+                } else {
+                    palette.text()
+                })
+                .vertical_alignment(VerticalAlignment::Center)
+                .text_trimming(TextTrimming::CharacterEllipsis),
+        ),
+    ];
+    if entry.observed {
+        task.push(KeyedView::new(
+            "observed",
+            Border::new()
+                .grid_column(2)
+                .horizontal_alignment(HorizontalAlignment::Left)
+                .vertical_alignment(VerticalAlignment::Center)
+                .content(crate::m3::badge(palette, "observed")),
+        ));
+    } else if !entry.project.is_empty() {
+        task.push(KeyedView::new(
+            "project",
+            crate::m3::secondary(entry.project.clone())
+                .grid_column(2)
+                .vertical_alignment(VerticalAlignment::Center)
+                .text_trimming(TextTrimming::CharacterEllipsis),
+        ));
+    }
+    let activity = crate::m3::text(entry.activity.clone(), tokens::text::BODY)
+        .grid_column(2)
+        .vertical_alignment(VerticalAlignment::Center)
+        .text_trimming(TextTrimming::CharacterEllipsis);
+    let activity = if entry.attention {
+        activity.foreground(palette.waiting())
     } else {
-        crate::m3::glyph::CHEVRON_RIGHT
+        activity
+    };
+    let content = Grid::new()
+        .columns(row_columns())
+        .column_spacing(tokens::spacing::SM)
+        .children((
+            Grid::new()
+                .margin(Thickness::new(
+                    if entry.kid {
+                        tokens::layout::TREE_INDENT
+                    } else {
+                        0.0
+                    },
+                    0.0,
+                    0.0,
+                    0.0,
+                ))
+                .columns([GridLength::Auto, GridLength::Star(2.0), GridLength::STAR])
+                .column_spacing(tokens::spacing::SM)
+                .keyed_children(task),
+            crate::m3::secondary(entry.model.clone())
+                .grid_column(1)
+                .vertical_alignment(VerticalAlignment::Center)
+                .text_trimming(TextTrimming::CharacterEllipsis),
+            activity,
+            number(&entry.cpu, 3),
+            number(&entry.memory, 4),
+        ));
+    let open = input.open.clone();
+    let id = row.id.clone();
+    let name = format!(
+        "{}, {}, {}, {}{}",
+        entry.title,
+        row.status_words(),
+        entry.model,
+        entry.activity,
+        entry.words
+    );
+    let button = crate::m3::row(palette, entry.selected)
+        .grid_column(1)
+        .automation_name(name.clone())
+        .on_click(move || {
+            let _ = open.call(id.clone());
+        })
+        .content(content)
+        .tooltip(name);
+    let chevron: View = match entry.children {
+        Some(open) => {
+            let (children, id) = (input.children.clone(), row.id.clone());
+            crate::m3::icon_button(palette)
+                .automation_name(format!(
+                    "{} the workers of {}",
+                    if open { "Hide" } else { "Show" },
+                    entry.title
+                ))
+                .on_click(move || {
+                    let _ = children.call(id.clone());
+                })
+                .content(crate::m3::small_icon(if open {
+                    crate::m3::glyph::CHEVRON_DOWN
+                } else {
+                    crate::m3::glyph::CHEVRON_RIGHT
+                }))
+        }
+        None => View::empty(),
+    };
+    let action: View = if let Some(enabled) = entry.resume {
+        let (resume, id, generation) = (input.resume.clone(), row.id.clone(), row.generation);
+        crate::m3::icon_button(palette)
+            .is_enabled(enabled)
+            .automation_name(format!("Resume {} (run {generation})", entry.title))
+            .on_click(move || {
+                let _ = resume.call((id.clone(), generation));
+            })
+            .content(crate::m3::icon(crate::m3::glyph::RESUME))
+    } else if let Some(state) = entry.stop {
+        let (stop, id, generation) = (input.stop.clone(), row.id.clone(), row.generation);
+        crate::m3::icon_button(palette)
+            .is_enabled(state == StopButton::Ready)
+            .automation_name(match state {
+                StopButton::Stopping => format!("Stopping {}", entry.title),
+                _ => format!("Stop Agent {} (run {generation})", entry.title),
+            })
+            .on_click(move || {
+                let _ = stop.call((id.clone(), generation));
+            })
+            .content(crate::m3::icon(crate::m3::glyph::STOP_CIRCLE))
+    } else {
+        View::empty()
+    };
+    let grid = Grid::new().columns(outer_columns()).children((
+        Border::new()
+            .vertical_alignment(VerticalAlignment::Center)
+            .content(chevron),
+        button,
+        Border::new()
+            .grid_column(2)
+            .vertical_alignment(VerticalAlignment::Center)
+            .content(action),
+    ));
+    if entry.attention {
+        Border::new()
+            .corner_radius(tokens::radius::PILL)
+            .background(palette.status_chip(crate::theme::StatusTone::Attention).0)
+            .content(grid)
+    } else {
+        grid
     }
 }
 
@@ -831,106 +857,43 @@ fn entry_view(entry: &MonitorEntry, input: &MonitorListInput) -> KeyedView {
     match entry {
         MonitorEntry::Section(key, label) => KeyedView::new(
             key.clone(),
-            crate::m3::muted(label.clone(), tokens::text::LABEL).margin(Thickness::new(
-                tokens::spacing::ROW,
-                6.0,
-                0.0,
-                0.0,
-            )),
+            Border::new()
+                .height(tokens::height::CONTROL)
+                .padding(Thickness::xy(tokens::spacing::SM, 0.0))
+                .content(
+                    crate::m3::muted(label.clone(), tokens::text::LABEL)
+                        .automation_heading_level(AutomationHeadingLevel::Level3)
+                        .vertical_alignment(VerticalAlignment::Center),
+                ),
         ),
         MonitorEntry::Stopped(label, open) => KeyedView::new(
             format!("section:stopped:{open}"),
             crate::m3::sub_row(palette, false)
-                .margin(Thickness::new(0.0, tokens::spacing::SM, 0.0, 0.0))
                 .automation_name(format!(
                     "{label} ({})",
                     if *open { "shown" } else { "hidden" }
                 ))
                 .on_click(input.stopped.clone())
                 .content(crate::m3::row_content(
-                    Some(chevron(*open)),
+                    Some(if *open {
+                        crate::m3::glyph::CHEVRON_DOWN
+                    } else {
+                        crate::m3::glyph::CHEVRON_RIGHT
+                    }),
                     label,
                     "",
                     View::empty(),
                 )),
         ),
-        MonitorEntry::Row(entry) => {
-            let id = entry.row.id.clone();
-            let open = input.open.clone();
-            let resume = entry.resume.map(|enabled| {
-                let (resume, id, generation) =
-                    (input.resume.clone(), id.clone(), entry.row.generation);
-                (
-                    Callback::new(move |()| {
-                        let _ = resume.call((id.clone(), generation));
-                    }),
-                    enabled,
-                )
-            });
-            let stop = entry.stop.map(|state| {
-                let (stop, id, generation) = (input.stop.clone(), id.clone(), entry.row.generation);
-                (
-                    Callback::new(move |()| {
-                        let _ = stop.call((id.clone(), generation));
-                    }),
-                    state,
-                )
-            });
-            let open_id = id.clone();
-            KeyedView::new(
-                format!("row:{id}:{}", entry.selected),
-                Border::new()
-                    .margin(Thickness::new(entry.indent, 0.0, 0.0, 0.0))
-                    .content(list_row(
-                        &entry.row,
-                        RowLook {
-                            title: &entry.title,
-                            elapsed: &entry.elapsed,
-                            elapsed_words: &entry.elapsed_words,
-                            tone: entry.tone,
-                            selected: entry.selected,
-                            working: entry.working,
-                            line: entry.line.clone(),
-                        },
-                        entry.note.as_ref(),
-                        RowActions {
-                            open: Callback::new(move |()| {
-                                let _ = open.call(open_id.clone());
-                            }),
-                            resume,
-                            stop,
-                        },
-                        palette,
-                    )),
-            )
-        }
-        MonitorEntry::Children {
-            id,
-            label,
-            title,
-            open,
-            indent,
-        } => {
-            let (children, id) = (input.children.clone(), id.clone());
-            KeyedView::new(
-                format!("children:{id}:{open}"),
-                crate::m3::sub_row(palette, false)
-                    .margin(Thickness::new(*indent, 0.0, 0.0, 0.0))
-                    .automation_name(format!(
-                        "{label} of {title} ({})",
-                        if *open { "shown" } else { "hidden" }
-                    ))
-                    .on_click(move || {
-                        let _ = children.call(id.clone());
-                    })
-                    .content(crate::m3::row_content(
-                        Some(chevron(*open)),
-                        label,
-                        "",
-                        View::empty(),
-                    )),
-            )
-        }
-        MonitorEntry::Note(text) => KeyedView::new("none", crate::m3::secondary(text.clone())),
+        MonitorEntry::Row(entry) => KeyedView::new(
+            format!("row:{}:{}", entry.row.id, entry.selected),
+            fleet_row(entry, input),
+        ),
+        MonitorEntry::Note(text) => KeyedView::new(
+            "none",
+            Border::new()
+                .padding(Thickness::uniform(tokens::spacing::SM))
+                .content(crate::m3::secondary(text.clone())),
+        ),
     }
 }

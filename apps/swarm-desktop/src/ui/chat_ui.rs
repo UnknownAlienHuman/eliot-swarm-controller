@@ -1342,8 +1342,8 @@ impl DesktopApp {
                         palette,
                         m3::suggestion(palette)
                             .automation_name("Schedule an automation")
-                            .on_click(context.message(Message::Shell(ShellMsg::SettingsPage(
-                                settings_ui::Page::Automations,
+                            .on_click(context.message(Message::Shell(ShellMsg::PlaceOpened(
+                                page_ui::Place::Automations,
                             ))))
                             .content(card(m3::glyph::SCHEDULE, "Schedule an automation")),
                     ),
@@ -1424,10 +1424,12 @@ impl DesktopApp {
         let column = self.reading_width();
         let transcript = self.transcript_view(column, context, palette);
         if self.main != Main::Conversation {
-            let content = if self.main == Main::Project {
-                self.project_view(context, palette)
-            } else {
-                self.settings_view(context, palette)
+            let content = match self.main {
+                Main::Project => self.project_view(context, palette),
+                Main::Inbox => self.inbox_view(context, palette),
+                Main::Agents => self.monitor_view(context, palette),
+                Main::Automations => self.automations_page(context, palette),
+                Main::Conversation | Main::Settings => self.settings_view(context, palette),
             };
             // Opaque over the transcript beneath; its corners follow the
             // main card's (a Border does not clip its child).

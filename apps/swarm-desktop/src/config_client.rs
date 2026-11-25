@@ -438,3 +438,84 @@ pub async fn run_timer(
     request.validate_response(&reply)?;
     Ok(reply)
 }
+
+/// One approved rule source file and its byte revision (`rule.read`).
+pub async fn read_rule_file(
+    data_dir: &Path,
+    project: Option<String>,
+    path: String,
+) -> Result<eliot_core::api::RuleReadResponse> {
+    let params = eliot_core::api::RuleReadRequest { project, path };
+    params.validate()?;
+    let reply = eliot_daemon::client_call_typed(data_dir, "rule.read", &params).await?;
+    params.validate_response(&reply)?;
+    Ok(reply)
+}
+
+/// Replace a rule source file against the revision it was read at
+/// (`rule.save`); saving never runs anything.
+pub async fn save_rule_file(
+    data_dir: &Path,
+    project: Option<String>,
+    path: String,
+    expected_revision: Option<String>,
+    content: String,
+) -> Result<eliot_core::api::RuleSaveResponse> {
+    let params = eliot_core::api::RuleSaveRequest {
+        project,
+        path,
+        expected_revision,
+        content,
+    };
+    params.validate()?;
+    let reply = eliot_daemon::client_call_typed(data_dir, "rule.save", &params).await?;
+    params.validate_response(&reply)?;
+    Ok(reply)
+}
+
+/// Remove a rule source file against its revision (`rule.delete`).
+pub async fn delete_rule_file(
+    data_dir: &Path,
+    project: Option<String>,
+    path: String,
+    expected_revision: String,
+) -> Result<eliot_core::api::RuleDeleteResponse> {
+    let params = eliot_core::api::RuleDeleteRequest {
+        project,
+        path,
+        expected_revision,
+    };
+    params.validate()?;
+    let reply = eliot_daemon::client_call_typed(data_dir, "rule.delete", &params).await?;
+    params.validate_response(&reply)?;
+    Ok(reply)
+}
+
+/// One rule's latest action outcome and latest refusal (`rule.get`).
+pub async fn rule_status(
+    data_dir: &Path,
+    project: Option<String>,
+    id: String,
+) -> Result<eliot_core::api::RuleShowView> {
+    let mut params = eliot_core::api::RuleGetRequest::new(id);
+    if let Some(project) = project {
+        params = params.in_project(project);
+    }
+    params.validate()?;
+    let reply = eliot_daemon::client_call_typed(data_dir, "rule.get", &params).await?;
+    params.validate_show_response(&reply)?;
+    Ok(reply)
+}
+
+/// Who works where in one project (`who`): each live Agent's files by
+/// Git, its commits against the base and its claims; shared checkouts.
+pub async fn who(data_dir: &Path, project: String) -> Result<eliot_core::api::WhoResponse> {
+    let params = eliot_core::api::WhoRequest {
+        project: Some(project),
+        history: None,
+    };
+    params.validate()?;
+    let reply = eliot_daemon::client_call_typed(data_dir, "who", &params).await?;
+    params.validate_response(&reply)?;
+    Ok(reply)
+}

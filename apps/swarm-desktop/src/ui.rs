@@ -65,6 +65,7 @@ mod link_ui;
 mod menu_ui;
 mod monitor_ui;
 mod move_ui;
+pub(crate) mod page_ui;
 mod picker_ui;
 mod profiles_ui;
 mod project_ui;
@@ -1009,6 +1010,7 @@ impl Component for DesktopApp {
             Message::Reveal(item, path) => self.reveal_path(item, path),
         }
         self.record_location();
+        self.sync_monitor();
         self.sync_dialog(context);
     }
 

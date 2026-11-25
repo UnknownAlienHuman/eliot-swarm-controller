@@ -284,24 +284,17 @@ pub mod layout {
     /// A worker row's step in under its manager: past the mark slot and
     /// its gap, so its mark sits under the manager's title.
     pub const KID_INDENT: f64 = MARK_SLOT + super::spacing::SM;
-    /// The Settings content, centred.
-    pub const SETTINGS_WIDTH: f64 = 720.0;
     /// The label column of every form.
     pub const LABEL_WIDTH: f64 = 200.0;
     /// Where a form's controls start: past the label column and its gap
     /// (a note or check under a field lines up with the field).
     pub const FIELD_INDENT: f64 = LABEL_WIDTH + super::spacing::SM;
-    /// The narrow label column of a path line (an automation's paths).
-    pub const PATH_LABEL_WIDTH: f64 = 96.0;
     /// A confirmation dialog's width.
     pub const DIALOG_WIDTH: f64 = crate::brand::SIZE_DIALOG;
     /// A list of items inside a dialog before it scrolls.
     pub const DIALOG_LIST_MAX_HEIGHT: f64 = 240.0;
     pub const MOVE_DIALOG_WIDTH: f64 = 480.0;
     pub const MOVE_LIST_MAX_HEIGHT: f64 = 320.0;
-    /// A theme's swatch in Settings › Appearance.
-    pub const SWATCH_WIDTH: f64 = 48.0;
-    pub const SWATCH_HEIGHT: f64 = 24.0;
     /// An enum dropdown ("low", "never", a role).
     pub const ENUM_WIDTH: f64 = 200.0;
     /// A number box.
@@ -318,8 +311,6 @@ pub mod layout {
     pub const TREE_INDENT: f64 = 28.0;
     pub const HEADER_TITLE_MIN_WIDTH: f64 = 96.0;
     pub const HEADER_STATUS_MIN_WIDTH: f64 = 64.0;
-    /// The widest trailing word of a Monitor row (model, need or age).
-    pub const MONITOR_TRAILING_WIDTH: f64 = 112.0;
     /// The composer's field grows with its text up to this height.
     pub const COMPOSER_MAX_HEIGHT: f64 = 200.0;
     /// The composer's field below its first line (the design's 44 DIP).
@@ -388,4 +379,41 @@ pub mod layout {
     pub const USAGE_RING: f64 = crate::brand::SIZE_RING;
     /// The neutral usage ring's stroke (the progress ring's track).
     pub const USAGE_RING_STROKE: f64 = crate::brand::SIZE_RING_STROKE;
+}
+
+/// The pages in the main card (`screens.css` `.page`): Project, Inbox,
+/// Agents, Automations and Settings.
+pub mod page {
+    use super::brand;
+
+    /// A list page's column at most, centred.
+    pub const WIDTH: f64 = brand::SIZE_PAGE;
+    /// A Settings page's column at most, centred.
+    pub const SETTINGS_WIDTH: f64 = brand::SIZE_SETTINGS_PAGE;
+    /// A dropdown at the end of a settings row.
+    pub const SETTINGS_CONTROL: f64 = brand::SIZE_SETTINGS_CONTROL;
+    /// The key column of a key-value line in a card.
+    pub const KEY_COLUMN: f64 = brand::SIZE_KEY_COLUMN;
+    /// A page's search field (Agents).
+    pub const SEARCH: f64 = brand::SIZE_PAGE_SEARCH;
+    /// The rule editor's word column and its Repeat count.
+    pub const SENTENCE_WORD: f64 = brand::SIZE_SENTENCE_WORD;
+    pub const REPEAT_FIELD: f64 = brand::SIZE_REPEAT_FIELD;
+    /// The Agents tree's Model, Activity, CPU and Memory columns.
+    pub const FLEET_MODEL: f64 = brand::SIZE_FLEET_MODEL;
+    pub const FLEET_ACTIVITY: f64 = brand::SIZE_FLEET_ACTIVITY;
+    pub const FLEET_NUMBER: f64 = brand::SIZE_FLEET_NUMBER;
+    /// A branch's preparation state on the project page.
+    pub const BRANCH_STATE: f64 = brand::SIZE_BRANCH_STATE;
+    /// A theme's swatch in Settings › General.
+    pub const THEME_SWATCH_WIDTH: f64 = brand::SIZE_THEME_SWATCH_WIDTH;
+    pub const THEME_SWATCH_HEIGHT: f64 = brand::SIZE_THEME_SWATCH_HEIGHT;
+
+    /// Type roles of a page: its title (`headline-medium`), a section
+    /// heading (`title-small`, muted), a stat's number (`title-large`),
+    /// an age (`label-small`).
+    pub const TITLE: brand::TypeStyle = brand::HEADLINE_MEDIUM;
+    pub const HEADING: brand::TypeStyle = brand::TITLE_SMALL;
+    pub const STAT: brand::TypeStyle = brand::TITLE_LARGE;
+    pub const AGE: brand::TypeStyle = brand::LABEL_SMALL;
 }

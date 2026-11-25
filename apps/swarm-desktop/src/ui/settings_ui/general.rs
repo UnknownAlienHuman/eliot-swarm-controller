@@ -48,8 +48,8 @@ fn swatch(choice: ThemeChoice, palette: Palette) -> View {
         other => half(other.theme(false), 0),
     };
     Border::new()
-        .width(tokens::layout::SWATCH_WIDTH)
-        .height(tokens::layout::SWATCH_HEIGHT)
+        .width(tokens::page::THEME_SWATCH_WIDTH)
+        .height(tokens::page::THEME_SWATCH_HEIGHT)
         .corner_radius(tokens::radius::SWATCH)
         .border_brush(palette.outline())
         .border_thickness(Thickness::uniform(tokens::layout::HAIRLINE))
@@ -58,86 +58,154 @@ fn swatch(choice: ThemeChoice, palette: Palette) -> View {
 }
 
 impl DesktopApp {
-    /// General: Appearance (System and the six themes of the design's
-    /// Themes board, each a row with its swatch) and what the window opens
-    /// with, each saved the moment it is chosen (`[desktop]` through the
-    /// preferences writer).
+    /// General (`Settings.dc.html`): Appearance (System and the six themes
+    /// of the Themes board as swatch cards), then Start and work (what the
+    /// window opens with, the default access of new tasks), each saved the
+    /// moment it is chosen (`[desktop]` through the preferences writer).
     pub(super) fn general_page(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
         let themes: Vec<KeyedView> = ThemeChoice::ALL
             .into_iter()
             .map(|choice| {
                 let selected = self.prefs.theme == choice;
+                let label: View = if selected {
+                    StackPanel::new()
+                        .orientation(Orientation::Horizontal)
+                        .spacing(tokens::spacing::XS)
+                        .horizontal_alignment(HorizontalAlignment::Center)
+                        .children((
+                            m3::small_icon(m3::glyph::CHECK),
+                            m3::text(choice.label(), tokens::text::LABEL),
+                        ))
+                } else {
+                    m3::text(choice.label(), tokens::text::LABEL)
+                        .horizontal_alignment(HorizontalAlignment::Center)
+                        .into()
+                };
                 // Keyed by its selection: WinUI reads a button's colors only
                 // when its template is applied.
                 KeyedView::new(
                     format!("{}:{selected}", choice.label()),
-                    m3::row(palette, selected)
+                    m3::segment(palette, selected)
+                        .height(
+                            tokens::page::THEME_SWATCH_HEIGHT
+                                + 2.0 * tokens::spacing::SM
+                                + tokens::text::LABEL.line_height
+                                + tokens::spacing::CHIP_GAP,
+                        )
                         .automation_name(format!(
-                            "Theme {}{}",
+                            "Theme {}: {}{}",
                             choice.label(),
+                            theme_note(choice),
                             if selected { " (current)" } else { "" }
                         ))
                         .on_click(context.message(Message::Shell(ShellMsg::ThemeChosen(choice))))
                         .content(
-                            Grid::new()
-                                .columns([
-                                    GridLength::Auto,
-                                    GridLength::Auto,
-                                    GridLength::STAR,
-                                    GridLength::Auto,
-                                ])
-                                .column_spacing(tokens::spacing::INSET)
-                                .children((
-                                    swatch(choice, palette),
-                                    m3::text(choice.label(), tokens::text::BUTTON)
-                                        .grid_column(1)
-                                        .vertical_alignment(VerticalAlignment::Center),
-                                    m3::secondary(theme_note(choice))
-                                        .grid_column(2)
-                                        .vertical_alignment(VerticalAlignment::Center)
-                                        .text_trimming(TextTrimming::CharacterEllipsis),
-                                    if selected {
-                                        Border::new()
-                                            .grid_column(3)
-                                            .vertical_alignment(VerticalAlignment::Center)
-                                            .content(m3::icon(m3::glyph::CHECK))
-                                    } else {
-                                        View::empty()
-                                    },
-                                )),
-                        ),
+                            StackPanel::new()
+                                .spacing(tokens::spacing::CHIP_GAP)
+                                .margin(Thickness::uniform(
+                                    tokens::spacing::SM - tokens::spacing::ROW,
+                                ))
+                                .children((swatch(choice, palette), label)),
+                        )
+                        .tooltip(theme_note(choice)),
                 )
             })
             .collect();
-        let reopen = self.prefs.startup == Startup::LastConversation;
-        let switch = Grid::new().keyed_children(vec![KeyedView::new(
-            format!("reopen:{reopen}"),
-            ToggleSwitch::new()
-                .is_on(reopen)
-                .automation_name("Reopen the last task at start")
-                .on_toggled(context.callback(|on: bool| {
-                    Message::Shell(ShellMsg::StartupChosen(if on {
-                        Startup::LastConversation
-                    } else {
-                        Startup::NewTask
-                    }))
+        let startup = Startup::ALL
+            .iter()
+            .position(|startup| *startup == self.prefs.startup);
+        let startup_labels: Vec<String> = Startup::ALL
+            .iter()
+            .map(|startup| startup.label().to_owned())
+            .collect();
+        let shown_startup = self.prefs.startup;
+        let startup_picker = Grid::new().keyed_children(vec![KeyedView::new(
+            format!("startup:{startup:?}"),
+            ComboBox::new()
+                .width(tokens::page::SETTINGS_CONTROL)
+                .items_source(startup_labels)
+                .selected_index(startup)
+                .automation_name("On startup")
+                // No selection is the value shown, never New task.
+                .on_selection_changed(context.callback(move |index: Option<usize>| {
+                    Message::Shell(ShellMsg::StartupChosen(
+                        index
+                            .and_then(|index| Startup::ALL.get(index).copied())
+                            .unwrap_or(shown_startup),
+                    ))
                 })),
         )]);
+        let shown = self.prefs.last_access.unwrap_or(Access::Ask);
+        let access = Access::ALL.iter().position(|access| *access == shown);
+        let access_labels: Vec<String> = Access::ALL
+            .iter()
+            .map(|access| access.label().to_owned())
+            .collect();
+        let access_picker = Grid::new().keyed_children(vec![KeyedView::new(
+            format!("access:{}", shown.wire()),
+            ComboBox::new()
+                .width(tokens::page::SETTINGS_CONTROL)
+                .items_source(access_labels)
+                .selected_index(access)
+                .automation_name("Default access for new tasks")
+                .on_selection_changed(
+                    context.callback(|index| Message::Settings(SettingsMsg::AccessChosen(index))),
+                ),
+        )]);
+        let levels: Vec<KeyedView> = Access::ALL
+            .iter()
+            .map(|access| {
+                KeyedView::new(
+                    access.wire(),
+                    m3::setting_row(access.label(), access.description(), View::empty()),
+                )
+            })
+            .collect();
         StackPanel::new().spacing(tokens::spacing::SM).children((
             m3::card_title("Appearance"),
-            m3::list(palette, themes),
-            m3::card_title("Startup"),
             m3::settings_card(
                 palette,
                 vec![KeyedView::new(
-                    "reopen",
-                    m3::setting_row(
-                        "Reopen the last task",
-                        "At start, open the most recently active task instead of a new one.",
-                        switch,
-                    ),
+                    "theme",
+                    StackPanel::new()
+                        .margin(Thickness::xy(0.0, tokens::spacing::INSET))
+                        .spacing(tokens::spacing::SM)
+                        .children((
+                            StackPanel::new().children((
+                                m3::body("Theme"),
+                                m3::secondary("Applies to every window right away"),
+                            )),
+                            StackPanel::new()
+                                .orientation(Orientation::Horizontal)
+                                .spacing(tokens::spacing::SM)
+                                .keyed_children(themes),
+                        )),
                 )],
             ),
+            m3::card_title("Start and work"),
+            m3::settings_card(
+                palette,
+                vec![
+                    KeyedView::new(
+                        "startup",
+                        m3::setting_row("On startup", "What the window opens with", startup_picker),
+                    ),
+                    KeyedView::new(
+                        "access",
+                        m3::setting_row(
+                            "Default access",
+                            "For new tasks. You can change it in the composer",
+                            access_picker,
+                        ),
+                    ),
+                ],
+            ),
+            m3::card_title("What each access level allows"),
+            m3::settings_card(palette, levels),
+            m3::secondary(
+                "Presets and Auto keep their own permissions. OpenCode has no Full access mode.",
+            )
+            .text_wrapping(TextWrapping::Wrap),
         ))
     }
 }

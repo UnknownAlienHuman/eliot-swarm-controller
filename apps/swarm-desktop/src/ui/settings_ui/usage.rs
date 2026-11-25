@@ -1,22 +1,28 @@
 use super::*;
 
 impl DesktopApp {
-    /// Models & Usage (Antigravity's page as the pattern): what Swarm runs
-    /// now, then each installed harness's limits as two-line rows (the
-    /// limit and when it refreshes) with the share left and its ring.
-    /// Storage and retention live in Advanced.
-    pub(super) fn usage_page(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
+    /// The tokens of the loaded Agents active today and how many of them
+    /// report a total (Swarm has no per-day read: each reports its whole
+    /// total).
+    pub(in crate::ui) fn tokens_today(&self) -> (i64, usize) {
         let today = today_start_ms();
-        let loaded = self.nav.agents.len();
-        let (tokens_today, reporting) = self
-            .nav
+        self.nav
             .agents
             .iter()
             .filter(|agent| agent.updated_at >= today)
             .fold((0i64, 0usize), |(sum, count), agent| match agent.tokens {
                 Some(tokens) => (sum + tokens, count + 1),
                 None => (sum, count),
-            });
+            })
+    }
+
+    /// Models & Usage (Antigravity's page as the pattern): what Swarm runs
+    /// now, then each installed harness's limits as two-line rows (the
+    /// limit and when it refreshes) with the share left and its ring.
+    /// Storage and retention live in Advanced.
+    pub(super) fn usage_page(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
+        let loaded = self.nav.agents.len();
+        let (tokens_today, reporting) = self.tokens_today();
         let fleet = self.settings.fleet.as_ref();
         let total = fleet.and_then(|fleet| fleet.as_ref().ok().map(|fleet| fleet.agents));
         let (running_value, running_note) = match fleet {

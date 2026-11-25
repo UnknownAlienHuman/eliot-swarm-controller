@@ -4,12 +4,14 @@
 //! coverage, resources, usage), on one refresh chain that runs only while
 //! the panel is open.
 
+use std::collections::BTreeMap;
+
 use super::*;
-use crate::monitor::{Filter, Group, MonitorRow, ProjectRef, Tree};
+use crate::monitor::{Filter, MonitorRow, ProjectRef, Tree};
 use crate::nav::Checkout;
-use crate::theme::StatusTone;
 use crate::theme::winui::Palette;
 use crate::ui::chat_ui::DraftAction;
+use eliot_core::AgentState;
 
 #[derive(Clone, Debug)]
 pub(super) enum MonitorMsg {
@@ -31,9 +33,14 @@ pub(super) enum MonitorMsg {
     PanelChosen(Panel),
     /// The search field's text.
     SearchChanged(String),
-    /// The state filter's choice (an index into `monitor::STATE_FILTERS`).
-    StateChosen(Option<usize>),
-    /// Show or hide Swarm autonomy (read while shown).
+    /// A filter chip of the Agents page.
+    FleetChosen(FleetFilter),
+    /// Group the tree by project (true) or by state.
+    GroupBy(bool),
+    /// The swarm's wait classes (`daemon.status` `liveness`): the read's
+    /// sequence and what it found.
+    LivenessLoaded(u64, Box<Fallible<eliot_core::api::SwarmLiveness>>),
+    /// Show or hide Autonomy's lines by source.
     AutonomyToggled,
     /// Swarm autonomy's window: the last 7 days (true) or 24 hours.
     AutonomyWindow(bool),
@@ -74,22 +81,139 @@ pub(super) struct MonitorState {
     /// What the list is narrowed to (a group, a project, or both).
     pub(super) filter: Filter,
     pub(super) technical_open: bool,
+    /// The event cursor the next scheduled read waits from.
+    pub(super) event_cursor: Option<i64>,
+    /// Read the selected Agent's usage and diagnosis at the next read.
+    pub(super) detail_due: bool,
+    /// The Agents page's filter chip and grouping.
+    pub(super) fleet: FleetFilter,
+    pub(super) by_project: bool,
+    /// The wait classes as last read (`None` until read).
+    pub(super) liveness: Option<Fallible<eliot_core::api::SwarmLiveness>>,
+    /// Tags wait-class reads; an older reply is dropped.
+    pub(super) liveness_seq: u64,
     /// The sidebar's read of attention reports is running (only while the
     /// panel, and so its refresh, is closed).
     pub(super) sidebar_reading: bool,
     pub(super) autonomy: AutonomyState,
 }
 
-/// Why the Details tab cannot open (its tooltip while disabled).
-const NO_DETAILS: &str = "Open a task, or choose an Agent in Monitor, to see its details";
+/// The Agents page's filter chips (`Agents.dc.html`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) enum FleetFilter {
+    #[default]
+    All,
+    Working,
+    Waiting,
+    /// An open attention report (no progress, no code progress…).
+    Attention,
+    Failed,
+    Chats,
+}
 
-/// A group's tone in the Monitor's charts and list dots.
-fn group_tone(group: Group) -> StatusTone {
-    match group {
-        Group::Working => StatusTone::Active,
-        Group::Attention => StatusTone::Attention,
-        Group::Idle => StatusTone::Ready,
-        Group::UnparentedSubagents | Group::Stopped => StatusTone::Neutral,
+impl FleetFilter {
+    const ALL: [Self; 6] = [
+        Self::All,
+        Self::Working,
+        Self::Waiting,
+        Self::Attention,
+        Self::Failed,
+        Self::Chats,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::All => "All",
+            Self::Working => "Working",
+            Self::Waiting => "Waiting for you",
+            Self::Attention => "Needs attention",
+            Self::Failed => "Failed or lost",
+            Self::Chats => "Chats",
+        }
+    }
+
+    /// Whether `row` (with an open attention report or not) is listed.
+    fn keeps(self, row: &MonitorRow, incident: bool) -> bool {
+        match self {
+            Self::All => true,
+            Self::Working => FleetGroup::of(row.state) == FleetGroup::Working,
+            Self::Waiting => row.state == AgentState::Waiting,
+            Self::Attention => incident,
+            Self::Failed => FleetGroup::of(row.state) == FleetGroup::Failed,
+            Self::Chats => row.chat,
+        }
+    }
+}
+
+/// The tree's groups by state, in order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FleetGroup {
+    Working,
+    Waiting,
+    /// Held by its provider, whatever its state.
+    Held,
+    Ready,
+    Failed,
+    /// Native subagents whose parent is not shown (observed, not
+    /// controlled).
+    Unparented,
+    Stopped,
+}
+
+impl FleetGroup {
+    const ALL: [Self; 7] = [
+        Self::Working,
+        Self::Waiting,
+        Self::Held,
+        Self::Ready,
+        Self::Failed,
+        Self::Unparented,
+        Self::Stopped,
+    ];
+
+    fn of(state: AgentState) -> Self {
+        match state {
+            AgentState::Busy | AgentState::Starting | AgentState::Created => Self::Working,
+            AgentState::Waiting => Self::Waiting,
+            AgentState::Idle => Self::Ready,
+            AgentState::Failed | AgentState::Lost | AgentState::Unknown => Self::Failed,
+            AgentState::Stopped => Self::Stopped,
+        }
+    }
+
+    /// A top-level row's group: a native subagent without its parent, a
+    /// provider hold, else its state's.
+    fn of_row(row: &MonitorRow) -> Self {
+        if row.native_child && row.state != AgentState::Stopped {
+            Self::Unparented
+        } else if page_ui::held(row.status_line.as_deref()) {
+            Self::Held
+        } else {
+            Self::of(row.state)
+        }
+    }
+
+    fn states(self) -> &'static [AgentState] {
+        match self {
+            Self::Held | Self::Unparented => &[],
+            Self::Working => &[AgentState::Busy, AgentState::Starting, AgentState::Created],
+            Self::Waiting => &[AgentState::Waiting],
+            Self::Ready => &[AgentState::Idle],
+            Self::Failed => &[AgentState::Failed, AgentState::Lost, AgentState::Unknown],
+            Self::Stopped => &[AgentState::Stopped],
+        }
+    }
+
+    fn title(self) -> &'static str {
+        match self {
+            Self::Working => "Working",
+            Self::Waiting => "Waiting for you",
+            Self::Held => "On provider hold",
+            Self::Ready => "Ready",
+            Self::Failed => "Failed or lost",
+            Self::Unparented => "Subagents without a visible parent",
+            Self::Stopped => "Recently stopped",
+        }
     }
 }
 
@@ -102,8 +226,7 @@ impl DesktopApp {
                 }
                 self.monitor.refreshing = false;
                 if let Some(snapshot) = snapshot {
-                    // The state filter stays as the owner chose it, even
-                    // while no Agent is in that state.
+                    self.monitor.event_cursor = snapshot.event_cursor;
                     self.monitor.data.apply(*snapshot);
                     // A refresh with errors asks whether the daemon runs
                     // (itself paced) and waits longer before the next, with
@@ -192,9 +315,11 @@ impl DesktopApp {
                     self.monitor.filter.text = text;
                 }
             }
-            MonitorMsg::StateChosen(index) => {
-                if let Some(group) = index.and_then(|index| monitor::STATE_FILTERS.get(index)) {
-                    self.monitor.filter.group = *group;
+            MonitorMsg::FleetChosen(filter) => self.monitor.fleet = filter,
+            MonitorMsg::GroupBy(by_project) => self.monitor.by_project = by_project,
+            MonitorMsg::LivenessLoaded(seq, read) => {
+                if seq == self.monitor.liveness_seq {
+                    self.monitor.liveness = Some(*read);
                 }
             }
             MonitorMsg::TechnicalToggled => {
@@ -203,14 +328,6 @@ impl DesktopApp {
             MonitorMsg::AutonomyToggled => {
                 let autonomy = &mut self.monitor.autonomy;
                 autonomy.open = !autonomy.open;
-                if autonomy.open {
-                    self.read_autonomy(0, context);
-                } else {
-                    // A shown report waits for its next read; a hidden one
-                    // reads nothing.
-                    autonomy.seq += 1;
-                    autonomy.reading = false;
-                }
             }
             MonitorMsg::AutonomyWindow(week) => {
                 if self.monitor.autonomy.week != week {
@@ -219,7 +336,10 @@ impl DesktopApp {
                     self.read_autonomy(0, context);
                 }
             }
-            MonitorMsg::AutonomyRefresh => self.read_autonomy(0, context),
+            MonitorMsg::AutonomyRefresh => {
+                self.read_autonomy(0, context);
+                self.read_liveness(context);
+            }
             MonitorMsg::AutonomyLoaded(seq, read) => {
                 if seq != self.monitor.autonomy.seq {
                     return;
@@ -240,7 +360,7 @@ impl DesktopApp {
                 };
                 let report = match *read {
                     Ok(read) => crate::autonomy_view::Report::Read(views::Shared(Rc::new(
-                        crate::autonomy_view::lines(
+                        crate::autonomy_view::read(
                             &read,
                             |agent| self.agent_title(agent),
                             project_name,
@@ -250,7 +370,7 @@ impl DesktopApp {
                     Err(error) => crate::autonomy_view::Report::Failed(error),
                 };
                 self.monitor.autonomy.report = Some(report);
-                if self.monitor.autonomy.open && self.panel == Panel::Monitor {
+                if self.main == Main::Agents {
                     self.read_autonomy(crate::autonomy_view::REFRESH_MS, context);
                 }
             }
@@ -266,25 +386,6 @@ impl DesktopApp {
             Panel::Details => {
                 if let Some(agent) = self.details_agent() {
                     self.show_details(&agent, context);
-                }
-            }
-            Panel::Monitor => {
-                if self.panel != Panel::Monitor {
-                    self.panel = Panel::Monitor;
-                    self.start_monitor(context);
-                    if self.monitor.autonomy.open {
-                        self.read_autonomy(0, context);
-                    }
-                }
-            }
-            Panel::Inbox => {
-                if self.panel != Panel::Inbox {
-                    // The Monitor's refresh stops; the inbox reads with the
-                    // sidebar's poll.
-                    self.close_panel();
-                    self.panel = Panel::Inbox;
-                    self.read_inbox(context);
-                    self.read_inbox_counts(context);
                 }
             }
             Panel::Closed => {}
@@ -305,6 +406,7 @@ impl DesktopApp {
             self.monitor.selected = Some(agent.to_owned());
             self.monitor.data.detail_errors.clear();
             self.monitor.technical_open = false;
+            self.monitor.detail_due = true;
         }
         let was_closed = !self.monitor_panel();
         self.panel = Panel::Details;
@@ -316,7 +418,20 @@ impl DesktopApp {
     /// Whether the pane shown runs the Monitor's refresh chain (the
     /// Monitor or the details; the Inbox reads with the sidebar's poll).
     pub(super) fn monitor_panel(&self) -> bool {
-        matches!(self.panel, Panel::Monitor | Panel::Details)
+        self.main == Main::Agents || self.panel == Panel::Details
+    }
+
+    /// After every update: neither the Agents page nor Details shows any
+    /// more, so the running read (a wait or a read) is cancelled now
+    /// rather than at its next result.
+    pub(super) fn sync_monitor(&mut self) {
+        if !self.monitor_panel()
+            && let Some(task) = self.monitor.task.take()
+        {
+            task.cancel();
+            self.monitor.epoch += 1;
+            self.monitor.refreshing = false;
+        }
     }
 
     /// Close the panel: no refresh, no render work.
@@ -381,114 +496,135 @@ impl DesktopApp {
             }
         };
         let epoch = self.monitor.epoch;
+        // The fleet only while the Agents page shows; the selected Agent
+        // only while its Details show; its usage and diagnosis only when
+        // the selection or its generation changed.
+        let fleet = self.main == Main::Agents;
+        let selected = self
+            .monitor
+            .selected
+            .clone()
+            .filter(|_| self.panel == Panel::Details);
+        let cached = self.monitor.data.detail.as_ref().map(|detail| {
+            (
+                detail.read.agent.agent.id.clone(),
+                detail.read.agent.agent.generation,
+            )
+        });
+        let current = selected.as_ref().and_then(|id| {
+            self.monitor
+                .data
+                .rows
+                .iter()
+                .find(|row| &row.id == id)
+                .map(|row| row.generation)
+        });
+        let detail_full = std::mem::take(&mut self.monitor.detail_due)
+            || selected.as_ref().is_some_and(|id| {
+                cached.as_ref().is_none_or(|(cached_id, generation)| {
+                    cached_id != id || current.is_some_and(|current| current != *generation)
+                })
+            });
+        let filter = monitor::fleet_filter(if fleet { None } else { selected.as_deref() });
         let plan = monitor::RefreshPlan {
-            selected: self.monitor.selected.clone(),
+            fleet,
+            selected,
+            detail_full,
             stopped: self.monitor.data.wants_stopped(),
             attention_cursor: self.monitor.data.attention_cursor,
-            losses: self.monitor.data.loss_reads(),
+            losses: if fleet {
+                self.monitor.data.loss_reads()
+            } else {
+                Vec::new()
+            },
         };
+        let cursor = self.monitor.event_cursor;
         let refresh_gate = self.monitor.refresh_gate.clone();
         self.monitor.refreshing = true;
         self.monitor.task = Some(context.spawn_background(move |cancel| {
             let cancelled = || cancel.is_cancelled();
+            // A scheduled read (`delay_ms` > 0) waits at least that long,
+            // then for one of the fleet's events, at most QUIET_PERIOD_MS
+            // in all. Nothing is read while the window is minimized or
+            // hidden; the first read after it shows again is immediate.
             if delay_ms > 0 && !feed::backoff(delay_ms, &cancelled) {
                 return Message::Monitor(MonitorMsg::MonitorLoaded(epoch, None));
             }
+            let paused = |cancelled: &dyn Fn() -> bool| -> bool {
+                let mut paused = false;
+                while crate::window_place::hidden() {
+                    paused = true;
+                    if !feed::backoff(monitor::HIDDEN_CHECK_MS, cancelled) {
+                        break;
+                    }
+                }
+                paused
+            };
+            let woke = paused(&cancelled);
             let snapshot = client::block_on(async {
                 // A cancelled epoch may still have an IPC read in flight.
                 let _guard = refresh_gate.lock().await;
                 if cancelled() {
                     return None;
                 }
-                monitor::refresh(&data_dir, plan, &cancelled).await
+                if delay_ms > 0 && !woke {
+                    let wait = monitor::QUIET_PERIOD_MS.saturating_sub(delay_ms);
+                    // Wait from the tip read before the last read: an event
+                    // committed since wakes it at once. Without a cursor, or
+                    // when the wait fails, the quiet period passes instead.
+                    // Cancellable: leaving the page drops the long-poll.
+                    let waited = match cursor {
+                        Some(after) => {
+                            match feed::cancellable(
+                                client::events_wait(&data_dir, after, &filter, wait),
+                                &cancelled,
+                            )
+                            .await
+                            {
+                                None => return None,
+                                Some(reply) => reply.is_ok(),
+                            }
+                        }
+                        None => false,
+                    };
+                    // Inside the runtime: `pause`, never `backoff` (it
+                    // starts its own runtime).
+                    if !waited && !feed::pause(wait, &cancelled).await {
+                        return None;
+                    }
+                    while crate::window_place::hidden() {
+                        if !feed::pause(monitor::HIDDEN_CHECK_MS, &cancelled).await {
+                            return None;
+                        }
+                    }
+                }
+                if cancelled() {
+                    return None;
+                }
+                // The tip before this read: the next wait starts there, so
+                // nothing committed during the read is missed.
+                let tip = client::events_bounds(&data_dir, &filter)
+                    .await
+                    .ok()
+                    .map(|bounds| bounds.hi);
+                monitor::refresh(&data_dir, plan, &cancelled)
+                    .await
+                    .map(|mut snapshot| {
+                        snapshot.event_cursor = tip;
+                        snapshot
+                    })
             });
             Message::Monitor(MonitorMsg::MonitorLoaded(epoch, snapshot.map(Box::new)))
         }));
     }
 
-    /// The Monitor's search and state filter (`Conversation.dc.html`): a
-    /// pill search field (title, id, harness, model, project, live and
-    /// recently stopped), then the connected segmented filter.
-    fn monitor_search(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
-        let filter = &self.monitor.filter;
-        let field = TextBox::new()
-            .text(filter.text.clone())
-            .placeholder_text("Search agents")
-            .automation_name("Search the monitor")
-            .on_text_changed(
-                context.callback(|text| Message::Monitor(MonitorMsg::SearchChanged(text))),
-            );
-        let segments: Vec<KeyedView> = monitor::STATE_FILTERS
-            .iter()
-            .enumerate()
-            .map(|(index, group)| {
-                let label = group.map_or("All", monitor::Group::filter_label);
-                let selected = filter.group == *group;
-                // Keyed by its selection: WinUI reads a button's colors
-                // only when its template is applied.
-                KeyedView::new(
-                    format!("{label}:{selected}"),
-                    m3::segment(palette, selected)
-                        .automation_name(format!("Show {label}"))
-                        .on_click(
-                            context.message(Message::Monitor(MonitorMsg::StateChosen(Some(index)))),
-                        )
-                        .content(m3::segment_label(label)),
-                )
-            })
-            .collect();
-        StackPanel::new().spacing(tokens::spacing::ROW).children((
-            m3::search_field(palette.tonal(), field),
-            m3::segmented(palette, segments),
-        ))
-    }
-
-    /// The pane's header: the Monitor and Details tabs and the close
-    /// button.
+    /// The Details pane's head: its title and the close button.
     pub(super) fn panel_header(
         &self,
-        _title: &str,
+        title: &str,
         context: &mut ViewContext<Self>,
         palette: Palette,
     ) -> View {
-        let inbox = match self.inbox.total() {
-            0 => "Inbox".to_owned(),
-            count => format!("Inbox · {count}"),
-        };
-        let tabs: Vec<KeyedView> = [
-            ("Monitor", Panel::Monitor),
-            (inbox.as_str(), Panel::Inbox),
-            ("Details", Panel::Details),
-        ]
-        .into_iter()
-        .map(|(label, panel)| {
-            let selected = self.panel == panel;
-            let enabled = panel != Panel::Details || self.details_agent().is_some();
-            let tab = m3::pane_tab(palette, selected)
-                .is_enabled(enabled)
-                .automation_name(if enabled {
-                    format!("Show {label}")
-                } else {
-                    format!("Show {label}: {NO_DETAILS}")
-                })
-                .on_click(context.message(Message::Monitor(MonitorMsg::PanelChosen(panel))))
-                .content(m3::pane_tab_label(label));
-            // WinUI shows no tooltip on a disabled control and does not
-            // hit-test it, so the reason sits on a hit-testable border
-            // behind it.
-            let tab: View = if enabled {
-                tab
-            } else {
-                Border::new()
-                    .background(Brush::Solid(Color::argb(0, 0, 0, 0)))
-                    .content(tab)
-                    .tooltip(NO_DETAILS)
-            };
-            // Keyed by its selection (k195 P2-5: the highlight follows
-            // the pane, however it opened) and by whether it can open.
-            KeyedView::new(format!("{label}:{selected}:{enabled}"), tab)
-        })
-        .collect();
         Grid::new()
             .height(tokens::height::CONTROL)
             .columns([GridLength::STAR, GridLength::Auto])
@@ -499,9 +635,7 @@ impl DesktopApp {
                 0.0,
             ))
             .children((
-                StackPanel::new()
-                    .orientation(Orientation::Horizontal)
-                    .keyed_children(tabs),
+                m3::section_title(title.to_owned()).vertical_alignment(VerticalAlignment::Center),
                 m3::icon_button(palette)
                     .grid_column(1)
                     .automation_name("Close panel")
@@ -531,11 +665,10 @@ impl DesktopApp {
         ProjectRef { key, name }
     }
 
-    /// One row, and below it (when `nest`) its children's toggle (workers
-    /// and subagents, collapsed by default) and, when open, their rows one
-    /// step in (recursively: a child may have its own). `selected` is the
-    /// open Agent's id, drawn as the selection. `now` is the snapshot's
-    /// read time, so the entries change only with a snapshot.
+    /// One tree row, and under it (when `tree` is given and its children
+    /// are shown) its workers and subagents one step in (recursively).
+    /// `selected` is the open Agent's id; `now` is the snapshot's read time,
+    /// so the entries change only with a snapshot.
     #[allow(
         clippy::too_many_arguments,
         reason = "The operation's distinct inputs remain explicit at its established call boundary."
@@ -546,158 +679,420 @@ impl DesktopApp {
         depth: usize,
         tree: Option<&Tree>,
         selected: Option<&str>,
+        project: String,
         now: i64,
         entries: &mut Vec<monitor_view::MonitorEntry>,
     ) {
         let data = &self.monitor.data;
-        let indent = depth as f64 * tokens::layout::TREE_INDENT;
         let title = self.agent_title(&row.id);
-        // A top-level row whose parent is not shown names its parent task
-        // by title (never a bare id: an unknown title leaves it out).
-        let parent = row
-            .parent
-            .as_deref()
-            .filter(|_| depth == 0)
-            .map(|parent| (parent, self.agent_title(parent)))
-            .filter(|(id, title)| title != id)
-            .map(|(_, title)| title);
         let incident = data
             .incident(row)
             .filter(|_| row.state != eliot_core::AgentState::Stopped);
-        // Working without writing code says so on the row's second line,
-        // in the attention tone; the trailing word stays the model.
-        let no_code = incident.filter(|incident| incident.no_code());
-        // The note: why a lost or failed Agent ended, as its conversation
-        // says; else why it needs attention (its open report, the first
-        // worker that needs you, or its own state); else the task it runs
-        // under.
-        let note = if row.resumable() {
-            data.loss_words(row).map(monitor_view::RowNote::Ended)
-        } else if incident.is_some() {
-            None
-        } else {
-            tree.filter(|_| !data.needs_attention(row))
-                .and_then(|tree| tree.worker_attention_words(&row.id))
-                .map(monitor_view::RowNote::Attention)
-        }
-        .or_else(|| {
-            (incident.is_none() && data.needs_attention(row))
-                .then(|| monitor_view::RowNote::Attention(row.status_words().to_owned()))
-        })
-        .or_else(|| parent.map(monitor_view::RowNote::Under));
-        // The second line leads with the active incident, then the
-        // projected status, then measured work.
-        let group = row.group(data.incident(row));
-        let line = if let Some(incident) = incident {
-            let text = incident.words(now);
-            Some(monitor_view::RowLine {
-                words: format!("needs attention: {text}"),
-                text,
-                attention: true,
-            })
+        // The activity column: the open attention report, why a lost or
+        // failed Agent ended, the first worker that needs you, the status
+        // line, else its state and how long it has been quiet.
+        let (activity, attention) = if let Some(incident) = incident {
+            (incident.words(now), true)
+        } else if row.resumable() {
+            (
+                data.loss_words(row)
+                    .unwrap_or_else(|| row.status_words().to_owned()),
+                false,
+            )
+        } else if let Some(words) = tree
+            .filter(|_| !data.needs_attention(row))
+            .and_then(|tree| tree.worker_attention_words(&row.id))
+        {
+            (words, true)
         } else if let Some(status) = &row.status_line {
-            Some(monitor_view::RowLine {
-                text: status.clone(),
-                words: status.clone(),
-                attention: group == monitor::Group::Attention,
-            })
+            (status.clone(), data.needs_attention(row))
+        } else if row.native_child {
+            (row.operation(), false)
         } else {
-            row.work
-                .as_ref()
-                .filter(|work| {
-                    !row.native_child
-                        && row.state != eliot_core::AgentState::Stopped
-                        && (!row.ended() || work.available)
-                })
-                .map(|work| monitor_view::RowLine {
-                    text: monitor::work_line(work, now),
-                    words: monitor::work_words(work, now),
-                    attention: false,
-                })
+            (
+                format!("{} · {}", row.status_words(), row.quiet(now).label()),
+                false,
+            )
         };
-        let quiet = row.quiet(now);
-        // A failure, an unconfirmed outcome or a wait for the owner keeps
-        // its own mark in any group (a native subagent's failure sits under
-        // Recently stopped); otherwise the group decides, a start excepted.
-        let tone = match (group_tone(group), StatusTone::of_state(row.state)) {
-            (_, own @ (StatusTone::Failed | StatusTone::Unknown | StatusTone::Attention)) => own,
-            (StatusTone::Neutral, StatusTone::Pending) => StatusTone::Pending,
-            (group_tone, _) => group_tone,
-        };
+        let point = data
+            .series
+            .get(&row.id)
+            .and_then(|series| series.points().back());
+        let cpu = point
+            .and_then(|point| point.cpu_percent)
+            .map_or_else(|| "–".to_owned(), |cpu| format!("{cpu:.0}%"));
+        let memory = point
+            .and_then(|point| point.rss_bytes)
+            .map_or_else(|| "–".to_owned(), |bytes| monitor::bytes_label(Some(bytes)));
+        // A top-level row whose parent is not shown names its parent task.
+        let under = row
+            .parent
+            .as_deref()
+            .filter(|_| depth == 0)
+            .map(|parent| self.agent_title(parent))
+            .filter(|parent| Some(parent.as_str()) != row.parent.as_deref())
+            .map_or_else(String::new, |parent| format!(", under {parent}"));
+        let children = tree
+            .map(|tree| tree.children(&row.id))
+            .filter(|children| !children.is_empty() && depth <= 4);
+        let open = self.monitor.expanded.contains(&row.id);
         entries.push(monitor_view::MonitorEntry::Row(Box::new(
             monitor_view::RowEntry {
                 row: row.clone(),
-                title: title.clone(),
-                elapsed: quiet.label(),
-                elapsed_words: quiet.words(),
-                tone,
+                title,
+                project,
+                model: crate::picker::harness_model_label(&row.harness, row.model.as_deref()),
+                activity,
+                attention,
+                cpu,
+                memory,
+                words: format!(
+                    ", {}{under}{}",
+                    row.quiet(now).words(),
+                    children
+                        .map(|_| format!(
+                            ", {}",
+                            tree.map(|tree| tree.children_label(&row.id))
+                                .unwrap_or_default()
+                        ))
+                        .unwrap_or_default()
+                ),
                 selected: selected == Some(row.id.as_str()),
-                working: group == monitor::Group::Working || no_code.is_some(),
-                line,
-                note,
+                children: children.map(|_| open),
+                kid: depth > 0,
+                observed: row.native_child,
                 resume: row.resumable().then(|| !self.submitting()),
                 stop: (!row.native_child && !row.ended())
                     .then(|| self.stop_button(&row.id, row.generation))
                     .flatten(),
-                indent,
             },
         )));
-        let Some(tree) = tree else {
-            return;
-        };
-        let children = tree.children(&row.id);
-        if children.is_empty() || depth > 4 {
-            return;
-        }
-        let open = self.monitor.expanded.contains(&row.id);
-        entries.push(monitor_view::MonitorEntry::Children {
-            id: row.id.clone(),
-            label: tree.children_label(&row.id),
-            title,
-            open,
-            indent,
-        });
-        if open {
+        if let Some(children) = children.filter(|_| open) {
             for child in children {
-                self.monitor_entries(child, depth + 1, Some(tree), selected, now, entries);
+                self.monitor_entries(
+                    child,
+                    depth + 1,
+                    tree,
+                    selected,
+                    String::new(),
+                    now,
+                    entries,
+                );
             }
         }
     }
 
-    /// The monitor: the overview, then Needs attention, Working, Idle and a
-    /// collapsed Recently stopped, workers and subagents under their
-    /// parent's row; under a filter the chart's loaded Agents are listed flat.
-    /// The sections and rows are their own component
-    /// ([`monitor_view::MonitorList`]), redrawn only when a snapshot or a
-    /// choice changes them.
+    /// Read the swarm's wait classes (`daemon.status` `liveness`) once:
+    /// when the Agents page opens and on its Refresh, never on a timer.
+    pub(super) fn read_liveness(&mut self, context: &ComponentContext<Self>) {
+        let Ok(data_dir) = self.data_dir.clone() else {
+            return;
+        };
+        self.monitor.liveness_seq += 1;
+        let seq = self.monitor.liveness_seq;
+        let _task = context.spawn_background(move |_| {
+            let read = client::block_on(client::daemon_status(&data_dir))
+                .map(|status| status.liveness)
+                .map_err(|error| error.user_message());
+            Message::Monitor(MonitorMsg::LivenessLoaded(seq, Box::new(read)))
+        });
+    }
+
+    /// The Agents page (`Agents.dc.html`): search and grouping, the
+    /// summary, the filter chips with counts, the wait classes, the tree
+    /// (managers and their workers; state mark, task, project, model,
+    /// activity, CPU, memory, Stop) and Autonomy. The tree is its own
+    /// component ([`monitor_view::MonitorList`]), redrawn only when a
+    /// snapshot or a choice changes it.
     pub(super) fn monitor_view(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
         let data = &self.monitor.data;
-        let now = crate::handoff::now_ms();
-        // The rows' ages and incidents as of the last read, so they change
-        // only with a snapshot.
-        let read_at = data.read_at_ms.unwrap_or(now);
+        // Ages and incidents as of the last read (the snapshot's time, not
+        // the clock's), so the page changes only with a read.
+        let read_at = data.read_at_ms.unwrap_or_default();
         let checkouts = self.checkouts();
         let project_of = |row: &MonitorRow| self.monitor_project(row, &checkouts);
-        let overview = data.overview(now, &project_of);
-        let filter = &self.monitor.filter;
+        let partial = data.partial();
+        let tree = data.tree(read_at);
+        let fleet = self.monitor.fleet;
+        let search = &self.monitor.filter;
+        let incident = |row: &MonitorRow| data.incident(row).is_some();
+        let live: Vec<&MonitorRow> = data.rows.iter().filter(|row| !row.native_child).collect();
+        let count = |filter: FleetFilter| {
+            live.iter()
+                .filter(|row| filter.keeps(row, incident(row)))
+                .count()
+        };
         let mut items: Vec<KeyedView> = Vec::new();
+
+        // Title row: search and grouping.
+        let field = TextBox::new()
+            .text(search.text.clone())
+            .placeholder_text("Search Agents")
+            .automation_name("Search Agents")
+            .on_text_changed(
+                context.callback(|text| Message::Monitor(MonitorMsg::SearchChanged(text))),
+            );
+        let by_project = self.monitor.by_project;
+        items.push(KeyedView::new(
+            "title",
+            page_ui::toolbar(
+                page_ui::title("Agents"),
+                vec![
+                    KeyedView::new(
+                        "search",
+                        Border::new()
+                            .width(tokens::page::SEARCH)
+                            .content(m3::search_field(palette.tonal(), field)),
+                    ),
+                    KeyedView::new(
+                        "group",
+                        page_ui::choice(
+                            palette,
+                            &[
+                                (
+                                    "By state",
+                                    !by_project,
+                                    context.message(Message::Monitor(MonitorMsg::GroupBy(false))),
+                                ),
+                                (
+                                    "By project",
+                                    by_project,
+                                    context.message(Message::Monitor(MonitorMsg::GroupBy(true))),
+                                ),
+                            ],
+                        ),
+                    ),
+                ],
+            ),
+        ));
+
+        // The summary.
+        let working = count(FleetFilter::Working);
+        let waiting = count(FleetFilter::Waiting);
+        let holds = live
+            .iter()
+            .filter(|row| page_ui::held(row.status_line.as_deref()))
+            .count();
+        let (tokens_today, reporting) = self.tokens_today();
+        let partial_tip =
+            partial.then(|| "Partial: more Agents are live than this read loaded.".to_owned());
+        items.push(KeyedView::new(
+            format!("stats:{working}:{waiting}:{holds}:{tokens_today}:{reporting}"),
+            page_ui::grid(vec![
+                page_ui::stat_panel(
+                    palette,
+                    page_ui::stat(working.to_string(), "Working", partial_tip.clone()),
+                ),
+                page_ui::stat_panel(
+                    palette,
+                    page_ui::stat(waiting.to_string(), "Waiting for you", partial_tip),
+                ),
+                page_ui::stat_panel(
+                    palette,
+                    page_ui::stat(
+                        holds.to_string(),
+                        "On provider hold",
+                        Some("Agents their provider holds (quota, rate limit, sign-in)".to_owned()),
+                    ),
+                ),
+                page_ui::stat_panel(
+                    palette,
+                    page_ui::stat(
+                        crate::monitor::group(tokens_today),
+                        "Tokens today",
+                        Some(format!(
+                            "Totals of {reporting} loaded Agents active today; each reports its whole total"
+                        )),
+                    ),
+                ),
+            ]),
+        ));
+
+        // The filter chips.
+        let chips: Vec<KeyedView> = FleetFilter::ALL
+            .into_iter()
+            .map(|filter| {
+                let selected = fleet == filter;
+                let n = count(filter);
+                KeyedView::new(
+                    format!("{}:{selected}:{n}", filter.label()),
+                    page_ui::filter_chip(
+                        palette,
+                        filter.label(),
+                        Some(n),
+                        selected,
+                        context.message(Message::Monitor(MonitorMsg::FleetChosen(filter))),
+                    ),
+                )
+            })
+            .collect();
+        items.push(KeyedView::new("filters", page_ui::chip_rows(chips, 6)));
+
+        // The wait classes.
+        let waits = match &self.monitor.liveness {
+            None => "Waits: reading…".to_owned(),
+            Some(Ok(liveness)) => format!(
+                "Waits: Moving {} · Asked {} · Parked {} · Stuck {} · Long {}",
+                liveness.moving, liveness.asked, liveness.parked, liveness.stuck, liveness.long
+            ),
+            Some(Err(error)) => format!("Waits: not read ({error})"),
+        };
+        items.push(KeyedView::new(
+            format!("waits:{waits}"),
+            m3::secondary(waits).text_wrapping(TextWrapping::Wrap),
+        ));
         if data.read_at_ms.is_none() && self.monitor.refreshing && data.errors.is_empty() {
             items.push(KeyedView::new(
                 "reading",
-                m3::secondary("Reading the swarm…"),
+                page_ui::quiet("Reading the swarm…"),
             ));
         }
         if !data.errors.is_empty() {
             items.push(KeyedView::new(
                 "errors",
-                m3::text(
+                page_ui::error_line(
+                    palette,
                     format!("Some reads failed: {}", data.errors.join("; ")),
-                    tokens::text::BODY,
-                )
-                .foreground(palette.attention())
-                .text_wrapping(TextWrapping::Wrap),
+                ),
             ));
         }
+
+        // The tree.
+        let searching = !search.text.trim().is_empty();
+        let flat = searching || fleet != FleetFilter::All;
+        let keeps = |row: &MonitorRow| {
+            fleet.keeps(row, incident(row)) && search.matches_text(row, &project_of(row).name)
+        };
+        let top: Vec<&MonitorRow> = if flat {
+            data.rows
+                .iter()
+                .filter(|row| !row.native_child && keeps(row))
+                .chain(
+                    data.stopped
+                        .iter()
+                        .filter(|row| searching && fleet == FleetFilter::All && keeps(row)),
+                )
+                .collect()
+        } else {
+            tree.sections()
+                .into_iter()
+                .flat_map(|section| section.rows)
+                .collect()
+        };
+        let focused = self
+            .selected_agent_id()
+            .or_else(|| self.monitor.selected.clone());
+        let nest = (!flat).then_some(&tree);
+        let mut entries = Vec::new();
+        let push_rows = |rows: &[&MonitorRow], entries: &mut Vec<monitor_view::MonitorEntry>| {
+            for row in rows {
+                let project = project_of(row).name;
+                self.monitor_entries(row, 0, nest, focused.as_deref(), project, read_at, entries);
+            }
+        };
+        if by_project {
+            let mut groups: BTreeMap<String, Vec<&MonitorRow>> = BTreeMap::new();
+            for row in &top {
+                groups.entry(project_of(row).name).or_default().push(row);
+            }
+            for (name, rows) in &groups {
+                entries.push(monitor_view::MonitorEntry::Section(
+                    format!("project:{name}"),
+                    format!("{name} · {}", rows.len()),
+                ));
+                push_rows(rows, &mut entries);
+            }
+        } else {
+            for group in FleetGroup::ALL {
+                let rows: Vec<&MonitorRow> = top
+                    .iter()
+                    .copied()
+                    .filter(|row| FleetGroup::of_row(row) == group)
+                    .collect();
+                if rows.is_empty() {
+                    continue;
+                }
+                // The state totals count held Agents in their state; they
+                // list under On provider hold instead.
+                let held_here = data
+                    .rows
+                    .iter()
+                    .filter(|row| {
+                        FleetGroup::of(row.state) == group
+                            && page_ui::held(row.status_line.as_deref())
+                    })
+                    .count();
+                let total = data
+                    .counts
+                    .iter()
+                    .filter(|count| group.states().contains(&count.state))
+                    .try_fold(0usize, |sum, count| count.total.map(|total| sum + total))
+                    .map_or(rows.len(), |total| {
+                        total.saturating_sub(held_here).max(rows.len())
+                    });
+                let label = format!("{} · {} of {total}", group.title(), rows.len());
+                if group == FleetGroup::Stopped {
+                    let open = self.monitor.stopped_open || searching;
+                    entries.push(monitor_view::MonitorEntry::Stopped(label, open));
+                    if !open {
+                        continue;
+                    }
+                } else {
+                    entries.push(monitor_view::MonitorEntry::Section(
+                        format!("section:{group:?}"),
+                        label,
+                    ));
+                }
+                push_rows(&rows, &mut entries);
+            }
+        }
+        if data.read_at_ms.is_some() && top.is_empty() {
+            entries.push(monitor_view::MonitorEntry::Note(
+                if flat {
+                    "No Agents match this filter"
+                } else {
+                    "No Agents to show"
+                }
+                .to_owned(),
+            ));
+        }
+        if partial {
+            items.push(KeyedView::new(
+                "partial",
+                page_ui::quiet("Showing loaded Agents: more are live than this read loaded."),
+            ));
+        }
+        items.push(KeyedView::new(
+            "tree",
+            Border::new()
+                .background(palette.tonal())
+                .border_brush(palette.outline())
+                .border_thickness(Thickness::uniform(tokens::layout::HAIRLINE))
+                .corner_radius(tokens::radius::CONTAINER)
+                .padding(Thickness::uniform(
+                    tokens::spacing::SM - tokens::layout::HAIRLINE,
+                ))
+                .automation_name("Agents")
+                .content(View::component::<monitor_view::MonitorList>(
+                    monitor_view::MonitorListInput {
+                        entries,
+                        palette,
+                        open: context.callback(|id| Message::Monitor(MonitorMsg::RowOpened(id))),
+                        resume: context.callback(|(id, generation)| {
+                            Message::Monitor(MonitorMsg::ResumeRequested(id, generation))
+                        }),
+                        stop: context.callback(|(id, generation)| {
+                            Message::Monitor(MonitorMsg::StopRequested(id, generation))
+                        }),
+                        children: context
+                            .callback(|id| Message::Monitor(MonitorMsg::ChildrenToggled(id))),
+                        stopped: context
+                            .callback(|()| Message::Monitor(MonitorMsg::StoppedToggled)),
+                    },
+                )),
+        ));
+
+        // Autonomy.
         let autonomy = &self.monitor.autonomy;
         items.push(KeyedView::new(
             "autonomy",
@@ -718,119 +1113,7 @@ impl DesktopApp {
                 },
             ),
         ));
-        items.push(KeyedView::new(
-            "search",
-            self.monitor_search(context, palette),
-        ));
-        let tree = data.tree(read_at);
-        // The open task is selected in its own group (the design has no
-        // separate "current" block).
-        let focused = self
-            .selected_agent_id()
-            .or_else(|| self.monitor.selected.clone());
-        let (mut sections, showing_loaded) = if filter.is_active() {
-            overview.list_for_filter(filter)
-        } else {
-            (tree.sections(), false)
-        };
-        if filter.is_active() {
-            // A search or the Stopped state reaches the recently stopped
-            // Agents too (k195 P3-2: 190 of them were found by scrolling).
-            let rows: Vec<&MonitorRow> = data
-                .stopped
-                .iter()
-                .filter(|row| filter.keeps_stopped(row, &project_of(row)))
-                .collect();
-            sections.push(monitor::Section {
-                group: monitor::Group::Stopped,
-                rows,
-            });
-        }
-        let no_rows = sections.iter().all(|section| section.rows.is_empty());
-        if showing_loaded {
-            let note = if no_rows {
-                "No live Agents were loaded in this partial read."
-            } else {
-                "No matches on this page. Showing loaded Agents."
-            };
-            items.push(KeyedView::new(
-                "filter-unavailable",
-                m3::secondary(note).text_wrapping(TextWrapping::Wrap),
-            ));
-        }
-        let nest = (!filter.is_active()).then_some(&tree);
-        let mut entries = Vec::new();
-        for section in &sections {
-            let top = section.rows.len();
-            if top == 0 {
-                continue;
-            }
-            // The design's group label: "Working · 2" (its top-level rows;
-            // nested workers fold under their task).
-            let label = format!("{} · {top}", section.group.title());
-            if section.group == monitor::Group::Stopped {
-                // Search results are shown, not folded.
-                let open = self.monitor.stopped_open || filter.is_active();
-                entries.push(monitor_view::MonitorEntry::Stopped(label, open));
-                if !open {
-                    continue;
-                }
-            } else {
-                entries.push(monitor_view::MonitorEntry::Section(
-                    format!("section:{:?}", section.group),
-                    label,
-                ));
-            }
-            for row in &section.rows {
-                self.monitor_entries(row, 0, nest, focused.as_deref(), read_at, &mut entries);
-            }
-        }
-        if data.read_at_ms.is_some() && no_rows && !showing_loaded {
-            let none = if filter.is_active() {
-                "No Agents match this filter."
-            } else {
-                "No Agents to show."
-            };
-            entries.push(monitor_view::MonitorEntry::Note(none.to_owned()));
-        }
-        items.push(KeyedView::new(
-            "list",
-            View::component::<monitor_view::MonitorList>(monitor_view::MonitorListInput {
-                entries,
-                palette,
-                open: context.callback(|id| Message::Monitor(MonitorMsg::RowOpened(id))),
-                resume: context.callback(|(id, generation)| {
-                    Message::Monitor(MonitorMsg::ResumeRequested(id, generation))
-                }),
-                stop: context.callback(|(id, generation)| {
-                    Message::Monitor(MonitorMsg::StopRequested(id, generation))
-                }),
-                children: context.callback(|id| Message::Monitor(MonitorMsg::ChildrenToggled(id))),
-                stopped: context.callback(|()| Message::Monitor(MonitorMsg::StoppedToggled)),
-            }),
-        ));
-        Grid::new()
-            .rows([GridLength::Auto, GridLength::STAR])
-            .children((
-                self.panel_header("Monitor", context, palette),
-                ScrollViewer::new()
-                    .grid_row(1)
-                    .vertical_scroll_bar_visibility(ScrollBarVisibility::Auto)
-                    .automation_name("Monitored Agents")
-                    .content(
-                        // The pane's column (`Conversation.dc.html`): 10 DIPs
-                        // in from its sides, 10 between its pieces.
-                        StackPanel::new()
-                            .spacing(tokens::spacing::ROW)
-                            .margin(Thickness::new(
-                                tokens::spacing::ROW,
-                                tokens::spacing::ROW,
-                                tokens::spacing::ROW,
-                                tokens::spacing::INSET,
-                            ))
-                            .keyed_children(items),
-                    ),
-            ))
+        page_ui::page("Agents", self.page_width(tokens::page::WIDTH), items)
     }
 
     /// The open Agent's details: its settings and coverage, resources and

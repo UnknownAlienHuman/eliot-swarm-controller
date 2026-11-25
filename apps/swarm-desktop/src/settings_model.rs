@@ -980,3 +980,115 @@ pub fn launch_error(error: &eliot_core::Error) -> String {
         _ => error.to_string(),
     }
 }
+
+/// One edit of the `[daemon]` section at a JSON pointer ("/attention/
+/// no_progress/enabled"): a switch or dropdown saves at once, a typed
+/// number or text when typing rests.
+#[derive(Clone, Debug, PartialEq)]
+pub enum DaemonEdit {
+    Switch(&'static str, bool),
+    /// A whole number; `None` (an empty box) removes the key, which the
+    /// daemon reads as its default or as "off" for a retention window.
+    Number(&'static str, Option<f64>),
+    Choice(&'static str, &'static str),
+    /// Text; empty removes the key.
+    Text(&'static str, String),
+    /// A control reported nothing to change (no selection).
+    Unchanged,
+}
+
+/// The value at `pointer` in the `[daemon]` draft.
+pub fn daemon_value<'a>(daemon: &'a Value, pointer: &str) -> Option<&'a Value> {
+    daemon.pointer(pointer)
+}
+
+/// A switch's state, `default` when the key is absent.
+pub fn daemon_bool(daemon: &Value, pointer: &str, default: bool) -> bool {
+    daemon_value(daemon, pointer)
+        .and_then(Value::as_bool)
+        .unwrap_or(default)
+}
+
+/// A number's value, if set.
+pub fn daemon_number(daemon: &Value, pointer: &str) -> Option<f64> {
+    daemon_value(daemon, pointer).and_then(Value::as_f64)
+}
+
+/// A text value, empty when absent.
+pub fn daemon_text(daemon: &Value, pointer: &str) -> String {
+    daemon_value(daemon, pointer)
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned()
+}
+
+/// Apply `edit` to the `[daemon]` draft; false when it changes nothing.
+pub fn apply_daemon_edit(daemon: &mut Value, edit: DaemonEdit) -> bool {
+    let (pointer, value) = match edit {
+        DaemonEdit::Switch(pointer, on) => (pointer, Some(Value::Bool(on))),
+        DaemonEdit::Number(pointer, number) => (
+            pointer,
+            number
+                .filter(|number| number.is_finite())
+                .map(|number| json!(number.round() as i64)),
+        ),
+        DaemonEdit::Choice(pointer, choice) => (pointer, Some(json!(choice))),
+        DaemonEdit::Text(pointer, text) => {
+            let text = text.trim().to_owned();
+            (pointer, (!text.is_empty()).then(|| json!(text)))
+        }
+        DaemonEdit::Unchanged => return false,
+    };
+    if daemon.pointer(pointer) == value.as_ref() {
+        return false;
+    }
+    if !daemon.is_object() {
+        *daemon = json!({});
+    }
+    let keys: Vec<&str> = pointer.trim_start_matches('/').split('/').collect();
+    let Some((last, parents)) = keys.split_last() else {
+        return false;
+    };
+    let mut node = daemon;
+    for key in parents {
+        let Some(object) = node.as_object_mut() else {
+            return false;
+        };
+        let child = object.entry((*key).to_owned()).or_insert_with(|| json!({}));
+        if !child.is_object() {
+            *child = json!({});
+        }
+        node = child;
+    }
+    let Some(object) = node.as_object_mut() else {
+        return false;
+    };
+    match value {
+        Some(value) => {
+            object.insert((*last).to_owned(), value);
+        }
+        None => {
+            object.remove(*last);
+        }
+    }
+    true
+}
+
+/// The owner rules text (`[owner_rules] text`).
+pub fn owner_rules_text(section: &Value) -> String {
+    section
+        .get("text")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned()
+}
+
+/// Set the owner rules text in its section draft.
+pub fn set_owner_rules(section: &mut Value, text: &str) {
+    if !section.is_object() {
+        *section = json!({});
+    }
+    if let Some(object) = section.as_object_mut() {
+        object.insert("text".to_owned(), json!(text));
+    }
+}
