@@ -176,7 +176,14 @@ impl WorkspaceGit {
     /// without an origin, for a missing directory, or when Git cannot read
     /// it. The URL itself, which may embed credentials, never leaves here.
     pub(crate) async fn origin_name(&self, common_dir: &str, deadline: Instant) -> Option<String> {
-        let root = canonical_root(common_dir).ok()?;
+        self.project_origin(common_dir, deadline)
+            .await
+            .ok()
+            .flatten()
+    }
+
+    async fn project_origin(&self, common_dir: &str, deadline: Instant) -> Result<Option<String>> {
+        let root = canonical_root(common_dir)?;
         let output = self
             .git
             .project_git_metadata(
@@ -194,12 +201,15 @@ impl WorkspaceGit {
                 }),
                 deadline,
             )
-            .await
-            .ok()?;
-        if output.code != 0 {
-            return None;
+            .await?;
+        match output.code {
+            0 => Ok(eliot_core::api::repository_name_from_url(
+                std::str::from_utf8(&output.stdout)
+                    .map_err(|_| problem("unavailable", "Git origin is not UTF-8"))?,
+            )),
+            1 => Ok(None),
+            _ => Err(problem("unavailable", "Git origin could not be read")),
         }
-        eliot_core::api::repository_name_from_url(std::str::from_utf8(&output.stdout).ok()?)
     }
 
     /// Discover the canonical checkout containing an Owner-opened directory.
