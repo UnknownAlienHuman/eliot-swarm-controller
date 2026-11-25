@@ -109,7 +109,7 @@ impl Drop for SessionLifetime {
 
 pub(super) struct OriginAuth {
     issuer: String,
-    audience: String,
+    audiences: Vec<String>,
     client: reqwest::Client,
     keys: Mutex<Keys>,
     key_refresh: Mutex<()>,
@@ -204,7 +204,9 @@ impl OriginAuth {
         data_dir: &Path,
         sdk_sessions: Arc<LocalSessionManager>,
     ) -> Result<Self, String> {
-        let (issuer, audience) = eliot_daemon::load_cloud_access_config(data_dir)
+        let (issuer, _) = eliot_daemon::load_cloud_access_config(data_dir)
+            .map_err(|error| format!("{}: {}", error.code, error.message))?;
+        let audiences = eliot_daemon::load_cloud_access_audiences(data_dir)
             .map_err(|error| format!("{}: {}", error.code, error.message))?;
         let client = reqwest::Client::builder()
             .https_only(true)
@@ -215,7 +217,7 @@ impl OriginAuth {
             .map_err(|_| "origin verifier HTTP client unavailable")?;
         let auth = Self {
             issuer,
-            audience,
+            audiences,
             client,
             key_refresh: Mutex::new(()),
             keys: Mutex::new(Keys {
@@ -317,7 +319,7 @@ impl OriginAuth {
         DecodingKey::from_jwk(jwk).map_err(|_| StatusCode::UNAUTHORIZED)
     }
 
-    async fn verify(&self, assertion: &str) -> Result<Claims, StatusCode> {
+    async fn verify(&self, assertion: &str) -> Result<(Claims, String), StatusCode> {
         if assertion.is_empty() || assertion.len() > MAX_ASSERTION_BYTES {
             return Err(StatusCode::UNAUTHORIZED);
         }
@@ -351,7 +353,7 @@ impl OriginAuth {
         };
         let mut validation = Validation::new(Algorithm::RS256);
         validation.set_issuer(&[&self.issuer]);
-        validation.set_audience(&[&self.audience]);
+        validation.validate_aud = false;
         validation.set_required_spec_claims(&["iss", "aud", "sub", "exp", "nbf"]);
         validation.validate_nbf = true;
         validation.leeway = 0;
@@ -363,13 +365,21 @@ impl OriginAuth {
             || claims.sub.chars().any(char::is_control)
             || claims.token_type != "app"
             || claims.iss != self.issuer
-            || !claims.aud.contains(&self.audience)
             || claims.exp <= now_seconds()
             || claims.nbf > now_seconds()
         {
             return Err(StatusCode::UNAUTHORIZED);
         }
-        Ok(claims)
+        let mut matches = claims.aud.iter().filter(|claim_audience| {
+            self.audiences
+                .iter()
+                .any(|allowed| allowed == *claim_audience)
+        });
+        let selected = matches.next().cloned().ok_or(StatusCode::UNAUTHORIZED)?;
+        if matches.next().is_some() {
+            return Err(StatusCode::UNAUTHORIZED);
+        }
+        Ok((claims, selected))
     }
 
     pub async fn authenticate(
@@ -385,7 +395,7 @@ impl OriginAuth {
             return Err(StatusCode::UNAUTHORIZED);
         }
         let assertion = values[0].to_str().map_err(|_| StatusCode::UNAUTHORIZED)?;
-        let claims = self.verify(assertion).await?;
+        let (claims, audience) = self.verify(assertion).await?;
         let observed_at = Instant::now();
         let epoch = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -398,7 +408,7 @@ impl OriginAuth {
             .ok_or(StatusCode::UNAUTHORIZED)?;
         let identity = RemoteIdentity {
             issuer: self.issuer.clone(),
-            audience: self.audience.clone(),
+            audience,
             subject: claims.sub,
         };
         let session_id = headers

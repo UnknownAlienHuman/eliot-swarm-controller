@@ -109,7 +109,7 @@ pub use presentation::{
     count_words, fence_untrusted_prefix, fence_untrusted_text, origin_words, reason_message,
     reason_words, swarm_note, swarm_note_with_trusted_review_labels,
 };
-pub use remote_call::{RemoteCallContext, RemoteIdentity};
+pub use remote_call::{RemoteCallContext, RemoteIdentity, RemoteManagerGrant};
 pub use restart::{
     CONTINUE_FROM_STOP_ARG, RESTART_PRINCIPAL, format_restart_interrupted_turn_note_body,
 };
