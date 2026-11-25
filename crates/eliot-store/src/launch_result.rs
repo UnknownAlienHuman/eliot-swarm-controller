@@ -2,6 +2,63 @@ use super::*;
 use eliot_core::api::ProjectManagerIdentity;
 
 impl Store {
+    pub fn pending_project_check_obligations(&self, after: i64, limit: i64) -> Result<Vec<Event>> {
+        let mut statement = self.connection.prepare(
+            "SELECT e.seq,e.ts,e.kind,e.agent,e.generation,e.source,e.native_id,e.data,e.subject,e.cause
+             FROM project_check_obligations o JOIN events e ON e.seq=o.completion_seq
+             WHERE o.state='not_started' AND o.completion_seq>?1
+             ORDER BY o.completion_seq LIMIT ?2",
+        ).map_err(sql_error)?;
+        let rows = statement
+            .query_map(params![after, limit.clamp(1, 256)], event_record_from_row)
+            .map_err(sql_error)?;
+        rows.map(|row| event_from_record(row.map_err(sql_error)?))
+            .collect()
+    }
+
+    pub fn claim_project_check_obligation(&mut self, event: &Event) -> Result<bool> {
+        self.ensure_writer_healthy()?;
+        let changed = self.connection.execute(
+            "UPDATE project_check_obligations SET state='checker_started'
+             WHERE completion_seq=?1 AND state='not_started' AND agent=(SELECT id FROM agents WHERE id=?2)
+               AND generation=?3 AND turn_id=?4 AND fingerprint=?5",
+            params![event.seq, parse_agent_id(event.agent.as_deref().unwrap_or_default())?, event.generation.unwrap_or_default(), event.data["turn_id"].as_str().unwrap_or_default(), event.data["worktree"]["fingerprint"].as_str().unwrap_or_default()],
+        ).map_err(sql_error)?;
+        Ok(changed == 1)
+    }
+
+    pub fn settle_project_check_obligation(
+        &mut self,
+        event: &Event,
+        outcome: &str,
+        now: i64,
+    ) -> Result<()> {
+        self.ensure_writer_healthy()?;
+        if !matches!(outcome, "unknown" | "stale" | "refused" | "passed") {
+            return Err(Error::new(
+                "invalid",
+                "invalid project check obligation outcome",
+            ));
+        }
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sql_error)?;
+        settle_project_check_obligation_tx(&tx, event, outcome, now)?;
+        commit_transaction(tx, &self.write_faulted)?;
+        Ok(())
+    }
+
+    pub fn abandon_started_project_check_obligations(&mut self, now: i64) -> Result<()> {
+        self.ensure_writer_healthy()?;
+        self.connection.execute(
+            "UPDATE project_check_obligations SET state='settled',outcome='unknown',settled_at=?1
+             WHERE state='checker_started'",
+            [now],
+        ).map_err(sql_error)?;
+        Ok(())
+    }
+
     pub fn has_project_worktree_check_outcome(&self, event: &Event) -> Result<bool> {
         let (Some(agent), Some(generation)) = (event.agent.as_deref(), event.generation) else {
             return Ok(false);
@@ -12,6 +69,25 @@ impl Store {
             generation,
             event.seq,
         )
+    }
+
+    pub fn project_check_unknown_blocks_fingerprint(
+        &self,
+        agent: &str,
+        generation: i64,
+        fingerprint: &str,
+    ) -> Result<bool> {
+        self.connection
+            .query_row(
+                "SELECT EXISTS(
+               SELECT 1 FROM project_check_obligations o
+               WHERE o.agent=?1 AND o.generation=?2 AND o.state='settled'
+                 AND o.outcome='unknown' AND o.fingerprint=?3
+             )",
+                params![parse_agent_id(agent)?, generation, fingerprint],
+                |row| row.get(0),
+            )
+            .map_err(sql_error)
     }
 
     pub fn record_project_worktree_check_outcome(
@@ -79,8 +155,16 @@ impl Store {
             Some(generation),
             data,
         );
-        outcome.cause = retained.cause;
+        outcome.cause = retained.cause.clone();
         let outcome = insert_daemon_event_input(&tx, outcome)?;
+        let obligation_outcome = if changed_fingerprint.is_some() {
+            "refused"
+        } else {
+            "passed"
+        };
+        if !settle_project_check_obligation_tx(&tx, &retained, obligation_outcome, now)? {
+            return Ok(empty);
+        }
         commit_transaction(tx, &self.write_faulted)?;
         Ok(Change {
             value: (),
@@ -116,6 +200,42 @@ impl Store {
     ) -> Result<Option<(Event, Agent)>> {
         rule_launch_result(&self.connection, principal, rule, to, terminal)
     }
+}
+
+fn settle_project_check_obligation_tx(
+    tx: &Transaction<'_>,
+    event: &Event,
+    outcome: &str,
+    now: i64,
+) -> Result<bool> {
+    let (Some(agent), Some(generation), Some(turn)) = (
+        event.agent.as_deref(),
+        event.generation,
+        event.data["turn_id"].as_str(),
+    ) else {
+        return Ok(false);
+    };
+    let fingerprint = event.data["worktree"]["fingerprint"]
+        .as_str()
+        .unwrap_or_default();
+    let changed = tx
+        .execute(
+            "UPDATE project_check_obligations SET state='settled',outcome=?2,settled_at=?3
+             WHERE completion_seq=?1 AND agent=?4 AND generation=?5 AND turn_id=?6
+               AND fingerprint=?7 AND state IN ('not_started','checker_started')
+               AND (?2 != 'passed' OR state='checker_started')",
+            params![
+                event.seq,
+                outcome,
+                now,
+                parse_agent_id(agent)?,
+                generation,
+                turn,
+                fingerprint
+            ],
+        )
+        .map_err(sql_error)?;
+    Ok(changed == 1)
 }
 
 pub(super) fn rule_launch_insertion_binding(
