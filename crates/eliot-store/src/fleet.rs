@@ -1029,7 +1029,7 @@ fn agent_list_select(
     }
     let mut forced_index = structural.or(fallback).or(match filter.archived {
         core::api::ArchivedFilter::Include => None,
-        _ => Some("agents_list_archived"),
+        _ => Some("agents_list_visible"),
     });
     let mut prefix = String::new();
     if let Some(caller) = caller {
@@ -1138,19 +1138,11 @@ fn agent_list_select(
     let held_extra: Option<(String, Vec<rusqlite::types::Value>)> = if custody_ids.is_empty() {
         None
     } else {
-        let placeholders = custody_ids
-            .iter()
-            .map(|_| "?")
-            .collect::<Vec<_>>()
-            .join(",");
         let extra_sql = format!(
-            "(agents.state IN ({}) AND agents.id IN ({placeholders}))",
+            "(agents.state IN ({}) AND agents.id IN (SELECT value FROM json_each(?)))",
             super::agent_lifecycle::CUSTODY_VISIBLE_STATES,
         );
-        let extra_params = custody_ids
-            .iter()
-            .map(|id| rusqlite::types::Value::from(*id))
-            .collect();
+        let extra_params = vec![rusqlite::types::Value::from(encode_json(custody_ids)?)];
         Some((extra_sql, extra_params))
     };
     let (archived_held, held_params) = branch(1, held_extra);

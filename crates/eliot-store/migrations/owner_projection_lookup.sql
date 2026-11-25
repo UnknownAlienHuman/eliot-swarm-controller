@@ -5,3 +5,7 @@ CREATE INDEX owner_inbox_resume_tip ON commands(target, generation, created_at)
 CREATE INDEX owner_inbox_unknown_receipt
   ON events(CAST(json_extract(data, '$.command_id') AS TEXT), seq)
   WHERE kind = 'command.unknown';
+CREATE INDEX artifacts_unknown_agent ON artifacts(agent)
+  WHERE json_extract(body, '$.state') = 'unknown';
+CREATE INDEX agents_list_visible ON agents(archived, id)
+  WHERE json_type(profile_snapshot, '$._harness_check') IS NULL;
