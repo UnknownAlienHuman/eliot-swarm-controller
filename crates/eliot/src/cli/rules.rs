@@ -1,10 +1,10 @@
 //! Owner-state commands: provider, project, rule, timer, goal.
 use super::args::{
-    GoalArgs, GoalClearArgs, GoalCommand, GoalPauseArgs, GoalResumeArgs, GoalRoundArgs,
-    GoalSetArgs, GoalShowArgs, ProjectArgs, ProjectCommand, ProjectShowArgs, ProviderArgs,
-    ProviderClearHoldArgs, ProviderCommand, ProviderHoldsArgs, RuleArgs, RuleCatchUpArgs,
-    RuleCommand, RuleFileArgs, RuleShowArgs, TimerArgs, TimerCommand, TimerListArgs, TimerRunArgs,
-    TimerShowArgs,
+    GoalArgs, GoalClearArgs, GoalCommand, GoalPauseArgs, GoalResumeArgs, GoalRoundAction,
+    GoalRoundArgs, GoalSetArgs, GoalShowArgs, ProjectArgs, ProjectCommand, ProjectShowArgs,
+    ProviderArgs, ProviderClearHoldArgs, ProviderCommand, ProviderHoldsArgs, RuleArgs,
+    RuleCatchUpArgs, RuleCommand, RuleFileArgs, RuleShowArgs, TimerArgs, TimerCommand,
+    TimerListArgs, TimerRunArgs, TimerShowArgs,
 };
 use super::support::read_and_print;
 use super::support::{
@@ -815,7 +815,30 @@ pub(crate) async fn run_goal(
             mode,
             idle_seq,
             slot,
+            action,
         }) => {
+            if let Some(GoalRoundAction::Close(close)) = action {
+                let request = eliot_core::api::GoalRoundCloseRequest {
+                    id: mutation_id(id)?,
+                    agent: close.agent,
+                    round: close.round,
+                    generation: close.generation,
+                    revision: close.revision,
+                };
+                request.validate().map_err(Failure::for_mutation)?;
+                let response: eliot_core::api::GoalRoundCloseResponse =
+                    eliot_daemon::client_call_typed(&data_dir, "goal.round.close", &request)
+                        .await
+                        .map_err(Failure::for_mutation)?;
+                request
+                    .validate_response(&response)
+                    .map_err(Failure::for_mutation)?;
+                let value = serde_json::to_value(response)
+                    .map_err(|_| Failure::new(4, "goal.round.close response is invalid"))?;
+                print_value(&value, json_output);
+                return Ok(0);
+            }
+            let agent = agent.ok_or_else(|| Failure::new(2, "goal round needs an Agent"))?;
             if idle_seq.is_none() == slot.is_none() {
                 return Err(Failure::new(
                     2,

@@ -51,10 +51,7 @@ const RESTART_LINKED_LAUNCH_INPUT_VALID: &str = "EXISTS (
 )";
 
 // Both facts must come from the retained restart event, not a later Store read.
-fn restart_resume_eligibility() -> String {
-    // A burned Goal round with closed checker custody from an older
-    // generation still fences the Goal in advance_resume_tx. It cannot
-    // execute work in the clean idle session being reopened here.
+fn restart_resume_base_eligibility() -> String {
     format!(
         r#"
     a.observe_only = 0 AND a.archived = 0
@@ -106,28 +103,44 @@ fn restart_resume_eligibility() -> String {
           AND (r.state = 'pending'
                OR (r.generation = a.generation AND r.state = 'stale'))
     )
-    AND NOT EXISTS (
-        SELECT 1 FROM goal_markers g
-        WHERE g.agent = a.id
-          AND (g.state = 'running'
+ "#,
+        interrupted_work = RESTART_INTERRUPTED_WORK,
+        clean_idle_session = RESTART_CLEAN_IDLE_SESSION,
+        undelivered_input = RESTART_UNDELIVERED_INPUT,
+    )
+}
+
+// Closing historical checker custody can reopen the native session. The
+// burned key still fences the Goal itself in advance_resume_tx.
+fn restart_goal_blocker_predicate() -> String {
+    format!(
+        r#"(g.state = 'running'
                OR (g.state = 'unknown' AND NOT (
-                   ({clean_idle_session}) IS TRUE
+                   ({RESTART_CLEAN_IDLE_SESSION}) IS TRUE
                    AND g.generation < a.generation AND g.custody_closed = 1
                    AND EXISTS (
                        SELECT 1 FROM events checker
                        WHERE checker.agent = g.agent AND checker.generation = g.generation
-                         AND checker.kind = 'goal.check_custody_closed' AND checker.ts = g.updated_at
+                         AND checker.source = 'daemon' AND checker.ts = g.updated_at
+                         AND (checker.kind = 'goal.check_custody_closed'
+                           OR (checker.kind = 'goal.check_custody_asserted'
+                               AND json_extract(checker.data, '$.principal') = 'owner'))
                          AND json_extract(checker.data, '$.mode') = g.mode
                          AND json_extract(checker.data, '$.revision') = g.revision
                          AND json_extract(checker.data, '$.round_key') =
                              (g.round_key_kind || ':' || g.round_key)
                    )
-               )))
+               )))"#
     )
-"#,
-        interrupted_work = RESTART_INTERRUPTED_WORK,
-        clean_idle_session = RESTART_CLEAN_IDLE_SESSION,
-        undelivered_input = RESTART_UNDELIVERED_INPUT,
+}
+
+fn restart_resume_eligibility() -> String {
+    format!(
+        "{} AND NOT EXISTS (
+             SELECT 1 FROM goal_markers g WHERE g.agent = a.id AND {}
+         )",
+        restart_resume_base_eligibility(),
+        restart_goal_blocker_predicate(),
     )
 }
 
@@ -380,6 +393,49 @@ impl Store {
             .optional()
             .map_err(sql_error)?;
         data.as_deref().map(decode_json).transpose()
+    }
+
+    /// Name a Goal fence even when it excludes the Agent before scheduling.
+    pub fn restart_goal_custody_blocker(
+        &self,
+        agent: &str,
+        generation: i64,
+    ) -> Result<Option<String>> {
+        let query = format!(
+            "SELECT g.generation, g.mode, g.revision, g.round_key_kind || ':' || g.round_key,
+                    g.state
+             FROM goal_markers g CROSS JOIN agents a ON a.id = g.agent {RESTART_RESUME_EVENT}
+             WHERE g.agent = ?1 AND a.generation = ?2
+               AND ({RESTART_CLEAN_IDLE_SESSION}) AND {} AND {}
+             ORDER BY g.generation DESC, g.revision DESC, g.round_key DESC LIMIT 1",
+            restart_resume_base_eligibility(),
+            restart_goal_blocker_predicate(),
+        );
+        let agent = parse_agent_id(agent)?;
+        self.connection
+            .query_row(
+                &query,
+                params![agent, generation, encode_json(&core::api::SUPPORTED_HARNESSES)?],
+                |row| {
+                    let bound = row.get::<_, i64>(0)?;
+                    let mode = row.get::<_, String>(1)?;
+                    let revision = row.get::<_, i64>(2)?;
+                    let round = row.get::<_, String>(3)?;
+                    let state = row.get::<_, String>(4)?;
+                    let reason = if state == "running" {
+                        "checker round is still marked running"
+                    } else if bound >= generation {
+                        "burned checker round belongs to the generation being reopened"
+                    } else {
+                        "exact Goal checker custody closure is unproven"
+                    };
+                    Ok(format!(
+                        "Automatic Resume is fenced by {mode} Goal revision {revision}, generation {bound}, round {round}: {reason}."
+                    ))
+                },
+            )
+            .optional()
+            .map_err(sql_error)
     }
 
     /// Current namespace, bound to this Store identity and canonical data dir.

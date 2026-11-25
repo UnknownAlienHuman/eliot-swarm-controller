@@ -2256,7 +2256,13 @@ configuration from the retained generation. Goals and project assignments
 follow the Agent to its new generation. An unknown Goal round from an older
 generation does not block a clean idle session from reopening when checker
 closure is recorded for that exact round, including proof that the checker
-never spawned. Older markers without this evidence stay fenced. The round key remains burned and the Goal remains
+never spawned. Without exact checker evidence, the fence remains and
+`swarm why` names the blocking round. After verifying that the checker and
+its descendants have exited or never started, the Owner can record
+`swarm goal round close A --round KEY`. Add `--generation` and `--revision`
+when more than one historical marker matches. The receipt records an Owner
+assertion, distinct from observed checker closure.
+The round key remains burned and the Goal remains
 paused until its unresolved work is settled. Hold leaves those sessions for
 explicit resume. Previously admitted commands still follow durable command
 recovery. Interrupted turns and uncertain effects stay `unknown` under either

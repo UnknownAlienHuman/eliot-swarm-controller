@@ -986,6 +986,73 @@ impl GoalResumeRequest {
 
 #[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct GoalRoundCloseRequest {
+    pub id: String,
+    pub agent: String,
+    /// A burned Eliot-mode key in the form `idle:SEQ` or `slot:N`.
+    pub round: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generation: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision: Option<i64>,
+}
+
+impl GoalRoundCloseRequest {
+    pub fn round_key(&self) -> Result<(&str, i64)> {
+        if let Some((kind, number)) = self.round.split_once(':')
+            && matches!(kind, "idle" | "slot")
+            && let Ok(number) = number.parse::<i64>()
+            && number >= i64::from(kind == "slot")
+            && self.round == format!("{kind}:{number}")
+        {
+            return Ok((kind, number));
+        }
+        Err(Error::new("invalid", "round must be idle:SEQ or slot:N"))
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        validate_agent(&self.agent)?;
+        self.round_key()?;
+        if self.id.is_empty()
+            || self.generation.is_some_and(|n| n < 1)
+            || self.revision.is_some_and(|n| n < 1)
+        {
+            return Err(Error::new("invalid", "invalid Goal round close binding"));
+        }
+        Ok(())
+    }
+
+    pub fn validate_response(&self, response: &GoalRoundCloseResponse) -> Result<()> {
+        if response.id != self.id
+            || response.agent != self.agent
+            || response.round != self.round
+            || response.generation < 1
+            || response.revision < 1
+            || self.generation.is_some_and(|n| n != response.generation)
+            || self.revision.is_some_and(|n| n != response.revision)
+            || response.event_seq < 1
+        {
+            return Err(Error::new(
+                "unknown",
+                "Goal round close receipt does not match the request",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GoalRoundCloseResponse {
+    pub id: String,
+    pub agent: String,
+    pub round: String,
+    pub generation: i64,
+    pub revision: i64,
+    pub event_seq: i64,
+}
+
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GoalRoundRequest {
     pub id: String,
     pub agent: String,

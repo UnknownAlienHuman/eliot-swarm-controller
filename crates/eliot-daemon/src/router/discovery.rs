@@ -373,6 +373,7 @@ const METHODS: &[Method] = &[
     method!("goal.clear", GoalClearRequest, GoalView, true, true, "Clear one Eliot Goal.", {"id":EXAMPLE_ID,"agent":"a1"}),
     method!("goal.resume", GoalResumeRequest, GoalView, true, true, "Resume a paused Eliot Goal.", {"id":EXAMPLE_ID,"agent":"a1"}),
     method!("goal.round", GoalRoundRequest, GoalRoundResponse, true, true, "Request one exact idle-event or cadence-slot Goal round.", {"id":EXAMPLE_ID,"agent":"a1","idle_seq":1}),
+    method!("goal.round.close", GoalRoundCloseRequest, GoalRoundCloseResponse, true, true, "Assert that the checker for a burned historical Eliot Goal round has no remaining process custody.", {"id":EXAMPLE_ID,"agent":"a1","round":"idle:1"}),
     method!("mail.send", MailSendRequest, MailSendResponse, false, true, "Queue addressed mail to 1..100 concrete Agents; acknowledgement is separate.", {"id":EXAMPLE_ID,"to":["a1"],"mode":"queue","text":"Please report your progress."}),
     method!("mail.inbox", MailInboxRequest, MailInboxResponse, false, false, "Page unread mail, long-polling up to 30 s with wait_ms; reading does not acknowledge.", {"limit":20,"wait_ms":30000}),
     method!("mail.read", MailReadRequest, MailDelivery, false, false, "Read one exact delivery id without acknowledging it.", {"delivery_id":"01ARZ3NDEKTSV4RRFFQ69G5FAV/a1"}),

@@ -357,6 +357,11 @@ impl Router {
         {
             unresolved.push(message.to_owned());
         }
+        if row.is_terminal()
+            && let Some(reason) = store.restart_goal_custody_blocker(agent, generation)?
+        {
+            unresolved.push(reason);
+        }
         if let Some(choice) = row.profile_choice.as_ref()
             && (!choice.skipped.is_empty() || choice.provider_failover.is_some())
         {

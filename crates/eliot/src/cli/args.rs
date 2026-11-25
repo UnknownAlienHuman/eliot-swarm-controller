@@ -1998,15 +1998,36 @@ pub(crate) struct GoalResumeArgs {
 }
 
 #[derive(Args)]
+#[command(args_conflicts_with_subcommands = true)]
 pub(crate) struct GoalRoundArgs {
     #[arg(value_name = "AGENT")]
-    pub(crate) agent: String,
+    pub(crate) agent: Option<String>,
     #[arg(long, value_parser = ["eliot", "native"], default_value = "eliot")]
     pub(crate) mode: String,
     #[arg(long, value_name = "SEQ", value_parser = clap::value_parser!(i64).range(0..))]
     pub(crate) idle_seq: Option<i64>,
     #[arg(long, value_name = "N", value_parser = clap::value_parser!(i64).range(1..))]
     pub(crate) slot: Option<i64>,
+    #[command(subcommand)]
+    pub(crate) action: Option<GoalRoundAction>,
+}
+
+#[derive(Subcommand)]
+pub(crate) enum GoalRoundAction {
+    /// Attest that a burned historical round has no checker process custody.
+    Close(GoalRoundCloseArgs),
+}
+
+#[derive(Args)]
+pub(crate) struct GoalRoundCloseArgs {
+    #[arg(value_name = "AGENT")]
+    pub(crate) agent: String,
+    #[arg(long, value_name = "KEY")]
+    pub(crate) round: String,
+    #[arg(long, value_name = "N")]
+    pub(crate) generation: Option<i64>,
+    #[arg(long, value_name = "N")]
+    pub(crate) revision: Option<i64>,
 }
 
 #[derive(Subcommand)]
