@@ -220,7 +220,7 @@ pub(crate) fn native_route_fingerprints(
         .collect()
 }
 
-/// Only absolute local paths, empty inputs and captured absence can be restored.
+/// Only absolute paths, empty inputs and captured absence can be restored.
 /// Explicit private provider selectors remain verified live, never serialized.
 pub(crate) fn is_native_route_home_value(value: &Value) -> bool {
     value.is_null()
@@ -449,7 +449,11 @@ pub(crate) fn capture_native_store_inputs(
             .iter()
             .filter_map(|name| {
                 let value = selectors.get(*name)?;
-                is_native_route_home_value(value).then(|| ((*name).to_owned(), value.clone()))
+                (is_native_route_home_value(value)
+                    && value
+                        .as_str()
+                        .is_none_or(|path| !policy.contains_text(path)))
+                .then(|| ((*name).to_owned(), value.clone()))
             })
             .collect();
         snapshot["native_route_home"] = Value::Object(home);

@@ -1307,8 +1307,8 @@ database root or scope; native configuration can affect selection.
 
 Claude and XDG store selectors and private provider selectors bind to the
 opaque `native_route_identity`. New snapshots also retain per-selector
-fingerprints and the admitted default home paths (`HOME`, and on Windows
-`USERPROFILE` and `LOCALAPPDATA`), including captured absence. These paths
+fingerprints and nonsecret absolute default home paths (`HOME`, and on Windows
+`USERPROFILE` and `LOCALAPPDATA`), including empty and unset values. These paths
 belong to the native process environment and are restored from the snapshot
 when the controller executable or its startup environment changes. Admitted
 live selectors must still match. Refusals name the changed selectors and
