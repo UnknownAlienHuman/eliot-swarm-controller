@@ -1811,8 +1811,9 @@ pub(crate) enum RuleCommand {
         project: String,
         #[arg(long, value_name = "PROFILE")]
         author: String,
+        /// Pin an eligible reviewer instead of choosing an approved profile automatically.
         #[arg(long, value_name = "PROFILE")]
-        reviewer: String,
+        reviewer: Option<String>,
         #[arg(long, value_name = "PATH")]
         workspace: String,
         #[arg(long, value_name = "SHA256")]

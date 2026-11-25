@@ -1890,6 +1890,10 @@ async fn process_rule_cursor(
             let prepared_result = if action.verb == "run" {
                 prepare_event_run_submission(router, rule, retiring, &definition, &event, action)
                     .await
+            } else if definition.includes_patch_digest() {
+                router
+                    .prepare_independent_review(action, rule.project.as_ref(), &event)
+                    .await
             } else {
                 match rule.project.as_ref() {
                     Some(project) => {
