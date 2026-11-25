@@ -93,6 +93,12 @@ and its response; the daemon bounds that write with `RESPONSE_WRITE_TIMEOUT`
 cannot hold its connection task past the deadline. An undelivered mutation result stays
 readable by exact retry; the daemon never replays the effect to deliver it.
 
+The local daemon serves up to 128 ordinary IPC connections and reserves eight
+additional slots for bounded overload responses. Overload responders return
+typed `busy` before routing. Once both budgets are full, newly accepted
+connections close immediately. An undelivered response follows the usual
+exact-ID retry rules.
+
 For local performance measurement the authentication envelope may additionally
 carry `_timing: true` (boolean only). The response then includes a nonsemantic
 top-level `_timing.handle_ns`: elapsed time from complete frame receipt through

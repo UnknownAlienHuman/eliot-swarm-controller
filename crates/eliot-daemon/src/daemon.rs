@@ -84,6 +84,7 @@ pub async fn client_call_measured(
     Ok((value, timings))
 }
 const MAX_CLIENTS: usize = 128;
+const MAX_OVERLOAD_RESPONDERS: usize = 8;
 const ACCEPT_FAILURE_LIMIT: u32 = 20;
 const DEFAULT_CALL_TIMEOUT: Duration = Duration::from_secs(35);
 const OVERLOAD_READ_TIMEOUT: Duration = Duration::from_secs(5);
@@ -418,6 +419,7 @@ struct DaemonRuntime {
 /// preserves ownership if normal draining cannot complete.
 struct DaemonSupervision {
     connections: JoinSet<()>,
+    overload_responders: JoinSet<()>,
     progress: watch::Receiver<u64>,
     workers: JoinSet<()>,
     worker_stop: watch::Sender<bool>,
@@ -1112,6 +1114,7 @@ async fn spawn_workers(
     let connections = JoinSet::new();
     Ok(DaemonSupervision {
         connections,
+        overload_responders: JoinSet::new(),
         progress,
         workers,
         worker_stop,
@@ -1177,6 +1180,7 @@ async fn supervise(
         cloud_mcp_tasks,
         progress,
         connections,
+        overload_responders,
         ..
     } = &mut supervision;
     let router = router.clone();
@@ -1247,9 +1251,10 @@ async fn supervise(
                             connections.spawn(async move {
                                 serve_connection(stream, router, policy, accepted_at).await;
                             });
-                        } else {
-                            // At the connection limit the request was never read or routed.
-                            tokio::spawn(reply_overloaded(stream));
+                        } else if overload_responders.len() < MAX_OVERLOAD_RESPONDERS {
+                            // Refuse before routing. With both budgets spent,
+                            // dropping the stream closes it without a task.
+                            overload_responders.spawn(reply_overloaded(stream));
                         }
                     }
                     Err(error) => {
@@ -1415,6 +1420,16 @@ async fn supervise(
                 }
                 let _ = joined;
             }
+            joined = overload_responders.join_next(), if !overload_responders.is_empty() => {
+                if matches!(joined, Some(Err(_))) {
+                    logging::record(
+                        &policy,
+                        "daemon.ipc_overload_task_failed",
+                        &[("producer", "daemon.ipc_listener"), ("method", "ipc.overload.join")],
+                        Some(&Error::new("connection_task_failed", "IPC overload responder panicked or was cancelled")),
+                    );
+                }
+            }
             signal = tokio::signal::ctrl_c() => {
                 if let Err(error) = signal {
                     break Err(Error::new(
@@ -1503,6 +1518,7 @@ async fn shutdown_supervision(
         cloud_mcp_tasks,
         recovery,
         connections,
+        overload_responders,
         ..
     } = &mut supervision;
     let router = router.clone();
@@ -1569,7 +1585,9 @@ async fn shutdown_supervision(
     recovery.abort_all();
     while recovery.join_next().await.is_some() {}
     connections.abort_all();
+    overload_responders.abort_all();
     while connections.join_next().await.is_some() {}
+    while overload_responders.join_next().await.is_some() {}
     monitor_stop.send_replace(true);
     let shutdown = timeout(MONITOR_SHUTDOWN_GRACE, async {
         while let Some(joined) = monitor_tasks.join_next().await {
