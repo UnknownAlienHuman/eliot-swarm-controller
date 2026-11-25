@@ -97,7 +97,6 @@ fn validate_adhoc_model(model: &str) -> core::Result<String> {
 /// Closed Claude Code `--effort` vocabulary, mirroring the profile freeze
 /// (`claude_snapshot_from_entry` in config.rs): `claude --help` documents
 /// `--effort <level>` and the frozen profile accepts exactly these levels.
-
 fn validate_adhoc_effort(harness: &str, effort: &str) -> core::Result<String> {
     // OpenCode efforts are the installed per-model `Model.Variant` ids
     // (the TUI "Variant" switch), so any well-formed value freezes and the

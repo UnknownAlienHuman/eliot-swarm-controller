@@ -430,7 +430,7 @@ struct DaemonSupervision {
 
 /// Validate configuration, recover durable state without replaying external
 /// effects, reconcile restart capacity, and load rule seeds. Invalid config
-/// fails startup exactly as before; no worker spawns here.
+/// fails startup exactly as before; no long-lived worker starts here.
 async fn initialize_runtime(
     data_dir: &DataDir,
     policy: Arc<SecretPolicy>,
@@ -440,17 +440,21 @@ async fn initialize_runtime(
     let store_path = data_dir.path().join("eliot.db");
     crate::platform::data_dir::validate_store_files(data_dir.path())?;
     logging::record(&policy, "daemon.store_opening", &[], None);
-    let mut store = eliot_store::Store::open_with_observer(&store_path, |phase| match phase {
-        eliot_store::StoreOpenPhase::ConnectionOpened => {
-            logging::record(&policy, "daemon.store_connection_opened", &[], None);
-        }
-        eliot_store::StoreOpenPhase::PragmasApplied => {
-            logging::record(&policy, "daemon.store_pragmas_applied", &[], None);
-        }
-        eliot_store::StoreOpenPhase::Migrated => {
-            logging::record(&policy, "daemon.store_migrated", &[], None);
-        }
-    })?;
+    // Open and migrate SQLite on a blocking worker before starting admission.
+    let open_path = store_path.clone();
+    let open_policy = policy.clone();
+    let mut store = tokio::task::spawn_blocking(move || {
+        eliot_store::Store::open_with_observer(&open_path, |phase| {
+            let code = match phase {
+                eliot_store::StoreOpenPhase::ConnectionOpened => "daemon.store_connection_opened",
+                eliot_store::StoreOpenPhase::PragmasApplied => "daemon.store_pragmas_applied",
+                eliot_store::StoreOpenPhase::Migrated => "daemon.store_migrated",
+            };
+            logging::record(&open_policy, code, &[], None);
+        })
+    })
+    .await
+    .map_err(|_| Error::new("internal", "startup Store open did not complete"))??;
     store.interrupt_bulk_cleanup_jobs(now_ms())?;
     let provider_scopes = crate::config::configured_provider_account_scopes(data_dir.path())
         .map_err(startup_config_failure)?;
