@@ -1798,10 +1798,6 @@ pub async fn stop_owned_session<P>(
     }
 }
 
-pub fn unconfirmed_control(acknowledged: bool, pending: &str, withdrawal: &str) -> Value {
-    unknown_control(if acknowledged { pending } else { withdrawal })
-}
-
 /// A cancellation notification only proves dispatch. Applied requires an
 /// observed cancellation terminal for the same bound turn.
 pub fn interrupt_settlement_outcome(

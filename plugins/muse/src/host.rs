@@ -199,10 +199,6 @@ struct AgentSession {
     skill_pointer: Option<String>,
 }
 
-#[allow(
-    dead_code,
-    reason = "The host start submodule consumes this initialization record."
-)]
 struct InitializedNative {
     effort: Option<String>,
     scope: String,

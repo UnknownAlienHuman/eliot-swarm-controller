@@ -509,20 +509,6 @@ impl OversizedFrame {
         envelope.frame(limit_bytes, length_bytes, known_methods, false)
     }
 
-    /// Diagnose from a bounded prefix while the line is still open: the
-    /// threshold was crossed without a newline, so the length is a lower
-    /// bound (`len>=n` in [`Self::describe`]).
-    pub fn parse_lower_bound(
-        limit_bytes: usize,
-        length_bytes: u64,
-        prefix: &[u8],
-        known_methods: &[&str],
-    ) -> Self {
-        let mut envelope = OversizedEnvelopeScanner::default();
-        envelope.feed(prefix);
-        envelope.frame(limit_bytes, length_bytes, known_methods, true)
-    }
-
     /// Fallback when the line itself is in hand but no prefix was captured.
     /// Defensive only: the bounded reader always captures a prefix.
     pub fn unparsed(limit_bytes: usize, length_bytes: u64) -> Self {
