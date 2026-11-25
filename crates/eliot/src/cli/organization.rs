@@ -1,9 +1,12 @@
 //! Headless chat and work organization commands (step 4a).
-use super::args::{ChatAttachArgs, ChatCommand, ChatDetachArgs, ChatOrganizationArgs, ChatTagArgs};
+use super::args::{
+    ChatAttachArgs, ChatCommand, ChatDetachArgs, ChatGroupArgs, ChatOrganizationArgs, ChatTagArgs,
+};
 use super::support::{Failure, mutation_id, print_value};
 use eliot_core::api::{
-    ArchivedFilter, ChatAttachRequest, ChatDetachRequest, ChatOrganizationMutationResponse,
-    ChatOrganizationRequest, ChatOrganizationResponse, ChatTagRequest,
+    ArchivedFilter, ChatAttachRequest, ChatDetachRequest, ChatGroupRequest,
+    ChatOrganizationMutationResponse, ChatOrganizationRequest, ChatOrganizationResponse,
+    ChatTagRequest, WaitTurnRef,
 };
 use std::path::Path;
 
@@ -87,12 +90,16 @@ pub(super) async fn run_chat(
             );
             Ok(0)
         }
-        ChatCommand::Tag(ChatTagArgs { agents, tag }) => {
+        ChatCommand::Tag(ChatTagArgs {
+            agents,
+            tag,
+            revision,
+        }) => {
             let request = ChatTagRequest {
                 id: mutation_id(id)?,
                 agents,
                 tags: tag,
-                expected_revision: None,
+                expected_revision: (!revision.is_empty()).then_some(revision),
             };
             request.validate().map_err(Failure::for_mutation)?;
             let response: ChatOrganizationMutationResponse =
@@ -105,6 +112,36 @@ pub(super) async fn run_chat(
             print_value(
                 &serde_json::to_value(response)
                     .map_err(|_| Failure::new(4, "invalid tag response"))?,
+                json_output,
+            );
+            Ok(0)
+        }
+        ChatCommand::Group(ChatGroupArgs {
+            agent,
+            generation,
+            turn_id,
+            revision,
+            rule,
+            replace_manual_tags,
+        }) => {
+            let request = ChatGroupRequest {
+                id: mutation_id(id)?,
+                source: WaitTurnRef::new(agent, generation, turn_id),
+                expected_revision: revision,
+                rules: rule,
+                replace_manual_tags,
+            };
+            request.validate().map_err(Failure::for_mutation)?;
+            let response: ChatOrganizationMutationResponse =
+                eliot_daemon::client_call_typed(data_dir, "chat.group", &request)
+                    .await
+                    .map_err(Failure::for_mutation)?;
+            request
+                .validate_response(&response)
+                .map_err(Failure::invalid_response)?;
+            print_value(
+                &serde_json::to_value(response)
+                    .map_err(|_| Failure::new(4, "invalid content grouping response"))?,
                 json_output,
             );
             Ok(0)

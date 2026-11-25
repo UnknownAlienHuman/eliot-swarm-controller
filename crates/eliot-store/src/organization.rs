@@ -10,10 +10,11 @@
 
 use super::*;
 use eliot_core::api::{
-    ArchivedFilter, ChatAttachRequest, ChatDetachRequest, ChatOrganizationMutationResponse,
-    ChatOrganizationRequest, ChatOrganizationResponse, ChatTagRequest, MAX_ORG_MEMBERS_PER_GROUP,
-    MAX_ORG_MEMBERS_TOTAL, ORGANIZATION_CHANGED_KIND, OrgGroupView, OrgLinkView, OrgMemberView,
-    OrgRowChange, OrganizationChangedEvent, ProjectManagerIdentity, ScopeLimits,
+    ArchivedFilter, ChatAttachRequest, ChatDetachRequest, ChatGroupRequest,
+    ChatOrganizationMutationResponse, ChatOrganizationRequest, ChatOrganizationResponse,
+    ChatTagRequest, MAX_ORG_MEMBERS_PER_GROUP, MAX_ORG_MEMBERS_TOTAL, ORGANIZATION_CHANGED_KIND,
+    OrgGroupView, OrgLinkView, OrgMemberView, OrgRowChange, OrganizationChangedEvent,
+    ProjectManagerIdentity, ScopeLimits, WaitTurnRef,
 };
 use std::collections::BTreeMap;
 
@@ -23,6 +24,7 @@ pub(super) use membership::membership_index_migration;
 pub(super) const CHAT_ATTACH_METHOD: &str = "chat.attach";
 pub(super) const CHAT_DETACH_METHOD: &str = "chat.detach";
 pub(super) const CHAT_TAG_METHOD: &str = "chat.tag";
+const CHAT_GROUP_METHOD: &str = "chat.group";
 
 /// Most retained roots read back for one project group: the first roots the
 /// team, the rest surface as the ambiguity. Roots are parentless Agents, so
@@ -94,16 +96,62 @@ fn decode_overlay(
     Ok((link, decode_tags(&raw_tags)?, continued_from))
 }
 
-enum LinkChange {
-    Attach { project: String },
-    Detach,
-    Tag { tags: Vec<String> },
+fn decode_content_source(raw: Option<&str>) -> Result<Option<WaitTurnRef>> {
+    raw.map(|json| {
+        serde_json::from_str(json)
+            .map_err(|_| Error::new("source_integrity", "organization content source malformed"))
+    })
+    .transpose()
+}
+
+fn content_tags(
+    tx: &Transaction<'_>,
+    agent: i64,
+    request: &ChatGroupRequest,
+) -> Result<Vec<String>> {
+    let source = &request.source;
+    let text: Option<String> = tx
+        .query_row(
+            "SELECT CASE WHEN state = 'completed'
+                              AND length(CAST(final_text AS BLOB)) <= ?4 THEN final_text END
+             FROM turns WHERE agent = ?1 AND generation = ?2 AND turn_id = ?3",
+            params![
+                agent,
+                source.generation,
+                source.turn_id,
+                MAX_EVENT_BYTES as i64
+            ],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(sql_error)?
+        .ok_or_else(|| Error::new("not_found", "organization source turn was not retained"))?;
+    let text = text.filter(|text| !text.trim().is_empty()).ok_or_else(|| {
+        Error::new(
+            "content_unavailable",
+            "source turn has no bounded completed text",
+        )
+    })?;
+    let tags: Vec<_> = request
+        .rules
+        .iter()
+        .filter(|rule| text.contains(&rule.contains))
+        .map(|rule| rule.tag.clone())
+        .collect();
+    if tags.is_empty() {
+        return Err(Error::new(
+            "no_match",
+            "no content grouping rule matched the source turn",
+        ));
+    }
+    Ok(tags)
 }
 
 enum LinkRequest<'a> {
     Attach(&'a ChatAttachRequest),
     Detach(&'a ChatDetachRequest),
     Tag(&'a ChatTagRequest),
+    Group(&'a ChatGroupRequest),
 }
 
 impl LinkRequest<'_> {
@@ -112,6 +160,7 @@ impl LinkRequest<'_> {
             LinkRequest::Attach(request) => &request.id,
             LinkRequest::Detach(request) => &request.id,
             LinkRequest::Tag(request) => &request.id,
+            LinkRequest::Group(request) => &request.id,
         }
     }
 
@@ -120,26 +169,16 @@ impl LinkRequest<'_> {
             LinkRequest::Attach(request) => &request.agents,
             LinkRequest::Detach(request) => &request.agents,
             LinkRequest::Tag(request) => &request.agents,
+            LinkRequest::Group(request) => std::slice::from_ref(&request.source.agent),
         }
     }
 
-    fn change(&self) -> LinkChange {
+    fn expected_revision(&self) -> Option<&[i64]> {
         match self {
-            LinkRequest::Attach(request) => LinkChange::Attach {
-                project: request.project.clone(),
-            },
-            LinkRequest::Detach(_) => LinkChange::Detach,
-            LinkRequest::Tag(request) => LinkChange::Tag {
-                tags: request.tags.clone(),
-            },
-        }
-    }
-
-    fn expected_revision(&self) -> &Option<Vec<i64>> {
-        match self {
-            LinkRequest::Attach(request) => &request.expected_revision,
-            LinkRequest::Detach(request) => &request.expected_revision,
-            LinkRequest::Tag(request) => &request.expected_revision,
+            LinkRequest::Attach(request) => request.expected_revision.as_deref(),
+            LinkRequest::Detach(request) => request.expected_revision.as_deref(),
+            LinkRequest::Tag(request) => request.expected_revision.as_deref(),
+            LinkRequest::Group(request) => Some(std::slice::from_ref(&request.expected_revision)),
         }
     }
 
@@ -148,6 +187,7 @@ impl LinkRequest<'_> {
             LinkRequest::Attach(request) => serde_json::to_value(request),
             LinkRequest::Detach(request) => serde_json::to_value(request),
             LinkRequest::Tag(request) => serde_json::to_value(request),
+            LinkRequest::Group(request) => serde_json::to_value(request),
         }
         .map_err(|_| Error::new("internal", "organization request could not be encoded"))
     }
@@ -401,6 +441,7 @@ type OrgMemberRow = (
     Option<String>,
     Option<String>,
     Option<String>,
+    Option<String>,
 );
 
 fn organization_members(
@@ -419,7 +460,7 @@ fn organization_members(
         .prepare_cached(&format!(
             "SELECT a.id, a.generation, a.state, a.harness, a.parent, a.root, a.project,
                     a.chat, a.archived, a.observe_only, a.workspace,
-                    o.project_link, o.tags, o.continued_from
+                    o.project_link, o.tags, o.continued_from, o.content_source
              FROM (
                  SELECT m.agent AS id
                  FROM organization_membership m INDEXED BY organization_membership_project
@@ -454,6 +495,7 @@ fn organization_members(
                 row.get::<_, Option<String>>(11)?,
                 row.get::<_, Option<String>>(12)?,
                 row.get::<_, Option<String>>(13)?,
+                row.get::<_, Option<String>>(14)?,
             ))
         })
         .map_err(sql_error)?
@@ -474,6 +516,7 @@ fn organization_members(
         link,
         raw_tags,
         continued_from,
+        content_source,
     ) in rows
     {
         let (project_link, tags, continued_from) = decode_overlay(
@@ -495,6 +538,7 @@ fn organization_members(
             project_link,
             tags,
             continued_from,
+            content_source: decode_content_source(content_source.as_deref())?,
             workspace,
         });
     }
@@ -788,7 +832,7 @@ impl Store {
         })
     }
 
-    /// Shared attach/detach/tag transaction: validate everything, then
+    /// Shared organization transaction: validate everything, then
     /// apply link rows atomically. Placement only: execution project,
     /// scope, workspace and history are untouched. Attach and detach place
     /// chats; tags group any Agent or chat. Replay returns the retained
@@ -805,8 +849,7 @@ impl Store {
     ) -> Result<Change<ChatOrganizationMutationResponse>> {
         let id = request.id();
         let agents = request.agents();
-        let change = request.change();
-        let expected = request.expected_revision().clone();
+        let expected = request.expected_revision();
         let payload = request.encode()?;
         let digest = canonical::digest(&payload)?;
         if let Some((old_principal, old_method, old_digest, result)) =
@@ -845,71 +888,92 @@ impl Store {
                 let row = load_agent_by_num(&tx, num)?.ok_or_else(|| {
                     Error::new("not_found", format!("Agent {agent} was not found"))
                 })?;
-                match &change {
-                    LinkChange::Attach { .. } | LinkChange::Detach => {
-                        if !row.chat {
-                            return Err(Error::new(
-                                "not_allowed",
-                                "organization placement moves chats only",
-                            ));
-                        }
-                    }
-                    LinkChange::Tag { .. } => {}
+                if matches!(request, LinkRequest::Attach(_) | LinkRequest::Detach(_)) && !row.chat {
+                    return Err(Error::new(
+                        "not_allowed",
+                        "organization placement moves chats only",
+                    ));
                 }
                 nums.push((agent.clone(), num));
             }
-            if let LinkChange::Attach { project } = &change
-                && projects::project_registration_tx(&tx, project)?.is_none()
+            if let LinkRequest::Attach(request) = &request
+                && projects::project_registration_tx(&tx, &request.project)?.is_none()
             {
                 return Err(Error::new(
                     "not_found",
-                    format!("project {project} was not found"),
+                    format!("project {} was not found", request.project),
                 ));
             }
             let mut links = Vec::with_capacity(nums.len());
             let mut rows = Vec::with_capacity(nums.len());
             for (index, (agent, num)) in nums.into_iter().enumerate() {
-                let current: Option<(Option<String>, String, i64, Option<String>)> = tx
+                let current: Option<StoredLink> = tx
                     .query_row(
-                        "SELECT project_link, tags, revision, continued_from
+                        "SELECT project_link, tags, revision, continued_from, content_source
                          FROM chat_organization WHERE agent = ?1",
                         [num],
-                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                        |row| {
+                            Ok(StoredLink {
+                                project: row.get(0)?,
+                                tags: row.get(1)?,
+                                revision: row.get(2)?,
+                                continued_from: row.get(3)?,
+                                content_source: row.get(4)?,
+                            })
+                        },
                     )
                     .optional()
                     .map_err(sql_error)?;
                 // A menu write carries the revision it observed (0 for no
                 // row yet); a write that raced another is refused whole and
                 // nothing is applied.
-                let observed = current.as_ref().map_or(0, |(_, _, revision, _)| *revision);
-                if expected
-                    .as_ref()
-                    .is_some_and(|entries| entries[index] != observed)
-                {
+                let current = current.unwrap_or_else(|| StoredLink {
+                    tags: "[]".to_owned(),
+                    ..StoredLink::default()
+                });
+                if expected.is_some_and(|entries| entries[index] != current.revision) {
                     return Err(Error::new(
                         "conflict",
                         format!("Agent {agent} was reorganized since it was read; read it again"),
                     ));
                 }
-                let revision = observed + 1;
-                // Attach/detach/tag never write provenance: the upsert below
-                // leaves `continued_from` as recorded, so a continuation
-                // survives every placement and tag change.
-                let (current_link, current_tags, continued_from) = match current {
-                    Some((link, tags, _, continued_from)) => (link, tags, continued_from),
-                    None => (None, "[]".to_owned(), None),
-                };
-                let (link, tags) = match &change {
-                    LinkChange::Attach { project } => (Some(project.clone()), current_tags),
-                    LinkChange::Detach => (None, current_tags),
-                    LinkChange::Tag { tags } => (current_link, encode_json(tags)?),
+                let revision = current.revision.checked_add(1).ok_or_else(|| {
+                    Error::new("source_integrity", "organization revision exhausted")
+                })?;
+                let (link, tags, content_source) = match &request {
+                    LinkRequest::Attach(request) => (
+                        Some(request.project.clone()),
+                        current.tags,
+                        current.content_source,
+                    ),
+                    LinkRequest::Detach(_) => (None, current.tags, current.content_source),
+                    LinkRequest::Tag(request) => {
+                        (current.project, encode_json(&request.tags)?, None)
+                    }
+                    LinkRequest::Group(request) => {
+                        if !request.replace_manual_tags
+                            && current.content_source.is_none()
+                            && !decode_tags(&current.tags)?.is_empty()
+                        {
+                            return Err(Error::new(
+                                "manual_tags",
+                                "content grouping requires replace_manual_tags to replace manual tags",
+                            ));
+                        }
+                        (
+                            current.project,
+                            encode_json(&content_tags(&tx, num, request)?)?,
+                            Some(encode_json(&request.source)?),
+                        )
+                    }
                 };
                 db!(tx.execute(
-                    "INSERT INTO chat_organization(agent, project_link, tags, revision)
-                     VALUES (?1, ?2, ?3, ?4)
+                    "INSERT INTO chat_organization(agent, project_link, tags, revision, content_source)
+                     VALUES (?1, ?2, ?3, ?4, ?5)
                      ON CONFLICT(agent) DO UPDATE SET project_link = excluded.project_link,
-                         tags = excluded.tags, revision = excluded.revision",
-                    params![num, link, tags, revision],
+                         tags = excluded.tags, revision = excluded.revision,
+                         content_source = excluded.content_source",
+                    params![num, link, tags, revision, content_source],
                 ));
                 // The event row is the Agent's `agent.list` placement as
                 // this write left it, read through the same group key.
@@ -925,7 +989,8 @@ impl Store {
                     project_link: link,
                     tags: decode_tags(&tags)?,
                     revision,
-                    continued_from,
+                    continued_from: current.continued_from,
+                    content_source: decode_content_source(content_source.as_deref())?,
                 });
             }
             let value = ChatOrganizationMutationResponse {
@@ -1017,4 +1082,30 @@ impl Store {
         owner_only(principal, "tag Agents")?;
         self.mutate_links(principal, CHAT_TAG_METHOD, LinkRequest::Tag(request), now)
     }
+
+    /// `chat.group`: apply explicit literal rules to one retained turn.
+    pub fn group_by_content(
+        &mut self,
+        principal: &str,
+        request: &ChatGroupRequest,
+        now: i64,
+    ) -> Result<Change<ChatOrganizationMutationResponse>> {
+        owner_only(principal, "group by content")?;
+        request.validate()?;
+        self.mutate_links(
+            principal,
+            CHAT_GROUP_METHOD,
+            LinkRequest::Group(request),
+            now,
+        )
+    }
+}
+
+#[derive(Default)]
+struct StoredLink {
+    project: Option<String>,
+    tags: String,
+    revision: i64,
+    continued_from: Option<String>,
+    content_source: Option<String>,
 }

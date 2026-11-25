@@ -1,6 +1,6 @@
 use super::*;
 
-pub(super) const CURRENT_SCHEMA_VERSION: i64 = CLEANUP_PATH_CUSTODY_VERSION;
+pub(super) const CURRENT_SCHEMA_VERSION: i64 = ORGANIZATION_CONTENT_SOURCE_VERSION;
 const HARNESS_CHECK_SCHEMA_VERSION: i64 = 112;
 const WORK_TRUTH_VERSION: i64 = 113;
 const WORK_TRUTH_INTENT_VERSION: i64 = 114;
@@ -45,6 +45,7 @@ const ASSIGNMENT_USAGE_VERSION: i64 = 152;
 const REMOTE_MANAGERS_VERSION: i64 = 153;
 const AUTONOMY_OUTCOMES_VERSION: i64 = 154;
 const CLEANUP_PATH_CUSTODY_VERSION: i64 = 155;
+const ORGANIZATION_CONTENT_SOURCE_VERSION: i64 = 156;
 
 fn has_restart_continuation_brief_column(connection: &Connection) -> Result<bool> {
     connection
@@ -2834,6 +2835,12 @@ impl Store {
             self.migrate_sql(
                 "ALTER TABLE artifacts ADD COLUMN custody_namespace TEXT;",
                 Some(CLEANUP_PATH_CUSTODY_VERSION),
+            )?;
+        }
+        if current < ORGANIZATION_CONTENT_SOURCE_VERSION {
+            self.migrate_sql(
+                "ALTER TABLE chat_organization ADD COLUMN content_source TEXT;",
+                Some(ORGANIZATION_CONTENT_SOURCE_VERSION),
             )?;
         }
         Ok(())

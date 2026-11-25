@@ -1160,6 +1160,8 @@ pub(crate) enum ChatCommand {
     Detach(ChatDetachArgs),
     /// Replace the tag groups of Agents or chats.
     Tag(ChatTagArgs),
+    /// Replace one Agent's tags by applying literal rules to a retained turn.
+    Group(ChatGroupArgs),
 }
 
 #[derive(Args)]
@@ -1200,6 +1202,37 @@ pub(crate) struct ChatTagArgs {
     /// Replacement tags, at most 16; omitted clears every tag.
     #[arg(long, value_name = "TAG")]
     pub(crate) tag: Vec<String>,
+    /// Observed link revisions in Agent order (0 before the first write).
+    #[arg(long, value_name = "REV")]
+    pub(crate) revision: Vec<i64>,
+}
+
+#[derive(Args)]
+pub(crate) struct ChatGroupArgs {
+    pub(crate) agent: String,
+    #[arg(long)]
+    pub(crate) generation: i64,
+    #[arg(long)]
+    pub(crate) turn_id: String,
+    /// Observed link revision (0 before the first write).
+    #[arg(long)]
+    pub(crate) revision: i64,
+    /// Match a case-sensitive substring and set its tag. Repeat up to 16 times.
+    #[arg(long, required = true, value_name = "TAG=LITERAL", value_parser = parse_content_group_rule)]
+    pub(crate) rule: Vec<eliot_core::api::ContentGroupRule>,
+    /// Allow replacing existing manual tags.
+    #[arg(long)]
+    pub(crate) replace_manual_tags: bool,
+}
+
+fn parse_content_group_rule(value: &str) -> Result<eliot_core::api::ContentGroupRule, String> {
+    let (tag, contains) = value
+        .split_once('=')
+        .ok_or_else(|| "grouping rule requires TAG=LITERAL".to_owned())?;
+    Ok(eliot_core::api::ContentGroupRule {
+        tag: tag.to_owned(),
+        contains: contains.to_owned(),
+    })
 }
 
 #[derive(Args)]

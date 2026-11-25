@@ -102,6 +102,7 @@ const METHODS: &[Method] = &[
     method!("chat.attach", ChatAttachRequest, ChatOrganizationMutationResponse, true, true, "Place chats under a retained project; execution scope is untouched.", {"id":EXAMPLE_ID,"agents":["a1"],"project":"app"}),
     method!("chat.detach", ChatDetachRequest, ChatOrganizationMutationResponse, true, true, "Return chats to the no-project bucket; execution scope is untouched.", {"id":EXAMPLE_ID,"agents":["a1"]}),
     method!("chat.tag", ChatTagRequest, ChatOrganizationMutationResponse, true, true, "Replace tag groups of Agents or chats with revision readback.", {"id":EXAMPLE_ID,"agents":["a1"],"tags":["inbox"]}),
+    method!("chat.group", ChatGroupRequest, ChatOrganizationMutationResponse, true, true, "Apply literal grouping rules to one exact retained turn and replace tags under its current link revision.", {"id":EXAMPLE_ID,"source":{"agent":"a1","generation":1,"turn_id":"turn-1"},"expected_revision":0,"rules":[{"tag":"release","contains":"release notes"}]}),
     method!("cleanup.plan", CleanupPlanRequest, CleanupPlan, false, false, "Plan bounded cleanup: Agents own subtree; Owner project or all. No deletion.", {"scope":"self_tree"}),
     method!("cleanup.apply", CleanupApplyRequest, CleanupApplyResponse, false, true, "Accept a cleanup plan for guarded daemon execution; inspect progress with cleanup.status.", {"id":EXAMPLE_ID,"plan_id":EXAMPLE_ID}),
     method!("cleanup.apply_all", CleanupApplyAllRequest, CleanupJobStatus, true, true, "Owner only: accept guarded cleanup across all pages of a project or fleet.", {"id":EXAMPLE_ID,"scope":"all"}),
@@ -693,6 +694,7 @@ impl Router {
             "chat.attach" => &["swarm chat attach"],
             "chat.detach" => &["swarm chat detach"],
             "chat.tag" => &["swarm chat tag"],
+            "chat.group" => &["swarm chat group"],
             "command.cancel" => &["swarm cmd cancel"],
             "rule.list" => &["swarm rule list"],
             "rule.read" => &["swarm rule read"],
@@ -1087,6 +1089,9 @@ fn method_limits(name: &str) -> &'static str {
         }
         "chat.attach" | "chat.detach" | "chat.tag" => {
             "Owner only. Placement and tags only; execution scope is untouched. At most 16 Agents per call. Retry the same id for the retained readback."
+        }
+        "chat.group" => {
+            "Owner only. Match up to 16 case-sensitive literals on one completed retained turn. Supply the current organization link revision. Existing manual tags require replace_manual_tags. No match leaves the link as read. Retry the same id for retained readback."
         }
         "chat.organization" => {
             "Owner only. Ready grouped projection with event-watermark readback; no client-side Git discovery."
