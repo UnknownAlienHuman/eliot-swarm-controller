@@ -260,7 +260,7 @@ impl Router {
     pub(crate) fn finish_update_boot(&self, complete: bool) {
         let mut boot = self.inner.update_boot.lock_recover();
         boot.finished = Some(complete);
-        boot.pending.clear();
+        boot.pending = HashMap::new();
     }
 }
 

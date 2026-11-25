@@ -84,6 +84,11 @@ fn print_update_value(value: &Value, json_output: bool) {
         }
         if let Some(state) = value["startup_health"]["state"].as_str() {
             println!("Startup health: {state}");
+            if let Some(omitted) = value["startup_health"]["omitted"].as_u64()
+                && omitted > 0
+            {
+                println!("  {omitted} startup outcomes omitted from details");
+            }
             if let Some(evidence) = value["startup_health"]["evidence"].as_array() {
                 for row in evidence {
                     println!(

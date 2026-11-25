@@ -3444,7 +3444,9 @@ session, and submit no model input. Adapters without an equivalent planner
 report unknown. The exact retained
 generation, retained subject, workspace, profile name and startup kind bind the
 comparison to the previous daemon's accepted validation. A boot attempt skipped
-before dispatch is reported as `not_dispatched` with its evidence.
+before dispatch, including a cancelled command, is reported as `not_dispatched`.
+The report counts every startup outcome and names how many exceed the evidence
+detail limit.
 
 A deterministic Swarm validation refusal for a previously accepted matching
 subject requests rollback only when boot evidence is complete and all attempts
