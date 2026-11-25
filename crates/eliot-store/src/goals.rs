@@ -460,7 +460,7 @@ fn abandon_goal_marker_tx(
     record: &GoalRoundRecord,
     custody_closed: bool,
     now: i64,
-) -> Result<()> {
+) -> Result<bool> {
     let agent = parse_agent_id(&record.request.agent)?;
     let mode = record.request.mode.as_str();
     if custody_closed
@@ -486,9 +486,9 @@ fn abandon_goal_marker_tx(
                 record.holder
             ],
         ));
-        return Ok(());
+        return Ok(false);
     }
-    db!(tx.execute(
+    let burned = db!(tx.execute(
         "UPDATE goal_markers SET state = 'unknown', updated_at = ?1, custody_closed = ?2
          WHERE agent = ?3 AND mode = ?4 AND generation = ?5 AND revision = ?6
            AND round_key = ?7 AND round_key_kind = ?8 AND state = 'running' AND holder = ?9",
@@ -504,7 +504,7 @@ fn abandon_goal_marker_tx(
             record.holder
         ],
     ));
-    Ok(())
+    Ok(burned == 1)
 }
 
 fn unknown_goal_round_error() -> Error {
@@ -1751,12 +1751,27 @@ impl Store {
                 &goal_round_digest(request)?,
             )?
             .ok_or_else(|| Error::new("unknown", "goal round reservation is no longer retained"))?;
+            let mut events = Vec::new();
             if custody.is_quiescent() && record.holder == self.goal_holder {
                 // A later proven closure may release the marker without
                 // replacing an already retained original request error.
-                abandon_goal_marker_tx(&tx, &record, custody == GoalCheckCustody::Exact, now)?;
+                let exact = custody == GoalCheckCustody::Exact;
+                if abandon_goal_marker_tx(&tx, &record, exact, now)? && exact {
+                    events.push(insert_daemon_event(
+                        &tx,
+                        now,
+                        "goal.check_custody_closed",
+                        "goal",
+                        Some(parse_agent_id(&request.agent)?),
+                        Some(record.generation),
+                        json!({
+                            "mode": record.request.mode,
+                            "revision": record.revision,
+                            "round_key": record.key.text(),
+                        }),
+                    )?);
+                }
             }
-            let mut events = Vec::new();
             let retained = if matches!(record.outcome, StoredGoalRoundOutcome::Running)
                 && record.holder == self.goal_holder
             {
