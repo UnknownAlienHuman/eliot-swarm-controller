@@ -1113,7 +1113,7 @@ fn project_work_not_in_git(
 ) -> eliot_core::Result<()> {
     let mut stmt = projection_query(
         db,
-        "SELECT c.agent, c.generation, c.state, c.updated_at
+        "SELECT c.agent, c.generation, c.state, c.updated_at, c.error
          FROM git_checkpoints c CROSS JOIN agents a ON a.id = c.agent AND a.generation = c.generation
          WHERE a.archived = 0
            AND (c.state = 'failed'
@@ -1131,17 +1131,18 @@ fn project_work_not_in_git(
                 r.get::<_, i64>(1)?,
                 r.get::<_, String>(2)?,
                 r.get::<_, i64>(3)?,
+                r.get::<_, Option<String>>(4)?,
             ))
         })
         .map_err(sql_error)?;
     for row in rows {
-        let (agent, generation, state, since) = row.map_err(sql_error)?;
+        let (agent, generation, state, since, error) = row.map_err(sql_error)?;
         let reason = if state == "failed" {
             "checkpoint_failed"
         } else {
             "ended_with_uncommitted_work"
         };
-        items.push(item(
+        let mut checkpoint = item(
             OwnerInboxKind::WorkNotInGit,
             format!("a{agent}:g{generation}:checkpoint"),
             format!("{state}:{since}"),
@@ -1154,7 +1155,9 @@ fn project_work_not_in_git(
                 "agent.get",
                 json!({"id": format!("a{agent}")}),
             )],
-        ));
+        );
+        checkpoint.detail = error;
+        items.push(checkpoint);
     }
     drop(stmt);
     let mut stmt = projection_query(

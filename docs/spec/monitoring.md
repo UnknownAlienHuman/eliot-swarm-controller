@@ -891,6 +891,12 @@ files, or past a generation budget of eight checkpoint totals of newly written b
 Each withheld file is recorded with its path, size and reason in the checkpoint,
 `swarm show` and the handoff brief. It exists only in the worktree, and the turn counts
 as not fully in Git. A checkpoint that could capture nothing is a failed one.
+If the turn-end attempt fails before reserving its Git writer, the worker
+records the failure against the exact committed completion before advancing
+its cursor. The failure accounts for zero captured bytes. The Owner inbox
+shows the reason when the attempt still owns the latest checkpoint view.
+A newer checkpoint or an active intent keeps its own state, and any previous
+restore point remains available.
 An Agent explicitly staging or committing `.env` on its own branch uses ordinary Git
 behavior. The checkpoint filter applies to daemon-owned capture.
 

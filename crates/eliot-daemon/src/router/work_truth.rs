@@ -24,6 +24,7 @@ const HANDOFF_BATCH: usize = 16;
 const DEFERRED_CHECKPOINT_BATCH: usize = 256;
 /// A turn this old with uncommitted files gets a reminder while it still runs.
 const UNCOMMITTED_REMINDER_MS: i64 = 10 * 60 * 1_000;
+const CHECKPOINT_OUTCOME_UNRECORDED: &str = "checkpoint_outcome_unrecorded";
 
 pub(crate) async fn run_work_truth(
     router: Router,
@@ -56,6 +57,17 @@ pub(crate) async fn run_work_truth(
                     return Ok(());
                 }
                 if let Err(error) = router.record_work_fact(&event).await {
+                    if error.code == CHECKPOINT_OUTCOME_UNRECORDED {
+                        // Keep the already handled prefix without crossing
+                        // the turn whose checkpoint outcome could not commit.
+                        router
+                            .inner
+                            .store
+                            .lock()
+                            .await
+                            .advance_work_truth_cursor(cursor)?;
+                        return Err(error);
+                    }
                     crate::logging::record(
                         &router.secret_policy_snapshot(),
                         "daemon.work_truth_failed",
@@ -227,7 +239,7 @@ impl Router {
             ("turn.completed", "stream") => {
                 let turn = event.data["turn_id"].as_str().map(str::to_owned);
                 let checkpoint = self
-                    .checkpoint_work(agent, generation, "turn_end", turn)
+                    .checkpoint_work_inner(agent, generation, "turn_end", turn, None, Some(event))
                     .await?;
                 if let Some(input) =
                     checkpoint.filter(|input| input.state == GitCheckpointState::Snapshot)
@@ -383,69 +395,121 @@ impl Router {
         turn_id: Option<String>,
         removal_command: Option<&str>,
     ) -> Result<Option<GitCheckpointInput>> {
-        let row = self.inner.store.lock().await.get_agent(agent)?;
-        let Some(row) = row.filter(|row| row.generation == generation && records_work(row)) else {
-            return Ok(None);
+        self.checkpoint_work_inner(agent, generation, trigger, turn_id, removal_command, None)
+            .await
+    }
+
+    async fn checkpoint_work_inner(
+        &self,
+        agent: &str,
+        generation: i64,
+        trigger: &'static str,
+        turn_id: Option<String>,
+        removal_command: Option<&str>,
+        completion: Option<&Event>,
+    ) -> Result<Option<GitCheckpointInput>> {
+        let (row, initial_basis) = {
+            let store = self.inner.store.lock().await;
+            let row = store.get_agent(agent).map_err(|error| {
+                if completion.is_some() {
+                    error.with_code(CHECKPOINT_OUTCOME_UNRECORDED)
+                } else {
+                    error
+                }
+            })?;
+            let Some(row) = row.filter(|row| row.generation == generation && records_work(row))
+            else {
+                return Ok(None);
+            };
+            let basis = completion
+                .map(|_| store.git_checkpoint_basis(agent, generation))
+                .transpose()
+                .map_err(|error| error.with_code(CHECKPOINT_OUTCOME_UNRECORDED))?;
+            (row, basis)
         };
         let workspace = row.workspace.clone().unwrap_or_default();
         if row.branch.is_none() && work_truth::current_branch(&workspace).await.is_none() {
             return Ok(None);
         }
-        let (_, common_dir) = crate::workspace_git::WorkspaceGit::new()?
-            .repository_identity(&workspace)
-            .await?;
         let limits = crate::config::load_daemon_config(&self.inner.data_root)
             .unwrap_or_default()
             .checkpoint_limits();
-        let mut intent = GitCheckpointIntent {
-            common_dir,
-            agent: agent.to_owned(),
-            generation,
-            workspace: workspace.clone(),
-            input: GitCheckpointInput::failed(
-                trigger,
-                turn_id.clone(),
-                "checkpoint capture was interrupted before the exact byte count was recorded"
-                    .to_owned(),
-            ),
-        };
-        let mut progress = self.inner.progress.subscribe();
-        let basis = tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                {
-                    let mut store = self.inner.store.lock().await;
-                    if store.get_agent(agent)?.is_none_or(|current| {
-                        current.generation != generation
-                            || current.workspace.as_deref() != Some(workspace.as_str())
-                    }) {
-                        return Ok::<_, Error>(None);
+        let preparation = async {
+            let (_, common_dir) = crate::workspace_git::WorkspaceGit::new()?
+                .repository_identity(&workspace)
+                .await?;
+            let mut intent = GitCheckpointIntent {
+                common_dir,
+                agent: agent.to_owned(),
+                generation,
+                workspace: workspace.clone(),
+                input: GitCheckpointInput::failed(
+                    trigger,
+                    turn_id.clone(),
+                    "checkpoint capture was interrupted before the exact byte count was recorded"
+                        .to_owned(),
+                ),
+            };
+            let mut progress = self.inner.progress.subscribe();
+            let basis = tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    {
+                        let mut store = self.inner.store.lock().await;
+                        if store.get_agent(agent)?.is_none_or(|current| {
+                            current.generation != generation
+                                || current.workspace.as_deref() != Some(workspace.as_str())
+                        }) {
+                            return Ok::<_, Error>(None);
+                        }
+                        let basis = store.git_checkpoint_basis(agent, generation)?;
+                        intent.input.task_ref = store.work_task_ref(agent, generation)?;
+                        intent.input.captured_bytes = limits
+                            .generation_bytes
+                            .saturating_sub(basis.captured_bytes)
+                            .min(limits.total_bytes);
+                        match store.reserve_git_checkpoint(&intent, removal_command)? {
+                            GitCheckpointReservation::Reserved => return Ok(Some(basis)),
+                            GitCheckpointReservation::Skipped => return Ok(None),
+                            GitCheckpointReservation::Deferred => {}
+                        }
                     }
-                    let basis = store.git_checkpoint_basis(agent, generation)?;
-                    intent.input.task_ref = store.work_task_ref(agent, generation)?;
-                    intent.input.captured_bytes = limits
-                        .generation_bytes
-                        .saturating_sub(basis.captured_bytes)
-                        .min(limits.total_bytes);
-                    match store.reserve_git_checkpoint(&intent, removal_command)? {
-                        GitCheckpointReservation::Reserved => return Ok(Some(basis)),
-                        GitCheckpointReservation::Skipped => return Ok(None),
-                        GitCheckpointReservation::Deferred => {}
-                    }
+                    progress.changed().await.map_err(|_| {
+                        Error::new("unavailable", "checkpoint repository write lane closed")
+                    })?;
                 }
-                progress.changed().await.map_err(|_| {
-                    Error::new("unavailable", "checkpoint repository write lane closed")
-                })?;
+            })
+            .await
+            .map_err(|_| {
+                Error::new(
+                    "repository_busy",
+                    "checkpoint repository write lane is busy",
+                )
+            })??;
+            Ok::<_, Error>(basis.map(|basis| (basis, intent)))
+        }
+        .await;
+        let (basis, intent) = match preparation {
+            Ok(Some(prepared)) => prepared,
+            Ok(None) => return Ok(None),
+            Err(error) => {
+                let (Some(completion), Some(initial_basis)) = (completion, initial_basis) else {
+                    return Err(error);
+                };
+                let mut failure = error.sanitized(&self.secret_policy_snapshot());
+                failure.message = eliot_core::bound_chars(&failure.message, 1024).into();
+                let mut store = self.inner.store.lock().await;
+                let events = store
+                    .record_unreserved_turn_checkpoint_failure(
+                        completion,
+                        &workspace,
+                        &initial_basis,
+                        &failure,
+                        now_ms(),
+                    )
+                    .map_err(|error| error.with_code(CHECKPOINT_OUTCOME_UNRECORDED))?;
+                self.publish_locked(&events);
+                return Ok(None);
             }
-        })
-        .await
-        .map_err(|_| {
-            Error::new(
-                "repository_busy",
-                "checkpoint repository write lane is busy",
-            )
-        })??;
-        let Some(basis) = basis else {
-            return Ok(None);
         };
         let first = basis.fingerprint.is_none();
         let mut input = work_truth::checkpoint(CheckpointRequest {
