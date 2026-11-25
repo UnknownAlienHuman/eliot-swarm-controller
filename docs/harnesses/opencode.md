@@ -130,6 +130,10 @@ event tags are committed as `session.native_unclassified` only when the event's
 missing identity is not inferred. The record contains the sanitized event tag
 and static site only, then processing continues. Known text/reasoning deltas,
 tool input details, steps, usage and `session.idle` remain intentionally unmapped.
+`session.instructions.updated` is a native instruction update with no reader or
+settlement use in Eliot. The
+`session.step.first-token` timing signal keeps its exact-session progress
+handling without a durable event. Both still pass native sequence checks.
 `session.status.status.type` recognizes `idle`, `retry` and `busy`; an unknown
 tag is `Other` with a diagnostic. Compaction reasons recognize `auto` and
 `manual`; an unknown reason projects only as `unknown` with a diagnostic.

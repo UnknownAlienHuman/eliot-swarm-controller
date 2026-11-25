@@ -1162,6 +1162,9 @@ processing the stream. These facts carry the adapter's decode site and a bounded
 native discriminator, without the raw payload. They have no lifecycle, authority or
 outcome semantics. A terminal record with an unfamiliar outcome cannot establish
 success, failure or interruption. Preserve frame integrity and exact binding checks.
+Known native advisory and progress records with no independent durable meaning
+do not consume the diagnostic budget. Adapter-specific contracts name those
+records and retain their existing binding, progress and native-history handling.
 Detect native capabilities from advertised or observed behavior. Installed version
 strings are diagnostic metadata. Choose native formats from the advertised methods,
 schema or fields present in the data. Check the feature or authority required for the

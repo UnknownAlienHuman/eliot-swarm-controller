@@ -583,6 +583,9 @@ with explicit origin. No refresh, login, model turn or inference probe is attemp
 
 Claude's stream-json uses the
 [shared 8 MiB inbound frame cap](../spec/plugin-protocol.md#lifecycle-hooks-and-qualification).
+`tool_progress` reports elapsed time while a native tool is running. It follows
+the matching rule for the active turn's native deadline. The adapter persists
+tool starts and completions and leaves progress pulses in the native stream.
 A `user` record carrying a
 Read tool's image result was observed live at 1,346,894 bytes (2026-11-19) and ended a 1 MiB
 stream with `frame_oversized`; Claude accepts images up to 5 MB (about 6.7 MB as base64), so 8 MiB

@@ -782,6 +782,19 @@ Unknown command and file-change statuses also decode as `Other` and are diagnose
 they do not produce a guessed `tool.completed`. Unknown message phases do not mark a
 final answer, and unknown patch-change kinds do not add an inferred move path.
 
+The installed 0.167.1 schema identifies these items and notifications as known.
+They add no independent durable fact to the parent or child stream.
+
+| Native input | Durable evidence |
+| --- | --- |
+| `reasoning` item | Keep ordinary item binding and the retained native history projection. No separate reasoning event is persisted. |
+| `account/rateLimits/updated` | Quota uses `account/rateLimits/read`. Provider holds require the authoritative restriction evidence. |
+| `thread/status/changed` | Exact thread and turn readback or lifecycle events establish state and settlement. |
+| `turn/diff/updated` | Keep existing active-turn activity handling. File changes and Git readback supply retained change facts. |
+| `item/commandExecution/terminalInteraction` | Keep existing active-turn activity handling, and use the exact tool item for lifecycle and outcome. Terminal input stays native. |
+| `mcpServer/startupStatus/updated` | Native initialization and operation-specific readback supply the readiness facts Eliot uses. |
+| `warning`, `model/safetyBuffering/updated` | These advisory notifications supply no structured outcome or routing decision. Their content stays native. |
+
 If the Codex stream could not commit its final tool records, exact turn
 settlement or generation loss closes retained tool starts as `unknown`.
 These daemon events carry the original turn and item and record the absence

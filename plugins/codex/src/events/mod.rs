@@ -1746,6 +1746,7 @@ impl EventProcessor {
             "error" => {
                 self.note_native_error(params).await?;
             }
+            _ if is_advisory_notification(method) => {}
             _ => {
                 if self.status.ready
                     && params
@@ -2346,6 +2347,19 @@ impl EventProcessor {
 fn turn_activity_notification(method: &str) -> bool {
     (method.starts_with("item/") && !matches!(method, "item/started" | "item/completed"))
         || matches!(method, "turn/diff/updated" | "turn/plan/updated")
+}
+
+fn is_advisory_notification(method: &str) -> bool {
+    matches!(
+        method,
+        "account/rateLimits/updated"
+            | "thread/status/changed"
+            | "turn/diff/updated"
+            | "warning"
+            | "mcpServer/startupStatus/updated"
+            | "item/commandExecution/terminalInteraction"
+            | "model/safetyBuffering/updated"
+    )
 }
 
 fn known_notification(method: &str) -> bool {

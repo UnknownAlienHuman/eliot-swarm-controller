@@ -1186,6 +1186,7 @@ impl EventProcessor {
             "thread/tokenUsage/updated" => {
                 self.note_child_token_usage(child_thread, &params)?;
             }
+            _ if is_advisory_notification(method) => {}
             _ => {
                 let host = self.host.clone();
                 let credential = self.credential.clone();
