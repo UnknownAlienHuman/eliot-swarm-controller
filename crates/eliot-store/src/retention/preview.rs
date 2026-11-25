@@ -230,11 +230,10 @@ fn summary(
     .map_err(sql_error)
 }
 
-fn events(
-    db: &Connection,
-    current: i64,
-    cutoff: Option<i64>,
-) -> Result<(RetentionPreviewRow, i64, Option<(i64, i64)>)> {
+// Row counts, projected replay floor, and the first replayable sequence and time.
+type EventPreview = (RetentionPreviewRow, i64, Option<(i64, i64)>);
+
+fn events(db: &Connection, current: i64, cutoff: Option<i64>) -> Result<EventPreview> {
     let high_water = count(db, "SELECT COALESCE(MAX(seq),?1) FROM events", [current])?;
     let boundary = match cutoff {
         Some(cutoff) => event_prune_end(db, current, high_water, cutoff)?,
