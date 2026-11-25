@@ -579,7 +579,9 @@ turn at admission. That binding stays in force through cancellation or refusal.
 same generation. Store retains fallback permission when `soonest` selects an
 in-turn point. An unclaimed safe-point item can move when its turn ends, and a
 confirmed pre-effect refusal of active-turn delivery can move in the same
-generation. A retained item with no fallback permission keeps its binding.
+generation. New explicit in-turn items record that fallback is disabled. Older
+items retain the historical behavior for their stored in-turn point. The
+daemon keeps this flag out of plugin command arguments.
 Queued pending contexts (`next_input`, `turn_safe_point`) are claimed FIFO from
 existing command rows for the target's current generation. At claim, Store
 rechecks project assignment and transfer fences, the frozen project binding for
@@ -620,7 +622,11 @@ weaker SEND.
 Before dispatch, an expired item or one whose generation or captured turn is stale is
 cancelled. Once claimed/dispatched, an uncertain native effect is `unknown` and is never
 requeued. A late hook response is discarded rather than carried into a later callback or
-turn. On harnesses that deliver `steer` through `turn_safe_point` hooks (Claude), pending
+turn. Every terminal or unknown turn settles its pending turn-bound context in
+the same transaction, including an Owner-resolved interrupt. Ending a generation
+cancels its unclaimed items. A retained active pointer on an unknown turn
+supports late readback. New in-turn delivery requires a running turn.
+On harnesses that deliver `steer` through `turn_safe_point` hooks (Claude), pending
 exact-turn `steer` commands share the `hook.event` FIFO safe-point claim with
 `turn_safe_point` injects in the `#888` Swarm note frame without using `InjectArgs` or
 moving to `next_input`: if the captured turn ends before any safe point arrives, an

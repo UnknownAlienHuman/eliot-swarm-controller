@@ -926,6 +926,7 @@ fn dispatch_inject_tx(
         .as_deref()
         .is_some_and(|expected| expected != turn_id)
         || agent.active_turn.as_deref() != Some(turn_id)
+        || !context::turn_accepts_context_tx(tx, agent_num, agent.generation, turn_id)?
     {
         return Err(Error::new(
             "stale_generation",

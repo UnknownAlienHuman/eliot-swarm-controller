@@ -97,7 +97,7 @@ impl Store {
             if state == CommandState::Rejected
                 && record.state == CommandState::Dispatched
                 && args.point == InjectPoint::ActiveTurn
-                && args.fallback_to_next_input
+                && args.allows_next_input_fallback()
                 && args.expires_at_ms.is_none_or(|expires| expires > now)
                 && let Some(target) = record.target
                 && let Some(agent) = load_agent_by_num(tx, target)?
@@ -2177,6 +2177,16 @@ fn settle_owner_interrupted_turn_tx(
             }),
         ),
     )?);
+    for event in context::settle_ended_turn_context_tx(
+        tx,
+        agent_num,
+        generation,
+        turn_id,
+        reason != "stopped_by_owner",
+        now,
+    )? {
+        events.push(event.commit(tx, agent_num, generation, now)?);
+    }
     Ok(())
 }
 

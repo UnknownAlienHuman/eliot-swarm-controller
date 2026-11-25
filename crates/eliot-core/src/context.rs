@@ -123,14 +123,29 @@ pub struct RetainedInjectArgs {
     pub point: InjectPoint,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_at_ms: Option<i64>,
-    #[serde(default, rename = "_fallback_to_next_input")]
-    pub fallback_to_next_input: bool,
+    #[serde(
+        default,
+        rename = "_fallback_to_next_input",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub fallback_to_next_input: Option<bool>,
     #[serde(
         default,
         rename = "_trusted_review_labels",
         skip_serializing_if = "Option::is_none"
     )]
     pub trusted_review_labels: Option<TrustedReviewLabels>,
+}
+
+impl RetainedInjectArgs {
+    pub fn allows_next_input_fallback(&self) -> bool {
+        // Older admissions stored only the resolved point. Unmarked in-turn
+        // rows retain the fallback behavior they had when admitted.
+        matches!(
+            self.point,
+            InjectPoint::TurnSafePoint | InjectPoint::ActiveTurn
+        ) && self.fallback_to_next_input.unwrap_or(true)
+    }
 }
 
 pub fn decode_retained_inject_args(value: &Value) -> serde_json::Result<RetainedInjectArgs> {

@@ -647,6 +647,15 @@ pub(super) fn admit_tx(
         ));
     }
     let points = context_points(&agent)?;
+    let active_context_turn = if args.point != InjectPoint::NextInput
+        && matches!(agent.state, AgentState::Busy | AgentState::Waiting)
+        && let Some(turn_id) = agent.active_turn.as_deref()
+        && turn_accepts_context_tx(tx, agent_num, agent.generation, turn_id)?
+    {
+        Some(turn_id)
+    } else {
+        None
+    };
     let fallback_to_next_input = args.point == InjectPoint::Soonest;
     if fallback_to_next_input {
         if let Some(expected) = request.expected_turn_id.as_deref()
@@ -655,12 +664,11 @@ pub(super) fn admit_tx(
         {
             return Err(Error::new("stale_generation", "inject turn is unknown"));
         }
-        let active = matches!(agent.state, AgentState::Busy | AgentState::Waiting)
-            && agent.active_turn.is_some()
+        let active = active_context_turn.is_some()
             && request
                 .expected_turn_id
-                .as_ref()
-                .is_none_or(|turn| agent.active_turn.as_ref() == Some(turn));
+                .as_deref()
+                .is_none_or(|turn| active_context_turn == Some(turn));
         args.point = [InjectPoint::TurnSafePoint, InjectPoint::ActiveTurn]
             .into_iter()
             .find(|point| active && points.contains(point))
@@ -681,13 +689,7 @@ pub(super) fn admit_tx(
                 InjectPoint::TurnSafePoint => "turn_safe_point",
                 _ => "active_turn",
             };
-            if !matches!(agent.state, AgentState::Busy | AgentState::Waiting) {
-                return Err(Error::new(
-                    "bad_state",
-                    format!("{point_name} inject requires an active turn"),
-                ));
-            }
-            let turn_id = agent.active_turn.as_deref().ok_or_else(|| {
+            let turn_id = active_context_turn.ok_or_else(|| {
                 Error::new(
                     "bad_state",
                     format!("{point_name} inject requires an exact active turn"),
@@ -708,8 +710,8 @@ pub(super) fn admit_tx(
     };
 
     let mut resolved = json!(args);
-    if fallback_to_next_input && args.point != InjectPoint::NextInput {
-        resolved["_fallback_to_next_input"] = json!(true);
+    if args.point != InjectPoint::NextInput {
+        resolved["_fallback_to_next_input"] = json!(fallback_to_next_input);
     }
     if let Some(labels) = &request.trusted_review_labels {
         resolved["_trusted_review_labels"] = serde_json::to_value(labels)
@@ -1102,6 +1104,12 @@ impl Store {
             ));
         }
         validate_id_age(consumer_id, now)?;
+        if !turn_accepts_context_tx(&tx, agent_num, generation, turn_id)? {
+            return Err(Error::new(
+                "stale_generation",
+                "context callback's captured turn is no longer running",
+            ));
+        }
 
         let mut events = Vec::new();
         let mut selected: Vec<ContextItem> = Vec::new();
@@ -1571,18 +1579,19 @@ pub(super) fn settle_ended_turn_context_tx(
     agent_num: i64,
     generation: i64,
     turn_id: &str,
+    allow_fallback: bool,
     now: i64,
 ) -> Result<Vec<super::native_events::PendingCommandEvent>> {
     let mut events = Vec::new();
     let agent = load_agent_by_num(tx, agent_num)?;
-    let can_move = agent.as_ref().is_some_and(next_input_available);
+    let can_move = allow_fallback && agent.as_ref().is_some_and(next_input_available);
     let safe_point_steers = agent.as_ref().is_some_and(Agent::steers_at_turn_safe_point);
     for command_id in pending_turn_context_command_ids(tx, agent_num, generation, turn_id)? {
         let record = load_command_record(tx, &command_id)?
             .ok_or_else(|| Error::new("source_integrity", "turn context disappeared"))?;
         let args = decode_inject_args(&record.command.args)?;
         let expired = args.expires_at_ms.is_some_and(|expires| expires <= now);
-        if args.fallback_to_next_input && can_move && !expired {
+        if args.allows_next_input_fallback() && can_move && !expired {
             let outcome = move_context_to_next_input(tx, &command_id, now)?;
             events.push(super::native_events::PendingCommandEvent {
                 command_id: command_id.clone(),
@@ -1687,6 +1696,21 @@ pub(super) fn move_context_to_next_input(
 pub(super) fn next_input_available(agent: &Agent) -> bool {
     !agent.is_terminal()
         && context_points(agent).is_ok_and(|points| points.contains(&InjectPoint::NextInput))
+}
+
+pub(super) fn turn_accepts_context_tx(
+    tx: &Transaction<'_>,
+    agent_num: i64,
+    generation: i64,
+    turn_id: &str,
+) -> Result<bool> {
+    tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM turns
+                       WHERE agent=?1 AND generation=?2 AND turn_id=?3 AND state='running')",
+        params![agent_num, generation, turn_id],
+        |row| row.get(0),
+    )
+    .map_err(sql_error)
 }
 
 pub(super) fn unknown_claim_outcome(outcome: Option<&Value>, reason: &str) -> Value {
