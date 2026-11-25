@@ -50,20 +50,19 @@ impl CheckpointListRequest {
         if self.generation < 0 || !(1..=MAX_CHECKPOINT_PAGE).contains(&self.limit) {
             return Err(Error::new("invalid", "checkpoint list bounds are invalid"));
         }
-        if let Some(cursor) = &self.cursor {
-            if cursor.agent != self.agent
+        if self.cursor.as_ref().is_some_and(|cursor| {
+            cursor.agent != self.agent
                 || cursor.generation != self.generation
                 || cursor.revision.len() != 64
                 || !cursor.revision.bytes().all(|b| b.is_ascii_hexdigit())
                 || cursor.after.is_empty()
                 || cursor.after.len() > 512
                 || cursor.after.contains('\0')
-            {
-                return Err(Error::new(
-                    "invalid_cursor",
-                    "checkpoint list cursor is malformed",
-                ));
-            }
+        }) {
+            return Err(Error::new(
+                "invalid_cursor",
+                "checkpoint list cursor is malformed",
+            ));
         }
         Ok(())
     }
@@ -173,13 +172,13 @@ impl CheckpointGetRequest {
                 "checkpoint metadata page limit is invalid",
             ));
         }
-        if let Some(cursor) = &self.cursor {
-            if cursor.checkpoint_ref != self.checkpoint_ref || cursor.oid != self.oid {
-                return Err(Error::new(
-                    "invalid_cursor",
-                    "checkpoint metadata cursor is malformed",
-                ));
-            }
+        if self.cursor.as_ref().is_some_and(|cursor| {
+            cursor.checkpoint_ref != self.checkpoint_ref || cursor.oid != self.oid
+        }) {
+            return Err(Error::new(
+                "invalid_cursor",
+                "checkpoint metadata cursor is malformed",
+            ));
         }
         Ok(())
     }
