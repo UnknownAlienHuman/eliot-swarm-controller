@@ -1081,6 +1081,27 @@ fn reserve_switch_tx(
         warning: None,
         next_action: "preparing_launch".into(),
     };
+    for (child_id, kind) in [
+        (value.launch_command.as_str(), "launch"),
+        (value.handoff_command.as_str(), "handoff"),
+    ] {
+        if command_binding(tx, child_id)?.is_some()
+            || write_exists(tx, child_id)?
+            || digest_id_bound(tx, child_id)?
+            || tx
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM switch_child_id_reservations WHERE id=?1)",
+                    [child_id],
+                    |row| row.get::<_, bool>(0),
+                )
+                .map_err(sql_error)?
+        {
+            return Err(Error::new(
+                "id_conflict",
+                "generated switch child id is already reserved",
+            ));
+        }
+    }
     let mut parent = SubmitCommand::new(&request.id, "switch");
     parent.args = args;
     let outcome = serde_json::to_value(&value)
@@ -1094,6 +1115,11 @@ fn reserve_switch_tx(
         },
         json!({"command_id":request.id,"verb":"switch"}),
     )?;
+    tx.execute(
+        "INSERT INTO switch_child_id_reservations(id,switch_command,kind) VALUES (?1,?2,'launch'),(?3,?2,'handoff')",
+        params![value.launch_command, request.id, value.handoff_command],
+    )
+    .map_err(sql_error)?;
     Ok(Change {
         value,
         events: vec![event],
@@ -2044,6 +2070,9 @@ impl Store {
                 self.hierarchy_limits,
                 self.capacity_policy.as_deref(),
             )?;
+            if admission.is_new {
+                consume_switch_child_id(&tx, id, &admission.command.id, "launch")?;
+            }
             let target_num =
                 parse_agent_id(admission.command.target.as_deref().ok_or_else(|| {
                     Error::new("source_integrity", "switch launch Agent is missing")
@@ -2206,6 +2235,7 @@ impl Store {
                         &destination.id,
                         destination.generation,
                     );
+                    consume_switch_child_id(&tx, id, &plan.handoff_command, "handoff")?;
                     let (source, _) =
                         source_tx(&tx, &request, self.hierarchy_limits, policy, true)?;
                     let manager = require_switch_project(&tx, &request, target_project.as_ref())?;
@@ -2768,6 +2798,48 @@ fn component(
     } else {
         Ok(None)
     }
+}
+
+pub(super) fn switch_child_id_reserved(
+    tx: &Connection,
+    id: &str,
+    kind: &str,
+    switch_id: &str,
+) -> Result<bool> {
+    tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM switch_child_id_reservations r
+         JOIN commands s ON s.id=r.switch_command
+         WHERE r.id=?1 AND r.kind=?2 AND r.switch_command=?3 AND s.method='swarm.switch'
+           AND s.verb='switch' AND s.principal='owner'
+           AND json_extract(s.outcome, CASE r.kind WHEN 'launch' THEN '$.launch_command' ELSE '$.handoff_command' END)=r.id)",
+        params![id, kind, switch_id],
+        |row| row.get(0),
+    )
+    .map_err(sql_error)
+}
+
+fn consume_switch_child_id(
+    tx: &Connection,
+    switch_id: &str,
+    child_id: &str,
+    kind: &str,
+) -> Result<()> {
+    let changed = tx.execute(
+        "DELETE FROM switch_child_id_reservations
+         WHERE id=?1 AND switch_command=?2 AND kind=?3",
+        params![child_id, switch_id, kind],
+    )
+    .map_err(sql_error)?;
+    if changed != 1 {
+        let ordinal = if kind == "launch" { 0 } else { 1 };
+        if component(tx, switch_id, child_id, ordinal)?.is_none() {
+            return Err(Error::new(
+                "source_integrity",
+                "switch child id reservation is missing",
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Check the exact unused successor again when its reserved stop dispatches.

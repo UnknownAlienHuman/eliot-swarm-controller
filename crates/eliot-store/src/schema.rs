@@ -1,6 +1,6 @@
 use super::*;
 
-pub(super) const CURRENT_SCHEMA_VERSION: i64 = FLUENT_READ_REVISIONS_VERSION;
+pub(super) const CURRENT_SCHEMA_VERSION: i64 = SWITCH_CHILD_ID_RESERVATIONS_VERSION;
 const HARNESS_CHECK_SCHEMA_VERSION: i64 = 112;
 const WORK_TRUTH_VERSION: i64 = 113;
 const WORK_TRUTH_INTENT_VERSION: i64 = 114;
@@ -35,6 +35,7 @@ const CHILD_DIGEST_ASSIGNMENT_VERSION: i64 = 142;
 const OWNER_PROJECTION_LOOKUP_VERSION: i64 = 143;
 const AGENT_RESULT_READS_VERSION: i64 = 144;
 const FLUENT_READ_REVISIONS_VERSION: i64 = 145;
+const SWITCH_CHILD_ID_RESERVATIONS_VERSION: i64 = 146;
 
 fn has_restart_continuation_brief_column(connection: &Connection) -> Result<bool> {
     connection
@@ -317,6 +318,16 @@ impl Store {
             self.migrate_sql(
                 include_str!("../migrations/fluent_read_revisions.sql"),
                 Some(FLUENT_READ_REVISIONS_VERSION),
+            )?;
+        }
+        if current < SWITCH_CHILD_ID_RESERVATIONS_VERSION {
+            self.migrate_sql(
+                "CREATE TABLE switch_child_id_reservations (
+                     id TEXT PRIMARY KEY NOT NULL,
+                     switch_command TEXT NOT NULL REFERENCES commands(id) ON DELETE CASCADE,
+                     kind TEXT NOT NULL CHECK(kind IN ('launch','handoff'))
+                 ) WITHOUT ROWID;",
+                Some(SWITCH_CHILD_ID_RESERVATIONS_VERSION),
             )?;
         }
         Ok(())

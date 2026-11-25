@@ -1259,6 +1259,19 @@ impl Store {
                 "write id is already used by a completion digest",
             ));
         }
+        if tx
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM switch_child_id_reservations WHERE id=?1)",
+                [id],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(sql_error)?
+        {
+            return Err(Error::new(
+                "id_conflict",
+                "write id is reserved by a switch child",
+            ));
+        }
         if let Some((old_principal, old_method, old_digest, old_result)) = write_binding(&tx, id)? {
             if old_principal != principal || old_method != method || old_digest != digest {
                 return Err(Error::new(
