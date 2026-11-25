@@ -850,7 +850,7 @@ the same guarded plan and apply path as the cleanup UI and CLI.
 Both Git base notice keys default to `true`. Set `enabled = false` to pause
 observation and new deliveries. Set `wake = false` to retain notices in mail
 until the manager's next ordinary input. Settings Save applies both keys live.
-See [local base movement notices](automation.md#local-base-movement-notices).
+See [branch dependence notices](automation.md#branch-dependence-notices).
 
 Store retention uses the `[daemon.retention]` table.
 

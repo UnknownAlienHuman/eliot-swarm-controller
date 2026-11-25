@@ -1266,17 +1266,24 @@ The Router and Store admit `git.fetch`, `git.integrate`, and check-bound
 `git.publish` through the ordinary command path. `git.fetch` is available to Owner and
 registered-project event or timer rules.
 
-### Local base movement notices
+### Branch dependence notices
 
-Swarm delivers a committed `git.upstream_moved` fact to the live manager bound
-to the observed workspace and generation. The mail identifies the observed
-topic branch, local upstream ref and old and new OIDs. It uses the existing
-context-note cursor, deterministic mail identity and wake admission. A repeated
-sample of the same tip produces no new notice.
+Swarm uses a committed `git.upstream_moved` fact to check the exact topic HEAD
+against the locally visible upstream tip. It mails the bound manager when
+the branch still depends on a recorded base newly contained in upstream,
+including a verified squash, or a previously verified base branch was
+deleted. A bounded private `git merge-tree` preview also qualifies when it
+reports conflicts against the new upstream. That mail names the conflicting
+paths and the exact tip. A clean upstream move without a retired dependency
+produces no mail. Preview output objects stay in the daemon's private Git
+directory and never change checkout refs, index or working files.
 
+Swarm uses the existing context-note cursor and mail admission. Retained mail
+deduplicates by repository, topic branch and upstream tip. A conflict may wake
+an idle manager under the ordinary mail gates. For a retired base alone,
+waking requires queued input for that manager's bound branch and generation.
 The [Owner settings](configuration.md#daemon-and-automation-settings) control
-delivery and waking. The notice reports locally visible refs. Fetching, merge
-verification and any rebase use their existing Owner-controlled paths.
+delivery and waking. Fetch and rebase decisions remain Owner-controlled.
 
 ### Local branch integration
 

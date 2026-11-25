@@ -270,6 +270,7 @@ struct GitBindingInput {
 struct GitGroup {
     baseline: Option<GitBaseline>,
     base_oid: Option<String>,
+    base_ref: Option<String>,
     common_dir: Option<String>,
     quiet: bool,
     observe_upstream: bool,
@@ -1396,6 +1397,7 @@ impl Monitoring {
                         entry.insert(GitGroup {
                             baseline: store.git_baseline(workspace)?,
                             base_oid: retained.as_ref().map(|row| row.base_oid.clone()),
+                            base_ref: retained.as_ref().and_then(|row| row.base_ref.clone()),
                             common_dir: retained.map(|row| row.repo_common_dir),
                             quiet: true,
                             observe_upstream: false,
@@ -1718,6 +1720,14 @@ impl Monitoring {
                     && tip.branch() != Some(branch)
                     && self.check_git_value(serde_json::json!(tip)).is_ok()
                 {
+                    snapshot.upstream_dependency = group
+                        .base_ref
+                        .as_deref()
+                        .zip(group.base_oid.as_deref())
+                        .and_then(|(base, oid)| checkout.base_dependency(base, oid))
+                        .filter(|dependency| {
+                            self.check_git_value(serde_json::json!(dependency)).is_ok()
+                        });
                     snapshot.upstream = Some(tip);
                 }
                 self.check_git_value(
@@ -1918,6 +1928,7 @@ impl Monitoring {
             committed_paths: Vec::new(),
             base_complete: false,
             upstream: None,
+            upstream_dependency: None,
             work: None,
         };
         loop {

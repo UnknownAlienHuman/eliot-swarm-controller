@@ -2,6 +2,24 @@ use super::*;
 use std::collections::BTreeSet;
 
 impl Store {
+    pub fn git_base_notice_sent(&self, thread: &str) -> Result<bool> {
+        self.connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM messages WHERE thread=?1 AND sender='swarm')",
+                [thread],
+                |row| row.get(0),
+            )
+            .map_err(sql_error)
+    }
+
+    pub fn git_base_has_queued_input(&self, agent: &str, generation: i64) -> Result<bool> {
+        self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM commands WHERE target=?1 AND generation=?2
+             AND state='queued' AND verb='send' AND COALESCE(json_extract(args,'$.notice_kind'),'')<>'mail')",
+            params![parse_agent_id(agent)?, generation], |row| row.get(0),
+        ).map_err(sql_error)
+    }
+
     /// The latest visible completed turn and the same native edit-path facts
     /// carried by its tool rows. Tool output and input content are never read.
     pub fn latest_diff_turn(
@@ -406,6 +424,11 @@ struct GitView {
     changed: bool,
     undelivered: Vec<GitCommit>,
     upstream_moved: Option<core::GitUpstreamMoved>,
+}
+
+struct ObservedGitRefs {
+    upstream: Option<core::GitUpstreamTip>,
+    dependency: Option<core::GitBaseDependency>,
 }
 
 /// Code-progress snapshot read by automatic attention without launching Git.
@@ -837,6 +860,7 @@ fn git_changed_data(
     complete: bool,
     base_complete: bool,
     view_digest: &str,
+    refs: &ObservedGitRefs,
 ) -> Value {
     let mut data = json!({
         "workspace": snapshot.workspace, "head": snapshot.head, "branch": snapshot.branch,
@@ -846,8 +870,11 @@ fn git_changed_data(
         "base_oid": snapshot.base_oid, "committed_paths": committed_paths, "base_complete": base_complete,
         "view_digest": view_digest,
     });
-    if let Some(upstream) = &snapshot.upstream {
+    if let Some(upstream) = &refs.upstream {
         data["upstream"] = json!(upstream);
+    }
+    if let Some(dependency) = &refs.dependency {
+        data["upstream_dependency"] = json!(dependency);
     }
     data
 }
@@ -893,6 +920,76 @@ fn compute_git_view(
     generation: i64,
     snapshot: &GitSnapshot,
 ) -> Result<GitView> {
+    let previous: Option<(String, i64)> = tx
+        .query_row(
+            "SELECT data,ts FROM events WHERE agent = ?1 AND generation = ?2
+         AND source = 'git' AND kind = 'git.changed' ORDER BY seq DESC LIMIT 1",
+            params![agent_num, generation],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(sql_error)?;
+    if previous
+        .as_ref()
+        .is_some_and(|(_, at)| *at > snapshot.observed_at)
+    {
+        return Err(Error::new(
+            "bad_state",
+            "Git snapshot predates the committed Git view",
+        ));
+    }
+    let previous: Option<Value> = previous
+        .as_ref()
+        .map(|(data, _)| decode_json(data))
+        .transpose()?;
+    let previous = previous.filter(|data| data["workspace"] == snapshot.workspace);
+    let historical = if snapshot.upstream.is_some()
+        && previous
+            .as_ref()
+            .is_none_or(|data| data["upstream"].is_null())
+    {
+        tx.query_row(
+            "SELECT data FROM events INDEXED BY events_agent WHERE agent=?1 AND generation<?2
+             AND source='git' AND kind='git.changed' AND json_extract(data,'$.workspace')=?3
+             AND json_type(data,'$.upstream')='object' ORDER BY seq DESC LIMIT 1",
+            params![agent_num, generation, snapshot.workspace],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(sql_error)?
+        .as_deref()
+        .map(decode_json)
+        .transpose()?
+    } else {
+        None
+    };
+    let earlier = historical.as_ref().or(previous.as_ref());
+    let prior_upstream = earlier
+        .and_then(|data| {
+            serde_json::from_value::<core::GitUpstreamTip>(data["upstream"].clone()).ok()
+        })
+        .filter(|tip| tip.branch().is_some());
+    let prior_dependency = earlier
+        .and_then(|data| {
+            serde_json::from_value::<core::GitBaseDependency>(data["upstream_dependency"].clone())
+                .ok()
+        })
+        .filter(core::GitBaseDependency::valid);
+    let mut dependency = snapshot.upstream_dependency.clone();
+    let base_deleted = if let (Some(old), Some(new)) = (&prior_dependency, &mut dependency)
+        && old.reference == new.reference
+        && old.base_oid == new.base_oid
+    {
+        new.verified |= old.verified;
+        old.verified && old.tip.is_some() && new.tip.is_none()
+    } else {
+        false
+    };
+    // Off, final and failed reads do not overwrite positive ref observations.
+    let refs = ObservedGitRefs {
+        upstream: snapshot.upstream.clone().or_else(|| prior_upstream.clone()),
+        dependency: dependency.or(prior_dependency),
+    };
     let mut dirty = snapshot.dirty.clone();
     dirty.sort_by(|a, b| {
         (&a.path, &a.status, &a.original_path).cmp(&(&b.path, &b.status, &b.original_path))
@@ -917,6 +1014,7 @@ fn compute_git_view(
         snapshot.complete,
         snapshot.base_complete,
         "",
+        &refs,
     ))?
     .iter()
     .map(|byte| format!("{byte:02x}"))
@@ -930,6 +1028,7 @@ fn compute_git_view(
         complete,
         base_complete,
         &view_digest,
+        &refs,
     );
     while encode_json(&data)?.len() > MAX_EVENT_BYTES {
         if !dirty.is_empty() {
@@ -951,30 +1050,9 @@ fn compute_git_view(
             complete,
             base_complete,
             &view_digest,
+            &refs,
         );
     }
-    let previous: Option<(String, i64)> = tx
-        .query_row(
-            "SELECT data,ts FROM events WHERE agent = ?1 AND generation = ?2
-             AND source = 'git' AND kind = 'git.changed' ORDER BY seq DESC LIMIT 1",
-            params![agent_num, generation],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .optional()
-        .map_err(sql_error)?;
-    if previous
-        .as_ref()
-        .is_some_and(|(_, observed_at)| *observed_at > snapshot.observed_at)
-    {
-        return Err(Error::new(
-            "bad_state",
-            "Git snapshot predates the committed Git view",
-        ));
-    }
-    let previous = previous
-        .as_ref()
-        .map(|(data, _)| decode_json(data))
-        .transpose()?;
     // Keep the exact committed OID in a generation-scoped ledger before
     // emitting its event. Event retention cannot erase this suppression, and
     // rewinding within the same generation does not redeliver an OID.
@@ -993,17 +1071,13 @@ fn compute_git_view(
             }
         }
     }
-    let upstream_moved = previous.as_ref().and_then(|previous| {
+    let upstream_moved = prior_upstream.as_ref().and_then(|old| {
         let upstream = snapshot.upstream.as_ref()?;
         let branch = snapshot.branch.as_ref()?;
-        let old: core::GitUpstreamTip =
-            serde_json::from_value(previous["upstream"].clone()).ok()?;
+        let head = snapshot.head.as_ref()?;
         if old.reference != upstream.reference
-            || old.oid == upstream.oid
-            || old.branch().is_none()
-            || previous["branch"].as_str() != Some(branch)
-            || previous["workspace"].as_str() != Some(snapshot.workspace.as_str())
-            || snapshot.head.as_deref() == Some(upstream.oid.as_str())
+            || (old.oid == upstream.oid && !base_deleted)
+            || head == &upstream.oid
         {
             return None;
         }
@@ -1011,7 +1085,9 @@ fn compute_git_view(
             workspace: snapshot.workspace.clone(),
             branch: branch.clone(),
             upstream: upstream.clone(),
-            previous_oid: old.oid,
+            previous_oid: old.oid.clone(),
+            head: head.clone(),
+            base_deleted: refs.dependency.clone().filter(|_| base_deleted),
         })
     });
     let changed = match previous {
@@ -1162,6 +1238,16 @@ fn git_path_key(workspace: &str, path: &str) -> String {
 
 fn validate_git_snapshot(snapshot: &GitSnapshot) -> Result<()> {
     require_nonempty(&snapshot.workspace, "Git workspace")?;
+    if snapshot
+        .upstream_dependency
+        .as_ref()
+        .is_some_and(|dependency| {
+            !dependency.valid()
+                || dependency.verified != (dependency.tip.as_ref() == Some(&dependency.base_oid))
+        })
+    {
+        return Err(Error::new("invalid", "invalid Git base branch observation"));
+    }
     if let Some(upstream) = &snapshot.upstream
         && (upstream.branch().is_none()
             || snapshot.branch.as_deref().is_none_or(|branch| {

@@ -684,10 +684,13 @@ silently disabling the configured HTTPS/SSH transport itself.
   `ls-remote` poll;
 - for controlled root managers on a topic branch, the sampler also reads the
   locally recorded `origin/HEAD` and its tip through the pinned Git directory.
-  It uses bounded loose or packed refs and starts no additional Git process.
-  First observation or a changed checkout, branch, or upstream ref establishes
-  a baseline. A changed tip on the same binding records `git.upstream_moved`.
-  The fact describes a local ref movement and carries no GitHub merge assertion.
+  It uses bounded loose or packed refs and starts no additional Git process
+  for sampling. A changed tip or observed deletion of a verified recorded
+  base branch emits `git.upstream_moved` for branch dependence checks. First
+  observation establishes a baseline. A missing observation during an
+  opt-out, final flush or read failure preserves the last verified refs.
+  The first sample of a new generation can reuse retained refs for the same
+  Agent and checkout.
 - slow status backs off and reports source health;
 - monitor never writes index, refs or objects.
 - an unchanged probe writes no Store rows: with no relevant native hints, Git events or

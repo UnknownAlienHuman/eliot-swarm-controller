@@ -16,7 +16,7 @@ pub(crate) struct BranchClassification {
     pub(crate) tip: String,
 }
 
-async fn prove_containment(
+pub(crate) async fn prove_containment(
     probe: &GitProbe,
     repo: &Path,
     tip: &str,

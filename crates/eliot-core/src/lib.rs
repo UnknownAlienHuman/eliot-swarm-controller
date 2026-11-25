@@ -389,6 +389,8 @@ pub struct GitSnapshot {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upstream: Option<GitUpstreamTip>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_dependency: Option<GitBaseDependency>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub work: Option<GitWorkProbe>,
 }
 
@@ -415,6 +417,29 @@ pub struct GitUpstreamMoved {
     pub branch: String,
     pub upstream: GitUpstreamTip,
     pub previous_oid: String,
+    pub head: String,
+    #[serde(default)]
+    pub base_deleted: Option<GitBaseDependency>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitBaseDependency {
+    pub reference: String,
+    pub base_oid: String,
+    pub tip: Option<String>,
+    #[serde(default)]
+    pub verified: bool,
+}
+
+impl GitBaseDependency {
+    pub fn valid(&self) -> bool {
+        self.reference.len() <= 256
+            && (self.reference.starts_with("refs/heads/")
+                || self.reference.starts_with("refs/remotes/"))
+            && api::valid_diff_path(&self.reference)
+            && api::is_git_oid(&self.base_oid)
+            && self.tip.as_deref().is_none_or(api::is_git_oid)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

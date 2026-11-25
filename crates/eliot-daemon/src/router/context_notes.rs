@@ -10,6 +10,105 @@ use sha2::{Digest, Sha256};
 use std::sync::atomic::Ordering;
 use tokio::sync::{broadcast, watch};
 
+fn matches_git_notice_binding(
+    store: &Store,
+    agent: &str,
+    generation: i64,
+    moved: &GitUpstreamMoved,
+) -> Result<bool> {
+    Ok(store.get_agent(agent)?.is_some_and(|current| {
+        current.generation == generation
+            && current.receives_git_base_notices()
+            && current.workspace.as_deref().is_some_and(|path| {
+                eliot_core::workspace_path_key(path)
+                    == eliot_core::workspace_path_key(&moved.workspace)
+            })
+    }))
+}
+
+fn git_notice_refs_current(
+    checkout: &crate::workspace_git::DiffCheckout,
+    moved: &GitUpstreamMoved,
+) -> bool {
+    checkout.on_branch(&moved.branch, &moved.head)
+        && checkout
+            .origin_default()
+            .is_ok_and(|tip| tip == moved.upstream)
+}
+
+async fn retired_git_base(
+    git: &crate::git_monitor::GitProbe,
+    checkout: &crate::workspace_git::DiffCheckout,
+    workspace: &eliot_core::WorkspacePreparation,
+    moved: &GitUpstreamMoved,
+    deadline: tokio::time::Instant,
+) -> Result<Option<String>> {
+    use crate::workspace_git::containment::prove_containment;
+    let binding = checkout.binding();
+    let base = workspace.base_oid.as_str();
+    if !eliot_core::api::is_git_oid(base) {
+        return Ok(None);
+    }
+    let ancestor = git
+        .workspace_command_bound(
+            &checkout.root.path,
+            &["merge-base", "--is-ancestor", base, &moved.head],
+            binding,
+            deadline,
+        )
+        .await?;
+    if ancestor.code != 0 {
+        return Ok(None);
+    }
+    if let Some(deleted) = moved.base_deleted.as_ref()
+        && deleted.valid()
+        && deleted.verified
+        && deleted.base_oid == base
+        && deleted.tip.is_none()
+        && let Some(reference) = workspace.base_ref.as_deref()
+        && checkout
+            .base_dependency(reference, base)
+            .is_some_and(|now| now.reference == deleted.reference && now.tip.is_none())
+    {
+        return Ok(Some(format!(
+            "Recorded base branch {} at {base} was deleted.",
+            deleted.reference
+        )));
+    }
+    if moved.previous_oid != moved.upstream.oid
+        && prove_containment(git, binding.common_dir, base, &moved.previous_oid, deadline)
+            .await
+            .is_err_and(|error| error.code == "content_not_at_tip")
+        && prove_containment(git, binding.common_dir, base, &moved.upstream.oid, deadline)
+            .await
+            .is_ok()
+    {
+        return Ok(Some(format!(
+            "Recorded base {} at {base} is now contained in upstream.",
+            workspace.base_ref.as_deref().unwrap_or("commit")
+        )));
+    }
+    Ok(None)
+}
+
+fn append_git_conflicts(text: &mut String, conflicts: &[String]) {
+    if !conflicts.is_empty() {
+        text.push_str("\nConflicting files from Git merge-tree:");
+        for (index, path) in conflicts.iter().enumerate() {
+            let path = json!(path).to_string();
+            if text.len() + path.len() > 24 * 1024 {
+                text.push_str(&format!(
+                    "\n{} additional conflicting files.",
+                    conflicts.len() - index
+                ));
+                break;
+            }
+            text.push_str("\n- ");
+            text.push_str(&path);
+        }
+    }
+}
+
 pub(crate) async fn run_context_notes(
     router: Router,
     mut shutdown: watch::Receiver<bool>,
@@ -50,7 +149,7 @@ pub(crate) async fn run_context_notes(
                     crate::logging::record(
                         &router.secret_policy_snapshot(),
                         "daemon.context_note_fact_failed",
-                        &[("seq", &event.seq.to_string()), ("kind", &event.kind)],
+                        &[("seq", &event.seq.to_string()), ("event_kind", &event.kind)],
                         Some(&error),
                     );
                 }
@@ -185,6 +284,7 @@ impl Router {
             ));
         };
         if !eliot_core::api::is_git_oid(&moved.previous_oid)
+            || !eliot_core::api::is_git_oid(&moved.head)
             || moved.branch.len() > 256
             || !eliot_core::api::valid_diff_path(&moved.branch)
         {
@@ -193,18 +293,87 @@ impl Router {
                 "invalid retained Git ref movement",
             ));
         }
+        let workspace = {
+            let store = self.inner.store.lock().await;
+            if !self.inner.monitoring.git_base_notice_config().enabled
+                || !matches_git_notice_binding(&store, agent, generation, &moved)?
+            {
+                return Ok(());
+            }
+            store.get_workspace(agent)?.filter(|workspace| {
+                workspace.requested_branch == moved.branch
+                    && eliot_core::workspace_path_key(&workspace.worktree_path)
+                        == eliot_core::workspace_path_key(&moved.workspace)
+            })
+        };
+        let checkout = crate::workspace_git::DiffCheckout::open(
+            &moved.workspace,
+            workspace
+                .as_ref()
+                .map(|workspace| workspace.repo_common_dir.as_str()),
+        )?;
+        if !git_notice_refs_current(&checkout, &moved) {
+            return Ok(());
+        }
+        let binding = checkout.binding();
+        let scope =
+            eliot_core::workspace_path_key(&binding.common_dir.to_string_lossy()).into_owned();
+        let key = eliot_core::api::inference::sha256_hex(
+            &serde_json::to_vec(&[scope.as_str(), &moved.branch, &moved.upstream.oid])
+                .map_err(|_| Error::new("internal", "Git notice identity could not be encoded"))?,
+        );
+        let thread = format!("git-base:{key}");
+        if self
+            .inner
+            .store
+            .lock()
+            .await
+            .git_base_notice_sent(&thread)?
+        {
+            return Ok(());
+        }
+        let git = crate::git_monitor::GitProbe::new()?;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(12);
+        let base = match workspace.as_ref() {
+            Some(workspace) => {
+                retired_git_base(&git, &checkout, workspace, &moved, deadline).await?
+            }
+            None => None,
+        };
+        let conflicts = if moved.previous_oid != moved.upstream.oid {
+            match crate::git_actions::preview_conflicting_paths(
+                &self.inner.data_root,
+                &git,
+                binding.common_dir,
+                &moved.upstream.oid,
+                &moved.head,
+                deadline,
+            )
+            .await
+            {
+                Ok(paths) => paths,
+                Err(_) if base.is_some() => Vec::new(),
+                Err(error) => return Err(error),
+            }
+        } else {
+            Vec::new()
+        };
+        if base.is_none() && conflicts.is_empty() {
+            return Ok(());
+        }
+        let rechecked = crate::workspace_git::DiffCheckout::open(
+            &moved.workspace,
+            binding.common_dir.to_str(),
+        )?;
+        if !checkout.same_identity(&rechecked) || !git_notice_refs_current(&rechecked, &moved) {
+            return Ok(());
+        }
         let mut store = self.inner.store.lock().await;
         let config = self.inner.monitoring.git_base_notice_config();
         if !config.enabled
             || self.inner.mode.load(Ordering::SeqCst) != MODE_OPEN
-            || !store.get_agent(agent)?.is_some_and(|current| {
-                current.generation == generation
-                    && current.receives_git_base_notices()
-                    && current.workspace.as_deref().is_some_and(|path| {
-                        eliot_core::workspace_path_key(path)
-                            == eliot_core::workspace_path_key(&moved.workspace)
-                    })
-            })
+            || !matches_git_notice_binding(&store, agent, generation, &moved)?
+            || store.git_base_notice_sent(&thread)?
         {
             return Ok(());
         }
@@ -218,20 +387,25 @@ impl Router {
             u64::try_from(event.ts).unwrap_or(0),
             u128::from_be_bytes(entropy),
         );
-        let text = format!(
-            "Your checkout was on {} when the locally observed origin/{} moved from {} to {}. Inspect the new base before deciding whether to rebase.",
-            moved.branch, upstream_branch, moved.previous_oid, moved.upstream.oid
+        let mut text = format!(
+            "Branch {} against origin/{} at {}.",
+            moved.branch, upstream_branch, moved.upstream.oid
         );
+        if let Some(base) = base {
+            text.push_str(&format!("\n{base} Verify the dependency before rebasing. The recorded base may be the --onto cutoff."));
+        }
+        append_git_conflicts(&mut text, &conflicts);
         let request = MailSendRequest {
             id: id.to_string(),
             to: vec![agent.to_owned()],
             mode: MailMode::Queue,
-            wake: config.wake,
+            wake: config.wake
+                && (!conflicts.is_empty() || store.git_base_has_queued_input(agent, generation)?),
             text: eliot_core::swarm_note(
                 &self.secret_policy_snapshot().redact_text(&text),
                 SWARM_MAIL_SENDER,
             ),
-            thread: Some("git-base".to_owned()),
+            thread: Some(thread),
             reply_to_delivery: None,
         };
         request.validate()?;
