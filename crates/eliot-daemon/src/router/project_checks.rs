@@ -1123,53 +1123,17 @@ async fn check_after_edit(
     let mut passed = None;
     let mut check_changed_worktree = false;
     if !work.config.format.is_empty() {
-        let dispatch_fingerprint = match work_fingerprint(&work.workspace).await {
-            Ok(fingerprint) => fingerprint,
-            Err(_) => {
-                settle_project_check_obligations(router, &edit.review, "refused").await;
-                return CheckDisposition {
-                    uncertain: false,
-                    fingerprint: None,
-                    passed: None,
-                };
-            }
-        };
-        if dispatch_fingerprint != before {
-            for event in &edit.review {
-                record_worktree_check_outcome(
-                    router,
-                    key,
-                    event,
-                    &work.config.id,
-                    Some(&dispatch_fingerprint),
-                )
-                .await;
-            }
-            settle_project_check_obligations(router, &edit.review, "stale").await;
-            return CheckDisposition {
-                uncertain: false,
-                fingerprint: Some(dispatch_fingerprint),
-                passed: None,
-            };
-        }
-        if router
-            .inner
-            .store
-            .lock()
-            .await
-            .project_check_unknown_blocks_fingerprint(
-                &key.agent,
-                key.generation,
-                &dispatch_fingerprint,
-            )
-            .unwrap_or(true)
+        if let Err(disposition) = pre_dispatch_fingerprint(
+            router,
+            key,
+            &edit.review,
+            &work.config.id,
+            &work.workspace,
+            &before,
+        )
+        .await
         {
-            settle_project_check_obligations(router, &edit.review, "unknown").await;
-            return CheckDisposition {
-                uncertain: true,
-                fingerprint: Some(dispatch_fingerprint),
-                passed: None,
-            };
+            return disposition;
         }
         match run_argv(
             &work.config.format,
@@ -1234,54 +1198,19 @@ async fn check_after_edit(
                 passed: None,
             };
         };
-        let dispatch_fingerprint = match work_fingerprint(&work.workspace).await {
-            Ok(fingerprint) => fingerprint,
-            Err(_) => {
-                settle_project_check_obligations(router, &edit.review, "refused").await;
-                return CheckDisposition {
-                    uncertain: false,
-                    fingerprint: None,
-                    passed: None,
-                };
-            }
-        };
-        if before_check != dispatch_fingerprint {
-            for event in &edit.review {
-                record_worktree_check_outcome(
-                    router,
-                    key,
-                    event,
-                    &work.config.id,
-                    Some(&dispatch_fingerprint),
-                )
-                .await;
-            }
-            settle_project_check_obligations(router, &edit.review, "stale").await;
-            return CheckDisposition {
-                uncertain: false,
-                fingerprint: Some(dispatch_fingerprint),
-                passed: None,
-            };
-        }
-        if router
-            .inner
-            .store
-            .lock()
-            .await
-            .project_check_unknown_blocks_fingerprint(
-                &key.agent,
-                key.generation,
-                &dispatch_fingerprint,
-            )
-            .unwrap_or(true)
+        let dispatch_fingerprint = match pre_dispatch_fingerprint(
+            router,
+            key,
+            &edit.review,
+            &work.config.id,
+            &work.workspace,
+            &before_check,
+        )
+        .await
         {
-            settle_project_check_obligations(router, &edit.review, "unknown").await;
-            return CheckDisposition {
-                uncertain: true,
-                fingerprint: Some(dispatch_fingerprint),
-                passed: None,
-            };
-        }
+            Ok(fingerprint) => fingerprint,
+            Err(disposition) => return disposition,
+        };
         match run_argv(
             &check.argv,
             check.cwd.as_deref().unwrap_or(&work.workspace),
@@ -1392,6 +1321,55 @@ async fn check_after_edit(
         fingerprint: checked_fingerprint,
         passed,
     }
+}
+
+async fn pre_dispatch_fingerprint(
+    router: &Router,
+    key: &WorkKey,
+    review: &[Event],
+    project: &str,
+    workspace: &str,
+    expected: &str,
+) -> std::result::Result<String, CheckDisposition> {
+    let dispatch_fingerprint = match work_fingerprint(workspace).await {
+        Ok(fingerprint) => fingerprint,
+        Err(_) => {
+            settle_project_check_obligations(router, review, "refused").await;
+            return Err(CheckDisposition {
+                uncertain: false,
+                fingerprint: None,
+                passed: None,
+            });
+        }
+    };
+    if dispatch_fingerprint.as_str() != expected {
+        for event in review {
+            record_worktree_check_outcome(router, key, event, project, Some(&dispatch_fingerprint))
+                .await;
+        }
+        settle_project_check_obligations(router, review, "stale").await;
+        return Err(CheckDisposition {
+            uncertain: false,
+            fingerprint: Some(dispatch_fingerprint),
+            passed: None,
+        });
+    }
+    if router
+        .inner
+        .store
+        .lock()
+        .await
+        .project_check_unknown_blocks_fingerprint(&key.agent, key.generation, &dispatch_fingerprint)
+        .unwrap_or(true)
+    {
+        settle_project_check_obligations(router, review, "unknown").await;
+        return Err(CheckDisposition {
+            uncertain: true,
+            fingerprint: Some(dispatch_fingerprint),
+            passed: None,
+        });
+    }
+    Ok(dispatch_fingerprint)
 }
 
 async fn work_fingerprint(workspace: &str) -> Result<String> {
