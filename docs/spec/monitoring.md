@@ -479,6 +479,7 @@ direct `git switch` or `git checkout` with a literal branch operand, including
 `cd <directory> &&` and a Git-global `-C <directory>` against the shell's native
 working directory before comparing the checkout path. The two Claude tool hooks
 must agree on the shell session directory for that exact foreground invocation.
+OpenCode uses the native shell working directory and a verified local zero exit.
 Paths requiring shell expansion, alias resolution, or parent traversal fall
 outside this attribution grammar.
 The latest HEAD checkout reflog entry
