@@ -581,6 +581,9 @@ struct FileConfig {
 struct OwnerRulesConfig {
     #[serde(default)]
     text: String,
+    /// Use the built-in local delivery rule when no custom text is set.
+    #[serde(default)]
+    default_commit_only: Option<bool>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]

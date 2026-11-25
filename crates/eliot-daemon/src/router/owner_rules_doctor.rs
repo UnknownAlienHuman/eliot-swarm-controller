@@ -16,7 +16,7 @@ const UTF8_BOM: &[u8] = b"\xef\xbb\xbf";
 const MAX_INSTRUCTION_FILE_BYTES: u64 = (MAX_OWNER_RULES_BYTES * 3 + UTF8_BOM.len()) as u64;
 
 pub(super) fn check(data_root: &Path) -> Result<Vec<OwnerRulesGlobalFile>> {
-    let Some((_, rules)) = crate::config::settings::owner_rules_snapshot(data_root)? else {
+    let Some(rules) = crate::config::settings::configured_owner_rules_text(data_root)? else {
         return Ok(Vec::new());
     };
     let home = absolute_env_path(if cfg!(windows) { "USERPROFILE" } else { "HOME" });
