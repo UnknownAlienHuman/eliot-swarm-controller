@@ -1204,7 +1204,11 @@ impl Store {
                     permission_refusal: None,
                     native_wake_cancel,
                 };
-                return Ok(BatchCommit { ack, events });
+                return Ok(BatchCommit {
+                    ack,
+                    events,
+                    replayed: true,
+                });
             }
             return Err(Error::new(
                 "source_integrity",
@@ -1588,6 +1592,7 @@ impl Store {
                 native_wake_cancel,
             },
             events: committed_events,
+            replayed: false,
         })
     }
 }

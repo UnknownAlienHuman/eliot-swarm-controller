@@ -486,6 +486,8 @@ pub enum WorkspaceGitReservation {
 #[derive(Clone, Debug, PartialEq)]
 pub struct BatchCommit {
     pub ack: BatchAck,
+    /// The input matched the last retained source receipt.
+    pub replayed: bool,
     pub events: Vec<Event>,
 }
 
