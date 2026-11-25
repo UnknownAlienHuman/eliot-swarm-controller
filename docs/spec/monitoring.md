@@ -1610,8 +1610,9 @@ log lines and resets on daemon restart.
 
 Intentional waits stay outside both the method windows and the slowest-call
 list. This includes `swarm.wait`, `events.subscribe`, `inject.wait`, and
-`mail.inbox` or `child.run` calls that request a positive wait. Ordinary
-`events.read` and `events.bounds` remain measured.
+`mail.inbox` with a positive wait and `child.run` with a positive effective
+wait, including continuations that use the default. Ordinary `events.read`
+and `events.bounds` remain measured.
 
 ## Swarm autonomy
 

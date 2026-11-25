@@ -1085,7 +1085,15 @@ impl Router {
         let method = discovery::canonical_method(&request.method)?;
         match method {
             "swarm.wait" | "events.subscribe" | "inject.wait" => None,
-            "mail.inbox" | "child.run"
+            "child.run"
+                if <eliot_core::api::ChildRunRequest as serde::Deserialize>::deserialize(
+                    &request.params["_payload"],
+                )
+                .is_ok_and(|request| request.effective_wait_ms() > 0) =>
+            {
+                None
+            }
+            "mail.inbox"
                 if request.params["_payload"]["wait_ms"]
                     .as_u64()
                     .is_some_and(|wait| wait > 0) =>
