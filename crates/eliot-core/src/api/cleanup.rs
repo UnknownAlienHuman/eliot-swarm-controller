@@ -43,6 +43,7 @@ impl ArtifactCapacityView {
     }
 }
 pub const SWARM_STAND_ARTIFACT_PURPOSE: &str = "Swarm private stand";
+pub const SWARM_CARGO_TARGET_ARTIFACT_PURPOSE: &str = "Swarm regenerable Cargo target";
 pub const MAX_ARTIFACT_TTL_MS: i64 = 30 * 24 * 60 * 60 * 1000;
 pub const DEFAULT_STAND_TTL_MS: i64 = 24 * 60 * 60 * 1000;
 
@@ -99,6 +100,26 @@ pub struct ArtifactView {
     pub state: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub git: Option<CleanupGitBinding>,
+}
+
+impl ArtifactView {
+    /// Directory classes discovered under an exact generation's owned root.
+    pub fn is_owned_cleanup_child(&self) -> bool {
+        (self.kind == ArtifactKind::Build && self.purpose == SWARM_CARGO_TARGET_ARTIFACT_PURPOSE)
+            || (self.kind == ArtifactKind::DataDir && self.purpose == SWARM_STAND_ARTIFACT_PURPOSE)
+    }
+
+    pub fn cleanup_byte_class(&self) -> &'static str {
+        match self.kind {
+            ArtifactKind::Build => "build_targets",
+            ArtifactKind::Worktree => "worktrees",
+            ArtifactKind::DataDir if self.purpose == SWARM_STAND_ARTIFACT_PURPOSE => "qa_stands",
+            ArtifactKind::DataDir => "data_dirs",
+            ArtifactKind::Temp => "temp",
+            ArtifactKind::Other if self.purpose == "Swarm chat directory" => "chats",
+            _ => "other",
+        }
+    }
 }
 
 #[derive(schemars::JsonSchema, Clone, Debug, Serialize, Deserialize)]
@@ -214,6 +235,10 @@ pub struct PlanContinuation {
     /// of returning the same empty page and token.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backfill_after: Option<String>,
+    /// Owned-root discovery sequence. Zero marks completion before the
+    /// ordinary Agent backfill freezes the inventory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owned_backfill_after: Option<i64>,
     /// Rank and ledger sequence reached by the bounded Store inventory scan.
     /// This advances through empty/filtered pages without changing the
     /// displayed-artifact cursor above.
@@ -293,6 +318,7 @@ impl PlanContinuation {
                 .as_deref()
                 .is_some_and(|id| crate::parse_agent_id(id).is_err())
             || self.snapshot_seq.is_some_and(|seq| seq < 0)
+            || self.owned_backfill_after.is_some_and(|seq| seq < 0)
             || self.inventory_rank.is_some_and(|rank| rank > 3)
             || (self.inventory_rank.is_none() && self.inventory_seq_after.is_some())
             || self.inventory_seq_after.is_some_and(|seq| seq <= 0)

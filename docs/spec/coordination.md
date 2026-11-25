@@ -158,9 +158,17 @@ resume at admission and dispatch. Windows
 pins ancestors, opens the entire bounded tree through relative handles without
 delete sharing for every directory and file until disposition/close, refuses
 reparse points and deletes by handle disposition. A scan is bounded to 262,144
-entries and by its deadline. Any file whose link count is
-not exactly one keeps the entire tree with `hard_link`, including Cargo targets
-with shared binaries. Guarded scans at both plan and apply refuse repository
+entries and by its deadline. Most artifacts require one link per file. For an
+identity-bound Cargo target, Windows enumerates every name of a multiply linked
+file and pins each only if it is inside that target. A link outside the target
+keeps the entire cache with `external_hard_link`. An unverified enumeration
+also keeps it. The primary handle denies data access through all names and
+the alias handles deny rename and deletion at their respective names. Any
+conflicting open keeps the entire target with `busy`. Counts are checked again
+before alias removal, and bytes are counted once per underlying file.
+For owned trees, Windows ignores a regular file's read-only
+attribute only at disposition on its pinned handle. Guarded scans at both plan
+and apply refuse repository
 roots (including bare repositories), every `.git` entry, and native/user config
 descendants. Only a clean, retained Swarm worktree may include its exact
 reciprocal `.git` pointer, verified by opened identity; nested repositories stay
@@ -302,11 +310,33 @@ sweep of each daemon startup. Each completed paged
 sweep updates aggregate status and sends one Owner `notify` with would-remove and
 kept totals and enablement; intermediate pages do not send notices. Per-item
 `cleanup.automatic` reason events remain available.
+The completed status sweep includes known would-remove, removed and kept
+bytes by class, plus a count of unmeasured entries in each class.
 Eligible paths include managed worktrees, recorded per-generation plugin directories,
 and artifacts under exact Swarm-created generation roots, including archived terminal
 Agents. Automatic worktree removal requires a clean checkout and a local Git ancestry
 proof that the current base contains the branch. Dirty or unmerged worktrees are
 kept with their sizes for the Owner. Disjoint owned artifacts can age out independently.
+Manual and automatic plans discover candidates before freezing the inventory.
+Discovery looks for Cargo targets up to three levels below durable owned
+artifact roots, without crossing repository or stand boundaries. A Cargo lock
+and build layout plus a cache signature or Rust metadata identify the cache.
+The durable root identifies the producer. Stock Cargo markers and a directory
+name alone confer no Agent ownership. The configured retention age does not
+apply to these targets. An explicit registration expiry still holds.
+A private stand must be a direct child with matching registry, identity,
+issuer and expiry. Stands, worktrees and other artifacts retain their age gates.
+After explicit automatic-cleanup enablement and the startup preview, committed
+Agent termination or custody release schedules a bounded cache-only pass
+through the same guarded plan and apply lane. The periodic sweep covers missed
+events and held candidates. A completed turn leaves the live Agent's cache intact.
+Historical roots remain eligible after the Agent has ended and all its
+generations' custody and outcomes have settled. A running or unknown Goal
+round keeps the cache because a Goal checker can hold the artifact root
+independently of the Agent process. Stand cleanup also checks the
+stand's own custody and retains internal managed worktrees pending guarded removal.
+Automatic stand removal also requires an untouched scratch repository and
+fresh merge proof for external worktrees before their guarded removal.
 A generation root can be
 removed when its creation identity is still bound, its registered descendants are
 settled, and the guarded scan of its contents succeeds. Branches, project registrations

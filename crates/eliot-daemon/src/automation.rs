@@ -1220,6 +1220,7 @@ async fn run_global_rules_inner(
     let mut reconcile = tokio::time::interval(RULE_RECONCILE_INTERVAL);
     reconcile.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut cleanup_after = None;
+    let mut terminal_cargo = std::collections::BTreeSet::new();
     let mut last_cleanup_at: Option<std::time::Instant> = None;
     let mut cleanup_enabled = false;
     let mut notices = initial_notices;
@@ -1403,6 +1404,13 @@ async fn run_global_rules_inner(
                     if event_wakes_launch_arbitration(&event) {
                         arbitrate_launches = true;
                     }
+                    if cleanup_enabled && terminal_cargo.len() < 64
+                        && matches!(event.kind.as_str(),
+                            "agent.stopped" | "agent.failed" | "agent.archived" | "capacity.released")
+                        && let (Some(agent), Some(generation)) = (event.agent, event.generation)
+                    {
+                        terminal_cargo.insert((agent, generation));
+                    }
                 }
                 Err(broadcast::error::RecvError::Lagged(_)) => {
                     router.clear_terminal_unknown_cache().await;
@@ -1490,6 +1498,19 @@ async fn run_global_rules_inner(
                 }
             }
         }
+        if !cleanup_requested
+            && cleanup_task.is_none()
+            && let Some((agent, generation)) = terminal_cargo.pop_first()
+        {
+            let cleanup_router = router.clone();
+            let after = cleanup_after.take();
+            *cleanup_task = Some(tokio::spawn(async move {
+                cleanup_router
+                    .release_terminal_cargo_targets(&agent, generation)
+                    .await;
+                after
+            }));
+        }
         if !reload_requested {
             continue;
         }
@@ -1499,6 +1520,7 @@ async fn run_global_rules_inner(
                 max_event_backlog = config.max_event_backlog;
                 cleanup_enabled = config.auto_cleanup != Some(false);
                 if !cleanup_enabled {
+                    terminal_cargo.clear();
                     cleanup_after = None;
                     last_cleanup_at = None;
                 } else if cleanup_requested
@@ -1528,6 +1550,7 @@ async fn run_global_rules_inner(
             }
             Err(error) => {
                 cleanup_enabled = false;
+                terminal_cargo.clear();
                 cleanup_after = None;
                 last_cleanup_at = None;
                 let log_ids = [

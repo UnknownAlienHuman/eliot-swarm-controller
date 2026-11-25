@@ -353,6 +353,18 @@ pub(crate) async fn run_status(data_dir: PathBuf, json_output: bool) -> Result<u
         if let Some(line) = cleanup_line {
             println!("{line}");
         }
+        if let Some(sweep) = response
+            .automatic_cleanup
+            .as_ref()
+            .and_then(|view| view.last_sweep.as_ref())
+        {
+            for (class, bytes) in &sweep.bytes_by_class {
+                println!(
+                    "  {class} | would remove {} bytes, removed {} bytes, kept {} bytes, {} unmeasured",
+                    bytes.would_remove, bytes.removed, bytes.kept, bytes.unmeasured,
+                );
+            }
+        }
         if let Some(line) = disk_usage_line {
             println!("{line}");
         }

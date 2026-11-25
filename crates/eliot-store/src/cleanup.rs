@@ -322,14 +322,101 @@ impl Store {
             .map_err(sql_error)?;
         Ok(count == 1)
     }
-    /// Derive ownership only from an exact retained generation and its frozen
-    /// workspace/profile. Never imports an unregistered filesystem inventory.
+    /// Page exact daemon-owned roots of ended Agents, including past generations.
+    pub fn cleanup_owned_roots_page(&self, after: i64) -> Result<Vec<(i64, ArtifactView)>> {
+        const PAGE: i64 = 64;
+        self.ensure_committed_reads()?;
+        let mut statement = self
+            .connection
+            .prepare_cached(
+                "SELECT ar.seq,ar.body FROM artifacts ar JOIN agents a ON a.id=ar.agent
+             WHERE ar.seq>?1 AND a.capacity_generation IS NULL
+               AND (a.state IN ('stopped','failed') OR (a.archived=1 AND a.state IN ('idle','lost')))
+               AND json_extract(ar.body,'$.state')='ownership_root'
+               AND json_extract(ar.body,'$.purpose')='Swarm artifact root'
+             ORDER BY ar.seq LIMIT ?2",
+            )
+            .map_err(sql_error)?;
+        let rows = statement
+            .query_map(params![after, PAGE], |r| {
+                Ok((r.get(0)?, r.get::<_, String>(1)?))
+            })
+            .map_err(sql_error)?;
+        rows.map(|row| {
+            let (seq, body) = row.map_err(sql_error)?;
+            Ok((
+                seq,
+                serde_json::from_str(&body)
+                    .map_err(|_| Error::new("source_integrity", "invalid owned artifact root"))?,
+            ))
+        })
+        .collect()
+    }
+
+    fn contains_owned_cleanup_child(&self, artifact: &ArtifactView) -> Result<bool> {
+        if !artifact.is_owned_cleanup_child() {
+            return Ok(false);
+        }
+        let Some(root) = self.agent_artifact_root(&artifact.agent, artifact.generation)? else {
+            return Ok(false);
+        };
+        let root = cleanup_path(&root.path);
+        let path = cleanup_path(&artifact.path);
+        Ok(path != root && path.starts_with(&root))
+    }
+
+    /// Reclassify an existing exact build registration without changing its
+    /// owner, identity, expiry or plan binding.
+    pub fn recognize_registered_cargo_target(
+        &mut self,
+        existing: &ArtifactView,
+        discovered: &ArtifactView,
+    ) -> Result<()> {
+        if discovered.kind != ArtifactKind::Build
+            || discovered.purpose != core::api::SWARM_CARGO_TARGET_ARTIFACT_PURPOSE
+            || existing.kind != ArtifactKind::Build
+            || existing.state != "registered"
+            || existing.purpose == discovered.purpose
+            || existing.agent != discovered.agent
+            || existing.generation != discovered.generation
+            || existing.path != discovered.path
+            || existing.identity != discovered.identity
+            || !self.contains_owned_cleanup_child(discovered)?
+        {
+            return Ok(());
+        }
+        self.ensure_writer_healthy()?;
+        let mut updated = existing.clone();
+        updated.purpose.clone_from(&discovered.purpose);
+        let result = self
+            .connection
+            .execute(
+                "UPDATE artifacts SET body=?1 WHERE id=?2 AND path=?3
+                 AND json_extract(body,'$.state')='registered'
+                 AND json_extract(body,'$.identity')=?4",
+                params![
+                    encode_json(&updated)?,
+                    existing.id,
+                    existing.path,
+                    existing.identity
+                ],
+            )
+            .map_err(sql_error);
+        self.fault_on_persistence_error(&result);
+        result.map(|_| ())
+    }
+
+    /// Derive ownership from the retained generation's frozen workspace or
+    /// profile, or from a recognized child of its exact durable artifact root.
     pub fn record_known_artifact(&mut self, mut artifact: ArtifactView) -> Result<()> {
         self.ensure_writer_healthy()?;
         let agent = self
             .get_agent(&artifact.agent)?
             .ok_or_else(|| Error::new("not_found", "artifact Agent absent"))?;
-        if agent.generation != artifact.generation {
+        if artifact.generation > agent.generation
+            || (agent.generation != artifact.generation
+                && !self.contains_owned_cleanup_child(&artifact)?)
+        {
             return Err(Error::new(
                 "stale_generation",
                 "automatic artifact generation changed",
@@ -780,18 +867,38 @@ impl Store {
     /// project-wide prefix the way the shared inventory page could be.
     /// Unknown attempt fences are untouched: this only selects rows.
     pub fn cleanup_retirement_inventory(&self, agent: &Agent) -> Result<(Vec<ArtifactView>, bool)> {
+        self.cleanup_terminal_inventory(agent, false)
+    }
+
+    pub fn cleanup_terminal_cargo_targets(&self, agent: &Agent) -> Result<Vec<ArtifactView>> {
+        self.cleanup_terminal_inventory(agent, true)
+            .map(|(items, _)| items)
+    }
+
+    fn cleanup_terminal_inventory(
+        &self,
+        agent: &Agent,
+        cargo_only: bool,
+    ) -> Result<(Vec<ArtifactView>, bool)> {
         let mut statement = self
             .connection
             .prepare(
                 "SELECT body FROM artifacts WHERE agent = ?1 AND generation = ?2
                  AND json_extract(body, '$.state') = 'registered'
                  AND json_extract(body, '$.kind') IN ('build', 'temp', 'worktree')
+                 AND (NOT ?3 OR (json_extract(body, '$.kind') = 'build'
+                      AND json_extract(body, '$.purpose') = ?4))
                  ORDER BY seq ASC LIMIT 65",
             )
             .map_err(sql_error)?;
         let rows = statement
             .query_map(
-                params![parse_agent_id(&agent.id)?, agent.generation],
+                params![
+                    parse_agent_id(&agent.id)?,
+                    agent.generation,
+                    cargo_only,
+                    core::api::SWARM_CARGO_TARGET_ARTIFACT_PURPOSE
+                ],
                 |row| row.get::<_, String>(0),
             )
             .map_err(sql_error)?;
@@ -1425,7 +1532,8 @@ impl Store {
                     response.items[index].reason = Some("prior_cleanup_attempt".to_owned());
                     continue;
                 }
-                if item.artifact.state == "ownership_root"
+                if (item.artifact.state == "ownership_root"
+                    || item.artifact.is_owned_cleanup_child())
                     && cleanup_root_has_descendants(&tx, &item.artifact)?
                 {
                     response.items[index].outcome = "skipped".to_owned();
@@ -1490,10 +1598,39 @@ impl Store {
             return Ok(false);
         };
         let probe = agent.is_automatic_provider_probe();
-        if agent.generation != artifact.generation
-            || !(cleanup_terminal(agent.state) || (probe && agent.state == AgentState::Lost))
+        let owned_child = self.contains_owned_cleanup_child(artifact)?;
+        let archived_idle_cargo = owned_child
+            && agent.archived
+            && agent.state == AgentState::Idle
+            && artifact.kind == ArtifactKind::Build;
+        if artifact.generation > agent.generation
+            || (agent.generation != artifact.generation && !owned_child)
+            || !(cleanup_terminal(agent.state)
+                || archived_idle_cargo
+                || ((probe || (owned_child && agent.archived)) && agent.state == AgentState::Lost))
         {
             return Ok(false);
+        }
+        let agent_num = parse_agent_id(&agent.id)?;
+        if owned_child {
+            let held: bool = self
+                .connection
+                .query_row(
+                    "SELECT capacity_generation IS NOT NULL OR EXISTS (
+                   SELECT 1 FROM processes INDEXED BY processes_live_owner
+                   WHERE state IN ('running','unknown') AND
+                     (owner GLOB 'agent:a'||?1||'#*' OR owner GLOB 'workspace:a'||?1||'#*')
+                 ) OR EXISTS (
+                    SELECT 1 FROM goal_markers WHERE agent=?1 AND state IN ('running','unknown')
+                 )
+                 FROM agents WHERE id=?1",
+                    [agent_num],
+                    |r| r.get(0),
+                )
+                .map_err(sql_error)?;
+            if held || has_unknown_gate(&self.connection, agent_num)? {
+                return Ok(false);
+            }
         }
         if artifact.purpose == "Swarm chat directory" {
             let Some(workspace) = agent.workspace.as_deref() else {
@@ -1511,6 +1648,23 @@ impl Store {
             params![parse_agent_id(&agent.id)?,probe], |r|r.get(0)).map_err(sql_error)?;
         let live_process: bool = self.connection.query_row("SELECT EXISTS(SELECT 1 FROM processes WHERE owner IN (?1,?2) AND state != 'exited')",params![format!("agent:{}#{}",agent.id,agent.generation),format!("workspace:{}#{}",agent.id,agent.generation)],|r|r.get(0)).map_err(sql_error)?;
         Ok(!sources && !pending && !live_process)
+    }
+
+    /// An offline writable stand must also have settled its internal custody.
+    /// A read-only snapshot stand has no owned processes of its own.
+    pub fn stand_has_unsettled_cleanup_work(&self) -> Result<bool> {
+        self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM processes WHERE state IN ('running','unknown'))
+              OR EXISTS(SELECT 1 FROM agents WHERE capacity_generation IS NOT NULL)
+              OR EXISTS(SELECT 1 FROM source_state WHERE state='open'
+                       AND source NOT IN ('daemon','os','git','workspace_process'))
+              OR EXISTS(SELECT 1 FROM commands WHERE state IN ('accepted','queued','dispatched','unknown'))
+              OR EXISTS(SELECT 1 FROM turns WHERE state IN ('running','unknown'))
+              OR EXISTS(SELECT 1 FROM goal_markers)
+              OR EXISTS(SELECT 1 FROM artifacts WHERE json_extract(body,'$.state')='unknown')
+              OR EXISTS(SELECT 1 FROM workspaces WHERE phase='unknown')",
+            [], |r|r.get(0),
+        ).map_err(sql_error)
     }
 
     pub fn settle_project_cleanup(
@@ -1632,7 +1786,13 @@ fn same_known_custody(existing: &ArtifactView, artifact: &ArtifactView) -> bool 
         && existing.generation == artifact.generation
         && existing.path == artifact.path
         && existing.kind == artifact.kind
-        && existing.purpose == artifact.purpose
+        && (existing.purpose == artifact.purpose
+            || (existing.purpose == core::api::SWARM_CARGO_TARGET_ARTIFACT_PURPOSE
+                && artifact.kind == ArtifactKind::Build
+                && matches!(
+                    artifact.purpose.as_str(),
+                    "frozen CARGO_TARGET_DIR" | "frozen profile scratch"
+                )))
         && existing.identity == artifact.identity
 }
 
@@ -1954,7 +2114,23 @@ pub(super) fn require_manager_cleanup_dispatch(
 }
 
 pub(super) fn require_no_cleanup_attempt(connection: &Connection, agent: &Agent) -> Result<()> {
-    let pending: bool = connection.query_row("SELECT EXISTS(SELECT 1 FROM artifacts WHERE agent=?1 AND generation=?2 AND (json_extract(body,'$.state')='unknown' OR (json_extract(body,'$.kind')='native_session' AND json_extract(body,'$.state')='removed')))",params![parse_agent_id(&agent.id)?,agent.generation],|r|r.get(0)).map_err(sql_error)?;
+    let pending: bool = connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM artifacts WHERE agent=?1 AND
+             ((json_extract(body,'$.state')='unknown' AND (generation=?2
+                OR (json_extract(body,'$.kind')='build' AND json_extract(body,'$.purpose')=?3)
+                OR (json_extract(body,'$.kind')='data_dir' AND json_extract(body,'$.purpose')=?4)))
+               OR (generation=?2 AND json_extract(body,'$.kind')='native_session'
+                   AND json_extract(body,'$.state')='removed')))",
+            params![
+                parse_agent_id(&agent.id)?,
+                agent.generation,
+                core::api::SWARM_CARGO_TARGET_ARTIFACT_PURPOSE,
+                core::api::SWARM_STAND_ARTIFACT_PURPOSE
+            ],
+            |r| r.get(0),
+        )
+        .map_err(sql_error)?;
     if pending {
         return Err(Error::new(
             "bad_state",
