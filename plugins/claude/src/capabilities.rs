@@ -39,6 +39,7 @@ pub fn declaration() -> HarnessCapabilities {
         }),
         native_route: NativeRoute::FixedCredential("claude-cli-oauth"),
         profile: ProfileCapabilities {
+            owner_subscription_reserve: true,
             read_only_markers: &[("permission_mode", "plan")],
             named_profile: Some(crate::profile_config::MAPPING),
             launch_model_scope: eliot_core::api::harness::LaunchModelScope::FixedRoute,

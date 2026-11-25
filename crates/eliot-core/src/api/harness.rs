@@ -355,6 +355,8 @@ pub struct ViewProjectionRecovery {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ProfileCapabilities {
     pub environment: ProfileEnvironment,
+    /// The adapter's subscription is designated for the Owner's automatic-launch reserve.
+    pub owner_subscription_reserve: bool,
     pub named_profile: Option<super::native_profile::NativeProfileMapping>,
     pub read_only_markers: &'static [(&'static str, &'static str)],
     pub route_selectors_resolved: bool,

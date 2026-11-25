@@ -30,13 +30,18 @@ impl LaunchRouting<'_> {
 struct QuotaPolicy {
     reserve: u8,
     hold_unknown: bool,
+    ranks_routes: bool,
 }
 
 impl QuotaPolicy {
     fn from_snapshot(snapshot: &Value) -> Self {
+        let reserve = profile_quota_reserve_percent(snapshot);
+        let hold_unknown = profile_quota_unknown_policy(snapshot) == QuotaUnknownPolicy::Hold;
         Self {
-            reserve: profile_quota_reserve_percent(snapshot),
-            hold_unknown: profile_quota_unknown_policy(snapshot) == QuotaUnknownPolicy::Hold,
+            reserve,
+            hold_unknown,
+            ranks_routes: hold_unknown
+                || (reserve > 0 && snapshot[crate::config::DEFAULTED_QUOTA_RESERVE_FIELD] != true),
         }
     }
 
@@ -184,6 +189,12 @@ impl RoutePreflight {
 
     fn check_candidate_holds(&self) -> bool {
         !self.arbitrated || self.automatic
+    }
+
+    fn has_explicit_quota_policy(&self) -> bool {
+        self.quota_policies
+            .values()
+            .any(|policy| policy.ranks_routes)
     }
 }
 
@@ -675,7 +686,7 @@ impl Router {
         mut preflight: RoutePreflight,
     ) -> Result<(String, String, Value)> {
         let rank_by_quota =
-            !preflight.prefer_candidate_order && !preflight.quota_policies.is_empty();
+            !preflight.prefer_candidate_order && preflight.has_explicit_quota_policy();
         preflight.discovery_deadline =
             Some(std::time::Instant::now() + crate::adhoc::DISCOVERY_BUDGET);
         let mut selected: Option<AvailableRoute> = None;
@@ -961,7 +972,10 @@ impl Router {
                 }
             }
         }
-        let quota = if preflight.arbitrated && preflight.quota_policies.is_empty() {
+        let quota = if preflight.arbitrated
+            && !preflight.quota_policies.contains_key(name)
+            && !preflight.has_explicit_quota_policy()
+        {
             CandidateQuota {
                 status: RouteQuotaStatus::Unknown,
                 unmapped: false,

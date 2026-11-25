@@ -646,6 +646,7 @@ pub(crate) fn checked_route(
     let mut snapshot = request.args["profile_snapshot"].clone();
     if let Some(snapshot) = snapshot.as_object_mut() {
         snapshot.remove("quota_reserve_percent");
+        snapshot.remove(crate::config::DEFAULTED_QUOTA_RESERVE_FIELD);
         snapshot.remove("quota_unknown");
     }
     if let Some(scopes) = snapshot["capacity_scopes"].as_array_mut() {
