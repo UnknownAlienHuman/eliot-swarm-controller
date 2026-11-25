@@ -167,6 +167,43 @@ struct PreparedMailAck {
     payload_digest: Vec<u8>,
 }
 
+#[derive(serde::Serialize)]
+struct MailSendDigest<'a> {
+    to: &'a [String],
+    mode: MailMode,
+    text: &'a str,
+    thread: Option<&'a str>,
+    reply_to_delivery: Option<&'a str>,
+    // Older retained sends implied wake=true without a field in their digest.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    wake: Option<bool>,
+}
+
+#[derive(serde::Serialize)]
+struct MailAckDigest<'a> {
+    agent: &'a str,
+    deliveries: &'a [String],
+}
+
+#[derive(serde::Serialize)]
+struct MailContentDigest<'a> {
+    sender: &'a str,
+    sender_generation: Option<i64>,
+    recipient: &'a str,
+    mode: MailMode,
+    text: &'a str,
+    thread: Option<&'a str>,
+    reply_to_delivery: Option<&'a str>,
+}
+
+#[derive(serde::Serialize)]
+struct MailDeliveredEvent<'a> {
+    recipient: &'a str,
+    delivery_id: &'a str,
+    sender: &'a str,
+    thread: Option<&'a str>,
+}
+
 pub(super) fn parse_sender(principal: &str, domain: &str) -> Result<Sender> {
     if principal == "owner" {
         return Ok(Sender::Owner);
@@ -201,10 +238,17 @@ pub(super) fn parse_sender(principal: &str, domain: &str) -> Result<Sender> {
 }
 
 fn delivery_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MailDelivery> {
+    use serde::{Deserialize, de::value::StringDeserializer};
+
     let mode: String = row.get(7)?;
-    let mode: MailMode = serde_json::from_value(Value::String(mode)).map_err(|error| {
-        rusqlite::Error::FromSqlConversionFailure(7, rusqlite::types::Type::Text, Box::new(error))
-    })?;
+    let mode = MailMode::deserialize(StringDeserializer::<serde::de::value::Error>::new(mode))
+        .map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                7,
+                rusqlite::types::Type::Text,
+                Box::new(error),
+            )
+        })?;
     Ok(MailDelivery {
         delivery_id: row.get(0)?,
         sender: row.get(1)?,
@@ -254,20 +298,16 @@ impl Store {
                 ));
             }
         }
-        let mut semantic_payload = json!({
-            "to": request.to,
-            "mode": request.mode.as_str(),
-            "text": request.text,
-            "thread": request.thread,
-            "reply_to_delivery": request.reply_to_delivery,
-        });
-        // Preserve the digest for retained sends whose wake behavior was implicit.
-        if !request.wake {
-            semantic_payload["wake"] = json!(false);
-        }
         Ok(PreparedMailSend {
             sender,
-            payload_digest: canonical::digest(&semantic_payload)?,
+            payload_digest: canonical::digest_serializable(&MailSendDigest {
+                to: &request.to,
+                mode: request.mode,
+                text: &request.text,
+                thread: request.thread.as_deref(),
+                reply_to_delivery: request.reply_to_delivery.as_deref(),
+                wake: (!request.wake).then_some(false),
+            })?,
         })
     }
 
@@ -278,13 +318,12 @@ impl Store {
     ) -> Result<PreparedMailAck> {
         request.validate()?;
         let mailbox = self.resolve_mailbox(principal, request.agent.as_deref())?;
-        let semantic_payload = json!({
-            "agent": mailbox_name(mailbox),
-            "deliveries": request.deliveries,
-        });
         Ok(PreparedMailAck {
             mailbox,
-            payload_digest: canonical::digest(&semantic_payload)?,
+            payload_digest: canonical::digest_serializable(&MailAckDigest {
+                agent: &mailbox_name(mailbox),
+                deliveries: &request.deliveries,
+            })?,
         })
     }
 
@@ -379,7 +418,7 @@ impl Store {
                 "mail write id is bound to another principal, method, or payload",
             )?
         {
-            let value = serde_json::from_value::<MailSendResponse>(decode_json(&retained)?)
+            let value = serde_json::from_str::<MailSendResponse>(&retained)
                 .map_err(|error| Error::new("internal", error.to_string()))?;
             request.validate_response(&value)?;
             return Ok(MailSendResult {
@@ -554,7 +593,7 @@ impl Store {
             &prepared.payload_digest,
             "mail write id is bound to another principal, method, or payload",
         )? {
-            let value = serde_json::from_value::<MailAckResponse>(decode_json(&retained)?)
+            let value = serde_json::from_str::<MailAckResponse>(&retained)
                 .map_err(|error| Error::new("internal", error.to_string()))?;
             request.validate_response(&value)?;
             return Ok(Change {
@@ -1187,9 +1226,8 @@ impl Store {
                                 "retained mail is not this digest's conversion",
                             ));
                         }
-                        let value =
-                            serde_json::from_value::<MailSendResponse>(decode_json(&old_result)?)
-                                .map_err(|error| Error::new("internal", error.to_string()))?;
+                        let value = serde_json::from_str::<MailSendResponse>(&old_result)
+                            .map_err(|error| Error::new("internal", error.to_string()))?;
                         request.validate_response(&value)?;
                         if let Some(delivery) = value.deliveries.first() {
                             Self::mark_digest_delivered_in_tx(
@@ -1216,9 +1254,8 @@ impl Store {
                     if let Some(old_result) =
                         retained_digest_write_binding(&tx, &request.id, payload_digest)?
                     {
-                        let value =
-                            serde_json::from_value::<MailSendResponse>(decode_json(&old_result)?)
-                                .map_err(|error| Error::new("internal", error.to_string()))?;
+                        let value = serde_json::from_str::<MailSendResponse>(&old_result)
+                            .map_err(|error| Error::new("internal", error.to_string()))?;
                         request.validate_response(&value)?;
                         commit_transaction(tx, &self.write_faulted)?;
                         return Ok(MailSendResult {
@@ -1249,7 +1286,7 @@ impl Store {
                 "mail write id is bound to another principal, method, or payload",
             )?
         {
-            let value = serde_json::from_value::<MailSendResponse>(decode_json(&old_result)?)
+            let value = serde_json::from_str::<MailSendResponse>(&old_result)
                 .map_err(|error| Error::new("internal", error.to_string()))?;
             request.validate_response(&value)?;
             commit_transaction(tx, &self.write_faulted)?;
@@ -1425,7 +1462,7 @@ impl Store {
             payload_digest,
             "mail write id is bound to another principal, method, or payload",
         )? {
-            let value = serde_json::from_value::<MailAckResponse>(decode_json(&old_result)?)
+            let value = serde_json::from_str::<MailAckResponse>(&old_result)
                 .map_err(|error| Error::new("internal", error.to_string()))?;
             request.validate_response(&value)?;
             commit_transaction(tx, &self.write_faulted)?;
@@ -1669,15 +1706,15 @@ impl Store {
         for agent in &recipients {
             let num = parse_agent_id(&agent.id)?;
             let delivery_id = format!("{delivery_prefix}/{}", agent.id);
-            let content_digest = canonical::digest(&json!({
-                "sender": sender_name,
-                "sender_generation": sender_generation,
-                "recipient": agent.id,
-                "mode": MailMode::Queue.as_str(),
-                "text": text,
-                "thread": thread,
-                "reply_to_delivery": reply_to_delivery,
-            }))?;
+            let content_digest = canonical::digest_serializable(&MailContentDigest {
+                sender: &sender_name,
+                sender_generation,
+                recipient: &agent.id,
+                mode: MailMode::Queue,
+                text,
+                thread,
+                reply_to_delivery,
+            })?;
             db!(tx.execute(
                 "INSERT INTO messages(delivery_id, sender, sender_generation, recipient,
                                       recipient_generation, thread, reply_to_delivery, mode, text,
@@ -1707,12 +1744,13 @@ impl Store {
                 "coordination",
                 Some(num),
                 Some(agent.generation),
-                json!({
-                    "recipient": agent.id,
-                    "delivery_id": delivery_id,
-                    "sender": sender_name,
-                    "thread": thread,
-                }),
+                serde_json::to_value(MailDeliveredEvent {
+                    recipient: &agent.id,
+                    delivery_id: &delivery_id,
+                    sender: &sender_name,
+                    thread,
+                })
+                .map_err(|error| Error::new("invalid", error.to_string()))?,
             );
             if let Some(id) = command_id {
                 input.cause = super::command_cause_tx(tx, id)?;
