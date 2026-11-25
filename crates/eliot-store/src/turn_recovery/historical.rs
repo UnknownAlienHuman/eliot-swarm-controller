@@ -91,7 +91,7 @@ impl Store {
             let updated = tx
                 .execute(
                     "UPDATE turns SET state='completed',status=?1,outcome=?2,
-                 completed_at=COALESCE(completed_at,?3),resolution_source='native'
+                     completed_at=COALESCE(completed_at,?3),resolution_source=NULL
                  WHERE agent=?4 AND generation=?5 AND turn_id=?6 AND state='unknown'",
                     params![
                         status.as_str(),
