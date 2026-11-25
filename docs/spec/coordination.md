@@ -342,8 +342,12 @@ removed when its creation identity is still bound, its registered descendants ar
 settled, and the guarded scan of its contents succeeds. Branches, project registrations
 and native sessions require an explicit cleanup request. Status reports the policy
 and the latest completed sweep's aggregate outcomes since daemon startup. A
-`cleanup.automatic` event records removals, planned removals, uncertain outcomes
-and new keep reasons. Repeated keep reasons are omitted from later events.
+`cleanup.automatic` records applied outcomes and new or changed observations of
+kept artifacts or planned removals. An identical observation from a later sweep
+does not record another item. The daemon keeps bounded recent observations and
+evicts the oldest at capacity. Every sweep still measures its current totals and
+updates status independently of diagnostic events. Command and apply receipts
+remain the evidence for actual outcomes.
 
 The direct manager ends a completed child with a graceful Stop while it has
 no active turn. Store records that applied Stop and both generations in the

@@ -21,6 +21,7 @@ const CLEANUP_BACKFILL_LIMIT: usize = 1_024;
 const CLEANUP_BACKFILL_BUDGET: Duration = Duration::from_secs(8);
 const CLEANUP_ABSENCE_OBSERVATION_BUDGET: Duration = Duration::from_secs(25);
 const CLEANUP_PLAN_MAX_PREFLIGHT: Duration = Duration::from_secs(15);
+const MAX_REPORTED_CLEANUP_OBSERVATIONS: usize = 4096;
 
 #[derive(Clone, Copy)]
 enum CleanupApplyMode<'a> {
@@ -86,11 +87,39 @@ pub(crate) fn remove_dir_all(path: &Path) -> std::io::Result<()> {
 
 #[derive(Default)]
 pub(super) struct AutomaticCleanupState {
-    kept_reasons: HashMap<String, (ArtifactKind, String, Option<u64>)>,
+    reported_observations: HashMap<String, ([u8; 32], Instant)>,
     owner_decision_worktrees: usize,
     first_sweep_complete: bool,
     active_sweep: Option<AutomaticCleanupProgress>,
     last_sweep: Option<eliot_core::api::AutomaticCleanupSweep>,
+}
+
+impl AutomaticCleanupState {
+    fn refresh_observations(&mut self, observed: Vec<(String, Option<[u8; 32]>)>) {
+        let now = Instant::now();
+        for (id, digest) in observed {
+            if let Some(digest) = digest {
+                self.reported_observations.insert(id, (digest, now));
+            } else {
+                self.reported_observations.remove(&id);
+            }
+        }
+        if self.reported_observations.len() > MAX_REPORTED_CLEANUP_OBSERVATIONS {
+            // Forget old entries in batches so an overflow never discards the
+            // observations just refreshed by the current sweep.
+            let keep = MAX_REPORTED_CLEANUP_OBSERVATIONS * 7 / 8;
+            let evict = self.reported_observations.len() - keep;
+            let mut oldest: Vec<_> = self
+                .reported_observations
+                .iter()
+                .map(|(id, (_, at))| (*at, id.clone()))
+                .collect();
+            oldest.select_nth_unstable(evict);
+            for (_, id) in oldest.into_iter().take(evict) {
+                self.reported_observations.remove(&id);
+            }
+        }
+    }
 }
 
 #[derive(Default)]
@@ -273,111 +302,106 @@ impl Router {
             ..Default::default()
         };
         let policy = self.secret_policy_snapshot();
-        let mut changed = Vec::new();
-        let mut keep_updates = Vec::new();
-        {
-            let state = self.inner.automatic_cleanup.lock_recover();
-            for item in &plan.items {
-                if matches!(
-                    item.artifact.kind,
-                    ArtifactKind::Branch | ArtifactKind::NativeSession
-                ) {
-                    continue;
-                }
-                let settled = applied.and_then(|response| {
-                    response
-                        .items
-                        .iter()
-                        .find(|outcome| outcome.artifact_id == item.artifact.id)
-                });
-                if item.verdict == "safe" {
-                    sweep.would_remove += 1;
-                }
-                let (outcome, reason, bytes) = if item.verdict != "safe" {
-                    ("kept", item.reason.as_str(), 0)
-                } else if plan_only {
-                    ("would_remove", item.reason.as_str(), 0)
-                } else if let Some(settled) = settled {
-                    match settled.outcome.as_str() {
-                        "removed" => ("removed", item.reason.as_str(), settled.bytes_reclaimed),
-                        "skipped" | "failed" => {
-                            ("kept", settled.reason.as_deref().unwrap_or("skipped"), 0)
-                        }
-                        _ => ("unknown", settled.reason.as_deref().unwrap_or("unknown"), 0),
-                    }
-                } else {
-                    ("unknown", "missing_cleanup_outcome", 0)
-                };
-                let class = sweep
-                    .bytes_by_class
-                    .entry(item.artifact.cleanup_byte_class().to_owned())
-                    .or_default();
-                if let Some(size) = item.bytes {
-                    if item.verdict == "safe" {
-                        class.would_remove = class.would_remove.saturating_add(size);
-                    } else {
-                        class.kept = class.kept.saturating_add(size);
-                    }
-                } else {
-                    class.unmeasured += 1;
-                }
-                class.removed = class.removed.saturating_add(bytes);
-                match outcome {
-                    "would_remove" => {}
-                    "removed" => sweep.removed += 1,
-                    "kept" => {
-                        sweep.kept += 1;
-                        if state.kept_reasons.get(&item.artifact.id).is_some_and(
-                            |(prior_kind, prior_reason, prior_bytes)| {
-                                *prior_kind == item.artifact.kind
-                                    && prior_reason == reason
-                                    && prior_bytes == &item.bytes
-                            },
-                        ) {
-                            continue;
-                        }
-                    }
-                    _ => sweep.unknown += 1,
-                }
-                keep_updates.push((
-                    item.artifact.id.clone(),
-                    (outcome == "kept")
-                        .then(|| (item.artifact.kind, reason.to_owned(), item.bytes)),
-                ));
-                changed.push(json!({
-                    "artifact_id": item.artifact.id,
-                    "agent": item.artifact.agent,
-                    "generation": item.artifact.generation,
-                    "kind": item.artifact.kind,
-                    "path": policy.redact_bounded(&item.artifact.path, 384),
-                    "outcome": outcome,
-                    "reason": reason,
-                    "bytes": item.bytes,
-                    "bytes_reclaimed": bytes,
-                }));
+        let mut observations = Vec::new();
+        for item in &plan.items {
+            if matches!(
+                item.artifact.kind,
+                ArtifactKind::Branch | ArtifactKind::NativeSession
+            ) {
+                continue;
             }
+            let settled = applied.and_then(|response| {
+                response
+                    .items
+                    .iter()
+                    .find(|outcome| outcome.artifact_id == item.artifact.id)
+            });
+            if item.verdict == "safe" {
+                sweep.would_remove += 1;
+            }
+            let (outcome, reason, bytes) = if item.verdict != "safe" {
+                ("kept", item.reason.as_str(), 0)
+            } else if plan_only {
+                ("would_remove", item.reason.as_str(), 0)
+            } else if let Some(settled) = settled {
+                match settled.outcome.as_str() {
+                    "removed" => ("removed", item.reason.as_str(), settled.bytes_reclaimed),
+                    "skipped" | "failed" => {
+                        ("kept", settled.reason.as_deref().unwrap_or("skipped"), 0)
+                    }
+                    _ => ("unknown", settled.reason.as_deref().unwrap_or("unknown"), 0),
+                }
+            } else {
+                ("unknown", "missing_cleanup_outcome", 0)
+            };
+            let class = sweep
+                .bytes_by_class
+                .entry(item.artifact.cleanup_byte_class().to_owned())
+                .or_default();
+            if let Some(size) = item.bytes {
+                if item.verdict == "safe" {
+                    class.would_remove = class.would_remove.saturating_add(size);
+                } else {
+                    class.kept = class.kept.saturating_add(size);
+                }
+            } else {
+                class.unmeasured += 1;
+            }
+            class.removed = class.removed.saturating_add(bytes);
+            match outcome {
+                "would_remove" => {}
+                "removed" => sweep.removed += 1,
+                "kept" => sweep.kept += 1,
+                _ => sweep.unknown += 1,
+            }
+            let data = json!({
+                "artifact_id": item.artifact.id,
+                "agent": item.artifact.agent,
+                "generation": item.artifact.generation,
+                "kind": item.artifact.kind,
+                "path": policy.redact_bounded(&item.artifact.path, 384),
+                "outcome": outcome,
+                "reason": reason,
+                "bytes": item.bytes,
+                "bytes_reclaimed": bytes,
+            });
+            let digest = (settled.is_none() && matches!(outcome, "kept" | "would_remove"))
+                .then(|| eliot_core::canonical_json_sha256(&data))
+                .transpose()
+                .map_err(|_| {
+                    Error::new(
+                        "internal",
+                        "automatic cleanup observation could not be hashed",
+                    )
+                })?;
+            observations.push((item.artifact.id.clone(), data, digest));
+        }
+        if observations.is_empty() {
+            return Ok(sweep);
+        }
+        let mut store = self.inner.store.lock().await;
+        let mut state = self.inner.automatic_cleanup.lock_recover();
+        let mut changed = Vec::new();
+        let mut cache_updates = Vec::new();
+        for (id, data, digest) in observations {
+            if digest.is_none_or(|digest| {
+                state
+                    .reported_observations
+                    .get(&id)
+                    .is_none_or(|(previous, _)| *previous != digest)
+            }) {
+                changed.push(data);
+            }
+            cache_updates.push((id, digest));
         }
         if !changed.is_empty() {
-            let mut store = self.inner.store.lock().await;
             let event = store.record_automatic_cleanup(
                 json!({"plan_id": plan.plan_id, "items": changed}),
                 now,
             )?;
             self.publish_locked(&[event]);
         }
-        let mut state = self.inner.automatic_cleanup.lock_recover();
-        for (id, retained) in keep_updates {
-            if let Some(retained) = retained {
-                // Keep only one reason per retained artifact, with a bound
-                // matching the size of the artifact ledger.
-                if state.kept_reasons.len() >= 4096 && !state.kept_reasons.contains_key(&id) {
-                    state.kept_reasons.clear();
-                }
-                state.kept_reasons.insert(id, retained);
-            } else {
-                state.kept_reasons.remove(&id);
-            }
-        }
+        state.refresh_observations(cache_updates);
         Ok(sweep)
     }
 
