@@ -866,7 +866,10 @@ receipt. Open requests and ordinary Goal items require a current subject.
 Work-at-risk and unknown outcomes keep their own items. An applied handoff
 no longer duplicates a separately displayed unknown source command or turn.
 Exact settlement of the linked source turn also closes that handoff notice.
-A notice stays visible when the source outcome cannot be established.
+A notice stays visible when the source outcome cannot be established. A
+session-loss wait records its unfinished turn when known and closes on
+exact settlement when no other turn, queued input or active Goal still
+needs that generation.
 
 Current handoff waits with the same recorded routing refusal, harness,
 profile and account appear once with `group.affected`. The oldest unsnoozed

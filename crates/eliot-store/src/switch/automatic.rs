@@ -1273,18 +1273,25 @@ impl Store {
                 .connection
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(sql_error)?;
+            let source = parse_agent_id(&candidate.agent.id)?;
+            let waiting_turn = if candidate.reason == HandoffReason::SessionLost {
+                handoff::last_unfinished_turn(&tx, source, candidate.agent.generation)?
+            } else {
+                None
+            };
             let event = insert_daemon_event(
                 &tx,
                 now,
                 HANDOFF_WAITING,
                 "handoff",
-                Some(parse_agent_id(&candidate.agent.id)?),
+                Some(source),
                 Some(candidate.agent.generation),
                 json!({
                     "reason": candidate.reason,
                     "kind": candidate.kind,
                     "message": core::bound_chars(message, 512),
                     "withheld_routes_blocked": withheld_routes_blocked,
+                    "waiting_turn": waiting_turn,
                 }),
             )?;
             commit_transaction(tx, &self.write_faulted)?;

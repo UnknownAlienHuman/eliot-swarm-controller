@@ -1028,6 +1028,16 @@ fn project_handoffs(
            AND NOT EXISTS(SELECT 1 FROM events newer INDEXED BY events_agent
                WHERE newer.agent = a.id AND newer.generation = a.generation AND newer.seq > e.seq
                  AND newer.kind IN ('handoff.waiting','handoff.queued','handoff.settled'))
+           AND NOT (
+             EXISTS(SELECT 1 FROM turns t WHERE t.agent=a.id AND t.generation=a.generation
+               AND t.turn_id=json_extract(e.data,'$.waiting_turn') AND t.state='completed')
+             AND NOT EXISTS(SELECT 1 FROM turns t WHERE t.agent=a.id AND t.generation=a.generation
+               AND t.state IN ('running','unknown'))
+             AND NOT EXISTS(SELECT 1 FROM commands c WHERE c.target=a.id AND c.generation=a.generation
+               AND c.verb='send' AND c.state IN ('accepted','queued','dispatched','unknown'))
+             AND NOT EXISTS(SELECT 1 FROM goals g WHERE g.agent=a.id AND g.generation=a.generation
+               AND json_extract(g.state,'$.status') IN ('active','blocked'))
+           )
            AND (json_extract(e.data,'$.reason') <> 'provider_response_withheld'
                 OR (NOT EXISTS(SELECT 1 FROM events newer_success INDEXED BY events_agent
                         WHERE newer_success.agent = a.id AND newer_success.generation = a.generation
