@@ -54,6 +54,18 @@ pub(super) fn read(
     })
 }
 
+pub(super) fn window_changes(tx: &Connection, from: i64, through: i64) -> eliot_core::Result<bool> {
+    tx.prepare_cached(
+        "SELECT EXISTS(SELECT 1 FROM agents INDEXED BY autonomy_fleet_agents_created_range
+                      WHERE origin = 'eliot' AND created_at BETWEEN ?1 AND ?2)
+             OR EXISTS(SELECT 1 FROM turns INDEXED BY autonomy_fleet_turn_window
+                       WHERE COALESCE(completed_at, started_at, 0) BETWEEN ?1 AND ?2)",
+    )
+    .map_err(crate::sql_error)?
+    .query_row(params![from, through], |row| row.get(0))
+    .map_err(crate::sql_error)
+}
+
 fn read_project_policy(
     tx: &Connection,
     since: i64,
@@ -173,7 +185,7 @@ fn read_project_policy(
     ))
 }
 
-fn read_owner_waiting(
+pub(super) fn read_owner_waiting(
     tx: &Connection,
     until: i64,
     confirmed: &crate::StuckStates,

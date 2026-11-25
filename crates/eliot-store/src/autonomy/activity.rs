@@ -91,6 +91,29 @@ pub(super) fn read(tx: &Connection, since: i64, until: i64) -> eliot_core::Resul
     })
 }
 
+/// Exact changes to window membership for the sections independent of notes.
+pub(super) fn window_changes(tx: &Connection, from: i64, through: i64) -> eliot_core::Result<bool> {
+    tx.prepare_cached(concat!(
+        "SELECT
+          EXISTS(SELECT 1 FROM events INDEXED BY autonomy_activity_shell_window WHERE ", shell_start!(), "
+                 AND ts BETWEEN ?1 AND ?2)
+          OR EXISTS(SELECT 1 FROM events INDEXED BY autonomy_activity_mcp_window WHERE ", swarm_start!(), "
+                 AND ts BETWEEN ?1 AND ?2)
+          OR EXISTS(SELECT 1 FROM events INDEXED BY autonomy_activity_events_window
+                 WHERE (kind = 'goal.round' OR kind = 'project.check.finished' OR kind = 'turn.started')
+                   AND ts BETWEEN ?1 AND ?2)
+          OR EXISTS(SELECT 1 FROM events INDEXED BY work_truth_events_window
+                 WHERE kind = 'git.checkpoint' AND ts BETWEEN ?1 AND ?2)
+          OR EXISTS(SELECT 1 FROM events INDEXED BY work_truth_events_window
+                 WHERE kind = 'handoff.settled' AND ts BETWEEN ?1 AND ?2)
+          OR EXISTS(SELECT 1 FROM commands INDEXED BY autonomy_activity_commands_window
+                 WHERE verb = 'steer' AND created_at BETWEEN ?1 AND ?2)",
+    ))
+    .map_err(crate::sql_error)?
+    .query_row(params![from, through], |row| row.get(0))
+    .map_err(crate::sql_error)
+}
+
 fn read_work_in_git(
     tx: &Connection,
     since: i64,
@@ -336,7 +359,7 @@ fn read_shell_activity(
     ))
 }
 
-fn read_notes(
+pub(super) fn read_notes(
     tx: &Connection,
     since: i64,
     until: i64,
