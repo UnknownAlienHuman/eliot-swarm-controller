@@ -84,6 +84,7 @@ impl Store {
             if state == CommandState::Rejected
                 && record.state == CommandState::Dispatched
                 && args.point == InjectPoint::ActiveTurn
+                && args.fallback_to_next_input
                 && args.expires_at_ms.is_none_or(|expires| expires > now)
                 && let Some(target) = record.target
                 && let Some(agent) = load_agent_by_num(&tx, target)?

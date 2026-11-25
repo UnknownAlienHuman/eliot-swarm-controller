@@ -647,7 +647,8 @@ pub(super) fn admit_tx(
         ));
     }
     let points = context_points(&agent)?;
-    if args.point == InjectPoint::Soonest {
+    let fallback_to_next_input = args.point == InjectPoint::Soonest;
+    if fallback_to_next_input {
         if let Some(expected) = request.expected_turn_id.as_deref()
             && agent.active_turn.as_deref() != Some(expected)
             && !captured_turn_exists(tx, agent_num, agent.generation, expected)?
@@ -707,6 +708,9 @@ pub(super) fn admit_tx(
     };
 
     let mut resolved = json!(args);
+    if fallback_to_next_input && args.point != InjectPoint::NextInput {
+        resolved["_fallback_to_next_input"] = json!(true);
+    }
     if let Some(labels) = &request.trusted_review_labels {
         resolved["_trusted_review_labels"] = serde_json::to_value(labels)
             .map_err(|_| Error::new("internal", "trusted review labels could not be encoded"))?;
@@ -1576,10 +1580,9 @@ pub(super) fn settle_ended_turn_context_tx(
     for command_id in pending_turn_context_command_ids(tx, agent_num, generation, turn_id)? {
         let record = load_command_record(tx, &command_id)?
             .ok_or_else(|| Error::new("source_integrity", "turn context disappeared"))?;
-        let expired = decode_inject_args(&record.command.args)?
-            .expires_at_ms
-            .is_some_and(|expires| expires <= now);
-        if can_move && !expired {
+        let args = decode_inject_args(&record.command.args)?;
+        let expired = args.expires_at_ms.is_some_and(|expires| expires <= now);
+        if args.fallback_to_next_input && can_move && !expired {
             let outcome = move_context_to_next_input(tx, &command_id, now)?;
             events.push(super::native_events::PendingCommandEvent {
                 command_id: command_id.clone(),

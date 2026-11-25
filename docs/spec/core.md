@@ -569,13 +569,17 @@ verbs are not advertised. No fake success or compatibility executor.
 The canonical `InjectArgs`, `InjectPoint`, `ContextItem` and `ContextOutcome` DTOs are
 defined in [Core context types](../../crates/eliot-core/src/context.rs); this spec owns
 their command and effect semantics. `inject` uses the existing `SubmitCommand` with
-`args` decoded as `InjectArgs`. The point is `next_input`, `turn_safe_point`, or
-`active_turn`, and `expires_at_ms` is optional.
+`args` decoded as `InjectArgs`. The point is `soonest`, `next_input`,
+`turn_safe_point`, or `active_turn`, and `expires_at_ms` is optional.
 
-Store binds each admitted context command to the target's current generation. A
-`turn_safe_point` or `active_turn` command also captures the exact active turn at
-admission; it cannot float to another turn or fall back to a send. `next_input` has
-no turn binding and is eligible only for the next send in that same generation.
+Store binds each admitted context command to the target's current generation.
+An explicit `turn_safe_point` or `active_turn` command captures the exact active
+turn at admission. That binding stays in force through cancellation or refusal.
+`next_input` has no turn binding and is eligible only for the next send in that
+same generation. Store retains fallback permission when `soonest` selects an
+in-turn point. An unclaimed safe-point item can move when its turn ends, and a
+confirmed pre-effect refusal of active-turn delivery can move in the same
+generation. A retained item with no fallback permission keeps its binding.
 Queued pending contexts (`next_input`, `turn_safe_point`) are claimed FIFO from
 existing command rows for the target's current generation. At claim, Store
 rechecks project assignment and transfer fences, the frozen project binding for
