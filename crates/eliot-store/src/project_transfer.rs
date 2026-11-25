@@ -680,10 +680,10 @@ fn commit_transfer(
     )?;
     for member in &moved.value.moved {
         let member = exact_agent(tx, &member.agent, member.generation)?;
-        if member.project != from.project || member.workspace != from.workspace {
+        if member.project != from.project {
             return Err(Error::new(
                 "bad_state",
-                "a retained worker has a different project or workspace",
+                "a retained worker belongs to a different registered project",
             ));
         }
     }

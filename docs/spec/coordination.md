@@ -1083,8 +1083,9 @@ remain unsupported.
   successor's retained start so cleanup can find them after the old manager is
   deleted and the assignment is released. The original preparation identity is
   preserved. If the receipt remains with an earlier owner, deletion is blocked
-  while the path is bound or borrowed. Worker generations, references and
-  reservations stay in place. A successor team over its assignment limit and
+  while the path is bound or borrowed. Workers stay in the same registered
+  project and authorization scope. Their individual worktrees, generations,
+  native references and reservations stay in place. A successor team over its assignment limit and
   unsettled queues block the transaction. Queues keep their
   retained principals and assignment epochs are preserved. New queued launches
   recheck current membership before an intent is written. Project-owned rules
