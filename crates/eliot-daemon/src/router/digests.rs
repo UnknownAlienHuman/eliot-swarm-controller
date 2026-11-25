@@ -148,6 +148,7 @@ fn pending_response(
         mode: request.mode.clone(),
         state: "pending".to_owned(),
         delivery_id: None,
+        delivery_to: None,
         completed,
         results,
     };
@@ -161,12 +162,19 @@ fn delivered_response(
     results: Vec<WaitEntryResult>,
 ) -> Result<SwarmDigestResponse> {
     let completed = digest_mode_completed(row.mode.as_str(), &results);
+    let requested = row.requested_parent.as_ref().unwrap_or(&row.parent);
+    let delivery_to = delivery_id
+        .split_once('/')
+        .map(|(_, recipient)| recipient)
+        .filter(|recipient| *recipient != requested)
+        .map(str::to_owned);
     let response = SwarmDigestResponse {
         id: row.id.clone(),
-        to: row.requested_parent.as_ref().unwrap_or(&row.parent).clone(),
+        to: requested.clone(),
         mode: row.mode.clone(),
         state: "delivered".to_owned(),
         delivery_id: Some(delivery_id),
+        delivery_to,
         completed,
         results,
     };

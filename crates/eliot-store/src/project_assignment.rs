@@ -733,44 +733,51 @@ fn enforce_agent(
     Ok(())
 }
 
-pub(super) fn require_current_project_team(
+pub(super) fn queued_launch_epoch(
     conn: &Connection,
     principal: &str,
     project: &str,
-) -> Result<()> {
-    let Some((id, generation)) = principal
+    args: &Value,
+) -> Result<i64> {
+    let Some((manager, manager_generation, epoch, _)) = load_row(conn, project)? else {
+        return Ok(0);
+    };
+    let binding = manager.zip(manager_generation);
+    let parent = args.get("parent").and_then(Value::as_str);
+    if let Some(id) = parent {
+        let agent = load_agent_by_num(conn, parse_agent_id(id)?)?;
+        if !agent
+            .filter(|agent| manager_live(agent.state))
+            .map(|agent| assignment_team_member(conn, &agent, project, binding))
+            .transpose()?
+            .unwrap_or(false)
+        {
+            return Err(Error::new(
+                "stale_assignment",
+                "queued launch parent is outside the current project assignment",
+            ));
+        }
+    }
+    if let Some((id, generation)) = principal
         .strip_prefix("agent:")
         .and_then(|value| value.split_once(':'))
-    else {
-        return Ok(());
-    };
-    let num = parse_agent_id(id)?;
-    let generation = generation.parse::<i64>().map_err(|_| {
-        Error::new(
-            "stale_assignment",
-            "queued launch caller is not authorized for the current project assignment",
-        )
-    })?;
-    let caller = load_agent_by_num(conn, num)?
-        .filter(|agent| agent.generation == generation)
-        .ok_or_else(|| {
-            Error::new(
+    {
+        let caller = load_agent_by_num(conn, parse_agent_id(id)?)?
+            .filter(|agent| generation.parse::<i64>() == Ok(agent.generation))
+            .ok_or_else(|| {
+                Error::new(
+                    "stale_generation",
+                    "queued launch caller generation changed",
+                )
+            })?;
+        if !assignment_team_member(conn, &caller, project, binding)? {
+            return Err(Error::new(
                 "stale_assignment",
-                "queued launch caller is not authorized for the current project assignment",
-            )
-        })?;
-    let Some((manager, manager_generation, _, _)) = load_row(conn, project)? else {
-        // Existing projects without a managed assignment keep their usual scope.
-        return Ok(());
-    };
-    project_transfer::fence(conn, principal, "launch", Some(&caller), None)?;
-    if !assignment_team_member(conn, &caller, project, manager.zip(manager_generation))? {
-        return Err(Error::new(
-            "stale_assignment",
-            "queued launch caller is not authorized for the current project assignment",
-        ));
+                "queued launch caller is outside the current project assignment",
+            ));
+        }
     }
-    Ok(())
+    Ok(epoch)
 }
 
 fn assignment_team_member(

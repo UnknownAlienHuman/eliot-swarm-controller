@@ -1085,15 +1085,25 @@ remain unsupported.
   preserved. If the receipt remains with an earlier owner, deletion is blocked
   while the path is bound or borrowed. Workers stay in the same registered
   project and authorization scope. Their individual worktrees, generations,
-  native references and reservations stay in place. A successor team over its assignment limit and
-  unsettled queues block the transaction. Queues keep their
-  retained principals and assignment epochs are preserved. New queued launches
-  recheck current membership before an intent is written. Project-owned rules
-  stay project-owned. Undelivered direct `child.run` digests follow the moved
-  child to the new manager with the same registration and mail ID. An already
-  delivered digest stays with its recorded recipient. Pending child cleanup
-  follows the moved child and retains the Stop receipt. An admitted cleanup
-  apply blocks transfer until it settles.
+  native references and reservations stay in place. A successor team over its
+  assignment limit or unsettled commands block the transaction. Project-bound
+  launch intents retain the enqueue epoch and principal, including Owner
+  intents. Enqueue and admission both check the current team and any explicit
+  parent. An open transfer defers admission. A changed epoch or revoked parent
+  rejects the receipt as `stale_assignment`. A legacy intent without an epoch
+  can dispatch only while the project still has epoch zero. Project-owned rules
+  stay project-owned.
+  In the epoch transaction, the paused Goal and its check binding go to B.
+  Pending direct `child.run` digests move with the exact child and keep the
+  original registration. Pending child cleanup keeps its original Stop
+  provenance and follows that child. An admitted cleanup apply blocks transfer
+  until it settles. A committed worker digest or cleanup notice still unread
+  in A's mailbox is copied into B's mailbox, consumes A's unread slot and
+  triggers B's normal mail wake. Original delivery receipts and already-read
+  mail remain retained. A full destination mailbox blocks commit and leaves
+  the source mail unread. A pending digest first delivered after transfer
+  reports the initial delivery recipient as `delivery_to` while retaining the
+  requested recipient in `to`.
   Saved continuation context and any expressly selected source SENDs enter the
   ordinary Handoff delivery gate in the same transaction. The Owner may cite a
   retained original task and select ordered plain SENDs from the exact source

@@ -42,10 +42,10 @@ macro_rules! self_completion_mail {
     () => {
         "m.sender = 'swarm' AND EXISTS (
             SELECT 1 FROM completion_digests d
-            WHERE d.id = substr(m.delivery_id, 1, instr(m.delivery_id, '/') - 1)
-              AND d.delivered_mail_id = m.delivery_id AND d.parent = m.recipient
+            WHERE COALESCE(d.transferred_mail_id, d.delivered_mail_id) = m.delivery_id AND d.parent = m.recipient
               AND (d.requester = ('agent:a' || m.recipient || ':' || m.recipient_generation)
-                   OR d.requested_parent IS NOT NULL)
+                   OR EXISTS (SELECT 1 FROM agents child
+                      WHERE child.id = d.transferred_child AND child.parent = d.parent))
         )"
     };
 }
@@ -1652,6 +1652,56 @@ impl Store {
         })
     }
 
+    /// Carry a committed, unread service delivery with its child. The old
+    /// write receipt still names the original delivery. Its unread slot is
+    /// consumed only after the successor delivery fits and is persisted.
+    pub(super) fn transfer_unread_service_mail(
+        tx: &Transaction<'_>,
+        old_delivery: &str,
+        from: &Agent,
+        to: &Agent,
+        limits: MailLimits,
+        now: i64,
+        events: &mut Vec<super::Event>,
+    ) -> Result<Option<MailDeliverySummary>> {
+        let source = parse_agent_id(&from.id)?;
+        let body: Option<(String, Option<String>)> = tx
+            .query_row(
+                "SELECT text, thread FROM messages WHERE delivery_id=?1
+                   AND recipient=?2 AND sender='swarm' AND wake=1 AND read_at IS NULL",
+                params![old_delivery, source],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(sql_error)?;
+        let Some((text, thread)) = body else {
+            return Ok(None);
+        };
+        let id = ulid::Ulid::new().to_string();
+        let definition = MailDefinitionArgs {
+            to: vec![to.id.clone()],
+            text,
+            thread,
+            reply_to_delivery: None,
+        };
+        let (receipt, delivered) = Self::mail_effect_tx_with_sender(
+            tx,
+            (&Sender::Owner, true, true),
+            &definition,
+            limits,
+            &id,
+            None,
+            now,
+        )?;
+        db!(tx.execute(
+            "UPDATE messages SET read_at=?2, inline_ack_pending=0
+             WHERE delivery_id=?1 AND read_at IS NULL",
+            params![old_delivery, now],
+        ));
+        events.extend(delivered);
+        Ok(receipt.deliveries.into_iter().next())
+    }
+
     /// Shared queued-mail row effect on the caller's transaction. No
     /// command/write-id checks, no retained binding, no id-age gate: the
     /// public path enforces those before calling, and the rule-child commit
@@ -2207,8 +2257,7 @@ fn render_inline_mail_tx(
              FROM messages m
              LEFT JOIN commands previous ON previous.id = m.presentation_command
              LEFT JOIN completion_digests digest
-                ON digest.id = substr(m.delivery_id, 1, instr(m.delivery_id, '/') - 1)
-               AND digest.delivered_mail_id = m.delivery_id
+                ON COALESCE(digest.transferred_mail_id, digest.delivered_mail_id) = m.delivery_id
              WHERE m.recipient = ?1
                AND m.recipient_generation = ?2
                AND m.read_at IS NULL
@@ -2228,7 +2277,8 @@ fn render_inline_mail_tx(
                AND (?4 = 0 OR COALESCE(m.thread, '') NOT LIKE 'attention-%'
                     OR ({ATTENTION_WAKING_THREAD_SQL}))
                AND (digest.id IS NULL OR (digest.parent = m.recipient
-                    AND (digest.requester = ?3 OR digest.requested_parent IS NOT NULL)
+                    AND (digest.requester = ?3 OR EXISTS (SELECT 1 FROM agents child
+                         WHERE child.id = digest.transferred_child AND child.parent = digest.parent))
                     AND m.sender IN ('owner', 'swarm')))
              ORDER BY m.id ASC",
         ))

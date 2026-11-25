@@ -372,8 +372,15 @@ impl Store {
                 .connection
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(sql_error)?;
-            tx.execute_batch("ALTER TABLE completion_digests ADD COLUMN requested_parent INTEGER;")
-                .map_err(sql_error)?;
+            tx.execute_batch(
+                "ALTER TABLE completion_digests ADD COLUMN requested_parent INTEGER;
+                 ALTER TABLE completion_digests ADD COLUMN transferred_child INTEGER;
+                 ALTER TABLE completion_digests ADD COLUMN transferred_mail_id TEXT;
+                 CREATE INDEX completion_digests_wake_mail
+                   ON completion_digests(COALESCE(transferred_mail_id, delivered_mail_id))
+                   WHERE COALESCE(transferred_mail_id, delivered_mail_id) IS NOT NULL;",
+            )
+            .map_err(sql_error)?;
             tx.execute(
                 "INSERT INTO schema_migrations(version) VALUES (?1)",
                 [CHILD_DIGEST_ASSIGNMENT_VERSION],

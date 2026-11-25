@@ -151,6 +151,7 @@ impl Store {
         request: &ProjectTransferRequest,
         launch: Option<Result<SubmitCommand>>,
         policy: &core::SecretPolicy,
+        mail_limits: core::api::MailLimits,
         owner_process: Option<&OwnerProcess>,
         now: i64,
     ) -> Result<Change<ProjectTransferResult>> {
@@ -237,7 +238,7 @@ impl Store {
                         db!(tx.execute_batch("SAVEPOINT project_transfer_commit"));
                         let mut committed = value.clone();
                         let attempt = (|| {
-                            let mut events = commit_transfer(tx, &from, &to, &mut committed, limits, policy, now, capacity_policy.as_deref())?;
+                            let mut events = commit_transfer(tx, &from, &to, &mut committed, limits, policy, mail_limits, now, capacity_policy.as_deref())?;
                             if committed.saved_context.is_some() || task_command.is_some() || !commands.is_empty() {
                                 let handoff = handoff::handoff_tx(
                                     tx,
@@ -274,7 +275,7 @@ impl Store {
                                 db!(tx.execute_batch("ROLLBACK TO project_transfer_commit; RELEASE project_transfer_commit"));
                                 value.blockers.push(blocker(&error.code, None));
                             }
-                            Err(error) if matches!(error.code.as_str(), "capacity_unavailable" | "project_transfer_child_cleanup_blocked") => {
+                            Err(error) if matches!(error.code.as_str(), "capacity_unavailable" | "mailbox_full" | "project_transfer_child_cleanup_blocked") => {
                                 db!(tx.execute_batch("ROLLBACK TO project_transfer_commit; RELEASE project_transfer_commit"));
                                 value.blockers.push(blocker(&error.code, Some(*error.message)));
                             }
@@ -654,6 +655,7 @@ fn commit_transfer(
     value: &mut ProjectTransferResult,
     limits: HierarchyLimits,
     policy: &core::SecretPolicy,
+    mail_limits: core::api::MailLimits,
     now: i64,
     capacity_policy: Option<&capacity::PolicyLoader>,
 ) -> Result<Vec<Event>> {
@@ -706,8 +708,24 @@ fn commit_transfer(
         workspace::transfer_workspace_custody(tx, path, from, to, now, &mut events)?;
     }
     write_next_assignment(tx, &value.assignment, Some((to_num, to.generation)), None)?;
-    digests::follow_project_transfer(tx, from, to, &moved.value.moved)?;
-    child_cleanup::follow_project_transfer(tx, from, to, &moved.value.moved)?;
+    digests::follow_project_transfer(
+        tx,
+        from,
+        to,
+        &moved.value.moved,
+        mail_limits,
+        now,
+        &mut events,
+    )?;
+    child_cleanup::follow_project_transfer(
+        tx,
+        from,
+        to,
+        &moved.value.moved,
+        mail_limits,
+        now,
+        &mut events,
+    )?;
     delete_intent(tx, &from.project)?;
     capacity::require_assignment_fits(tx, &from.project, capacity_policy)?;
     let assignment = read_assignment(tx, &from.project)?;

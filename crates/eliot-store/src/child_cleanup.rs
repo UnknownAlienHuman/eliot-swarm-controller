@@ -1,5 +1,5 @@
 use super::*;
-use eliot_core::api::ReparentedAgent;
+use eliot_core::api::{MailLimits, ReparentedAgent};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ChildCleanupState {
@@ -222,6 +222,9 @@ pub(super) fn follow_project_transfer(
     from: &Agent,
     to: &Agent,
     moved_agents: &[ReparentedAgent],
+    limits: MailLimits,
+    now: i64,
+    events: &mut Vec<Event>,
 ) -> Result<()> {
     if from.id == to.id {
         return Err(Error::new(
@@ -247,7 +250,7 @@ pub(super) fn follow_project_transfer(
         let Some((job, stop_id)) = binding else {
             continue;
         };
-        if job.state == ChildCleanupState::Removed || job.notice_delivered {
+        if job.state == ChildCleanupState::Removed {
             continue;
         }
         if job.parent != from.id {
@@ -284,25 +287,45 @@ pub(super) fn follow_project_transfer(
                 "has an admitted cleanup apply",
             ));
         }
-        if let Some(notice_id) = &job.notice_id
-            && let Some((principal, method, _, _)) = write_binding(tx, notice_id)?
-        {
-            if principal != core::api::SWARM_MAIL_SENDER || method != "mail.send" {
-                return Err(cleanup_transfer_blocked(
-                    &job,
-                    "has a conflicting notice receipt",
-                ));
+        let mut notice_id = job.notice_id.clone();
+        let mut notice_delivered = job.notice_delivered;
+        if let Some(id) = &notice_id {
+            if let Some((principal, method, _, _)) = write_binding(tx, id)? {
+                if principal != core::api::SWARM_MAIL_SENDER || method != "mail.send" {
+                    return Err(cleanup_transfer_blocked(
+                        &job,
+                        "has a conflicting notice receipt",
+                    ));
+                }
+                notice_delivered = true;
             }
-            // The stable notice ID already reached its earlier recipient.
-            // Retain that result without delivering another notice.
-            db!(tx.execute(
-                "UPDATE child_cleanup SET notice_delivered=1 WHERE child=?1 AND child_generation=?2",
-                params![child, moved.generation],
-            ));
-            continue;
+            if notice_delivered {
+                let old_delivery = format!("{id}/{}", from.id);
+                if let Some(mail) = Store::transfer_unread_service_mail(
+                    tx,
+                    &old_delivery,
+                    from,
+                    to,
+                    limits,
+                    now,
+                    events,
+                )? {
+                    notice_id = mail
+                        .delivery_id
+                        .split_once('/')
+                        .map(|(id, _)| id.to_owned());
+                } else {
+                    // Keep read notice receipt and original provenance intact.
+                    db!(tx.execute(
+                        "UPDATE child_cleanup SET notice_delivered=1 WHERE child=?1 AND child_generation=?2",
+                        params![child, moved.generation],
+                    ));
+                    continue;
+                }
+            }
         }
         db!(tx.execute(
-            "UPDATE child_cleanup SET parent=?1, parent_generation=?2
+            "UPDATE child_cleanup SET parent=?1, parent_generation=?2, notice_id=?7, notice_delivered=?8
              WHERE child=?3 AND child_generation=?4 AND parent=?5 AND parent_generation=?6",
             params![
                 destination,
@@ -310,7 +333,9 @@ pub(super) fn follow_project_transfer(
                 child,
                 moved.generation,
                 source,
-                job.parent_generation
+                job.parent_generation,
+                notice_id,
+                notice_delivered,
             ],
         ));
     }

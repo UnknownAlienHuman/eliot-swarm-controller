@@ -100,24 +100,12 @@ impl SwarmDigestRequest {
 
     pub fn validate_response(&self, response: &SwarmDigestResponse) -> Result<()> {
         if self.validate().is_err()
+            || response.validate().is_err()
             || response.id != self.id
             || response.to != self.to
             || response.mode != self.mode
             || response.results.len() != self.total()
         {
-            return Err(binding_mismatch());
-        }
-        if response.state != "pending" && response.state != "delivered" {
-            return Err(binding_mismatch());
-        }
-        if response.state == "delivered" {
-            if response.delivery_id.as_deref() != Some(&format!("{}/{}", self.id, self.to)) {
-                return Err(binding_mismatch());
-            }
-            if !response.completed {
-                return Err(binding_mismatch());
-            }
-        } else if response.delivery_id.is_some() {
             return Err(binding_mismatch());
         }
         let mut expected: Vec<(String, String)> = Vec::new();
@@ -155,6 +143,10 @@ pub struct SwarmDigestResponse {
     pub state: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delivery_id: Option<String>,
+    /// Actual initial recipient when a project transfer moved this digest
+    /// before it was delivered. Omitted for the original mailbox.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery_to: Option<String>,
     pub completed: bool,
     pub results: Vec<WaitEntryResult>,
 }
@@ -176,7 +168,10 @@ impl SwarmDigestResponse {
             ));
         }
         if self.state == "delivered" {
-            if self.delivery_id.as_deref() != Some(&format!("{}/{}", self.id, self.to)) {
+            let destination = self.delivery_to.as_deref().unwrap_or(&self.to);
+            if parse_agent_id(destination).is_err()
+                || self.delivery_id.as_deref() != Some(&format!("{}/{}", self.id, destination))
+            {
                 return Err(Error::new("invalid", "digest delivery id is invalid"));
             }
             if !self.completed {
@@ -185,7 +180,7 @@ impl SwarmDigestResponse {
                     "a delivered digest must be completed",
                 ));
             }
-        } else if self.delivery_id.is_some() {
+        } else if self.delivery_id.is_some() || self.delivery_to.is_some() {
             return Err(Error::new(
                 "invalid",
                 "a pending digest carries no delivery id",

@@ -72,8 +72,14 @@ impl Router {
                 "drain prevents new project transfer actions",
             ));
         }
-        let change =
-            store.project_transfer(&request, prepared, &policy, owner_process, now_ms())?;
+        let change = store.project_transfer(
+            &request,
+            prepared,
+            &policy,
+            self.inner.mail.limits(),
+            owner_process,
+            now_ms(),
+        )?;
         self.publish_locked(&change.events);
         if !change.events.is_empty()
             && change.value.outcome == ProjectTransferOutcome::LaunchAdmitted
@@ -87,8 +93,17 @@ impl Router {
                 self.schedule_command(child.clone(), None);
             }
         }
+        let wake_recipient = change.events.iter().find_map(|event| {
+            (event.kind == "mail.delivered")
+                .then_some(event.agent.as_deref())
+                .flatten()
+        });
+        drop(store);
         self.signal_progress();
         self.signal_launch_arbitration();
+        if let Some(recipient) = wake_recipient {
+            self.offer_notice(recipient).await;
+        }
         encode_assignment(change.value)
     }
 
