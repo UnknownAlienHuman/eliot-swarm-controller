@@ -1,9 +1,44 @@
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::{Error, Result, api::REDACTION_MARKER};
 
 pub const UNCLASSIFIED_NATIVE_EVENT: &str = "session.native_unclassified";
+pub const NATIVE_WARNING_EVENT: &str = "session.native_warning";
+pub const MAX_NATIVE_WARNING_BYTES: usize = 1024;
 const MAX_LABEL_BYTES: usize = 128;
+
+/// An advisory diagnostic for one exact native thread, never a verdict.
+#[derive(schemars::JsonSchema, Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeWarning {
+    pub thread_id: String,
+    pub code: String,
+    pub count: u64,
+    pub message: String,
+    pub truncated: bool,
+}
+
+impl NativeWarning {
+    pub fn validate_for_thread(&self, thread: Option<&str>) -> Result<()> {
+        if self.thread_id.is_empty() || Some(self.thread_id.as_str()) != thread {
+            return Err(Error::new(
+                "source_integrity",
+                "native warning names another thread",
+            ));
+        }
+        if !is_published_label(&self.code)
+            || self.count == 0
+            || self.message.len() > MAX_NATIVE_WARNING_BYTES
+        {
+            return Err(Error::new(
+                "invalid",
+                "native warning exceeds its diagnostic bounds",
+            ));
+        }
+        Ok(())
+    }
+}
 
 pub fn is_native_discriminator(text: &str) -> bool {
     !text.is_empty()

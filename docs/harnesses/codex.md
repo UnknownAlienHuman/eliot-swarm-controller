@@ -4,6 +4,8 @@ Current harness; see [L2](../roadmap.md#l2--first-useful-harness-codex-with-luna
 Use `plugins/codex`, Rust/built-in, with one plugin/app-server process per controlled
 Agent generation.
 
+## Historical verification on Codex 0.161.0
+
 On 2026-10-27, the Windows smoke with Codex 0.161.0 and actual `gpt-6-luna`
 completed three native turns: generation 1 created `hello.txt` containing `hello`
 and appended `world`; after an exact graceful stop, resume kept the same `native_ref`
@@ -34,7 +36,7 @@ File-change approval was not live exercised; file-change requests carrying `gran
 remain unsupported. Full L7 qualification remains pending.
 [Roadmap](../roadmap.md) owns milestone status.
 
-In the installed 0.161.0 runtime, a stopped test thread with no turns returned
+In that 0.161.0 verification, a stopped test thread with no turns returned
 `thread not loaded` from `thread/read` and `thread/turns/list`; a retained thread with
 a completed turn remained readable as `notLoaded`. Resume requires that exact native
 readback. An unavailable empty subject fails without creating a replacement thread;
@@ -48,8 +50,9 @@ Checked against official documentation on 2026-10-27:
 - [available model names and rollout caveats](https://learn.chatgpt.com/docs/models);
 - [upstream protocol definitions](https://github.com/openai/codex/tree/main/codex-rs/app-server-protocol/src).
 
-The installed binary's generated schema controls wire names. Generate it once for the
-version being integrated; update when that version changes, not before every command:
+The current adapter uses the installed Codex 0.167.1 generated schema for wire
+names. Generate it once for the version being integrated and update it when the
+version changes:
 
 ```text
 codex app-server generate-json-schema --out <temporary-schema-directory>
@@ -793,7 +796,13 @@ They add no independent durable fact to the parent or child stream.
 | `turn/diff/updated` | Keep existing active-turn activity handling. File changes and Git readback supply retained change facts. |
 | `item/commandExecution/terminalInteraction` | Keep existing active-turn activity handling, and use the exact tool item for lifecycle and outcome. Terminal input stays native. |
 | `mcpServer/startupStatus/updated` | Native initialization and operation-specific readback supply the readiness facts Eliot uses. |
-| `warning`, `model/safetyBuffering/updated` | These advisory notifications supply no structured outcome or routing decision. Their content stays native. |
+| `model/safetyBuffering/updated` | The advisory supplies no structured outcome or routing decision. Its content stays native. |
+
+`warning` produces a typed `session.native_warning` diagnostic only when its
+`threadId` matches the exact owned thread. The adapter records a running count
+per bounded code and redacts the message before truncating it. The 0.167.1
+schema has no code field, so uncoded notifications use `warning`. The diagnostic
+remains visible in retained events even if a later turn fails.
 
 If the Codex stream could not commit its final tool records, exact turn
 settlement or generation loss closes retained tool starts as `unknown`.

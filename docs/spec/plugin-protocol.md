@@ -1177,6 +1177,12 @@ Codex skip-lists the known high-volume notifications `item/agentMessage/delta`,
 no independent normalized event; supported completions carry the durable facts.
 An unfamiliar method cannot establish a native turn binding.
 
+`session.native_warning` retains the [Core diagnostic](../../crates/eliot-core/src/native_data.rs)
+for an exact owned thread and generation, independently of turn state. Codex
+supplies cumulative per-code counts with a bounded code inventory and the
+redacted, UTF-8-bounded message. The diagnostic supplies no lifecycle, progress,
+quota or settlement evidence. Unbound warnings stay in the native adapter.
+
 Known Codex `reasoning` item envelopes are not schema-drift diagnostics.
 Keep normal item processing, including existing thread and turn binding,
 but give these envelopes no independent persisted fact. Claude `tool_progress`

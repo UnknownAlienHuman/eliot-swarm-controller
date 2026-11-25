@@ -6805,6 +6805,7 @@ pub fn family_for_kind(kind: &str) -> Result<&'static str> {
         | "session.usage"
         | "session.context.compacted"
         | eliot_core::UNCLASSIFIED_NATIVE_EVENT
+        | eliot_core::NATIVE_WARNING_EVENT
         | "quota.observed" => Ok("session"),
         "turn.started"
         | "turn.completed"
