@@ -885,11 +885,17 @@ interval_seconds = 300
 compact_on_start = false
 ```
 
-The four history windows above are initial config values. Daemon bootstrap
-writes them only if both `eliot.db` and `config.toml` are absent. Fresh private
-stands also write them into their generated config. Loading a config defaults
-all four history windows to unset, including for an existing Store with no
-config. An omitted window disables deletion for its class.
+The four history windows above come from the bootstrap config template.
+Daemon bootstrap writes the template only when both `eliot.db` and `config.toml`
+are absent. Fresh private stands use the same template. The config loader
+otherwise leaves any omitted history window unset. In particular, an existing
+Store with no retention section has no age cutoff for events, exited child
+processes, commands or mail.
+
+`swarm daemon status` prints `Store retention off` when the active config was
+read successfully and all four history windows are unset. Periodic maintenance
+still runs, including cleanup of reclaimable metadata and SQLite space
+maintenance.
 `interval_seconds` defaults to 300. `events_seconds` can specify the event
 window in seconds instead of `events_days`. Set at most one of the two. The event
 and exited-child process windows are positive integers. `interval_seconds` allows
