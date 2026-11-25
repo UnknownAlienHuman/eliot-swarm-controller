@@ -118,7 +118,9 @@ engine, second scheduler or critic loop.
       basenames and quoted paths.
 - [x] **Child completion wakes by default (#883).** A new `child.run`
       returns its exact result if ready and registers the existing completion
-      wake while the child is pending. Explicit bounded waits remain available.
+      wake while the child is pending. A fresh self-registered completion can
+      wake an eligible idle parent during the ordinary mail cooldown.
+      Explicit bounded waits remain available.
 - [x] **Store-derived deadlines and attention (#873).** Three Claude Haiku
       checks raised the project deadline. OpenCode's timed-out check passed on
       one retry in the same Goal round. Doctor showed learned native and Git

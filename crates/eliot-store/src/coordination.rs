@@ -6,8 +6,8 @@
 //! overfull mailbox rejects without a partial fanout. Reads never mark
 //! state; explicit ack over exact delivery ids is idempotent. Inline mail
 //! is acknowledged by the committed start of its bound turn.
-//! A notice claim is an atomic check-and-set: at most one notice per
-//! recipient per minute with at most one open (or unknown) notice command.
+//! A notice claim is an atomic check-and-set with at most one open (or
+//! unknown) notice command. Generic notices share a one-minute cooldown.
 //! Variable writes are
 //! compare-and-swap on an incrementing version; an absent row reads as
 //! version 0, so `expect_version: 0` creates.
@@ -37,6 +37,21 @@ use serde_json::{Value, json};
 const MAIL_SEND_METHOD: &str = "mail.send";
 const MAIL_ACK_METHOD: &str = "mail.ack";
 const VAR_SET_METHOD: &str = "var.set";
+
+/// An exact, fresh result requested by this recipient generation. The first
+/// notice is eligible during cooldown. The presentation and failed-attempt
+/// paths stamp the notice time, so the same delivery cannot bypass it again.
+/// Uses outer Agent and notice aliases `a` and `mn`.
+const FRESH_COMPLETION_WAKE_SQL: &str = "EXISTS (
+    SELECT 1 FROM messages m
+    JOIN completion_digests d ON d.id = substr(m.delivery_id, 1, instr(m.delivery_id, '/') - 1)
+      AND d.delivered_mail_id = m.delivery_id
+    WHERE m.recipient = a.id AND m.recipient_generation = a.generation
+      AND m.sender = 'swarm' AND m.wake = 1 AND m.read_at IS NULL
+      AND m.presented_at IS NULL AND m.presentation_command IS NULL
+      AND m.inline_wake_retries = 0 AND m.admitted_at > mn.last_notice_at
+      AND d.parent = a.id AND d.requester = ('agent:a' || a.id || ':' || a.generation)
+)";
 /// Bound lock hold time and rollback work when concurrent writes share a commit.
 pub const MAX_VAR_WRITE_GROUP: usize = 64;
 
@@ -820,8 +835,8 @@ impl Store {
     }
 
     /// Page recipients due a normal mail notice or a restart-closed parent
-    /// with its exact unread child completion. An idle recipient's notice
-    /// must be outside the normal cooldown.
+    /// with its exact unread child completion. An idle recipient can also
+    /// be due during cooldown for a fresh, self-registered completion.
     /// Advisory attention mail never pages here; it stays inbox-durable
     /// without a wake. Attention escalation threads page at most once per
     /// (recipient, thread) and only with a bound incident proving the
@@ -853,7 +868,8 @@ impl Store {
                        AND a.observe_only = 0
                        AND a.generation >= 1
                        AND ((a.state = 'idle' AND (mn.last_notice_at IS NULL
-                            OR (mn.last_notice_at <= ?2 AND ?2 - mn.last_notice_at >= ?3))
+                            OR (mn.last_notice_at <= ?2 AND ?2 - mn.last_notice_at >= ?3)
+                            OR ({FRESH_COMPLETION_WAKE_SQL}))
                        AND EXISTS (
                            SELECT 1 FROM messages m
                            WHERE m.recipient = a.id AND m.read_at IS NULL AND m.wake = 1
@@ -2235,20 +2251,20 @@ pub(super) fn notice_pending_count_tx(tx: &Transaction<'_>, num: i64) -> Result<
     Ok((unread != 0).then_some(unread))
 }
 
-/// True when the recipient's mailbox holds an unread reply, admitted after
-/// the last presentation, whose `reply_to_delivery` names mail the recipient
-/// itself sent: the answer to its own question bypasses the cooldown once.
-fn fresh_reply_to_own_mail_tx(tx: &Transaction<'_>, agent: &Agent, since: i64) -> Result<bool> {
-    let num = parse_agent_id(&agent.id)?;
+/// A result of the recipient's own request can bypass cooldown once.
+fn fresh_requested_wake_tx(tx: &Transaction<'_>, num: i64) -> Result<bool> {
     tx.query_row(
-        "SELECT EXISTS(
-             SELECT 1 FROM messages reply
-             JOIN messages asked ON asked.delivery_id = reply.reply_to_delivery
-             WHERE reply.recipient = ?1 AND reply.read_at IS NULL AND reply.wake = 1
-               AND reply.inline_wake_retries < 2
-               AND reply.admitted_at > ?2 AND asked.sender = ?3
-         )",
-        params![num, since, agent.id],
+        &format!(
+            "SELECT EXISTS(
+                 SELECT 1 FROM messages reply
+                 JOIN messages asked ON asked.delivery_id = reply.reply_to_delivery
+                 WHERE reply.recipient = a.id AND reply.read_at IS NULL AND reply.wake = 1
+                   AND reply.inline_wake_retries < 2
+                   AND reply.admitted_at > mn.last_notice_at AND asked.sender = ('a' || a.id)
+             ) OR ({FRESH_COMPLETION_WAKE_SQL})
+             FROM agents a JOIN mail_notices mn ON mn.recipient = a.id WHERE a.id = ?1"
+        ),
+        [num],
         |row| row.get(0),
     )
     .map_err(sql_error)
@@ -2258,8 +2274,8 @@ fn fresh_reply_to_own_mail_tx(tx: &Transaction<'_>, agent: &Agent, since: i64) -
 /// notice command, unknown command/turn, pending request, provider hold,
 /// or busy/waiting/input-pending mail recipient. Suppression records
 /// nothing. Mail defers on busy, pending or unknown input.
-/// An unread reply to the recipient's own mail skips only the presentation
-/// cooldown; the open, busy and unknown gates still suppress.
+/// An unread reply to the recipient's own mail or a fresh completion it
+/// registered skips only the cooldown.
 fn notice_suppressed_tx(tx: &Transaction<'_>, num: i64, agent: &Agent, now: i64) -> Result<bool> {
     if matches!(agent.state, AgentState::Busy | AgentState::Waiting)
         || has_pending_send_input(tx, num, agent.generation)?
@@ -2276,7 +2292,7 @@ fn notice_suppressed_tx(tx: &Transaction<'_>, num: i64, agent: &Agent, now: i64)
         .map_err(sql_error)?;
     if let Some((last, _)) = notice.as_ref()
         && now.saturating_sub(*last) < MAIL_NOTICE_COOLDOWN_MS
-        && !fresh_reply_to_own_mail_tx(tx, agent, *last)?
+        && !fresh_requested_wake_tx(tx, num)?
     {
         return Ok(true);
     }

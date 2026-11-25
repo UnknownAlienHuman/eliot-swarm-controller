@@ -527,9 +527,11 @@ default true), a routed recipient may receive one coalesced notice per minute,
 with at most one open notice command. The count-only fallback is
 `N unread: mail.inbox, then mail.ack`. An unread reply whose
 `reply_to_delivery` names mail the recipient itself sent, admitted after the
-last presentation, skips the one-minute cooldown once, so an answer to an
-Agent's own question wakes it at once; the open-notice, busy, pending-input
-and unknown gates still apply.
+last presentation, skips the one-minute cooldown once. A fresh Swarm
+completion digest registered by the same recipient generation can also skip
+it once. The digest must still be unread and untouched by a notice, with an
+admission time after the previous notice. Open-notice, busy, pending-input,
+provider-hold and unknown gates still apply.
 The notice is an ordinary owner `send` bound to the recipient's
 current generation. At claim, Store selects eligible unread mail addressed to
 that generation, in admission order. Each inline entry carries its sender,
@@ -596,9 +598,9 @@ A daemon driver checks every two seconds. It re-pages due recipients from
 indexed unread wake-enabled mail after a candidate input changes or a
 cooldown boundary arrives. Between changes it reuses the existing recipient
 pages and reapplies the routing and atomic claim gates. Current `idle`,
-non-observer agents holding unread mail past the normal cooldown are
-re-offered through the same atomic claim, so an agent that idles with no
-new event still wakes once due. Normal queued mail and older-generation
+non-observer agents with eligible mail past cooldown or a fresh completion
+they registered are re-offered through the same atomic claim. Normal queued
+mail and older-generation
 unread rows can therefore surface as a fresh current-generation count notice.
 Only current-generation ordinary mail bodies are inlined; older-generation
 bodies remain in the inbox and are represented by the remainder count.

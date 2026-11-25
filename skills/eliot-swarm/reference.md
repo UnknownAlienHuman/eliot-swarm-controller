@@ -12,7 +12,9 @@ readback. Add `--metadata` to result when you need the current Agent metadata.
 wakes the parent with the pending result. Supply a positive `wait_ms` to wait now.
 A returned id reads the same child's result with `{id, wait_ms?}`.
 
-Use `wait_ms:0` if you can finish your turn and take the completion wake. To stay in your turn, launch with a bounded wait and continue with the same `id` only if the result is `still_running`. Read `status`, `final_text` and available `facts`. Use `agent.result` with the exact Agent, generation and turn if the text is truncated.
+With a pending completion wake, continue your work or finish the turn so Swarm
+can deliver the result. Read `status`, `final_text` and available `facts`.
+Use `agent.result` with the exact Agent, generation and turn if the text is truncated.
 
 Use `swarm.wait` for a bounded wait on exact, already known child commands or turns. Use `agent.patch_digest` to review an Agent's changes and `usage.summary` for bounded usage totals.
 

@@ -2951,8 +2951,10 @@ A routed recipient with `wake_on_mail` (profile snapshot, default true) may
 receive one coalesced wake per minute with at most one open notice
 command per recipient. An unread reply
 whose `reply_to_delivery` names mail the recipient itself sent, admitted after
-the last presentation, skips the one-minute cooldown once; the open-notice,
-busy, pending-input and unknown gates still apply.
+the last presentation, skips the one-minute cooldown once. A fresh Swarm
+completion digest registered by the same recipient generation has the same
+one-attempt exception. The open-notice, busy, pending-input, provider-hold and
+unknown gates still apply.
 Eligible mail for the current generation is presented with sender, thread,
 delivery ID and body within the encoded wake budget. Peer bodies are fenced
 untrusted data. The exact wake's first committed model output or successful
