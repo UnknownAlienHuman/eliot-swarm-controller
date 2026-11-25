@@ -315,21 +315,23 @@ and the latest completed sweep's aggregate outcomes since daemon startup. A
 `cleanup.automatic` event records removals, planned removals, uncertain outcomes
 and new keep reasons. Repeated keep reasons are omitted from later events.
 
-For a direct child with an owned managed worktree, the same sweep handles
-newly stopped generations and idle generations whose manager received the
-latest completed result. Store binds the direct read or acknowledged inline
-digest to both Agent generations and the exact child turn. For an idle
-child, Swarm checks the clean tree and the existing merge proof before
-admitting a normal stop. Stop dispatch rechecks the same idle turn and
-requires no pending or unknown child work. Cleanup then waits for the K69
-quiet period and uses a retained single-worktree plan and apply receipt.
+The direct manager ends a completed child with a graceful Stop while it has
+no active turn. Store records that applied Stop and both generations in the
+transaction that changes the child to stopped. Reading a result or receiving
+a completion digest leaves an idle child available for follow-up. Owner stops,
+forced stops, and unsolicited exits leave child worktrees for explicit cleanup.
 
-Child worktree cleanup is on by default. It rechecks artifact ownership,
-the current base and candidate tips, retention holds, and the guarded
-removal gates. An archived child, an unexpired artifact, or a refused or
-uncertain removal is kept. Store retains the reason and sends one addressed
-notice to the matching manager generation when that binding still holds.
-Branches and native sessions continue to use their own cleanup policies.
+Child completion cleanup is on by default and uses the existing minute sweep
+and 60-second K69 quiet period. Each pass reads at most four due rows from an
+index and runs Git preflights only for eligible stopped worktrees. The worker
+retains a single-worktree plan and apply receipt. The removal lane verifies
+current checkout cleanliness, exact tip and local ancestry under the workspace
+gate before reserving non-force Git removal. The reservation rechecks the
+current manager binding, artifact ownership and retention holds.
+An archived child, an unexpired artifact, or a refused or uncertain removal
+is kept. Store retains the reason and sends one addressed notice to the matching
+manager generation when that binding still holds. Branches and native sessions
+continue to use their own cleanup policies.
 
 A folder assignment opts in with
 `cleanup_on_retire`: after an applied stop retires its Agent, the existing

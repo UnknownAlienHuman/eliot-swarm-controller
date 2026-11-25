@@ -1157,7 +1157,7 @@ impl WorkspaceManager {
                         preparation,
                         slot,
                         git,
-                        (mutator, tip),
+                        (Some(mutator), tip),
                         deadline,
                     )
                     .await
@@ -1330,22 +1330,12 @@ impl WorkspaceManager {
             }
             preflight.tip
         };
-        let mutator = match timeout_at(
-            deadline,
-            git.prepare_remove(preparation, &verified_tip, deadline),
-        )
-        .await
-        {
-            Ok(Ok(command)) => command,
-            Ok(Err(error)) => return removal_preflight_error(&error, "git_prepare"),
-            Err(_) => return removal_unknown("workspace_remove_deadline"),
-        };
         self.run_removal_mutator(
             command,
             preparation,
             slot,
             git,
-            (mutator, &verified_tip),
+            (None, &verified_tip),
             deadline,
         )
         .await
@@ -1361,7 +1351,7 @@ impl WorkspaceManager {
         preparation: &WorkspacePreparation,
         slot: &Arc<Slot>,
         git: &WorkspaceGit,
-        (mutator, expected_tip): (Command, &str),
+        (missing_mutator, expected_tip): (Option<Command>, &str),
         deadline: Instant,
     ) -> WorkspaceRemovalOutcome {
         let gate = slot.gate.clone().lock_owned().await;
@@ -1373,13 +1363,49 @@ impl WorkspaceManager {
         }
         let manager_removing_present = command.principal.starts_with("agent:")
             && command.args.get("observe_missing").and_then(Value::as_bool) != Some(true);
-        if (command.args.get("cleanup_mode").and_then(Value::as_str) == Some("automatic")
-            || manager_removing_present)
+        let automatic = command.args["cleanup_mode"].as_str() == Some("automatic");
+        if automatic && missing_mutator.is_some() {
+            return removal_refused(
+                "worktree_missing",
+                "the planned automatic removal no longer has a checkout to verify",
+                "git_prepare",
+            );
+        }
+        if (automatic || manager_removing_present)
             && let Err(error) = git
                 .require_automatic_removal_merge(preparation, expected_tip, deadline)
                 .await
         {
             return removal_preflight_error(&error, "merge_proof");
+        }
+        let mutator = if let Some(mutator) = missing_mutator {
+            mutator
+        } else {
+            // Read the actual checkout under the removal gate before reserving
+            // the write. Git still performs ordinary non-force removal.
+            match timeout_at(
+                deadline,
+                git.prepare_remove(preparation, expected_tip, deadline),
+            )
+            .await
+            {
+                Ok(Ok(mutator)) => mutator,
+                Ok(Err(error)) => return removal_preflight_error(&error, "git_prepare"),
+                Err(_) => return removal_unknown("workspace_remove_deadline"),
+            }
+        };
+        if automatic {
+            match crate::config::load_automation_config(&self.inner.data_root) {
+                Ok(config) if config.auto_cleanup != Some(false) => {}
+                Ok(_) => {
+                    return removal_refused(
+                        "owner_hold",
+                        "the Owner paused automatic cleanup",
+                        "owner_read",
+                    );
+                }
+                Err(error) => return removal_preflight_error(&error, "owner_read"),
+            }
         }
         let reservation = self.inner.store.lock().await.begin_workspace_git_effect(
             &command.id,

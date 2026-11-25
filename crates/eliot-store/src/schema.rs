@@ -224,33 +224,19 @@ impl Store {
                      child_generation INTEGER NOT NULL CHECK(child_generation > 0),
                      parent INTEGER NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
                      parent_generation INTEGER NOT NULL CHECK(parent_generation > 0),
-                     latest_read_turn TEXT,
+                     stop_id TEXT NOT NULL,
                      not_before INTEGER NOT NULL CHECK(not_before >= 0),
                      state TEXT NOT NULL CHECK(state IN ('pending','kept','removed')),
                      reason TEXT NOT NULL,
                      detail TEXT,
-                     stop_id TEXT, plan_id TEXT, apply_id TEXT, notice_id TEXT,
+                     plan_id TEXT, apply_id TEXT, notice_id TEXT,
                      notice_delivered INTEGER NOT NULL DEFAULT 0 CHECK(notice_delivered IN (0,1)),
                      PRIMARY KEY(child, child_generation),
-                     CHECK((stop_id IS NULL AND plan_id IS NULL AND apply_id IS NULL AND notice_id IS NULL)
-                        OR (stop_id IS NOT NULL AND plan_id IS NOT NULL AND apply_id IS NOT NULL AND notice_id IS NOT NULL))
+                     CHECK((plan_id IS NULL AND apply_id IS NULL AND notice_id IS NULL)
+                        OR (plan_id IS NOT NULL AND apply_id IS NOT NULL AND notice_id IS NOT NULL))
                  ) WITHOUT ROWID;
-                 CREATE INDEX child_cleanup_due ON child_cleanup(state, not_before, child)
-                     WHERE state = 'pending';
-                 CREATE TRIGGER child_cleanup_arm_stopped
-                 AFTER UPDATE OF state ON agents
-                 WHEN NEW.state = 'stopped' AND OLD.state <> 'stopped'
-                   AND NEW.parent IS NOT NULL AND NEW.origin = 'eliot'
-                   AND EXISTS (SELECT 1 FROM workspaces w WHERE w.agent = NEW.id
-                               AND w.target_generation = NEW.generation AND w.phase <> 'removed')
-                 BEGIN
-                     INSERT OR IGNORE INTO child_cleanup
-                       (child, child_generation, parent, parent_generation, latest_read_turn,
-                        not_before, state, reason)
-                     SELECT NEW.id, NEW.generation, p.id, p.generation, NULL,
-                            NEW.updated_at + 60000, 'pending', 'child_stopped'
-                     FROM agents p WHERE p.id = NEW.parent;
-                 END;
+                 CREATE INDEX child_cleanup_due ON child_cleanup(not_before, child, child_generation)
+                     WHERE state = 'pending' OR (state = 'kept' AND notice_delivered = 0);
                  INSERT INTO schema_migrations(version) VALUES (137);"
             ).map_err(sql_error)?;
             tx.commit().map_err(sql_error)?;

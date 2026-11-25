@@ -7,38 +7,6 @@ const CHILD_CLEANUP_PAGE: usize = 4;
 const CHILD_CLEANUP_RECHECK_MS: i64 = 60_000;
 
 impl Router {
-    pub(in crate::router) async fn record_child_cleanup_result_read(
-        &self,
-        principal: &Principal,
-        child: &str,
-        generation: i64,
-        turn: &str,
-    ) {
-        let Principal::Agent {
-            id: parent,
-            generation: parent_generation,
-        } = principal
-        else {
-            return;
-        };
-        if let Err(error) = self.inner.store.lock().await.record_child_cleanup_result(
-            parent,
-            *parent_generation,
-            child,
-            generation,
-            turn,
-            now_ms(),
-        ) && !matches!(error.code.as_str(), "bad_state" | "not_found")
-        {
-            crate::logging::record(
-                &self.secret_policy_snapshot(),
-                "daemon.child_cleanup_receipt_failed",
-                &[("agent", child)],
-                Some(&error),
-            );
-        }
-    }
-
     pub(super) async fn sweep_child_worktree_cleanup(&self) -> Result<()> {
         self.check_child_cleanup_enabled()?;
         let jobs = self
@@ -57,7 +25,7 @@ impl Router {
                 .reserve_child_cleanup_ids(&job.child, job.child_generation)?;
             if job.state == ChildCleanupState::Pending {
                 match self.clean_completed_child_worktree(&job).await {
-                    Ok(true) => {
+                    Ok(()) => {
                         self.inner.store.lock().await.finish_child_cleanup(
                             &job.child,
                             job.child_generation,
@@ -65,10 +33,6 @@ impl Router {
                             "removed",
                             None,
                         )?;
-                        continue;
-                    }
-                    Ok(false) => {
-                        self.defer_child_cleanup(&job, "waiting_for_stop").await?;
                         continue;
                     }
                     Err(error) if error.code == "interrupted" => return Err(error),
@@ -121,7 +85,7 @@ impl Router {
         )
     }
 
-    async fn clean_completed_child_worktree(&self, job: &ChildCleanupJob) -> Result<bool> {
+    async fn clean_completed_child_worktree(&self, job: &ChildCleanupJob) -> Result<()> {
         let (child, workspace) = {
             let store = self.inner.store.lock().await;
             let child = store
@@ -154,12 +118,12 @@ impl Router {
             ));
         }
         if workspace.phase == eliot_core::WorkspacePhase::Removed {
-            return Ok(true);
+            return Ok(());
         }
-        if !matches!(child.state, AgentState::Idle | AgentState::Stopped) {
+        if child.state != AgentState::Stopped {
             return Err(Error::new(
                 "child_not_quiescent",
-                "child no longer has an idle or stopped generation",
+                "child is no longer stopped",
             ));
         }
         let mut artifact = self
@@ -219,90 +183,14 @@ impl Router {
                 "worktree has a retained assignment or borrower",
             ));
         }
-        if child.state == AgentState::Idle {
-            self.stop_idle_child_for_cleanup(job, &workspace, &artifact)
-                .await?;
-            return Ok(false);
-        }
         self.apply_completed_child_plan(job, artifact).await
-    }
-
-    async fn stop_idle_child_for_cleanup(
-        &self,
-        job: &ChildCleanupJob,
-        workspace: &eliot_core::WorkspacePreparation,
-        artifact: &ArtifactView,
-    ) -> Result<()> {
-        let stop_id = child_cleanup_id(&job.stop_id)?;
-        let retained = {
-            let store = self.inner.store.lock().await;
-            let retained = store.get_command(stop_id)?;
-            if retained.is_none() {
-                store.child_cleanup_stop_guard(&job.child, job.child_generation)?;
-            }
-            retained
-        };
-        if let Some(retained) = retained {
-            if matches!(
-                retained.state,
-                CommandState::Accepted | CommandState::Queued | CommandState::Dispatched
-            ) {
-                return Ok(());
-            }
-            let reason = retained
-                .outcome
-                .as_ref()
-                .and_then(|outcome| {
-                    outcome["code"]
-                        .as_str()
-                        .or_else(|| outcome["reason"].as_str())
-                })
-                .unwrap_or("stop_unconfirmed");
-            return Err(Error::new(
-                reason,
-                "the reserved cleanup stop did not prove exit",
-            ));
-        }
-        check_worktree_artifact(artifact, workspace)?;
-        let git = crate::workspace_git::WorkspaceGit::new()?;
-        let deadline = Instant::now() + CLEANUP_PLAN_MAX_PREFLIGHT;
-        let preflight = self
-            .inner
-            .workspaces
-            .removal_candidates(&git, workspace, &json!({"scratch": []}), None, deadline)
-            .await?;
-        git.require_automatic_removal_merge(workspace, &preflight.tip, deadline)
-            .await?;
-        self.check_child_cleanup_enabled()?;
-        let admission = {
-            let mut store = self.inner.store.lock().await;
-            store.child_cleanup_stop_guard(&job.child, job.child_generation)?;
-            let mut request = SubmitCommand::new(stop_id, "stop");
-            request.target = Some(job.child.clone());
-            request.expected_generation = Some(job.child_generation);
-            request.args = json!({"force": false});
-            let admission = self.admit_prepared_submission(
-                &mut store,
-                "owner",
-                PreparedSubmission {
-                    request,
-                    workspace: None,
-                },
-                SubmissionContext::default(),
-            )?;
-            self.publish_locked(&admission.events);
-            admission
-        };
-        self.schedule_admission(&admission);
-        self.signal_progress();
-        Ok(())
     }
 
     async fn apply_completed_child_plan(
         &self,
         job: &ChildCleanupJob,
         mut artifact: ArtifactView,
-    ) -> Result<bool> {
+    ) -> Result<()> {
         let plan_id = child_cleanup_id(&job.plan_id)?;
         let apply = CleanupApplyRequest {
             id: child_cleanup_id(&job.apply_id)?.to_owned(),
@@ -369,7 +257,7 @@ impl Router {
             )
         })?;
         if outcome.outcome == "removed" {
-            return Ok(true);
+            return Ok(());
         }
         let code = outcome
             .reason
@@ -423,14 +311,7 @@ impl Router {
                 return Err(Error::new("owner_hold", "worktree is held"));
             }
         }
-        let tip = artifact
-            .git
-            .as_ref()
-            .and_then(|git| git.planned_tip.as_deref())
-            .ok_or_else(|| {
-                Error::new("merge_proof_unavailable", "planned worktree tip is missing")
-            })?;
-        self.automatic_cleanup_worktree_merged(artifact, tip).await
+        Ok(())
     }
 
     async fn send_child_cleanup_notice(&self, job: &ChildCleanupJob) -> Result<()> {

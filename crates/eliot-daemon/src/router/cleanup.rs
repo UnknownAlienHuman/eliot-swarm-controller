@@ -1216,6 +1216,9 @@ impl Router {
             if !agent.state.is_terminal() {
                 return Ok(Some("agent_not_terminal".to_owned()));
             }
+            if artifact.kind == ArtifactKind::Worktree && agent.parent.is_some() {
+                return Ok(Some("child_completion_only".to_owned()));
+            }
             let ended_at = store.terminal_agent_end_time(&agent)?;
             (agent, ended_at)
         };

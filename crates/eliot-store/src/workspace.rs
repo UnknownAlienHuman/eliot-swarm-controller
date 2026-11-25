@@ -969,7 +969,7 @@ pub(super) fn require_workspace_removable(
     Ok(())
 }
 
-const WORKSPACE_REMOVAL_QUIET_MS: i64 = 60_000;
+pub(super) const WORKSPACE_REMOVAL_QUIET_MS: i64 = 60_000;
 
 fn assignment_overlaps_workspace(connection: &Connection, path: &str) -> Result<bool> {
     let mut statement = connection
@@ -2171,6 +2171,11 @@ impl Store {
                     "stale_generation",
                     "worktree removal no longer targets its terminal workspace generation",
                 ));
+            }
+            if command.command.args["cleanup_mode"].as_str() == Some("automatic") {
+                super::child_cleanup::require_automatic_removal_tx(
+                    &tx, &agent, &workspace, command_id, now,
+                )?;
             }
         } else {
             if preparation_command(&tx, &workspace)?.0.command.id != command_id {

@@ -1140,17 +1140,12 @@ fn confirm_inline_mail_tx(
            AND thread LIKE 'attention-%' AND thread NOT LIKE 'attention-%-advisory'",
         params![now, agent, generation, command],
     ));
-    let confirmed = db!(tx.execute(
+    db!(tx.execute(
         "UPDATE messages SET inline_ack_pending = 0
          WHERE recipient = ?1 AND recipient_generation = ?2 AND presentation_command = ?3
            AND inline_ack_pending = 1",
         params![agent, generation, command],
     ));
-    if confirmed > 0 {
-        super::child_cleanup::record_acknowledged_child_cleanup_tx(
-            tx, agent, generation, &command, now,
-        )?;
-    }
     Ok(())
 }
 
