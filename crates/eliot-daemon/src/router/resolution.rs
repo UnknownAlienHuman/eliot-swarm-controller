@@ -16,8 +16,7 @@ use eliot_core::{
         TurnResolveRequest,
     },
 };
-use eliot_store::HistoricalTurnCursor;
-use eliot_store::TurnInactiveProof;
+use eliot_store::{HistoricalTurn, HistoricalTurnCursor, TurnInactiveProof};
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 
@@ -109,11 +108,8 @@ impl Router {
             let status = if let Some((_, status)) = turn.retained_terminal {
                 Some(status)
             } else if reader == Some(TurnHistoryReadback::HistoryFile) {
-                self.inner
-                    .plugin_host
-                    .historical_turn_evidence(&turn)
-                    .await
-                    .ok()
+                let result = self.inner.plugin_host.historical_turn_evidence(&turn).await;
+                self.historical_readback(&turn, "native.turn_evidence", result)
                     .flatten()
             } else if reader == Some(TurnHistoryReadback::OwnedSnapshot)
                 && turn.agent.generation == turn.generation
@@ -123,11 +119,12 @@ impl Router {
             {
                 // The owned reader binds the exact inbox input through the
                 // adapter's shared turn readback. A retired reader proves nothing.
-                self.inner
+                let result = self
+                    .inner
                     .plugin_host
                     .snapshot_turn(&turn.agent, command, &turn.turn_id)
-                    .await
-                    .ok()
+                    .await;
+                self.historical_readback(&turn, "agent.snapshot", result)
                     .filter(|snapshot| {
                         snapshot["command_id"].as_str() == Some(command)
                             && snapshot["last_turn"]["command_id"].as_str() == Some(command)
@@ -162,6 +159,33 @@ impl Router {
             }
         }
         Ok(next)
+    }
+
+    fn historical_readback<T>(
+        &self,
+        turn: &HistoricalTurn,
+        method: &str,
+        read: Result<T>,
+    ) -> Option<T> {
+        match read {
+            Ok(result) => Some(result),
+            Err(error) => {
+                let policy = self.secret_policy_snapshot();
+                crate::logging::record(
+                    &policy,
+                    "daemon.turn_history_readback_failed",
+                    &[
+                        ("agent", &turn.agent.id),
+                        ("generation", &turn.generation.to_string()),
+                        ("turn_id", &turn.turn_id),
+                        ("method", method),
+                        ("error_code", &policy.redact_bounded(&error.code, 64)),
+                    ],
+                    None,
+                );
+                None
+            }
+        }
     }
 
     pub(crate) async fn reconcile_retained_command_evidence(

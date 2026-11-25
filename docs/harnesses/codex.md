@@ -749,8 +749,11 @@ For the Codex rollout writer at upstream commit
 dynamic-tool catalog (`dynamic_tools_updated`, rollout `policy.rs`), legacy
 message/tool echoes and legacy-mode records are ignorable without clearing binding; only
 lifecycle records mutate binding. A new event or item type emits an unclassified
-diagnostic and leaves binding unchanged. An abort settles the bound turn as
-interrupted for `reason: interrupted` or failed for another recognized reason.
+diagnostic and leaves binding unchanged. The live tail and historical reconciliation
+settle an exactly bound abort as interrupted for `interrupted`, `replaced`
+(replacement by another native task), `review_ended` (review ended), or
+`budget_limited` (the native goal budget stopped the turn). Codex 0.167.1 projects
+these abort records to an interrupted turn in [thread history](https://github.com/openai/codex/blob/rust-v0.167.1/codex-rs/app-server-protocol/src/protocol/thread_history.rs).
 An unfamiliar abort reason produces a diagnostic and an unknown outcome. An abort
 without a `turn_id` is unclassified in the live tail and supplies no turn fact in
 history. A subsequent exact start binds its own turn without settling the older

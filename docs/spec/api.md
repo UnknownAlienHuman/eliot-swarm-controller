@@ -1002,7 +1002,9 @@ status` prints the identity in one line; JSON status retains the typed
 
 `daemon.status` reports bounded, redacted runtime status for all 15
 supervised daemon workers via Core `WorkerTaskStatus`/`WorkerTaskHealth`.
-An unregistered worker name is logged as an error. `starting` means spawned but not yet past the
+An unregistered worker runs under the same supervision, logs a registration miss
+and reports `registration_missing: true` alongside its runtime health. The
+status view holds up to 32 worker rows. `starting` means spawned but not yet past the
 task startup boundary; `running` means alive after that boundary and does not prove
 rule/timer/goal delivery; `stopped` means the task exited without error (including
 shutdown); `failed` carries a bounded code and a redacted failure summary.

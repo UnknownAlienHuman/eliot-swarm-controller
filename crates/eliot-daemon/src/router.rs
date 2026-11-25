@@ -574,6 +574,7 @@ impl Router {
                         .map(|name| WorkerTaskStatus {
                             name: (*name).to_owned(),
                             health: WorkerTaskHealth::Starting,
+                            registration_missing: false,
                             failure_code: None,
                             last_failure: None,
                             restart_count: 0,
@@ -1681,19 +1682,27 @@ impl Router {
         failure: Option<(String, String, u32)>,
     ) {
         let mut tasks = self.inner.worker_tasks.lock_recover();
-        let Some(task) = tasks.iter_mut().find(|task| task.name == name) else {
-            drop(tasks);
-            crate::logging::record(
-                &self.secret_policy_snapshot(),
-                "daemon.worker_status_unregistered",
-                &[("worker", name)],
-                Some(&Error::new(
-                    "internal",
-                    "worker report has no daemon status registration",
-                )),
-            );
-            return;
-        };
+        let index = tasks.iter().position(|task| task.name == name);
+        let registration_missing = index.is_none();
+        if registration_missing {
+            if tasks.len() >= eliot_core::api::DaemonStatusResponse::MAX_AUTOMATION_TASKS {
+                drop(tasks);
+                if health == WorkerTaskHealth::Starting {
+                    self.log_worker_registration_missing(name);
+                }
+                return;
+            }
+            tasks.push(WorkerTaskStatus {
+                name: name.to_owned(),
+                health,
+                registration_missing: true,
+                failure_code: None,
+                last_failure: None,
+                restart_count: 0,
+            });
+        }
+        let index = index.unwrap_or(tasks.len() - 1);
+        let task = &mut tasks[index];
         task.health = health;
         task.failure_code = None;
         if let Some((code, cause, restart_count)) = failure {
@@ -1702,7 +1711,19 @@ impl Router {
             task.restart_count = restart_count;
         }
         drop(tasks);
+        if registration_missing {
+            self.log_worker_registration_missing(name);
+        }
         self.signal_progress();
+    }
+
+    fn log_worker_registration_missing(&self, name: &str) {
+        crate::logging::record(
+            &self.secret_policy_snapshot(),
+            "daemon.worker_status_unregistered",
+            &[("worker", name)],
+            None,
+        );
     }
 
     pub(crate) fn note_events(&self, events: &[Event]) {

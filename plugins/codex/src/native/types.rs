@@ -500,6 +500,14 @@ pub enum NativeTurnStatus {
     Other,
 }
 
+/// Codex 0.167.1 thread/read projects every known TurnAborted reason to Interrupted.
+pub(crate) fn known_turn_abort_reason(reason: &str) -> bool {
+    matches!(
+        reason,
+        "interrupted" | "replaced" | "review_ended" | "budget_limited"
+    )
+}
+
 /// Native turn error (fresh `TurnError`; required: message only).
 /// `codexErrorInfo` taxonomy is preserved opaquely as JSON so this file
 /// does not copy the upstream error model.

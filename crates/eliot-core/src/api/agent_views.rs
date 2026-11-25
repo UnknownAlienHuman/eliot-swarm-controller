@@ -2564,7 +2564,7 @@ pub struct DaemonBuildIdentity {
 }
 
 impl DaemonStatusResponse {
-    pub const MAX_AUTOMATION_TASKS: usize = 15;
+    pub const MAX_AUTOMATION_TASKS: usize = 32;
     pub const MAX_PLUGIN_CRASHES: usize = 8;
 }
 
@@ -2789,6 +2789,9 @@ pub enum WorkerTaskHealth {
 pub struct WorkerTaskStatus {
     pub name: String,
     pub health: WorkerTaskHealth,
+    /// This worker reported progress under a name absent from the expected registry.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub registration_missing: bool,
     #[serde(deserialize_with = "nullable")]
     pub failure_code: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

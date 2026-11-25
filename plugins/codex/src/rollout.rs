@@ -692,10 +692,7 @@ fn normalize_live_event(
             .get("reason")
             .and_then(Value::as_str)
             .ok_or_else(integrity)?;
-        if matches!(
-            reason,
-            "interrupted" | "replaced" | "review_ended" | "budget_limited"
-        ) {
+        if crate::native::types::known_turn_abort_reason(reason) {
             data["abort_reason"] = json!(reason);
         } else {
             events.push((
@@ -711,19 +708,11 @@ fn normalize_live_event(
             Some(_) => return Err(integrity()),
         }
     }
-    // An exact-bound abort with reason `interrupted` is an interruption, not
-    // a failure: the turn never ran to a native terminal because it was
-    // interrupted. Every other abort reason and any native error fails.
-    let interrupted_abort = aborted
-        && payload
-            .get("reason")
-            .and_then(Value::as_str)
-            .is_some_and(|reason| reason == "interrupted");
     let (status, outcome) = if !events.is_empty() {
         ("unknown", "unknown")
-    } else if interrupted_abort {
+    } else if aborted {
         ("interrupted", "interrupted")
-    } else if aborted || has_error {
+    } else if has_error {
         ("failed", "failure")
     } else {
         ("completed", "success")
