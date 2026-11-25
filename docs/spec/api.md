@@ -1089,8 +1089,13 @@ Git monitoring refreshes checkout identities and the read-only `origin`
 basename in the background. The Store lock is released before filesystem or
 Git work. `project.list` and `project.get` return the verified projection
 only for its observed watcher revision. A cached read may lag a filesystem
-change until the watcher notification arrives and is processed. The OS
-sets no fixed delivery deadline. Before publication, monitoring
+change by up to about 6 s before the bounded-live-read fallback: the 2 s
+monitor sweep ([`SAMPLE_INTERVAL`](../../crates/eliot-daemon/src/monitor.rs))
+plus watcher notification latency, across up to three consecutive
+invalidated observations
+([`MAX_UNVERIFIED_PROJECT_READS`](../../crates/eliot-daemon/src/workspace_git/readback.rs)).
+The OS sets no fixed delivery deadline for the notification itself.
+Before publication, monitoring
 checks the registered checkout HEAD and index stamps on both sides of the
 Git read. Git configuration and checkout inventory changes depend on watcher
 coverage. Legacy callers get a bounded live Git read on a cache miss. Callers
