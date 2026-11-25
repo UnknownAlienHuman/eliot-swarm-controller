@@ -52,6 +52,17 @@ that actually extracts code; do not install all these projects as dependencies.
 | L6 MCP stdio | **Dependency:** official [`rmcp` 3.9.0](https://crates.io/crates/rmcp/3.9.0); Apache-2.0; MSRV 1.88; crate download verified with Rust 1.99.1. | Use the SDK directly; no source copied. |
 | L6 HTTP origin authentication | **Dependency:** [`jsonwebtoken` 11.1.0](https://crates.io/crates/jsonwebtoken/11.1.0), MIT, MSRV 1.88, inspected 2026-11-07 with pinned Rust 1.99.1. Reuse the already-locked `aws-lc-rs` backend and `reqwest` 0.13.5; PEM features are disabled. | Verify the signed Cloudflare Access application assertion with fixed configured issuer/JWKS/AUD and bounded refresh. Reuse rmcp request extensions and sessions. No copied crypto, OAuth implementation, new service or identity registry. |
 
+## Desktop UI library (D12 M0, 2026-11-25)
+
+**Dependency:** [windows-rs](https://github.com/microsoft/windows-rs) by git on
+its default branch, with no `rev`, `tag` or exact version; `Cargo.lock` records
+the resolved commit (`5a875c078eb9` on 2026-11-25: `windows-reactor`,
+`windows-collections`, `-core`, `-future`, `-reference`, `-time` and `-window`
+0.101.0; `windows-threading`, `-link`, `-result` and `-strings` 0.100.1).
+MIT OR Apache-2.0, used under MIT; the license texts ship in each crate.
+`rust-version` 1.95 at that commit, below the pinned toolchain 1.99.1. Target:
+`apps/swarm-desktop`; the library is used directly and no source is copied.
+
 ## Desktop Material controls (k202, 2026-11-19)
 
 **Pattern only**, no code copied and no dependency added: the button template,

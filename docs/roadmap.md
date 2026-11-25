@@ -1037,7 +1037,9 @@ of the explicitly selected release scope.
       the daemon's refusal of a stale choice, and per-kind counts in the sidebar.
 
 - [ ] **D11 Material 3 Expressive on the Codex skeleton (owner-approved
-      2026-11-24).** The approved interface skeleton, brand book "Eliot Swarm
+      2026-11-24).** Frozen 2026-11-25 on `freeze/material-ui`: the desktop
+      moves to native Fluent (D12); the open items below are not continued.
+      The approved interface skeleton, brand book "Eliot Swarm
       Material" and design canvas, built into the desktop. Reactor 0.100 limits
       are worked around as the brand book's WinUI page states; nothing is drawn
       to imitate a control.
@@ -1194,6 +1196,27 @@ of the explicitly selected release scope.
   - [ ] **Owner-level review.** All six themes on a private stand, side by side
     with Codex, Claude Code Desktop and OpenCode; response, alignment, color,
     type and shadows checked.
+
+- [ ] **D12 Native Fluent desktop (owner decision 2026-11-25).** Stock WinUI
+      templates, states and theme resources through Reactor, laid out by the
+      brand book [Fluent design system](design/fluent-design-system.md). One
+      manager and worktree; the stages close in order.
+  - [ ] **M0 Compatibility.** Track upstream windows-rs (Reactor and its
+    companion crates from one git source; `Cargo.lock` records the resolved
+    commit), the 0.101 API adaptations, runtime bootstrap, scoped monospace
+    for code, scroll/focus/IME sanity on Windows.
+  - [ ] **M1 Fluent foundation.** Remove the global M3 overrides; native
+    themes, shell and sidebar, title bar, one set of app layout constants;
+    System, Light, Dark and Contrast work.
+  - [ ] **M2 Main working path.** Home, conversation, composer, decisions,
+    native menus and long history: launch, read, send, steer, stop and decide
+    with draft, focus and scroll kept.
+  - [ ] **M3 Context and projects.** Real diff, Agents, Details and Terminal,
+    project assignment and transfer, fleet and Inbox.
+  - [ ] **M4 Management.** Settings, model, routing and auth, Automations and
+    Scripts, Usage, Archive, cleanup and recovery.
+  - [ ] **M5 Acceptance and cleanup.** Windows review, targeted profiling,
+    dead Material assets and dependencies removed, documentation.
 
 - [ ] **K92 Backend quota and chat lifecycle (#407).** Private Windows Owner
       proof covers real Codex/Claude desktop launch/send and private chats.
