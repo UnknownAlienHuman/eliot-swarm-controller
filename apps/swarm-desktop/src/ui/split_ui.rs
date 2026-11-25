@@ -101,6 +101,44 @@ impl PanelWidths {
     }
 }
 
+/// A subtree the window built, compared by identity: SplitShell's own
+/// renders (a drag step) pass the same one, which Reactor then skips
+/// without walking it; a window render builds a new one.
+#[derive(Clone)]
+pub(super) struct Built(Rc<View>);
+
+impl Built {
+    pub(super) fn new(view: View) -> Self {
+        Self(Rc::new(view))
+    }
+}
+
+impl PartialEq for Built {
+    fn eq(&self, other: &Self) -> bool {
+        Rc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+/// The memo boundary around a [`Built`] subtree.
+struct Subtree;
+
+impl Component for Subtree {
+    type Input = Built;
+    type Message = ();
+
+    fn create(_input: &Built, _context: &ComponentContext<Self>) -> Self {
+        Self
+    }
+
+    fn view(&self, input: &Built, _context: &mut ViewContext<Self>) -> View {
+        (*input.0).clone()
+    }
+}
+
+fn subtree(built: &Built) -> View {
+    View::component::<Subtree>(built.clone())
+}
+
 /// How the sidebar column shows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Side {
@@ -113,14 +151,14 @@ pub(super) enum Side {
 /// The window's subtrees and the panels' requested state.
 #[derive(Clone, PartialEq)]
 pub(super) struct SplitInput {
-    pub(super) side: View,
+    pub(super) side: Built,
     pub(super) mode: Side,
     /// A compact window's sidebar, open in the native navigation pane.
-    pub(super) overlay: Option<View>,
+    pub(super) overlay: Option<Built>,
     /// The main card's content: the conversation or a page.
-    pub(super) main: View,
+    pub(super) main: Built,
     /// The open pane.
-    pub(super) pane: Option<View>,
+    pub(super) pane: Option<Built>,
     /// The pane lies over the main area (Full view, or a window too narrow
     /// to dock it) instead of docking beside it.
     pub(super) over: bool,
@@ -149,7 +187,7 @@ pub(super) enum SplitMsg {
     Hover(Option<Edge>),
     /// An arrow key on the focused handle: DIPs toward the right.
     Step(Edge, f64),
-    /// The arrow key is released: the widths persist.
+    /// The focus leaves the handle: the arrow keys' widths persist.
     Stepped,
 }
 
@@ -212,8 +250,9 @@ impl SplitShell {
     }
 
     /// A panel's drag handle on its inner edge: a 6-DIP strip with the
-    /// resize cursor, highlighted under the pointer and while focused or
-    /// dragged; Left and Right move it by 10 DIPs (50 with Shift).
+    /// resize cursor, highlighted under the pointer and while dragged;
+    /// Left and Right move it by 10 DIPs (50 with Shift), and the
+    /// widths persist when the focus leaves it.
     fn handle(&self, edge: Edge, context: &mut ViewContext<Self>) -> View {
         let active = self.hover == Some(edge) || self.drag.as_ref().is_some_and(|d| d.edge == edge);
         let sender = context.sender();
@@ -257,17 +296,7 @@ impl SplitShell {
             )
             .on_pointer_exited(context.callback(|_: PointerEventInfo| SplitMsg::Hover(None)))
             .on_preview_key_down(keys)
-            .on_key_up(RoutedCallback::new({
-                let sender = context.sender();
-                move |key: KeyEventInfo| {
-                    if matches!(key.key, VirtualKey::LEFT | VirtualKey::RIGHT) {
-                        let _ = sender.send(SplitMsg::Stepped);
-                        true
-                    } else {
-                        false
-                    }
-                }
-            }))
+            .on_lost_focus(context.callback(|_: FocusEventInfo| SplitMsg::Stepped))
             .tooltip(name)
     }
 }
@@ -343,13 +372,13 @@ impl Component for SplitShell {
         let side: View = match input.mode {
             Side::Rail => Border::new()
                 .width(RAIL_WIDTH)
-                .content(input.side.clone())
+                .content(subtree(&input.side))
                 .into(),
             Side::Panel => Grid::new()
                 .children((
                     Border::new()
                         .width(self.widths.sidebar)
-                        .content(input.side.clone()),
+                        .content(subtree(&input.side)),
                     self.handle(Edge::Sidebar, context),
                 ))
                 .into(),
@@ -360,8 +389,8 @@ impl Component for SplitShell {
         // with its handle; over the main area, both columns on the opaque
         // base, the conversation beneath keeping its scroll, selection and
         // draft for Back to conversation.
-        let pane: Option<View> = input.pane.clone().map(|pane| {
-            let surface = Border::new().content(pane);
+        let pane: Option<View> = input.pane.as_ref().map(|pane| {
+            let surface = Border::new().content(subtree(pane));
             let border = if input.over {
                 Border::new()
                     .background(ThemeBrush::SolidBackground)
@@ -404,7 +433,7 @@ impl Component for SplitShell {
             .content(
                 Grid::new()
                     .columns([GridLength::STAR, GridLength::Auto])
-                    .keyed_children(crate::views::slots([Some(input.main.clone()), pane])),
+                    .keyed_children(crate::views::slots([Some(subtree(&input.main)), pane])),
             )
             .into();
         // The requested pane width decides docking: the Wide preset's, or
@@ -441,8 +470,8 @@ impl Component for SplitShell {
             .pane(
                 input
                     .overlay
-                    .clone()
-                    .unwrap_or_else(|| Border::new().into()),
+                    .as_ref()
+                    .map_or_else(|| Border::new().into(), subtree),
             )
             .content(columns)
             .on_pane_closed(input.on_overlay_closed.clone())

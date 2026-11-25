@@ -1214,7 +1214,7 @@ of the explicitly selected release scope.
       Icons, System/Light/Dark through Reactor's window theme with legacy
       palettes read as Light or Dark, and Reactor theme brushes for the few
       accent or critical marks. The shell layout is M1b.
-    - [ ] **M1b Window layout.** The §6.2 size classes and docking formula
+    - [x] **M1b Window layout.** The §6.2 size classes and docking formula
       from one window-size observer that posts only on a class or docking
       change; no widths derived from the window (Grid star/Auto columns,
       the 720 reading column centred by MaxWidth); resizable sidebar and

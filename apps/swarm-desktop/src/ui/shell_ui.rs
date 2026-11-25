@@ -2365,15 +2365,15 @@ impl DesktopApp {
             side
         };
         let shell = View::component::<split_ui::SplitShell>(split_ui::SplitInput {
-            side,
+            side: split_ui::Built::new(side),
             mode: if rail {
                 split_ui::Side::Rail
             } else {
                 split_ui::Side::Panel
             },
-            overlay,
-            main,
-            pane,
+            overlay: overlay.map(split_ui::Built::new),
+            main: split_ui::Built::new(main),
+            pane: pane.map(split_ui::Built::new),
             over: !self.pane_docked(),
             wide: self.pane.wide,
             widths: split_ui::PanelWidths::of(self.prefs.panels),
