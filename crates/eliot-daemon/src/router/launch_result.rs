@@ -20,18 +20,7 @@ struct ReviewModel {
 
 impl ReviewModel {
     fn new(harness: &str, model: &str) -> Option<Self> {
-        let leaf = model.rsplit('/').next()?;
-        let stem = leaf
-            .split(['-', '_', ':', '@'])
-            .next()?
-            .rsplit('.')
-            .next()?;
-        let family = stem
-            .trim_end_matches(|ch: char| ch.is_ascii_digit())
-            .to_ascii_lowercase();
-        if family.is_empty() || matches!(family.as_str(), "auto" | "default") {
-            return None;
-        }
+        let family = eliot_core::api::model_family(model)?;
         Some(Self {
             provider: catalog_provider(harness, model).to_ascii_lowercase(),
             family,
@@ -57,17 +46,23 @@ impl Router {
         let Some(subject) = event.subject.as_ref() else {
             return Err(Error::new("bad_state", "review has no exact author turn"));
         };
-        let author = self
-            .inner
-            .store
-            .lock()
-            .await
-            .review_author_model(event)?
-            .and_then(|model| ReviewModel::new(&subject.harness, &model))
-            .ok_or_else(|| Error::new("bad_state", "review author model is not retained"))?;
+        let author_model = self.inner.store.lock().await.review_author_model(event)?;
+        let Some(author_model) = author_model else {
+            return Err(Error::new(
+                "bad_state",
+                "review author model is not retained",
+            ));
+        };
+        let Some(author) = ReviewModel::new(&subject.harness, &author_model) else {
+            return Err(Error::new(
+                "invalid",
+                format!("unknown model family for review author model {author_model:?}"),
+            ));
+        };
+        let pinned = action.args["profile"].as_str().map(str::to_owned);
         let name = crate::config::select_review_profile(
             &self.inner.data_root,
-            action.args["profile"].as_str(),
+            pinned.as_deref(),
             action.args["role"].as_str(),
             project.map(|project| project.profiles.as_slice()),
             |name, snapshot| {
@@ -77,6 +72,17 @@ impl Router {
             },
         )?
         .ok_or_else(|| {
+            if let Some(pinned) = pinned.as_deref() {
+                return Error::new(
+                    "routing_unavailable",
+                    format!(
+                        "reviewer profile {pinned:?} cannot review this turn (author {} {}): \
+                         the reviewer must be an approved profile with a concrete known model, \
+                         no setup entries, and a different provider and model family",
+                        author.provider, author.family,
+                    ),
+                );
+            }
             Error::new(
                 "routing_unavailable",
                 "review requires an approved profile from a different provider and model family",
@@ -84,7 +90,7 @@ impl Router {
         })?;
         let args = action.args.as_object_mut().expect("rendered launch args");
         args.remove("role");
-        args.insert("profile".to_owned(), Value::String(name));
+        args.insert("profile".to_owned(), Value::String(name.clone()));
         let prepared = match project {
             Some(project) => {
                 self.prepare_project_rule_submission(action, project)
@@ -97,7 +103,9 @@ impl Router {
         if !author.independent(&prepared.request.args["profile_snapshot"]) {
             return Err(Error::new(
                 "routing_unavailable",
-                "frozen reviewer profile no longer has an independent provider and model family",
+                format!(
+                    "frozen reviewer profile {name:?} no longer has an independent provider and model family",
+                ),
             ));
         }
         Ok(prepared)

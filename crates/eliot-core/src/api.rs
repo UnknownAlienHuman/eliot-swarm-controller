@@ -179,7 +179,8 @@ pub use harness::{
     MAX_HARNESS_CREDENTIAL_BYTES, MAX_HARNESS_PROFILE_BYTES, MAX_HARNESS_QUOTA_NOTE_BYTES,
     MAX_HARNESS_SCOPE_BYTES, ModelsCatalogEntry, ModelsCatalogFailure, ModelsCatalogRequest,
     ModelsCatalogResponse, SUPPORTED_HARNESSES, catalog_cursor, catalog_matches, catalog_provider,
-    configure_uses_native_session, is_supported_harness, register_harness_capabilities,
+    configure_uses_native_session, is_supported_harness, model_family,
+    register_harness_capabilities,
 };
 pub use hierarchy::{
     DEFAULT_MAX_CHILDREN_PER_AGENT, DEFAULT_MAX_DEPTH, DEFAULT_MAX_SELECTOR_TARGETS,
