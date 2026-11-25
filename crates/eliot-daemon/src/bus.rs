@@ -6,22 +6,29 @@
 use tokio::sync::broadcast;
 /// Bounded live-event broadcast. Clone to share; receivers lag explicitly.
 #[derive(Clone)]
-pub struct Bus(broadcast::Sender<eliot_core::Event>);
+pub struct Bus {
+    events: broadcast::Sender<eliot_core::Event>,
+    pub(crate) previews: crate::turn_preview::TurnPreviews,
+}
 impl Bus {
     /// Create a bounded broadcast channel. Capacity is forced nonzero.
     pub fn new(capacity: usize) -> Self {
         let capacity = capacity.max(1);
         let (sender, _) = broadcast::channel(capacity);
-        Self(sender)
+        Self {
+            events: sender,
+            previews: crate::turn_preview::TurnPreviews::new(),
+        }
     }
     /// Register a live receiver. Daemon calls this before capturing high-water.
     pub fn subscribe(&self) -> broadcast::Receiver<eliot_core::Event> {
-        self.0.subscribe()
+        self.events.subscribe()
     }
     /// Publish committed events in supplied seq order. Ignores zero-subscriber sends.
     pub fn publish(&self, events: &[eliot_core::Event]) {
         for event in events {
-            let _ = self.0.send(event.clone());
+            self.previews.committed(event);
+            let _ = self.events.send(event.clone());
         }
     }
 }

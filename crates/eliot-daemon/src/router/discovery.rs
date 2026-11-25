@@ -264,6 +264,7 @@ const METHODS: &[Method] = &[
     method!("agent.patch_digest", AgentPatchDigestRequest, AgentPatchDigestResponse, false, false, "Digest an Agent's patch for review: files, packages, new dependencies, public interface, checker changes and suppressions.", {"id":"a1"}),
     method!("agent.edits", AgentEditsRequest, AgentEditsResponse, false, false, "Read a bounded page of observed workspace edits.", {"id":"a1","limit":20}),
     method!("turn.get", TurnGetRequest, Turn, false, false, "Read one exact Agent/generation/turn binding.", {"agent":"a1","generation":1,"turn_id":"turn-1"}),
+    method!("turn.preview.watch", TurnPreviewWatchRequest, TurnPreviewWatchResponse, false, false, "Long-poll an in-memory assistant preview for one exact live turn.", {"agent":"a1","generation":1,"turn_id":"turn-1"}),
     method!("turn.resolve", TurnResolveRequest, TurnResolveResponse, true, true, "Record an owner resolution for one uncertain exact turn.", {"id":EXAMPLE_ID,"agent":"a1","generation":1,"turn_id":"turn-1","status":"completed","reason":"Owner verified completion."}),
     method!("diagnose", DiagnoseRequest, DiagnoseResponse, true, false, "Explain a failed command, Agent or agent:turn: origin, where, exits, stderr tail (Owner).", {"target":"a1"}),
     method!(

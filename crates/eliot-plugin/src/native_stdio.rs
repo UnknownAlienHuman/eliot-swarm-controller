@@ -60,12 +60,21 @@ pub trait NativeStdioConfig: Clone + Send + Sync + 'static {
         let _ = method;
         true
     }
+
+    fn best_effort_notification(_method: &str) -> bool {
+        false
+    }
 }
 
 pub enum NativeFrame {
     Notification {
         method: String,
         params: Value,
+    },
+    BestEffortNotification {
+        method: String,
+        params: Value,
+        gap: bool,
     },
     Request {
         id: Value,
@@ -505,6 +514,15 @@ fn classify_jsonrpc_frame<C: NativeStdioConfig>(value: Value) -> PumpAction<Nati
         };
         if !C::consumes_notification(&notification.method) {
             return PumpAction::Skip;
+        }
+        if C::best_effort_notification(&notification.method) {
+            return PumpAction::BestEffort(Box::new(move |gap| {
+                NativeFrame::BestEffortNotification {
+                    method: notification.method,
+                    params: notification.params.unwrap_or_else(empty_object),
+                    gap,
+                }
+            }));
         }
         PumpAction::Emit(NativeFrame::Notification {
             method: notification.method,

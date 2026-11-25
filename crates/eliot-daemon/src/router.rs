@@ -55,6 +55,7 @@ mod swarm_usage;
 mod switch;
 mod task_card;
 mod tool_incident;
+mod turn_preview;
 mod update_health;
 mod update_probe;
 mod wake;
@@ -991,6 +992,7 @@ impl Router {
             "agent.patch_digest" => self.agent_patch_digest(&params, &principal).await,
             "agent.edits" => self.agent_edits(&params, &principal).await,
             "turn.get" => self.turn_get(&params, &principal).await,
+            "turn.preview.watch" => self.turn_preview_watch(&params, &principal).await,
             "turn.resolve" => self.turn_resolve(&params, &principal).await,
             "diagnose" => self.diagnose(&params, &principal).await,
             "events.bounds" => self.events_bounds(&params, &principal).await,
@@ -1190,7 +1192,7 @@ impl Router {
     pub(crate) fn rpc_latency_method(request: &eliot_plugin::RpcRequest) -> Option<&'static str> {
         let method = discovery::canonical_method(&request.method)?;
         match method {
-            "swarm.wait" | "events.subscribe" | "inject.wait" => None,
+            "swarm.wait" | "events.subscribe" | "inject.wait" | "turn.preview.watch" => None,
             "child.run"
                 if <eliot_core::api::ChildRunRequest as serde::Deserialize>::deserialize(
                     &request.params["_payload"],

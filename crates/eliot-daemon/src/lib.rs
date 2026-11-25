@@ -34,6 +34,7 @@ mod setup;
 mod skill;
 mod stand_cleanup;
 pub mod startup;
+mod turn_preview;
 mod update_backup;
 mod work_truth;
 mod work_truth_repo;

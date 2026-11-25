@@ -372,6 +372,8 @@ struct PendingRateLimitEvent {
 
 struct EventProcessor {
     host: PeerClient,
+    preview: eliot_plugin::turn_preview::PreviewSender,
+    preview_message: Option<(String, String)>,
     sink: CommitSink,
     credential: String,
     agent_id: String,
@@ -700,11 +702,15 @@ async fn run(
                     publish(&processor, &status);
                     continue;
                 };
-                let ClaudeFrame::Record(record) = frame;
-                if processor.accept_frames {
-                    processor.handle_record(record).await;
-                } else {
-                    processor.buffer_record(record);
+                match frame {
+                    ClaudeFrame::Record(record) if processor.accept_frames => {
+                        processor.handle_record(record).await;
+                    }
+                    ClaudeFrame::Record(record) => processor.buffer_record(record),
+                    ClaudeFrame::Preview { record, gap } if processor.accept_frames => {
+                        processor.preview_record(&record, gap);
+                    }
+                    ClaudeFrame::Preview { .. } => {}
                 }
                 if frames.is_empty() {
                     processor.report_pending_fault_gap().await;
@@ -879,8 +885,16 @@ impl EventProcessor {
         control_actor: EventActor<Control, EventStatus>,
     ) -> Self {
         let sink = CommitSink::new(host.clone(), config.credential.clone());
+        let preview = eliot_plugin::turn_preview::PreviewSender::new(
+            host.clone(),
+            config.credential.clone(),
+            config.agent_id.clone(),
+            config.generation,
+        );
         Self {
             host,
+            preview,
+            preview_message: None,
             sink,
             credential: config.credential,
             agent_id: config.agent_id,
@@ -1148,6 +1162,47 @@ impl EventProcessor {
         let _ = self.flush_buffer().await;
     }
 
+    fn preview_record(&mut self, record: &Value, gap: bool) {
+        let Some(session) = self.status.session_id.as_deref() else {
+            return;
+        };
+        if record["session_id"].as_str() != Some(session)
+            || !is_main_thread(record)
+            || self.status.active_turn_id.is_none()
+            || record["turn_id"]
+                .as_str()
+                .is_some_and(|id| self.status.active_turn_id.as_deref() != Some(id))
+        {
+            return;
+        }
+        self.refresh_terminal_deadline();
+        let Some(turn) = self.status.active_turn_id.as_deref() else {
+            return;
+        };
+        if gap {
+            self.preview_message = None;
+        }
+        let event = &record["event"];
+        match event["type"].as_str() {
+            Some("message_start") => {
+                self.preview_message = event["message"]["id"]
+                    .as_str()
+                    .filter(|_| event["message"]["role"] == "assistant")
+                    .map(|id| (turn.to_owned(), id.to_owned()));
+            }
+            Some("message_stop") => self.preview_message = None,
+            Some("content_block_delta") if event["delta"]["type"] == "text_delta" => {
+                if let (Some((bound_turn, message)), Some(text)) =
+                    (&self.preview_message, event["delta"]["text"].as_str())
+                    && bound_turn == turn
+                {
+                    self.preview.offer(turn, message, text);
+                }
+            }
+            _ => {}
+        }
+    }
+
     async fn process_record(&mut self, record: Value) -> Result<()> {
         let kind = record
             .get("type")
@@ -1181,9 +1236,9 @@ impl EventProcessor {
                 if self.status.active_turn_id.is_some()
                     && is_main_thread(&record)
                     && record.get("session_id").and_then(Value::as_str).is_some()
-                    && record.get("turn_id").map_or(kind == "stream_event", |id| {
-                        id.as_str() == self.status.active_turn_id.as_deref()
-                    })
+                    && record
+                        .get("turn_id")
+                        .is_some_and(|id| id.as_str() == self.status.active_turn_id.as_deref())
                 {
                     self.refresh_terminal_deadline();
                 }

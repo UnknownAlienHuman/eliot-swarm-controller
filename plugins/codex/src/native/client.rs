@@ -57,14 +57,17 @@ impl NativeStdioConfig for CodexStdioConfig {
     fn consumes_notification(method: &str) -> bool {
         !matches!(
             method,
-            "item/agentMessage/delta"
-                | "item/commandExecution/outputDelta"
+            "item/commandExecution/outputDelta"
                 | "item/fileChange/outputDelta"
                 | "item/plan/delta"
                 | "item/reasoning/summaryPartAdded"
                 | "item/reasoning/summaryTextDelta"
                 | "item/reasoning/textDelta"
         )
+    }
+
+    fn best_effort_notification(method: &str) -> bool {
+        method == "item/agentMessage/delta"
     }
 }
 

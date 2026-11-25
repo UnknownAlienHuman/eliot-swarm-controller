@@ -25,6 +25,7 @@ use eliot_plugin::protocol::{
     HookEvent, HookResponse, SessionUsageSampleAck, SessionUsageSampleRequest,
 };
 use eliot_plugin::sync::LockExt;
+use eliot_plugin::turn_preview::{PUT as PUT_PREVIEW, TurnPreviewChunk};
 use eliot_store::{BatchCommit, PreparedSourceBatch, ReadyToolBatch, family_for_kind};
 use serde_json::{Value, json};
 
@@ -252,6 +253,7 @@ pub(super) async fn serve_plugin_requests(mut connection: PluginConnection, sour
             method.as_str(),
             "events.put"
                 | "usage.sample"
+                | PUT_PREVIEW
                 | "source.gap"
                 | "source.handoff"
                 | "source.health"
@@ -262,7 +264,7 @@ pub(super) async fn serve_plugin_requests(mut connection: PluginConnection, sour
         ) {
             Err(Error::new(
                 "unsupported",
-                "plugin host only accepts events.put, usage.sample, source.gap, source.handoff, source.health, source.state, process.put, child, and hook.event",
+                "plugin host request method is unsupported",
             ))
         } else {
             let mut params = request.params;
@@ -292,6 +294,27 @@ pub(super) async fn serve_plugin_requests(mut connection: PluginConnection, sour
                 Err(error)
             } else {
                 match method.as_str() {
+                    PUT_PREVIEW => {
+                        let current = state
+                            .upgrade()
+                            .is_some_and(|state| state.running.lock_recover().contains_key(&key));
+                        match serde_json::from_value::<TurnPreviewChunk>(params) {
+                            Ok(chunk)
+                                if observation.is_none()
+                                    && current
+                                    && chunk.agent_id == agent_id
+                                    && chunk.generation == generation
+                                    && chunk.valid() =>
+                            {
+                                bus.previews.put(chunk, Arc::clone(&source_credentials));
+                                Ok(Value::Bool(true))
+                            }
+                            _ => Err(Error::new(
+                                "invalid",
+                                "preview chunk or source binding is invalid",
+                            )),
+                        }
+                    }
                     "process.put" => {
                         let current = state
                             .upgrade()

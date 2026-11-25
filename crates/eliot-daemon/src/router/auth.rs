@@ -283,6 +283,7 @@ pub(super) fn authorize_rpc_method(principal: &Principal, method: &str) -> Resul
                 | "command.get"
                 | "agent.get"
                 | "turn.get"
+                | "turn.preview.watch"
         )
     {
         return Err(Error::new(

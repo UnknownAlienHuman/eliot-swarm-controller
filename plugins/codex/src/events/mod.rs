@@ -194,6 +194,7 @@ struct NativeItemStarted {
 struct EventProcessor {
     native: NativeClient,
     host: PeerClient,
+    preview: eliot_plugin::turn_preview::PreviewSender,
     sink: CommitSink,
     credential: String,
     agent_id: String,
@@ -414,9 +415,16 @@ impl EventHandle {
 impl EventProcessor {
     fn new(native: NativeClient, host: PeerClient, config: EventConfig) -> Self {
         let sink = CommitSink::new(host.clone(), config.credential.clone());
+        let preview = eliot_plugin::turn_preview::PreviewSender::new(
+            host.clone(),
+            config.credential.clone(),
+            config.agent_id.clone(),
+            config.generation,
+        );
         Self {
             native,
             host,
+            preview,
             sink,
             credential: config.credential,
             agent_id: config.agent_id,
@@ -571,6 +579,29 @@ impl EventProcessor {
 
     async fn handle_frame(&mut self, frame: Option<NativeFrame>) {
         match frame {
+            Some(NativeFrame::BestEffortNotification {
+                method,
+                params,
+                gap,
+            }) => {
+                if method == "item/agentMessage/delta"
+                    && let (Some(thread), Some(turn), Some(message), Some(text)) = (
+                        params["threadId"].as_str(),
+                        params["turnId"].as_str(),
+                        params["itemId"].as_str(),
+                        params["delta"].as_str(),
+                    )
+                    && self.status.ready
+                    && self.status.thread_id.as_deref() == Some(thread)
+                {
+                    if gap || self.status.active_turn_id.as_deref() != Some(turn) {
+                        self.preview.gap(turn, message);
+                    }
+                    if self.status.active_turn_id.as_deref() == Some(turn) {
+                        self.preview.offer(turn, message, text);
+                    }
+                }
+            }
             Some(NativeFrame::Request { id, method, params }) => {
                 if self.take_child_frame(&params, true) {
                     self.reject_child_request(id, &method, &params).await;
