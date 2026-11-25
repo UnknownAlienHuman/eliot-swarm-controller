@@ -72,7 +72,7 @@ impl PluginHost {
             native_scope: turn.native_scope.clone(),
             native_ref: turn.native_ref.clone(),
             turn_id: turn.turn_id.clone(),
-            target_environment: Value::Object(build_process_environment(&turn.profile)?),
+            target_environment: history_environment(&turn.profile),
             profile: turn.profile.clone(),
         };
         let (id, stop, done) = self.register_metadata_reader()?;
@@ -1189,6 +1189,42 @@ fn require_reader_cleanup<T>(
             format!("{operation} reader cleanup is unconfirmed"),
         ))
     }
+}
+
+/// A historical read needs store selectors, never an inference credential or
+/// a current provider route. The adapter rechecks the retained scope against
+/// the resolved directories before it opens any history file.
+fn history_environment(profile: &Value) -> Value {
+    let native = HarnessCapabilities::of(profile["harness"].as_str().unwrap_or_default())
+        .profile
+        .environment;
+    let names = ["HOME", "USERPROFILE"]
+        .into_iter()
+        .chain(native.store_paths.iter().copied())
+        .chain(native.legacy_captured_paths.iter().copied())
+        .chain(native.credential_directory);
+    let mut environment = serde_json::Map::new();
+    for name in names {
+        let captured = profile["native_route_home"]
+            .get(name)
+            .or_else(|| profile["pass_env_values"].get(name));
+        let admitted = matches!(name, "HOME" | "USERPROFILE")
+            || profile["pass_env"].as_array().is_some_and(|names| {
+                names
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .any(|key| key == name || cfg!(windows) && key.eq_ignore_ascii_case(name))
+            });
+        let path = match captured {
+            Some(value) => value.as_str().map(str::to_owned),
+            None if admitted => std::env::var(name).ok(),
+            None => None,
+        };
+        if let Some(path) = path.filter(|path| std::path::Path::new(path).is_absolute()) {
+            environment.insert(name.to_owned(), Value::String(path));
+        }
+    }
+    Value::Object(environment)
 }
 
 fn cleanup_state(cleanup_confirmed: bool) -> ReaderCleanup {

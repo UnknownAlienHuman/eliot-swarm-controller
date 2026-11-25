@@ -141,8 +141,7 @@ fn binding(
     let Some(agent) = load_agent_by_num(db, num)? else {
         return Ok(None);
     };
-    if agent.observe_only
-        || generation > agent.generation
+    if generation > agent.generation
         || (generation == agent.generation && agent.active_turn.as_deref() == Some(turn))
         || load_turn(db, num, generation, turn)?.is_none_or(|turn| turn.state != TurnState::Unknown)
     {
@@ -172,12 +171,13 @@ fn binding(
         .prepare_cached(
             "SELECT DISTINCT json_extract(data,'$.command_id') FROM events INDEXED BY events_agent
          WHERE agent=?1 AND generation=?2 AND kind='turn.started'
-           AND source='stream' AND native_id IS NOT NULL AND json_extract(data,'$.turn_id')=?3
+           AND (source='stream' OR (?4 AND source='transcript'))
+           AND native_id IS NOT NULL AND json_extract(data,'$.turn_id')=?3
          LIMIT 2",
         )
         .map_err(sql_error)?;
     let start = starts
-        .query_map(params![num, generation, turn], |r| {
+        .query_map(params![num, generation, turn, agent.observe_only], |r| {
             r.get::<_, Option<String>>(0)
         })
         .map_err(sql_error)?
@@ -191,19 +191,23 @@ fn binding(
             "SELECT seq,json_extract(data,'$.status'),json_extract(data,'$.outcome')
          FROM events INDEXED BY events_agent
          WHERE agent=?1 AND generation=?2 AND kind='turn.completed'
-           AND source='stream' AND native_id IS NOT NULL AND json_extract(data,'$.turn_id')=?3
+           AND (source='stream' OR (?5 AND source='transcript'))
+           AND native_id IS NOT NULL AND json_extract(data,'$.turn_id')=?3
            AND json_extract(data,'$.command_id') IS ?4
          LIMIT 2",
         )
         .map_err(sql_error)?;
     let rows = terminals
-        .query_map(params![num, generation, turn, command_id], |r| {
-            Ok((
-                r.get::<_, i64>(0)?,
-                r.get::<_, Option<String>>(1)?,
-                r.get::<_, Option<String>>(2)?,
-            ))
-        })
+        .query_map(
+            params![num, generation, turn, command_id, agent.observe_only],
+            |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, Option<String>>(1)?,
+                    r.get::<_, Option<String>>(2)?,
+                ))
+            },
+        )
         .map_err(sql_error)?
         .collect::<rusqlite::Result<Vec<_>>>()
         .map_err(sql_error)?;
@@ -222,27 +226,22 @@ fn binding(
         }
         _ => return Ok(None),
     };
-    let profile = if agent.native_scope.as_ref() == Some(scope)
-        && agent.native_ref.as_ref() == Some(reference)
-    {
-        agent.profile_snapshot.clone()
-    } else {
-        let snapshot = db
-            .query_row(
-                "SELECT json_extract(args,'$.profile_snapshot') FROM commands
-             WHERE target=?1 AND generation=?2 AND verb IN ('launch','resume') AND state='applied'
-               AND json_type(args,'$.profile_snapshot')='object'
-             ORDER BY rowid DESC LIMIT 1",
-                params![num, generation],
-                |r| r.get::<_, String>(0),
-            )
-            .optional()
-            .map_err(sql_error)?;
-        match snapshot {
-            Some(snapshot) => decode_json(&snapshot)?,
-            None if retained_terminal.is_some() => Value::Null,
-            None => return Ok(None),
+    let snapshot = db.query_row(
+        "SELECT json_extract(args,'$.profile_snapshot') FROM commands
+         WHERE target=?1 AND generation=?2 AND verb IN ('launch','resume','attach') AND state='applied'
+           AND json_type(args,'$.profile_snapshot')='object'
+         ORDER BY rowid DESC LIMIT 1",
+        params![num,generation],|r|r.get::<_,String>(0),
+    ).optional().map_err(sql_error)?;
+    let profile = match snapshot {
+        Some(snapshot) => decode_json(&snapshot)?,
+        None if agent.native_scope.as_ref() == Some(scope)
+            && agent.native_ref.as_ref() == Some(reference) =>
+        {
+            agent.profile_snapshot.clone()
         }
+        None if retained_terminal.is_some() => Value::Null,
+        None => return Ok(None),
     };
     Ok(Some(HistoricalTurn {
         agent,
