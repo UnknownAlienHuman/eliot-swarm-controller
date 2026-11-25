@@ -62,30 +62,17 @@ const WORKTREES_RESOLVED: &str = "
           AND json_extract(ar.body,'$.state') IS NOT 'removed'
     )";
 
-// Use the same newest-turn ordering as agent.result. A read receipt and a
-// read completion digest both bind the current parent and exact result.
-const READ_CHILD_RESULT: &str = "
-    EXISTS (
-        SELECT 1 FROM turns t WHERE t.agent=a.id AND t.generation=a.generation
-          AND t.insertion_seq=(SELECT MAX(insertion_seq) FROM turns
-                               WHERE agent=a.id AND generation=a.generation)
-          AND t.state='completed'
-          AND (
-              EXISTS (SELECT 1 FROM agent_result_reads r WHERE r.child=a.id
-                       AND r.generation=a.generation AND r.parent=a.parent AND r.turn_id=t.turn_id)
-              OR EXISTS (
-                  SELECT 1 FROM completion_digests d
-                  JOIN messages m ON m.delivery_id=COALESCE(d.transferred_mail_id,d.delivered_mail_id)
-                  JOIN json_each(d.turns) item
-                  WHERE d.parent=a.parent AND m.recipient=a.parent AND m.sender='swarm'
-                    AND m.read_at IS NOT NULL
-                    AND json_extract(item.value,'$.agent')='a'||a.id
-                    AND json_extract(item.value,'$.generation')=a.generation
-                    AND json_extract(item.value,'$.turn_id')=t.turn_id
-                    AND json_extract(d.hidden,'$['||item.key||']')=0
-              )
-          )
-    )";
+// The newest result and receipt both use the exact generation and current
+// parent. Reading a mailbox summary does not prove result readback.
+const LATEST_COMPLETED_CHILD_RESULT: &str = "
+    SELECT t.turn_id FROM turns t WHERE t.agent=a.id AND t.generation=a.generation
+      AND t.insertion_seq=(SELECT MAX(insertion_seq) FROM turns
+                           WHERE agent=a.id AND generation=a.generation)
+      AND t.state='completed'";
+const RESULT_READ: &str = "
+    EXISTS (SELECT 1 FROM agent_result_reads r WHERE r.child=a.id
+            AND r.generation=a.generation AND r.parent=a.parent
+            AND r.turn_id=latest.turn_id)";
 
 impl Store {
     /// Record the exact current result returned to the authenticated direct
@@ -163,15 +150,18 @@ impl Store {
                     WHEN successor.successor IS NOT NULL THEN 'handed_off'
                     ELSE 'child_result_read' END AS reason
                  FROM page JOIN agents a USING(id)
+                 LEFT JOIN turns latest ON latest.agent=a.id AND latest.generation=a.generation
+                    AND latest.turn_id=({LATEST_COMPLETED_CHILD_RESULT})
                  LEFT JOIN agent_successors successor ON successor.agent=a.id AND successor.generation=a.generation
                     AND EXISTS (SELECT 1 FROM agents next WHERE next.id=successor.successor)
                  WHERE a.id NOT IN (SELECT value FROM json_each(?5))
                    AND a.capacity_generation IS NULL AND a.active_turn IS NULL AND a.pending='[]'
                    AND ((a.observe_only=1 AND a.state IN ('idle','stopped') AND a.updated_at<=?4)
                      OR (a.observe_only=0 AND a.updated_at<=?3 AND (
-                       (successor.successor IS NOT NULL AND a.state IN ('stopped','failed','lost'))
+                       (successor.successor IS NOT NULL AND a.state IN ('stopped','failed','lost')
+                          AND (a.parent IS NULL OR {RESULT_READ}))
                        OR (a.parent IS NOT NULL AND a.state IN ('idle','stopped')
-                           AND a.origin='eliot' AND {READ_CHILD_RESULT}))))
+                           AND a.origin='eliot' AND {RESULT_READ}))))
                    AND NOT EXISTS (SELECT 1 FROM commands c WHERE c.target=a.id
                                     AND c.state IN ('accepted','queued','dispatched','unknown'))
                    AND NOT EXISTS (SELECT 1 FROM turns t WHERE t.agent=a.id AND t.state IN ('running','unknown'))
@@ -180,6 +170,12 @@ impl Store {
                                     AND json_extract(g.state,'$.status') IN ('active','paused','blocked'))
                    AND NOT EXISTS (SELECT 1 FROM goal_markers g WHERE g.agent=a.id)
                    AND NOT EXISTS (SELECT 1 FROM project_assignments p WHERE p.manager=a.id)
+                   AND NOT EXISTS (
+                       SELECT 1 FROM completion_digests digest
+                       LEFT JOIN messages mail ON mail.delivery_id=COALESCE(digest.transferred_mail_id,digest.delivered_mail_id)
+                          AND mail.recipient=a.id
+                       WHERE digest.parent=a.id AND mail.read_at IS NULL
+                   )
                    AND NOT EXISTS (
                        WITH RECURSIVE descendants(id,state,capacity_generation) AS (
                            SELECT id,state,capacity_generation FROM agents WHERE parent=a.id
@@ -191,6 +187,12 @@ impl Store {
                        WHERE d.state IN ('created','starting','idle','busy','waiting','unknown')
                           OR d.capacity_generation IS NOT NULL
                           OR d.id IN (SELECT value FROM json_each(?5))
+                          OR EXISTS (
+                              SELECT 1 FROM agents a JOIN turns latest
+                                ON latest.agent=a.id AND latest.generation=a.generation
+                               AND latest.turn_id=({LATEST_COMPLETED_CHILD_RESULT})
+                              WHERE a.id=d.id AND NOT {RESULT_READ}
+                          )
                    )
                    AND {WORKTREES_RESOLVED}
                  ORDER BY a.id"
