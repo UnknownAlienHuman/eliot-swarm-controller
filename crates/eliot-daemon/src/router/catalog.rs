@@ -998,6 +998,30 @@ impl Router {
                 "daemon is shutting down and rejects new discovery",
             ));
         }
+        if let Some(after) = request.after.as_deref() {
+            let snapshot = self
+                .inner
+                .catalog_cache
+                .lock_recover()
+                .aggregate
+                .clone()
+                .filter(|snapshot| {
+                    snapshot.is_usable()
+                        && after
+                            .split_once(':')
+                            .is_some_and(|(revision, _)| revision == snapshot.revision)
+                })
+                .ok_or_else(invalid_catalog_cursor)?;
+            if self.catalog_key(deadline).await.as_ref().ok() != Some(&snapshot.key) {
+                return Err(invalid_catalog_cursor());
+            }
+            let response = self.catalog_page(request, &snapshot, deadline).await?;
+            self.inner
+                .catalog_cache
+                .lock_recover()
+                .aggregate_requested_at = Some(Instant::now());
+            return Ok(response);
+        }
         let mut updates = self.inner.catalog_updates.subscribe();
         let snapshot = {
             let mut cache = self.inner.catalog_cache.lock_recover();
@@ -1016,7 +1040,7 @@ impl Router {
             Some(snapshot)
                 if key.as_ref() == Some(&snapshot.key)
                     && snapshot.is_usable()
-                    && (request.after.is_some() || !snapshot.refresh_due()) =>
+                    && !snapshot.refresh_due() =>
             {
                 snapshot
             }
@@ -1473,10 +1497,7 @@ impl Router {
                 prefix == revision && matched.any(|entry| entry.cursor() == row)
             })
         {
-            return Err(Error::new(
-                "invalid",
-                "catalogue cursor is no longer in the listing; restart from the first page",
-            ));
+            return Err(invalid_catalog_cursor());
         }
         let mut models: Vec<_> = matched.by_ref().take(limit).cloned().collect();
         let next = if matched.next().is_some() {
@@ -1551,6 +1572,13 @@ fn catalog_source_changed() -> Error {
     Error::new(
         "unavailable",
         "model catalogue source changed during refresh",
+    )
+}
+
+fn invalid_catalog_cursor() -> Error {
+    Error::new(
+        "invalid",
+        "catalogue cursor is no longer in the listing; restart from the first page",
     )
 }
 
