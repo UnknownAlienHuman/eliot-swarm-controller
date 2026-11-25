@@ -15,7 +15,7 @@ use rmcp::transport::streamable_http_server::session::{
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
-    path::Path,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex as StdMutex},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -108,8 +108,10 @@ impl Drop for SessionLifetime {
 }
 
 pub(super) struct OriginAuth {
+    /// Private data directory; grant audiences are reloaded from it on every
+    /// verification so grant add and revoke apply without a restart.
+    data_dir: PathBuf,
     issuer: String,
-    audiences: Vec<String>,
     client: reqwest::Client,
     keys: Mutex<Keys>,
     key_refresh: Mutex<()>,
@@ -206,7 +208,9 @@ impl OriginAuth {
     ) -> Result<Self, String> {
         let (issuer, _) = eliot_daemon::load_cloud_access_config(data_dir)
             .map_err(|error| format!("{}: {}", error.code, error.message))?;
-        let audiences = eliot_daemon::load_cloud_access_audiences(data_dir)
+        // Validate the grant table at startup (same failure as before) but do
+        // not retain the audiences: they are reloaded on every verification.
+        eliot_daemon::load_cloud_access_audiences(data_dir)
             .map_err(|error| format!("{}: {}", error.code, error.message))?;
         let client = reqwest::Client::builder()
             .https_only(true)
@@ -216,8 +220,8 @@ impl OriginAuth {
             .build()
             .map_err(|_| "origin verifier HTTP client unavailable")?;
         let auth = Self {
+            data_dir: data_dir.to_owned(),
             issuer,
-            audiences,
             client,
             key_refresh: Mutex::new(()),
             keys: Mutex::new(Keys {
@@ -370,11 +374,24 @@ impl OriginAuth {
         {
             return Err(StatusCode::UNAUTHORIZED);
         }
-        let mut matches = claims.aud.iter().filter(|claim_audience| {
-            self.audiences
-                .iter()
-                .any(|allowed| allowed == *claim_audience)
-        });
+        // Grant audiences are reloaded on every verification so a newly added
+        // grant is accepted and a revoked grant is rejected before the next
+        // request without a restart. Any config load failure (or an issuer
+        // change, which still needs a restart) fails closed. No token or
+        // secret is logged or persisted here.
+        let audiences = eliot_daemon::load_cloud_access_audiences(&self.data_dir)
+            .map_err(|_| StatusCode::UNAUTHORIZED)?;
+        if eliot_daemon::load_cloud_access_config(&self.data_dir)
+            .map_err(|_| StatusCode::UNAUTHORIZED)?
+            .0
+            != self.issuer
+        {
+            return Err(StatusCode::UNAUTHORIZED);
+        }
+        let mut matches = claims
+            .aud
+            .iter()
+            .filter(|claim_audience| audiences.iter().any(|allowed| allowed == *claim_audience));
         let selected = matches.next().cloned().ok_or(StatusCode::UNAUTHORIZED)?;
         if matches.next().is_some() {
             return Err(StatusCode::UNAUTHORIZED);
