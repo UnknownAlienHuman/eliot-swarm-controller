@@ -1145,6 +1145,14 @@ pub(super) fn handoff_tx(
         )
         .map_err(sql_error)?;
     }
+    events.extend(super::restart_queue::retire_sealed(
+        tx,
+        parse_agent_id(&from.id)?,
+        from.generation,
+        None,
+        "restart_agent_handed_off",
+        now,
+    )?);
     // The durable fact that this generation's work has moved. Automatic
     // handoff reads it so the same work is never moved twice.
     events.push(insert_daemon_event(

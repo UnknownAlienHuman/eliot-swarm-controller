@@ -113,6 +113,14 @@ fn dispatch_launch_tx(
     }
     workspace::gate_workspace_start(tx, agent, &command.command, 1)?;
     capacity::require_reservation_tx(tx, agent_num, 1)?;
+    events.extend(super::restart_queue::retire_sealed(
+        tx,
+        agent_num,
+        agent.generation,
+        None,
+        "restart_native_subject_changed",
+        now,
+    )?);
     let snapshot = native_store
         .map(|(expected, binding, startup)| {
             workspace::launch_snapshot_with_native_store(agent, expected, binding, startup, id)
@@ -277,6 +285,14 @@ fn dispatch_resume_tx(
     };
     workspace::gate_workspace_start(tx, agent, &command.command, next_generation)?;
     capacity::require_reservation_tx(tx, agent_num, next_generation)?;
+    events.extend(super::restart_queue::retire_sealed(
+        tx,
+        agent_num,
+        old_generation,
+        (!restart_fresh_native).then_some((native_scope, native_ref)),
+        "restart_native_subject_changed",
+        now,
+    )?);
     for old_id in pending_command_ids(tx, agent_num, agent.generation)? {
         if old_id == id || super::restart_queue::is_parked(tx, &old_id)? {
             continue;

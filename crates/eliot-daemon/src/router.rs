@@ -857,13 +857,15 @@ impl Router {
                 let request: eliot_core::api::AgentArchiveRequest =
                     eliot_core::api::discovery::decode_params(params.clone())?;
                 request.validate()?;
-                let response = self.inner.store.lock().await.archive_agent_tree(
+                let mut store = self.inner.store.lock().await;
+                let change = store.archive_agent_tree(
                     &request.id,
                     &request.agent,
                     request.archived,
                     now_ms(),
                 )?;
-                serde_json::to_value(response)
+                self.publish_locked(&change.events);
+                serde_json::to_value(change.value)
                     .map_err(|_| Error::new("internal", "Agent tree result encoding failed"))
             }
             "agent.delete" => self.agent_delete(&params, &principal).await,
