@@ -184,6 +184,22 @@ struct RuleFiringKey<'a> {
     child_id: String,
 }
 
+#[derive(serde::Serialize)]
+struct RuleCommandAccepted<'a> {
+    #[serde(flatten)]
+    firing: &'a Value,
+    command_id: &'a str,
+    children: &'a [String],
+}
+
+#[derive(serde::Serialize)]
+struct RuleFired<'a> {
+    #[serde(flatten)]
+    firing: &'a Value,
+    parent_command: &'a str,
+    child_command: &'a str,
+}
+
 impl<'a> RuleFiringKey<'a> {
     fn event(
         principal: &'a str,
@@ -223,20 +239,22 @@ impl<'a> RuleFiringKey<'a> {
         self.args["rate_agent"] = json!(agent);
     }
 
-    fn command_event_data(&self, children: Vec<String>) -> Value {
-        let mut data = self.args.clone();
-        let object = data.as_object_mut().expect("firing args are an object");
-        object.insert("command_id".to_owned(), json!(self.parent_id));
-        object.insert("children".to_owned(), json!(children));
-        data
+    fn command_event_data(&self, children: &[String]) -> Result<Value> {
+        serde_json::to_value(RuleCommandAccepted {
+            firing: &self.args,
+            command_id: &self.parent_id,
+            children,
+        })
+        .map_err(|_| Error::new("internal", "rule command event cannot encode"))
     }
 
-    fn fired_data(&self, child_id: &str) -> Value {
-        let mut data = self.args.clone();
-        let object = data.as_object_mut().expect("firing args are an object");
-        object.insert("parent_command".to_owned(), json!(self.parent_id));
-        object.insert("child_command".to_owned(), json!(child_id));
-        data
+    fn fired_data(&self, child_id: &str) -> Result<Value> {
+        serde_json::to_value(RuleFired {
+            firing: &self.args,
+            parent_command: &self.parent_id,
+            child_command: child_id,
+        })
+        .map_err(|_| Error::new("internal", "rule firing event cannot encode"))
     }
 
     fn rejected_data(&self, rejection: &Error) -> Value {
@@ -313,6 +331,23 @@ fn next_rule_cause_depth(trigger_cause: Option<&core::EventCause>) -> u8 {
 enum RuleParentOutcome<'a> {
     Admitted,
     Rejected { error: &'a Error },
+}
+
+#[derive(serde::Serialize)]
+struct RuleParentReply<'a> {
+    children: &'a [String],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    code: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    message: Option<String>,
+    #[serde(rename = "where", skip_serializing_if = "Option::is_none")]
+    failure_where: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    script_context: Option<&'a core::api::FrozenScriptContext>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rate_limit: Option<&'a core::api::RuleLimit>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rate_key_digest: Option<[u8; 32]>,
 }
 
 impl Store {
@@ -3221,40 +3256,25 @@ fn insert_rule_parent_with_event_mode(
     if write_exists(tx, &key.parent_id)? {
         return Err(Error::new("id_conflict", "rule parent id is already used"));
     }
-    let (child_ids, state, rejection_code) = match &outcome_kind {
+    let (child_ids, state, rejection) = match &outcome_kind {
         RuleParentOutcome::Admitted => (vec![key.child_id.clone()], CommandState::Applied, None),
-        RuleParentOutcome::Rejected { error } => (
-            Vec::new(),
-            CommandState::Rejected,
-            Some(error.code.as_str()),
-        ),
+        RuleParentOutcome::Rejected { error } => (Vec::new(), CommandState::Rejected, Some(*error)),
     };
     let args = &key.args;
-    let mut outcome = match rejection_code {
-        Some(code) => json!({"children": child_ids, "code": code}),
-        None => json!({"children": child_ids}),
-    };
-    if let RuleParentOutcome::Rejected { error } = &outcome_kind {
-        outcome["message"] = json!(bounded_rule_rejection_message(&error.message, &error.code,));
-        if let Some((_, where_)) = capacity_metadata(error) {
-            outcome["where"] = json!(where_);
-        }
-    }
-    if rejection_code.is_none()
-        && let Some(script_context) = &key.script_context
-    {
-        outcome["script_context"] = serde_json::to_value(script_context)
-            .map_err(|_| Error::new("internal", "timer script context cannot be encoded"))?;
-    }
-    if rejection_code.is_none()
-        && let Some(rate_limit) = &key.run_rate_limit
-    {
-        outcome["rate_limit"] = serde_json::to_value(rate_limit)
-            .map_err(|_| Error::new("internal", "rule rate policy cannot be encoded"))?;
-        if let Some(rate_key) = key.rate_key {
-            outcome["rate_key_digest"] = json!(rate_key);
-        }
-    }
+    let script_context = key.script_context.as_ref().filter(|_| rejection.is_none());
+    let rate_limit = key.run_rate_limit.as_ref().filter(|_| rejection.is_none());
+    let outcome = serde_json::to_value(RuleParentReply {
+        children: &child_ids,
+        code: rejection.map(|error| error.code.as_str()),
+        message: rejection.map(|error| bounded_rule_rejection_message(&error.message, &error.code)),
+        failure_where: rejection
+            .and_then(capacity_metadata)
+            .map(|(_, where_)| where_),
+        script_context,
+        rate_limit,
+        rate_key_digest: key.rate_key.filter(|_| rate_limit.is_some()),
+    })
+    .map_err(|_| Error::new("internal", "rule parent reply cannot encode"))?;
     let digest = match &key.parent_digest {
         Some(digest) => digest.clone(),
         None => canonical::digest(&json!({
@@ -3291,7 +3311,7 @@ fn insert_rule_parent_with_event_mode(
         Some(admit_command(
             tx,
             &command,
-            key.command_event_data(child_ids.clone()),
+            key.command_event_data(&child_ids)?,
         )?)
     } else {
         insert_command(tx, &command, &ordinary_command_cause(command.id))?;
@@ -3538,7 +3558,7 @@ fn admit_rule_action_tx(
         tx,
         now,
         "rule.fired",
-        key.fired_data(&child_id),
+        key.fired_data(&child_id)?,
         Some(parent_cause),
     )?);
     Ok((parent, child_admission, events))
