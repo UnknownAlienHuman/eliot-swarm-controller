@@ -97,6 +97,7 @@ mod windows {
     pub(crate) struct WorktreeWriteGuard {
         root: PathBuf,
         root_identity: String,
+        _ancestors: crate::platform::script_file::Directory,
         _parent: File,
         directories: Vec<DirectoryEntry>,
         _files: Vec<File>,
@@ -108,11 +109,16 @@ mod windows {
         /// Open and snapshot without changing ACLs. Persist journal() before activate().
         pub(crate) fn prepare(path: &Path) -> Result<Self> {
             let deadline = Instant::now() + FENCE_TIME;
-            let root = fs::canonicalize(path).map_err(|_| refused())?;
-            let parent = open_directory(root.parent().ok_or_else(refused)?, false)?;
+            // Pin the original ancestry and open the leaf without following
+            // a replacement reparse point.
+            let root = path.to_path_buf();
+            let parent_path = root.parent().ok_or_else(refused)?;
+            let ancestors = crate::platform::script_file::Directory::open(parent_path)?;
+            let parent = open_directory(parent_path, false)?;
             let mut guard = Self {
                 root: root.clone(),
                 root_identity: String::new(),
+                _ancestors: ancestors,
                 _parent: parent,
                 directories: Vec::new(),
                 _files: Vec::new(),
@@ -220,12 +226,10 @@ mod windows {
                     "worktree ACL journal is invalid",
                 ));
             }
-            let root = match fs::canonicalize(path) {
-                Ok(root) => root,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-                Err(_) => return Err(refused()),
-            };
-            let _parent = open_directory(root.parent().ok_or_else(refused)?, false)?;
+            if path_is_missing(path) {
+                return Ok(());
+            }
+            let _root = crate::platform::script_file::Directory::open(path)?;
             let mut handles = Vec::new();
             let mut seen = HashSet::new();
             for entry in &journal.entries {
@@ -235,7 +239,12 @@ mod windows {
                         "worktree ACL journal repeats a directory",
                     ));
                 }
-                let directory = journal_directory(&root, &entry.relative_path)?;
+                let directory = journal_directory(path, &entry.relative_path)?;
+                let _directory = match crate::platform::script_file::Directory::open(&directory) {
+                    Ok(guard) => guard,
+                    Err(_) if path_is_missing(&directory) => continue,
+                    Err(error) => return Err(error),
+                };
                 let handle = match open_directory(&directory, true) {
                     Ok(handle) => handle,
                     Err(_) if path_is_missing(&directory) => continue,

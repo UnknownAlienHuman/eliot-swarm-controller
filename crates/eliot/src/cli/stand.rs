@@ -159,8 +159,7 @@ pub(crate) async fn up(
         None => prepare(&root, &workspace, profiles).await,
     };
     if let Err(failure) = preparation {
-        drop(pinned_root);
-        super::cleanup::remove_dir_all(&root).map_err(|error| {
+        pinned_root.discard_unstarted().map_err(|error| {
             io_failure(
                 &format!(
                     "{}; remove incomplete stand {}",
@@ -248,9 +247,8 @@ pub(crate) async fn up(
             }
             Err(error) => {
                 drop(_transition);
-                drop(pinned_root);
                 let _ = remove_stand_registration(&registry, &reg_name);
-                let _ = super::cleanup::remove_dir_all(&root);
+                let _ = pinned_root.discard_unstarted();
                 return Err(Failure::for_mutation(error));
             }
         }

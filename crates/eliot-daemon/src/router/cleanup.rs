@@ -14,6 +14,7 @@ mod child_completion;
 mod delete;
 mod discovery;
 mod jobs;
+mod ownership;
 mod projects;
 
 const CLEANUP_BACKFILL_BATCH: usize = 8;
@@ -81,7 +82,20 @@ async fn open_cleanup_tree(
     clippy::disallowed_methods,
     reason = "Recursive directory removal is centralized in daemon cleanup."
 )]
-pub(crate) fn remove_dir_all(path: &Path) -> std::io::Result<()> {
+pub(crate) fn remove_dir_all(parent: &Directory, path: &Path) -> std::io::Result<()> {
+    let path = parent.direct_child_path(path)?;
+    let metadata = std::fs::symlink_metadata(&path)?;
+    if !metadata.is_dir()
+        || metadata.file_type().is_symlink()
+        || crate::platform::is_reparse_point(&metadata)
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "recursive cleanup requires a plain directory inside its pinned parent",
+        ));
+    }
+    // The standard recursive remover opens children without following links.
+    // Its absolute ancestors are pinned on Windows, and Linux uses the directory fd.
     std::fs::remove_dir_all(path)
 }
 
@@ -622,7 +636,7 @@ impl Router {
             .store
             .lock()
             .await
-            .record_known_artifact(ArtifactView {
+            .record_created_artifact(ArtifactView {
                 id: ulid::Ulid::new().to_string(),
                 agent: agent.id,
                 generation: agent.generation,
@@ -679,7 +693,7 @@ impl Router {
             state: "ownership_root".to_owned(),
             git: None,
         };
-        store.record_known_artifact(root.clone())?;
+        store.record_created_artifact(root.clone())?;
         if store
             .agent_artifact_root(&agent.id, agent.generation)?
             .as_ref()
@@ -817,6 +831,9 @@ impl Router {
             .registered_branches(&agent.id, agent.generation)?;
         for row in retained {
             let Some(git) = row.git.clone() else { continue };
+            if self.require_cleanup_ownership(&row).await.is_err() {
+                continue;
+            }
             let probe = crate::git_monitor::GitProbe::new()?;
             let Ok(tip) = probe
                 .workspace_command(
@@ -857,6 +874,10 @@ impl Router {
         workspace: eliot_core::WorkspacePreparation,
         known: &mut Vec<ArtifactView>,
     ) -> Result<()> {
+        crate::workspaces::require_managed_cleanup_path(
+            &self.inner.data_root,
+            Path::new(&workspace.worktree_path),
+        )?;
         match std::fs::symlink_metadata(&workspace.worktree_path) {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 return Err(Error::new(
@@ -1030,22 +1051,9 @@ impl Router {
     }
 
     fn current_managed_worktree_path(&self, path: &str) -> Result<PathBuf> {
-        let data_root = std::fs::canonicalize(&self.inner.data_root)
-            .map_err(|_| Error::new("unavailable", "daemon root unavailable"))?;
-        let managed_root = std::fs::canonicalize(data_root.join("worktrees"))
-            .map_err(|_| Error::new("not_allowed", "managed worktree root unavailable"))?;
-        let path = std::fs::canonicalize(path)
-            .map_err(|_| Error::new("not_allowed", "managed worktree unavailable"))?;
-        if managed_root.parent() != Some(data_root.as_path())
-            || path == managed_root
-            || !path.starts_with(&managed_root)
-        {
-            return Err(Error::new(
-                "not_allowed",
-                "worktree is outside this daemon's managed root",
-            ));
-        }
-        Ok(path)
+        crate::workspaces::require_managed_cleanup_path(&self.inner.data_root, Path::new(path))?;
+        std::fs::canonicalize(path)
+            .map_err(|_| Error::new("not_allowed", "managed worktree unavailable"))
     }
 
     async fn checked_cleanup_artifact_path(
@@ -1639,6 +1647,11 @@ impl Router {
             {
                 break;
             }
+            if let Err(error) = self.require_cleanup_ownership(&candidate.artifact).await {
+                cleanup_plan_refusal(&mut candidate, bulk, error);
+                middle.push(candidate);
+                continue;
+            }
             let mut retention_reason = None;
             if let Some(retention_ms) = auto_cleanup_after_ms {
                 match self
@@ -2033,6 +2046,7 @@ impl Router {
         automatic: bool,
         observe_missing: bool,
     ) -> Result<Option<String>> {
+        self.require_cleanup_ownership(artifact).await?;
         if !cfg!(windows) {
             return Err(Error::new(
                 "unsupported",
@@ -2473,6 +2487,7 @@ impl Router {
         artifact: &ArtifactView,
         scan_budget: Duration,
     ) -> Result<(u64, bool)> {
+        let owned_path = self.require_cleanup_ownership(artifact).await?;
         if artifact.kind == ArtifactKind::NativeSession {
             // The archive itself runs at apply through the harness native
             // API; the plan verdict already gated harness and quiescence.
@@ -2515,6 +2530,7 @@ impl Router {
         let path = self
             .checked_cleanup_artifact_path(&agent, artifact, false)
             .await?;
+        require_same_cleanup_path(owned_path.as_deref(), &path)?;
         self.cleanup_check_git(&agent, &path, artifact.is_owned_cleanup_child())
             .await?;
         if is_stand_artifact(artifact) {
@@ -2761,6 +2777,7 @@ impl Router {
         automatic: bool,
     ) -> Result<CleanupRemoval> {
         let artifact = &item.artifact;
+        let owned_path = self.require_cleanup_ownership(artifact).await?;
         if artifact.kind == ArtifactKind::Branch {
             let git = artifact
                 .git
@@ -2946,6 +2963,7 @@ impl Router {
         let path = self
             .checked_cleanup_artifact_path(&agent, artifact, true)
             .await?;
+        require_same_cleanup_path(owned_path.as_deref(), &path)?;
         self.cleanup_check_git(&agent, &path, artifact.is_owned_cleanup_child())
             .await?;
         if is_stand_artifact(artifact) {
@@ -3931,6 +3949,10 @@ impl Router {
             verdict: "keep".to_owned(),
             reason: "retirement_preflight".to_owned(),
         };
+        if let Err(error) = self.require_cleanup_ownership(&candidate.artifact).await {
+            candidate.reason = error.code;
+            return candidate;
+        }
         if candidate.artifact.kind == ArtifactKind::Worktree {
             self.classify_worktree(&mut candidate, false, false, true)
                 .await;
@@ -4097,6 +4119,16 @@ fn cleanup_operation_failed(code: &str) -> bool {
         code,
         "internal" | "platform_io" | "store_io" | "source_integrity"
     )
+}
+
+fn require_same_cleanup_path(owned_path: Option<&Path>, checked: &Path) -> Result<()> {
+    if owned_path != Some(checked) {
+        return Err(Error::new(
+            "identity_changed",
+            "cleanup path changed after custody verification",
+        ));
+    }
+    Ok(())
 }
 
 fn cleanup_plan_refusal(candidate: &mut CleanupCandidate, bulk: bool, error: Error) {

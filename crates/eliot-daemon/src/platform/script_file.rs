@@ -35,6 +35,54 @@ pub(crate) struct Directory {
     pub(crate) path: PathBuf,
 }
 
+/// Resolve a cleanup directory with no links in its existing ancestry.
+/// Missing suffixes are retained so absence cannot waive path custody.
+pub(crate) fn canonical_cleanup_path(path: &Path) -> Result<PathBuf> {
+    if !path.is_absolute()
+        || path
+            .components()
+            .any(|part| matches!(part, Component::CurDir | Component::ParentDir))
+    {
+        return Err(refused());
+    }
+    for prefix in path.ancestors() {
+        match std::fs::symlink_metadata(prefix) {
+            Ok(_) => {
+                let _directory = Directory::open(prefix)?;
+                let resolved = std::fs::canonicalize(prefix).map_err(|_| refused())?;
+                let suffix = path.strip_prefix(prefix).map_err(|_| refused())?;
+                return Ok(resolved.join(suffix));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return Err(refused()),
+        }
+    }
+    Err(refused())
+}
+
+pub(crate) fn cleanup_canonical_path_in_root(path: &Path, root: &Path) -> Result<bool> {
+    match std::fs::symlink_metadata(root) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(_) => return Err(refused()),
+        Ok(_) => {}
+    }
+    let _directory = Directory::open(root).map_err(|_| unsafe_cleanup_root())?;
+    let canonical = std::fs::canonicalize(root).map_err(|_| unsafe_cleanup_root())?;
+    if eliot_core::workspace_path_key(&root.to_string_lossy())
+        != eliot_core::workspace_path_key(&canonical.to_string_lossy())
+    {
+        return Err(unsafe_cleanup_root());
+    }
+    Ok(path != canonical && path.starts_with(canonical))
+}
+
+fn unsafe_cleanup_root() -> Error {
+    Error::new(
+        "unsafe_cleanup_root",
+        "cleanup root must be a plain directory at its canonical location",
+    )
+}
+
 #[cfg(unix)]
 const STAGED_FILE: &str = "data";
 
@@ -46,6 +94,27 @@ struct StagedFile {
 }
 
 impl Directory {
+    pub(crate) fn direct_child_path(&self, child: &Path) -> std::io::Result<PathBuf> {
+        let name = child
+            .file_name()
+            .filter(|_| child.parent() == Some(self.path.as_path()));
+        let name = name.ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "not a direct cleanup child",
+            )
+        })?;
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::fd::AsRawFd;
+            Ok(PathBuf::from(format!("/proc/self/fd/{}", self.handle().as_raw_fd())).join(name))
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            Ok(self.path.join(name))
+        }
+    }
+
     pub(crate) fn open(path: &Path) -> Result<Self> {
         if !path.is_absolute() {
             return Err(refused());
@@ -474,6 +543,53 @@ impl Directory {
         native::sync(self.handle())
             .map_err(|_| Error::new("unknown", "rule file deleted but directory sync failed"))?;
         Ok(())
+    }
+
+    /// Delete the exact verified image without clearing attributes by path.
+    /// The updater owns the transition lock and the directory pin.
+    pub(crate) fn remove_update_image(
+        &self,
+        name: &str,
+        expected_digest: Option<&str>,
+    ) -> Result<bool> {
+        plain(name)?;
+        #[cfg(windows)]
+        let mut file = {
+            let file = native::open_cleanup(self.handle(), name.as_ref(), false)
+                .map_err(cleanup_open_error)?;
+            cleanup_file_size(&file)?;
+            file
+        };
+        #[cfg(unix)]
+        let mut file = self.file(name)?;
+        if native::links(&file).map_err(io)? != 1 {
+            return Err(Error::new(
+                "external_hard_link",
+                "staged image has another link",
+            ));
+        }
+        if let Some(expected) = expected_digest
+            && crate::operator::binary_reader_sha256(&mut file)? != expected
+        {
+            return Ok(false);
+        }
+        #[cfg(windows)]
+        {
+            require_single_cleanup_link(&file)?;
+            native::delete_cleanup_entry(&file).map_err(cleanup_open_error)?;
+        }
+        #[cfg(unix)]
+        {
+            let current = self.file(name)?;
+            if eliot_plugin::file_identity(&file).map_err(io)?
+                != eliot_plugin::file_identity(&current).map_err(io)?
+                || native::links(&current).map_err(io)? != 1
+            {
+                return Err(conflict());
+            }
+            native::unlink_file(self.handle(), name).map_err(io)?;
+        }
+        Ok(true)
     }
 }
 

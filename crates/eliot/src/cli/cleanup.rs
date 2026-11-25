@@ -5,14 +5,6 @@ use super::{
 use eliot_core::api::*;
 use std::path::PathBuf;
 
-#[expect(
-    clippy::disallowed_methods,
-    reason = "Recursive directory removal is centralized in CLI cleanup."
-)]
-pub(super) fn remove_dir_all(path: &std::path::Path) -> std::io::Result<()> {
-    std::fs::remove_dir_all(path)
-}
-
 /// Remove only verified, inactive images owned by the updater in this release
 /// directory. Linux can unlink a mapped image while its running process keeps
 /// the inode; Windows refuses deletion while a process has the image mapped.
@@ -25,7 +17,7 @@ pub(super) fn prune_update_images(
 ) -> Result<(), String> {
     let directory = eliot_daemon::operator::update_images_directory(data_root)
         .map_err(|error| error.to_string())?;
-    let entries = std::fs::read_dir(directory)
+    let entries = std::fs::read_dir(directory.path())
         .map_err(|error| format!("inspect staged image directory: {error}"))?;
     for entry in entries {
         let entry = entry.map_err(|error| format!("read staged image directory: {error}"))?;
@@ -49,54 +41,9 @@ pub(super) fn prune_update_images(
         if eliot_daemon::operator::validate_update_image(&path).is_err() {
             continue;
         }
-        let metadata = std::fs::symlink_metadata(&path)
-            .map_err(|error| format!("inspect staged image {}: {error}", path.display()))?;
-        if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
-            continue;
-        }
-        match eliot_daemon::operator::binary_sha256(&path) {
-            Ok(hash) if hash == digest => {}
-            _ => continue,
-        }
-        #[cfg(windows)]
-        {
-            let mut permissions = metadata.permissions();
-            #[expect(
-                clippy::permissions_set_readonly_false,
-                reason = "Windows requires clearing the read-only attribute before pruning an inactive staged image"
-            )]
-            permissions.set_readonly(false);
-            std::fs::set_permissions(&path, permissions).map_err(|error| {
-                format!(
-                    "prepare staged image {} for removal: {error}",
-                    path.display()
-                )
-            })?;
-        }
-        if let Err(error) = std::fs::remove_file(&path) {
-            #[cfg(windows)]
-            {
-                let mut permissions = std::fs::metadata(&path)
-                .map_err(|restore| {
-                    format!(
-                        "remove inactive staged image {} failed: {error}; cannot restore its permissions: {restore}",
-                        path.display()
-                    )
-                })?
-                .permissions();
-                permissions.set_readonly(true);
-                std::fs::set_permissions(&path, permissions).map_err(|restore| {
-                format!(
-                    "remove inactive staged image {} failed: {error}; cannot restore read-only protection: {restore}",
-                    path.display()
-                )
-            })?;
-            }
-            return Err(format!(
-                "remove inactive staged image {}: {error}",
-                path.display()
-            ));
-        }
+        directory
+            .remove_image(&path, Some(digest))
+            .map_err(|error| format!("remove inactive staged image {}: {error}", path.display()))?;
     }
     Ok(())
 }
