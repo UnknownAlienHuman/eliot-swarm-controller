@@ -1080,6 +1080,7 @@ impl Router {
     ) -> Result<()> {
         let mut tick = tokio::time::interval(CATALOG_REFRESH_INTERVAL);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        self.note_worker_task_running("catalog_refresh");
         while !*shutdown.borrow() {
             tokio::select! {
                 _ = shutdown.changed() => break,
