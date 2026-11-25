@@ -385,7 +385,6 @@ impl PluginHost {
                 &profile,
                 &environment,
                 None,
-                false,
             )
             .await;
         let mut reader = match opened.result {
@@ -495,7 +494,6 @@ impl PluginHost {
                 &profile,
                 &environment,
                 None,
-                false,
             )
             .await;
         let mut reader = match opened.result {
@@ -673,7 +671,6 @@ impl PluginHost {
                 profile,
                 environment,
                 None,
-                false,
             )
             .await;
         let mut reader = match opened.result {
@@ -854,7 +851,6 @@ impl PluginHost {
                 &params.profile,
                 &params.target_environment,
                 None,
-                false,
             )
             .await;
         let mut reader = match opened.result {
@@ -954,7 +950,7 @@ impl PluginHost {
             };
         };
         let opened = self
-            .open_reader_with_cleanup(
+            .open_reader_with_policy(
                 &AgentKey {
                     id: "discovery".to_owned(),
                     generation: 0,

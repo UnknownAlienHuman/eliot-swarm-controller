@@ -58,20 +58,32 @@ impl ReaderOpen {
 }
 
 impl PluginHost {
-    pub(super) async fn open_reader(
+    pub(super) async fn open_observation_reader(
+        &self,
+        key: &AgentKey,
+        harness: &str,
+        profile: &Value,
+        environment: &Value,
+        observation: &Agent,
+    ) -> Result<ReaderTransport> {
+        self.open_reader_with_policy(key, harness, profile, environment, Some(observation), true)
+            .await
+            .result
+    }
+
+    pub(super) async fn open_reader_with_cleanup(
         &self,
         key: &AgentKey,
         harness: &str,
         profile: &Value,
         environment: &Value,
         observation: Option<&Agent>,
-    ) -> Result<ReaderTransport> {
-        self.open_reader_with_cleanup(key, harness, profile, environment, observation, true)
+    ) -> ReaderOpen {
+        self.open_reader_with_policy(key, harness, profile, environment, observation, false)
             .await
-            .result
     }
 
-    pub(super) async fn open_reader_with_cleanup(
+    pub(super) async fn open_reader_with_policy(
         &self,
         key: &AgentKey,
         harness: &str,
