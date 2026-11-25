@@ -219,8 +219,14 @@ async fn run_update(
     let previous_binary = running_binary(&old).map_err(Failure::for_read)?;
     let previous_hash = binary_sha256(&previous_binary).map_err(Failure::for_read)?;
     let binary = release_binary(&source)?;
+    // Stage a content-addressed copy before inspecting it. The original path can
+    // change while the update drains; metadata, preflight, and spawn must all use
+    // the same staged bytes.
+    let (launch_binary, sha256) = prepare_update_release(&binary)?;
+    #[cfg(windows)]
+    let _launch_pin = pin_update_release(&launch_binary, &sha256)?;
     let previous = release_info(&previous_binary).await?;
-    let candidate = release_info(&binary).await?;
+    let candidate = release_info(&launch_binary).await?;
     if candidate.store_schema < previous.store_schema {
         return Err(Failure::new(
             2,
@@ -236,14 +242,13 @@ async fn run_update(
             "both releases must support updates with a Store backup",
         ));
     }
-    let sha256 = binary_sha256(&binary).map_err(Failure::for_read)?;
     #[cfg(windows)]
     let desktop = desktop_binary(&binary)?;
     let _transition = lock_transition(&data_dir).map_err(Failure::for_read)?;
     check_same_daemon(&data_dir, &old)?;
     let startup_path = replacement_data_dir(&data_dir, &old).map_err(Failure::for_read)?;
-    preflight_store(&startup_path, &binary).await?;
-    if binary_sha256(&binary).map_err(Failure::for_read)? != sha256 {
+    preflight_store(&startup_path, &launch_binary).await?;
+    if binary_sha256(&launch_binary).map_err(Failure::for_read)? != sha256 {
         return Err(Failure::new(
             2,
             "replacement binary changed during preflight",
@@ -366,7 +371,7 @@ async fn run_update(
         );
         return Ok(error.exit_code);
     }
-    let replacement = match start_update(&startup_path, &binary, backup.id).await {
+    let replacement = match start_update(&startup_path, &launch_binary, backup.id).await {
         Ok(info) => info,
         Err(error) => {
             return Ok(rollback(
@@ -465,7 +470,7 @@ async fn run_update(
             "previous_pid": old.pid, "pid": replacement.pid,
             "deadline_policy": mode, "interrupted_agents": interruptions,
             "commit_reply_uncertain": commit_reply_uncertain,
-            "binary": eliot_core::display_path(&binary.to_string_lossy()), "version": candidate.version,
+            "binary": eliot_core::display_path(&launch_binary.to_string_lossy()), "version": candidate.version,
             "sha256": sha256, "desktop": desktop,
             "backup": backup.retained(), "backup_cleanup_error": backup_cleanup.as_ref().map(ToString::to_string),
             "agents_before": before, "agents_after": observe_agents(&data_dir, &before).await,
@@ -1321,6 +1326,95 @@ fn release_binary(source: &Path) -> Result<PathBuf, Failure> {
         ));
     }
     Ok(path)
+}
+
+/// Create or verify a versioned launch image beside the supplied release. Its
+/// parent is intentionally the release directory so the child keeps the same
+/// working-directory semantics as a direct launch. Existing content-addressed
+/// images are accepted only after their bytes match the name's digest.
+fn prepare_update_release(source: &Path) -> Result<(PathBuf, String), Failure> {
+    let digest = binary_sha256(source).map_err(Failure::for_read)?;
+    let artifact = source.with_file_name(format!(
+        ".swarm-release-{digest}{}",
+        std::env::consts::EXE_SUFFIX
+    ));
+    let artifact_metadata = match std::fs::symlink_metadata(&artifact) {
+        Ok(metadata) if metadata.file_type().is_file() => Some(metadata),
+        Ok(_) => {
+            return Err(Failure::new(
+                2,
+                "versioned release image path is not a regular file",
+            ));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => {
+            return Err(Failure::new(
+                2,
+                format!("inspect versioned release image path: {error}"),
+            ));
+        }
+    };
+    if artifact_metadata.is_none() {
+        let mut input = std::fs::File::open(source)
+            .map_err(|error| Failure::new(2, format!("open selected release: {error}")))?;
+        let output = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&artifact)
+            .map_err(|error| {
+                if error.kind() == std::io::ErrorKind::AlreadyExists {
+                    Failure::new(2, "versioned release image appeared while staging")
+                } else {
+                    Failure::new(2, format!("create versioned release image: {error}"))
+                }
+            })?;
+        if let Err(error) = std::io::copy(&mut input, &mut output).and_then(|_| output.sync_all()) {
+            let _ = std::fs::remove_file(&artifact);
+            return Err(Failure::new(
+                2,
+                format!("stage versioned release image: {error}"),
+            ));
+        }
+    }
+    let mut permissions = std::fs::metadata(source)
+        .map_err(|error| Failure::new(2, format!("inspect selected release: {error}")))?
+        .permissions();
+    permissions.set_readonly(true);
+    if let Err(error) = std::fs::set_permissions(&artifact, permissions) {
+        return Err(Failure::new(
+            2,
+            format!("protect versioned release image: {error}"),
+        ));
+    }
+    let staged_digest = binary_sha256(&artifact).map_err(Failure::for_read)?;
+    if staged_digest != digest {
+        return Err(Failure::new(
+            2,
+            "versioned release image bytes do not match the selected release",
+        ));
+    }
+    Ok((artifact, staged_digest))
+}
+
+/// Keep a Windows handle open from before preflight through candidate health
+/// validation. Allowing readers lets the image loader run; denying write/delete
+/// prevents replacement of the verified path while the update is in flight.
+#[cfg(windows)]
+fn pin_update_release(path: &Path, expected_sha256: &str) -> Result<std::fs::File, Failure> {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    let pin = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(1) // FILE_SHARE_READ
+        .open(path)
+        .map_err(|error| Failure::new(2, format!("pin versioned release image: {error}")))?;
+    if binary_sha256(path).map_err(Failure::for_read)? != expected_sha256 {
+        return Err(Failure::new(
+            2,
+            "versioned release image changed before it could be pinned",
+        ));
+    }
+    Ok(pin)
 }
 
 #[derive(serde::Deserialize)]
