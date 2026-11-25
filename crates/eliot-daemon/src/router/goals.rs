@@ -573,6 +573,26 @@ impl Router {
             .map_err(|_| Error::new("internal", "goal state could not be encoded"))
     }
 
+    pub(super) async fn goal_round_close(
+        &self,
+        params: &Value,
+        principal: &Principal,
+    ) -> Result<Value> {
+        let request: eliot_core::api::GoalRoundCloseRequest = decode_goal_request(
+            params,
+            principal,
+            &self.inner.secrets,
+            "goal.round.close",
+            eliot_core::api::GoalRoundCloseRequest::validate,
+        )?;
+        let mut store = self.inner.store.lock().await;
+        let change = store.goal_round_close(&request, now_ms())?;
+        self.publish_locked(&change.events);
+        request.validate_response(&change.value)?;
+        serde_json::to_value(change.value)
+            .map_err(|_| Error::new("internal", "Goal round close receipt could not be encoded"))
+    }
+
     pub(super) async fn goal_round(&self, params: &Value, principal: &Principal) -> Result<Value> {
         self.goal_round_with(params, principal, real_goal_check)
             .await

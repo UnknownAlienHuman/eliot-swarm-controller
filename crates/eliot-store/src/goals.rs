@@ -4,9 +4,9 @@
 use super::*;
 use eliot_core::api::{
     CHECK_SPAWN_RETRYABLE, CommandSubmitResponse, GoalContinuationStage, GoalCounters,
-    GoalDefinition, GoalMarkerState, GoalMode, GoalRoundEvent, GoalRoundEventOutcome,
-    GoalRoundMarker, GoalRoundOutcome, GoalRoundRequest, GoalRoundResponse, GoalStatus, GoalView,
-    MAX_GOAL_OBSERVATION_BYTES,
+    GoalDefinition, GoalMarkerState, GoalMode, GoalRoundCloseRequest, GoalRoundCloseResponse,
+    GoalRoundEvent, GoalRoundEventOutcome, GoalRoundMarker, GoalRoundOutcome, GoalRoundRequest,
+    GoalRoundResponse, GoalStatus, GoalView, MAX_GOAL_OBSERVATION_BYTES,
 };
 use serde::{Deserialize, Serialize};
 
@@ -1723,6 +1723,171 @@ impl Store {
         })();
         self.fault_on_persistence_error(&result);
         result?.transpose()
+    }
+
+    /// The Owner may attest to a burned checker in an older generation.
+    /// The round remains unknown and its key is never replayed.
+    pub fn goal_round_close(
+        &mut self,
+        request: &GoalRoundCloseRequest,
+        now: i64,
+    ) -> Result<Change<GoalRoundCloseResponse>> {
+        const METHOD: &str = "goal.round.close";
+        const OWNER: &str = "owner";
+        self.ensure_writer_healthy()?;
+        request.validate()?;
+        validate_ulid(&request.id)?;
+        let agent = parse_agent_id(&request.agent)?;
+        let (kind, key) = request.round_key()?;
+        let digest = canonical::digest(&json!({
+            "agent": request.agent, "round": request.round,
+            "generation": request.generation, "revision": request.revision,
+        }))?;
+        let result = (|| {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            if let Some(value) = replay_goal_write(&tx, &request.id, OWNER, METHOD, &digest)? {
+                commit_transaction(tx, &self.write_faulted)?;
+                return Ok(Change {
+                    value,
+                    events: Vec::new(),
+                });
+            }
+            validate_id_age(&request.id, now)?;
+            let matches = {
+                let mut statement = tx
+                    .prepare(
+                        "SELECT g.generation, g.revision, g.updated_at FROM goal_markers g
+                     JOIN agents a ON a.id=g.agent
+                     WHERE g.agent=?1 AND g.mode='eliot' AND g.generation<a.generation
+                       AND g.state='unknown' AND g.round_key_kind=?2 AND g.round_key=?3
+                       AND (?4 IS NULL OR g.generation=?4) AND (?5 IS NULL OR g.revision=?5)
+                     LIMIT 2",
+                    )
+                    .map_err(sql_error)?;
+                statement
+                    .query_map(
+                        params![agent, kind, key, request.generation, request.revision],
+                        |row| {
+                            Ok((
+                                row.get::<_, i64>(0)?,
+                                row.get::<_, i64>(1)?,
+                                row.get::<_, i64>(2)?,
+                            ))
+                        },
+                    )
+                    .map_err(sql_error)?
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .map_err(sql_error)?
+            };
+            let [(generation, revision, updated_at)] = matches.as_slice() else {
+                return Err(if matches.is_empty() {
+                    Error::new(
+                        "not_found",
+                        "no matching burned Goal round in an older generation",
+                    )
+                } else {
+                    Error::new(
+                        "invalid",
+                        "round matches multiple historical markers; specify generation and revision",
+                    )
+                });
+            };
+            let prior = tx
+                .query_row(
+                    "SELECT seq, kind, json_extract(data,'$.id')
+                 FROM events INDEXED BY events_agent
+                 WHERE agent=?1 AND generation=?2 AND ts=?3 AND source='daemon'
+                   AND (kind='goal.check_custody_closed'
+                     OR (kind='goal.check_custody_asserted' AND json_extract(data,'$.principal')='owner'))
+                   AND json_extract(data,'$.mode')='eliot'
+                   AND json_extract(data,'$.revision')=?4 AND json_extract(data,'$.round_key')=?5
+                 ORDER BY seq DESC LIMIT 1",
+                    params![agent, generation, updated_at, revision, request.round],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, Option<String>>(2)?)),
+                )
+                .optional()
+                .map_err(sql_error)?;
+            if let Some((event_seq, closure_kind, id)) = prior {
+                if closure_kind == "goal.check_custody_asserted" {
+                    let id = id.ok_or_else(|| {
+                        Error::new("source_integrity", "Goal assertion lacks its write id")
+                    })?;
+                    validate_ulid(&id)?;
+                    let value = GoalRoundCloseResponse {
+                        id,
+                        agent: request.agent.clone(),
+                        round: request.round.clone(),
+                        generation: *generation,
+                        revision: *revision,
+                        event_seq,
+                    };
+                    retain_goal_result(&tx, &request.id, OWNER, METHOD, &digest, &value, now)?;
+                    commit_transaction(tx, &self.write_faulted)?;
+                    return Ok(Change {
+                        value,
+                        events: Vec::new(),
+                    });
+                }
+                return Err(Error::new(
+                    "bad_state",
+                    "Goal round custody is already closed",
+                ));
+            }
+            // Legacy rows cannot identify the checker more finely than its
+            // owned generation. Treat all unexited custody there as a fence.
+            let live = tx
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM processes INDEXED BY processes_owner
+                 WHERE owner IN (?1, ?2) AND state IN ('running', 'unknown'))",
+                    params![
+                        ProcessSourceKind::Agent.owner(&request.agent, *generation),
+                        ProcessSourceKind::Workspace.owner(&request.agent, *generation),
+                    ],
+                    |row| row.get::<_, bool>(0),
+                )
+                .map_err(sql_error)?;
+            if live {
+                return Err(Error::new(
+                    "busy",
+                    "historical Goal generation still owns unexited processes",
+                ));
+            }
+            db!(tx.execute(
+                "UPDATE goal_markers SET custody_closed=1, updated_at=?1
+                 WHERE agent=?2 AND mode='eliot' AND generation=?3 AND revision=?4
+                   AND round_key_kind=?5 AND round_key=?6",
+                params![now, agent, generation, revision, kind, key],
+            ));
+            let event = insert_daemon_event(
+                &tx,
+                now,
+                "goal.check_custody_asserted",
+                "goal",
+                Some(agent),
+                Some(*generation),
+                json!({"id": request.id, "principal": OWNER, "mode": "eliot",
+                       "revision": revision, "round_key": request.round}),
+            )?;
+            let value = GoalRoundCloseResponse {
+                id: request.id.clone(),
+                agent: request.agent.clone(),
+                round: request.round.clone(),
+                generation: *generation,
+                revision: *revision,
+                event_seq: event.seq,
+            };
+            retain_goal_result(&tx, &request.id, OWNER, METHOD, &digest, &value, now)?;
+            commit_transaction(tx, &self.write_faulted)?;
+            Ok(Change {
+                value,
+                events: vec![event],
+            })
+        })();
+        self.fault_on_persistence_error(&result);
+        result
     }
 
     /// Keep the original error and release single-flight only on quiescence.

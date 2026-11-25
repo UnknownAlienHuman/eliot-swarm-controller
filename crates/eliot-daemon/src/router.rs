@@ -985,6 +985,7 @@ impl Router {
             "goal.clear" => self.goal_clear(&params, &principal).await,
             "goal.resume" => self.goal_resume(&params, &principal).await,
             "goal.round" => self.goal_round(&params, &principal).await,
+            "goal.round.close" => self.goal_round_close(&params, &principal).await,
             "owner.inbox" => self.owner_inbox(&params, &principal, false).await,
             "owner.inbox.aged" => self.owner_inbox(&params, &principal, true).await,
             "owner.decide" => self.owner_decide(&params, &principal, context).await,
