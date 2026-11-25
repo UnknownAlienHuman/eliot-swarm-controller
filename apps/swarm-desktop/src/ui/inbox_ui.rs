@@ -244,7 +244,13 @@ impl DesktopApp {
     pub(super) fn inbox_update(&mut self, msg: InboxMsg, context: &ComponentContext<Self>) {
         match msg {
             InboxMsg::Status(Ok(status)) => {
+                let before = self.panel_counts();
                 self.inbox.counts = status.owner_inbox;
+                // A decision appeared or left: the open conversation's
+                // panel reads the inbox again.
+                if self.panel_counts() != before {
+                    self.read_decisions(context);
+                }
                 self.inbox.profile_command_issues = status.profile_command_issues;
             }
             // The last counts stay; the daemon's own notice speaks for it.

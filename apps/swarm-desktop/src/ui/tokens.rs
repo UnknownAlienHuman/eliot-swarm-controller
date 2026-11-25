@@ -217,7 +217,6 @@ pub mod layout {
     pub const TREE_INDENT: f64 = 28.0;
     pub const COMPOSER_MAX_HEIGHT: f64 = 200.0;
     pub const COMPOSER_MIN_HEIGHT: f64 = 44.0;
-    pub const SPLIT_MENU: f64 = 34.0;
     pub const SOURCE_MIN_HEIGHT: f64 = 240.0;
     pub const SOURCE_MAX_HEIGHT: f64 = 420.0;
     /// The hand-off dialog: ContentDialog's maximum.

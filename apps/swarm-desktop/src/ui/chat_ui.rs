@@ -43,6 +43,8 @@ pub(super) enum ChatMsg {
     ToolsToggled(String, bool),
     CopyPart(String),
     CopyCode(String, usize),
+    /// Copy a step's retained output (its part key).
+    CopyOutput(String),
     /// Send, Steer or Resume with the draft, bound when it was clicked.
     DraftRequested(DraftAction),
     /// Retry the unresolved submission with its saved action, body, ledger
@@ -58,9 +60,6 @@ pub(super) enum ChatMsg {
     /// Approve or deny the request, with the offered choice when it has
     /// choices.
     ApprovalRequested(UiPending, bool, Option<String>),
-    /// An approve choice from the split Approve's menu, by its label: the
-    /// request shown when the click is handled.
-    ApproveChoice(String),
     /// The open Agent's goal (`goal.get`), for the Agent it was read for.
     GoalRead(String, Fallible<Option<Box<eliot_core::api::GoalView>>>),
     /// The open Agent's inbox items (`owner.inbox`), for the decision panel.
@@ -78,6 +77,8 @@ pub(super) enum ChatMsg {
     DecideReason(String),
     /// Previous (-1) or next (1) item of the decision panel.
     DecisionStep(i32),
+    /// Check again: read the open Agent and its inbox items anew.
+    DecisionsRecheck,
     /// Wait out the hold: the strip hides until the hold changes.
     HoldWait,
     /// Clear the hold with the owner's evidence.
@@ -364,6 +365,18 @@ impl DraftAction {
     }
 }
 
+/// What decides whether the decision panel reads the inbox again: the
+/// open Agent, its pending requests, an unknown state, an unconfirmed
+/// outcome in its history and the daemon's panel counts.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct DecisionFacts {
+    pub(super) agent: String,
+    pub(super) pending: usize,
+    pub(super) unknown: bool,
+    pub(super) unconfirmed: bool,
+    pub(super) counts: [usize; 3],
+}
+
 /// An unconfirmed submission kept with the draft: the exact action, body,
 /// mutation id and ledger key to retry. The next identical Send reuses this
 /// snapshot instead of rederiving identity, which could admit a second
@@ -455,7 +468,18 @@ pub(super) struct ChatState {
     pub(super) goal: Option<(String, Option<eliot_core::api::GoalView>)>,
     /// The open Agent's `owner.inbox` items (requests, unconfirmed
     /// outcomes), for the decision panel.
-    pub(super) decisions: Option<(String, Vec<eliot_core::api::OwnerInboxItem>)>,
+    pub(super) decisions: Option<(String, Vec<eliot_core::api::OwnerInboxItem>, i64)>,
+    /// The facts the decision panel's last `owner.inbox` read was asked
+    /// for: a detail refresh with the same facts reads nothing.
+    pub(super) decisions_facts: Option<DecisionFacts>,
+    /// That read is in flight: another request waits for its reply.
+    pub(super) decisions_reading: bool,
+    /// The facts changed while the read was in flight: read again on its
+    /// reply.
+    pub(super) decisions_again: bool,
+    /// The last `owner.inbox` read for the panel failed: what it shows is
+    /// as of `decisions`' time, and it says so.
+    pub(super) decisions_error: Option<String>,
     /// The provider holds with their scopes, read while the open Agent is
     /// held.
     pub(super) holds: Option<(String, Fallible<Vec<eliot_core::ProviderHold>>)>,
@@ -593,7 +617,6 @@ impl DesktopApp {
                         self.check_loss(context);
                         self.sync_open_agent();
                         self.ensure_catalog(context);
-                        self.read_conversation_extras(context);
                         let cursor = snapshot.coverage.cursor;
                         let mut generation_changed = false;
                         if let Some(convo) = self.chat.convo.as_mut() {
@@ -613,6 +636,10 @@ impl DesktopApp {
                             });
                         }
                         self.rebuild_items();
+                        // After the history is in place: the panel's read
+                        // looks at its unconfirmed turns (a restart showed
+                        // no Resolve card when this ran on the empty one).
+                        self.read_conversation_extras(context);
                         if generation_changed {
                             self.follow_next(
                                 Next::Resnapshot {
@@ -750,6 +777,10 @@ impl DesktopApp {
                 }
             }
             ChatMsg::LoadOlderRequested => {
+                // The pressed button leaves the tree once every page is in;
+                // focus WinUI moved from it would land on the oldest turn and
+                // bring it into view instead of the text being read.
+                self.take_focus(FocusTarget::Composer);
                 self.chat.depth = self.chat.depth.older();
                 self.set_status("Loading older retained history…");
                 self.start_snapshot(context);
@@ -792,6 +823,13 @@ impl DesktopApp {
             }
             ChatMsg::ToolsToggled(key, expanded) => {
                 if expanded {
+                    // A step opened while its turn runs stays in view when
+                    // the turn ends: its finished log opens too.
+                    if let Some(log) = crate::chat::log_part_key(&key)
+                        .filter(|log| *log != key && key.contains("/tools:"))
+                    {
+                        self.chat.expanded.insert(views::log_key("open", &log));
+                    }
                     self.chat.expanded.insert(key);
                 } else {
                     self.chat.expanded.remove(&key);
@@ -885,6 +923,20 @@ impl DesktopApp {
                     Some((count, Ok(()))) => self.set_status(format!("Copied {count} characters.")),
                     Some((_, Err(error))) => self.alert(format!("Copy failed: {error}")),
                     None => self.alert("That message is no longer loaded."),
+                }
+            }
+            ChatMsg::CopyOutput(key) => {
+                let output = self
+                    .chat
+                    .convo
+                    .as_ref()
+                    .and_then(|convo| convo.part(&key))
+                    .and_then(|part| part.step)
+                    .and_then(|step| step.output);
+                match output.map(|(text, _)| crate::clipboard::set_text(&text)) {
+                    Some(Ok(())) => self.set_status("Copied the output."),
+                    Some(Err(error)) => self.alert(format!("Copy failed: {error}")),
+                    None => self.alert("That output is no longer loaded."),
                 }
             }
             ChatMsg::CopyCode(key, index) => {
@@ -1022,27 +1074,6 @@ impl DesktopApp {
                     ))
                 });
             }
-            ChatMsg::ApproveChoice(label) => {
-                let choice = self.chat.detail.as_ref().and_then(|detail| {
-                    detail.pending.iter().find_map(|request| {
-                        request
-                            .choices
-                            .iter()
-                            .find(|choice| {
-                                choice.label == label
-                                    && choice.decision
-                                        == eliot_core::requests::ApprovalDecision::Approve
-                            })
-                            .map(|choice| (request.clone(), choice.id.clone()))
-                    })
-                });
-                if let Some((request, choice)) = choice {
-                    self.chat_update(
-                        ChatMsg::ApprovalRequested(request, true, Some(choice)),
-                        context,
-                    );
-                }
-            }
             ChatMsg::GoalRead(agent, read) => {
                 if self.selected_agent_id().as_deref() == Some(agent.as_str()) {
                     // A failed read shows no mark rather than a stale one.
@@ -1050,13 +1081,23 @@ impl DesktopApp {
                 }
             }
             ChatMsg::DecisionsRead(agent, read) => {
+                self.chat.decisions_reading = false;
                 if self.selected_agent_id().as_deref() == Some(agent.as_str()) {
                     match read {
-                        Ok(items) => self.chat.decisions = Some((agent, items)),
+                        Ok(items) => {
+                            self.chat.decisions = Some((agent, items, crate::handoff::now_ms()));
+                            self.chat.decisions_error = None;
+                        }
                         Err(error) => {
+                            // The next detail read tries again.
+                            self.chat.decisions_facts = None;
                             self.set_status(format!("The inbox was not read: {error}"));
+                            self.chat.decisions_error = Some(error);
                         }
                     }
+                }
+                if std::mem::take(&mut self.chat.decisions_again) {
+                    self.read_decisions(context);
                 }
             }
             ChatMsg::HoldsRead(agent, read) => {
@@ -1069,6 +1110,18 @@ impl DesktopApp {
             }
             ChatMsg::OwnerDecided(words, result) => self.owner_decided(&words, *result, context),
             ChatMsg::DecideReason(text) => self.chat.decide_reason = text,
+            ChatMsg::DecisionsRecheck => {
+                // Check again reads the inbox whatever the facts.
+                self.chat.decisions_facts = None;
+                self.queue_reread(
+                    Invalidation {
+                        detail: true,
+                        turns: true,
+                        ..Invalidation::default()
+                    },
+                    context,
+                );
+            }
             ChatMsg::DecisionStep(step) => {
                 self.chat.decision_at = self.chat.decision_at.saturating_add_signed(step as isize);
             }

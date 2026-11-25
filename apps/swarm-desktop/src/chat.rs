@@ -163,9 +163,15 @@ struct ToolRow {
     /// The native exit code of a failed command, as its adapter retained it
     /// (`tool.completed` `exit_code`).
     exit_code: Option<i64>,
-    /// The bounded, redacted tail of a failed tool's native output
-    /// (`tool.completed` `error_tail`): the lines that usually say why.
-    error_tail: Option<String>,
+    /// The command was cut at its retained bound (`command_truncated`).
+    command_truncated: bool,
+    /// The folder the command ran in, as its adapter retained it
+    /// (`tool.started` `cwd`, `tool.completed` `shell_execution_cwd`).
+    cwd: Option<String>,
+    /// The bounded, redacted output a failed tool's adapter retained: the
+    /// tail that usually says why (`error_tail`), or the native error text
+    /// (`native_error`, with its own truncation flag).
+    output: Option<(String, OutputBound)>,
 }
 
 /// Separates a tool row's name, status, duration and start (ms since the
@@ -294,6 +300,8 @@ impl TurnEntry {
                             + row.status.as_ref().map_or(0, String::len)
                             + row.paths.iter().map(String::len).sum::<usize>()
                             + row.command.as_ref().map_or(0, String::len)
+                            + row.cwd.as_ref().map_or(0, String::len)
+                            + row.output.as_ref().map_or(0, |(text, _)| text.len())
                             + 32
                     })
                     .sum(),
@@ -348,9 +356,33 @@ impl TurnEntry {
             .data
             .get("exit_code")
             .and_then(serde_json::Value::as_i64);
-        let error_tail = data_str(event, "error_tail")
-            .map(|tail| tail.replace(TOOL_FIELDS, " "))
-            .filter(|tail| !tail.trim().is_empty());
+        let command_truncated = event
+            .data
+            .get("command_truncated")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        let cwd = data_str(event, "cwd")
+            .or_else(|| data_str(event, "shell_execution_cwd"))
+            .map(str::to_owned);
+        let output = data_str(event, "error_tail")
+            .map(|tail| (tail.to_owned(), OutputBound::Tail))
+            .or_else(|| {
+                let error = event.data.get("native_error")?;
+                let text = error.get("message")?.as_str()?.to_owned();
+                let truncated = error
+                    .get("truncated")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false);
+                Some((
+                    text,
+                    if truncated {
+                        OutputBound::Truncated
+                    } else {
+                        OutputBound::Whole
+                    },
+                ))
+            })
+            .filter(|(text, _)| !text.trim().is_empty());
         let failed_now = done && status.as_deref().is_some_and(|status| !is_success(status));
         if let Some(&group) = self.item_groups.get(item_id)
             && let Some(Activity::Tools {
@@ -377,8 +409,12 @@ impl TurnEntry {
                     if row.exit_code.is_none() {
                         row.exit_code = exit_code;
                     }
-                    if row.error_tail.is_none() {
-                        row.error_tail = error_tail;
+                    row.command_truncated |= command_truncated;
+                    if row.cwd.is_none() {
+                        row.cwd = cwd;
+                    }
+                    if row.output.is_none() {
+                        row.output = output;
                     }
                     row.paths_truncated |= paths_truncated;
                     if status.is_some() || done {
@@ -407,7 +443,9 @@ impl TurnEntry {
             paths_truncated,
             command,
             exit_code,
-            error_tail,
+            command_truncated,
+            cwd,
+            output,
         };
         if !matches!(self.activity.last(), Some(Activity::Tools { .. })) {
             self.activity.push(Activity::Tools {
@@ -689,6 +727,28 @@ impl Coverage {
         !self.turns_complete() && self.result_limit < MAX_RESIDENT_TURNS
     }
 
+    /// What the resident history leaves out that Load older cannot bring
+    /// back, in words, for the transcript's top (§9.3: partial history is
+    /// never shown as whole). `None` when nothing is cut.
+    pub fn boundary(&self) -> Option<String> {
+        let mut lines = Vec::new();
+        if !self.turns_complete() && !self.can_load_older() {
+            lines.push(format!(
+                "Older turns are not shown: this window keeps up to {MAX_RESIDENT_TURNS}."
+            ));
+        }
+        if self.evicted_turns > 0 {
+            lines.push(format!(
+                "{} left memory to keep the window light.",
+                count(self.evicted_turns, "older turn", "older turns")
+            ));
+        }
+        if self.activity_pruned() {
+            lines.push("Older activity was removed by retention.".to_owned());
+        }
+        (!lines.is_empty()).then(|| lines.join(" "))
+    }
+
     /// Human-readable coverage lines; every limit is named, none is hidden.
     /// Only what is unusual about the loaded conversation, in words: older
     /// turns not loaded, retention pruning, unreadable inputs, evicted
@@ -752,12 +812,45 @@ impl Invalidation {
     }
 }
 
-/// The label of a turn's answer, and of its end notice when the turn
-/// succeeded without public final text.
-pub const ANSWER_LABEL: &str = "Assistant";
+/// How a turn ended, on the part that ends it (its answer, its end notice
+/// or its failure): the view tells an owner's stop or an unconfirmed result
+/// apart by this, never by the label's words.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum TurnEnd {
+    Answered,
+    StoppedByYou,
+    Interrupted,
+    Failed,
+    /// The outcome is not confirmed: shown beside any answer text.
+    Unconfirmed,
+}
 
-/// The label of the end notice of a turn the owner stopped.
-pub const STOPPED_BY_YOU_LABEL: &str = "Assistant · stopped by you";
+/// How much of a step's output its adapter retained.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum OutputBound {
+    /// All of it (a native error text that was not cut).
+    Whole,
+    /// Its last lines only (`error_tail`).
+    Tail,
+    /// Cut at the adapter's bound (`native_error.truncated`).
+    Truncated,
+}
+
+/// What an expanded step shows beyond its row (§9.2): the command and the
+/// folder it ran in, its state with the exit code when known, the output
+/// its adapter retained, and whether it leads to Changes.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub struct StepDetail {
+    /// The whole retained command (redacted, bounded by its adapter).
+    pub command: Option<String>,
+    pub command_truncated: bool,
+    pub folder: Option<String>,
+    /// "Completed · exit 0", "Failed · exit 2", "Running".
+    pub state: String,
+    pub output: Option<(String, OutputBound)>,
+    /// A file edit: the step leads to Changes.
+    pub changes: bool,
+}
 
 /// Kind of one keyed part inside a turn item.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -802,6 +895,14 @@ pub struct InputFailure {
     pub definite: bool,
 }
 
+/// The work-log head of the turn a part belongs to (`turn:G:ID/…` →
+/// `turn:G:ID/log:ID`), for keeping an opened step's log open.
+pub fn log_part_key(part_key: &str) -> Option<String> {
+    let (item, _) = part_key.split_once('/')?;
+    let (_, id) = item.strip_prefix("turn:")?.split_once(':')?;
+    Some(format!("{item}/log:{id}"))
+}
+
 /// One keyed part of a turn item.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Part {
@@ -813,6 +914,10 @@ pub struct Part {
     pub text: String,
     /// Bounded detail lines, e.g. tool rows of a collapsed group.
     pub detail: Vec<String>,
+    /// How the turn ended, on the part that ends it.
+    pub end: Option<TurnEnd>,
+    /// A step's disclosure.
+    pub step: Option<StepDetail>,
 }
 
 impl Part {
@@ -829,7 +934,24 @@ impl Part {
             label,
             text,
             detail,
+            end: None,
+            step: None,
         }
+    }
+
+    fn ending(mut self, end: TurnEnd) -> Self {
+        self.revision = mix(self.revision, 0x100 + end as u64);
+        self.end = Some(end);
+        self
+    }
+
+    fn with_step(mut self, step: StepDetail) -> Self {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        step.hash(&mut hasher);
+        self.revision = mix(self.revision, hasher.finish());
+        self.step = Some(step);
+        self
     }
 }
 
@@ -1761,25 +1883,28 @@ impl Conversation {
         }
         parts.extend(activity);
         let final_key = format!("final:{}", turn.key.id);
-        let label = match &turn.status {
+        let (label, end) = match &turn.status {
             TurnStatus::Completed(Some(TurnOutcome::Success)) | TurnStatus::Completed(None) => {
-                ANSWER_LABEL.to_owned()
+                ("Assistant", Some(TurnEnd::Answered))
             }
-            TurnStatus::Completed(Some(TurnOutcome::Failure)) => "Assistant · failed".to_owned(),
+            TurnStatus::Completed(Some(TurnOutcome::Failure)) => {
+                ("Assistant · failed", Some(TurnEnd::Failed))
+            }
             TurnStatus::Completed(Some(TurnOutcome::Interrupted)) if turn.stopped_by_owner => {
-                STOPPED_BY_YOU_LABEL.to_owned()
+                ("Assistant · stopped by you", Some(TurnEnd::StoppedByYou))
             }
             TurnStatus::Completed(Some(TurnOutcome::Interrupted)) => {
-                "Assistant · interrupted".to_owned()
+                ("Assistant · interrupted", Some(TurnEnd::Interrupted))
             }
-            TurnStatus::Completed(Some(TurnOutcome::Unknown)) => {
-                "Assistant · result not confirmed".to_owned()
-            }
-            TurnStatus::Unknown => "Assistant · result not confirmed".to_owned(),
-            TurnStatus::Running => "Assistant · working".to_owned(),
+            TurnStatus::Completed(Some(TurnOutcome::Unknown)) | TurnStatus::Unknown => (
+                "Assistant · result not confirmed",
+                Some(TurnEnd::Unconfirmed),
+            ),
+            TurnStatus::Running => ("Assistant · working", None),
         };
-        match (final_text, &turn.status) {
-            (Some(text), _) => parts.push(Part::new(
+        let label = label.to_owned();
+        let final_part = match (final_text, end) {
+            (Some(text), _) => Some(Part::new(
                 final_key,
                 PartKind::Final,
                 label,
@@ -1787,8 +1912,8 @@ impl Conversation {
                 Vec::new(),
             )),
             // While the turn runs, the work log's head says so.
-            (None, TurnStatus::Running) => {}
-            (None, _) => parts.push(Part::new(
+            (None, None) => None,
+            (None, Some(_)) => Some(Part::new(
                 final_key,
                 PartKind::Notice,
                 label,
@@ -1804,7 +1929,11 @@ impl Conversation {
                 },
                 Vec::new(),
             )),
-        }
+        };
+        parts.extend(final_part.map(|part| match end {
+            Some(end) => part.ending(end),
+            None => part,
+        }));
         // A failed turn shows its native error inline, names the model it
         // ran under, and points at the model picker for the next try. The
         // picker itself stays available: nothing else in the chat changes.
@@ -1830,13 +1959,16 @@ impl Conversation {
                 }
                 _ => (reason, detail),
             };
-            parts.push(Part::new(
-                format!("failed:{}", turn.key.id),
-                PartKind::TurnFailed,
-                final_part.label,
-                text,
-                detail,
-            ));
+            parts.push(
+                Part::new(
+                    format!("failed:{}", turn.key.id),
+                    PartKind::TurnFailed,
+                    final_part.label,
+                    text,
+                    detail,
+                )
+                .ending(TurnEnd::Failed),
+            );
         }
         // Under the answer: the files the turn's steps report changing
         // (only adapters that report changed paths give them).
@@ -1876,19 +2008,23 @@ impl Conversation {
         texts
     }
 
-    /// Full retained text of one part, for Copy message.
-    pub fn part_text(&self, key: &str) -> Option<String> {
+    /// One resident part by its key.
+    pub fn part(&self, key: &str) -> Option<Part> {
         self.items()
             .into_iter()
             .flat_map(|item| item.parts)
             .find(|part| part.key == key)
-            .map(|part| {
-                if part.detail.is_empty() {
-                    part.text
-                } else {
-                    format!("{}\n{}", part.text, part.detail.join("\n"))
-                }
-            })
+    }
+
+    /// Full retained text of one part, for Copy message.
+    pub fn part_text(&self, key: &str) -> Option<String> {
+        self.part(key).map(|part| {
+            if part.detail.is_empty() {
+                part.text
+            } else {
+                format!("{}\n{}", part.text, part.detail.join("\n"))
+            }
+        })
     }
 }
 
@@ -1989,8 +2125,22 @@ struct Step {
     elapsed: Option<i64>,
     /// The start of a running step: the view counts its seconds.
     started: Option<i64>,
+    /// The changed paths it names, and what was not retained of them.
     detail: Vec<String>,
+    disclosure: StepDetail,
     calls: usize,
+}
+
+/// A tool's name in words: an MCP tool's server and tool apart
+/// ("mcp__swarm__agent_launch" → "swarm · agent launch"), underscores as
+/// spaces.
+fn tool_words(tool: &str) -> String {
+    let tool = tool.strip_prefix("mcp__").unwrap_or(tool);
+    tool.split("__")
+        .filter(|part| !part.is_empty())
+        .map(|part| part.replace(['_', '-'], " "))
+        .collect::<Vec<_>>()
+        .join(" \u{b7} ")
 }
 
 impl Step {
@@ -2059,8 +2209,8 @@ impl Step {
             ("Worker", _, _) if running => "Starting a worker".to_owned(),
             ("Worker", _, _) => "Started a worker".to_owned(),
             ("Plan", _, _) => "Updated the plan".to_owned(),
-            (_, _, _) if running => format!("Calling {}", row.tool),
-            (_, _, _) => format!("Called {}", row.tool),
+            (_, _, _) if running => format!("Calling {}", tool_words(&row.tool)),
+            (_, _, _) => format!("Called {}", tool_words(&row.tool)),
         };
         let name = if class == "fail" && kind != "Command" {
             format!("{name} · failed")
@@ -2072,27 +2222,18 @@ impl Step {
             .zip(row.completed_ms)
             .and_then(|(start, end)| end.checked_sub(start))
             .filter(|ms| *ms >= 0);
-        let mut detail: Vec<String> = row
-            .command
-            .iter()
-            .flat_map(|command| command.lines())
-            .map(str::to_owned)
-            .collect();
-        if let Some(tail) = row.error_tail.as_deref() {
-            detail.push(format!(
-                "Failed with exit {} · {}",
-                row.exit_code
-                    .map_or_else(|| "code unavailable".to_owned(), |code| code.to_string()),
-                tail.lines().next().unwrap_or_default()
-            ));
-        }
-        detail.extend(row.paths.iter().cloned());
+        let mut detail: Vec<String> = row.paths.clone();
         if row.paths_truncated {
-            detail.push("More changed paths were not retained in this card.".to_owned());
+            detail.push("More changed paths were not retained.".to_owned());
         }
-        if row.error_tail.is_none() {
-            detail.push("Tool output was not retained by the app.".to_owned());
-        }
+        let disclosure = StepDetail {
+            command: row.command.clone(),
+            command_truncated: row.command_truncated,
+            folder: row.cwd.clone(),
+            state: status.clone(),
+            output: row.output.clone(),
+            changes: kind == "Edit" && class == "ok",
+        };
         Self {
             item_id: row.item_id.clone(),
             kind,
@@ -2102,6 +2243,7 @@ impl Step {
             elapsed,
             started: row.started_ms.filter(|_| running),
             detail,
+            disclosure,
             calls: 1,
         }
     }
@@ -2112,6 +2254,7 @@ impl Step {
             && next.class == "ok"
             && self.kind == next.kind
             && self.name == next.name
+            && self.disclosure.folder == next.disclosure.folder
             && self.detail.len() + next.detail.len() <= 40
     }
 
@@ -2147,6 +2290,7 @@ impl Step {
             .join(&TOOL_FIELDS.to_string()),
             self.detail,
         )
+        .with_step(self.disclosure)
     }
 }
 

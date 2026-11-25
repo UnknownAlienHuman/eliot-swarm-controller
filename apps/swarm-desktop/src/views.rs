@@ -20,7 +20,7 @@ use std::rc::Rc;
 
 use windows_reactor::*;
 
-use crate::chat::{self, Part, PartKind, TurnItem, text_hash};
+use crate::chat::{self, OutputBound, Part, PartKind, StepDetail, TurnEnd, TurnItem, text_hash};
 use crate::markdown::{Block, Doc, Inline};
 use crate::ui::tokens;
 
@@ -193,6 +193,8 @@ pub struct RenderedPart {
     pub detail_paths: Vec<String>,
     /// Files the owner attached (an input's closing block).
     pub attachments: Vec<String>,
+    pub end: Option<TurnEnd>,
+    pub step: Option<StepDetail>,
 }
 
 /// One virtualized turn item.
@@ -332,6 +334,8 @@ fn render_part(part: &Part, docs: &HashMap<u64, Doc>) -> RenderedPart {
         detail: part.detail.clone(),
         file_paths: chat::file_references(&part.text),
         detail_paths: chat::file_references(&part.detail.join("\n")),
+        end: part.end,
+        step: part.step.clone(),
     }
 }
 
@@ -389,6 +393,8 @@ pub struct RowCallbacks {
     pub retry: Callback<String>,
     pub pick_model: Option<Callback<()>>,
     pub copy_code: Callback<(String, usize)>,
+    /// Copy a step's retained output (the step part's key).
+    pub copy_output: Callback<String>,
     pub toggle_tools: Callback<(String, bool)>,
     /// View changes: the right pane's Changes tab on the last turn.
     pub view_changes: Callback<()>,
@@ -434,6 +440,28 @@ fn copy_glyph() -> View {
     crate::controls::icon(crate::controls::glyph::COPY)
 }
 
+/// Code or output on the code ground: monospace, selectable, its long
+/// lines scrolled sideways rather than cut.
+fn code_ground(text: &str) -> Border {
+    Border::new()
+        .background(ThemeBrush::CardBackground)
+        .border_brush(ThemeBrush::CardStroke)
+        .border_thickness(Thickness::uniform(tokens::layout::HAIRLINE))
+        .corner_radius(tokens::radius::CONTAINER)
+        .padding(Thickness::xy(tokens::spacing::INSET, tokens::spacing::SM))
+        .content(
+            ScrollViewer::new()
+                .horizontal_scroll_bar_visibility(ScrollBarVisibility::Auto)
+                .vertical_scroll_bar_visibility(ScrollBarVisibility::Disabled)
+                .content(
+                    crate::controls::body(text.to_owned())
+                        .font_family(CODE_FONT)
+                        .text_wrapping(TextWrapping::NoWrap)
+                        .is_text_selection_enabled(true),
+                ),
+        )
+}
+
 fn block_views(part: &RenderedPart, callbacks: &RowCallbacks, hovered: bool) -> Vec<KeyedView> {
     let Some(blocks) = part.blocks.as_ref() else {
         return vec![KeyedView::new("plain", body_text(&part.plain))];
@@ -467,25 +495,7 @@ fn block_views(part: &RenderedPart, callbacks: &RowCallbacks, hovered: bool) -> 
                     StackPanel::new()
                         .spacing(tokens::spacing::XS)
                         .children((
-                            Border::new()
-                                .background(ThemeBrush::CardBackground)
-                                .border_brush(ThemeBrush::CardStroke)
-                                .border_thickness(Thickness::uniform(tokens::layout::HAIRLINE))
-                                .corner_radius(tokens::radius::CONTAINER)
-                                .padding(Thickness::xy(tokens::spacing::INSET, tokens::spacing::SM))
-                                .content(
-                                    ScrollViewer::new()
-                                        .horizontal_scroll_bar_visibility(ScrollBarVisibility::Auto)
-                                        .vertical_scroll_bar_visibility(
-                                            ScrollBarVisibility::Disabled,
-                                        )
-                                        .content(
-                                            crate::controls::body(text.clone())
-                                                .font_family(CODE_FONT)
-                                                .text_wrapping(TextWrapping::NoWrap)
-                                                .is_text_selection_enabled(true),
-                                        ),
-                                ),
+                            code_ground(text),
                             Border::new()
                                 .horizontal_alignment(HorizontalAlignment::Left)
                                 .margin(Thickness::new(-INSET, 0.0, 0.0, 0.0))
@@ -562,10 +572,14 @@ fn part_view(
             .into(),
         PartKind::Tools => step_view(part, expanded, callbacks),
         PartKind::Log | PartKind::Edited => return None,
-        // The answer: Markdown on the surface; a label only when the
-        // outcome is not a plain success.
+        // The answer: Markdown on the surface; its outcome beside it only
+        // when it is not a plain success ("result not confirmed" stays in
+        // view over the answer text).
         PartKind::Final => {
-            let note: Option<View> = (part.label != "Assistant").then(|| label(&part.label).into());
+            let note: Option<View> = match part.end {
+                None | Some(TurnEnd::Answered) => None,
+                Some(end) => Some(outcome_line(&part.label, end)),
+            };
             StackPanel::new()
                 .spacing(tokens::spacing::SM)
                 .keyed_children(crate::views::slots([
@@ -698,18 +712,15 @@ fn part_view(
         // owner's stop says only that ("Stopped by you after 3m"); any other
         // end keeps its outcome in view ("Assistant · result not confirmed
         // · …"), with a warning unless the turn succeeded.
-        PartKind::Notice if part.key.contains("/final:") => {
-            if part.label == crate::chat::STOPPED_BY_YOU_LABEL {
+        PartKind::Notice if part.end.is_some() => match part.end {
+            Some(TurnEnd::StoppedByYou) => {
                 service_line(&part.plain, crate::controls::glyph::STOP_CIRCLE)
-            } else {
-                let glyph = if part.label == crate::chat::ANSWER_LABEL {
-                    crate::controls::glyph::INFO
-                } else {
-                    crate::controls::glyph::WARNING
-                };
-                service_line(&format!("{} · {}", part.label, part.plain), glyph)
             }
-        }
+            end => service_line(
+                &format!("{} · {}", part.label, part.plain),
+                end_glyph(end.unwrap_or(TurnEnd::Answered)),
+            ),
+        },
         PartKind::Notice => crate::controls::secondary(format!("{} · {}", part.label, part.plain))
             .text_wrapping(TextWrapping::Wrap)
             .margin(Thickness::xy(tokens::spacing::ROW, 0.0))
@@ -717,6 +728,33 @@ fn part_view(
         // Where a new generation starts: one quiet line, read out by name.
         PartKind::Generation => service_line(&part.label, generation_glyph(&part.label)),
     })
+}
+
+/// The icon of how a turn ended.
+fn end_glyph(end: TurnEnd) -> &'static str {
+    match end {
+        TurnEnd::Answered => crate::controls::glyph::INFO,
+        TurnEnd::StoppedByYou => crate::controls::glyph::STOP_CIRCLE,
+        TurnEnd::Interrupted | TurnEnd::Failed | TurnEnd::Unconfirmed => {
+            crate::controls::glyph::WARNING
+        }
+    }
+}
+
+/// An answer's outcome over its text ("Assistant · result not
+/// confirmed"): the icon and the words, read out together.
+fn outcome_line(text: &str, end: TurnEnd) -> View {
+    StackPanel::new()
+        .orientation(Orientation::Horizontal)
+        .spacing(tokens::spacing::SM)
+        .automation_name(text)
+        .children((
+            crate::controls::muted_icon(end_glyph(end)),
+            label(text)
+                .vertical_alignment(VerticalAlignment::Center)
+                .text_wrapping(TextWrapping::Wrap),
+        ))
+        .into()
 }
 
 /// The owner's side of the reading column (§9.1): the message at the
@@ -897,8 +935,7 @@ const TABLE_CELL_INSET: f64 = 6.0;
 
 /// A work-log step (`.step`): the kind's icon (the loader while it runs,
 /// the error icon in `error` when it failed), verb and object, the time on
-/// the right; a click shows what the adapter retained (the command, the
-/// paths, the failure's first line).
+/// the right; a click shows what the adapter retained ([`step_detail`]).
 fn step_view(part: &RenderedPart, expanded: bool, callbacks: &RowCallbacks) -> View {
     let toggle = callbacks.toggle_tools.clone();
     let key = part.key.clone();
@@ -947,29 +984,136 @@ fn step_view(part: &RenderedPart, expanded: bool, callbacks: &RowCallbacks) -> V
             toggle.call((key.clone(), !expanded));
         })
         .content(crate::controls::step_content(lead, &name, trailing));
-    let detail: Option<View> = expanded.then(|| {
-        StackPanel::new()
-            .spacing(tokens::spacing::XS)
-            .margin(Thickness::new(
-                tokens::spacing::ROW + tokens::icon::ROW + tokens::spacing::ROW,
-                0.0,
-                tokens::spacing::ROW,
-                tokens::spacing::XS,
-            ))
-            .keyed_children(crate::views::slots([
-                Some(
-                    crate::controls::secondary(format!("{status}\n{}", part.detail.join("\n")))
-                        .text_wrapping(TextWrapping::Wrap)
-                        .is_text_selection_enabled(true)
-                        .into(),
-                ),
-                path_actions(&part.key, &part.detail_paths, callbacks),
-            ]))
+    // The row is keyed by its class: WinUI reads a button's colors only
+    // when its template is applied, so a finished row would keep the
+    // running tint. The open detail keeps its own key, so a selection in
+    // it survives the step's updates.
+    let mut views = vec![KeyedView::new(format!("row:{class}"), row)];
+    if expanded {
+        views.push(KeyedView::new("detail", step_detail(part, callbacks)));
+    }
+    StackPanel::new().keyed_children(views).into()
+}
+
+/// A step's disclosure (§9.2): the whole command on the code ground, the
+/// folder it ran in with its state and exit code, the output its adapter
+/// retained with Copy and how much of it this is, the changed paths, and
+/// View changes for an edit.
+fn step_detail(part: &RenderedPart, callbacks: &RowCallbacks) -> View {
+    let step = part.step.clone().unwrap_or_default();
+    let quiet = |text: String| -> View {
+        crate::controls::secondary(text)
+            .text_wrapping(TextWrapping::Wrap)
+            .is_text_selection_enabled(true)
             .into()
-    });
+    };
+    let mut rows: Vec<KeyedView> = Vec::new();
+    if let Some(command) = step.command.as_deref() {
+        rows.push(KeyedView::new("command", code_ground(command)));
+        if step.command_truncated {
+            rows.push(KeyedView::new(
+                "command-cut",
+                quiet("Command truncated".to_owned()),
+            ));
+        }
+    }
+    // "In crates/eliot-core · Failed · exit 2".
+    let facts: Vec<String> = step
+        .folder
+        .as_deref()
+        .map(|folder| folder_words(folder, &callbacks.workspace))
+        .into_iter()
+        .chain((!step.state.is_empty()).then(|| step.state.clone()))
+        .collect();
+    if !facts.is_empty() {
+        rows.push(KeyedView::new("facts", quiet(facts.join(" \u{b7} "))));
+    }
+    match &step.output {
+        Some((output, bound)) => {
+            let copy = callbacks.copy_output.clone();
+            let key = part.key.clone();
+            rows.push(KeyedView::new(
+                "output-head",
+                crate::controls::row_grid(
+                    None,
+                    crate::controls::secondary(match bound {
+                        OutputBound::Whole => "Output",
+                        OutputBound::Tail => "Output \u{b7} last lines",
+                        OutputBound::Truncated => "Output truncated",
+                    })
+                    .vertical_alignment(VerticalAlignment::Center)
+                    .into(),
+                    Some(
+                        crate::controls::text_button()
+                            .automation_name("Copy output")
+                            .on_click(move || {
+                                copy.call(key.clone());
+                            })
+                            .content(crate::controls::label("Copy output"))
+                            .into(),
+                    ),
+                    tokens::spacing::SM,
+                ),
+            ));
+            rows.push(KeyedView::new("output", code_ground(output)));
+        }
+        None => rows.push(KeyedView::new(
+            "output",
+            quiet("Output not retained".to_owned()),
+        )),
+    }
+    if !part.detail.is_empty() {
+        rows.push(KeyedView::new("paths", quiet(part.detail.join("\n"))));
+    }
+    if let Some(actions) = path_actions(&part.key, &part.detail_paths, callbacks) {
+        rows.push(KeyedView::new("path-actions", actions));
+    }
+    if step.changes {
+        rows.push(KeyedView::new(
+            "changes",
+            crate::controls::text_button()
+                .horizontal_alignment(HorizontalAlignment::Left)
+                .automation_name("View changes")
+                .on_click(callbacks.view_changes.clone())
+                .content(crate::controls::label("View changes")),
+        ));
+    }
     StackPanel::new()
-        .keyed_children(crate::views::slots([Some(row.into()), detail]))
+        .spacing(tokens::spacing::XS)
+        .margin(Thickness::new(
+            tokens::spacing::ROW + tokens::icon::ROW + tokens::spacing::ROW,
+            0.0,
+            tokens::spacing::ROW,
+            tokens::spacing::XS,
+        ))
+        .keyed_children(rows)
         .into()
+}
+
+/// Where a command ran, in words: inside the task's folder as a relative
+/// path ("In crates/eliot-core", "In the task folder"), elsewhere in full.
+fn folder_words(folder: &str, workspace: &str) -> String {
+    let trim = |path: &str| path.trim_end_matches(['\\', '/']).to_owned();
+    let (folder, workspace) = (trim(folder), trim(workspace));
+    let same = |a: &str, b: &str| {
+        a.len() == b.len()
+            && a.bytes().zip(b.bytes()).all(|(x, y)| {
+                x.eq_ignore_ascii_case(&y)
+                    || (matches!(x, b'\\' | b'/') && matches!(y, b'\\' | b'/'))
+            })
+    };
+    if !workspace.is_empty() && folder.is_char_boundary(workspace.len()) {
+        let (head, rest) = folder.split_at(workspace.len());
+        if same(head, &workspace) {
+            if rest.is_empty() {
+                return "In the task folder".to_owned();
+            }
+            if let Some(rest) = rest.strip_prefix(['\\', '/']) {
+                return format!("In {rest}");
+            }
+        }
+    }
+    format!("In {folder}")
 }
 
 /// An `Rc` compared by identity: a component input whose content is rebuilt
@@ -1027,6 +1171,8 @@ pub struct TranscriptInput {
     pub load_older: Option<(bool, Callback<()>)>,
     /// The line shown without turns ("Loading…", "No messages yet.").
     pub empty: Option<&'static str>,
+    /// What the loaded history leaves out and why, over its oldest turn.
+    pub boundary: Option<String>,
     pub automation_id: &'static str,
     /// The ScrollView's reference, for the scroll to the end after a send.
     pub scroll: ElementRef<ScrollView>,
@@ -1052,6 +1198,37 @@ pub enum TranscriptStep {
     Drain,
 }
 
+/// How far from the far edge the view still counts as at the end (DIPs):
+/// layout rounding, not a reading position.
+const END_SLACK: f64 = 1.0;
+
+fn at_end(metrics: &ScrollViewMetrics) -> bool {
+    metrics.extent_height - metrics.viewport_height - metrics.vertical_offset <= END_SLACK
+}
+
+/// The first built part's key: the oldest part drawn.
+fn first_built(items: &[Rc<RenderedItem>], hidden: usize) -> Option<&str> {
+    items
+        .iter()
+        .flat_map(|item| item.parts.iter())
+        .nth(hidden)
+        .map(|part| part.key.as_str())
+}
+
+/// The parts added after the owner left the end: those of the item that
+/// was last then beyond its count then, and every later item's. `None`
+/// once that item left the list (the count would be a guess).
+fn new_parts(items: &[Rc<RenderedItem>], last: &str, seen: usize) -> Option<usize> {
+    let at = items.iter().position(|item| item.key == last)?;
+    Some(
+        items[at].parts.len().saturating_sub(seen)
+            + items[at + 1..]
+                .iter()
+                .map(|item| item.parts.len())
+                .sum::<usize>(),
+    )
+}
+
 /// The conversation's transcript: its own component, so it renders only
 /// when its input changes. A newly shown conversation builds its newest
 /// parts first and the older ones over the next frames (the transcript is
@@ -1068,6 +1245,9 @@ pub struct Transcript {
     shown: TranscriptInput,
     /// Conversations left, the latest first.
     leaving: Vec<Leaving>,
+    /// Counts the times parts were built above the oldest drawn one
+    /// ([`Follow`] keeps the reading position over them).
+    built_above: u64,
 }
 
 fn part_count(items: &[Rc<RenderedItem>]) -> usize {
@@ -1083,6 +1263,18 @@ fn step_later(step: TranscriptStep, context: &ComponentContext<Transcript>) {
 
 impl Transcript {
     fn settle(&mut self, input: &TranscriptInput, context: &ComponentContext<Self>) {
+        if input.conversation == self.shown.conversation
+            && let Some(first) = first_built(&self.shown.items.0, self.hidden)
+            && first_built(&input.items.0, self.hidden) != Some(first)
+            && input
+                .items
+                .0
+                .iter()
+                .any(|item| item.parts.iter().any(|part| part.key == first))
+        {
+            // An older page arrived above the oldest drawn part.
+            self.built_above += 1;
+        }
         if input.conversation != self.shown.conversation {
             let left = std::mem::replace(&mut self.shown, input.clone());
             let parts = part_count(&left.items.0);
@@ -1127,6 +1319,7 @@ impl Component for Transcript {
             hidden: 0,
             shown: input.clone(),
             leaving: Vec::new(),
+            built_above: 0,
         };
         transcript.settle(input, context);
         transcript
@@ -1142,6 +1335,7 @@ impl Component for Transcript {
                 if serial != self.serial || self.hidden == 0 {
                     return;
                 }
+                self.built_above += 1;
                 self.hidden = self.hidden.saturating_sub(GROW_PARTS);
                 if self.hidden > 0 {
                     step_later(step, context);
@@ -1162,6 +1356,13 @@ impl Component for Transcript {
     }
 
     fn view(&self, input: &TranscriptInput, _context: &mut ViewContext<Self>) -> View {
+        let boundary: Option<View> = input.boundary.as_ref().map(|line| {
+            crate::controls::secondary(line.clone())
+                .horizontal_alignment(HorizontalAlignment::Center)
+                .text_wrapping(TextWrapping::Wrap)
+                .margin(Thickness::new(0.0, 0.0, 0.0, tokens::spacing::MD))
+                .into()
+        });
         let load_older: Option<View> = match &input.load_older {
             Some((enabled, load)) if self.hidden == 0 => Some(
                 crate::controls::text_button()
@@ -1199,10 +1400,9 @@ impl Component for Transcript {
         // stays there while earlier turns are built or new activity
         // arrives, with no scroll after the first frame; read further up,
         // the anchor keeps the reading position.
-        ScrollView::new()
+        let scroll: View = ScrollView::new()
             .element_ref(&input.scroll)
             .vertical_anchor_ratio(1.0)
-            .grid_row(1)
             .vertical_scroll_bar_visibility(ScrollingScrollBarVisibility::Auto)
             .automation_name("Conversation")
             .automation_id(input.automation_id)
@@ -1214,11 +1414,183 @@ impl Component for Transcript {
                         tokens::spacing::MD,
                     )
                     .keyed_children(crate::views::slots([
+                        boundary,
                         load_older,
                         empty,
                         Some(StackPanel::new().keyed_children(conversations).into()),
                     ])),
             )
+            .into();
+        // Over the transcript's foot: Jump to latest while it is read
+        // higher up, in its own component, so a scroll redraws only it.
+        let follow = View::component::<Follow>(FollowInput {
+            scroll: input.scroll.clone(),
+            conversation: input.conversation.clone(),
+            items: input.items.clone(),
+            built_above: self.built_above,
+        });
+        Grid::new().grid_row(1).children((scroll, follow)).into()
+    }
+}
+
+/// What [`Follow`] watches: the transcript's view, the open conversation
+/// and its items, and how often parts were built above the oldest one.
+#[derive(Clone, PartialEq)]
+pub struct FollowInput {
+    pub scroll: ElementRef<ScrollView>,
+    pub conversation: String,
+    pub items: Shared<Vec<Rc<RenderedItem>>>,
+    pub built_above: u64,
+}
+
+/// The view's metrics changed, or Jump to latest was pressed.
+#[derive(Clone, Copy, Debug)]
+pub enum FollowStep {
+    Scrolled(ScrollViewMetrics),
+    Jump,
+}
+
+/// Whether the owner reads at the end of the transcript (§9.3), from the
+/// ScrollView's own metrics (`observe_view`), never from wheel events or
+/// timers: at the end the far-edge anchor (`VerticalAnchorRatio=1`)
+/// carries new events into view; read higher up, Jump to latest shows with
+/// the count of parts added since, and parts built above keep the text in
+/// view where it was (the view has no anchor element of its own).
+pub struct Follow {
+    /// The input last seen: the view to scroll, the items whose last one
+    /// marks where the owner left the end.
+    shown: FollowInput,
+    metrics: Option<ScrollViewMetrics>,
+    /// Read higher up: the item that was last when the view left the end,
+    /// and its part count then.
+    away: Option<(String, usize)>,
+    /// Parts added since the view left the end (Jump to latest's count),
+    /// kept with `away` and the items, not recounted on every render.
+    fresh: Option<usize>,
+    /// Parts are being built above while read higher up: the extent
+    /// before, so the next extent change moves the offset by as much.
+    /// Any other input clears it: content changing at the end would make
+    /// that next extent change ambiguous, and a build above that added no
+    /// height (parts inside a folded log) never changes the extent.
+    above: Option<f64>,
+    _observation: ElementObservation,
+}
+
+impl Follow {
+    /// Count the parts added since the view left the end.
+    fn count_fresh(&mut self) {
+        self.fresh = self
+            .away
+            .as_ref()
+            .and_then(|(last, seen)| new_parts(&self.shown.items.0, last, *seen));
+    }
+}
+
+impl Component for Follow {
+    type Input = FollowInput;
+    type Message = FollowStep;
+
+    fn create(input: &FollowInput, context: &ComponentContext<Self>) -> Self {
+        let scrolled = context.callback(FollowStep::Scrolled);
+        Self {
+            shown: input.clone(),
+            metrics: None,
+            away: None,
+            fresh: None,
+            above: None,
+            _observation: input
+                .scroll
+                .observe_view(move |metrics| scrolled.call(metrics)),
+        }
+    }
+
+    fn input_changed(&mut self, input: &FollowInput, _context: &ComponentContext<Self>) {
+        if input.conversation != self.shown.conversation {
+            // Another conversation opens at its end.
+            self.away = None;
+            self.above = None;
+        } else if input.built_above != self.shown.built_above && self.away.is_some() {
+            // Called before the new tree reaches WinUI: the metrics still
+            // hold the extent before the parts built above.
+            self.above = self
+                .above
+                .or(self.metrics.map(|metrics| metrics.extent_height));
+        } else {
+            self.above = None;
+        }
+        self.shown = input.clone();
+        self.count_fresh();
+    }
+
+    fn update(&mut self, step: FollowStep, _context: &ComponentContext<Self>) {
+        match step {
+            FollowStep::Scrolled(metrics) => {
+                let before = self.metrics.replace(metrics);
+                // The first metrics after a build above settle it: a new
+                // extent moves the offset by the height built; the same
+                // extent means it added none.
+                if let Some(extent) = self.above.take()
+                    && metrics.extent_height != extent
+                {
+                    let _ = self.shown.scroll.request_scroll_to(
+                        0.0,
+                        metrics.vertical_offset + (metrics.extent_height - extent),
+                        false,
+                        |_| {},
+                    );
+                    self.count_fresh();
+                    return;
+                }
+                if at_end(&metrics) {
+                    self.away = None;
+                } else if self.away.is_none()
+                    && before.is_none_or(|before| metrics.vertical_offset < before.vertical_offset)
+                {
+                    // The owner scrolled up (or the first metrics already
+                    // find the view off its end): content growing at the
+                    // end moves only the end, never the offset back.
+                    self.away = self
+                        .shown
+                        .items
+                        .0
+                        .last()
+                        .map(|item| (item.key.clone(), item.parts.len()));
+                }
+                self.count_fresh();
+            }
+            FollowStep::Jump => {
+                // WinUI clamps the offset to the end of the content.
+                let _ = self
+                    .shown
+                    .scroll
+                    .request_scroll_to(0.0, f64::MAX, false, |_| {});
+            }
+        }
+    }
+
+    fn view(&self, _input: &FollowInput, context: &mut ViewContext<Self>) -> View {
+        if self.away.is_none() {
+            // Nothing over the transcript at the end (no background: the
+            // pointer reaches the view below).
+            return Border::new()
+                .horizontal_alignment(HorizontalAlignment::Center)
+                .vertical_alignment(VerticalAlignment::Bottom)
+                .into();
+        }
+        let words = match self.fresh {
+            Some(fresh) if fresh > 0 => format!("Jump to latest \u{b7} {fresh} new"),
+            _ => "Jump to latest".to_owned(),
+        };
+        crate::controls::outlined()
+            .horizontal_alignment(HorizontalAlignment::Center)
+            .vertical_alignment(VerticalAlignment::Bottom)
+            .margin(Thickness::new(0.0, 0.0, 0.0, tokens::spacing::MD))
+            .automation_name(words.clone())
+            .on_click(context.message(FollowStep::Jump))
+            .content(crate::controls::icon_label(
+                crate::controls::glyph::ARROW_DOWN,
+                &words,
+            ))
             .into()
     }
 }
@@ -1231,17 +1603,18 @@ const EDITED_FILES: usize = 5;
 /// The expanded-set keys of a work log: a finished turn's log is open
 /// with `open:`, a running one closed with `shut:`, and a running one
 /// shows every step with `all:`.
-fn log_key(prefix: &str, log: &str) -> String {
+pub fn log_key(prefix: &str, log: &str) -> String {
     format!("{prefix}:{log}")
 }
 
 /// Whether a part ends a turn's work log: the answer, a failure, the end
-/// notice, the edited files.
+/// notice (each carries how the turn ended), the edited files.
 fn ends_log(part: &RenderedPart) -> bool {
-    matches!(
-        part.kind,
-        PartKind::Final | PartKind::TurnFailed | PartKind::Edited
-    ) || (part.kind == PartKind::Notice && part.key.contains("/final:"))
+    part.end.is_some()
+        || matches!(
+            part.kind,
+            PartKind::Final | PartKind::TurnFailed | PartKind::Edited
+        )
 }
 
 /// The turns of one conversation, its oldest `skip` parts left out; each
@@ -1332,18 +1705,10 @@ fn turn_views(input: &TranscriptInput, skip: usize) -> Vec<KeyedView> {
                         ),
                     )),
                     _ => {
-                        // A step is keyed by its class: WinUI reads a
-                        // button's colors only when its template is
-                        // applied, so a finished row would keep the
-                        // running tint.
-                        let key = if part.kind == PartKind::Tools {
-                            let class = part.plain.rsplit(crate::chat::TOOL_FIELDS).next();
-                            format!("{}:{}", part.key, class.unwrap_or_default())
-                        } else {
-                            part.key.clone()
-                        };
+                        // Every part keeps its key while it streams: an
+                        // open step and a selection survive its updates.
                         views.push(KeyedView::new(
-                            key,
+                            part.key.clone(),
                             View::component::<PartView>(PartInput {
                                 part: Shared(Rc::clone(part)),
                                 expanded: input.expanded.contains(&part.key),

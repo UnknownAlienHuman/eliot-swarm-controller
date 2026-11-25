@@ -1251,6 +1251,22 @@ of the explicitly selected release scope.
       line of duration and confirmed counters, the running one open on its
       last five steps, the answer and changed files without a card); the
       project poll alerts once per failing streak.
+    - [ ] **M2b Step disclosure, history and Jump to latest, decision
+      panel.** §9.2 steps keyed for streaming (an open step and its
+      selection kept, its log kept open when the turn ends): the whole
+      command, the folder it ran in, the state and exit code, the retained
+      output with Copy and how much of it this is, View changes for an
+      edit, MCP tools in words; §9.3 "at the end" from the ScrollView's
+      own metrics (`observe_view`, `VerticalAnchorRatio=1` kept), Jump to
+      latest with the count of new parts, one scroll to the real end, the
+      reading position kept when an older page is built above, the
+      history's boundary named at its top; §10.1 the decision panel for
+      approvals (each grant its own button), questions (native radio
+      buttons, a numbered sequence), unknown outcomes (last read, Check
+      again, the technical ID under Details) and Goal blocked (reason,
+      budget used, the daemon's actions), read from `owner.inbox` by the
+      daemon's counts after the history loads, so a restart rebuilds the
+      Resolve card; a turn's end typed on its part, not told by its label.
   - [ ] **M3 Context and projects.** Real diff, Agents, Details and Terminal,
     project assignment and transfer, fleet and Inbox.
   - [ ] **M4 Management.** Settings, model, routing and auth, Automations and

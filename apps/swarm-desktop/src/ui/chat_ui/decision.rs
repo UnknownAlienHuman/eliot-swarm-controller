@@ -20,6 +20,32 @@ enum Decision<'a> {
     Request(&'a UiPending, Option<&'a OwnerInboxItem>),
     /// An unconfirmed command or turn of the Agent (`owner.inbox`).
     Unknown(&'a OwnerInboxItem),
+    /// The Agent's Goal is blocked (`owner.inbox` `blocked_goal`).
+    Goal(&'a OwnerInboxItem),
+}
+
+/// The `owner.inbox` kinds the decision panel shows besides the open
+/// Agent's own requests: their daemon counts decide whether it reads them.
+const PANEL_KINDS: [OwnerInboxKind; 3] = [
+    OwnerInboxKind::UnknownTurn,
+    OwnerInboxKind::UnknownCommand,
+    OwnerInboxKind::BlockedGoal,
+];
+
+/// A Goal's budget in words: rounds and turns used of their limits, and
+/// its cost when tracked ("2 of 5 rounds · 7 of 20 turns").
+fn goal_budget(goal: &eliot_core::api::GoalView) -> Option<String> {
+    let mut words = Vec::new();
+    if let Some(max) = goal.definition.max_rounds {
+        words.push(format!("{} of {max} rounds", goal.counters.rounds));
+    }
+    if let Some(max) = goal.definition.max_turns {
+        words.push(format!("{} of {max} turns", goal.counters.turns_used));
+    }
+    if goal.cost_status != "untracked" && !goal.cost_status.is_empty() {
+        words.push(goal.cost_status.clone());
+    }
+    (!words.is_empty()).then(|| words.join(" \u{b7} "))
 }
 
 /// The hold strip's corrective choices: the menu label, the daemon's
@@ -65,8 +91,8 @@ impl DesktopApp {
             .chat
             .decisions
             .as_ref()
-            .filter(|(read, _)| *read == agent)
-            .map(|(_, items)| items.as_slice())
+            .filter(|(read, _, _)| *read == agent)
+            .map(|(_, items, _)| items.as_slice())
             .unwrap_or_default();
         let mut items: Vec<Decision<'_>> = detail
             .pending
@@ -98,7 +124,90 @@ impl DesktopApp {
                 })
                 .map(Decision::Unknown),
         );
+        items.extend(
+            inbox
+                .iter()
+                .filter(|item| {
+                    item.kind == OwnerInboxKind::BlockedGoal
+                        && subject_agent(&item.subject) == Some(agent.as_str())
+                })
+                .map(Decision::Goal),
+        );
         items
+    }
+
+    /// The daemon's counts of the inbox kinds the panel shows, as last
+    /// read with the sidebar (`daemon.sidebar` `owner_inbox`).
+    pub(in crate::ui) fn panel_counts(&self) -> [usize; 3] {
+        PANEL_KINDS.map(|kind| self.inbox.counts.get(&kind).copied().unwrap_or(0))
+    }
+
+    /// Read the open Agent's inbox items for the decision panel when one
+    /// may wait: a pending request, an unknown state or outcome in its
+    /// history, or a panel kind the daemon counts. The read is decided by
+    /// these facts as they stand, never by the order the reads arrive in,
+    /// so a restart rebuilds the panel from the inbox. One read is in
+    /// flight at a time. With nothing shown it reads only for facts not
+    /// already read: a detail refresh with the same facts reads nothing,
+    /// and facts that change during a read are read on its reply. While an
+    /// item shows, each detail read checks it again.
+    pub(in crate::ui) fn read_decisions(&mut self, context: &ComponentContext<Self>) {
+        let (Some(agent), Some(detail), Ok(data_dir)) = (
+            self.selected_agent_id(),
+            self.chat.detail.as_ref(),
+            self.data_dir.clone(),
+        ) else {
+            return;
+        };
+        let facts = DecisionFacts {
+            agent: agent.clone(),
+            pending: detail.pending.len(),
+            unknown: detail.state == eliot_core::AgentState::Unknown,
+            unconfirmed: self
+                .chat
+                .convo
+                .as_ref()
+                .is_some_and(Conversation::has_unconfirmed),
+            counts: self.panel_counts(),
+        };
+        let waiting = facts.pending > 0
+            || facts.unknown
+            || facts.unconfirmed
+            || facts.counts.iter().any(|count| *count > 0);
+        if !waiting {
+            self.chat.decisions = None;
+            self.chat.decisions_facts = None;
+            self.chat.decisions_error = None;
+            // A read still in flight would show its items again: its
+            // reply looks once more and clears them.
+            if self.chat.decisions_reading {
+                self.chat.decisions_again = true;
+            }
+            return;
+        }
+        // While the panel shows an item, every detail read checks it again:
+        // its revision changes with events the facts do not count (a new
+        // attention report), and a choice on a stale revision is refused.
+        let showing = self
+            .chat
+            .decisions
+            .as_ref()
+            .is_some_and(|(shown, items, _)| *shown == agent && !items.is_empty());
+        if !showing && self.chat.decisions_facts.as_ref() == Some(&facts) {
+            return;
+        }
+        if self.chat.decisions_reading {
+            self.chat.decisions_again = true;
+            return;
+        }
+        self.chat.decisions_facts = Some(facts);
+        self.chat.decisions_reading = true;
+        let _task = context.spawn_background(move |_| {
+            let read = client::block_on(client::owner_inbox(&data_dir, None))
+                .map(|reply| reply.items)
+                .map_err(|error| error.user_message());
+            Message::Chat(ChatMsg::DecisionsRead(agent, read))
+        });
     }
 
     /// Read what the decision panel and the hold strip need for the open
@@ -123,23 +232,7 @@ impl DesktopApp {
                 Message::Chat(ChatMsg::GoalRead(agent, read))
             });
         }
-        let unknown = detail.state == eliot_core::AgentState::Unknown
-            || self
-                .chat
-                .convo
-                .as_ref()
-                .is_some_and(Conversation::has_unconfirmed);
-        if !detail.pending.is_empty() || unknown {
-            let (agent, data_dir) = (agent.clone(), data_dir.clone());
-            let _task = context.spawn_background(move |_| {
-                let read = client::block_on(client::owner_inbox(&data_dir, None))
-                    .map(|reply| reply.items)
-                    .map_err(|error| error.user_message());
-                Message::Chat(ChatMsg::DecisionsRead(agent, read))
-            });
-        } else {
-            self.chat.decisions = None;
-        }
+        self.read_decisions(context);
         if detail.provider_hold.is_some() {
             let _task = context.spawn_background(move |_| {
                 let read = client::block_on(crate::config_client::provider_holds(&data_dir))
@@ -227,6 +320,9 @@ impl DesktopApp {
             )),
             Err(error) => self.alert(format!("{words} refused: {}", error.user_message())),
         }
+        // The panel reads the inbox again after any choice: a resolved item
+        // leaves, and a refused one (a stale revision) shows its current one.
+        self.chat.decisions_facts = None;
         self.queue_reread(
             Invalidation {
                 detail: true,
@@ -381,10 +477,27 @@ impl DesktopApp {
                     false,
                     deny.map(|choice| choice.id.clone()),
                 ));
-                let more: Vec<MenuItem> = approvals
+                // A broader grant is its own button, never folded into
+                // Allow once (§10.1).
+                let broader: Vec<KeyedView> = approvals
                     .iter()
                     .skip(1)
-                    .map(|choice| MenuItem::item(choice.label.clone(), choice.label.clone()))
+                    .map(|choice| {
+                        KeyedView::new(
+                            choice.id.clone(),
+                            controls::outlined_small()
+                                .is_enabled(enabled)
+                                .automation_name(choice.label.clone())
+                                .on_click(context.message(Message::Chat(
+                                    ChatMsg::ApprovalRequested(
+                                        (*request).clone(),
+                                        true,
+                                        Some(choice.id.clone()),
+                                    ),
+                                )))
+                                .content(controls::label(&choice.label)),
+                        )
+                    })
                     .collect();
                 let mut actions: Vec<KeyedView> = stop
                     .map(|stop| KeyedView::new("stop", stop))
@@ -399,26 +512,34 @@ impl DesktopApp {
                             .maybe_content(snooze(*item, context)),
                     ),
                     KeyedView::new(
-                        "deny",
-                        controls::outlined_small()
+                        "choices",
+                        StackPanel::new()
                             .grid_column(3)
-                            .is_enabled(enabled)
-                            .automation_name(deny_label.clone())
-                            .on_click(context.message(deny_message))
-                            .content(controls::label(&deny_label)),
+                            .grid_column_span(2)
+                            .orientation(Orientation::Horizontal)
+                            .spacing(tokens::spacing::SM)
+                            .keyed_children(
+                                std::iter::once(KeyedView::new(
+                                    "deny",
+                                    controls::outlined_small()
+                                        .is_enabled(enabled)
+                                        .automation_name(deny_label.clone())
+                                        .on_click(context.message(deny_message))
+                                        .content(controls::label(&deny_label)),
+                                ))
+                                .chain(broader)
+                                .chain(std::iter::once(KeyedView::new(
+                                    "approve",
+                                    controls::filled()
+                                        .is_enabled(enabled)
+                                        .automation_name(approve_label.clone())
+                                        .on_click(context.message(approve))
+                                        .content(controls::label(&approve_label)),
+                                )))
+                                .collect::<Vec<_>>(),
+                            ),
                     ),
                 ]);
-                let split = split_action(
-                    enabled,
-                    &approve_label,
-                    context.message(approve),
-                    more.clone(),
-                    context,
-                );
-                actions.push(KeyedView::new(
-                    format!("approve:{}", more.len()),
-                    Border::new().grid_column(4).content(split),
-                ));
                 (
                     controls::glyph::TERMINAL,
                     format!("Approval \u{b7} {harness}{count}"),
@@ -431,14 +552,29 @@ impl DesktopApp {
             Decision::Request(request, item) => {
                 let key = request.binding.request.clone().unwrap_or_default();
                 let secret = request.questions.iter().any(|question| question.is_secret);
+                let total = request.questions.len();
                 let questions: Vec<KeyedView> = request
                     .questions
                     .iter()
-                    .map(|question| {
-                        KeyedView::new(
-                            question.id.clone(),
-                            self.question_view(&key, question, context),
-                        )
+                    .enumerate()
+                    .map(|(index, question)| {
+                        let view = self.question_view(&key, question, context);
+                        // Several questions: an explicit sequence.
+                        let view: View = if total > 1 {
+                            StackPanel::new()
+                                .spacing(tokens::spacing::XS)
+                                .children((
+                                    controls::secondary(format!(
+                                        "Question {} of {total}",
+                                        index + 1
+                                    )),
+                                    view,
+                                ))
+                                .into()
+                        } else {
+                            view
+                        };
+                        KeyedView::new(question.id.clone(), view)
                     })
                     .collect();
                 let body: Option<View> = if secret {
@@ -563,17 +699,54 @@ impl DesktopApp {
                             .content(controls::label(&words)),
                     ));
                 }
-                let body = controls::field()
+                let reason = controls::field()
                     .text(self.chat.decide_reason.clone())
                     .placeholder_text("Why (required)")
                     .automation_name("Reason for the outcome")
                     .on_text_changed(crate::views::text_edits(
                         context.callback(|text| Message::Chat(ChatMsg::DecideReason(text))),
                     ));
-                let mut actions: Vec<KeyedView> = stop
-                    .map(|stop| KeyedView::new("stop", stop))
-                    .into_iter()
-                    .collect();
+                // What is known and when it was read; no choice repeats
+                // the request (§10.1).
+                let read_at = self
+                    .chat
+                    .decisions
+                    .as_ref()
+                    .map(|(_, _, at)| crate::monitor::clock(*at))
+                    .map(|at| match &self.chat.decisions_error {
+                        // A failed re-read leaves the last answer, and says so.
+                        Some(error) => format!("{at} · not read again: {error}"),
+                        None => at,
+                    });
+                // The technical identity stays folded until asked for.
+                let details_key = format!("details:{}", item.subject);
+                let body = StackPanel::new()
+                    .spacing(tokens::spacing::SM)
+                    .keyed_children(crate::views::slots([
+                        read_at.map(|at| controls::secondary(format!("Checked {at}")).into()),
+                        Some(reason.into()),
+                        Some(details_view(
+                            &item.subject,
+                            item.detail.as_deref(),
+                            self.chat.expanded.contains(&details_key),
+                            context.message(Message::Chat(ChatMsg::ToolsToggled(
+                                details_key.clone(),
+                                !self.chat.expanded.contains(&details_key),
+                            ))),
+                        )),
+                    ]));
+                let check = controls::text_button()
+                    .is_enabled(enabled)
+                    .automation_name("Check again")
+                    .on_click(context.message(Message::Chat(ChatMsg::DecisionsRecheck)))
+                    .content(controls::label("Check again"));
+                let mut actions: Vec<KeyedView> = vec![KeyedView::new(
+                    "left",
+                    StackPanel::new()
+                        .orientation(Orientation::Horizontal)
+                        .spacing(tokens::spacing::SM)
+                        .keyed_children(crate::views::slots([stop, Some(check.into())])),
+                )];
                 actions.extend([
                     KeyedView::new("sp", Border::new().grid_column(1)),
                     KeyedView::new(
@@ -611,8 +784,101 @@ impl DesktopApp {
                         "{what}: {}.",
                         eliot_core::reason_words(&item.reason).to_lowercase()
                     ),
-                    item.subject.clone(),
+                    String::new(),
                     Some(body.into()),
+                    actions,
+                )
+            }
+            // Goal blocked: why, the budget left, the daemon's actions.
+            Decision::Goal(item) => {
+                let reference = OwnerInboxItemRef {
+                    kind: item.kind,
+                    subject: item.subject.clone(),
+                    revision: item.revision.clone(),
+                };
+                let agent = self.selected_agent_id().unwrap_or_default();
+                let goal = self
+                    .chat
+                    .goal
+                    .as_ref()
+                    .filter(|(read, _)| *read == agent)
+                    .and_then(|(_, goal)| goal.as_ref());
+                let recommended = item
+                    .recommended
+                    .as_ref()
+                    .map(|choice| choice.choice.clone());
+                let mut choices: Vec<&str> = recommended.iter().map(String::as_str).collect();
+                choices.extend(
+                    item.choices
+                        .iter()
+                        .map(|choice| choice.choice.as_str())
+                        .filter(|choice| Some(*choice) != recommended.as_deref()),
+                );
+                let buttons: Vec<KeyedView> = choices
+                    .into_iter()
+                    .map(|choice| {
+                        let words = format!("{} goal", choice_words(choice));
+                        let primary = Some(choice) == recommended.as_deref();
+                        let button = if primary {
+                            controls::filled()
+                        } else {
+                            controls::outlined_small()
+                        };
+                        KeyedView::new(
+                            choice.to_owned(),
+                            button
+                                .is_enabled(enabled)
+                                .automation_name(words.clone())
+                                .on_click(context.message(Message::Chat(ChatMsg::OwnerDecide(
+                                    reference.clone(),
+                                    if primary {
+                                        "recommended".to_owned()
+                                    } else {
+                                        choice.to_owned()
+                                    },
+                                    words.clone(),
+                                ))))
+                                .content(controls::label(&words)),
+                        )
+                    })
+                    .collect();
+                let mut actions: Vec<KeyedView> = stop
+                    .map(|stop| KeyedView::new("stop", stop))
+                    .into_iter()
+                    .collect();
+                actions.extend([
+                    KeyedView::new("sp", Border::new().grid_column(1)),
+                    KeyedView::new(
+                        "snooze",
+                        Border::new()
+                            .grid_column(2)
+                            .maybe_content(snooze(Some(item), context)),
+                    ),
+                    KeyedView::new(
+                        "choices",
+                        StackPanel::new()
+                            .grid_column(3)
+                            .grid_column_span(2)
+                            .orientation(Orientation::Horizontal)
+                            .spacing(tokens::spacing::SM)
+                            .keyed_children(buttons),
+                    ),
+                ]);
+                let reason = goal
+                    .and_then(|goal| goal.blocked_reason.clone())
+                    .unwrap_or_else(|| eliot_core::reason_words(&item.reason));
+                let body: Option<View> = goal.and_then(goal_budget).map(|budget| {
+                    controls::secondary(format!("Budget used: {budget}"))
+                        .text_wrapping(TextWrapping::Wrap)
+                        .is_text_selection_enabled(true)
+                        .into()
+                });
+                (
+                    controls::glyph::GOAL,
+                    format!("Goal blocked \u{b7} {harness}{count}"),
+                    reason,
+                    String::new(),
+                    body,
                     actions,
                 )
             }
@@ -813,27 +1079,33 @@ impl DesktopApp {
                         .collect()
                 };
                 let selected = values.first().cloned();
-                let chips: Vec<KeyedView> = options
-                    .iter()
-                    .map(|(option, label)| {
-                        let on = selected.as_deref() == Some(option.as_str());
-                        KeyedView::new(
-                            format!("{option}:{on}"),
-                            controls::segment(on)
-                                .automation_name(label.clone())
-                                .on_click(context.message(Message::Chat(ChatMsg::AnswerChanged(
-                                    request.clone(),
-                                    id.clone(),
-                                    vec![option.clone()],
-                                ))))
-                                .content(controls::segment_label(label)),
-                        )
-                    })
-                    .collect();
-                let chips = StackPanel::new()
-                    .orientation(Orientation::Horizontal)
-                    .spacing(tokens::spacing::SM)
-                    .keyed_children(chips);
+                // One answer: native radio buttons (§10.1).
+                let picked = context.callback({
+                    let (request, id, options) = (request.clone(), id.clone(), options.clone());
+                    move |index: Option<usize>| match index.and_then(|index| options.get(index)) {
+                        Some((option, _)) => Message::Chat(ChatMsg::AnswerChanged(
+                            request.clone(),
+                            id.clone(),
+                            vec![option.clone()],
+                        )),
+                        None => Message::Chat(ChatMsg::AnswerUnchanged),
+                    }
+                });
+                let chips = RadioButtons::new()
+                    .automation_name(
+                        question
+                            .title
+                            .clone()
+                            .or_else(|| question.prompt.clone())
+                            .unwrap_or_else(|| "Answer".to_owned()),
+                    )
+                    .items_source(options.iter().map(|(_, label)| label.as_str()))
+                    .selected_index(
+                        options
+                            .iter()
+                            .position(|(option, _)| selected.as_deref() == Some(option.as_str())),
+                    )
+                    .on_selection_changed(move |index: Option<usize>| picked.call(index));
                 if question.free_entry {
                     let request = request.clone();
                     let id = id.clone();
@@ -1223,50 +1495,37 @@ impl DesktopApp {
     }
 }
 
-/// A filled split action (`SplitButton`): the main choice and, 2 DIPs after
-/// it, the menu of its variants (none: the main choice alone).
-fn split_action(
-    enabled: bool,
-    label: &str,
-    click: Callback<()>,
-    more: Vec<MenuItem>,
-    context: &mut ViewContext<DesktopApp>,
-) -> View {
-    let main = controls::filled()
-        .is_enabled(enabled)
-        .automation_name(label)
-        .on_click(click)
-        .content(
-            controls::text(label.to_owned(), tokens::text::EMPHASIZED).margin(Thickness::xy(
-                tokens::spacing::MD - tokens::spacing::ROW,
-                0.0,
-            )),
-        );
-    let menu: Option<View> = if more.is_empty() {
-        None
-    } else {
-        Some(
-            controls::icon_button()
-                .style(ButtonStyle::Accent)
-                .width(tokens::layout::SPLIT_MENU)
-                .is_enabled(enabled)
-                .automation_name("Approval options")
-                .content(controls::icon(controls::glyph::CHEVRON_DOWN))
-                .menu(Menu::new(
-                    more,
-                    // Capture-free: one identity across renders; the label
-                    // names the request's choice when the click is handled.
-                    crate::views::menu_keys(
-                        context
-                            .callback(|label: String| Message::Chat(ChatMsg::ApproveChoice(label))),
-                    ),
-                )),
-        )
-    };
+/// The request's technical identity, folded under Details (§10.1).
+fn details_view(subject: &str, detail: Option<&str>, open: bool, toggle: Callback<()>) -> View {
+    let text: Option<View> = open.then(|| {
+        controls::body(match detail {
+            Some(detail) => format!("{subject}\n{detail}"),
+            None => subject.to_owned(),
+        })
+        .font_size(tokens::text::KID_SIZE)
+        .text_wrapping(TextWrapping::Wrap)
+        .is_text_selection_enabled(true)
+        .into()
+    });
     StackPanel::new()
-        .orientation(Orientation::Horizontal)
-        .spacing(tokens::spacing::ROW_GAP)
-        .vertical_alignment(VerticalAlignment::Center)
-        .keyed_children(crate::views::slots([Some(main.into()), menu]))
+        .spacing(tokens::spacing::XS)
+        .keyed_children(crate::views::slots([
+            Some(
+                controls::text_button()
+                    .horizontal_alignment(HorizontalAlignment::Left)
+                    .automation_name(if open { "Hide details" } else { "Details" })
+                    .on_click(toggle)
+                    .content(controls::icon_label(
+                        if open {
+                            controls::glyph::CHEVRON_UP
+                        } else {
+                            controls::glyph::CHEVRON_DOWN
+                        },
+                        "Details",
+                    ))
+                    .into(),
+            ),
+            text,
+        ]))
         .into()
 }
