@@ -671,6 +671,13 @@ silently disabling the configured HTTPS/SSH transport itself.
   including no-op observations. After restart, retained Git views and HEAD transitions
   provide the durable lower bounds; an unchanged observation needs no durable heartbeat.
 
+Git hint normalization rejects symlinks and reparse points in every path component,
+including junctions to directories inside the worktree. On Windows, existing ordinary
+relative hints can be opened without reparsing from the root pinned for that probe.
+The final path must have the canonical worktree root as a case-sensitive component
+prefix. A missing name or path uses ordinary normalization. Other hint-open errors,
+including transient errors such as sharing violations, make the Git probe unavailable.
+
 The monitor skips periodic Git reads for an idle checkout with a complete sample
 under a healthy filesystem watch. The next reconciliation becomes due after
 300 seconds even if notifications are silently lost or a change is outside the

@@ -194,6 +194,8 @@ impl Directory {
             ));
         }
         let resolved = eliot_plugin::file_final_path(&file).map_err(io)?;
+        // Both the handle's final path and the canonical worktree root use
+        // verbatim DOS paths. Case-sensitive component matching fails closed.
         let relative = resolved
             .strip_prefix(&self.path)
             .map_err(|_| Error::new("unavailable", "file-change hint escapes its worktree"))?;
