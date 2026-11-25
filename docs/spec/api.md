@@ -1062,13 +1062,17 @@ optional Git fetch approval. They do not create or modify registrations. Their p
 values use Core [`ProjectRegistrationView`](../../crates/eliot-core/src/api/agent_views.rs),
 
 whose optional `git` value uses [`ProjectGitView` and `GitCredentialHelper`](../../crates/eliot-core/src/api/agent_views.rs).
-The read-only `origin` is the validated basename of the local `origin` remote's path,
-with `.git` stripped. Malformed and pathless remotes produce no name. The daemon
-reads each common directory in the Git probe's sanitized environment after releasing
-the Store lock. An observed readback can be reused while the watched checkout
-bindings and Git metadata revision still agree with the live registered
-checkout HEAD and index stamps. Missing coverage or a changed stamp takes the
-live Git path. The readback carries only the name. The
+Git monitoring refreshes checkout identities and the read-only `origin`
+basename in the background. The Store lock is released before filesystem or
+Git work. `project.list` and `project.get` return the verified projection
+only for its observed watcher revision. Before publication, monitoring
+checks the registered checkout HEAD and index stamps on both sides of the
+Git read. An absent or invalidated observation returns
+`git_readback_state: "refreshing"` with no origin or checkout details.
+The desktop reads the projection again on its normal refresh cadence.
+Malformed and pathless remotes produce no name, and the origin URL itself
+never leaves the daemon.
+
 `ProjectRegistrationView.policy_usage` field carries
 `applied`, `total`, `opted_out` and `opt_outs` for the last 24 hours. `total` counts distinct
 retained launched Agent IDs, including stopped Agents; attaches and resumed

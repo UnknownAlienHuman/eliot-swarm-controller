@@ -100,6 +100,7 @@ struct State {
     git_bindings: Mutex<HashMap<Key, String>>,
     git_workspaces: Mutex<HashMap<String, Arc<GitWorkspace>>>,
     git_unavailable: Mutex<Option<String>>,
+    project_readbacks: crate::workspace_git::ProjectReadCache,
     git_base_notices: Mutex<GitBaseNoticeConfig>,
     observe: Mutex<ObserveThresholds>,
 }
@@ -312,6 +313,7 @@ impl Monitoring {
                 git_bindings: Mutex::new(HashMap::new()),
                 git_workspaces: Mutex::new(HashMap::new()),
                 git_unavailable: Mutex::new(None),
+                project_readbacks: Default::default(),
                 git_base_notices: Mutex::new(GitBaseNoticeConfig::default()),
                 observe: Mutex::new(ObserveThresholds::default()),
             }),
@@ -1303,17 +1305,86 @@ impl Monitoring {
     }
 
     pub(crate) async fn finish_git(&self) {
+        self.inner.project_readbacks.clear();
         // Finish cursor/gap bookkeeping even when the Git task failed or was cancelled.
         self.finish_git_unavailable().await;
         self.release_inactive_watchers(&HashSet::new(), true);
     }
 
     pub(crate) fn mark_git_unavailable(&self, code: &str) {
+        self.inner.project_readbacks.clear();
         *self.inner.git_unavailable.lock_recover() = Some(code.to_owned());
         self.release_inactive_watchers(&HashSet::new(), true);
     }
 
+    pub(crate) fn project_readbacks(
+        &self,
+        registrations: &mut [eliot_core::api::ProjectRegistrationView],
+        single: bool,
+    ) {
+        self.inner.project_readbacks.apply(registrations, single);
+    }
+
     pub(crate) async fn run_git(
+        self,
+        shutdown: watch::Receiver<bool>,
+        reporter: crate::daemon::workers::WorkerReporter,
+    ) -> Result<()> {
+        tokio::try_join!(
+            self.clone().run_workspace_git(shutdown.clone(), reporter),
+            self.run_project_readbacks(shutdown),
+        )?;
+        Ok(())
+    }
+
+    pub(crate) async fn run_project_readbacks(
+        &self,
+        mut shutdown: watch::Receiver<bool>,
+    ) -> Result<()> {
+        let mut ticks = interval(SAMPLE_INTERVAL);
+        ticks.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        let mut next = Instant::now();
+        let cache = &self.inner.project_readbacks;
+        while !*shutdown.borrow() {
+            tokio::select! {
+                _ = ticks.tick() => {}
+                _ = cache.changed() => {}
+                _ = shutdown.changed() => break,
+            }
+            // Coalesce watcher activity and retry unavailable or missed
+            // observations on the existing bounded Git sampling cadence.
+            tokio::select! {
+                _ = sleep_until(next) => {}
+                _ = shutdown.changed() => break,
+            }
+            next = Instant::now() + SAMPLE_INTERVAL;
+            let refresh = async {
+                let registrations = self.inner.store.lock().await.list_project_registrations(
+                    "owner",
+                    None,
+                    crate::router::PAGE_MAX,
+                );
+                match registrations {
+                    Ok(registrations) => {
+                        crate::workspace_git::WorkspaceGit::refresh_project_readbacks(
+                            cache,
+                            &registrations,
+                        )
+                        .await
+                    }
+                    Err(_) => cache.clear(),
+                }
+            };
+            tokio::select! {
+                _ = refresh => {}
+                _ = shutdown.changed() => break,
+            }
+        }
+        cache.clear();
+        Ok(())
+    }
+
+    async fn run_workspace_git(
         self,
         mut shutdown: watch::Receiver<bool>,
         reporter: crate::daemon::workers::WorkerReporter,

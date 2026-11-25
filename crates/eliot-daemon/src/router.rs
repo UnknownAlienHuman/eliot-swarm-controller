@@ -140,7 +140,7 @@ use tokio::{
     time::{Instant, timeout_at},
 };
 
-const PAGE_MAX: usize = 1_000;
+pub(crate) const PAGE_MAX: usize = 1_000;
 const EVENT_SCAN_MAX: usize = 1_000;
 const EVENT_RESPONSE_MAX_BYTES: usize = 900 * 1024;
 const EVENT_RESPONSE_WRAPPER_RESERVE_BYTES: usize = 4 * 1024;
@@ -300,7 +300,6 @@ struct RouterInner {
     direct_launches: Mutex<launch_queue::DirectLaunches>,
     usage_summary_cache: Mutex<UsageSummaryCache>,
     recent_patch_reads: patch_digest::PatchReadCache,
-    project_read_cache: crate::workspace_git::ProjectReadCache,
 }
 
 const USAGE_SUMMARY_CACHE_CAPACITY: usize = 8;
@@ -660,7 +659,6 @@ impl Router {
                 direct_launches: Mutex::new(launch_queue::DirectLaunches::default()),
                 usage_summary_cache: Mutex::new(UsageSummaryCache::default()),
                 recent_patch_reads: Default::default(),
-                project_read_cache: Default::default(),
             }),
         })
     }
@@ -4514,13 +4512,10 @@ impl Router {
             registration.policy_usage = store.project_policy_usage(&registration.id, now_ms())?;
             registration
         };
-        // Git reads run after the Store lock is released.
         let mut registrations = [registration];
-        crate::workspace_git::WorkspaceGit::fill_project_readbacks(
-            &self.inner.project_read_cache,
-            &mut registrations,
-        )
-        .await;
+        self.inner
+            .monitoring
+            .project_readbacks(&mut registrations, true);
         display_project_registration(&mut registrations[0]);
         let [registration] = registrations;
         registration.validate()?;
@@ -4545,12 +4540,9 @@ impl Router {
             }
             registrations
         };
-        // Git reads run after the Store lock is released.
-        crate::workspace_git::WorkspaceGit::fill_project_readbacks(
-            &self.inner.project_read_cache,
-            &mut registrations,
-        )
-        .await;
+        self.inner
+            .monitoring
+            .project_readbacks(&mut registrations, false);
         for registration in &mut registrations {
             display_project_registration(registration);
         }

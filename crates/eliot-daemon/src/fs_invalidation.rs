@@ -82,7 +82,7 @@ impl WorkspaceInvalidation {
             }
             scope.linked = Some((admin, common));
         }
-        Self::watch_paths(paths, move |path| {
+        Self::watch_paths(paths, None, move |path| {
             (scope.includes(path), scope.binding_changed(path))
         })
     }
@@ -92,6 +92,7 @@ impl WorkspaceInvalidation {
     #[cfg(any(windows, target_os = "linux"))]
     pub(crate) fn watch_paths(
         paths: Vec<(PathBuf, RecursiveMode)>,
+        wake: Option<Arc<tokio::sync::Notify>>,
         classify: impl Fn(&Path) -> (bool, bool) + Send + 'static,
     ) -> core::Result<Self> {
         use crate::git_monitor::reject_links;
@@ -123,6 +124,9 @@ impl WorkspaceInvalidation {
                 if binding || changed {
                     callback_revision.fetch_add(1, Ordering::AcqRel);
                     callback_dirty.store(true, Ordering::Release);
+                    if let Some(wake) = &wake {
+                        wake.notify_one();
+                    }
                 }
             },
             Config::default().with_follow_symlinks(false),
