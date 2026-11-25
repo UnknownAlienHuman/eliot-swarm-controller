@@ -1205,7 +1205,8 @@ impl Store {
         if !result_page::is_restart_continuation_send(&self.connection, id)? {
             return Ok(requested.map(str::to_owned));
         }
-        self.connection
+        let previous = self
+            .connection
             .query_row(
                 "SELECT t.task_command FROM git_work_tasks t
                  LEFT JOIN commands c ON c.id=t.task_command
@@ -1219,7 +1220,13 @@ impl Store {
                 |row| row.get(0),
             )
             .optional()
-            .map_err(sql_error)
+            .map_err(sql_error)?;
+        previous.map(Some).ok_or_else(|| {
+            Error::new(
+                "unavailable",
+                "original task is unavailable behind a generated restart continuation",
+            )
+        })
     }
 
     /// Capture bounded Owner and manager inputs in Store admission order.
