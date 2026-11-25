@@ -236,6 +236,7 @@ struct RouterInner {
     unknown_causes: Mutex<HashMap<String, String>>,
     repeat_failures: Mutex<repeat_failures::RepeatFailures>,
     rule_definitions: Mutex<HashMap<(String, String), (i64, RuleDefinition)>>,
+    rule_inventory_ready: AtomicBool,
     assignment_observations: Mutex<crate::automation::assignment::Observations>,
     rule_source_files: Mutex<HashMap<String, HashMap<String, String>>>,
     catalog_cache: Mutex<catalog::CatalogCache>,
@@ -547,6 +548,7 @@ impl Router {
                 unknown_causes: Mutex::new(HashMap::new()),
                 repeat_failures: Mutex::default(),
                 rule_definitions: Mutex::new(HashMap::new()),
+                rule_inventory_ready: AtomicBool::new(false),
                 assignment_observations: Mutex::default(),
                 rule_source_files: Mutex::new(HashMap::new()),
                 catalog_cache,
@@ -4568,6 +4570,16 @@ impl Router {
         self.inner
             .plugin_host
             .install_completion_interests(principal, completion_interests);
+    }
+
+    pub(crate) fn mark_rule_inventory_ready(&self) {
+        self.inner
+            .rule_inventory_ready
+            .store(true, Ordering::Release);
+    }
+
+    pub(crate) fn rule_inventory_ready(&self) -> bool {
+        self.inner.rule_inventory_ready.load(Ordering::Acquire)
     }
 
     pub(crate) fn remove_completion_interest(&self, principal: &str, id: &str) {

@@ -1,6 +1,6 @@
 use super::*;
 
-pub(super) const CURRENT_SCHEMA_VERSION: i64 = FLUENT_READ_REVISIONS_VERSION;
+pub(super) const CURRENT_SCHEMA_VERSION: i64 = PROJECT_CHECK_OBLIGATIONS_VERSION;
 const HARNESS_CHECK_SCHEMA_VERSION: i64 = 112;
 const WORK_TRUTH_VERSION: i64 = 113;
 const WORK_TRUTH_INTENT_VERSION: i64 = 114;
@@ -35,6 +35,7 @@ const CHILD_DIGEST_ASSIGNMENT_VERSION: i64 = 142;
 const OWNER_PROJECTION_LOOKUP_VERSION: i64 = 143;
 const AGENT_RESULT_READS_VERSION: i64 = 144;
 const FLUENT_READ_REVISIONS_VERSION: i64 = 145;
+const PROJECT_CHECK_OBLIGATIONS_VERSION: i64 = 147;
 
 fn has_restart_continuation_brief_column(connection: &Connection) -> Result<bool> {
     connection
@@ -317,6 +318,26 @@ impl Store {
             self.migrate_sql(
                 include_str!("../migrations/fluent_read_revisions.sql"),
                 Some(FLUENT_READ_REVISIONS_VERSION),
+            )?;
+        }
+        if current < PROJECT_CHECK_OBLIGATIONS_VERSION {
+            self.migrate_sql(
+                "CREATE TABLE project_check_obligations (
+                     completion_seq INTEGER PRIMARY KEY REFERENCES events(seq) ON DELETE CASCADE,
+                     agent INTEGER NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+                     generation INTEGER NOT NULL,
+                     turn_id TEXT NOT NULL,
+                     fingerprint TEXT NOT NULL,
+                     state TEXT NOT NULL CHECK(state IN ('not_started','checker_started','settled')),
+                     outcome TEXT CHECK(outcome IS NULL OR outcome IN ('passed','refused','unknown','stale')),
+                     created_at INTEGER NOT NULL,
+                     settled_at INTEGER,
+                     UNIQUE(agent,generation,completion_seq)
+                 ) WITHOUT ROWID;
+                 CREATE INDEX project_check_obligations_pending
+                   ON project_check_obligations(completion_seq)
+                   WHERE state='not_started';",
+                Some(PROJECT_CHECK_OBLIGATIONS_VERSION),
             )?;
         }
         Ok(())

@@ -622,6 +622,17 @@ The launch rule matches a passed project check for the author turn, selects the
 recorded change size, and admits at most one review per fingerprint, up to two per
 Agent per trailing day and at least two hours apart. A project without a configured
 check can use the recipe's alternate successful `turn.completed` trigger.
+For a successful required-check completion, Store commits one durable review
+obligation with that exact completion. The obligation binds Agent, generation,
+turn, completion sequence and captured worktree fingerprint; it pins the source
+event until the obligation settles. Worker startup recovers only obligations
+whose checker has not started. Claiming the checker is durable before execution,
+so a restart after that point settles the attempt as unknown and never reruns it.
+An unavailable or changed worktree settles without a pass. A later completion
+does not replace an earlier obligation; each receipt remains bound to its own
+completion and fingerprint. Recovery defers a no-rule decision until the initial
+Owner and project rule inventories have loaded successfully; a temporary rule
+read failure leaves the obligation pending.
 `require_worktree = true` rechecks the exact captured Agent generation, workspace
 and fingerprint before live admission and dispatch. This launch form requires live
 event processing. The binding is to the observed tree

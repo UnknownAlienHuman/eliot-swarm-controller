@@ -1285,6 +1285,7 @@ async fn run_global_rules_inner(
             }
         }
     }
+    router.mark_rule_inventory_ready();
     loop {
         if *shutdown.borrow() {
             join_cleanup_task(cleanup_task).await;

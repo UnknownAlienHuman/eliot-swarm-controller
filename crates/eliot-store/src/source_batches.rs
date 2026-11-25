@@ -1429,6 +1429,28 @@ impl Store {
                     cause: cause.clone(),
                 },
             )?;
+            if native_event.kind == "turn.completed"
+                && native_event.data["outcome"] == "success"
+                && native_event.data["project_check"] == "required"
+                && let (Some(turn_id), Some(fingerprint)) = (
+                    native_event.data["turn_id"].as_str(),
+                    native_event.data["worktree"]["fingerprint"].as_str(),
+                )
+            {
+                db!(tx.execute(
+                    "INSERT OR IGNORE INTO project_check_obligations
+                       (completion_seq,agent,generation,turn_id,fingerprint,state,created_at)
+                     VALUES (?1,?2,?3,?4,?5,'not_started',?6)",
+                    params![
+                        stored.seq,
+                        agent_num,
+                        batch.generation,
+                        turn_id,
+                        fingerprint,
+                        now
+                    ],
+                ));
+            }
             let (effects, hold_events) = persist_effects(
                 tx,
                 &effects,
