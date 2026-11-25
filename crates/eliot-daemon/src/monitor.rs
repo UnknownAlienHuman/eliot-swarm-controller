@@ -1321,8 +1321,11 @@ impl Monitoring {
         &self,
         registrations: &mut [eliot_core::api::ProjectRegistrationView],
         single: bool,
+        include_git_state: bool,
     ) {
-        self.inner.project_readbacks.apply(registrations, single);
+        self.inner
+            .project_readbacks
+            .apply(registrations, single, include_git_state);
     }
 
     pub(crate) async fn run_git(

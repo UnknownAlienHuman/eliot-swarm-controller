@@ -3,7 +3,7 @@
 use super::*;
 use crate::fs_invalidation::{FilesystemRevision, WorkspaceInvalidation};
 use crate::platform::is_reparse_point;
-use eliot_core::api::{ProjectCheckoutView, ProjectGitReadbackState, ProjectRegistrationView};
+use eliot_core::api::{ProjectCheckoutView, ProjectRegistrationView};
 use eliot_plugin::sync::LockExt;
 use futures_util::{StreamExt, stream};
 use std::{
@@ -39,7 +39,12 @@ struct WatchedProject {
 impl ProjectReadCache {
     /// Publish only the observation for the current watched revision. This
     /// projection performs no filesystem work and never joins a refresh.
-    pub(crate) fn apply(&self, registrations: &mut [ProjectRegistrationView], single: bool) {
+    pub(crate) fn apply(
+        &self,
+        registrations: &mut [ProjectRegistrationView],
+        single: bool,
+        include_git_state: bool,
+    ) {
         let mut groups = BTreeMap::<String, Vec<&mut ProjectRegistrationView>>::new();
         for registration in &mut *registrations {
             groups
@@ -70,7 +75,7 @@ impl ProjectReadCache {
                 }
             }
             for registration in group {
-                registration.git_readback_state = ProjectGitReadbackState::Refreshing;
+                registration.git_refreshing = include_git_state;
                 registration.origin = None;
                 registration.checkouts.clear();
             }
@@ -701,7 +706,7 @@ fn assign_readbacks(
     mut checkouts: Vec<ProjectCheckoutView>,
 ) {
     for registration in registrations {
-        registration.git_readback_state = ProjectGitReadbackState::Current;
+        registration.git_refreshing = false;
         registration.origin = origin.clone();
         registration.checkouts = std::mem::take(&mut checkouts);
     }

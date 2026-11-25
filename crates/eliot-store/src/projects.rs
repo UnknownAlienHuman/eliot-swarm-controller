@@ -1331,7 +1331,7 @@ fn normalize_registration(input: &ProjectRegistrationInput) -> Result<ProjectReg
         policy_usage: core::api::ProjectPolicyUsageView::default(),
         origin: None,
         checkouts: Vec::new(),
-        git_readback_state: Default::default(),
+        git_refreshing: false,
     };
     view.validate()?;
     Ok(ProjectRegistrationInput {
@@ -1585,6 +1585,6 @@ fn project_registration_from_row(
         policy_usage: core::api::ProjectPolicyUsageView::default(),
         origin: None,
         checkouts: Vec::new(),
-        git_readback_state: Default::default(),
+        git_refreshing: false,
     })
 }

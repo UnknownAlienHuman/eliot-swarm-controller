@@ -1067,13 +1067,15 @@ basename in the background. The Store lock is released before filesystem or
 Git work. `project.list` and `project.get` return the verified projection
 only for its observed watcher revision. Before publication, monitoring
 checks the registered checkout HEAD and index stamps on both sides of the
-Git read. An absent or invalidated observation returns
-`git_readback_state: "refreshing"` with no origin or checkout details.
-The desktop reads the projection again on its normal refresh cadence.
+Git read. An absent or invalidated observation omits origin and checkout
+details. Callers that send `include_git_state: true` receive
+`git_refreshing: true` in those rows. Current rows and callers using the
+original request omit the marker. Clients can read the projection again on
+their normal refresh cadence.
 Malformed and pathless remotes produce no name, and the origin URL itself
 never leaves the daemon.
 
-`ProjectRegistrationView.policy_usage` field carries
+The `ProjectRegistrationView.policy_usage` field carries
 `applied`, `total`, `opted_out` and `opt_outs` for the last 24 hours. `total` counts distinct
 retained launched Agent IDs, including stopped Agents; attaches and resumed
 generations do not add another launch. `applied` counts those Agents that inherited

@@ -424,7 +424,7 @@ enum SubmissionScope {
     DirectRpc,
 }
 
-use eliot_core::api::discovery::{ProjectGetRequest, ProjectListRequest};
+use eliot_core::api::discovery::{ProjectGetRequest, ProjectListViewRequest};
 
 /// One locked snapshot of a frozen wait set: per-entry results plus the
 /// wake filter (watched Agents and commands, and the caller's mailbox for a
@@ -4513,9 +4513,11 @@ impl Router {
             registration
         };
         let mut registrations = [registration];
-        self.inner
-            .monitoring
-            .project_readbacks(&mut registrations, true);
+        self.inner.monitoring.project_readbacks(
+            &mut registrations,
+            true,
+            request.include_git_state,
+        );
         display_project_registration(&mut registrations[0]);
         let [registration] = registrations;
         registration.validate()?;
@@ -4525,7 +4527,8 @@ impl Router {
 
     async fn project_list(&self, params: &Value, principal: &Principal) -> Result<Value> {
         require_owner(principal)?;
-        let _: ProjectListRequest = eliot_core::api::discovery::decode_params(params.clone())?;
+        let request: ProjectListViewRequest =
+            eliot_core::api::discovery::decode_params(params.clone())?;
         let mut registrations = {
             let store = self.inner.store.lock().await;
             let mut registrations = store.list_project_registrations("owner", None, PAGE_MAX)?;
@@ -4540,9 +4543,11 @@ impl Router {
             }
             registrations
         };
-        self.inner
-            .monitoring
-            .project_readbacks(&mut registrations, false);
+        self.inner.monitoring.project_readbacks(
+            &mut registrations,
+            false,
+            request.include_git_state,
+        );
         for registration in &mut registrations {
             display_project_registration(registration);
         }
