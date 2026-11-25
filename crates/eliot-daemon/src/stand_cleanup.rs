@@ -1794,7 +1794,10 @@ pub(crate) async fn plan_external_git(
         }
         check_worktree_record(registry, registry_file, &rec.preparation)?;
         check_stand_worktree_location(stand_root, &rec.preparation.worktree_path)?;
-        Box::pin(git.removal_candidates(&rec.preparation, &rec.scratch, None, deadline)).await?;
+        let (tip, _) =
+            Box::pin(git.removal_candidates(&rec.preparation, &[], None, deadline)).await?;
+        git.require_automatic_removal_merge(&rec.preparation, &tip, deadline)
+            .await?;
         planned_worktrees.insert(wt_key);
     }
 
@@ -1825,13 +1828,15 @@ pub(crate) async fn plan_external_git(
                 "stand branch is checked out in another worktree",
             ));
         }
-        crate::router::Router::pin_local_branch_tip(
+        let tip = crate::router::Router::pin_local_branch_tip(
             &rec.preparation.repo_path,
             &common,
             &rec.preparation.requested_branch,
             deadline,
         )
         .await?;
+        git.require_automatic_removal_merge(&rec.preparation, &tip, deadline)
+            .await?;
     }
     Ok(())
 }
@@ -1841,6 +1846,17 @@ pub async fn cleanup_stand_external_git(
     registry: &Path,
     registry_file: &str,
     registration: &mut StandRegistration,
+) -> Result<StandExternalCleanupReport> {
+    cleanup_stand_external_git_with_policy(stand_root, registry, registry_file, registration, false)
+        .await
+}
+
+async fn cleanup_stand_external_git_with_policy(
+    stand_root: &Path,
+    registry: &Path,
+    registry_file: &str,
+    registration: &mut StandRegistration,
+    require_merged: bool,
 ) -> Result<StandExternalCleanupReport> {
     if let Some(pending) = registration.pending_write_guard.clone() {
         WorktreeWriteGuard::recover(Path::new(&pending.worktree_path), &pending.journal)?;
@@ -1962,7 +1978,12 @@ pub async fn cleanup_stand_external_git(
         }
 
         let outcome = Box::pin(remove_guarded_stand_worktree(
-            stand_root, &git, rec, &mut guard, deadline,
+            stand_root,
+            &git,
+            rec,
+            &mut guard,
+            deadline,
+            require_merged,
         ))
         .await;
         match outcome {
@@ -2190,10 +2211,16 @@ async fn remove_guarded_stand_worktree(
     rec: &StandWorkspaceRecord,
     _guard: &mut WorktreeWriteGuard,
     deadline: Instant,
+    require_merged: bool,
 ) -> GuardedOutcome {
+    let scratch = if require_merged {
+        &[][..]
+    } else {
+        rec.scratch.as_slice()
+    };
     let (tip, files) = match timeout_at(
         deadline,
-        Box::pin(git.removal_candidates(&rec.preparation, &rec.scratch, None, deadline)),
+        Box::pin(git.removal_candidates(&rec.preparation, scratch, None, deadline)),
     )
     .await
     {
@@ -2201,6 +2228,13 @@ async fn remove_guarded_stand_worktree(
         Ok(Err(error)) => return GuardedOutcome::Kept(error.code),
         Err(_) => return GuardedOutcome::Kept("unavailable".to_owned()),
     };
+    if require_merged
+        && let Err(error) = git
+            .require_automatic_removal_merge(&rec.preparation, &tip, deadline)
+            .await
+    {
+        return GuardedOutcome::Kept(error.code);
+    }
 
     let mut mutated = false;
     for candidate in files {
@@ -2389,6 +2423,39 @@ fn require_stand_cleanup_custody_closed(stand_root: &Path) -> Result<()> {
     Ok(())
 }
 
+async fn require_empty_stand_scratch(stand_root: &Path) -> Result<()> {
+    if crate::operator::read_only_stand_exists(stand_root)? {
+        return Ok(());
+    }
+    let scratch = stand_root.join("repo");
+    check_directory_chain(&scratch)?;
+    reject_links(&scratch.join(".git"))?;
+    let probe = GitProbe::new()?;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    for (args, expected) in [
+        (
+            &[
+                "status",
+                "--porcelain=v1",
+                "--untracked-files=all",
+                "--ignored=matching",
+            ][..],
+            "",
+        ),
+        (&["rev-list", "--all", "--count", "HEAD"][..], "1"),
+        (&["ls-tree", "-r", "HEAD"][..], ""),
+    ] {
+        let result = probe.workspace_command(&scratch, args, deadline).await?;
+        if result.code != 0 || String::from_utf8_lossy(&result.stdout).trim() != expected {
+            return Err(Error::new(
+                "stand_scratch_retained",
+                "stand scratch contains changes or retained commits",
+            ));
+        }
+    }
+    Ok(())
+}
+
 pub(crate) async fn plan_stand_artifact(
     daemon_data_root: &Path,
     stand_root: &Path,
@@ -2411,6 +2478,7 @@ pub(crate) async fn plan_stand_artifact(
     crate::operator::verify_stand_target(stand_root, &registration)?;
     let _ = verify_stand_stopped(stand_root, &registration)?;
     require_stand_cleanup_custody_closed(stand_root)?;
+    require_empty_stand_scratch(stand_root).await?;
     Box::pin(plan_external_git(
         stand_root,
         &registry,
@@ -2464,12 +2532,21 @@ pub(crate) async fn apply_stand_artifact(
         ));
     }
     require_stand_cleanup_custody_closed(stand_root)?;
+    require_empty_stand_scratch(stand_root).await?;
     let bytes = stand_tree_bytes(stand_root)?;
-    let report = Box::pin(cleanup_stand_external_git(
+    Box::pin(plan_external_git(
+        stand_root,
+        &registry,
+        &reg_name,
+        &registration,
+    ))
+    .await?;
+    let report = Box::pin(cleanup_stand_external_git_with_policy(
         stand_root,
         &registry,
         &reg_name,
         &mut registration,
+        true,
     ))
     .await?;
     if report.has_retained_or_unknown() {

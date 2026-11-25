@@ -316,6 +316,8 @@ A private stand needs the matching registry, identity, issuer and expiry.
 Historical roots remain eligible after the Agent has ended and all its
 generations' custody and outcomes have settled. Stand cleanup also checks the
 stand's own custody and retains internal managed worktrees pending guarded removal.
+Automatic stand removal also requires an untouched scratch repository and
+fresh merge proof for external worktrees before their guarded removal.
 A generation root can be
 removed when its creation identity is still bound, its registered descendants are
 settled, and the guarded scan of its contents succeeds. Branches, project registrations
