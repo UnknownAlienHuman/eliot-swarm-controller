@@ -1526,16 +1526,19 @@ impl Component for Follow {
         match step {
             FollowStep::Scrolled(metrics) => {
                 let before = self.metrics.replace(metrics);
-                if let Some(extent) = self.above
+                // The first metrics after a build above settle it: a new
+                // extent moves the offset by the height built; the same
+                // extent means it added none.
+                if let Some(extent) = self.above.take()
                     && metrics.extent_height != extent
                 {
-                    self.above = None;
                     let _ = self.shown.scroll.request_scroll_to(
                         0.0,
                         metrics.vertical_offset + (metrics.extent_height - extent),
                         false,
                         |_| {},
                     );
+                    self.count_fresh();
                     return;
                 }
                 if at_end(&metrics) {

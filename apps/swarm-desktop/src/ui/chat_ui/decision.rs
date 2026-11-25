@@ -177,6 +177,11 @@ impl DesktopApp {
             self.chat.decisions = None;
             self.chat.decisions_facts = None;
             self.chat.decisions_error = None;
+            // A read still in flight would show its items again: its
+            // reply looks once more and clears them.
+            if self.chat.decisions_reading {
+                self.chat.decisions_again = true;
+            }
             return;
         }
         if self.chat.decisions_facts.as_ref() == Some(&facts) {
