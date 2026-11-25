@@ -324,6 +324,8 @@ pub use native_children::{
     NATIVE_CHILD_ATTENTION_PAGE_SIZE, NativeChildrenAttention, NativeChildrenAttentionPage,
 };
 mod agent_lifecycle;
+mod agent_retirement;
+pub use agent_retirement::AgentRetirementPolicy;
 mod auth_login;
 mod native_events;
 mod native_session_failure;

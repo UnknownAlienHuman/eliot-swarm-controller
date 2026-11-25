@@ -1,3 +1,4 @@
+mod agent_retirement;
 mod attention;
 mod attribution;
 mod auth;
@@ -6073,6 +6074,12 @@ impl Router {
         request
             .validate_response(&response)
             .map_err(|_| Error::new("internal", "agent.result response is invalid"))?;
+        if let Some(turn) = response.turns.first()
+            && turn.state == eliot_core::TurnState::Completed
+        {
+            self.note_child_result_read(principal, id, turn.generation, &turn.turn_id)
+                .await;
+        }
         serde_json::to_value(response)
             .map_err(|_| Error::new("internal", "agent.result response could not be encoded"))
     }

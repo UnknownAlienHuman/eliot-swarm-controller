@@ -1203,6 +1203,26 @@ the archived leg seeks those ids by primary key and the totals use the same set,
 so no page scans archived history or probes custody per archived row. Summaries and full Agents expose `archived`.
 CLI: `swarm archive aN`, `swarm unarchive aN`, `swarm ls --archived include`.
 
+Automatic [Agent retirement](configuration.md#agent-retirement) archives one
+Agent at a time. It checks aged handoff sources with a retained successor,
+ended children whose direct manager received their latest result, and quiet
+observed sessions whose custody has closed. A successful direct-parent
+`agent.result` readback of the latest completed turn records its exact child
+generation, parent, and turn. A terminal `child.run` response with the full,
+untruncated final text records the same receipt. This receipt also gates
+handed-off children.
+Unread completion digests and unread latest results anywhere below an Agent
+keep it visible. A working child or attached observer
+keeps its custody and stays visible. Retirement starts and stops no sessions.
+
+Open custody, live descendants, unknown outcomes, open commands or requests,
+retained Goals needing attention, project manager assignments and Owner pins
+all block the pass. A managed worktree still binds its Agent until the guarded
+cleanup lane has resolved it and its branch, including proof that unpublished
+work was preserved. Missing-path reconciliation alone does not prove this.
+The pass changes only the archive flag and records `agent.archived`. The
+Agent remains readable by ID and in history.
+
 `agent.delete {id, agent:"aN"}` is Owner-only and removes a tree whose Agents are ended
 (stopped or failed), a detached external observer, or an ended native observation with
 its `unknown` turn retained as ended-observation evidence, using retention's leaf-first

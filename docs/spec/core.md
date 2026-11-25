@@ -1237,6 +1237,12 @@ An idle member keeps its live custody. Unarchive skips the custody check.
 A refusal names the Agent and its first blocker. Reattaching an archived
 observer opens a new `observe` source and clears the flag, so a live reader is never hidden.
 Send, resume, steer and inject admission atomically clears the target's archive flag.
+
+Automatic [Agent retirement](configuration.md#agent-retirement) applies the archive flag
+to an individual Agent with closed custody and no unresolved work. The
+automatic path keeps Agents with unknown commands or turns visible and
+retains all history.
+
 Deletion requires every descendant stopped or failed, a detached external observer, or
 an ended native observation, all drained, and shares retention's leaf-first command row
 cleanup. Archive preserves retained unknown evidence; delete removes the tree's turns

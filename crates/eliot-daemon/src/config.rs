@@ -1235,6 +1235,8 @@ pub(crate) struct DaemonConfig {
     pub(crate) artifact_roots: Vec<String>,
     #[serde(default)]
     pub(crate) retention: RetentionConfig,
+    #[serde(default)]
+    pub(crate) agent_retirement: eliot_store::AgentRetirementPolicy,
     /// Daemon log verbosity: `standard` (working mode) or `debug`
     /// (everything mode). Hot-reloadable through `settings.save`; changing
     /// only this key never requires a restart. See
@@ -1312,6 +1314,7 @@ impl Default for DaemonConfig {
             chats_root: None,
             artifact_roots: Vec::new(),
             retention: RetentionConfig::default(),
+            agent_retirement: eliot_store::AgentRetirementPolicy::default(),
             log_level: default_log_level(),
             limits: core::api::HierarchyLimits::default(),
             attention_suspicion_secs: default_attention_suspicion_secs(),
@@ -1383,6 +1386,12 @@ fn validate_absolute_setting_path(path: &str) -> std::result::Result<(), &'stati
 
 impl DaemonConfig {
     fn validate(self) -> core::Result<Self> {
+        self.agent_retirement.validate().map_err(|error| {
+            core::Error::new(
+                "profile_error",
+                format!("config.toml: daemon.agent_retirement: {}", error.message),
+            )
+        })?;
         if let Some(path) = &self.chats_root {
             validate_absolute_setting_path(path).map_err(|reason| {
                 core::Error::new("profile_error", format!("daemon.chats_root {reason}"))
@@ -1475,6 +1484,7 @@ impl DaemonConfig {
             on_restart: self.on_restart,
             artifact_roots: self.artifact_roots,
             retention: self.retention.validate()?,
+            agent_retirement: self.agent_retirement,
             limits: self.limits,
             attention_suspicion_secs: self.attention_suspicion_secs,
             attention,

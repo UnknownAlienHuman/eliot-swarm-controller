@@ -2219,6 +2219,22 @@ retries inside that Job. The daemon then shares the caller Job's lifetime.
 Unix demand-start starts the daemon in a separate session with standard
 streams disconnected.
 
+### Agent retirement
+
+```toml
+[daemon.agent_retirement]
+enabled = true
+ended_after_seconds = 86400
+observed_idle_after_seconds = 604800
+pinned_agents = ["a123"]
+```
+
+Omitted keys use the shown defaults and an empty pin list. Both thresholds
+are positive integer seconds. The daemon reloads the settings on its
+[retention cadence](#daemon-and-automation-settings). Set `enabled = false` to pause the
+archive pass. A pinned Agent stays out of automatic retirement, and explicit
+Owner archive and unarchive remain available.
+
 ### Agent restart policy
 
 `[daemon].on_restart` takes `"continue"` (default) or `"hold"` and applies
