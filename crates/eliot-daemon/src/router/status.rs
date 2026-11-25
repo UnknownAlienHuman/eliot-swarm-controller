@@ -462,7 +462,7 @@ impl Router {
                 .iter()
                 .map(|agent| {
                     if agent.observe_only {
-                        store.observer_active(&agent.id, agent.generation)
+                        store.observer_active_for_agent(agent, agent.generation)
                     } else {
                         Ok(false)
                     }

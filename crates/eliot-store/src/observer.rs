@@ -707,6 +707,15 @@ impl Store {
         let id = parse_agent_id(agent)?;
         let current = load_agent_by_num(&self.connection, id)?
             .ok_or_else(|| Error::new("not_found", "Agent was not found"))?;
+        self.observer_active_for_agent(&current, generation)
+    }
+
+    pub(crate) fn observer_active_for_agent(
+        &self,
+        current: &Agent,
+        generation: i64,
+    ) -> Result<bool> {
+        let id = parse_agent_id(&current.id)?;
         Ok(current.observe_only
             && current.generation == generation
             && source_open(&self.connection, id, generation)?

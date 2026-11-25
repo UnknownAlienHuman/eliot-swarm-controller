@@ -1617,7 +1617,7 @@ impl Store {
         )?;
         let scope_base = row.state.scope_base.clone();
         let project_default = row.state.project_default;
-        let unsuccessful_turn = self.goal_last_task_turn_unsuccessful(agent, &row)?;
+        let unsuccessful_turn = self.goal_last_task_turn_unsuccessful(&row)?;
         let max_seq = max_agent_seq(&self.connection, &row)?;
         let view = self.goal_view(row)?;
         let probe = GoalRoundProbe {
@@ -1644,30 +1644,59 @@ impl Store {
 
     /// Resume can open a new generation before another task turn runs.
     /// Until then, the last turn on this Agent is still the completion evidence.
-    fn goal_last_task_turn_unsuccessful(&self, agent: &str, goal: &GoalRow) -> Result<bool> {
-        let latest: Option<(i64, String)> = self
+    fn goal_last_task_turn_unsuccessful(&self, goal: &GoalRow) -> Result<bool> {
+        let latest: Option<(
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            String,
+        )> = self
             .connection
             .query_row(
-                "SELECT generation, turn_id FROM turns
-                 WHERE agent = ?1 AND generation <= ?2
-                   AND (native_trigger IS NULL OR start_command_id IS NOT NULL)
-                 ORDER BY generation DESC, COALESCE(started_at, completed_at, 0) DESC, turn_id DESC
+                "SELECT t.state, t.status, t.outcome, t.resolution_source, a.harness
+                 FROM turns t JOIN agents a ON a.id = t.agent
+                 WHERE t.agent = ?1 AND t.generation <= ?2
+                   AND (t.native_trigger IS NULL OR t.start_command_id IS NOT NULL)
+                 ORDER BY t.generation DESC, COALESCE(t.started_at, t.completed_at, 0) DESC, t.turn_id DESC
                  LIMIT 1",
                 params![goal.agent_num, goal.generation],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
             )
             .optional()
             .map_err(sql_error)?;
-        let Some((generation, turn_id)) = latest else {
+        let Some((state, status, stored_outcome, resolution_source, harness)) = latest else {
             return Ok(false);
         };
-        let turn = self
-            .get_turn(agent, generation, &turn_id)?
-            .ok_or_else(|| Error::new("source_integrity", "Goal's latest task turn is missing"))?;
-        let outcome = turn.outcome.unwrap_or(core::TurnOutcome::Unknown);
-        let reported = turn
-            .resolution_source
-            .map_or(outcome, |source| source.reported_outcome(outcome));
+        let resolution_source = resolution_source
+            .as_deref()
+            .map(|value| match value {
+                "owner" => Ok(core::TurnResolutionSource::Owner),
+                "unknown" => Ok(core::TurnResolutionSource::Unknown),
+                _ => Err(Error::new(
+                    "internal",
+                    "invalid stored turn resolution source",
+                )),
+            })
+            .transpose()?;
+        let outcome = match (resolution_source, stored_outcome.as_deref(), state.as_str()) {
+            (Some(core::TurnResolutionSource::Unknown), _, _) => core::TurnOutcome::Unknown,
+            (_, Some(value), _) => core::TurnOutcome::parse(value)
+                .ok_or_else(|| Error::new("internal", "invalid stored turn outcome"))?,
+            (_, None, "completed") => {
+                core::TurnOutcome::classify_legacy_status_for_harness(&harness, status.as_deref())
+            }
+            (_, None, _) => core::TurnOutcome::Unknown,
+        };
+        let reported = resolution_source.map_or(outcome, |source| source.reported_outcome(outcome));
         Ok(reported != core::TurnOutcome::Success)
     }
 
