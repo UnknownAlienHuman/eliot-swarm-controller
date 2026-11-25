@@ -22,6 +22,15 @@ const PROBE_INTERVAL: Duration = Duration::from_secs(10);
 const PROBE_TIMEOUT: Duration = Duration::from_secs(20);
 const MAX_STATUS_BYTES: u64 = 64 * 1024;
 
+/// No daemon answers (the window's daemon link is starting it, or shows
+/// the daemon screen): the poll asks nothing meanwhile.
+static DAEMON_DOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The window's daemon link says whether a daemon answers.
+pub(crate) fn set_daemon_down(down: bool) {
+    DAEMON_DOWN.store(down, std::sync::atomic::Ordering::Relaxed);
+}
+
 pub(crate) fn start() {
     if std::thread::Builder::new()
         .name("swarm-vendor-sign-in".to_owned())
@@ -87,6 +96,9 @@ async fn run() {
             } else {
                 index += 1;
             }
+        }
+        if DAEMON_DOWN.load(std::sync::atomic::Ordering::Relaxed) {
+            continue;
         }
         let Ok(data_dir) = crate::client::data_dir() else {
             continue;

@@ -1076,6 +1076,7 @@ impl Component for DesktopApp {
             Message::Reveal(item, path) => self.reveal_path(item, path),
         }
         self.record_location();
+        crate::vendor_sign_in::set_daemon_down(self.daemon_down());
         self.sync_monitor();
         self.sync_pane(context);
         self.sync_dialog(context);
