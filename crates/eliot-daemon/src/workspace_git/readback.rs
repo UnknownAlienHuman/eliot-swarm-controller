@@ -384,7 +384,7 @@ impl WorkspaceGit {
                         return;
                     }
                     drop(registration_refs);
-                    let watcher = project_watcher(&common_dir);
+                    let watcher = project_watcher(&common_dir, &registrations);
                     if let Some(watcher) = watcher.as_ref() {
                         watcher.take_dirty();
                     }
@@ -760,7 +760,10 @@ fn same_path(left: &Path, right: &Path) -> bool {
 }
 
 #[cfg(any(windows, target_os = "linux"))]
-fn project_watcher(common: &str) -> Option<WorkspaceInvalidation> {
+fn project_watcher(
+    common: &str,
+    registrations: &[&mut ProjectRegistrationView],
+) -> Option<WorkspaceInvalidation> {
     let common = canonical_root(common).ok()?;
     let registry = common.join("worktrees");
     let mut paths = vec![(common.clone(), notify::RecursiveMode::NonRecursive)];
@@ -773,15 +776,37 @@ fn project_watcher(common: &str) -> Option<WorkspaceInvalidation> {
             paths.push((path, notify::RecursiveMode::Recursive));
         }
     }
+    let mut checkout_scopes = Vec::new();
+    for registration in registrations {
+        let root = canonical_root(&registration.checkout).ok()?;
+        let parent = root.parent()?.to_owned();
+        for path in [&parent, &root] {
+            if !paths.iter().any(|(watched, _)| same_path(watched, path)) {
+                paths.push((path.to_owned(), notify::RecursiveMode::NonRecursive));
+            }
+        }
+        checkout_scopes.push((root.clone(), root.join(".git")));
+    }
     WorkspaceInvalidation::watch_paths(paths, move |path| {
-        let relevant = path.starts_with(&common);
-        let binding = path == common || path == registry || path.starts_with(&registry);
+        let checkout_change = checkout_scopes
+            .iter()
+            .any(|(root, dot_git)| path == root || path == dot_git || path.starts_with(root));
+        let relevant = path.starts_with(&common) || checkout_change;
+        let binding = path == common
+            || path == registry
+            || path.starts_with(&registry)
+            || checkout_scopes
+                .iter()
+                .any(|(root, dot_git)| path == root || path == dot_git);
         (relevant, binding)
     })
     .ok()
 }
 
 #[cfg(not(any(windows, target_os = "linux")))]
-fn project_watcher(_common: &str) -> Option<WorkspaceInvalidation> {
+fn project_watcher(
+    _common: &str,
+    _registrations: &[&mut ProjectRegistrationView],
+) -> Option<WorkspaceInvalidation> {
     None
 }
