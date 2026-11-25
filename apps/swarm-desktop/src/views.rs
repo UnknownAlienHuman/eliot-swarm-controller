@@ -1464,10 +1464,26 @@ pub struct Follow {
     /// Read higher up: the item that was last when the view left the end,
     /// and its part count then.
     away: Option<(String, usize)>,
+    /// Parts added since the view left the end (Jump to latest's count),
+    /// kept with `away` and the items, not recounted on every render.
+    fresh: Option<usize>,
     /// Parts are being built above while read higher up: the extent
     /// before, so the next extent change moves the offset by as much.
+    /// Any other input clears it: content changing at the end would make
+    /// that next extent change ambiguous, and a build above that added no
+    /// height (parts inside a folded log) never changes the extent.
     above: Option<f64>,
     _observation: ElementObservation,
+}
+
+impl Follow {
+    /// Count the parts added since the view left the end.
+    fn count_fresh(&mut self) {
+        self.fresh = self
+            .away
+            .as_ref()
+            .and_then(|(last, seen)| new_parts(&self.shown.items.0, last, *seen));
+    }
 }
 
 impl Component for Follow {
@@ -1480,6 +1496,7 @@ impl Component for Follow {
             shown: input.clone(),
             metrics: None,
             away: None,
+            fresh: None,
             above: None,
             _observation: input
                 .scroll
@@ -1498,8 +1515,11 @@ impl Component for Follow {
             self.above = self
                 .above
                 .or(self.metrics.map(|metrics| metrics.extent_height));
+        } else {
+            self.above = None;
         }
         self.shown = input.clone();
+        self.count_fresh();
     }
 
     fn update(&mut self, step: FollowStep, _context: &ComponentContext<Self>) {
@@ -1521,10 +1541,11 @@ impl Component for Follow {
                 if at_end(&metrics) {
                     self.away = None;
                 } else if self.away.is_none()
-                    && before.is_some_and(|before| metrics.vertical_offset < before.vertical_offset)
+                    && before.is_none_or(|before| metrics.vertical_offset < before.vertical_offset)
                 {
-                    // The owner scrolled up: content growing at the end
-                    // moves only the end, never the offset back.
+                    // The owner scrolled up (or the first metrics already
+                    // find the view off its end): content growing at the
+                    // end moves only the end, never the offset back.
                     self.away = self
                         .shown
                         .items
@@ -1532,6 +1553,7 @@ impl Component for Follow {
                         .last()
                         .map(|item| (item.key.clone(), item.parts.len()));
                 }
+                self.count_fresh();
             }
             FollowStep::Jump => {
                 // WinUI clamps the offset to the end of the content.
@@ -1543,16 +1565,16 @@ impl Component for Follow {
         }
     }
 
-    fn view(&self, input: &FollowInput, context: &mut ViewContext<Self>) -> View {
-        let Some((last, seen)) = self.away.as_ref() else {
+    fn view(&self, _input: &FollowInput, context: &mut ViewContext<Self>) -> View {
+        if self.away.is_none() {
             // Nothing over the transcript at the end (no background: the
             // pointer reaches the view below).
             return Border::new()
                 .horizontal_alignment(HorizontalAlignment::Center)
                 .vertical_alignment(VerticalAlignment::Bottom)
                 .into();
-        };
-        let words = match new_parts(&input.items.0, last, *seen) {
+        }
+        let words = match self.fresh {
             Some(fresh) if fresh > 0 => format!("Jump to latest \u{b7} {fresh} new"),
             _ => "Jump to latest".to_owned(),
         };

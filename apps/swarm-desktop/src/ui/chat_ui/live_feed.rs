@@ -356,6 +356,8 @@ impl DesktopApp {
         self.chat.confirm_force = None;
         self.chat.goal = None;
         self.chat.decisions = None;
+        self.chat.decisions_facts = None;
+        self.chat.decisions_error = None;
         self.chat.holds = None;
         self.chat.decision_at = 0;
         self.chat.decide_reason.clear();

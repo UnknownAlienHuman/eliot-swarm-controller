@@ -146,7 +146,10 @@ impl DesktopApp {
     /// may wait: a pending request, an unknown state or outcome in its
     /// history, or a panel kind the daemon counts. The read is decided by
     /// these facts as they stand, never by the order the reads arrive in,
-    /// so a restart rebuilds the panel from the inbox.
+    /// so a restart rebuilds the panel from the inbox. One read is in
+    /// flight at a time, and only for facts not already read: a detail
+    /// refresh with the same facts reads nothing, and facts that change
+    /// during a read are read on its reply.
     pub(in crate::ui) fn read_decisions(&mut self, context: &ComponentContext<Self>) {
         let (Some(agent), Some(detail), Ok(data_dir)) = (
             self.selected_agent_id(),
@@ -155,24 +158,42 @@ impl DesktopApp {
         ) else {
             return;
         };
-        let waiting = !detail.pending.is_empty()
-            || detail.state == eliot_core::AgentState::Unknown
-            || self
+        let facts = DecisionFacts {
+            agent: agent.clone(),
+            pending: detail.pending.len(),
+            unknown: detail.state == eliot_core::AgentState::Unknown,
+            unconfirmed: self
                 .chat
                 .convo
                 .as_ref()
-                .is_some_and(Conversation::has_unconfirmed)
-            || self.panel_counts().iter().any(|count| *count > 0);
-        if waiting {
-            let _task = context.spawn_background(move |_| {
-                let read = client::block_on(client::owner_inbox(&data_dir, None))
-                    .map(|reply| reply.items)
-                    .map_err(|error| error.user_message());
-                Message::Chat(ChatMsg::DecisionsRead(agent, read))
-            });
-        } else {
+                .is_some_and(Conversation::has_unconfirmed),
+            counts: self.panel_counts(),
+        };
+        let waiting = facts.pending > 0
+            || facts.unknown
+            || facts.unconfirmed
+            || facts.counts.iter().any(|count| *count > 0);
+        if !waiting {
             self.chat.decisions = None;
+            self.chat.decisions_facts = None;
+            self.chat.decisions_error = None;
+            return;
         }
+        if self.chat.decisions_facts.as_ref() == Some(&facts) {
+            return;
+        }
+        if self.chat.decisions_reading {
+            self.chat.decisions_again = true;
+            return;
+        }
+        self.chat.decisions_facts = Some(facts);
+        self.chat.decisions_reading = true;
+        let _task = context.spawn_background(move |_| {
+            let read = client::block_on(client::owner_inbox(&data_dir, None))
+                .map(|reply| reply.items)
+                .map_err(|error| error.user_message());
+            Message::Chat(ChatMsg::DecisionsRead(agent, read))
+        });
     }
 
     /// Read what the decision panel and the hold strip need for the open
@@ -674,7 +695,12 @@ impl DesktopApp {
                     .chat
                     .decisions
                     .as_ref()
-                    .map(|(_, _, at)| crate::monitor::clock(*at));
+                    .map(|(_, _, at)| crate::monitor::clock(*at))
+                    .map(|at| match &self.chat.decisions_error {
+                        // A failed re-read leaves the last answer, and says so.
+                        Some(error) => format!("{at} · not read again: {error}"),
+                        None => at,
+                    });
                 // The technical identity stays folded until asked for.
                 let details_key = format!("details:{}", item.subject);
                 let body = StackPanel::new()

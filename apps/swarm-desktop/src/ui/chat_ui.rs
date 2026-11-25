@@ -365,6 +365,18 @@ impl DraftAction {
     }
 }
 
+/// What decides whether the decision panel reads the inbox again: the
+/// open Agent, its pending requests, an unknown state, an unconfirmed
+/// outcome in its history and the daemon's panel counts.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct DecisionFacts {
+    pub(super) agent: String,
+    pub(super) pending: usize,
+    pub(super) unknown: bool,
+    pub(super) unconfirmed: bool,
+    pub(super) counts: [usize; 3],
+}
+
 /// An unconfirmed submission kept with the draft: the exact action, body,
 /// mutation id and ledger key to retry. The next identical Send reuses this
 /// snapshot instead of rederiving identity, which could admit a second
@@ -457,6 +469,17 @@ pub(super) struct ChatState {
     /// The open Agent's `owner.inbox` items (requests, unconfirmed
     /// outcomes), for the decision panel.
     pub(super) decisions: Option<(String, Vec<eliot_core::api::OwnerInboxItem>, i64)>,
+    /// The facts the decision panel's last `owner.inbox` read was asked
+    /// for: a detail refresh with the same facts reads nothing.
+    pub(super) decisions_facts: Option<DecisionFacts>,
+    /// That read is in flight: another request waits for its reply.
+    pub(super) decisions_reading: bool,
+    /// The facts changed while the read was in flight: read again on its
+    /// reply.
+    pub(super) decisions_again: bool,
+    /// The last `owner.inbox` read for the panel failed: what it shows is
+    /// as of `decisions`' time, and it says so.
+    pub(super) decisions_error: Option<String>,
     /// The provider holds with their scopes, read while the open Agent is
     /// held.
     pub(super) holds: Option<(String, Fallible<Vec<eliot_core::ProviderHold>>)>,
@@ -1058,15 +1081,23 @@ impl DesktopApp {
                 }
             }
             ChatMsg::DecisionsRead(agent, read) => {
+                self.chat.decisions_reading = false;
                 if self.selected_agent_id().as_deref() == Some(agent.as_str()) {
                     match read {
                         Ok(items) => {
                             self.chat.decisions = Some((agent, items, crate::handoff::now_ms()));
+                            self.chat.decisions_error = None;
                         }
                         Err(error) => {
+                            // The next detail read tries again.
+                            self.chat.decisions_facts = None;
                             self.set_status(format!("The inbox was not read: {error}"));
+                            self.chat.decisions_error = Some(error);
                         }
                     }
+                }
+                if std::mem::take(&mut self.chat.decisions_again) {
+                    self.read_decisions(context);
                 }
             }
             ChatMsg::HoldsRead(agent, read) => {
@@ -1080,6 +1111,8 @@ impl DesktopApp {
             ChatMsg::OwnerDecided(words, result) => self.owner_decided(&words, *result, context),
             ChatMsg::DecideReason(text) => self.chat.decide_reason = text,
             ChatMsg::DecisionsRecheck => {
+                // Check again reads the inbox whatever the facts.
+                self.chat.decisions_facts = None;
                 self.queue_reread(
                     Invalidation {
                         detail: true,
