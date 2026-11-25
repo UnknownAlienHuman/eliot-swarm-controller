@@ -819,6 +819,10 @@ is written as enabled when Swarm creates a new configuration. An existing
 configuration that omits the key runs plan-only sweeps. Explicit `true` applies
 eligible cleanup after the first complete plan-only sweep of each daemon startup.
 Set `auto_cleanup = false` to disable automatic planning and apply.
+Newly stopped or result-read direct-child worktrees use guarded completion
+cleanup by default. An explicit `auto_cleanup = false` pauses that path too.
+The completion path uses the worktree removal quiet period. The age setting
+below applies to the broad retention sweep.
 `auto_cleanup_after` defaults to seven days and accepts a positive duration
 such as `"14d"`. Every automatic apply uses the
 [cleanup retention policy](coordination.md#registered-artifacts-and-cleanup-k69) through

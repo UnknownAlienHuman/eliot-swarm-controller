@@ -315,6 +315,22 @@ and the latest completed sweep's aggregate outcomes since daemon startup. A
 `cleanup.automatic` event records removals, planned removals, uncertain outcomes
 and new keep reasons. Repeated keep reasons are omitted from later events.
 
+For a direct child with an owned managed worktree, the same sweep handles
+newly stopped generations and idle generations whose manager received the
+latest completed result. Store binds the direct read or acknowledged inline
+digest to both Agent generations and the exact child turn. For an idle
+child, Swarm checks the clean tree and the existing merge proof before
+admitting a normal stop. Stop dispatch rechecks the same idle turn and
+requires no pending or unknown child work. Cleanup then waits for the K69
+quiet period and uses a retained single-worktree plan and apply receipt.
+
+Child worktree cleanup is on by default. It rechecks artifact ownership,
+the current base and candidate tips, retention holds, and the guarded
+removal gates. An archived child, an unexpired artifact, or a refused or
+uncertain removal is kept. Store retains the reason and sends one addressed
+notice to the matching manager generation when that binding still holds.
+Branches and native sessions continue to use their own cleanup policies.
+
 A folder assignment opts in with
 `cleanup_on_retire`: after an applied stop retires its Agent, the existing
 stop worker runs the same plan/apply for that Agent's build, temp and

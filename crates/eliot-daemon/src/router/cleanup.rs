@@ -10,6 +10,7 @@ use eliot_core::api::*;
 use std::path::{Component, Path, PathBuf};
 use tokio::time::timeout;
 
+mod child_completion;
 mod delete;
 mod jobs;
 mod projects;
@@ -24,6 +25,7 @@ const CLEANUP_PLAN_MAX_PREFLIGHT: Duration = Duration::from_secs(15);
 enum CleanupApplyMode<'a> {
     Manual,
     Automatic,
+    ChildCompletion(&'a eliot_store::ChildCleanupJob),
     AgentTree,
     Bulk(&'a HashSet<String>),
 }
@@ -1980,6 +1982,14 @@ impl Router {
     }
 
     pub(crate) async fn auto_cleanup_worktrees(&self, after: &mut Option<String>) {
+        if let Err(error) = self.sweep_child_worktree_cleanup().await {
+            crate::logging::record(
+                &self.secret_policy_snapshot(),
+                "daemon.child_worktree_cleanup_failed",
+                &[],
+                Some(&error),
+            );
+        }
         if let Err(error) = self.sweep_automatic_cleanup(after).await {
             if error.code == "invalid" {
                 *after = None;
@@ -2418,14 +2428,23 @@ impl Router {
                                     cleanup_tree_root(&item.artifact) == Some(root)
                                 }))
                     }));
-            let automatic = matches!(mode, CleanupApplyMode::Automatic);
+            let automatic = matches!(
+                mode,
+                CleanupApplyMode::Automatic | CleanupApplyMode::ChildCompletion(_)
+            );
             let removal = if blocked_workspace {
                 Err(Error::new(
                     "native_session_kept",
                     "The tree's native session cleanup did not complete",
                 ))
             } else if automatic {
-                match self.automatic_cleanup_effect_gate(&item.artifact).await {
+                let gate = match mode {
+                    CleanupApplyMode::ChildCompletion(job) => {
+                        self.child_completion_effect_gate(job, &item.artifact).await
+                    }
+                    _ => self.automatic_cleanup_effect_gate(&item.artifact).await,
+                };
+                match gate {
                     Ok(()) => self.cleanup_remove(name, item, request, true).await,
                     Err(error) => Err(error),
                 }
@@ -2453,7 +2472,9 @@ impl Router {
                 Ok(removal) => removal.outcome(&item.artifact.id),
                 Err(error) => CleanupItemOutcome {
                     artifact_id: item.artifact.id.clone(),
-                    detail: (item.artifact.kind == ArtifactKind::Branch).then(|| {
+                    detail: (item.artifact.kind == ArtifactKind::Branch
+                        || matches!(mode, CleanupApplyMode::ChildCompletion(_)))
+                    .then(|| {
                         let secrets: Vec<_> =
                             self.inner.secrets.lock_recover().iter().cloned().collect();
                         eliot_core::SecretPolicy::new(secrets).redact_bounded(&error.message, 512)

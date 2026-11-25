@@ -677,6 +677,7 @@ fn dispatch_stop_tx(
             ),
         ));
     }
+    super::child_cleanup::child_cleanup_stop_guard_tx(tx, id, agent_num, command_generation)?;
     super::switch::require_unused_switch_successor(tx, id, agent)?;
     super::launch_refusal::require_refused_launch_stop(tx, &command.command, agent)?;
     let turn = if command.command.principal == "owner" {

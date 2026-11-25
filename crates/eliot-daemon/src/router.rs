@@ -5906,6 +5906,14 @@ impl Router {
         request
             .validate_response(&response)
             .map_err(|_| Error::new("internal", "agent.result response is invalid"))?;
+        if let Some(turn) = response
+            .turns
+            .first()
+            .filter(|turn| turn.state == eliot_core::TurnState::Completed)
+        {
+            self.record_child_cleanup_result_read(principal, id, turn.generation, &turn.turn_id)
+                .await;
+        }
         serde_json::to_value(response)
             .map_err(|_| Error::new("internal", "agent.result response could not be encoded"))
     }
@@ -6115,6 +6123,17 @@ impl Router {
             {
                 let mut results = snapshot.results;
                 self.attach_wait_facts(&mut results, principal).await;
+                for result in &results {
+                    if matches!(
+                        result.status.as_str(),
+                        "succeeded" | "failed" | "interrupted"
+                    ) && let (Some(agent), Some(generation), Some(turn)) =
+                        (&result.agent, result.generation, &result.turn_id)
+                    {
+                        self.record_child_cleanup_result_read(principal, agent, generation, turn)
+                            .await;
+                    }
+                }
                 return Self::encode_wait(
                     &request,
                     results,

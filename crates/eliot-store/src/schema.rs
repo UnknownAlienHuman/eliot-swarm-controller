@@ -1,6 +1,6 @@
 use super::*;
 
-pub(super) const CURRENT_SCHEMA_VERSION: i64 = BROKEN_NATIVE_SESSION_VERSION;
+pub(super) const CURRENT_SCHEMA_VERSION: i64 = CHILD_CLEANUP_VERSION;
 const HARNESS_CHECK_SCHEMA_VERSION: i64 = 112;
 const WORK_TRUTH_VERSION: i64 = 113;
 const WORK_TRUTH_INTENT_VERSION: i64 = 114;
@@ -26,6 +26,7 @@ const AUTH_LOGIN_UNKNOWN_VERSION: i64 = 133;
 const ATTENTION_ENDPOINTS_CUSTODY_VERSION: i64 = 134;
 const PROJECT_OVERVIEW_GIT_VERSION: i64 = 135;
 const BROKEN_NATIVE_SESSION_VERSION: i64 = 136;
+const CHILD_CLEANUP_VERSION: i64 = 137;
 
 impl Store {
     pub const SCHEMA_VERSION: i64 = CURRENT_SCHEMA_VERSION;
@@ -210,6 +211,48 @@ impl Store {
                 [BROKEN_NATIVE_SESSION_VERSION],
             )
             .map_err(sql_error)?;
+            tx.commit().map_err(sql_error)?;
+        }
+        if current < CHILD_CLEANUP_VERSION {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            tx.execute_batch(
+                "CREATE TABLE child_cleanup (
+                     child INTEGER NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+                     child_generation INTEGER NOT NULL CHECK(child_generation > 0),
+                     parent INTEGER NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+                     parent_generation INTEGER NOT NULL CHECK(parent_generation > 0),
+                     latest_read_turn TEXT,
+                     not_before INTEGER NOT NULL CHECK(not_before >= 0),
+                     state TEXT NOT NULL CHECK(state IN ('pending','kept','removed')),
+                     reason TEXT NOT NULL,
+                     detail TEXT,
+                     stop_id TEXT, plan_id TEXT, apply_id TEXT, notice_id TEXT,
+                     notice_delivered INTEGER NOT NULL DEFAULT 0 CHECK(notice_delivered IN (0,1)),
+                     PRIMARY KEY(child, child_generation),
+                     CHECK((stop_id IS NULL AND plan_id IS NULL AND apply_id IS NULL AND notice_id IS NULL)
+                        OR (stop_id IS NOT NULL AND plan_id IS NOT NULL AND apply_id IS NOT NULL AND notice_id IS NOT NULL))
+                 ) WITHOUT ROWID;
+                 CREATE INDEX child_cleanup_due ON child_cleanup(state, not_before, child)
+                     WHERE state = 'pending';
+                 CREATE TRIGGER child_cleanup_arm_stopped
+                 AFTER UPDATE OF state ON agents
+                 WHEN NEW.state = 'stopped' AND OLD.state <> 'stopped'
+                   AND NEW.parent IS NOT NULL AND NEW.origin = 'eliot'
+                   AND EXISTS (SELECT 1 FROM workspaces w WHERE w.agent = NEW.id
+                               AND w.target_generation = NEW.generation AND w.phase <> 'removed')
+                 BEGIN
+                     INSERT OR IGNORE INTO child_cleanup
+                       (child, child_generation, parent, parent_generation, latest_read_turn,
+                        not_before, state, reason)
+                     SELECT NEW.id, NEW.generation, p.id, p.generation, NULL,
+                            NEW.updated_at + 60000, 'pending', 'child_stopped'
+                     FROM agents p WHERE p.id = NEW.parent;
+                 END;
+                 INSERT INTO schema_migrations(version) VALUES (137);"
+            ).map_err(sql_error)?;
             tx.commit().map_err(sql_error)?;
         }
         Ok(())
