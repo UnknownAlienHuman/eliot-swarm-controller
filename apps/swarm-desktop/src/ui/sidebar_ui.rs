@@ -900,6 +900,9 @@ fn agent_row(task: &TaskEntry, input: &SidebarInput, context: &mut ViewContext<S
         name.push_str(&format!(", {words}"));
     }
     let (mark, word) = task_look(task);
+    // A working row's static mark is named on screen by its tooltip.
+    let line =
+        line.or_else(|| (mark == Some(controls::RowMark::Working)).then(|| "Working".to_owned()));
     let diff = agent
         .work
         .as_deref()
@@ -975,7 +978,7 @@ fn agent_row(task: &TaskEntry, input: &SidebarInput, context: &mut ViewContext<S
         end
     };
     let kid = row.depth > 0;
-    let leading = mark.map(|mark| controls::row_mark(mark, word.unwrap_or("Failed")));
+    let leading = mark.map(|mark| controls::row_mark(mark, word.unwrap_or(mark.word())));
     let row_button = controls::sub_row(selected)
         .automation_name(name)
         .on_click(context.message(Message::Shell(ShellMsg::AgentOpened(agent.clone()))))
@@ -1039,17 +1042,12 @@ fn agents_row(agents: &AgentsEntry, context: &mut ViewContext<Sidebar>) -> Keyed
             .on_click(context.message(Message::Shell(ShellMsg::PlaceOpened(
                 super::page_ui::Place::Agents,
             ))))
-            .content(controls::sidebar_row(
-                controls::icon(controls::glyph::HUB),
+            // The nav row rule: "Agents" keeps its width and the fleet's
+            // line trims at the right.
+            .content(controls::nav_content(
+                controls::glyph::HUB,
                 "Agents",
-                open,
-                0.0,
-                false,
-                None,
-                View::from(
-                    controls::trailing(agents.line.clone())
-                        .text_trimming(TextTrimming::CharacterEllipsis),
-                ),
+                &agents.line,
             ))
             .tooltip(agents.summary.clone()),
     )

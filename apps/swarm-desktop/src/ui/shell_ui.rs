@@ -320,6 +320,10 @@ pub(super) struct ShellState {
     /// `project.list` reads in flight ([`DesktopApp::load_projects`] and
     /// [`DesktopApp::poll_projects`]): a poll waits while any is.
     pub(super) project_reads: u32,
+    /// The alert of the failing `project.list` streak: a poll repeats no
+    /// alert while the error stays the same; a new error alerts, and a read
+    /// that succeeds clears it.
+    pub(super) projects_error: Option<String>,
     pub(super) selection: Selection,
     pub(super) projects: Vec<UiProject>,
     /// The sidebar's projects as the daemon groups and counts them.
@@ -548,6 +552,7 @@ impl DesktopApp {
                 self.nav.project_reads = self.nav.project_reads.saturating_sub(1);
                 match projects {
                     Ok(mut projects) => {
+                        self.nav.projects_error = None;
                         keep_last_known(&mut projects, &self.nav.projects);
                         self.nav.projects = projects;
                         let workspace = self.launch.workspace.clone();
@@ -568,22 +573,23 @@ impl DesktopApp {
                         }
                         self.refresh_search();
                     }
-                    Err(error) => self.alert(format!("Projects not read: {error}")),
+                    Err(error) => self.projects_failed(&error),
                 }
             }
             ShellMsg::ProjectsPolled(read) => {
-                // A failed read keeps what is shown and says why; the next
-                // poll reads again. A row still refreshing keeps its last
-                // known Git data; one whose marker cleared takes the new
-                // metadata.
+                // A failed read keeps what is shown and says why once per
+                // failing streak; the next poll reads again. A row still
+                // refreshing keeps its last known Git data; one whose
+                // marker cleared takes the new metadata.
                 self.nav.project_reads = self.nav.project_reads.saturating_sub(1);
                 let mut read = match read {
                     Ok(read) => read,
                     Err(error) => {
-                        self.alert(format!("Projects not read: {error}"));
+                        self.projects_failed(&error);
                         return;
                     }
                 };
+                self.nav.projects_error = None;
                 keep_last_known(&mut read, &self.nav.projects);
                 let mut git_changed = false;
                 for fresh in read {
@@ -1937,6 +1943,17 @@ impl DesktopApp {
             && !self.link_view_shown()
     }
 
+    /// The main area is narrow (§6.2): a compact or medium window, or a Wide
+    /// one whose pane docks beside the main area at its minimum width. The
+    /// composer's parameters then take their own line.
+    pub(super) fn narrow_main(&self) -> bool {
+        match self.layout.class {
+            split_ui::SizeClass::Compact | split_ui::SizeClass::Medium => true,
+            split_ui::SizeClass::Wide => self.pane_docked(),
+            split_ui::SizeClass::Wider => false,
+        }
+    }
+
     /// The open pane docks beside the main area (§6.2's docking condition,
     /// not Full view); otherwise it takes the main area, over the
     /// conversation, which keeps its scroll, selection and draft.
@@ -2339,8 +2356,20 @@ impl DesktopApp {
         });
     }
 
+    /// A `project.list` read failed: it alerts unless the same error is
+    /// already the streak's alert ([`ShellState::projects_error`]).
+    fn projects_failed(&mut self, error: &str) {
+        let text = format!("Projects not read: {error}");
+        if self.nav.projects_error.as_deref() != Some(text.as_str()) {
+            self.nav.projects_error = Some(text.clone());
+            self.alert(text);
+        }
+    }
+
     /// Read the projects again (start-up, a refresh, a settings save): it
-    /// always runs, and a poll waits until it replies.
+    /// always runs, and a poll waits until it replies. Its task handle is
+    /// dropped on purpose: Reactor's `ComponentTask` has no `Drop`, so the
+    /// read runs on detached and replies as a message.
     pub(super) fn load_projects(&mut self, context: &ComponentContext<Self>) {
         let Ok(data_dir) = self.data_dir.clone() else {
             return;

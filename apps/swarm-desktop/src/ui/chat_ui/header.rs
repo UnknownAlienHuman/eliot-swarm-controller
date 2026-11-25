@@ -205,8 +205,9 @@ impl DesktopApp {
 
     /// The conversation's header ([`Header`]): the window reads what it
     /// says (the title, project and branch, the state, the goal, the pane
-    /// toggles, the "…" entries); the header draws it, and a window render
-    /// that changes none of it leaves the header as it is.
+    /// commands, the "…" entries); the header draws it, and a window render
+    /// that changes none of it leaves the header as it is. Path, PID,
+    /// generation and session id stay in Details.
     pub(super) fn header_view(&self, agent: &str, context: &mut ViewContext<Self>) -> View {
         let title = self.agent_title(agent);
         let detail = self.bound_detail().ok();
@@ -220,7 +221,7 @@ impl DesktopApp {
         let held = detail
             .and_then(|detail| detail.provider_hold.as_ref())
             .is_some_and(|hold| hold.state == eliot_core::ProviderHoldState::Held);
-        let pill = match state {
+        let shown = match state {
             // A hold shows on a task that is waiting for its provider; an
             // ended one says it ended.
             eliot_core::AgentState::Idle
@@ -229,18 +230,18 @@ impl DesktopApp {
             | eliot_core::AgentState::Starting
                 if held =>
             {
-                Pill::Hold
+                State::Hold
             }
-            eliot_core::AgentState::Busy => Pill::Working("Working"),
+            eliot_core::AgentState::Busy => State::Working("Working"),
             eliot_core::AgentState::Created | eliot_core::AgentState::Starting => {
-                Pill::Working("Starting")
+                State::Working("Starting")
             }
-            eliot_core::AgentState::Waiting => Pill::Waiting,
-            eliot_core::AgentState::Idle => Pill::Idle,
-            eliot_core::AgentState::Stopped => Pill::Stopped,
-            eliot_core::AgentState::Failed => Pill::Failed("Failed"),
-            eliot_core::AgentState::Lost => Pill::Failed("Lost"),
-            eliot_core::AgentState::Unknown => Pill::Failed("Unknown"),
+            eliot_core::AgentState::Waiting => State::Waiting,
+            eliot_core::AgentState::Idle => State::Idle,
+            eliot_core::AgentState::Stopped => State::Stopped,
+            eliot_core::AgentState::Failed => State::Failed("Failed"),
+            eliot_core::AgentState::Lost => State::Failed("Lost"),
+            eliot_core::AgentState::Unknown => State::Failed("Outcome unknown"),
         };
         // Project · branch under the title.
         let workspace = detail
@@ -283,7 +284,7 @@ impl DesktopApp {
         View::component::<Header>(HeaderInput {
             title,
             subtitle,
-            pill,
+            state: shown,
             goal,
             changes,
             workers,
@@ -293,6 +294,7 @@ impl DesktopApp {
                 Panel::Closed
             },
             menu,
+            compact: self.narrow_main(),
             running,
             send: context.forward(),
         })
@@ -381,11 +383,9 @@ fn goal_words(goal: &eliot_core::api::GoalView) -> Option<String> {
     })
 }
 
-/// The header's state pill: its mark (the loader while working, a dot while
-/// waiting or idle, the hold or error icon) and its word, in a hairline
-/// outline.
+/// The header's readable state (§4.2): a static mark and its words.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Pill {
+pub(super) enum State {
     Working(&'static str),
     Waiting,
     Hold,
@@ -394,7 +394,7 @@ pub(super) enum Pill {
     Failed(&'static str),
 }
 
-impl Pill {
+impl State {
     fn word(self) -> &'static str {
         match self {
             Self::Working(word) | Self::Failed(word) => word,
@@ -405,44 +405,19 @@ impl Pill {
         }
     }
 
-    /// The pill: its mark and word, a hairline around them.
-    fn view(self) -> View {
-        let mark: Option<View> = match self {
-            Self::Working(word) => Some(controls::row_mark(controls::RowMark::Working, word)),
-            Self::Waiting => Some(controls::row_mark(
-                controls::RowMark::Waiting,
-                "Waiting for you",
-            )),
-            Self::Idle => Some(controls::row_mark(controls::RowMark::Idle, "Idle")),
-            Self::Hold => Some(controls::xs_icon(controls::glyph::HOLD)),
-            Self::Failed(_) => Some(controls::critical_icon(
-                controls::glyph::ERROR,
-                tokens::icon::CHEVRON,
-            )),
+    /// The mark: the sidebar row's static mark in its slot (the hold icon
+    /// for a hold); none for a stopped task, whose word says it.
+    fn mark(self) -> Option<View> {
+        use controls::RowMark;
+        let word = self.word();
+        match self {
+            Self::Working(_) => Some(controls::row_mark(RowMark::Working, word)),
+            Self::Waiting => Some(controls::row_mark(RowMark::Waiting, word)),
+            Self::Idle => Some(controls::row_mark(RowMark::Idle, word)),
+            Self::Failed(_) => Some(controls::row_mark(RowMark::Failed, word)),
+            Self::Hold => Some(controls::icon(controls::glyph::HOLD)),
             Self::Stopped => None,
-        };
-        Border::new()
-            .min_height(tokens::height::BADGE)
-            .corner_radius(tokens::radius::CONTROL)
-            .border_brush(ThemeBrush::CardStroke)
-            .border_thickness(Thickness::uniform(tokens::layout::HAIRLINE))
-            .padding(Thickness::xy(tokens::spacing::ROW, 0.0))
-            .vertical_alignment(VerticalAlignment::Center)
-            .automation_name(self.word())
-            .content(
-                StackPanel::new()
-                    .orientation(Orientation::Horizontal)
-                    .spacing(tokens::spacing::CHIP_GAP)
-                    .keyed_children(crate::views::slots([
-                        mark,
-                        Some(
-                            controls::text(self.word(), tokens::text::LABEL)
-                                .vertical_alignment(VerticalAlignment::Center)
-                                .into(),
-                        ),
-                    ])),
-            )
-            .into()
+        }
     }
 }
 
@@ -453,8 +428,8 @@ pub(super) struct HeaderInput {
     title: String,
     /// "project · branch".
     subtitle: String,
-    pill: Pill,
-    /// The goal mark's words, when the Agent has a goal.
+    state: State,
+    /// The goal's words, when the Agent has a goal.
     goal: Option<String>,
     /// The worktree's `+N −M`, when read.
     changes: Option<(u64, u64)>,
@@ -462,21 +437,33 @@ pub(super) struct HeaderInput {
     workers: usize,
     /// The right pane's open tab (`Closed`: no pane).
     open: Panel,
-    /// The "…" entries; `None` while the detail is read (the button is
-    /// shown, not active).
+    /// The task's "…" entries; `None` while the detail is read.
     menu: Option<Vec<MenuItem>>,
+    /// The main area is at its narrowest: Agents and Details move into
+    /// More, so the title keeps its room.
+    compact: bool,
     /// A turn runs: the progress bar under the header.
     running: bool,
     send: Callback<Message>,
 }
 
-/// The header (`ConversationHeader`), as its own component: the title over
-/// project · branch, the state pill, the goal mark, the pane toggles
-/// (Changes, Agents, Details, Terminal) and "…", 52 DIPs on a hairline;
-/// under it the progress bar while a turn runs. Its controls go to the window.
+/// The header (`ConversationHeader`, §9.1), as its own component. Left, in
+/// the star cell: the title (trimmed with "…") over one line of project ·
+/// branch, the state and the goal. Right: Changes, Agents, Details and
+/// More, stock buttons of one height (the pane commands are toggle buttons,
+/// checked while their tab is open); when the main area is at its
+/// narrowest, Agents and Details are More's first entries unless their tab
+/// is open, and Terminal is in More unless its tab is open. Under it the
+/// progress bar while a turn runs: the header's one activity indicator.
 pub(super) struct Header {
     send: Callback<Message>,
 }
+
+/// More's entries that open a pane tab not in the bar, before the task's
+/// own actions.
+const OPEN_AGENTS: &str = "Agents";
+const OPEN_DETAILS: &str = "Details";
+const OPEN_TERMINAL: &str = "Terminal (Ctrl+J)";
 
 impl Component for Header {
     type Input = HeaderInput;
@@ -497,187 +484,178 @@ impl Component for Header {
     }
 
     fn view(&self, input: &HeaderInput, context: &mut ViewContext<Self>) -> View {
-        let more: View = match &input.menu {
-            Some(items) => controls::icon_button()
-                .automation_name("More task actions")
-                .content(controls::icon(controls::glyph::MORE))
-                .menu(Menu::new(
-                    items.clone(),
-                    // Capture-free, so the callback keeps one identity
-                    // across renders: Reactor 0.100.0 re-sends a menu
-                    // whose callback changed, replacing the native
-                    // MenuFlyout and dropping a click on the open one.
-                    // Reactor reports the chosen item's label only.
-                    crate::views::menu_keys(context.callback(|label: String| {
-                        Action::from_label(&label)
+        // A pane command: checked while its tab is open; unchecking it
+        // closes the pane, checking it opens that tab.
+        let toggle = |panel: Panel, words: String, context: &mut ViewContext<Self>| -> View {
+            let checked = input.open == panel;
+            controls::bar_toggle(checked)
+                .automation_name(if checked {
+                    format!("{words} (open)")
+                } else {
+                    words.clone()
+                })
+                .on_is_checked_changed(crate::views::check_changes(context.callback(
+                    move |on: bool| {
+                        Message::Shell(ShellMsg::PanelToggled(if on {
+                            panel
+                        } else {
+                            Panel::Closed
+                        }))
+                    },
+                )))
+                .content(controls::label(&words))
+                .into()
+        };
+        let changes = toggle(
+            Panel::Changes,
+            match input.changes {
+                Some((add, del)) => format!("Changes +{add} \u{2212}{del}"),
+                None => "Changes".to_owned(),
+            },
+            context,
+        );
+        let agents_words = if input.workers > 0 {
+            format!("Agents {}", input.workers)
+        } else {
+            "Agents".to_owned()
+        };
+        // A secondary pane command sits in the bar while its tab is open
+        // (checked, so unchecking it closes the pane) and in More otherwise:
+        // Agents and Details when the bar is compact, Terminal always.
+        let in_bar = |panel: Panel| -> bool {
+            input.open == panel || (!input.compact && panel != Panel::Terminal)
+        };
+        let mut items: Vec<MenuItem> = Vec::new();
+        if !in_bar(Panel::Agents) {
+            items.push(MenuItem::item(OPEN_AGENTS, agents_words.clone()));
+        }
+        if !in_bar(Panel::Details) {
+            items.push(MenuItem::item(OPEN_DETAILS, OPEN_DETAILS));
+        }
+        if !in_bar(Panel::Terminal) {
+            items.push(MenuItem::item(OPEN_TERMINAL, OPEN_TERMINAL));
+        }
+        if let Some(menu) = &input.menu {
+            items.push(MenuItem::separator("actions"));
+            items.extend(menu.iter().cloned());
+        }
+        let more: View = controls::bar_button(false)
+            .automation_name("More task actions")
+            .content(controls::icon(controls::glyph::MORE))
+            .menu(Menu::new(
+                items,
+                // Capture-free, so the callback keeps one identity across
+                // renders: Reactor re-sends a menu whose callback changed,
+                // replacing the native MenuFlyout and dropping a click on
+                // the open one.
+                crate::views::menu_keys(context.callback(|key: String| {
+                    match key.as_str() {
+                        OPEN_AGENTS => Message::Shell(ShellMsg::PanelToggled(Panel::Agents)),
+                        OPEN_DETAILS => Message::Shell(ShellMsg::PanelToggled(Panel::Details)),
+                        OPEN_TERMINAL => Message::Shell(ShellMsg::PanelToggled(Panel::Terminal)),
+                        label => Action::from_label(label)
                             .map_or(Message::Menu(menu_ui::MenuMsg::Ignored), |action| {
                                 Message::Chat(ChatMsg::AgentMenu(action))
-                            })
-                    })),
-                )),
-            None => controls::icon_button()
-                .is_enabled(false)
-                .automation_name("More task actions")
-                .content(controls::icon(controls::glyph::MORE))
-                .into(),
-        };
+                            }),
+                    }
+                })),
+            ));
+        let mut commands = vec![KeyedView::new("changes", changes)];
+        if in_bar(Panel::Agents) {
+            commands.push(KeyedView::new(
+                "agents",
+                toggle(Panel::Agents, agents_words, context),
+            ));
+        }
+        if in_bar(Panel::Details) {
+            commands.push(KeyedView::new(
+                "details",
+                toggle(Panel::Details, OPEN_DETAILS.to_owned(), context),
+            ));
+        }
+        if in_bar(Panel::Terminal) {
+            commands.push(KeyedView::new(
+                "terminal",
+                toggle(Panel::Terminal, "Terminal".to_owned(), context),
+            ));
+        }
+        commands.push(KeyedView::new("more", more));
+        // The line under the title: project · branch (it trims first), the
+        // state and the goal, in one type size on one baseline.
+        let state: View = StackPanel::new()
+            .orientation(Orientation::Horizontal)
+            .spacing(tokens::spacing::XS)
+            .vertical_alignment(VerticalAlignment::Center)
+            .automation_name(input.state.word())
+            .keyed_children(crate::views::slots([
+                input.state.mark(),
+                Some(
+                    controls::secondary(input.state.word())
+                        .vertical_alignment(VerticalAlignment::Center)
+                        .into(),
+                ),
+            ]))
+            .into();
         let goal: Option<View> = input.goal.as_ref().map(|words| {
-            controls::status_chip_button()
-                .automation_name(format!("{words}: open Details"))
-                .on_click(
-                    context.message(Message::Monitor(MonitorMsg::PanelChosen(Panel::Details))),
-                )
-                .content(controls::chip_content(
-                    Some(controls::glyph::GOAL),
-                    words,
-                    false,
+            StackPanel::new()
+                .orientation(Orientation::Horizontal)
+                .spacing(tokens::spacing::XS)
+                .vertical_alignment(VerticalAlignment::Center)
+                .automation_name(words.clone())
+                .children((
+                    controls::xs_icon(controls::glyph::GOAL),
+                    controls::secondary(words.clone())
+                        .vertical_alignment(VerticalAlignment::Center),
                 ))
                 .into()
         });
-        // The pane toggles (component 3): pressed = that tab of the right
-        // pane is open; the pressed one closes the pane. Changes and
-        // "Agents N" are labelled buttons (accent when pressed), Agents
-        // without workers, Details and Terminal icon buttons.
-        let toggle = |panel: Panel| -> Callback<()> {
-            if input.open == panel {
-                context.message(Message::Shell(ShellMsg::PanelToggled(Panel::Closed)))
-            } else {
-                context.message(Message::Shell(ShellMsg::PanelToggled(panel)))
-            }
-        };
-        let named = |panel: Panel, words: &str| -> String {
-            if input.open == panel {
-                format!("{words} (open)")
-            } else {
-                words.to_owned()
-            }
-        };
-        // An open pane's toggle is the accent button.
-        let labelled = controls::segment;
-        let changes: View = {
-            let pressed = input.open == Panel::Changes;
-            let counts: Option<View> = input
-                .changes
-                .map(|(add, del)| controls::diff_counts(add, del));
-            labelled(pressed)
-                .automation_name(named(Panel::Changes, "Changes"))
-                .on_click(toggle(Panel::Changes))
-                .content(
-                    StackPanel::new()
-                        .orientation(Orientation::Horizontal)
-                        .spacing(tokens::spacing::SM)
-                        .margin(Thickness::xy(
-                            tokens::spacing::INSET - tokens::spacing::ROW,
-                            0.0,
-                        ))
-                        .keyed_children(crate::views::slots([
-                            Some(
-                                controls::text("Changes", tokens::text::BUTTON)
-                                    .vertical_alignment(VerticalAlignment::Center)
-                                    .into(),
-                            ),
-                            counts,
-                        ])),
-                )
-                .tooltip("Changes")
-        };
-        let icon_toggle = |panel: Panel, glyph: &str, words: &str| -> View {
-            let pressed = input.open == panel;
-            controls::toggle_icon_button(pressed)
-                .automation_name(named(panel, words))
-                .on_click(toggle(panel))
-                .content(controls::icon(glyph))
-                .tooltip(words)
-        };
-        let agents: View = if input.workers > 0 {
-            let pressed = input.open == Panel::Agents;
-            let words = format!("Agents {}", input.workers);
-            labelled(pressed)
-                .automation_name(named(Panel::Agents, &words))
-                .on_click(toggle(Panel::Agents))
-                .content(
-                    StackPanel::new()
-                        .orientation(Orientation::Horizontal)
-                        .spacing(tokens::spacing::SM)
-                        .margin(Thickness::xy(
-                            tokens::spacing::INSET - tokens::spacing::ROW,
-                            0.0,
-                        ))
-                        .children((
-                            controls::small_icon(controls::glyph::HUB),
-                            controls::text(words.clone(), tokens::text::BUTTON)
-                                .vertical_alignment(VerticalAlignment::Center),
-                        )),
-                )
-                .tooltip("Agents")
-        } else {
-            icon_toggle(Panel::Agents, controls::glyph::HUB, "Agents")
-        };
-        let details = icon_toggle(Panel::Details, controls::glyph::INFO, "Details");
-        let terminal = icon_toggle(
-            Panel::Terminal,
-            controls::glyph::TERMINAL,
-            "Terminal (Ctrl+J)",
-        );
+        let mut columns = vec![GridLength::STAR, GridLength::Auto];
+        let mut cells = vec![
+            KeyedView::new(
+                "place",
+                controls::secondary(input.subtitle.clone())
+                    .vertical_alignment(VerticalAlignment::Center)
+                    .text_trimming(TextTrimming::CharacterEllipsis),
+            ),
+            KeyedView::new("state", Border::new().grid_column(1).content(state)),
+        ];
+        if let Some(goal) = goal {
+            columns.push(GridLength::Auto);
+            cells.push(KeyedView::new(
+                "goal",
+                Border::new().grid_column(2).content(goal),
+            ));
+        }
+        let line = Grid::new()
+            .columns(columns)
+            .column_spacing(tokens::spacing::MD)
+            .horizontal_alignment(HorizontalAlignment::Left)
+            .keyed_children(cells);
         let bar = Border::new()
             .min_height(tokens::height::HEADER)
             .border_brush(ThemeBrush::CardStroke)
             .border_thickness(Thickness::new(0.0, 0.0, 0.0, tokens::layout::HAIRLINE))
-            .padding(Thickness::new(
-                tokens::spacing::MD,
-                0.0,
-                tokens::spacing::SM,
-                0.0,
-            ))
+            .padding(Thickness::xy(tokens::spacing::MD, tokens::spacing::XS))
             .content(
                 Grid::new()
                     .columns([GridLength::STAR, GridLength::Auto])
-                    .column_spacing(tokens::spacing::SM)
+                    .column_spacing(tokens::spacing::MD)
                     .children((
                         StackPanel::new()
                             .vertical_alignment(VerticalAlignment::Center)
                             .children((
-                                controls::text(input.title.clone(), tokens::text::TITLE)
+                                controls::text(input.title.clone(), tokens::text::HEADER)
                                     .automation_heading_level(AutomationHeadingLevel::Level2)
                                     .text_trimming(TextTrimming::CharacterEllipsis)
                                     .is_text_selection_enabled(true),
-                                controls::secondary(input.subtitle.clone())
-                                    .text_trimming(TextTrimming::CharacterEllipsis),
+                                line,
                             )),
                         StackPanel::new()
                             .grid_column(1)
                             .orientation(Orientation::Horizontal)
-                            .spacing(tokens::spacing::SM)
+                            .spacing(tokens::spacing::XS)
                             .vertical_alignment(VerticalAlignment::Center)
-                            // Keyed by the open tab: a toggle whose pressed
-                            // state changes is a new control, so its style
-                            // (accent or default, on or off) is applied.
-                            .keyed_children(
-                                [
-                                    Some(KeyedView::new("pill", input.pill.view())),
-                                    goal.map(|goal| KeyedView::new("goal", goal)),
-                                    Some(KeyedView::new(
-                                        format!("changes:{}", input.open == Panel::Changes),
-                                        changes,
-                                    )),
-                                    Some(KeyedView::new(
-                                        format!("agents:{}", input.open == Panel::Agents),
-                                        agents,
-                                    )),
-                                    Some(KeyedView::new(
-                                        format!("details:{}", input.open == Panel::Details),
-                                        details,
-                                    )),
-                                    Some(KeyedView::new(
-                                        format!("terminal:{}", input.open == Panel::Terminal),
-                                        terminal,
-                                    )),
-                                    Some(KeyedView::new("more", more)),
-                                ]
-                                .into_iter()
-                                .flatten()
-                                .collect::<Vec<_>>(),
-                            ),
+                            .keyed_children(commands),
                     )),
             );
         // WinUI's indeterminate progress bar under the header while a turn

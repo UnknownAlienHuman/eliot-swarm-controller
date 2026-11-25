@@ -522,36 +522,38 @@ fn part_view(
         copy.call(key.clone());
     };
     Some(match part.kind {
-        PartKind::Input => StackPanel::new()
-            .spacing(tokens::spacing::XS)
-            .horizontal_alignment(HorizontalAlignment::Right)
-            .max_width(tokens::layout::READING_WIDTH * tokens::layout::BUBBLE_SHARE)
-            .keyed_children(crate::views::slots([
-                Some(crate::controls::bubble(
-                    bubble_content(&part.plain, &part.label),
-                    None,
-                )),
-                (!part.attachments.is_empty()).then(|| attached_chips(&part.attachments)),
-                Some(
-                    Border::new()
-                        .horizontal_alignment(HorizontalAlignment::Right)
-                        .margin(Thickness::new(0.0, 0.0, -INSET, 0.0))
-                        .content(copy_button("Copy message", hovered, copy_message))
-                        .into(),
-                ),
-            ]))
-            .into(),
+        PartKind::Input => owner_side(
+            StackPanel::new()
+                .spacing(tokens::spacing::XS)
+                .horizontal_alignment(HorizontalAlignment::Right)
+                .keyed_children(crate::views::slots([
+                    Some(crate::controls::bubble(
+                        bubble_content(&part.plain, &part.label),
+                        None,
+                    )),
+                    (!part.attachments.is_empty()).then(|| attached_chips(&part.attachments)),
+                    Some(
+                        Border::new()
+                            .horizontal_alignment(HorizontalAlignment::Right)
+                            .margin(Thickness::new(0.0, 0.0, -INSET, 0.0))
+                            .content(copy_button("Copy message", hovered, copy_message))
+                            .into(),
+                    ),
+                ]))
+                .into(),
+        ),
         // A steered message stays in the turn it steered, its label under
         // the text ("Steer · 14:02").
-        PartKind::Steer => Border::new()
-            .horizontal_alignment(HorizontalAlignment::Right)
-            .max_width(tokens::layout::READING_WIDTH * tokens::layout::BUBBLE_SHARE)
-            .automation_name(format!("Steered: {}", part.plain))
-            .content(crate::controls::bubble(
-                bubble_content(&part.plain, &part.label),
-                None,
-            ))
-            .into(),
+        PartKind::Steer => owner_side(
+            Border::new()
+                .horizontal_alignment(HorizontalAlignment::Right)
+                .automation_name(format!("Steered: {}", part.plain))
+                .content(crate::controls::bubble(
+                    bubble_content(&part.plain, &part.label),
+                    None,
+                ))
+                .into(),
+        ),
         // The agent's commentary between steps (`.note`).
         PartKind::Progress => StackPanel::new()
             .spacing(tokens::spacing::SM)
@@ -692,10 +694,21 @@ fn part_view(
                 .keyed_children(crate::views::slots([Some(row.into()), detail]))
                 .into()
         }
-        // The end of a turn without an answer ("Stopped by you after 3m")
-        // is a service line; other notices keep their label.
+        // The end of a turn without an answer is a service line: the
+        // owner's stop says only that ("Stopped by you after 3m"); any other
+        // end keeps its outcome in view ("Assistant · result not confirmed
+        // · …"), with a warning unless the turn succeeded.
         PartKind::Notice if part.key.contains("/final:") => {
-            service_line(&part.plain, crate::controls::glyph::STOP_CIRCLE)
+            if part.label == crate::chat::STOPPED_BY_YOU_LABEL {
+                service_line(&part.plain, crate::controls::glyph::STOP_CIRCLE)
+            } else {
+                let glyph = if part.label == crate::chat::ANSWER_LABEL {
+                    crate::controls::glyph::INFO
+                } else {
+                    crate::controls::glyph::WARNING
+                };
+                service_line(&format!("{} · {}", part.label, part.plain), glyph)
+            }
         }
         PartKind::Notice => crate::controls::secondary(format!("{} · {}", part.label, part.plain))
             .text_wrapping(TextWrapping::Wrap)
@@ -704,6 +717,19 @@ fn part_view(
         // Where a new generation starts: one quiet line, read out by name.
         PartKind::Generation => service_line(&part.label, generation_glyph(&part.label)),
     })
+}
+
+/// The owner's side of the reading column (§9.1): the message at the
+/// right, as wide as its text up to the bubble's share of the column (a
+/// star cell, not a fixed width), so a short message stays short.
+fn owner_side(message: View) -> View {
+    Grid::new()
+        .columns([
+            GridLength::Star(1.0 - tokens::layout::BUBBLE_SHARE),
+            GridLength::Star(tokens::layout::BUBBLE_SHARE),
+        ])
+        .children((Border::new().grid_column(1).content(message),))
+        .into()
 }
 
 /// A message bubble's text and, under it, its time and label
@@ -1352,8 +1378,8 @@ struct LogHead {
     more: Option<usize>,
 }
 
-/// A work log's head (`.lg-head`): the chevron, "Worked for 4m 12s · ran 6
-/// commands, edited 3 files" muted; while the
+/// A work log's head (`.lg-head`): the chevron, "Worked for 4m 12s · 8
+/// commands · 3 files changed"; while the
 /// turn runs, "Working for …" counting and what the running step does, with
 /// the loader, on the right. A click opens or closes the log.
 fn log_head(part: &RenderedPart, head: LogHead, callbacks: &RowCallbacks) -> View {
@@ -1447,23 +1473,42 @@ fn log_head(part: &RenderedPart, head: LogHead, callbacks: &RowCallbacks) -> Vie
         .into()
 }
 
-/// The Edited files card under an answer (`.edited`): up to five paths,
-/// "Show N more", and View changes (the Changes tab on Last turn).
+/// The changed files under an answer (§9.1): "N files changed" with View
+/// changes (the Changes tab on Last turn), up to five paths, "Show N
+/// more"; a plain list, no card.
 fn edited_card(part: &RenderedPart, all: bool, callbacks: &RowCallbacks) -> View {
     let shown = if all {
         part.detail.len()
     } else {
         part.detail.len().min(EDITED_FILES)
     };
+    // The caption and View changes on one line, the paths under it: a
+    // plain list under the answer, no card around it.
     let mut rows: Vec<KeyedView> = vec![KeyedView::new(
         "caption",
-        crate::controls::secondary("Edited files").margin(Thickness::xy(0.0, tokens::spacing::XS)),
+        crate::controls::row_grid(
+            None,
+            crate::controls::secondary(crate::chat::count_words(
+                part.detail.len(),
+                "file changed",
+                "files changed",
+            ))
+            .vertical_alignment(VerticalAlignment::Center)
+            .into(),
+            Some(
+                crate::controls::text_button()
+                    .automation_name("View changes")
+                    .on_click(callbacks.view_changes.clone())
+                    .content(crate::controls::label("View changes"))
+                    .into(),
+            ),
+            tokens::spacing::SM,
+        ),
     )];
     for path in part.detail.iter().take(shown) {
         rows.push(KeyedView::new(
             path.clone(),
             Grid::new()
-                .min_height(tokens::height::CONTROL)
                 .columns([GridLength::Auto, GridLength::STAR])
                 .column_spacing(tokens::spacing::SM)
                 .automation_name(format!("Edited {path}"))
@@ -1477,45 +1522,24 @@ fn edited_card(part: &RenderedPart, all: bool, callbacks: &RowCallbacks) -> View
                 )),
         ));
     }
-    let more: Option<View> = (part.detail.len() > EDITED_FILES && !all).then(|| {
+    if part.detail.len() > EDITED_FILES && !all {
         let toggle = callbacks.toggle_tools.clone();
         let key = log_key("more", &part.key);
         let hidden = part.detail.len() - EDITED_FILES;
-        crate::controls::text_button()
-            .automation_name(format!("Show {hidden} more edited files"))
-            .on_click(move || {
-                toggle.call((key.clone(), true));
-            })
-            .content(crate::controls::label(&format!("Show {hidden} more")))
-            .into()
-    });
-    rows.push(KeyedView::new(
-        "actions",
-        Grid::new()
-            .columns([GridLength::Auto, GridLength::STAR, GridLength::Auto])
-            .keyed_children(crate::views::slots([
-                more,
-                Some(
-                    crate::controls::text_button()
-                        .grid_column(2)
-                        .automation_name("View changes")
-                        .on_click(callbacks.view_changes.clone())
-                        .content(crate::controls::label("View changes"))
-                        .into(),
-                ),
-            ])),
-    ));
-    Border::new()
-        .background(ThemeBrush::CardBackground)
-        .border_brush(ThemeBrush::CardStroke)
-        .border_thickness(Thickness::uniform(tokens::layout::HAIRLINE))
-        .corner_radius(tokens::radius::CONTAINER)
-        .padding(Thickness::xy(tokens::spacing::INSET, tokens::spacing::SM))
-        .content(
-            StackPanel::new()
-                .spacing(tokens::spacing::ROW_GAP)
-                .keyed_children(rows),
-        )
+        rows.push(KeyedView::new(
+            "more",
+            crate::controls::text_button()
+                .horizontal_alignment(HorizontalAlignment::Left)
+                .automation_name(format!("Show {hidden} more edited files"))
+                .on_click(move || {
+                    toggle.call((key.clone(), true));
+                })
+                .content(crate::controls::label(&format!("Show {hidden} more"))),
+        ));
+    }
+    StackPanel::new()
+        .spacing(tokens::spacing::XS)
+        .keyed_children(rows)
         .into()
 }
 

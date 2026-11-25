@@ -428,48 +428,59 @@ pub fn toggle_icon_button(on: bool) -> Button {
     }
 }
 
-/// The composer's main action (Send): the accent button, square.
-pub fn send_button() -> Button {
-    composer_action().style(ButtonStyle::Accent)
-}
-
-/// A square composer action (Stop, Steer, Resume): the default button.
-fn composer_action() -> Button {
-    Button::new()
-        .padding(Thickness::uniform(0.0))
-        .width(height::FAB)
-        .height(height::FAB)
-}
-
-/// Send's glyph.
-pub fn send_icon() -> View {
-    icon(glyph::ARROW_UP)
-}
-
-/// The composer's Stop turn.
-pub fn stop_button() -> Button {
-    composer_action()
-}
-
-/// The composer's Steer.
-pub fn steer_button() -> Button {
-    composer_action()
-}
-
-/// The composer's Resume.
-pub fn resume_button() -> Button {
-    composer_action()
-}
-
-/// The composer's ▾ beside its main action: the main action's style
-/// (`accent` when that action is Send), the action's height.
-pub fn send_menu_button(accent: bool) -> Button {
-    let button = composer_action().width(height::SEND_MENU);
+/// A command in a bar (the conversation header, the composer row): a
+/// stock button at the control height with its own padding, so every
+/// command in one bar has the same height whatever its content (a label,
+/// an icon and a label, or the "…" icon). `accent` for the one main action,
+/// and for the ▾ beside it (the composer's Add as a note, Home's Start task
+/// options).
+pub fn bar_button(accent: bool) -> Button {
+    let button = Button::new()
+        .min_height(height::CONTROL)
+        .vertical_alignment(VerticalAlignment::Stretch);
     if accent {
         button.style(ButtonStyle::Accent)
     } else {
         button
     }
+}
+
+/// A pane command in the conversation header (Changes, Agents, Details):
+/// WinUI's toggle button at the bar's height, checked while its tab of the
+/// right pane is open; its checked look is the template's own state.
+pub fn bar_toggle(checked: bool) -> ToggleButton {
+    ToggleButton::new()
+        .is_checked(checked)
+        .min_height(height::CONTROL)
+        .vertical_alignment(VerticalAlignment::Stretch)
+}
+
+/// A command's content: its icon, then its label (Body) on the same line,
+/// both centred on it; `pending` puts WinUI's small indeterminate ring in
+/// the icon's place while the command is confirmed (§9.4), so the busy
+/// state stays on the action itself.
+pub fn command_content(glyph: &str, label: &str, pending: bool) -> View {
+    let lead: View = if pending {
+        ProgressRing::new()
+            .is_indeterminate(true)
+            .width(icon_size::ROW)
+            .height(icon_size::ROW)
+            .min_width(icon_size::ROW)
+            .min_height(icon_size::ROW)
+            .vertical_alignment(VerticalAlignment::Center)
+            .into()
+    } else {
+        icon(glyph)
+    };
+    StackPanel::new()
+        .orientation(Orientation::Horizontal)
+        .spacing(spacing::SM)
+        .vertical_alignment(VerticalAlignment::Center)
+        .children((
+            lead,
+            text(label.to_owned(), style::BUTTON).vertical_alignment(VerticalAlignment::Center),
+        ))
+        .into()
 }
 
 /// The New task button: the sidebar's main action, an accent button.
@@ -479,11 +490,6 @@ pub fn new_task_button() -> Button {
         .min_height(height::NEW_TASK)
         .horizontal_alignment(HorizontalAlignment::Stretch)
         .horizontal_content_alignment(HorizontalAlignment::Stretch)
-}
-
-/// Stop's mark.
-pub fn stop_mark() -> View {
-    icon(glyph::STOP)
 }
 
 /// A nav, project, task or list row: a full-width subtle button; the
@@ -539,14 +545,28 @@ pub fn row_content(
 }
 
 /// A nav row's content: its icon, its label and a trailing caption
-/// ("Ctrl+N").
+/// ("Ctrl+N", "1 working · 1 needs attention"). The label is the row's
+/// name and keeps its width; the caption takes the star cell at the right
+/// and is the text that trims when the row runs out of room.
 pub fn nav_content(glyph: &str, label: &str, hint: &str) -> View {
-    row_content(
-        Some(glyph),
-        label,
-        "",
-        (!hint.is_empty()).then(|| secondary(hint.to_owned()).into()),
-    )
+    if hint.is_empty() {
+        return row_content(Some(glyph), label, "", None);
+    }
+    Grid::new()
+        .columns([GridLength::Auto, GridLength::Auto, GridLength::STAR])
+        .column_spacing(spacing::ROW)
+        .children((
+            icon(glyph),
+            text(label.to_owned(), style::BODY)
+                .grid_column(1)
+                .vertical_alignment(VerticalAlignment::Center),
+            secondary(hint.to_owned())
+                .grid_column(2)
+                .horizontal_alignment(HorizontalAlignment::Right)
+                .vertical_alignment(VerticalAlignment::Center)
+                .text_trimming(TextTrimming::CharacterEllipsis),
+        ))
+        .into()
 }
 
 /// A chip: a default button (`.content(chip_content(..))` last, then a
@@ -620,9 +640,12 @@ pub fn chip_row(chips: Vec<View>) -> View {
             }
         })
         .collect();
+    // Left-aligned, so the star cell is as wide as its chip while the row
+    // has room (no gap after the first chip) and trims it only when not.
     Grid::new()
         .columns(columns)
         .column_spacing(spacing::CHIP_GAP)
+        .horizontal_alignment(HorizontalAlignment::Left)
         .keyed_children(chips.into_iter().enumerate().map(|(index, chip)| {
             KeyedView::new(
                 index,
@@ -691,14 +714,7 @@ pub fn xs_icon(glyph: &str) -> View {
     icon_sized(glyph, icon_size::CHEVRON)
 }
 
-/// A plain status chip that acts (the goal mark): a subtle button.
-pub fn status_chip_button() -> Button {
-    Button::new()
-        .style(ButtonStyle::Subtle)
-        .min_height(height::CHIP)
-}
-
-/// A small ordinary action (the header's Changes and Agents, Deny).
+/// A small ordinary action (Deny).
 pub fn outlined_small() -> Button {
     Button::new()
 }
@@ -1101,12 +1117,14 @@ fn group_digits(value: u64) -> String {
     out
 }
 
-/// A task row's state mark.
+/// A task row's state mark (§4.2): a static shape in a fixed slot; the row
+/// or label beside it carries the words. No row draws a progress ring, so
+/// a list of working tasks never shows a row of spinning fragments.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RowMark {
-    /// Working or starting: WinUI's indeterminate ring.
+    /// Working or starting: a filled accent dot.
     Working,
-    /// Waiting for you: an accent dot.
+    /// Waiting for you: the attention icon in the accent text color.
     Waiting,
     /// Idle or ready: a small ring.
     Idle,
@@ -1116,9 +1134,23 @@ pub enum RowMark {
     Failed,
 }
 
-/// The view of a row's state mark in its slot. `word` names the failed mark
-/// for a screen reader (the row's own name says the other states). A stopped row has no mark (`None` where a mark is
-/// optional).
+impl RowMark {
+    /// The mark's own name for a screen reader, when the row gives no more
+    /// precise word (`Lost`, `Provider hold`).
+    pub fn word(self) -> &'static str {
+        match self {
+            Self::Working => "Working",
+            Self::Waiting => "Waiting",
+            Self::Idle => "Idle",
+            Self::Queued => "Queued",
+            Self::Failed => "Failed",
+        }
+    }
+}
+
+/// The view of a row's state mark in its slot: `word` names it for a
+/// screen reader; the row's text or tooltip says it on screen. A stopped
+/// row has no mark (`None` where a mark is optional).
 pub fn row_mark(mark: RowMark, word: &str) -> View {
     let slot = |content: View| -> Border {
         Border::new()
@@ -1134,33 +1166,24 @@ pub fn row_mark(mark: RowMark, word: &str) -> View {
             .horizontal_alignment(HorizontalAlignment::Center)
             .vertical_alignment(VerticalAlignment::Center)
     };
-    match mark {
-        RowMark::Working => slot(
-            ProgressRing::new()
-                .is_indeterminate(true)
-                .width(layout::LOADER_SMALL)
-                .height(layout::LOADER_SMALL)
-                .min_width(layout::LOADER_SMALL)
-                .min_height(layout::LOADER_SMALL)
-                .horizontal_alignment(HorizontalAlignment::Center)
+    let slot = match mark {
+        RowMark::Working => slot(dot(layout::DOT_WAIT).fill(ThemeBrush::Accent).into()),
+        RowMark::Waiting => slot(
+            glyph_icon(glyph::ATTENTION, icon_size::ROW)
+                .foreground(ThemeBrush::AccentText)
                 .vertical_alignment(VerticalAlignment::Center)
                 .into(),
-        )
-        .into(),
-        RowMark::Waiting => slot(dot(layout::DOT_WAIT).fill(ThemeBrush::Accent).into()).into(),
+        ),
         RowMark::Idle => slot(
             dot(layout::DOT_IDLE)
                 .stroke(ThemeBrush::PrimaryText)
                 .stroke_thickness(layout::HAIRLINE)
                 .into(),
-        )
-        .into(),
-        RowMark::Queued => slot(icon(glyph::SCHEDULE)).into(),
-        // The failed icon carries the word for a screen reader.
-        RowMark::Failed => slot(critical_icon(glyph::ERROR, icon_size::ROW))
-            .automation_name(word)
-            .into(),
-    }
+        ),
+        RowMark::Queued => slot(icon(glyph::SCHEDULE)),
+        RowMark::Failed => slot(critical_icon(glyph::ERROR, icon_size::ROW)),
+    };
+    slot.automation_name(word).into()
 }
 
 /// A sidebar row's content: the leading mark or icon, the label (Body;

@@ -983,6 +983,7 @@ impl Component for DesktopApp {
                 place_epoch: 0,
                 batch: None,
                 project_reads: 0,
+                projects_error: None,
             },
             launch: launch_ui::LaunchState {
                 workspace: input
