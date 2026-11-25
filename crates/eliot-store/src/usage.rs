@@ -15,9 +15,11 @@
 //! retained-event watermark names the retention floor instead of implying
 //! full totals.
 
+mod assignment;
 pub(crate) mod context;
 mod role;
 
+pub(super) use assignment::send_assignment_usage;
 pub(crate) use role::{RoleUsage, manager_at_sql};
 
 use super::*;

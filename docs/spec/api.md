@@ -535,6 +535,7 @@ command id frozen at claim. The settled event's persisted `kind` is exactly
 | `script.list/read/save` | Owner-only scripts under approved Run roots: cursor/encoded-byte-bounded list (one root scan per page; continue through empty pages until `next_cursor` is absent), verified-handle bounded read, and serialized revision-guarded replacement. Complete secret-bearing entries are withheld; raw and decoded TOML/JSON keys/values are checked. Saves never execute; external-writer conflict limits and editor environment are specified in [automation](automation.md#script-editing). DTOs/budgets: [`script_edit.rs`](../../crates/eliot-core/src/api/script_edit.rs). |
 | `settings.read/save` | owner-only unified section read/save, including revisioned `owner_rules.text` and budget warnings, revision CAS, dry run, restart indication and bounded author history; see configuration |
 | `project.transfer` | Owner-only transfer intent, optional replacement launch, atomic commit or cancellation with typed readback. See [Project transfer](coordination.md#project-transfer). |
+| `project.assignment.usage` | Owner read of retained turn usage for a project assignment epoch or its unattributed turns. |
 | `project.assignment.get/claim/launch/release` | Current registered project manager, explicit adoption or manager launch, and revision-bound release through the ordinary command path. See [project manager assignments](#project-manager-assignments). |
 | `chat.organization` | owner-only grouped work projection by project assignment, manager, repository/worktree and ancestry, with event-watermark and per-group readback; no client repeats Git discovery or grouping. See [Chat organization](#chat-organization). |
 | `chat.attach` / `chat.detach` | owner-only chat placement moves between a retained project and the no-project bucket; optional per-Agent `expected_revision` refuses a stale write with `conflict`; committed per-Agent link readback; execution scope, workspace and history untouched |
@@ -606,6 +607,15 @@ For ordinary commands, a supplied `args.assignment_epoch` is a precondition when
 the verb accepts it. Admission records the current binding even when it is
 omitted. See [coordination](coordination.md#project-manager-assignment) for
 generation, epoch and dispatch behavior.
+
+`project.assignment.usage` takes a project ID, an optional positive `epoch`,
+and an optional `after` cursor. Read one assignment's historical turn usage
+with `swarm project assignment usage PROJECT --epoch EPOCH`. Omit `--epoch`
+to read that project's retained unattributed turns. Each page counts at most
+256 turns and uses the same per-scope counters as `usage.summary`. Pass
+`next_after` as `--after` with the same project and epoch. The response names
+the captured manager incarnation on a nonempty epoch page and reports the
+Store's event retention floor as `pruned_through`.
 
 `project.overview` returns exact fleet totals beside authorized project and
 native-child detail. Each project with authorized detail includes `dirty` and

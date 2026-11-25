@@ -1010,6 +1010,7 @@ impl Router {
                     .await
             }
             "project.assignment.get" => self.project_assignment_get(&params, &principal).await,
+            "project.assignment.usage" => self.project_assignment_usage(&params, &principal).await,
             "project.assignment.claim" => self.project_assignment_claim(&params, &principal).await,
             "project.assignment.launch" => {
                 self.project_assignment_launch(&params, &principal, context.owner_process)

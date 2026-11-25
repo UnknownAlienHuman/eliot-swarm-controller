@@ -13,6 +13,74 @@ use serde::{Deserialize, Serialize};
 pub const MAX_FIRST_CALL_TURNS: usize = 64;
 pub const MAX_NATIVE_CHILD_TURN_MARKERS: usize = 64;
 pub const PROFILE_FIRST_CALL_WINDOW: usize = 256;
+pub const MAX_ASSIGNMENT_USAGE_PAGE: usize = 256;
+
+/// Page of retained turn usage for one project assignment epoch. Omit the
+/// epoch to read the project's unattributed turns.
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectAssignmentUsageRequest {
+    pub project: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub epoch: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after: Option<i64>,
+}
+
+impl ProjectAssignmentUsageRequest {
+    pub fn validate(&self) -> Result<()> {
+        super::project_assignment::validate_name(&self.project, "params.project")?;
+        if self.epoch.is_some_and(|epoch| epoch < 1) || self.after.is_some_and(|after| after < 1) {
+            return Err(Error::new(
+                "invalid",
+                "assignment usage epoch and cursor must be positive",
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn validate_response(&self, reply: &ProjectAssignmentUsageResponse) -> Result<()> {
+        let turns = &reply.turns;
+        let rows = turns
+            .turns_counted
+            .saturating_add(turns.turns_unknown_excluded)
+            .saturating_add(turns.turns_running_excluded);
+        if self.validate().is_err()
+            || reply.project != self.project
+            || reply.epoch != self.epoch
+            || rows > MAX_ASSIGNMENT_USAGE_PAGE
+            || reply.manager.is_some() != (self.epoch.is_some() && rows > 0)
+            || reply.pruned_through < 0
+            || reply.next_after.is_some_and(|after| {
+                rows != MAX_ASSIGNMENT_USAGE_PAGE || after <= self.after.unwrap_or(0)
+            })
+        {
+            return Err(invalid_response());
+        }
+        if let Some(ref manager) = reply.manager {
+            let super::ProjectManagerIdentity::Local { agent, generation } = manager else {
+                return Err(invalid_response());
+            };
+            if crate::parse_agent_id(agent).is_err() || *generation < 1 {
+                return Err(invalid_response());
+            }
+        }
+        turns.validate()
+    }
+}
+
+/// One page of turn expenditure. Native cumulative session usage is separate.
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectAssignmentUsageResponse {
+    pub project: String,
+    pub epoch: Option<i64>,
+    pub manager: Option<super::ProjectManagerIdentity>,
+    pub turns: TurnExpenditure,
+    pub pruned_through: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_after: Option<i64>,
+}
 
 #[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

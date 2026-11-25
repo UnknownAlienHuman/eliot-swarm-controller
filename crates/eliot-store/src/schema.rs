@@ -1,6 +1,6 @@
 use super::*;
 
-pub(super) const CURRENT_SCHEMA_VERSION: i64 = ORGANIZATION_MEMBERSHIP_INDEX_VERSION;
+pub(super) const CURRENT_SCHEMA_VERSION: i64 = ASSIGNMENT_USAGE_VERSION;
 const HARNESS_CHECK_SCHEMA_VERSION: i64 = 112;
 const WORK_TRUTH_VERSION: i64 = 113;
 const WORK_TRUTH_INTENT_VERSION: i64 = 114;
@@ -40,6 +40,8 @@ const SWITCH_CHILD_ID_RESERVATIONS_VERSION: i64 = 147;
 const WITHHELD_FRESH_SESSION_VERSION: i64 = 148;
 const ORGANIZATION_KEY_INDEX_VERSION: i64 = 149;
 const ORGANIZATION_MEMBERSHIP_INDEX_VERSION: i64 = 150;
+// Version 151 is reserved for the project-check obligation migration.
+const ASSIGNMENT_USAGE_VERSION: i64 = 152;
 
 fn has_restart_continuation_brief_column(connection: &Connection) -> Result<bool> {
     connection
@@ -2779,6 +2781,19 @@ impl Store {
             self.migrate_sql(
                 &organization::membership_index_migration(),
                 Some(ORGANIZATION_MEMBERSHIP_INDEX_VERSION),
+            )?;
+        }
+        if current < ASSIGNMENT_USAGE_VERSION {
+            self.migrate_sql(
+                "ALTER TABLE commands ADD COLUMN assignment_usage TEXT;
+                 ALTER TABLE turns ADD COLUMN assignment_usage TEXT;
+                 CREATE INDEX turns_assignment_usage ON turns (
+                     json_extract(assignment_usage, '$.project'),
+                     json_extract(assignment_usage, '$.epoch'), insertion_seq
+                 ) WHERE assignment_usage IS NOT NULL;
+                 CREATE INDEX turns_unattributed_usage ON turns(agent, insertion_seq)
+                     WHERE assignment_usage IS NULL;",
+                Some(ASSIGNMENT_USAGE_VERSION),
             )?;
         }
         Ok(())

@@ -517,6 +517,17 @@ turn counts match `usage.summary`. Usage coverage is independent of the rows
 on the page. Session snapshots and per-turn diagnostics are available through
 `usage.summary`. Teams visible only as aggregates omit Git and token usage detail.
 
+Historical assignment usage uses the project, epoch, and manager generation
+recorded when a SEND is dispatched to an assigned Agent or worker. The exact
+turn inherits that attribution in its creation transaction. A transfer changes
+subsequent dispatches. Existing turns keep their recorded attribution. Legacy
+turns, native starts without a verified SEND, and dispatches outside an
+assignment appear in the separate unattributed read. Input bound to an already
+running native turn leaves its original attribution in place. The Owner reads
+these pages with `project.assignment.usage`. The two page types can be shown
+independently in the desktop. Their counters use native turn scopes, with
+session cumulative usage available separately through `usage.summary`.
+
 Live harnesses, dispatched starts, active turns, waiting work and retained
 unknown reservations use their respective committed generation, command, turn
 and reservation evidence. The fleet separately counts distinct observed native
