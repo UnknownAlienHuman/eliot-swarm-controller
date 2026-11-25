@@ -273,7 +273,7 @@ impl Store {
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(sql_error)?;
             tx.execute_batch(
-                "CREATE TABLE restart_deferred_sends (
+                "CREATE TABLE IF NOT EXISTS restart_deferred_sends (
                    command_id TEXT PRIMARY KEY NOT NULL REFERENCES commands(id) ON DELETE CASCADE,
                    restart_id TEXT NOT NULL,
                    native_scope TEXT NOT NULL,

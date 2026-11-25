@@ -685,6 +685,14 @@ impl Router {
                     "the Store is sealed for replacement",
                 ));
             }
+            // Command submission performs its verb-level check under the
+            // Store writer. Other mutations must not enter behind the fence.
+            if self.lossless_quiescing() && method != "command.submit" {
+                return Err(Error::new(
+                    "daemon_update_in_progress",
+                    "daemon is waiting for admitted work to finish before update",
+                ));
+            }
             Some(guard)
         } else {
             None
@@ -6946,7 +6954,7 @@ impl Router {
         // In-flight RPC mutations may write settings as well as the Store.
         // Keep the backup behind their completion boundary.
         let _write_barrier =
-            if request.backup {
+            if request.backup || request.drain_seconds.is_some() {
                 Some(self.inner.restart_writes.try_write().map_err(|_| {
                     Error::new("restart_busy", "an admitted mutation is still running")
                 })?)
@@ -7110,6 +7118,9 @@ impl Router {
             tokio::time::sleep_until(expires).await;
             let mut store = self.inner.store.lock().await;
             let mut current = self.inner.restart_lease.lock_recover();
+            if self.inner.mode.load(Ordering::SeqCst) != MODE_QUIESCE {
+                return;
+            }
             let Some(lease) = current.as_ref().filter(|lease| lease.id == id) else {
                 return;
             };

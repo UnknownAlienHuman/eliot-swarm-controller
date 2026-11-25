@@ -3203,7 +3203,8 @@ service. The running daemon uses the planned-restart
 fence and parks admitted, never-dispatched direct SENDs for controlled
 sessions. The command must target the current generation without an explicit
 generation or turn constraint. Linked and selector inputs retain their own
-admission rules. New work is refused during the fence. Stop and native
+admission rules. Prepare acquires the mutation barrier before recording the fence. New work
+and non-command RPC mutations are refused during the fence. Stop and native
 request-resolution controls remain available so admitted turns can progress.
 The CLI reports active turn IDs, Agent generations and elapsed age to stderr.
 The writer waits for every controlled turn, start and already-dispatched
@@ -3217,16 +3218,23 @@ The previous 90-second CLI ceiling left time inside the fixed 120-second
 admission lease for interruption and settlement. The lossless preparation
 carries a wait budget of 1–1800 seconds (default 60). Bound restart attempts renew
 the short 120-second inactivity lease within an absolute ceiling of the wait
-budget plus 60 seconds. Expiry or confirmed cancellation releases the parked
+budget plus 60 seconds. While still quiescing, expiry or confirmed cancellation releases the parked
 rows to the old daemon and reopens admission. At its deadline the CLI cancels by
-default. With `--interrupt-on-deadline` it first uses ordinary non-force Stop for
+default. Ctrl-C (or Ctrl-Break on Windows) cancels through the same bound
+preparation. The CLI checks the running daemon advertises `drain_seconds` in
+full method help before preparing. A daemon without the field yields
+`unsupported`.
+With `--interrupt-on-deadline` it first uses ordinary non-force Stop for
 the captured active turns, busy roots first, and allows the bounded custody and
 settlement interval before cancellation.
 
 Parked rows are durable before the online backup. The seal transaction repeats
 the readiness check before writing its receipt. After an applied Resume on the
 same native subject, parked SENDs retain their original IDs and FIFO order and
-receive the new execution generation. A held, failed or uncertain Resume keeps
+receive the new execution generation. An applied Resume with a changed native
+subject rejects those inputs with `restart_native_subject_changed`. The
+original command receipts report that the input was never dispatched. A held,
+failed or uncertain Resume keeps
 the parked rows pending. Dispatched and unknown input is excluded from parking
 and remains subject to normal recovery.
 Before

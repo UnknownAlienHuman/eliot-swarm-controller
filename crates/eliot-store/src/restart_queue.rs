@@ -87,6 +87,10 @@ pub(super) fn pending_before_resume(
 }
 
 pub(super) fn consume_on_dispatch(tx: &Transaction<'_>, id: &str) -> Result<()> {
+    clear_parked(tx, id)
+}
+
+fn clear_parked(tx: &Transaction<'_>, id: &str) -> Result<()> {
     tx.prepare_cached("DELETE FROM restart_deferred_sends WHERE command_id=?1")
         .map_err(sql_error)?
         .execute([id])
@@ -133,6 +137,47 @@ pub(super) fn release_after_resume(
             &id,
             json!({"command_id":id}),
         )?);
+    }
+
+    // An applied Resume may legally bind the Agent to another native subject.
+    // These original receipts were proven never dispatched, but cannot be
+    // rebound to the replacement subject. Settle only still-pending parked
+    // inputs; dispatched/unknown and earlier failed attempts are untouched.
+    let mut statement = tx
+        .prepare_cached(
+            "SELECT c.id, c.generation
+               FROM commands c
+               JOIN restart_deferred_sends d ON d.command_id=c.id
+               JOIN agents a ON a.id=c.target AND a.generation=?2
+              WHERE c.target=?1 AND c.generation<?2 AND c.verb='send'
+                AND c.state IN ('accepted','queued')
+                AND (a.native_scope IS NOT d.native_scope OR a.native_ref IS NOT d.native_ref)",
+        )
+        .map_err(sql_error)?;
+    let mismatched = statement
+        .query_map(params![agent, generation], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })
+        .map_err(sql_error)?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(sql_error)?;
+    for (id, original_generation) in mismatched {
+        let outcome = json!({
+            "code": "restart_native_subject_changed",
+            "message": "The resumed session has a different native identity. The queued input was never dispatched.",
+            "native_dispatched": false
+        });
+        update_command_state(tx, &id, CommandState::Rejected, Some(&outcome), None, now)?;
+        events.push(insert_daemon_command_event(
+            tx,
+            now,
+            "command.rejected",
+            Some(agent),
+            Some(original_generation),
+            &id,
+            json!({"command_id": id, "state": "rejected", "outcome": outcome}),
+        )?);
+        clear_parked(tx, &id)?;
     }
     Ok(())
 }

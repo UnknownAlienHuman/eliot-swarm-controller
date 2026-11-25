@@ -7,7 +7,7 @@ use super::operator::{
 use super::support::{
     Failure, mutation_id, print_value_or_human, submit_command, submit_request, wait_for_command,
 };
-use eliot_core::api::discovery::{IdentityRequest, IdentityResponse};
+use eliot_core::api::discovery::{IdentityRequest, IdentityResponse, MethodHelpRequest};
 use eliot_core::api::{
     AgentGetRequest, AgentGetResponse, AgentSummary, DaemonShutdownRequest, HarnessCapabilities,
     ShutdownMode, TurnGetRequest,
@@ -171,6 +171,7 @@ async fn run_update(
     if identity.principal != "owner" {
         return Err(Failure::new(3, "daemon update requires the local Owner"));
     }
+    require_lossless_restart_drain(&data_dir).await?;
     let previous_binary = running_binary(&old).map_err(Failure::for_read)?;
     let previous_hash = binary_sha256(&previous_binary).map_err(Failure::for_read)?;
     let binary = release_binary(&source)?;
@@ -245,12 +246,6 @@ async fn run_update(
     .await;
     let commit_reply_uncertain = committed.is_err();
     if let Err(error) = committed {
-        if error.message.contains("drain_seconds") && error.message.contains("unknown field") {
-            return Err(Failure::new(
-                2,
-                "daemon update requires a daemon that supports lossless restart drains (drain_seconds); no restart effect was applied",
-            ));
-        }
         match reconcile_preparation(&data_dir, &old, &cancel).await {
             result @ (Preparation::Open | Preparation::Unconfirmed) => {
                 let recovered = matches!(result, Preparation::Open);
@@ -573,10 +568,54 @@ async fn quiesce(
     prepare: &DaemonShutdownRequest,
     commit: &DaemonShutdownRequest,
     wait: Duration,
+    interrupt_on_deadline: bool,
+    stopped: &mut Vec<StoppedAgent>,
+) -> Result<(), Failure> {
+    let cancelled = wait_for_update_cancel();
+    let preparing = call_shutdown(path, prepare);
+    tokio::pin!(cancelled, preparing);
+    tokio::select! {
+        result = &mut preparing => result?,
+        signal = &mut cancelled => {
+            // Let the prepare request settle before cancelling its lease.
+            let _ = preparing.await;
+            return Err(update_cancel_failure(signal));
+        }
+    }
+    tokio::select! {
+        result = drain_prepared(path, old, commit, wait, interrupt_on_deadline, stopped) => result,
+        signal = &mut cancelled => Err(update_cancel_failure(signal)),
+    }
+}
+
+fn update_cancel_failure(signal: std::io::Result<()>) -> Failure {
+    match signal {
+        Ok(()) => Failure::new(130, "daemon update cancelled by console interrupt"),
+        Err(error) => Failure::new(4, format!("listen for daemon update cancellation: {error}")),
+    }
+}
+
+async fn wait_for_update_cancel() -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        let mut ctrl_break = tokio::signal::windows::ctrl_break()?;
+        tokio::select! {
+            signal = tokio::signal::ctrl_c() => signal,
+            _ = ctrl_break.recv() => Ok(()),
+        }
+    }
+    #[cfg(not(windows))]
+    tokio::signal::ctrl_c().await
+}
+
+async fn drain_prepared(
+    path: &Path,
+    old: &DaemonInfo,
+    commit: &DaemonShutdownRequest,
+    wait: Duration,
     mut interrupt_on_deadline: bool,
     stopped: &mut Vec<StoppedAgent>,
 ) -> Result<(), Failure> {
-    call_shutdown(path, prepare).await?;
     let mut deadline = Instant::now() + wait;
     let mut next_report = Instant::now();
     loop {
@@ -611,6 +650,35 @@ async fn quiesce(
         sleep(Duration::from_millis(200).min(deadline.saturating_duration_since(Instant::now())))
             .await;
     }
+}
+
+async fn require_lossless_restart_drain(path: &Path) -> Result<(), Failure> {
+    let request = MethodHelpRequest {
+        method: "daemon.shutdown".to_owned(),
+        full: Some(true),
+    };
+    #[derive(serde::Deserialize)]
+    struct ShutdownHelp {
+        method: String,
+        request_schema: Option<Value>,
+    }
+    let help: ShutdownHelp = eliot_daemon::client_call_typed(path, "api.help", &request)
+        .await
+        .map_err(Failure::for_read)?;
+    let supports_drain = help.method == "daemon.shutdown"
+        && help
+            .request_schema
+            .as_ref()
+            .and_then(|schema| schema.get("properties"))
+            .and_then(|properties| properties.get("drain_seconds"))
+            .is_some();
+    if !supports_drain {
+        return Err(Failure::for_read(eliot_core::Error::new(
+            "unsupported",
+            "daemon does not advertise lossless restart drains",
+        )));
+    }
+    Ok(())
 }
 
 async fn report_restart_progress(path: &Path) {
