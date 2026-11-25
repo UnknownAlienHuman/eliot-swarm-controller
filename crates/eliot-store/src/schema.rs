@@ -39,8 +39,7 @@ const DESKTOP_USAGE_LOOKUP_VERSION: i64 = 146;
 const SWITCH_CHILD_ID_RESERVATIONS_VERSION: i64 = 147;
 const WITHHELD_FRESH_SESSION_VERSION: i64 = 148;
 const ORGANIZATION_KEY_INDEX_VERSION: i64 = 149;
-// Version 150 is reserved for the project-check obligation migration.
-const ORGANIZATION_MEMBERSHIP_INDEX_VERSION: i64 = 151;
+const ORGANIZATION_MEMBERSHIP_INDEX_VERSION: i64 = 150;
 
 fn has_restart_continuation_brief_column(connection: &Connection) -> Result<bool> {
     connection
