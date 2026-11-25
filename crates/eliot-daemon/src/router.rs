@@ -5375,9 +5375,12 @@ impl Router {
                 contract_mismatch,
             });
         }
-        let (profile_first_calls, profile_first_calls_truncated) = store.profile_first_calls()?;
-        let (profile_native_child_usage, profile_native_child_usage_truncated) =
-            store.profile_native_child_usage()?;
+        let (
+            profile_first_calls,
+            profile_first_calls_truncated,
+            profile_native_child_usage,
+            profile_native_child_usage_truncated,
+        ) = store.doctor_usage_summaries()?;
         drop(store);
         let data_root = self.inner.data_root.clone();
         let ((owner_rules_drift, owner_rules_check_unavailable), project_checks) =

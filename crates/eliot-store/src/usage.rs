@@ -1063,74 +1063,22 @@ impl Store {
         Ok(result)
     }
 
-    /// The newest retained turn rows give doctor a fixed-size observation
-    /// window. Only the current generation has the exact profile snapshot.
-    pub fn profile_first_calls(&self) -> Result<(Vec<ProfileFirstCallInput>, bool)> {
-        let mut statement = self
-            .connection
-            .prepare(
-                "SELECT a.profile, a.harness, json_extract(a.profile_snapshot, '$.mcp'),
-                        t.usage, t.state
-                 FROM (
-                     SELECT rowid AS sequence, agent, generation, usage, state FROM turns
-                     ORDER BY rowid DESC LIMIT ?1
-                 ) t
-                 LEFT JOIN agents a ON a.id = t.agent AND a.generation = t.generation
-                      AND a.origin = 'eliot'
-                 ORDER BY t.sequence DESC",
-            )
-            .map_err(sql_error)?;
-        let mut rows = statement
-            .query(params![PROFILE_FIRST_CALL_WINDOW as i64 + 1])
-            .map_err(sql_error)?;
-        let mut examined = 0;
-        let mut truncated = false;
-        let mut by_profile = BTreeMap::new();
-        while let Some(row) = rows.next().map_err(sql_error)? {
-            if examined == PROFILE_FIRST_CALL_WINDOW {
-                truncated = true;
-                break;
-            }
-            examined += 1;
-            if row.get::<_, String>(4).map_err(sql_error)? != "completed" {
-                continue;
-            }
-            let (Some(profile), Some(harness), Some(usage)) = (
-                row.get::<_, Option<String>>(0).map_err(sql_error)?,
-                row.get::<_, Option<String>>(1).map_err(sql_error)?,
-                row.get::<_, Option<String>>(3).map_err(sql_error)?,
-            ) else {
-                continue;
-            };
-            let Some(input) = decode_turn_usage(&usage, &harness)?.first_call_input_tokens else {
-                continue;
-            };
-            let policy = row.get::<_, Option<String>>(2).map_err(sql_error)?;
-            let (sum, count) = by_profile
-                .entry((profile, harness, policy))
-                .or_insert((0_i128, 0));
-            *sum += i128::from(input);
-            *count += 1;
-        }
-        let profiles = by_profile
-            .into_iter()
-            .map(
-                |((profile, harness, mcp_policy), (sum, count))| ProfileFirstCallInput {
-                    profile,
-                    harness,
-                    mcp_policy,
-                    sampled_turns: count,
-                    average_input_tokens: (sum / count as i128) as i64,
-                },
-            )
-            .collect();
-        Ok((profiles, truncated))
-    }
-
-    /// Compare current-profile completed parent turns over the same bounded
-    /// window as `profile_first_calls`. Unknown legacy child attribution is
-    /// counted separately; medians use only the parent's turn-level usage.
-    pub fn profile_native_child_usage(&self) -> Result<(Vec<ProfileNativeChildUsage>, bool)> {
+    /// Both Doctor usage summaries over the newest retained turn rows: the
+    /// average first-call input tokens by exact profile snapshot, and the
+    /// parent-turn native-child comparison over that window. One turn scan
+    /// serves both summaries, with the row cap applied before filtering, the
+    /// current-generation join, and one usage decode per row; rows decode
+    /// only when completed with a current-generation profile and harness, as
+    /// before. Unknown legacy child attribution is counted separately;
+    /// medians use only the parent's turn-level usage.
+    pub fn doctor_usage_summaries(
+        &self,
+    ) -> Result<(
+        Vec<ProfileFirstCallInput>,
+        bool,
+        Vec<ProfileNativeChildUsage>,
+        bool,
+    )> {
         let mut statement = self
             .connection
             .prepare(
@@ -1150,8 +1098,9 @@ impl Store {
             .map_err(sql_error)?;
         let mut examined = 0;
         let mut truncated = false;
-        let mut samples = Vec::new();
+        let mut by_first_call = BTreeMap::new();
         let mut pairs = BTreeSet::new();
+        let mut samples = Vec::new();
         while let Some(row) = rows.next().map_err(sql_error)? {
             if examined == PROFILE_FIRST_CALL_WINDOW {
                 truncated = true;
@@ -1170,14 +1119,30 @@ impl Store {
             let agent = row.get::<_, i64>(3).map_err(sql_error)?;
             let generation = row.get::<_, i64>(4).map_err(sql_error)?;
             pairs.insert((agent, generation));
+            let mcp_policy = row.get::<_, Option<String>>(2).map_err(sql_error)?;
+            let usage = row
+                .get::<_, Option<String>>(6)
+                .map_err(sql_error)?
+                .map(|usage| decode_turn_usage(&usage, &harness))
+                .transpose()?;
+            if let Some(input) = usage
+                .as_ref()
+                .and_then(|usage| usage.first_call_input_tokens)
+            {
+                let (sum, count) = by_first_call
+                    .entry((profile.clone(), harness.clone(), mcp_policy.clone()))
+                    .or_insert((0_i128, 0));
+                *sum += i128::from(input);
+                *count += 1;
+            }
             samples.push((
                 profile,
                 harness,
-                row.get::<_, Option<String>>(2).map_err(sql_error)?,
+                mcp_policy,
                 agent,
                 generation,
                 row.get::<_, String>(5).map_err(sql_error)?,
-                row.get::<_, Option<String>>(6).map_err(sql_error)?,
+                usage,
             ));
         }
         drop(rows);
@@ -1187,7 +1152,6 @@ impl Store {
         let bindings = self.native_child_bindings(&pairs)?;
         let mut by_profile = BTreeMap::new();
         for (profile, harness, mcp_policy, agent, generation, turn_id, usage) in samples {
-            let decode_harness = harness.clone();
             let has_children =
                 if bindings
                     .by_turn
@@ -1214,7 +1178,6 @@ impl Store {
             let Some(usage) = usage else {
                 continue;
             };
-            let usage = decode_turn_usage(&usage, &decode_harness)?;
             if !matches!(usage.scope.as_deref(), Some("turn" | "main_loop_turn")) {
                 continue;
             }
@@ -1227,7 +1190,19 @@ impl Store {
                 None => {}
             }
         }
-        let profiles = by_profile
+        let profile_first_calls = by_first_call
+            .into_iter()
+            .map(
+                |((profile, harness, mcp_policy), (sum, count))| ProfileFirstCallInput {
+                    profile,
+                    harness,
+                    mcp_policy,
+                    sampled_turns: count,
+                    average_input_tokens: (sum / count as i128) as i64,
+                },
+            )
+            .collect();
+        let profile_native_child_usage = by_profile
             .into_iter()
             .map(|((profile, harness, mcp_policy), mut sample)| {
                 let median_parent_tokens_with_children =
@@ -1249,7 +1224,12 @@ impl Store {
                 }
             })
             .collect();
-        Ok((profiles, truncated))
+        Ok((
+            profile_first_calls,
+            truncated,
+            profile_native_child_usage,
+            truncated,
+        ))
     }
 }
 
