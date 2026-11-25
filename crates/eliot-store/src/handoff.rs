@@ -828,6 +828,7 @@ pub(super) fn handoff_tx(
 ) -> Result<HandoffAdmission> {
     let project_transfer = matches!(input, HandoffInput::ProjectTransfer { .. });
     let from_switch = matches!(input, HandoffInput::Switch(_));
+    let enters_assignment = matches!(input, HandoffInput::Switch(plan) if plan.enters_assignment);
     if (!project_transfer && !from_switch) || !request.task_command.is_empty() {
         request.validate()?;
     }
@@ -899,7 +900,20 @@ pub(super) fn handoff_tx(
     if from.generation != request.from_generation || to.generation != request.to_generation {
         return Err(Error::new("stale_generation", "handoff generation moved"));
     }
-    if from.project_scope() != to.project_scope() {
+    if enters_assignment {
+        if principal != "owner"
+            || !from.chat
+            || !from.project_scope().is_empty()
+            || to.project_scope().is_empty()
+            || to.parent.is_none()
+            || !request.commands.is_empty()
+        {
+            return Err(Error::new(
+                "not_allowed",
+                "project continuation carries only an Owner-authorized brief",
+            ));
+        }
+    } else if from.project_scope() != to.project_scope() {
         return Err(Error::new(
             "not_allowed",
             "handoff must stay in one project",
@@ -1010,7 +1024,7 @@ pub(super) fn handoff_tx(
     // inputs the caller issued itself. Claims, Goals and children stay put;
     // moving children stays Owner-only.
     let (claims, claim_conflicts, conflicts_truncated, goal_revision, reparented) =
-        if project_transfer || manager_caller.is_some() {
+        if project_transfer || enters_assignment || manager_caller.is_some() {
             (Vec::new(), Vec::new(), false, None, Vec::new())
         } else {
             let (claims, claim_conflicts, conflicts_truncated) =

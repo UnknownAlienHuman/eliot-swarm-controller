@@ -209,8 +209,9 @@ Checked layers record delivered increments, not full crash/load qualification.
   Reject stale Owner and Agent launch intents, and move pending and unread
   child wakes and cleanup with the workers while retaining the original receipts.
 - [x] **4a. Headless chat and work organization.** Grouped projection with
-  attach/detach placement and tags (schema v64). Continue-in-project returns
-  later through the existing switch/handoff path (#657).
+  attach/detach placement and tags (schema v64). The Owner can continue a
+  projectless chat in an active assignment through switch and handoff, with
+  a prepared worktree and a retained link to the original chat.
 - [x] **4b. Fair queue.** Arbitrate automation assignments across projects and support
   explicit queued interactive launch, wait readback and scoped manager budgets.
   Ordinary direct launches share the same project rotation and capacity

@@ -18,10 +18,10 @@ pub struct SwitchLaunch {
     pub auth: Option<String>,
     pub cmd: Option<String>,
     pub access: Option<String>,
-    /// Target execution project for B. Omitted keeps A's project. When set,
-    /// the switch worker prepares the target's standard worktree (or verifies
-    /// an explicit workspace against it); B still retains A's authorization
-    /// scope so the handoff stays in one namespace.
+    /// Registered execution project for B. The Owner can continue a
+    /// projectless root chat as a worker of the exact active assignment.
+    /// The worker gets a prepared worktree and receives a bounded brief.
+    /// A vacant target instead retains A's authorization scope.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project: Option<String>,
     /// Omitted uses A's retained workspace (or the target project's checkout

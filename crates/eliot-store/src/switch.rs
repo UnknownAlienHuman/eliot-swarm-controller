@@ -2,8 +2,10 @@
 use super::*;
 use eliot_core::api::{
     HandoffReason, ORGANIZATION_CHANGED_KIND, OrgRowChange, OrganizationChangedEvent,
-    ReparentRequest, SwitchAgent, SwitchLaunch, SwitchRequest, SwitchResponse,
+    ProjectAssignmentState, ProjectManagerIdentity, ReparentRequest, SwitchAgent, SwitchLaunch,
+    SwitchRequest, SwitchResponse,
 };
+use serde::{Deserialize, Serialize};
 
 mod automatic;
 mod recovery;
@@ -20,6 +22,7 @@ const SESSION_GROWTH_AUTHORITY: &str = "session_growth_authority";
 const OWNER_AUTOMATION: &str = "owner_automation";
 const CONTINUATION: &str = "continuation";
 const REQUESTED_BY: &str = "requested_by";
+const TARGET_PROJECT: &str = "switch_target_project";
 const PROVIDER_ROUTE_WITHHELD: &str = "provider_route_withheld";
 
 pub type SwitchLiveCheckout = (String, i64, String, String);
@@ -222,6 +225,7 @@ pub struct SwitchWork {
     pub continuation: Option<SwitchContinuation>,
     /// The manager principal that requested this switch.
     pub requested_by: Option<String>,
+    pub enters_assignment: bool,
 }
 
 /// Switch input prepared against the source generation and reserved payload.
@@ -231,6 +235,7 @@ pub struct PreparedSwitchBrief {
     pub(super) binding: Option<(String, String)>,
     pub(super) brief: handoff::brief::BuiltBrief,
     pub(super) resume_goal: bool,
+    pub(super) enters_assignment: bool,
 }
 
 struct RetainedSwitch {
@@ -246,6 +251,73 @@ struct RetainedSwitch {
     owner_automation: bool,
     continuation: Option<SwitchContinuation>,
     requested_by: Option<String>,
+    target_project: Option<SwitchProject>,
+}
+
+#[derive(Serialize, Deserialize, PartialEq, Eq)]
+struct SwitchProject {
+    registration_revision: i64,
+    assignment_epoch: i64,
+    manager: Option<ProjectManagerIdentity>,
+}
+
+fn read_switch_project(
+    conn: &Connection,
+    project: &str,
+) -> Result<(SwitchProject, core::api::ProjectRegistrationView)> {
+    project_transfer::require_no_intent(conn, project)?;
+    let registration = projects::project_registration_tx(conn, project)?.ok_or_else(|| {
+        Error::new(
+            "not_found",
+            format!("switch target project {project} was not found"),
+        )
+    })?;
+    let assignment = project_assignment::read_assignment(conn, project)?;
+    if assignment.manager.is_some() && assignment.state != ProjectAssignmentState::Active {
+        return Err(Error::new(
+            "bad_state",
+            "switch target manager is not active",
+        ));
+    }
+    Ok((
+        SwitchProject {
+            registration_revision: registration.revision,
+            assignment_epoch: assignment.epoch,
+            manager: assignment.manager,
+        },
+        registration,
+    ))
+}
+
+fn require_switch_project(
+    conn: &Connection,
+    request: &SwitchRequest,
+    expected: Option<&SwitchProject>,
+) -> Result<Option<Agent>> {
+    let Some(project) = request.launch.project.as_deref() else {
+        return Ok(None);
+    };
+    let (current, _) = read_switch_project(conn, project)?;
+    // Pre-upgrade requests can still use a vacant project. They did not
+    // authorize a manager binding and cannot acquire one during recovery.
+    if expected.map_or(current.manager.is_some(), |binding| *binding != current) {
+        return Err(Error::new(
+            "stale_assignment",
+            "switch target project or manager changed",
+        ));
+    }
+    match current.manager {
+        Some(ProjectManagerIdentity::Local { agent, generation }) => {
+            load_agent_by_num(conn, parse_agent_id(&agent)?)?
+                .filter(|agent| agent.generation == generation && agent.project == project)
+                .map(Some)
+                .ok_or_else(|| Error::new("stale_assignment", "switch target manager changed"))
+        }
+        Some(ProjectManagerIdentity::Remote { .. }) => {
+            Err(Error::new("unsupported", "switch target manager is remote"))
+        }
+        None => Ok(None),
+    }
 }
 
 fn decode_switch(mut args: Value) -> Result<RetainedSwitch> {
@@ -312,6 +384,11 @@ fn decode_switch(mut args: Value) -> Result<RetainedSwitch> {
         .map(serde_json::from_value)
         .transpose()
         .map_err(|_| malformed())?;
+    let target_project = args_map
+        .remove(TARGET_PROJECT)
+        .map(serde_json::from_value)
+        .transpose()
+        .map_err(|_| malformed())?;
     let request = serde_json::from_value(args).map_err(|_| malformed())?;
     Ok(RetainedSwitch {
         request,
@@ -326,6 +403,7 @@ fn decode_switch(mut args: Value) -> Result<RetainedSwitch> {
         owner_automation,
         continuation,
         requested_by,
+        target_project,
     })
 }
 
@@ -911,14 +989,41 @@ fn reserve_switch_tx(
     if source.generation != request.from_generation {
         return Err(Error::new("stale_generation", "source generation moved"));
     }
-    // The replay digest still binds the caller payload. Only the retained
-    // worker request freezes the additional, Store-discovered SEND IDs.
-    args["commands"] = json!(handoff::switch_transfer_commands(
-        tx,
-        &source,
-        &request.commands,
-        source.is_terminal()
-    )?);
+    // The replay digest binds the original caller payload. Capture current
+    // routing and discovered SENDs only on the retained worker request.
+    let selected =
+        handoff::switch_transfer_commands(tx, &source, &request.commands, source.is_terminal())?;
+    if let Some(project) = request.launch.project.as_deref() {
+        let (binding, registration) = read_switch_project(tx, project)?;
+        if binding.manager.is_some() {
+            if !source.chat
+                || !source.project_scope().is_empty()
+                || source.parent.is_some()
+                || hierarchy::count_children_tx(tx, parse_agent_id(&source.id)?)? != 0
+                || !selected.is_empty()
+            {
+                return Err(Error::new(
+                    "not_allowed",
+                    "continuing into an assignment requires a projectless root chat with no controlled children or transferable SENDs",
+                ));
+            }
+            if !registration.actions.iter().any(|action| action == "launch")
+                || request.launch.harness.is_some()
+                || request
+                    .launch
+                    .profile
+                    .as_ref()
+                    .is_some_and(|profile| !registration.profiles.contains(profile))
+            {
+                return Err(Error::new(
+                    "not_allowed",
+                    "continuation requires a project-approved launch profile or role",
+                ));
+            }
+        }
+        args[TARGET_PROJECT] = json!(binding);
+    }
+    args["commands"] = json!(selected);
     let source_checkout_root = args
         .get(SOURCE_CHECKOUT_ROOT)
         .and_then(Value::as_str)
@@ -1212,6 +1317,8 @@ impl Store {
         let plan = stored_result(&parent.outcome)?;
         let request = &retained.request;
         let (source, _) = source_tx(&tx, request, self.hierarchy_limits, policy, true)?;
+        let enters_assignment =
+            require_switch_project(&tx, request, retained.target_project.as_ref())?.is_some();
         let (task, originals) = handoff::source_inputs(
             &tx,
             &source,
@@ -1301,6 +1408,7 @@ impl Store {
             binding,
             brief,
             resume_goal,
+            enters_assignment,
         })
     }
 
@@ -1455,7 +1563,11 @@ impl Store {
                 owner_automation,
                 continuation,
                 requested_by,
+                target_project,
             } = decode_switch(command.args)?;
+            let enters_assignment = target_project
+                .as_ref()
+                .is_some_and(|binding| binding.manager.is_some());
             let owner_automation = owner_automation
                 || continuation.is_some()
                 || requested_by.is_some()
@@ -1566,6 +1678,7 @@ impl Store {
                     owner_automation,
                     continuation,
                     requested_by,
+                    enters_assignment,
                 }),
                 events,
             })
@@ -1615,7 +1728,7 @@ impl Store {
     pub fn admit_switch_launch(
         &mut self,
         brief: &PreparedSwitchBrief,
-        request: SubmitCommand,
+        mut request: SubmitCommand,
         preparation: Option<WorkspacePreparationInput>,
         checkout: SwitchLaunchCheckout<'_>,
         policy: &core::SecretPolicy,
@@ -1663,9 +1776,17 @@ impl Store {
                 owner_automation,
                 continuation,
                 requested_by,
+                target_project,
                 ..
             } = decode_switch(parent.args.clone())?;
             let (agent, target) = source_tx(&tx, &source, self.hierarchy_limits, policy, true)?;
+            let manager = require_switch_project(&tx, &source, target_project.as_ref())?;
+            if manager.is_some() != brief.enters_assignment {
+                return Err(Error::new(
+                    "stale_assignment",
+                    "switch brief target assignment changed",
+                ));
+            }
             if agent.workspace != source_checkout {
                 return Err(Error::new(
                     "source_integrity",
@@ -1817,6 +1938,21 @@ impl Store {
                         "switch target registration changed",
                     ));
                 }
+                if manager.is_some()
+                    && (preparation.is_none()
+                        || !registration.actions.iter().any(|action| action == "launch")
+                        || request.args["profile"].as_str().is_none_or(|profile| {
+                            !registration
+                                .profiles
+                                .iter()
+                                .any(|allowed| allowed == profile)
+                        }))
+                {
+                    return Err(Error::new(
+                        "not_allowed",
+                        "continuation requires a prepared worktree and a project-approved profile",
+                    ));
+                }
                 // The frozen checkout admitted here must already be the
                 // target registration's checkout: a changed registration or
                 // a preparation from another repository refuses before any
@@ -1880,6 +2016,20 @@ impl Store {
                     "id_conflict",
                     "reserved launch id occupied by another command",
                 ));
+            }
+            if let Some(manager) = &manager {
+                request.args["project"] = json!(manager.project_scope());
+                request.args["parent"] = json!(manager.id);
+                request.args["assignment_epoch"] = json!(
+                    target_project
+                        .as_ref()
+                        .map(|binding| binding.assignment_epoch)
+                );
+                request
+                    .args
+                    .as_object_mut()
+                    .expect("validated launch args")
+                    .remove(core::api::SWITCH_BLANK_SCOPE_ARG);
             }
             super::work_truth::require_no_checkpoint_intent_tx(&tx, &agent)?;
             let admission = admission::submit_switch_launch_tx(
@@ -1945,7 +2095,7 @@ impl Store {
                 )
             };
             let same_checkout = source_checkout_key == actual_checkout_key.as_str();
-            if !same_checkout && source_checkout_clean != Some(true) {
+            if !same_checkout && !brief.enters_assignment && source_checkout_clean != Some(true) {
                 return Err(Error::new(
                     "dirty",
                     "switch to a different checkout requires a fully verified clean source worktree",
@@ -2023,6 +2173,7 @@ impl Store {
                 profile_authority,
                 continuation,
                 requested_by,
+                target_project,
                 ..
             } = decode_switch(parent.args)?;
             let handoff_reason = continuation.map_or(
@@ -2055,6 +2206,20 @@ impl Store {
                     );
                     let (source, _) =
                         source_tx(&tx, &request, self.hierarchy_limits, policy, true)?;
+                    let manager = require_switch_project(&tx, &request, target_project.as_ref())?;
+                    if manager.is_some() != brief.enters_assignment
+                        || manager.as_ref().is_some_and(|manager| {
+                            destination.parent.as_deref() != Some(manager.id.as_str())
+                                || destination.root != manager.id
+                                || destination.project != manager.project
+                                || destination.project_scope() != manager.project_scope()
+                        })
+                    {
+                        return Err(Error::new(
+                            "stale_assignment",
+                            "switch successor is outside the reserved assignment",
+                        ));
+                    }
                     if continuation.is_some()
                         || requested_by.is_some()
                         || provider_failure.is_some()
@@ -2115,13 +2280,15 @@ impl Store {
                         self.hierarchy_limits,
                         handoff::HandoffInput::Switch(brief),
                     )?;
-                    super::work_truth::inherit_work_task_tx(
-                        &tx,
-                        &source,
-                        &destination,
-                        &change.value.transfers,
-                        now,
-                    )?;
+                    if !brief.enters_assignment {
+                        super::work_truth::inherit_work_task_tx(
+                            &tx,
+                            &source,
+                            &destination,
+                            &change.value.transfers,
+                            now,
+                        )?;
+                    }
                     Store::transfer_handoff_lineage_tx(&tx, &source, &destination)?;
                     let target_root = target_checkout_root.as_deref().ok_or_else(|| {
                         Error::new("source_integrity", "switch target checkout root is missing")

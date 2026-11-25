@@ -935,6 +935,18 @@ pub(super) fn check_dispatch(conn: &Connection, command: &CommandRecord) -> Resu
                 "switch target registration changed",
             ));
         }
+        if let Some(parent) = command.command.args["parent"].as_str() {
+            project_transfer::require_no_intent(conn, &project)?;
+            let assignment = read_assignment(conn, &project)?;
+            if assignment.state != ProjectAssignmentState::Active
+                || !matches!(assignment.manager, Some(ProjectManagerIdentity::Local { agent, .. }) if agent == parent)
+            {
+                return Err(Error::new(
+                    "stale_assignment",
+                    "continuation manager is no longer active",
+                ));
+            }
+        }
         let workspace = required_string(&command.command.args, "workspace")?;
         if workspace != registration.checkout {
             return Err(Error::new(
