@@ -88,8 +88,9 @@ Use an existing authenticated `CODEX_HOME` and a disposable existing workspace.
 No proxy, native Goal, subagent, worktree creation or transcript handoff is needed yet.
 
 1. Spawn `codex app-server --listen stdio://` inside Agent custody and start its reader.
-   The Windows plugin and piped app-server run detached from the console. Native
-   terminal children and the generation Job keep their existing roles.
+   The Windows plugin and app-server use redirected stdin, stdout, and stderr
+   without joining a console. Codex owns the console policy for its terminal
+   children, and the generation Job retains custody of the process tree.
 2. Send `initialize`, await success, then send `initialized`.
 3. Read paginated `model/list`. Select the explicitly configured Luna model and an
    effort supported by that response. Apply the frozen profile effort on start and
