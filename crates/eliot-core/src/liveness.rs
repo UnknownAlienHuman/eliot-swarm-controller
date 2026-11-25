@@ -310,7 +310,7 @@ pub fn mover(object: &LivenessObject, now: i64) -> Mover {
                 if *round_active {
                     moving_or_long(*since, now, 7 * DAY_MS, "active_goal_round", None)
                 } else if *turn_active {
-                    moving_or_long(*since, now, 7 * DAY_MS, "goal_waiting_for_turn", *timer_due)
+                    moving_or_long(*since, now, 7 * DAY_MS, "goal_waiting_for_turn", None)
                 } else if let Some(due) = (*timer_due).filter(|due| *due > now) {
                     moving_or_long(*since, now, 7 * DAY_MS, "goal_timer", Some(due))
                 } else if *owner_item {
