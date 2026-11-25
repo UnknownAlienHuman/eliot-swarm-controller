@@ -95,6 +95,7 @@ impl<'a> Scan<'a> {
         if !names.remove(relative) {
             return Err(unverified());
         }
+        let identity = eliot_plugin::file_identity(&primary).map_err(|_| unverified())?;
         let mut aliases = Vec::with_capacity(names.len());
         for name in names {
             if Instant::now() >= deadline || !self.pending.insert(name.clone()) {
@@ -103,7 +104,7 @@ impl<'a> Scan<'a> {
             let alias = native::open_cleanup_alias(self.root, name.as_os_str())
                 .map_err(cleanup_open_error)?;
             cleanup_file_size(&alias)?;
-            if !native::same(&alias, &primary).map_err(|_| unverified())? {
+            if eliot_plugin::file_identity(&alias).map_err(|_| unverified())? != identity {
                 return Err(unverified());
             }
             aliases.push(alias);
