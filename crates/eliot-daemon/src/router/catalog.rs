@@ -1030,7 +1030,7 @@ impl Router {
         Ok(())
     }
 
-    /// Merge sparse typed stream observations into Codex's public quota detail
+    /// Merge sparse typed stream observations into the declared quota detail
     /// shape. The observation timestamp remains provenance only; the enclosing
     /// response's full-read timestamp and native usage authorization are intact.
     fn overlay_quota_windows(
@@ -1059,17 +1059,15 @@ impl Router {
                 continue;
             };
             fields.insert(slot.used_percent_key.to_owned(), json!(window.used_percent));
-            if let (Some(reset_key), Some(at)) = (slot.reset_key, window.resets_at_ms) {
-                let value = match slot.reset_unit {
+            if let Some(reset_key) = slot.reset_key {
+                let value = window.resets_at_ms.map(|at| match slot.reset_unit {
                     eliot_core::api::harness::QuotaResetUnit::Milliseconds => at,
                     eliot_core::api::harness::QuotaResetUnit::Seconds => at / 1_000,
-                };
+                });
                 fields.insert(reset_key.to_owned(), json!(value));
             }
-            if let (Some(key), Some(minutes)) =
-                (slot.duration_mins_key, window.window_duration_mins)
-            {
-                fields.insert(key.to_owned(), json!(minutes));
+            if let Some(key) = slot.duration_mins_key {
+                fields.insert(key.to_owned(), json!(window.window_duration_mins));
             }
         }
         details[projection.observed_at_key] = json!(observation.observed_at_ms);
