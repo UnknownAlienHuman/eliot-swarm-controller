@@ -25,6 +25,34 @@ impl TurnPreviewWatchRequest {
         }
         Ok(())
     }
+
+    /// A reply that keeps the contract: an ended turn carries neither a
+    /// revision nor a preview; a live one carries its revision, no preview
+    /// when that revision is the one echoed (a timeout), and otherwise at
+    /// most a bounded preview with a valid message id.
+    pub fn validate_response(&self, reply: &TurnPreviewWatchResponse) -> Result<()> {
+        let valid = if reply.ended {
+            reply.revision.is_none() && reply.preview.is_none()
+        } else {
+            reply.revision.is_some()
+                && match &reply.preview {
+                    None => true,
+                    Some(preview) => {
+                        reply.revision != self.revision
+                            && valid_preview_id(&preview.message_id)
+                            && preview.text.len() <= MAX_TURN_PREVIEW_BYTES
+                    }
+                }
+        };
+        if valid {
+            Ok(())
+        } else {
+            Err(Error::new(
+                "invalid",
+                "turn preview reply does not match its request",
+            ))
+        }
+    }
 }
 
 pub fn valid_preview_id(id: &str) -> bool {

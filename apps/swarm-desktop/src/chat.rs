@@ -190,6 +190,9 @@ enum Activity {
     Message {
         key: String,
         text: String,
+        /// The harness's own id of the message (`message_id`), which the
+        /// live preview of the same message carries.
+        message_id: Option<String>,
     },
     /// An input steered into the running turn (its command id): shown in
     /// the turn where it was accepted.
@@ -202,10 +205,7 @@ enum Activity {
     },
     /// A Swarm note (an `inject` command) delivered into this turn, and
     /// whether a project rule caused it (its frame then names the rule).
-    Note {
-        command: String,
-        rule: bool,
-    },
+    Note { command: String, rule: bool },
     Tools {
         key: String,
         rows: Vec<ToolRow>,
@@ -947,6 +947,19 @@ impl Part {
         }
     }
 
+    /// The running turn's live message (`turn.preview.watch`) as the
+    /// progress message it becomes once committed. It is drawn after its
+    /// turn's parts and is never one of them.
+    pub fn draft(message_id: &str, text: String) -> Self {
+        Self::new(
+            format!("draft:{message_id}"),
+            PartKind::Progress,
+            "Assistant · progress".to_owned(),
+            text,
+            Vec::new(),
+        )
+    }
+
     fn ending(mut self, end: TurnEnd) -> Self {
         self.revision = mix(self.revision, 0x100 + end as u64);
         self.end = Some(end);
@@ -1354,7 +1367,12 @@ impl Conversation {
                             let text = bound_text(text);
                             turn.messages += 1;
                             turn.message_bytes += text.len();
-                            turn.activity.push(Activity::Message { key, text });
+                            let message_id = data_str(event, "message_id").map(str::to_owned);
+                            turn.activity.push(Activity::Message {
+                                key,
+                                text,
+                                message_id,
+                            });
                         }
                     }
                 }
@@ -1826,7 +1844,7 @@ impl Conversation {
     }
 
     fn turn_item(&self, turn: &TurnEntry) -> TurnItem {
-        let key = format!("turn:{}:{}", turn.key.generation, turn.key.id);
+        let key = turn_item_key(turn.key.generation, &turn.key.id);
         let mut parts = Vec::new();
         // The owner's message, with when its turn started ("You · 13:58").
         let you = match turn.started_ms {
@@ -1887,7 +1905,7 @@ impl Conversation {
                 continue;
             }
             match entry {
-                Activity::Message { key, text } => activity.push(Part::new(
+                Activity::Message { key, text, .. } => activity.push(Part::new(
                     key.clone(),
                     PartKind::Progress,
                     "Assistant · progress".to_owned(),
@@ -2185,6 +2203,26 @@ impl Conversation {
     }
 
     /// Full retained text of one part, for Copy message.
+    /// Whether the turn is resident and no longer running: its live draft
+    /// is over.
+    pub fn turn_ended(&self, generation: i64, turn_id: &str) -> bool {
+        self.turns
+            .get(&TurnKey::new(generation, turn_id))
+            .is_some_and(|turn| turn.status != TurnStatus::Running)
+    }
+
+    /// Whether the turn holds the committed message whose harness id is
+    /// `message_id`: its live draft would draw it twice.
+    pub fn holds_message(&self, generation: i64, turn_id: &str, message_id: &str) -> bool {
+        self.turns
+            .get(&TurnKey::new(generation, turn_id))
+            .is_some_and(|turn| {
+                turn.activity.iter().any(|entry| {
+                    matches!(entry, Activity::Message { message_id: Some(id), .. } if id == message_id)
+                })
+            })
+    }
+
     pub fn part_text(&self, key: &str) -> Option<String> {
         self.part(key).map(|part| {
             if part.detail.is_empty() {
@@ -2194,6 +2232,11 @@ impl Conversation {
             }
         })
     }
+}
+
+/// The key of one turn's item.
+pub fn turn_item_key(generation: i64, turn_id: &str) -> String {
+    format!("turn:{generation}:{turn_id}")
 }
 
 /// The quiet line where a generation starts. The Agent's launch needs none,

@@ -22,6 +22,7 @@ mod transcript;
 use super::move_ui;
 use super::*;
 use crate::chat::InputFailure;
+use live_feed::{PreviewReply, PreviewState, PreviewTurn};
 use transcript::starting_view;
 
 #[derive(Clone, Debug)]
@@ -107,6 +108,10 @@ pub(super) enum ChatMsg {
     RetryInput(String),
     /// The `why` summary of the open lost Agent (Agent, generation).
     LossRead(String, i64, Fallible<eliot_core::api::DiagnoseResponse>),
+    /// A `turn.preview.watch` reply (epoch, call, its turn), with the
+    /// Markdown of its preview parsed off the UI thread; `None` once the
+    /// call was cancelled.
+    PreviewLoaded(u64, u64, PreviewTurn, Option<Box<PreviewReply>>),
 }
 
 /// Between two reads of inputs that still wait while the Agent is idle or
@@ -489,6 +494,8 @@ pub(super) struct ChatState {
     pub(super) decision_at: usize,
     /// The reason typed for an unconfirmed outcome.
     pub(super) decide_reason: String,
+    /// The open running turn's live draft and its one watch.
+    pub(super) preview: PreviewState,
 }
 
 impl DesktopApp {
@@ -886,6 +893,9 @@ impl DesktopApp {
                 let command = key.strip_prefix("fail:").unwrap_or(&key).to_owned();
                 self.retry_input(&command, context);
             }
+            ChatMsg::PreviewLoaded(epoch, call, turn, reply) => {
+                self.preview_loaded(epoch, call, turn, reply);
+            }
             ChatMsg::LossRead(agent, generation, summary) => {
                 if self
                     .chat
@@ -917,11 +927,7 @@ impl DesktopApp {
                 }
             }
             ChatMsg::CopyPart(key) => {
-                let text = self
-                    .chat
-                    .convo
-                    .as_ref()
-                    .and_then(|convo| convo.part_text(&key));
+                let text = self.shown_part_text(&key);
                 match text.map(|text| (text.chars().count(), crate::clipboard::set_text(&text))) {
                     Some((count, Ok(()))) => self.set_status(format!("Copied {count} characters.")),
                     Some((_, Err(error))) => self.alert(format!("Copy failed: {error}")),
@@ -944,10 +950,7 @@ impl DesktopApp {
             }
             ChatMsg::CopyCode(key, index) => {
                 let code = self
-                    .chat
-                    .convo
-                    .as_ref()
-                    .and_then(|convo| convo.part_text(&key))
+                    .shown_part_text(&key)
                     .map(|text| crate::markdown::parse(&text))
                     .and_then(|doc| doc.code_blocks().get(index).map(|code| (*code).to_owned()));
                 match code.map(|code| crate::clipboard::set_text(&code)) {
