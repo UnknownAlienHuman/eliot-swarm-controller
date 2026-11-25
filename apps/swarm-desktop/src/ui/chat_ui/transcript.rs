@@ -53,13 +53,11 @@ impl DesktopApp {
     /// The transcript ([`views::Transcript`]): "Load older" when more
     /// history exists, then every turn in the reading column. It is its own
     /// component: a window render compares its input and redraws it only
-    /// when the conversation, its expanded rows, the column or the palette
-    /// changed.
+    /// when the conversation, its expanded rows or the column changed.
     pub(super) fn transcript_view(
         &self,
         column: Option<f64>,
         context: &mut ViewContext<Self>,
-        palette: Palette,
     ) -> View {
         // Settings and a project page leave the conversation as New task does.
         let conversation = match self.main {
@@ -132,7 +130,6 @@ impl DesktopApp {
             },
             expanded: Rc::new(self.chat.expanded.clone()),
             callbacks: Rc::new(callbacks),
-            palette,
             column,
             load_older,
             empty,
@@ -144,12 +141,7 @@ impl DesktopApp {
 
 /// A new task's first message and its "Starting Codex…" line while the
 /// launch is submitted, in the transcript's place and shape.
-pub(super) fn starting_view(
-    text: &str,
-    label: &str,
-    column: Option<f64>,
-    palette: Palette,
-) -> View {
+pub(super) fn starting_view(text: &str, label: &str, column: Option<f64>) -> View {
     let (shown, files) = crate::attachments::split(text);
     StackPanel::new()
         .grid_row(1)
@@ -168,18 +160,17 @@ pub(super) fn starting_view(
                 .max_width(tokens::layout::READING_WIDTH * tokens::layout::BUBBLE_SHARE)
                 .automation_name(format!("You: {shown}"))
                 .keyed_children(crate::views::slots([
-                    Some(m3::bubble(
-                        palette,
-                        m3::body(shown.to_owned()).text_wrapping(TextWrapping::Wrap),
+                    Some(controls::bubble(
+                        controls::body(shown.to_owned()).text_wrapping(TextWrapping::Wrap),
                         None,
                     )),
-                    (!files.is_empty()).then(|| views::attached_chips(&files, palette)),
+                    (!files.is_empty()).then(|| views::attached_chips(&files)),
                 ])),
             StackPanel::new()
                 .spacing(tokens::spacing::XS)
                 .automation_name(label)
                 .children((
-                    m3::secondary(label.to_owned()),
+                    controls::secondary(label.to_owned()),
                     ProgressBar::new()
                         .is_indeterminate(true)
                         .width(tokens::layout::PROGRESS_WIDTH)

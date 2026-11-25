@@ -50,7 +50,7 @@ fn close_outcome(prior: Option<String>, closed: Result<(), String>) -> Result<()
 /// `SetClipboardData` -- after the previous contents were already cleared
 /// (#647). With no window yet the copy refuses before touching anything.
 fn owner() -> Result<HWND, String> {
-    crate::app_resources::own_window()
+    crate::app_window::own_window()
         .ok_or_else(|| "the window is not shown yet, so the clipboard was left alone".to_owned())
 }
 

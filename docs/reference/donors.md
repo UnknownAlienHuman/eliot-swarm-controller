@@ -63,63 +63,6 @@ MIT OR Apache-2.0, used under MIT; the license texts ship in each crate.
 `rust-version` 1.95 at that commit, below the pinned toolchain 1.99.1. Target:
 `apps/swarm-desktop`; the library is used directly and no source is copied.
 
-## Desktop Material controls (k202, 2026-11-19)
-
-**Pattern only**, no code copied and no dependency added: the button template,
-shapes, elevation and motion in `apps/swarm-desktop/src/app_resources/templates.rs`,
-`shadow.rs` and `ui::tokens`.
-
-- [material-web](https://github.com/material-components/material-web) (`main`),
-  Apache-2.0: the elevation levels of `elevation/internal/_elevation.scss` (key
-  shadow at 0.30, ambient at 0.15; levels 2–4 offsets, blurs and spreads),
-  checked against the file on 2026-11-19. The 8 % and 10 % state layers were
-  already the desktop's (`theme::state`); the emphasized and
-  emphasized-decelerate curves and the short/medium durations follow the M3
-  motion tokens as published, not re-checked against source this round.
-- [Uno.Themes](https://github.com/unoplatform/Uno.Themes) (`master`), Apache-2.0
-  (license checked 2026-11-19): the pattern of Material styles as WinUI control
-  templates over lightweight-styling keys. Its XAML is not imported: the
-  desktop's templates read its own button families' keys.
-- **Shadows (D11, 2026-11-24, pattern only):** WinUI's `ThemeShadow` takes no
-  color or opacity; in the tree it now draws without receivers (observed
-  live on Windows App SDK WinUI 2.3.0; an earlier round saw nothing), and
-  the card template's hover lift uses it. The composer's `elevation-1` and
-  the night glow are Composition `DropShadow`s on Reactor's composition host
-  (`apps/swarm-desktop/src/shadow.rs`), after the pattern of the Windows
-  Community Toolkit's `AttachedCardShadow`
-  ([CommunityToolkit/Windows](https://github.com/CommunityToolkit/Windows),
-  MIT): a brushless sprite whose shadow is masked by a rounded rectangle
-  rendered through a `CompositionVisualSurface`. No code copied. The drawn
-  1-DIP bands they replace are removed.
-- **Extract (2026-11-21):** WinUI's default ComboBox `ControlTemplate`
-  ([microsoft/microsoft-ui-xaml](https://github.com/microsoft/microsoft-ui-xaml)
-  `controls/dev/ComboBox/ComboBox_themeresources.xaml` at `7cc6dcc1`, MIT,
-  "Copyright (c) Microsoft Corporation"; license read at that revision on
-  2026-11-21), copied from the build the desktop runs
-  (Microsoft.WindowsAppSDK.WinUI 2.3.0 `Themes/generic.xaml`) into
-  `apps/swarm-desktop/src/app_resources/combo_box.xaml`, whose header carries
-  the full MIT copyright, permission and warranty text. Only
-  the drop-down glyph size (the design's 14-DIP chevron), the focus
-  highlight corner and inlined StaticResource values differ; WinUI hard-codes
-  the 12-DIP glyph in the template, so no style setter can change it.
-- **Fonts (D11, 2026-11-24):** shipped inside `swarm-desktop` and written
-  with their licence texts into `fonts/` beside the executable
-  (`apps/swarm-desktop/src/fonts.rs`); the subsets and the licence texts are
-  in `apps/swarm-desktop/design/fonts/`, built by `make_fonts.py`
-  (fontTools 4.60.1). Licences read at these revisions on 2026-11-24.
-  - Roboto and Roboto Mono:
-    [google/fonts](https://github.com/google/fonts) `ofl/roboto` at
-    `6183fc0d2636` and `ofl/robotomono` at `b01086459d9d`, SIL OFL 1.1, no
-    Reserved Font Name. Subset to Latin, Greek and Cyrillic and instanced at
-    normal width; the name table says so.
-  - Material Symbols Rounded:
-    [google/material-design-icons](https://github.com/google/material-design-icons)
-    `variablefont/` at `10ecc1479061`, Apache-2.0. Cut to the desktop's
-    icons at optical size 20, weight 400 and grade 0 or -25. Filled glyphs
-    are added at `0xF0000 + code - 0xE000`, and the font is renamed Eliot
-    Symbols. The name table states the modification and the licence (Apache
-    §4(b)).
-
 ## Provider quota pattern (k92, inspected 2026-11-16)
 
 OpenCodex release 2.84.0, local source

@@ -22,7 +22,6 @@ use windows_reactor::*;
 
 use crate::chat::{self, Part, PartKind, TurnItem, text_hash};
 use crate::markdown::{Block, Doc, Inline};
-use crate::theme::winui::Palette;
 use crate::ui::tokens;
 
 /// Children with optional slots. Reactor 0.101 has no empty view, so an
@@ -281,7 +280,7 @@ fn list_view(items: &[(usize, String, RichText)]) -> View {
                                 GridLength::STAR,
                             ])
                             .children((
-                                crate::m3::body(marker.clone()),
+                                crate::controls::body(marker.clone()),
                                 rich_block(text).grid_column(1),
                             )),
                     )
@@ -372,13 +371,12 @@ pub struct RowCallbacks {
 }
 
 fn label(text: &str) -> TextBlock {
-    crate::m3::secondary(text.to_owned())
+    crate::controls::secondary(text.to_owned())
 }
 
 /// Message text: body.
-fn body_text(text: &str, palette: Palette) -> TextBlock {
-    crate::m3::body(text.to_owned())
-        .foreground(palette.text())
+fn body_text(text: &str) -> TextBlock {
+    crate::controls::body(text.to_owned())
         .text_wrapping(TextWrapping::Wrap)
         .is_text_selection_enabled(true)
 }
@@ -389,17 +387,17 @@ const INSET: f64 = (tokens::height::CONTROL - tokens::icon::ROW) / 2.0;
 
 /// Copy for `part`: an icon button while the part is under the pointer;
 /// otherwise the same place holds a keyboard stop whose glyph shows only
-/// with keyboard focus ([`crate::m3::reveal_button`]). Never a permanently
+/// with keyboard focus ([`crate::controls::reveal_button`]). Never a permanently
 /// visible icon.
-fn copy_button(name: &str, hovered: bool, palette: Palette, callback: impl Fn() + 'static) -> View {
+fn copy_button(name: &str, hovered: bool, callback: impl Fn() + 'static) -> View {
     if hovered {
-        crate::m3::icon_button(palette)
+        crate::controls::icon_button()
             .automation_name(name)
             .on_click(callback)
             .content(copy_glyph())
             .into()
     } else {
-        crate::m3::reveal_button()
+        crate::controls::reveal_button()
             .automation_name(name)
             .on_click(callback)
             .content(copy_glyph())
@@ -409,17 +407,12 @@ fn copy_button(name: &str, hovered: bool, palette: Palette, callback: impl Fn() 
 
 /// The glyph of a copy button.
 fn copy_glyph() -> View {
-    crate::m3::icon(crate::m3::glyph::COPY)
+    crate::controls::icon(crate::controls::glyph::COPY)
 }
 
-fn block_views(
-    part: &RenderedPart,
-    callbacks: &RowCallbacks,
-    hovered: bool,
-    palette: Palette,
-) -> Vec<KeyedView> {
+fn block_views(part: &RenderedPart, callbacks: &RowCallbacks, hovered: bool) -> Vec<KeyedView> {
     let Some(blocks) = part.blocks.as_ref() else {
-        return vec![KeyedView::new("plain", body_text(&part.plain, palette))];
+        return vec![KeyedView::new("plain", body_text(&part.plain))];
     };
     blocks
         .iter()
@@ -428,7 +421,7 @@ fn block_views(
             let view: View = match block {
                 RenderedBlock::Rich(text) => rich_block(text).into(),
                 RenderedBlock::List(items) => list_view(items),
-                RenderedBlock::Heading(level, text) => crate::m3::text(
+                RenderedBlock::Heading(level, text) => crate::controls::text(
                     text.clone(),
                     match level {
                         1 => tokens::text::TITLE,
@@ -451,8 +444,8 @@ fn block_views(
                         .spacing(tokens::spacing::XS)
                         .children((
                             Border::new()
-                                .background(palette.composer())
-                                .border_brush(palette.outline())
+                                .background(ThemeBrush::CardBackground)
+                                .border_brush(ThemeBrush::CardStroke)
                                 .border_thickness(Thickness::uniform(tokens::layout::HAIRLINE))
                                 .corner_radius(tokens::radius::CONTAINER)
                                 .padding(Thickness::xy(tokens::spacing::INSET, tokens::spacing::SM))
@@ -463,7 +456,7 @@ fn block_views(
                                             ScrollBarVisibility::Disabled,
                                         )
                                         .content(
-                                            crate::m3::body(text.clone())
+                                            crate::controls::body(text.clone())
                                                 .font_family(CODE_FONT)
                                                 .text_wrapping(TextWrapping::NoWrap)
                                                 .is_text_selection_enabled(true),
@@ -472,16 +465,15 @@ fn block_views(
                             Border::new()
                                 .horizontal_alignment(HorizontalAlignment::Left)
                                 .margin(Thickness::new(-INSET, 0.0, 0.0, 0.0))
-                                .content(copy_button("Copy code", hovered, palette, move || {
+                                .content(copy_button("Copy code", hovered, move || {
                                     copy.call((key.clone(), code_index));
                                 })),
                         ))
                         .into()
                 }
-                RenderedBlock::Rule => crate::m3::divider(palette).into(),
+                RenderedBlock::Rule => crate::controls::divider().into(),
                 RenderedBlock::Table(table) => View::component::<TableView>(TableInput {
                     table: Shared(Rc::clone(table)),
-                    palette,
                 }),
             };
             KeyedView::new(index, view)
@@ -490,7 +482,7 @@ fn block_views(
 }
 
 /// One style for every part (`Conversation.dc.html`, `Finished.dc.html`):
-/// the owner's message is a `secondary-container` bubble on the right with
+/// the owner's message is a card-surface bubble on the right with
 /// its time and label under the text; the answer is Markdown on the
 /// surface; the work log is one head line over its notes and step rows;
 /// service lines are quiet centred text with an icon.
@@ -499,7 +491,6 @@ fn part_view(
     expanded: bool,
     hovered: bool,
     callbacks: &RowCallbacks,
-    palette: Palette,
 ) -> Option<View> {
     let copy = callbacks.copy_part.clone();
     let key = part.key.clone();
@@ -512,17 +503,16 @@ fn part_view(
             .horizontal_alignment(HorizontalAlignment::Right)
             .max_width(tokens::layout::READING_WIDTH * tokens::layout::BUBBLE_SHARE)
             .keyed_children(crate::views::slots([
-                Some(crate::m3::bubble(
-                    palette,
-                    bubble_content(&part.plain, &part.label, palette),
+                Some(crate::controls::bubble(
+                    bubble_content(&part.plain, &part.label),
                     None,
                 )),
-                (!part.attachments.is_empty()).then(|| attached_chips(&part.attachments, palette)),
+                (!part.attachments.is_empty()).then(|| attached_chips(&part.attachments)),
                 Some(
                     Border::new()
                         .horizontal_alignment(HorizontalAlignment::Right)
                         .margin(Thickness::new(0.0, 0.0, -INSET, 0.0))
-                        .content(copy_button("Copy message", hovered, palette, copy_message))
+                        .content(copy_button("Copy message", hovered, copy_message))
                         .into(),
                 ),
             ]))
@@ -533,9 +523,8 @@ fn part_view(
             .horizontal_alignment(HorizontalAlignment::Right)
             .max_width(tokens::layout::READING_WIDTH * tokens::layout::BUBBLE_SHARE)
             .automation_name(format!("Steered: {}", part.plain))
-            .content(crate::m3::bubble(
-                palette,
-                bubble_content(&part.plain, &part.label, palette),
+            .content(crate::controls::bubble(
+                bubble_content(&part.plain, &part.label),
                 None,
             ))
             .into(),
@@ -543,9 +532,9 @@ fn part_view(
         PartKind::Progress => StackPanel::new()
             .spacing(tokens::spacing::SM)
             .margin(Thickness::xy(tokens::spacing::ROW, tokens::spacing::XS))
-            .keyed_children(block_views(part, callbacks, hovered, palette))
+            .keyed_children(block_views(part, callbacks, hovered))
             .into(),
-        PartKind::Tools => step_view(part, expanded, callbacks, palette),
+        PartKind::Tools => step_view(part, expanded, callbacks),
         PartKind::Log | PartKind::Edited => return None,
         // The answer: Markdown on the surface; a label only when the
         // outcome is not a plain success.
@@ -558,21 +547,21 @@ fn part_view(
                     Some(
                         StackPanel::new()
                             .spacing(tokens::spacing::SM)
-                            .keyed_children(block_views(part, callbacks, hovered, palette))
+                            .keyed_children(block_views(part, callbacks, hovered))
                             .into(),
                     ),
                     Some(
                         Border::new()
                             .horizontal_alignment(HorizontalAlignment::Left)
                             .margin(Thickness::new(-INSET, 0.0, 0.0, 0.0))
-                            .content(copy_button("Copy message", hovered, palette, copy_message))
+                            .content(copy_button("Copy message", hovered, copy_message))
                             .into(),
                     ),
                 ]))
                 .into()
         }
         // A local input waiting for its turn ("Sending…", "Starting
-        // Codex…"): its words and the wave.
+        // Codex…"): its words and the progress bar.
         PartKind::Working => StackPanel::new()
             .spacing(tokens::spacing::XS)
             .keyed_children(crate::views::slots([
@@ -580,7 +569,7 @@ fn part_view(
                 // Why the check of its outcome failed, when it did.
                 (!part.detail.is_empty()).then(|| {
                     label(&part.detail.join(" · "))
-                        .foreground(palette.attention())
+                        .foreground(ThemeBrush::SystemCritical)
                         .text_wrapping(TextWrapping::Wrap)
                         .is_text_selection_enabled(true)
                         .into()
@@ -601,26 +590,26 @@ fn part_view(
                 let retry = callbacks.retry.clone();
                 let key = part.key.clone();
                 Some(
-                    crate::m3::outlined(palette)
+                    crate::controls::outlined()
                         .horizontal_alignment(HorizontalAlignment::Left)
                         .automation_name("Retry")
                         .on_click(move || {
                             retry.call(key.clone());
                         })
-                        .content(crate::m3::label("Retry"))
+                        .content(crate::controls::label("Retry"))
                         .into(),
                 )
             } else if let (PartKind::TurnFailed, Some(pick_model)) =
                 (part.kind, callbacks.pick_model.clone())
             {
                 Some(
-                    crate::m3::outlined(palette)
+                    crate::controls::outlined()
                         .horizontal_alignment(HorizontalAlignment::Left)
                         .automation_name("Pick another model")
                         .on_click(move || {
                             pick_model.call(());
                         })
-                        .content(crate::m3::label("Pick another model"))
+                        .content(crate::controls::label("Pick another model"))
                         .into(),
                 )
             } else {
@@ -630,10 +619,10 @@ fn part_view(
                 .spacing(tokens::spacing::XS)
                 .keyed_children(crate::views::slots([
                     Some(
-                        crate::m3::body(format!("{} · {}", part.label, part.plain))
+                        crate::controls::body(format!("{} · {}", part.label, part.plain))
                             .text_wrapping(TextWrapping::Wrap)
                             .is_text_selection_enabled(true)
-                            .foreground(palette.attention())
+                            .foreground(ThemeBrush::SystemCritical)
                             .into(),
                     ),
                     Some(label(&part.detail.join(" · ")).into()),
@@ -647,7 +636,7 @@ fn part_view(
         PartKind::Note => {
             let toggle = callbacks.toggle_tools.clone();
             let key = part.key.clone();
-            let row = crate::m3::step_row(palette, false)
+            let row = crate::controls::step_row(false)
                 .automation_name(format!(
                     "{} ({})",
                     part.label,
@@ -656,19 +645,18 @@ fn part_view(
                 .on_click(move || {
                     toggle.call((key.clone(), !expanded));
                 })
-                .content(crate::m3::step_content(
-                    crate::m3::icon(crate::m3::glyph::INFO),
+                .content(crate::controls::step_content(
+                    crate::controls::icon(crate::controls::glyph::INFO),
                     &part.label,
                     None,
-                    palette,
                 ));
             let detail: Option<View> = (expanded && !part.plain.is_empty()).then(|| {
                 Border::new()
-                    .background(palette.composer())
+                    .background(ThemeBrush::CardBackground)
                     .corner_radius(tokens::radius::CONTAINER)
                     .padding(Thickness::xy(tokens::spacing::INSET, tokens::spacing::SM))
                     .content(
-                        crate::m3::secondary(part.plain.clone())
+                        crate::controls::secondary(part.plain.clone())
                             .text_wrapping(TextWrapping::Wrap)
                             .is_text_selection_enabled(true)
                             .automation_name(format!("Swarm note content: {}", part.plain)),
@@ -683,9 +671,9 @@ fn part_view(
         // The end of a turn without an answer ("Stopped by you after 3m")
         // is a service line; other notices keep their label.
         PartKind::Notice if part.key.contains("/final:") => {
-            service_line(&part.plain, crate::m3::glyph::STOP_CIRCLE)
+            service_line(&part.plain, crate::controls::glyph::STOP_CIRCLE)
         }
-        PartKind::Notice => crate::m3::secondary(format!("{} · {}", part.label, part.plain))
+        PartKind::Notice => crate::controls::secondary(format!("{} · {}", part.label, part.plain))
             .text_wrapping(TextWrapping::Wrap)
             .margin(Thickness::xy(tokens::spacing::ROW, 0.0))
             .into(),
@@ -695,17 +683,15 @@ fn part_view(
 }
 
 /// A message bubble's text and, under it, its time and label
-/// ("You · 13:58", "Steer · 14:02") in `label-small`.
-fn bubble_content(text: &str, meta: &str, palette: Palette) -> View {
+/// ("You · 13:58", "Steer · 14:02") in smaller type.
+fn bubble_content(text: &str, meta: &str) -> View {
     StackPanel::new()
         .spacing(tokens::spacing::XS)
         .children((
-            crate::m3::body(text.to_owned())
-                .foreground(palette.on_selected())
+            crate::controls::body(text.to_owned())
                 .text_wrapping(TextWrapping::Wrap)
                 .is_text_selection_enabled(true),
-            crate::m3::text(meta.to_owned(), tokens::text::TRAILING)
-                .foreground(palette.on_selected()),
+            crate::controls::text(meta.to_owned(), tokens::text::TRAILING),
         ))
         .into()
 }
@@ -718,8 +704,8 @@ fn service_line(text: &str, glyph: &str) -> View {
         .horizontal_alignment(HorizontalAlignment::Center)
         .automation_name(text)
         .children((
-            crate::m3::muted_icon(glyph),
-            crate::m3::secondary(text.to_owned())
+            crate::controls::muted_icon(glyph),
+            crate::controls::secondary(text.to_owned())
                 .vertical_alignment(VerticalAlignment::Center)
                 .text_wrapping(TextWrapping::Wrap),
         ))
@@ -729,24 +715,23 @@ fn service_line(text: &str, glyph: &str) -> View {
 /// The icon of a generation's line: a restart, a resume, a move.
 fn generation_glyph(line: &str) -> &'static str {
     if line.contains("restart") {
-        crate::m3::glyph::RESTART
+        crate::controls::glyph::RESTART
     } else if line.starts_with("Resumed") {
-        crate::m3::glyph::RESUME
+        crate::controls::glyph::RESUME
     } else {
-        crate::m3::glyph::WORKTREE
+        crate::controls::glyph::WORKTREE
     }
 }
 
-/// A table's input: its bounded data (compared by identity) and palette.
+/// A table's input: its bounded data (compared by identity).
 #[derive(Clone, PartialEq)]
 pub struct TableInput {
     pub table: Shared<TableData>,
-    pub palette: Palette,
 }
 
 /// An answer table (`.md table`) as its own component: a hover or another
 /// part's change re-renders its message, never its grid. The header in
-/// `label-large` on-surface-variant, the cells in `body-medium`, a hairline
+/// muted, the cells in body type, a hairline
 /// under every row; past the bound, how many rows and columns are left out
 /// and Copy table (every row, tab-separated).
 pub struct TableView;
@@ -764,7 +749,7 @@ impl Component for TableView {
 
     fn view(&self, input: &TableInput, context: &mut ViewContext<Self>) -> View {
         let table = &*input.table.0;
-        let grid = table_grid(&table.head, &table.rows, input.palette);
+        let grid = table_grid(&table.head, &table.rows);
         if table.hidden_rows == 0 && table.hidden_columns == 0 {
             return grid;
         }
@@ -795,12 +780,12 @@ impl Component for TableView {
                     .orientation(Orientation::Horizontal)
                     .spacing(tokens::spacing::SM)
                     .children((
-                        crate::m3::secondary(left_out.join(" \u{b7} "))
+                        crate::controls::secondary(left_out.join(" \u{b7} "))
                             .vertical_alignment(VerticalAlignment::Center),
-                        crate::m3::text_button(input.palette)
+                        crate::controls::text_button()
                             .automation_name("Copy table: every row, tab-separated")
                             .on_click(copy)
-                            .content(crate::m3::label("Copy table"))
+                            .content(crate::controls::label("Copy table"))
                             .tooltip("Copies every row, tab-separated"),
                     )),
             ))
@@ -810,7 +795,7 @@ impl Component for TableView {
 
 /// The grid of a bounded table: one hairline per row, one cell per drawn
 /// cell.
-fn table_grid(head: &[String], rows: &[Vec<String>], palette: Palette) -> View {
+fn table_grid(head: &[String], rows: &[Vec<String>]) -> View {
     let columns = head
         .len()
         .max(rows.iter().map(Vec::len).max().unwrap_or(0))
@@ -831,13 +816,13 @@ fn table_grid(head: &[String], rows: &[Vec<String>], palette: Palette) -> View {
                 .grid_column_span(columns as i32)
                 .vertical_alignment(VerticalAlignment::Bottom)
                 .height(tokens::layout::HAIRLINE)
-                .background(palette.outline()),
+                .background(ThemeBrush::CardStroke),
         ));
         for (column, cell) in row.iter().enumerate() {
             let text = if header {
-                crate::m3::text(cell.clone(), tokens::text::BUTTON).foreground(palette.muted())
+                crate::controls::text(cell.clone(), tokens::text::BUTTON)
             } else {
-                crate::m3::body(cell.clone())
+                crate::controls::body(cell.clone())
             };
             cells.push(KeyedView::new(
                 format!("{index}:{column}"),
@@ -864,12 +849,7 @@ const TABLE_CELL_INSET: f64 = 6.0;
 /// the error icon in `error` when it failed), verb and object, the time on
 /// the right; a click shows what the adapter retained (the command, the
 /// paths, the failure's first line).
-fn step_view(
-    part: &RenderedPart,
-    expanded: bool,
-    callbacks: &RowCallbacks,
-    palette: Palette,
-) -> View {
+fn step_view(part: &RenderedPart, expanded: bool, callbacks: &RowCallbacks) -> View {
     let toggle = callbacks.toggle_tools.clone();
     let key = part.key.clone();
     // Name, status, duration, start and class (`chat::TOOL_FIELDS` apart).
@@ -885,32 +865,25 @@ fn step_view(
     let trailing: View = match started {
         Some(started_ms) if running => View::component::<Elapsed>(ElapsedInput {
             started_ms,
-            palette,
             words: None,
         }),
-        _ => crate::m3::tool_caption(duration.clone(), None).into(),
+        _ => crate::controls::tool_caption(duration.clone(), None).into(),
     };
     let glyph = match part.label.as_str() {
-        "Command" => crate::m3::glyph::TERMINAL,
-        "Edit" => crate::m3::glyph::EDIT,
-        "Read" => crate::m3::glyph::FILE,
-        "Search" | "Web" => crate::m3::glyph::SEARCH,
-        "Worker" => crate::m3::glyph::HUB,
-        "Plan" => crate::m3::glyph::LIST,
-        _ => crate::m3::glyph::TOOLS,
+        "Command" => crate::controls::glyph::TERMINAL,
+        "Edit" => crate::controls::glyph::EDIT,
+        "Read" => crate::controls::glyph::FILE,
+        "Search" | "Web" => crate::controls::glyph::SEARCH,
+        "Worker" => crate::controls::glyph::HUB,
+        "Plan" => crate::controls::glyph::LIST,
+        _ => crate::controls::glyph::TOOLS,
     };
     let lead: View = match class {
-        "run" => crate::m3::row_mark(palette, crate::m3::RowMark::Working, "Running"),
-        "fail" => crate::m3::carrier(
-            palette,
-            |s| s.error,
-            "Failed",
-            tokens::icon::ROW,
-            crate::m3::icon(crate::m3::glyph::ERROR),
-        ),
-        _ => crate::m3::icon(glyph),
+        "run" => crate::controls::row_mark(crate::controls::RowMark::Working, "Running"),
+        "fail" => crate::controls::critical_icon(crate::controls::glyph::ERROR, tokens::icon::ROW),
+        _ => crate::controls::icon(glyph),
     };
-    let row = crate::m3::step_row(palette, running)
+    let row = crate::controls::step_row(running)
         .automation_name(format!(
             "{name} · {status}{} ({})",
             if running {
@@ -923,7 +896,7 @@ fn step_view(
         .on_click(move || {
             toggle.call((key.clone(), !expanded));
         })
-        .content(crate::m3::step_content(lead, &name, trailing, palette));
+        .content(crate::controls::step_content(lead, &name, trailing));
     let detail: Option<View> = expanded.then(|| {
         StackPanel::new()
             .spacing(tokens::spacing::XS)
@@ -935,12 +908,12 @@ fn step_view(
             ))
             .keyed_children(crate::views::slots([
                 Some(
-                    crate::m3::secondary(format!("{status}\n{}", part.detail.join("\n")))
+                    crate::controls::secondary(format!("{status}\n{}", part.detail.join("\n")))
                         .text_wrapping(TextWrapping::Wrap)
                         .is_text_selection_enabled(true)
                         .into(),
                 ),
-                path_actions(&part.key, &part.detail_paths, callbacks, palette),
+                path_actions(&part.key, &part.detail_paths, callbacks),
             ]))
             .into()
     });
@@ -999,7 +972,6 @@ pub struct TranscriptInput {
     pub items: Shared<Vec<Rc<RenderedItem>>>,
     pub expanded: Rc<HashSet<String>>,
     pub callbacks: Rc<RowCallbacks>,
-    pub palette: Palette,
     pub column: Option<f64>,
     /// "Load older messages" when more history exists: enabled, and its
     /// callback.
@@ -1141,21 +1113,20 @@ impl Component for Transcript {
     }
 
     fn view(&self, input: &TranscriptInput, _context: &mut ViewContext<Self>) -> View {
-        let palette = input.palette;
         let load_older: Option<View> = match &input.load_older {
             Some((enabled, load)) if self.hidden == 0 => Some(
-                crate::m3::text_button(palette)
+                crate::controls::text_button()
                     .is_enabled(*enabled)
                     .horizontal_alignment(HorizontalAlignment::Center)
                     .margin(Thickness::new(0.0, 0.0, 0.0, tokens::spacing::MD))
                     .on_click(load.clone())
-                    .content(crate::m3::label("Load older messages"))
+                    .content(crate::controls::label("Load older messages"))
                     .into(),
             ),
             _ => None,
         };
         let empty: Option<View> = input.empty.map(|line| {
-            crate::m3::secondary(line)
+            crate::controls::secondary(line)
                 .horizontal_alignment(HorizontalAlignment::Center)
                 .into()
         });
@@ -1289,7 +1260,6 @@ fn turn_views(input: &TranscriptInput, skip: usize) -> Vec<KeyedView> {
                         more,
                     },
                     &input.callbacks,
-                    input.palette,
                 ));
             }
             let mut views: Vec<KeyedView> = Vec::new();
@@ -1309,7 +1279,6 @@ fn turn_views(input: &TranscriptInput, skip: usize) -> Vec<KeyedView> {
                             part,
                             input.expanded.contains(&log_key("more", &part.key)),
                             &input.callbacks,
-                            input.palette,
                         ),
                     )),
                     _ => {
@@ -1329,7 +1298,6 @@ fn turn_views(input: &TranscriptInput, skip: usize) -> Vec<KeyedView> {
                                 part: Shared(Rc::clone(part)),
                                 expanded: input.expanded.contains(&part.key),
                                 callbacks: Rc::clone(&input.callbacks),
-                                palette: input.palette,
                             }),
                         ));
                     }
@@ -1362,15 +1330,10 @@ struct LogHead {
 }
 
 /// A work log's head (`.lg-head`): the chevron, "Worked for 4m 12s · ran 6
-/// commands, edited 3 files" in `label-large` on-surface-variant; while the
+/// commands, edited 3 files" muted; while the
 /// turn runs, "Working for …" counting and what the running step does, with
 /// the loader, on the right. A click opens or closes the log.
-fn log_head(
-    part: &RenderedPart,
-    head: LogHead,
-    callbacks: &RowCallbacks,
-    palette: Palette,
-) -> View {
+fn log_head(part: &RenderedPart, head: LogHead, callbacks: &RowCallbacks) -> View {
     let words = part.label.clone();
     let summary = |time: Option<String>| -> String {
         let verb = if head.running { "Working" } else { "Worked" };
@@ -1384,14 +1347,12 @@ fn log_head(
     let text: View = match (head.running, head.started) {
         (true, Some(started_ms)) => View::component::<Elapsed>(ElapsedInput {
             started_ms,
-            palette,
             words: Some(words.clone()),
         }),
-        _ => crate::m3::text(
+        _ => crate::controls::text(
             summary(head.elapsed.map(crate::chat::short_duration)),
             tokens::text::BUTTON,
         )
-        .foreground(palette.muted())
         .vertical_alignment(VerticalAlignment::Center)
         .text_trimming(TextTrimming::CharacterEllipsis)
         .into(),
@@ -1403,9 +1364,9 @@ fn log_head(
             .grid_column(2)
             .vertical_alignment(VerticalAlignment::Center)
             .children((
-                crate::m3::row_mark(palette, crate::m3::RowMark::Working, &head.doing),
-                crate::m3::text(head.doing.clone(), tokens::text::LABEL)
-                    .foreground(palette.primary_text())
+                crate::controls::row_mark(crate::controls::RowMark::Working, &head.doing),
+                crate::controls::text(head.doing.clone(), tokens::text::LABEL)
+                    .foreground(ThemeBrush::AccentText)
                     .vertical_alignment(VerticalAlignment::Center),
             ))
             .into()
@@ -1416,7 +1377,7 @@ fn log_head(
     } else {
         (log_key("open", &part.key), !head.open)
     };
-    let button = crate::m3::step_row(palette, false)
+    let button = crate::controls::step_row(false)
         .automation_name(format!(
             "{} ({})",
             summary(head.elapsed.map(crate::chat::short_duration)),
@@ -1430,10 +1391,10 @@ fn log_head(
                 .columns([GridLength::Auto, GridLength::STAR, GridLength::Auto])
                 .column_spacing(tokens::spacing::SM)
                 .keyed_children(crate::views::slots([
-                    Some(crate::m3::icon(if head.open {
-                        crate::m3::glyph::CHEVRON_UP
+                    Some(crate::controls::icon(if head.open {
+                        crate::controls::glyph::CHEVRON_UP
                     } else {
-                        crate::m3::glyph::CHEVRON_DOWN
+                        crate::controls::glyph::CHEVRON_DOWN
                     })),
                     Some(
                         Border::new()
@@ -1448,13 +1409,13 @@ fn log_head(
     let more: Option<View> = head.more.map(|steps| {
         let toggle = callbacks.toggle_tools.clone();
         let key = log_key("all", &part.key);
-        crate::m3::text_button(palette)
+        crate::controls::text_button()
             .horizontal_alignment(HorizontalAlignment::Left)
             .automation_name(format!("Show all {steps} steps"))
             .on_click(move || {
                 toggle.call((key.clone(), true));
             })
-            .content(crate::m3::label(&format!("Show all {steps}")))
+            .content(crate::controls::label(&format!("Show all {steps}")))
             .into()
     });
     StackPanel::new()
@@ -1465,7 +1426,7 @@ fn log_head(
 
 /// The Edited files card under an answer (`.edited`): up to five paths,
 /// "Show N more", and View changes (the Changes tab on Last turn).
-fn edited_card(part: &RenderedPart, all: bool, callbacks: &RowCallbacks, palette: Palette) -> View {
+fn edited_card(part: &RenderedPart, all: bool, callbacks: &RowCallbacks) -> View {
     let shown = if all {
         part.detail.len()
     } else {
@@ -1473,7 +1434,7 @@ fn edited_card(part: &RenderedPart, all: bool, callbacks: &RowCallbacks, palette
     };
     let mut rows: Vec<KeyedView> = vec![KeyedView::new(
         "caption",
-        crate::m3::secondary("Edited files").margin(Thickness::xy(0.0, tokens::spacing::XS)),
+        crate::controls::secondary("Edited files").margin(Thickness::xy(0.0, tokens::spacing::XS)),
     )];
     for path in part.detail.iter().take(shown) {
         rows.push(KeyedView::new(
@@ -1484,8 +1445,8 @@ fn edited_card(part: &RenderedPart, all: bool, callbacks: &RowCallbacks, palette
                 .column_spacing(tokens::spacing::SM)
                 .automation_name(format!("Edited {path}"))
                 .children((
-                    crate::m3::muted_icon(crate::m3::glyph::EDIT),
-                    crate::m3::body(path.clone())
+                    crate::controls::muted_icon(crate::controls::glyph::EDIT),
+                    crate::controls::body(path.clone())
                         .grid_column(1)
                         .vertical_alignment(VerticalAlignment::Center)
                         .text_trimming(TextTrimming::CharacterEllipsis)
@@ -1497,12 +1458,12 @@ fn edited_card(part: &RenderedPart, all: bool, callbacks: &RowCallbacks, palette
         let toggle = callbacks.toggle_tools.clone();
         let key = log_key("more", &part.key);
         let hidden = part.detail.len() - EDITED_FILES;
-        crate::m3::text_button(palette)
+        crate::controls::text_button()
             .automation_name(format!("Show {hidden} more edited files"))
             .on_click(move || {
                 toggle.call((key.clone(), true));
             })
-            .content(crate::m3::label(&format!("Show {hidden} more")))
+            .content(crate::controls::label(&format!("Show {hidden} more")))
             .into()
     });
     rows.push(KeyedView::new(
@@ -1512,18 +1473,18 @@ fn edited_card(part: &RenderedPart, all: bool, callbacks: &RowCallbacks, palette
             .keyed_children(crate::views::slots([
                 more,
                 Some(
-                    crate::m3::text_button(palette)
+                    crate::controls::text_button()
                         .grid_column(2)
                         .automation_name("View changes")
                         .on_click(callbacks.view_changes.clone())
-                        .content(crate::m3::label("View changes"))
+                        .content(crate::controls::label("View changes"))
                         .into(),
                 ),
             ])),
     ));
     Border::new()
-        .background(palette.composer())
-        .border_brush(palette.outline())
+        .background(ThemeBrush::CardBackground)
+        .border_brush(ThemeBrush::CardStroke)
         .border_thickness(Thickness::uniform(tokens::layout::HAIRLINE))
         .corner_radius(tokens::radius::CONTAINER)
         .padding(Thickness::xy(tokens::spacing::INSET, tokens::spacing::SM))
@@ -1542,7 +1503,6 @@ pub struct PartInput {
     pub part: Shared<RenderedPart>,
     pub expanded: bool,
     pub callbacks: Rc<RowCallbacks>,
-    pub palette: Palette,
 }
 
 /// One transcript part as its own component: a transcript render rebuilds
@@ -1568,15 +1528,15 @@ impl Component for PartView {
 
     fn view(&self, input: &PartInput, context: &mut ViewContext<Self>) -> View {
         let part = &*input.part.0;
-        let (callbacks, palette) = (&*input.callbacks, input.palette);
+        let callbacks = &*input.callbacks;
         let body = StackPanel::new()
             .spacing(tokens::spacing::XS)
             .keyed_children(crate::views::slots([
-                part_view(part, input.expanded, self.hovered, callbacks, palette),
+                part_view(part, input.expanded, self.hovered, callbacks),
                 // The assistant's files are actions; the owner's own message
                 // only names them.
                 if matches!(part.kind, PartKind::Progress | PartKind::Final) {
-                    path_actions(&part.key, &part.file_paths, callbacks, palette)
+                    path_actions(&part.key, &part.file_paths, callbacks)
                 } else {
                     None
                 },
@@ -1621,7 +1581,7 @@ pub mod clock {
     }
 
     fn minimized() -> bool {
-        crate::app_resources::window_minimized()
+        crate::app_window::window_minimized()
     }
 
     fn start() {
@@ -1665,11 +1625,10 @@ pub mod clock {
     }
 }
 
-/// A running tool row's start and the palette its caption takes.
+/// A running tool row's start and its caption.
 #[derive(Clone, PartialEq)]
 pub struct ElapsedInput {
     pub started_ms: i64,
-    pub palette: Palette,
     /// A work log's head: "Working for 3m 12s · {words}"; a step's time
     /// otherwise.
     pub words: Option<String>,
@@ -1707,7 +1666,7 @@ impl Component for Elapsed {
     fn view(&self, input: &ElapsedInput, _context: &mut ViewContext<Self>) -> View {
         let time = crate::chat::short_duration(self.now_ms - input.started_ms);
         match &input.words {
-            Some(words) => crate::m3::text(
+            Some(words) => crate::controls::text(
                 if words.is_empty() {
                     format!("Working for {time}")
                 } else {
@@ -1715,11 +1674,10 @@ impl Component for Elapsed {
                 },
                 tokens::text::BUTTON,
             )
-            .foreground(input.palette.muted())
             .vertical_alignment(VerticalAlignment::Center)
             .text_trimming(TextTrimming::CharacterEllipsis)
             .into(),
-            None => crate::m3::tool_caption(time, None).into(),
+            None => crate::controls::tool_caption(time, None).into(),
         }
     }
 }
@@ -1731,12 +1689,7 @@ const FILE_CHIPS: usize = 6;
 /// name, the full path in the tooltip; one chip per file however often it
 /// is named). A click opens it in Explorer (`ui::reveal`); Reactor 0.100.0
 /// hyperlinks only navigate URIs, and prose selection is kept.
-fn path_actions(
-    part: &str,
-    paths: &[String],
-    callbacks: &RowCallbacks,
-    palette: Palette,
-) -> Option<View> {
+fn path_actions(part: &str, paths: &[String], callbacks: &RowCallbacks) -> Option<View> {
     let mut seen = HashSet::new();
     let files: Vec<(String, String)> = paths
         .iter()
@@ -1766,8 +1719,8 @@ fn path_actions(
             && failed == &item
         {
             note = Some(
-                crate::m3::secondary(text.clone())
-                    .foreground(palette.attention())
+                crate::controls::secondary(text.clone())
+                    .foreground(ThemeBrush::SystemCritical)
                     .text_wrapping(TextWrapping::Wrap)
                     .is_text_selection_enabled(true)
                     .into(),
@@ -1778,19 +1731,22 @@ fn path_actions(
         let name = crate::attachments::file_name(resolved).to_owned();
         chips.push(KeyedView::new(
             resolved.clone(),
-            crate::m3::file_chip(palette)
+            crate::controls::file_chip()
                 .automation_name(format!("Open {resolved} in Explorer"))
                 .on_click(move || {
                     open.call((item.clone(), target.clone()));
                 })
-                .content(crate::m3::file_chip_content(file_glyph(resolved), &name))
+                .content(crate::controls::file_chip_content(
+                    file_glyph(resolved),
+                    &name,
+                ))
                 .tooltip(resolved.clone()),
         ));
     }
     if files.len() > FILE_CHIPS {
         chips.push(KeyedView::new(
             "more",
-            crate::m3::secondary(format!("+{} more", files.len() - FILE_CHIPS))
+            crate::controls::secondary(format!("+{} more", files.len() - FILE_CHIPS))
                 .vertical_alignment(VerticalAlignment::Center),
         ));
     }
@@ -1814,15 +1770,15 @@ fn path_actions(
 /// A folder's glyph for a folder, else a file's.
 fn file_glyph(path: &str) -> &'static str {
     if std::path::Path::new(path).is_dir() {
-        crate::m3::glyph::FOLDER
+        crate::controls::glyph::FOLDER
     } else {
-        crate::m3::glyph::FILE
+        crate::controls::glyph::FILE
     }
 }
 
 /// The files the owner attached to a message: chips under the bubble, at
 /// its right edge (`attachments`).
-pub fn attached_chips(files: &[String], palette: Palette) -> View {
+pub fn attached_chips(files: &[String]) -> View {
     StackPanel::new()
         .orientation(Orientation::Horizontal)
         .spacing(tokens::spacing::CHIP_GAP)
@@ -1833,10 +1789,9 @@ pub fn attached_chips(files: &[String], palette: Palette) -> View {
                 .map(|path| {
                     KeyedView::new(
                         path.clone(),
-                        crate::m3::fixed_chip(
-                            palette,
+                        crate::controls::fixed_chip(
                             false,
-                            Some(crate::m3::glyph::FILE),
+                            Some(crate::controls::glyph::FILE),
                             crate::attachments::file_name(path),
                             &format!("Attached file {path}"),
                         )

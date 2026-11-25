@@ -18,53 +18,31 @@ use sha2::{Digest, Sha256};
 const MAX_CONFIG_BYTES: usize = 128 * 1024;
 const MAX_LEGACY_BYTES: usize = 8 * 1024;
 
+/// The window's theme (`[desktop] theme`): System follows Windows between
+/// Light and Dark; High Contrast always follows Windows. The palettes of the
+/// retired Material desktop are still read (brand book §22.5): `purple` as
+/// Light, `amoled`, `neon` and `matrix` as Dark. The next preference save
+/// writes the normalized value through the usual revision-guarded flow;
+/// reading never writes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ThemeChoice {
     #[default]
     System,
+    #[serde(alias = "purple")]
     Light,
+    #[serde(alias = "amoled", alias = "neon", alias = "matrix")]
     Dark,
-    Amoled,
-    Purple,
-    Neon,
-    Matrix,
 }
 impl ThemeChoice {
-    /// Settings › Appearance, in the Themes board's order.
-    pub const ALL: [ThemeChoice; 7] = [
-        Self::System,
-        Self::Light,
-        Self::Dark,
-        Self::Amoled,
-        Self::Purple,
-        Self::Neon,
-        Self::Matrix,
-    ];
+    /// Settings › General, in order.
+    pub const ALL: [ThemeChoice; 3] = [Self::System, Self::Light, Self::Dark];
 
     pub fn label(self) -> &'static str {
         match self {
             Self::System => "System",
             Self::Light => "Light",
             Self::Dark => "Dark",
-            Self::Amoled => "Amoled",
-            Self::Purple => "Purple",
-            Self::Neon => "Neon",
-            Self::Matrix => "Matrix",
-        }
-    }
-
-    /// The theme shown: System follows Windows between Light and Dark.
-    pub fn theme(self, system_dark: bool) -> crate::theme::Theme {
-        use crate::theme::Theme;
-        match self {
-            Self::System if system_dark => Theme::Dark,
-            Self::System | Self::Light => Theme::Light,
-            Self::Dark => Theme::Dark,
-            Self::Amoled => Theme::Amoled,
-            Self::Purple => Theme::Purple,
-            Self::Neon => Theme::Neon,
-            Self::Matrix => Theme::Matrix,
         }
     }
 }

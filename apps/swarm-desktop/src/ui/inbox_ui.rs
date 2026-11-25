@@ -15,7 +15,6 @@
 use std::collections::BTreeMap;
 
 use super::*;
-use crate::theme::winui::Palette;
 use eliot_core::api::{
     OwnerDecideRequest, OwnerDecideResponse, OwnerInboxItem, OwnerInboxItemRef, OwnerInboxKind,
     OwnerInboxResponse, ProfileCommandIssue,
@@ -712,7 +711,7 @@ impl DesktopApp {
 
     /// The Inbox page (`Inbox.dc.html`): the title and Select, the group
     /// filter with counts, the selection bar, then the items by group.
-    pub(super) fn inbox_view(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
+    pub(super) fn inbox_view(&self, context: &mut ViewContext<Self>) -> View {
         let inbox = &self.inbox;
         let mut items: Vec<KeyedView> = Vec::new();
         let selecting = inbox.selecting;
@@ -722,16 +721,15 @@ impl DesktopApp {
                 page_ui::title("Inbox"),
                 vec![KeyedView::new(
                     "select",
-                    m3::chip(palette)
-                        .resource_overrides(page_ui::selected_chip(palette, selecting))
+                    controls::segment(selecting)
                         .automation_name(if selecting {
                             "Select several items (on)"
                         } else {
                             "Select several items"
                         })
                         .on_click(context.message(Message::Inbox(InboxMsg::SelectToggled)))
-                        .content(m3::chip_content(
-                            Some(m3::glyph::CHECKLIST),
+                        .content(controls::chip_content(
+                            Some(controls::glyph::CHECKLIST),
                             "Select",
                             false,
                             tokens::layout::PROJECT_CHIP_WIDTH,
@@ -744,7 +742,6 @@ impl DesktopApp {
         let mut chips: Vec<KeyedView> = vec![KeyedView::new(
             format!("all:{}:{}", inbox.filter.is_none(), inbox.total()),
             page_ui::filter_chip(
-                palette,
                 "All",
                 Some(inbox.total()),
                 inbox.filter.is_none(),
@@ -760,7 +757,6 @@ impl DesktopApp {
             chips.push(KeyedView::new(
                 format!("{}:{selected}:{count}", kind.as_str()),
                 page_ui::filter_chip(
-                    palette,
                     kind_title(kind),
                     Some(count),
                     selected,
@@ -775,15 +771,12 @@ impl DesktopApp {
             .filter(|item| inbox.filter.is_none_or(|kind| item.kind == kind))
             .collect();
         if selecting {
-            items.push(KeyedView::new(
-                "bulk",
-                self.inbox_bulk_bar(&shown, context, palette),
-            ));
+            items.push(KeyedView::new("bulk", self.inbox_bulk_bar(&shown, context)));
         }
         if let Some(result) = &inbox.bulk_result {
             items.push(KeyedView::new(
                 format!("bulk-result:{result}"),
-                m3::body(result.clone())
+                controls::body(result.clone())
                     .automation_name(format!("Result: {result}"))
                     .is_text_selection_enabled(true),
             ));
@@ -792,7 +785,6 @@ impl DesktopApp {
             items.push(KeyedView::new(
                 "error",
                 page_ui::read_failed(
-                    palette,
                     format!("The inbox could not be read: {error}"),
                     "Read again",
                     !inbox.reading,
@@ -810,7 +802,6 @@ impl DesktopApp {
             items.push(KeyedView::new(
                 format!("refusal:{at}"),
                 page_ui::read_failed(
-                    palette,
                     format!("This item changed. {text}"),
                     "Read again",
                     !inbox.reading,
@@ -856,7 +847,7 @@ impl DesktopApp {
                 .map(|item| {
                     KeyedView::new(
                         format!("item:{}@{}", item.cursor(), item.revision),
-                        self.inbox_item(item, context, palette),
+                        self.inbox_item(item, context),
                     )
                 })
                 .collect();
@@ -870,10 +861,10 @@ impl DesktopApp {
         if inbox.next.is_some() {
             items.push(KeyedView::new(
                 "more",
-                m3::text_button(palette)
+                controls::text_button()
                     .is_enabled(!inbox.reading)
                     .on_click(context.message(Message::Inbox(InboxMsg::NextPage)))
-                    .content(m3::label("Next page")),
+                    .content(controls::label("Next page")),
             ));
         }
         page_ui::page("Owner inbox", self.page_width(tokens::page::WIDTH), items)
@@ -881,12 +872,7 @@ impl DesktopApp {
 
     /// The selection bar (`.bulk`): select all, the count, Snooze and
     /// Apply recommended.
-    fn inbox_bulk_bar(
-        &self,
-        shown: &[&OwnerInboxItem],
-        context: &mut ViewContext<Self>,
-        palette: Palette,
-    ) -> View {
+    fn inbox_bulk_bar(&self, shown: &[&OwnerInboxItem], context: &mut ViewContext<Self>) -> View {
         let inbox = &self.inbox;
         let selected = shown
             .iter()
@@ -894,9 +880,10 @@ impl DesktopApp {
             .count();
         let all = selected > 0 && selected == shown.len();
         let busy = inbox.bulk_running;
-        let (fill, on) = palette.status_chip(crate::theme::StatusTone::Active);
         Border::new()
-            .background(fill)
+            .background(ThemeBrush::CardBackground)
+            .border_brush(ThemeBrush::CardStroke)
+            .border_thickness(Thickness::uniform(tokens::layout::HAIRLINE))
             .corner_radius(tokens::radius::CONTAINER)
             .min_height(tokens::height::CONTROL + tokens::spacing::MD)
             .padding(Thickness::new(
@@ -929,7 +916,7 @@ impl DesktopApp {
                                     }),
                                 )),
                         )]),
-                        m3::text(
+                        controls::text(
                             if busy {
                                 format!("Deciding {selected}…")
                             } else {
@@ -938,22 +925,21 @@ impl DesktopApp {
                             tokens::page::HEADING,
                         )
                         .grid_column(1)
-                        .foreground(on)
                         .vertical_alignment(VerticalAlignment::Center),
-                        m3::text_button(palette)
+                        controls::text_button()
                             .grid_column(2)
                             .is_enabled(selected > 0 && !busy)
                             .automation_name(format!("Snooze {selected} selected"))
                             .on_click(context.message(Message::Inbox(InboxMsg::BulkSnooze)))
-                            .content(m3::label("Snooze")),
-                        m3::filled(palette)
+                            .content(controls::label("Snooze")),
+                        controls::filled()
                             .grid_column(3)
                             .is_enabled(selected > 0 && !busy)
                             .automation_name(format!(
                                 "Apply the recommended action to {selected} selected"
                             ))
                             .on_click(context.message(Message::Inbox(InboxMsg::ApplyRecommended)))
-                            .content(m3::label("Apply recommended")),
+                            .content(controls::label("Apply recommended")),
                     )),
             )
             .into()
@@ -963,7 +949,6 @@ impl DesktopApp {
     pub(super) fn inbox_confirmation(
         &self,
         context: &mut ViewContext<Self>,
-        palette: Palette,
     ) -> Option<ContentDialog> {
         let Some(names) = &self.inbox.confirm else {
             return None;
@@ -974,19 +959,18 @@ impl DesktopApp {
             .map(|(index, name)| {
                 KeyedView::new(
                     index,
-                    m3::body(format!("• {name}")).text_wrapping(TextWrapping::Wrap),
+                    controls::body(format!("• {name}")).text_wrapping(TextWrapping::Wrap),
                 )
             })
             .collect();
         Some(super::dialog_ui::surface(
             context,
             self.dialog.epoch,
-            palette,
             "Stop these Agents?".to_owned(),
             StackPanel::new()
                 .spacing(tokens::spacing::SM)
                 .children((
-                    m3::body(
+                    controls::body(
                         "The recommended action stops them. Their worktrees, branches and records stay.",
                     )
                     .text_wrapping(TextWrapping::Wrap),
@@ -995,16 +979,16 @@ impl DesktopApp {
                         .keyed_children(lines),
                 )).into(),
             super::dialog_ui::actions(
-                m3::text_button(palette)
+                controls::text_button()
                     .element_ref(&self.dialog.close)
                     .automation_name("Cancel")
                     .on_click(context.message(Message::Inbox(InboxMsg::BulkConfirmed(false))))
-                    .content(m3::label("Cancel")).into(),
-                View::from(m3::destructive(palette)
+                    .content(controls::label("Cancel")).into(),
+                View::from(controls::destructive()
                     .element_ref(&self.dialog.primary)
                     .automation_name("Apply recommended and stop")
                     .on_click(context.message(Message::Inbox(InboxMsg::BulkConfirmed(true))))
-                    .content(m3::label("Apply recommended"))),
+                    .content(controls::label("Apply recommended"))),
             ),
             tokens::layout::DIALOG_WIDTH,
         ))
@@ -1014,12 +998,7 @@ impl DesktopApp {
     /// the reason in one line, its age, the recommended action with the
     /// other choices in its menu, Snooze; then the restore commands with
     /// Copy, a reason field, and the last outcome.
-    fn inbox_item(
-        &self,
-        item: &OwnerInboxItem,
-        context: &mut ViewContext<Self>,
-        palette: Palette,
-    ) -> View {
+    fn inbox_item(&self, item: &OwnerInboxItem, context: &mut ViewContext<Self>) -> View {
         let inbox = &self.inbox;
         let at = item.cursor();
         let auth_task = format!("{}@{}", item.subject, item.revision);
@@ -1100,37 +1079,39 @@ impl DesktopApp {
             let enabled = !busy && (choice != "abandon_reservation" || reason_ok);
             actions.push(KeyedView::new(
                 format!("main:{choice}"),
-                // The recommended action is tonal; without a recommendation
-                // the first choice is only outlined, so it never reads as
-                // Swarm's advice.
-                m3::filled(palette)
-                    .resource_overrides(if recommended == Some(choice) {
-                        palette.segment(true)
+                // The recommended action is the accent button; without a
+                // recommendation every choice is a default button, so none
+                // reads as Swarm's advice.
+                if recommended == Some(choice) {
+                    controls::filled()
+                } else {
+                    controls::outlined()
+                }
+                .is_enabled(enabled)
+                .automation_name(format!(
+                    "{label}{}: {subject}",
+                    if recommended == Some(choice) {
+                        " (recommended)"
                     } else {
-                        palette.outlined()
-                    })
-                    .is_enabled(enabled)
-                    .automation_name(format!(
-                        "{label}{}: {subject}",
-                        if recommended == Some(choice) {
-                            " (recommended)"
-                        } else {
-                            ""
-                        }
-                    ))
-                    .on_click(click)
-                    .content(m3::label(&label)),
+                        ""
+                    }
+                ))
+                .on_click(click)
+                .content(controls::label(&label)),
             ));
         }
         if let Some(commands) = &item.instructions {
             actions.push(KeyedView::new(
                 "copy",
-                m3::outlined(palette)
+                controls::outlined()
                     .automation_name(format!("Copy restore commands: {subject}"))
                     .on_click(
                         context.message(Message::Inbox(InboxMsg::CopyCommands(commands.clone()))),
                     )
-                    .content(m3::icon_label(m3::glyph::COPY, "Copy restore commands")),
+                    .content(controls::icon_label(
+                        controls::glyph::COPY,
+                        "Copy restore commands",
+                    )),
             ));
         }
         let menu_choices: Vec<&str> = others
@@ -1153,9 +1134,9 @@ impl DesktopApp {
                 .collect();
             actions.push(KeyedView::new(
                 format!("menu:{}:{busy}:{reason_ok}", menu_choices.join(",")),
-                m3::icon_button(palette)
+                controls::icon_button()
                     .automation_name(format!("Other options: {subject}"))
-                    .content(m3::icon(m3::glyph::CHEVRON_DOWN))
+                    .content(controls::icon(controls::glyph::CHEVRON_DOWN))
                     .menu(Menu::new(
                         menu,
                         crate::views::menu_keys(
@@ -1167,11 +1148,11 @@ impl DesktopApp {
         }
         actions.push(KeyedView::new(
             "snooze",
-            m3::icon_button(palette)
+            controls::icon_button()
                 .is_enabled(!busy && !item.has_unknown_outcome())
                 .automation_name(format!("Snooze: {subject}"))
                 .on_click(decide(SNOOZE, "Snooze"))
-                .content(m3::icon(m3::glyph::SNOOZE)),
+                .content(controls::icon(controls::glyph::SNOOZE)),
         ));
 
         let mut columns = vec![GridLength::STAR, GridLength::Auto, GridLength::Auto];
@@ -1196,7 +1177,7 @@ impl DesktopApp {
             0
         };
         let title: View = match agent {
-            Some(agent) => m3::text_button(palette)
+            Some(agent) => controls::text_button()
                 .horizontal_alignment(HorizontalAlignment::Left)
                 .margin(Thickness::new(-tokens::spacing::ROW, 0.0, 0.0, 0.0))
                 .min_height(0.0)
@@ -1204,11 +1185,11 @@ impl DesktopApp {
                 .automation_name(format!("Open {subject}"))
                 .on_click(context.message(Message::Inbox(InboxMsg::OpenAgent(agent.to_owned()))))
                 .content(
-                    m3::text(format!("{subject} · {kind}"), tokens::page::HEADING)
+                    controls::text(format!("{subject} · {kind}"), tokens::page::HEADING)
                         .text_trimming(TextTrimming::CharacterEllipsis),
                 )
                 .into(),
-            None => m3::text(format!("{subject} · {kind}"), tokens::page::HEADING)
+            None => controls::text(format!("{subject} · {kind}"), tokens::page::HEADING)
                 .text_trimming(TextTrimming::CharacterEllipsis)
                 .into(),
         };
@@ -1216,7 +1197,7 @@ impl DesktopApp {
             KeyedView::new("title", title),
             KeyedView::new(
                 "reason",
-                m3::secondary(reason.clone())
+                controls::secondary(reason.clone())
                     .text_trimming(TextTrimming::CharacterEllipsis)
                     .tooltip(match &item.detail {
                         Some(detail) => format!("{reason}\n{detail}"),
@@ -1227,7 +1208,7 @@ impl DesktopApp {
         if let Some(commands) = &item.instructions {
             text.push(KeyedView::new(
                 "commands",
-                m3::secondary(commands.clone())
+                controls::secondary(commands.clone())
                     .text_wrapping(TextWrapping::Wrap)
                     .is_text_selection_enabled(true)
                     .automation_name(format!("Commands to run: {subject}")),
@@ -1240,7 +1221,7 @@ impl DesktopApp {
         {
             text.push(KeyedView::new(
                 "abandon",
-                m3::field()
+                controls::field()
                     .text(abandon_reason)
                     .is_enabled(!inbox.ids.contains_key(&abandon_key))
                     .placeholder_text("Reason for releasing the reservation")
@@ -1258,14 +1239,14 @@ impl DesktopApp {
         };
         match visible_outcome {
             Some(outcome) => {
-                let line = m3::secondary(outcome.text.clone())
+                let line = controls::secondary(outcome.text.clone())
                     .text_wrapping(TextWrapping::Wrap)
                     .is_text_selection_enabled(true)
                     .automation_name(format!("Outcome: {}", outcome.text));
                 text.push(KeyedView::new(
                     "outcome",
                     if outcome.error {
-                        line.foreground(palette.attention())
+                        line.foreground(ThemeBrush::SystemCritical)
                     } else {
                         line
                     },
@@ -1274,10 +1255,10 @@ impl DesktopApp {
             None if busy && item.kind == OwnerInboxKind::HarnessAuth => {
                 text.push(KeyedView::new(
                     "outcome",
-                    m3::secondary("Requesting sign-in…"),
+                    controls::secondary("Requesting sign-in…"),
                 ));
             }
-            None if busy => text.push(KeyedView::new("outcome", m3::secondary("Deciding…"))),
+            None if busy => text.push(KeyedView::new("outcome", controls::secondary("Deciding…"))),
             None => {}
         }
         cells.push(KeyedView::new(
@@ -1303,9 +1284,9 @@ impl DesktopApp {
         let selected = inbox.selecting && inbox.selected.contains(&selection_key(item));
         Border::new()
             .background(if selected {
-                palette.steer()
+                ThemeBrush::AccentText
             } else {
-                palette.tonal()
+                ThemeBrush::CardBackground
             })
             .corner_radius(tokens::radius::CONTAINER)
             .min_height(tokens::height::CONTROL + tokens::spacing::MD)

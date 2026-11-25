@@ -199,11 +199,7 @@ impl DesktopApp {
     /// automation, the Automations / Scripts tabs, then the groups (Checks,
     /// Reactions, After work, Schedules) beside the editor of the row
     /// chosen. The project check itself stays in Settings › Projects.
-    pub(in crate::ui) fn automations_page(
-        &self,
-        context: &mut ViewContext<Self>,
-        palette: Palette,
-    ) -> View {
+    pub(in crate::ui) fn automations_page(&self, context: &mut ViewContext<Self>) -> View {
         let scripts = self.automation.scripts_tab;
         let busy = self
             .automation
@@ -226,20 +222,23 @@ impl DesktopApp {
                 vec![
                     KeyedView::new(
                         "refresh",
-                        m3::icon_button(palette)
+                        controls::icon_button()
                             .automation_name("Refresh automations")
                             .on_click(context.message(Message::Automation(
                                 AutomationMsg::AutomationRefreshRequested,
                             )))
-                            .content(m3::icon(m3::glyph::REFRESH))
+                            .content(controls::icon(controls::glyph::REFRESH))
                             .tooltip("Refresh automations"),
                     ),
                     KeyedView::new(
                         format!("new:{busy}"),
-                        m3::filled(palette)
+                        controls::filled()
                             .is_enabled(!busy)
                             .automation_name("New automation")
-                            .content(m3::icon_label(m3::glyph::NEW_TASK, "New automation"))
+                            .content(controls::icon_label(
+                                controls::glyph::NEW_TASK,
+                                "New automation",
+                            ))
                             .menu(Menu::new(
                                 new_menu,
                                 crate::views::menu_keys(context.callback(|key: String| {
@@ -260,7 +259,7 @@ impl DesktopApp {
                 let selected = scripts == tab;
                 KeyedView::new(
                     format!("{label}:{selected}"),
-                    m3::pane_tab(palette, selected)
+                    controls::pane_tab(selected)
                         .automation_name(if selected {
                             format!("{label} (shown)")
                         } else {
@@ -269,14 +268,14 @@ impl DesktopApp {
                         .on_click(context.message(Message::Automation(AutomationMsg::Rule(
                             RuleMsg::TabChosen(tab),
                         ))))
-                        .content(m3::pane_tab_label(label)),
+                        .content(controls::pane_tab_label(label)),
                 )
             })
             .collect();
         items.push(KeyedView::new(
             "tabs",
             Border::new()
-                .border_brush(palette.outline())
+                .border_brush(ThemeBrush::CardStroke)
                 .border_thickness(Thickness::new(0.0, 0.0, 0.0, tokens::layout::HAIRLINE))
                 .padding(Thickness::new(0.0, 0.0, 0.0, tokens::spacing::XS))
                 .content(
@@ -286,10 +285,7 @@ impl DesktopApp {
                 ),
         ));
         if scripts {
-            items.push(KeyedView::new(
-                "scripts",
-                self.scripts_view(context, palette),
-            ));
+            items.push(KeyedView::new("scripts", self.scripts_view(context)));
             return page_ui::page("Automations", self.page_width(tokens::page::WIDTH), items);
         }
         let cards = self.automation_cards();
@@ -317,7 +313,6 @@ impl DesktopApp {
                 Err(error) => left.push(KeyedView::new(
                     format!("error:{}", namespace.label),
                     page_ui::read_failed(
-                        palette,
                         format!(
                             "{}: not read ({})",
                             namespace.label,
@@ -344,12 +339,7 @@ impl DesktopApp {
             let rows: Vec<KeyedView> = cards
                 .iter()
                 .filter(|card| card.group == group)
-                .map(|card| {
-                    KeyedView::new(
-                        card.key.clone(),
-                        self.automation_row(card, context, palette),
-                    )
-                })
+                .map(|card| KeyedView::new(card.key.clone(), self.automation_row(card, context)))
                 .collect();
             if rows.is_empty() {
                 continue;
@@ -360,25 +350,24 @@ impl DesktopApp {
             ));
             left.push(KeyedView::new(
                 format!("rows:{}", group.title()),
-                m3::settings_card(palette, rows),
+                controls::settings_card(rows),
             ));
         }
         let mut right: Vec<KeyedView> = Vec::new();
         if let Some(form) = self.automation.form.as_ref() {
             right.push(KeyedView::new(
                 format!("queue:{:?}", form.editing),
-                self.assignment_form_view(form, context, palette),
+                self.assignment_form_view(form, context),
             ));
         } else if let Some(editor) = self.automation.editor.as_ref() {
             right.push(KeyedView::new(
                 format!("editor:{:?}:{}", editor.card, editor.toml.is_some()),
-                self.rule_editor_view(editor, context, palette),
+                self.rule_editor_view(editor, context),
             ));
         } else {
             right.push(KeyedView::new(
                 "pick",
                 page_ui::panel(
-                    palette,
                     tokens::spacing::SM,
                     vec![KeyedView::new(
                         "hint",
@@ -397,7 +386,7 @@ impl DesktopApp {
             right.push(KeyedView::new(
                 format!("note:{}", note.text),
                 if note.error {
-                    page_ui::error_line(palette, note.text.clone())
+                    page_ui::error_line(note.text.clone())
                 } else {
                     page_ui::quiet(note.text.clone())
                 },
@@ -423,7 +412,7 @@ impl DesktopApp {
                     .spacing(tokens::spacing::XS)
                     .keyed_children(crate::views::slots([
                         Some(
-                            m3::text_button(palette)
+                            controls::text_button()
                                 .horizontal_alignment(HorizontalAlignment::Left)
                                 .automation_name(format!(
                                     "Technical details of {} ({})",
@@ -433,11 +422,11 @@ impl DesktopApp {
                                 .on_click(context.message(Message::Automation(
                                     AutomationMsg::TechnicalToggled(card.key.clone()),
                                 )))
-                                .content(m3::icon_label(
+                                .content(controls::icon_label(
                                     if open {
-                                        m3::glyph::CHEVRON_DOWN
+                                        controls::glyph::CHEVRON_DOWN
                                     } else {
-                                        m3::glyph::CHEVRON_RIGHT
+                                        controls::glyph::CHEVRON_RIGHT
                                     },
                                     "Technical details",
                                 ))
@@ -445,7 +434,7 @@ impl DesktopApp {
                         ),
                         if open {
                             Some(
-                                m3::secondary(card.technical.join("\n"))
+                                controls::secondary(card.technical.join("\n"))
                                     .text_wrapping(TextWrapping::Wrap)
                                     .is_text_selection_enabled(true)
                                     .into(),
@@ -472,12 +461,7 @@ impl DesktopApp {
     /// One row (`.srow.arow`): its plain name, the trigger with the last
     /// outcome or refusal (the next run for a timer), the state pill, the
     /// switch and the menu (Run now for a timer, Edit, Remove).
-    fn automation_row(
-        &self,
-        card: &Card,
-        context: &mut ViewContext<Self>,
-        palette: Palette,
-    ) -> View {
+    fn automation_row(&self, card: &Card, context: &mut ViewContext<Self>) -> View {
         let selected = self.automation.open.as_deref() == Some(card.key.as_str())
             || self
                 .automation
@@ -521,15 +505,12 @@ impl DesktopApp {
         let toggle_error = self.automation.toggle_errors.get(&card.key);
         let mut text: Vec<KeyedView> = Vec::new();
         if let Some(reason) = card.state.reason() {
-            text.push(KeyedView::new(
-                "reason",
-                page_ui::error_line(palette, reason),
-            ));
+            text.push(KeyedView::new("reason", page_ui::error_line(reason)));
         }
         if let Some(error) = toggle_error {
             text.push(KeyedView::new(
                 "toggle",
-                page_ui::error_line(palette, format!("Not switched: {error}")),
+                page_ui::error_line(format!("Not switched: {error}")),
             ));
         }
         if let Some(run) = card
@@ -540,7 +521,7 @@ impl DesktopApp {
             text.push(KeyedView::new(
                 "run",
                 if run.error {
-                    page_ui::error_line(palette, run.text.clone())
+                    page_ui::error_line(run.text.clone())
                 } else {
                     page_ui::quiet(run.text.clone())
                 },
@@ -603,7 +584,7 @@ impl DesktopApp {
             ])
             .column_spacing(tokens::spacing::SM)
             .children((
-                m3::row(palette, false)
+                controls::row(false)
                     .height(tokens::height::CONTROL + tokens::spacing::LG)
                     .automation_name(format!("Edit {}: {line}", card.title))
                     .on_click(context.message(Message::Automation(AutomationMsg::Rule(
@@ -613,8 +594,7 @@ impl DesktopApp {
                 Border::new()
                     .grid_column(1)
                     .vertical_alignment(VerticalAlignment::Center)
-                    .content(m3::status_pill(
-                        palette,
+                    .content(controls::status_pill(
                         card.state.tone(),
                         &card.state.label(),
                         tokens::page::FLEET_NUMBER * 2.0,
@@ -623,11 +603,11 @@ impl DesktopApp {
                     .grid_column(2)
                     .vertical_alignment(VerticalAlignment::Center)
                     .content(switch),
-                m3::icon_button(palette)
+                controls::icon_button()
                     .grid_column(3)
                     .vertical_alignment(VerticalAlignment::Center)
                     .automation_name(format!("Actions for {}", card.title))
-                    .content(m3::icon(m3::glyph::MORE_VERTICAL))
+                    .content(controls::icon(controls::glyph::MORE_VERTICAL))
                     .menu(Menu::new(
                         menu,
                         crate::views::menu_keys(context.callback(|key: String| {
@@ -656,7 +636,7 @@ impl DesktopApp {
             // The ring spans the card's row (`.arow.sel`): out over the
             // card's side padding.
             Border::new()
-                .border_brush(palette.primary())
+                .border_brush(ThemeBrush::Accent)
                 .border_thickness(Thickness::uniform(2.0 * tokens::layout::HAIRLINE))
                 .corner_radius(tokens::radius::CONTAINER)
                 .margin(Thickness::xy(-tokens::spacing::MD, 0.0))
@@ -674,12 +654,7 @@ impl DesktopApp {
     /// The rule editor (`.panel.editor`): the sentence When · Only if · Do
     /// · Repeat, the last outcome and refusal, then Delete, Edit as TOML,
     /// Cancel and Save; check errors under their field.
-    fn rule_editor_view(
-        &self,
-        editor: &RuleEditor,
-        context: &mut ViewContext<Self>,
-        palette: Palette,
-    ) -> View {
+    fn rule_editor_view(&self, editor: &RuleEditor, context: &mut ViewContext<Self>) -> View {
         let title = match &editor.rule {
             Some(rule) => rule.key.1.clone(),
             None => "New rule".to_owned(),
@@ -690,14 +665,12 @@ impl DesktopApp {
             vec![KeyedView::new("head", page_ui::panel_head(&title, None))];
         let field_error = |field: EditorField| -> Option<View> {
             match &editor.field_error {
-                Some((at, error)) if *at == field => {
-                    Some(page_ui::error_line(palette, error.clone()))
-                }
+                Some((at, error)) if *at == field => Some(page_ui::error_line(error.clone())),
                 _ => None,
             }
         };
         let word = |text: &str, row: i32| -> View {
-            m3::muted(text.to_owned(), tokens::page::HEADING)
+            controls::text(text.to_owned(), tokens::page::HEADING)
                 .grid_row(row)
                 .vertical_alignment(VerticalAlignment::Center)
                 .into()
@@ -717,7 +690,7 @@ impl DesktopApp {
         } else if let Some(toml) = &editor.toml {
             parts.push(KeyedView::new(
                 "toml",
-                m3::field()
+                controls::field()
                     .text(toml.clone())
                     .accepts_return(true)
                     .text_wrapping(TextWrapping::Wrap)
@@ -742,7 +715,7 @@ impl DesktopApp {
                         .grid_column(1)
                         .keyed_children(crate::views::slots([
                             Some(
-                                m3::field()
+                                controls::field()
                                     .text(editor.id.clone())
                                     .placeholder_text("check-after-turn")
                                     .is_enabled(enabled)
@@ -778,7 +751,7 @@ impl DesktopApp {
             if sentence.when_typed() {
                 when.push(KeyedView::new(
                     "when-value",
-                    m3::field()
+                    controls::field()
                         .text(sentence.when_value.clone())
                         .placeholder_text(match sentence.when {
                             WhenKind::Event => "turn.completed",
@@ -796,7 +769,7 @@ impl DesktopApp {
             if sentence.when == WhenKind::Cron {
                 when.push(KeyedView::new(
                     "zone",
-                    m3::field()
+                    controls::field()
                         .text(sentence.zone.clone())
                         .placeholder_text("Time zone (UTC when empty)")
                         .is_enabled(enabled)
@@ -827,7 +800,7 @@ impl DesktopApp {
                     .grid_column(1)
                     .keyed_children(crate::views::slots([
                         Some(
-                            m3::field()
+                            controls::field()
                                 .text(sentence.only_if.clone())
                                 .placeholder_text("Always")
                                 .is_enabled(enabled)
@@ -862,7 +835,7 @@ impl DesktopApp {
             if let Some(text) = &sentence.text {
                 act.push(KeyedView::new(
                     "text",
-                    m3::field()
+                    controls::field()
                         .text(text.clone())
                         .placeholder_text("The text it sends")
                         .is_enabled(enabled)
@@ -875,7 +848,7 @@ impl DesktopApp {
             if sentence.more_actions > 0 {
                 act.push(KeyedView::new(
                     "more",
-                    m3::secondary(format!(
+                    controls::secondary(format!(
                         "and {} more (Edit as TOML)",
                         eliot_core::count_words(sentence.more_actions as u64, "action", "actions")
                     )),
@@ -911,7 +884,7 @@ impl DesktopApp {
                                 .into(),
                         ),
                         Some(
-                            m3::secondary(match words {
+                            controls::secondary(match words {
                                 Some(words) if !words.is_empty() => {
                                     format!("times at most ({words}), then it waits")
                                 }
@@ -923,7 +896,7 @@ impl DesktopApp {
                         field_error(EditorField::Repeat),
                     ]))
                     .into(),
-                (None, _) => m3::secondary("No limit · Edit as TOML to add one")
+                (None, _) => controls::secondary("No limit · Edit as TOML to add one")
                     .vertical_alignment(VerticalAlignment::Center)
                     .into(),
             };
@@ -987,7 +960,7 @@ impl DesktopApp {
             parts.push(KeyedView::new(
                 "note",
                 if *error {
-                    page_ui::error_line(palette, note.clone())
+                    page_ui::error_line(note.clone())
                 } else {
                     page_ui::quiet(note.clone())
                 },
@@ -998,17 +971,17 @@ impl DesktopApp {
         if editor.rule.as_ref().is_some_and(|rule| rule.file.is_some()) {
             left.push(KeyedView::new(
                 "delete",
-                m3::destructive(palette)
+                controls::destructive()
                     .is_enabled(can_edit && editor.revision.is_some())
                     .automation_name(format!("Delete {title}"))
                     .on_click(
                         context.message(Message::Automation(AutomationMsg::Rule(RuleMsg::Delete))),
                     )
-                    .content(m3::label("Delete")),
+                    .content(controls::label("Delete")),
             ));
             left.push(KeyedView::new(
                 format!("toml:{}", editor.toml.is_some()),
-                m3::text_button(palette)
+                controls::text_button()
                     .is_enabled(can_edit)
                     .automation_name(if editor.toml.is_some() {
                         "Edit as a sentence"
@@ -1018,7 +991,7 @@ impl DesktopApp {
                     .on_click(context.message(Message::Automation(AutomationMsg::Rule(
                         RuleMsg::TomlToggled,
                     ))))
-                    .content(m3::label(if editor.toml.is_some() {
+                    .content(controls::label(if editor.toml.is_some() {
                         "Edit as a sentence"
                     } else {
                         "Edit as TOML"
@@ -1035,7 +1008,7 @@ impl DesktopApp {
                 vec![
                     KeyedView::new(
                         "cancel",
-                        m3::outlined(palette)
+                        controls::outlined()
                             .is_enabled(!editor.saving)
                             .automation_name("Cancel")
                             .on_click(
@@ -1043,11 +1016,11 @@ impl DesktopApp {
                                     RuleMsg::Cancel,
                                 ))),
                             )
-                            .content(m3::label("Cancel")),
+                            .content(controls::label("Cancel")),
                     ),
                     KeyedView::new(
                         "save",
-                        m3::filled(palette)
+                        controls::filled()
                             .is_enabled(can_edit && (editor.dirty() || editor.rule.is_none()))
                             .automation_name(format!("Save {title}"))
                             .on_click(
@@ -1055,21 +1028,20 @@ impl DesktopApp {
                                     RuleMsg::Save,
                                 ))),
                             )
-                            .content(m3::label(if editor.saving { "Saving…" } else { "Save" })),
+                            .content(controls::label(if editor.saving {
+                                "Saving…"
+                            } else {
+                                "Save"
+                            })),
                     ),
                 ],
             ),
         ));
-        page_ui::panel(palette, tokens::spacing::SM, parts)
+        page_ui::panel(tokens::spacing::SM, parts)
     }
 
     /// The short form: labelled fields with a line of help each.
-    fn assignment_form_view(
-        &self,
-        form: &AssignmentForm,
-        context: &mut ViewContext<Self>,
-        palette: Palette,
-    ) -> View {
+    fn assignment_form_view(&self, form: &AssignmentForm, context: &mut ViewContext<Self>) -> View {
         let text_row = |context: &mut ViewContext<Self>,
                         field: FormField,
                         label: &str,
@@ -1079,9 +1051,9 @@ impl DesktopApp {
             KeyedView::new(
                 label.to_owned(),
                 StackPanel::new().children((
-                    m3::form_row(
+                    controls::form_row(
                         label,
-                        m3::field()
+                        controls::field()
                             .is_enabled(!form.saving)
                             .text(value)
                             .placeholder_text(hint)
@@ -1094,21 +1066,21 @@ impl DesktopApp {
                             .into(),
                         None,
                     ),
-                    m3::help(help),
+                    controls::help(help),
                 )),
             )
         };
         let mut rows: Vec<KeyedView> = vec![
             KeyedView::new(
                 "title",
-                m3::section_title(match &form.editing {
+                controls::section_title(match &form.editing {
                     Some(key) => format!("Edit {key}"),
                     None => "New automation".to_owned(),
                 }),
             ),
             KeyedView::new(
                 "about",
-                m3::secondary(
+                controls::secondary(
                     "Swarm takes the .md briefs in a folder in filename order and starts one task for each.",
                 )
                 .text_wrapping(TextWrapping::Wrap),
@@ -1140,12 +1112,12 @@ impl DesktopApp {
         rows.push(KeyedView::new(
             "workspace",
             StackPanel::new().children((
-                m3::form_row(
+                controls::form_row(
                     "Work in",
                     Grid::new()
                         .keyed_children(vec![KeyedView::new(
                             format!("{}:{workspace_index:?}", labels.join("\u{1f}")),
-                            m3::enum_width(ComboBox::new())
+                            controls::enum_width(ComboBox::new())
                                 .is_enabled(!form.saving)
                                 .items_source(labels)
                                 .selected_index(workspace_index)
@@ -1157,7 +1129,7 @@ impl DesktopApp {
                         .into(),
                     None,
                 ),
-                m3::help("The project the tasks start in."),
+                controls::help("The project the tasks start in."),
             )),
         ));
         let roles = self.assignment_roles();
@@ -1165,12 +1137,12 @@ impl DesktopApp {
         rows.push(KeyedView::new(
             "role",
             StackPanel::new().children((
-                m3::form_row(
+                controls::form_row(
                     "Start as",
                     Grid::new()
                         .keyed_children(vec![KeyedView::new(
                             format!("{}:{role_index:?}", roles.join("\u{1f}")),
-                            m3::enum_width(ComboBox::new())
+                            controls::enum_width(ComboBox::new())
                                 .is_enabled(!form.saving)
                                 .items_source(roles)
                                 .selected_index(role_index)
@@ -1182,13 +1154,15 @@ impl DesktopApp {
                         .into(),
                     None,
                 ),
-                m3::help("The kind of task. Settings › Routing picks its model for this role."),
+                controls::help(
+                    "The kind of task. Settings › Routing picks its model for this role.",
+                ),
             )),
         ));
         rows.push(KeyedView::new(
             "busy",
             StackPanel::new().children((
-                m3::form_row(
+                controls::form_row(
                     "At most at once",
                     NumberBox::new()
                         .is_enabled(!form.saving)
@@ -1206,7 +1180,7 @@ impl DesktopApp {
                         .into(),
                     None,
                 ),
-                m3::help("How many of its tasks may run at the same time."),
+                controls::help("How many of its tasks may run at the same time."),
             )),
         ));
         rows.push(text_row(
@@ -1220,15 +1194,15 @@ impl DesktopApp {
         if let Some(error) = &form.error {
             rows.push(KeyedView::new(
                 "error",
-                m3::body(error.clone())
-                    .foreground(palette.attention())
+                controls::body(error.clone())
+                    .foreground(ThemeBrush::SystemCritical)
                     .text_wrapping(TextWrapping::Wrap),
             ));
         }
         let mut buttons: Vec<KeyedView> = vec![
             KeyedView::new(
                 "save",
-                m3::filled(palette)
+                controls::filled()
                     .is_enabled(!form.saving)
                     .automation_name(if form.editing.is_some() {
                         "Save automation"
@@ -1236,7 +1210,7 @@ impl DesktopApp {
                         "Create automation"
                     })
                     .on_click(context.message(Message::Automation(AutomationMsg::FormSaved)))
-                    .content(m3::label(if form.editing.is_some() {
+                    .content(controls::label(if form.editing.is_some() {
                         "Save"
                     } else {
                         "Create"
@@ -1244,23 +1218,23 @@ impl DesktopApp {
             ),
             KeyedView::new(
                 "cancel",
-                m3::text_button(palette)
+                controls::text_button()
                     .is_enabled(!form.saving)
                     .automation_name("Cancel")
                     .on_click(context.message(Message::Automation(AutomationMsg::FormClosed)))
-                    .content(m3::label("Cancel")),
+                    .content(controls::label("Cancel")),
             ),
         ];
         if let Some(key) = &form.editing {
             buttons.push(KeyedView::new(
                 "remove",
-                m3::destructive(palette)
+                controls::destructive()
                     .is_enabled(!form.saving)
                     .automation_name(format!("Remove automation {key}"))
                     .on_click(
                         context.message(Message::Automation(AutomationMsg::Removed(key.clone()))),
                     )
-                    .content(m3::label("Remove automation")),
+                    .content(controls::label("Remove automation")),
             ));
         }
         rows.push(KeyedView::new(
@@ -1276,6 +1250,6 @@ impl DesktopApp {
                 ))
                 .keyed_children(buttons),
         ));
-        page_ui::panel(palette, tokens::spacing::SM, rows)
+        page_ui::panel(tokens::spacing::SM, rows)
     }
 }

@@ -83,9 +83,9 @@ use crate::client::{self, LaunchTarget};
 use crate::config_client;
 use crate::config_view::{self, ProfilesActions, ProfilesData, RuleNamespace};
 use crate::configure;
+use crate::controls;
 use crate::feed::{self, Delivery, Depth, Reread, Snapshot};
 use crate::live::{self, LiveStatus, Next};
-use crate::m3;
 use crate::markdown::Doc;
 use crate::monitor::{self, Monitor, MonitorSnapshot};
 use crate::monitor_view;
@@ -94,7 +94,6 @@ use crate::profiles;
 use crate::reparent;
 use crate::scripts;
 use crate::state::{BoundAction, Drafts, MutationLedger, Selection};
-use crate::theme;
 use crate::views::{self, RenderCache, RenderedItem, RowCallbacks};
 
 /// Agent rows per `agent.list` page in the navigation list.
@@ -328,9 +327,8 @@ struct DesktopApp {
     status: String,
     /// A notice for the owner above the composer, until dismissed.
     alert: Option<String>,
-    appearance: shell_ui::Appearance,
-    /// The palette the title bar was last colored in (`None`: not yet).
-    title_bar: Option<theme::winui::Palette>,
+    /// The window has its icon (set once it is shown).
+    icon_set: bool,
     dialog: dialog_ui::Focus,
     /// The `[desktop]` preferences (theme, what opens at start).
     prefs: crate::settings::Preferences,
@@ -399,9 +397,6 @@ struct DesktopApp {
     inbox: inbox_ui::InboxState,
     /// The Usage popover's holds and when the limits were read.
     usage: usage_ui::UsageState,
-    /// The main card's `elevation-1`: a real shadow on the theme's layers
-    /// (`crate::shadow`).
-    card_shadow: crate::shadow::ShadowHost,
     automation: automation_ui::AutomationState,
     /// The open project page and its reads.
     project: project_ui::ProjectState,
@@ -421,11 +416,6 @@ struct DesktopApp {
 }
 
 impl DesktopApp {
-    /// The active M3 palette (system colors under High Contrast).
-    fn palette(&self) -> theme::winui::Palette {
-        self.appearance.palette(self.prefs.theme)
-    }
-
     fn submitting(&self) -> bool {
         self.in_flight_key.is_some()
     }
@@ -886,8 +876,7 @@ impl Component for DesktopApp {
             data_dir,
             status: "Connecting to the daemon…".to_owned(),
             alert: None,
-            appearance: shell_ui::Appearance::new(),
-            title_bar: None,
+            icon_set: false,
             dialog: dialog_ui::Focus::default(),
             prefs: crate::settings::Preferences::default(),
             prefs_saving: false,
@@ -1000,7 +989,6 @@ impl Component for DesktopApp {
             monitor: monitor_ui::MonitorState::default(),
             inbox: inbox_ui::InboxState::default(),
             usage: usage_ui::UsageState::default(),
-            card_shadow: crate::shadow::ShadowHost::new(tokens::layout::CARD_RADIUS, &[]),
             automation: automation_ui::AutomationState::default(),
             project: project_ui::ProjectState::default(),
             menu: menu_ui::MenuState::default(),
@@ -1010,13 +998,7 @@ impl Component for DesktopApp {
             missing_cleanup: HashMap::new(),
             revealed: None,
         };
-        // Before the first controls exist (see `app_resources::install`).
-        if let Err(error) =
-            crate::app_resources::install(app.palette().roles(), app.appearance.animations)
-        {
-            app.status = format!("WinUI M3 resources not applied: {error}");
-        }
-        if let Err(error) = crate::motion::install() {
+        if let Err(error) = crate::elements::install() {
             app.status = error;
         }
         app.note_window_size();

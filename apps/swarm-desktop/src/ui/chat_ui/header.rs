@@ -207,12 +207,7 @@ impl DesktopApp {
     /// says (the title, project and branch, the state, the goal, the pane
     /// toggles, the "…" entries); the header draws it, and a window render
     /// that changes none of it leaves the header as it is.
-    pub(super) fn header_view(
-        &self,
-        agent: &str,
-        context: &mut ViewContext<Self>,
-        palette: Palette,
-    ) -> View {
+    pub(super) fn header_view(&self, agent: &str, context: &mut ViewContext<Self>) -> View {
         let title = self.agent_title(agent);
         let detail = self.bound_detail().ok();
         // While its detail is read, the sidebar row's state stands in, so
@@ -286,7 +281,6 @@ impl DesktopApp {
             .is_some_and(|detail| detail.active_turn.is_some() && !detail.observe_only)
             || (detail.is_none() && state == eliot_core::AgentState::Busy);
         View::component::<Header>(HeaderInput {
-            palette,
             title,
             subtitle,
             pill,
@@ -313,7 +307,6 @@ impl DesktopApp {
         title: &str,
         column: Option<f64>,
         context: &mut ViewContext<Self>,
-        palette: Palette,
     ) -> View {
         Border::new()
             .grid_row(4)
@@ -321,7 +314,7 @@ impl DesktopApp {
             .max_width(tokens::layout::READING_WIDTH)
             .horizontal_alignment(HorizontalAlignment::Center)
             .margin(Thickness::new(0.0, tokens::spacing::SM, 0.0, 0.0))
-            .background(palette.attention_container())
+            .background(ThemeBrush::SystemCriticalBackground)
             .corner_radius(tokens::radius::CONTAINER)
             .padding(Thickness::uniform(tokens::spacing::MD))
             .content(
@@ -333,17 +326,17 @@ impl DesktopApp {
                             .spacing(tokens::spacing::XS)
                             .vertical_alignment(VerticalAlignment::Center)
                             .children((
-                                m3::section_title(format!("Force stop {title}?"))
-                                    .foreground(palette.attention())
+                                controls::section_title(format!("Force stop {title}?"))
+                                    .foreground(ThemeBrush::SystemCritical)
                                     .text_trimming(TextTrimming::CharacterEllipsis),
-                                m3::text(
+                                controls::text(
                                     format!(
                                         "Ends Agent {} (run {}) at once instead of a clean stop; an active turn is cut off.",
                                         bound.agent, bound.generation
                                     ),
                                     tokens::text::CAPTION,
                                 )
-                                .foreground(palette.attention())
+                                .foreground(ThemeBrush::SystemCritical)
                                 .text_wrapping(TextWrapping::Wrap),
                             )),
                         StackPanel::new()
@@ -352,13 +345,13 @@ impl DesktopApp {
                             .spacing(tokens::spacing::SM)
                             .vertical_alignment(VerticalAlignment::Center)
                             .children((
-                                m3::destructive(palette)
+                                controls::destructive()
                                     .automation_name("Cancel force stop")
                                     .on_click(context.message(Message::Chat(
                                         ChatMsg::ForceStopAnswered(false),
                                     )))
-                                    .content(m3::label("Cancel")),
-                                m3::destructive(palette)
+                                    .content(controls::label("Cancel")),
+                                controls::destructive()
                                     .is_enabled(!self.submitting())
                                     .automation_name(format!(
                                         "Force stop {} run {}",
@@ -367,7 +360,7 @@ impl DesktopApp {
                                     .on_click(context.message(Message::Chat(
                                         ChatMsg::ForceStopAnswered(true),
                                     )))
-                                    .content(m3::label("Force stop")),
+                                    .content(controls::label("Force stop")),
                             )),
                     )),
             ).into()
@@ -392,11 +385,9 @@ fn goal_words(goal: &eliot_core::api::GoalView) -> Option<String> {
     })
 }
 
-/// The header's state pill, by the brand book's roles: working on
-/// `secondary-container` with the loader; waiting for you and a provider
-/// hold on `tertiary-container`; idle and stopped on
-/// `surface-container-high`; failed, lost and unknown on `error-container`
-/// with the error icon.
+/// The header's state pill: its mark (the loader while working, a dot while
+/// waiting or idle, the hold or error icon) and its word, in a hairline
+/// outline.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Pill {
     Working(&'static str),
@@ -418,46 +409,27 @@ impl Pill {
         }
     }
 
-    fn tone(self) -> StatusTone {
-        match self {
-            Self::Working(_) => StatusTone::Active,
-            Self::Waiting | Self::Hold => StatusTone::Attention,
-            Self::Idle | Self::Stopped => StatusTone::Ready,
-            Self::Failed(_) => StatusTone::Failed,
-        }
-    }
-
-    /// The pill: 24 DIPs, its mark and word 6 DIPs apart, 10 DIPs inside.
-    fn view(self, palette: Palette) -> View {
-        let (container, on) = palette.status_chip(self.tone());
+    /// The pill: its mark and word, a hairline around them.
+    fn view(self) -> View {
         let mark: Option<View> = match self {
-            Self::Working(word) => Some(m3::row_mark(palette, m3::RowMark::Working, word)),
-            Self::Waiting => Some(m3::row_mark(
-                palette,
-                m3::RowMark::Waiting,
+            Self::Working(word) => Some(controls::row_mark(controls::RowMark::Working, word)),
+            Self::Waiting => Some(controls::row_mark(
+                controls::RowMark::Waiting,
                 "Waiting for you",
             )),
-            Self::Idle => Some(m3::row_mark(palette, m3::RowMark::Idle, "Idle")),
-            Self::Hold => Some(m3::carrier(
-                palette,
-                |s| s.on_tertiary_container,
-                "Provider hold",
+            Self::Idle => Some(controls::row_mark(controls::RowMark::Idle, "Idle")),
+            Self::Hold => Some(controls::xs_icon(controls::glyph::HOLD)),
+            Self::Failed(_) => Some(controls::critical_icon(
+                controls::glyph::ERROR,
                 tokens::icon::CHEVRON,
-                m3::xs_icon(m3::glyph::HOLD),
-            )),
-            Self::Failed(word) => Some(m3::carrier(
-                palette,
-                |s| s.error,
-                word,
-                tokens::icon::CHEVRON,
-                m3::xs_icon(m3::glyph::ERROR),
             )),
             Self::Stopped => None,
         };
         Border::new()
             .height(tokens::height::BADGE)
-            .corner_radius(tokens::radius::BADGE)
-            .background(container)
+            .corner_radius(tokens::radius::CONTROL)
+            .border_brush(ThemeBrush::CardStroke)
+            .border_thickness(Thickness::uniform(tokens::layout::HAIRLINE))
             .padding(Thickness::xy(tokens::spacing::ROW, 0.0))
             .vertical_alignment(VerticalAlignment::Center)
             .automation_name(self.word())
@@ -468,8 +440,7 @@ impl Pill {
                     .keyed_children(crate::views::slots([
                         mark,
                         Some(
-                            m3::text(self.word(), tokens::text::LABEL)
-                                .foreground(on)
+                            controls::text(self.word(), tokens::text::LABEL)
                                 .vertical_alignment(VerticalAlignment::Center)
                                 .into(),
                         ),
@@ -483,7 +454,6 @@ impl Pill {
 /// ([`DesktopApp::header_view`]).
 #[derive(Clone, PartialEq)]
 pub(super) struct HeaderInput {
-    palette: Palette,
     title: String,
     /// "project · branch".
     subtitle: String,
@@ -499,7 +469,7 @@ pub(super) struct HeaderInput {
     /// The "…" entries; `None` while the detail is read (the button is
     /// shown, not active).
     menu: Option<Vec<MenuItem>>,
-    /// A turn runs: the wave under the header.
+    /// A turn runs: the progress bar under the header.
     running: bool,
     send: Callback<Message>,
 }
@@ -507,7 +477,7 @@ pub(super) struct HeaderInput {
 /// The header (`ConversationHeader`), as its own component: the title over
 /// project · branch, the state pill, the goal mark, the pane toggles
 /// (Changes, Agents, Details, Terminal) and "…", 52 DIPs on a hairline;
-/// under it the wave while a turn runs. Its controls go to the window.
+/// under it the progress bar while a turn runs. Its controls go to the window.
 pub(super) struct Header {
     send: Callback<Message>,
 }
@@ -531,11 +501,10 @@ impl Component for Header {
     }
 
     fn view(&self, input: &HeaderInput, context: &mut ViewContext<Self>) -> View {
-        let palette = input.palette;
         let more: View = match &input.menu {
-            Some(items) => m3::icon_button(palette)
+            Some(items) => controls::icon_button()
                 .automation_name("More task actions")
-                .content(m3::icon(m3::glyph::MORE))
+                .content(controls::icon(controls::glyph::MORE))
                 .menu(Menu::new(
                     items.clone(),
                     // Capture-free, so the callback keeps one identity
@@ -550,20 +519,20 @@ impl Component for Header {
                             })
                     })),
                 )),
-            None => m3::icon_button(palette)
+            None => controls::icon_button()
                 .is_enabled(false)
                 .automation_name("More task actions")
-                .content(m3::icon(m3::glyph::MORE))
+                .content(controls::icon(controls::glyph::MORE))
                 .into(),
         };
         let goal: Option<View> = input.goal.as_ref().map(|words| {
-            m3::status_chip_button(palette)
+            controls::status_chip_button()
                 .automation_name(format!("{words}: open Details"))
                 .on_click(
                     context.message(Message::Monitor(MonitorMsg::PanelChosen(Panel::Details))),
                 )
-                .content(m3::chip_content(
-                    Some(m3::glyph::GOAL),
+                .content(controls::chip_content(
+                    Some(controls::glyph::GOAL),
                     words,
                     false,
                     tokens::layout::PROJECT_CHIP_WIDTH,
@@ -572,7 +541,7 @@ impl Component for Header {
         });
         // The pane toggles (component 3): pressed = that tab of the right
         // pane is open; the pressed one closes the pane. Changes and
-        // "Agents N" are labelled buttons (tonal when pressed), Agents
+        // "Agents N" are labelled buttons (accent when pressed), Agents
         // without workers, Details and Terminal icon buttons.
         let toggle = |panel: Panel| -> Callback<()> {
             if input.open == panel {
@@ -588,18 +557,13 @@ impl Component for Header {
                 words.to_owned()
             }
         };
-        let labelled = |pressed: bool| {
-            if pressed {
-                m3::tonal(palette)
-            } else {
-                m3::outlined_small(palette)
-            }
-        };
+        // An open pane's toggle is the accent button.
+        let labelled = controls::segment;
         let changes: View = {
             let pressed = input.open == Panel::Changes;
             let counts: Option<View> = input
                 .changes
-                .map(|(add, del)| m3::diff_counts(add, del, pressed));
+                .map(|(add, del)| controls::diff_counts(add, del));
             labelled(pressed)
                 .automation_name(named(Panel::Changes, "Changes"))
                 .on_click(toggle(Panel::Changes))
@@ -613,7 +577,7 @@ impl Component for Header {
                         ))
                         .keyed_children(crate::views::slots([
                             Some(
-                                m3::text("Changes", tokens::text::BUTTON)
+                                controls::text("Changes", tokens::text::BUTTON)
                                     .vertical_alignment(VerticalAlignment::Center)
                                     .into(),
                             ),
@@ -624,15 +588,10 @@ impl Component for Header {
         };
         let icon_toggle = |panel: Panel, glyph: &str, words: &str| -> View {
             let pressed = input.open == panel;
-            m3::icon_button(palette)
-                .resource_overrides(palette.toggle(pressed))
+            controls::toggle_icon_button(pressed)
                 .automation_name(named(panel, words))
                 .on_click(toggle(panel))
-                .content(m3::icon(&if pressed {
-                    m3::glyph::filled(glyph)
-                } else {
-                    glyph.to_owned()
-                }))
+                .content(controls::icon(glyph))
                 .tooltip(words)
         };
         let agents: View = if input.workers > 0 {
@@ -650,21 +609,24 @@ impl Component for Header {
                             0.0,
                         ))
                         .children((
-                            m3::small_icon(m3::glyph::HUB),
-                            m3::text(words.clone(), tokens::text::BUTTON)
+                            controls::small_icon(controls::glyph::HUB),
+                            controls::text(words.clone(), tokens::text::BUTTON)
                                 .vertical_alignment(VerticalAlignment::Center),
                         )),
                 )
                 .tooltip("Agents")
         } else {
-            icon_toggle(Panel::Agents, m3::glyph::HUB, "Agents")
+            icon_toggle(Panel::Agents, controls::glyph::HUB, "Agents")
         };
-        let details = icon_toggle(Panel::Details, m3::glyph::INFO, "Details");
-        let terminal = icon_toggle(Panel::Terminal, m3::glyph::TERMINAL, "Terminal (Ctrl+J)");
+        let details = icon_toggle(Panel::Details, controls::glyph::INFO, "Details");
+        let terminal = icon_toggle(
+            Panel::Terminal,
+            controls::glyph::TERMINAL,
+            "Terminal (Ctrl+J)",
+        );
         let bar = Border::new()
             .height(tokens::height::HEADER)
-            .background(palette.surface())
-            .border_brush(palette.outline())
+            .border_brush(ThemeBrush::CardStroke)
             .border_thickness(Thickness::new(0.0, 0.0, 0.0, tokens::layout::HAIRLINE))
             .padding(Thickness::new(
                 tokens::spacing::MD,
@@ -680,11 +642,11 @@ impl Component for Header {
                         StackPanel::new()
                             .vertical_alignment(VerticalAlignment::Center)
                             .children((
-                                m3::text(input.title.clone(), tokens::text::TITLE)
+                                controls::text(input.title.clone(), tokens::text::TITLE)
                                     .automation_heading_level(AutomationHeadingLevel::Level2)
                                     .text_trimming(TextTrimming::CharacterEllipsis)
                                     .is_text_selection_enabled(true),
-                                m3::secondary(input.subtitle.clone())
+                                controls::secondary(input.subtitle.clone())
                                     .text_trimming(TextTrimming::CharacterEllipsis),
                             )),
                         StackPanel::new()
@@ -693,11 +655,11 @@ impl Component for Header {
                             .spacing(tokens::spacing::SM)
                             .vertical_alignment(VerticalAlignment::Center)
                             // Keyed by the open tab: a toggle whose pressed
-                            // state changes is a new control, so its colors
-                            // (tonal or outlined, on or off) are applied.
+                            // state changes is a new control, so its style
+                            // (accent or default, on or off) is applied.
                             .keyed_children(
                                 [
-                                    Some(KeyedView::new("pill", input.pill.view(palette))),
+                                    Some(KeyedView::new("pill", input.pill.view())),
                                     goal.map(|goal| KeyedView::new("goal", goal)),
                                     Some(KeyedView::new(
                                         format!("changes:{}", input.open == Panel::Changes),
@@ -723,11 +685,11 @@ impl Component for Header {
                             ),
                     )),
             );
-        // The wave under the header while a turn runs (`.wave-bar`).
+        // WinUI's indeterminate progress bar under the header while a turn
+        // runs.
         let wave: Option<View> = if input.running {
             Some(
                 Border::new()
-                    .height(tokens::wave::TRACK)
                     .padding(Thickness::xy(tokens::spacing::MD, 0.0))
                     .content(
                         ProgressBar::new()

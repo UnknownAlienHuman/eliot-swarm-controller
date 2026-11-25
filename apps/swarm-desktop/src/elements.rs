@@ -1,29 +1,24 @@
-//! The design's press-point ripple ("Ripple from the press point",
-//! `System.dc.html`), focus within a sidebar row, and the window's content
-//! root that `crate::flyout` finds its anchors under: WinUI calls Reactor
-//! 0.100.0 does not expose.
+//! The window's XAML elements: focus within a sidebar row, elements by
+//! automation id, and pointer presses. WinUI calls Reactor does not expose.
 //!
-//! - **Ripple.** The button template (`app_resources::templates`) grows its
-//!   `Ripple` ellipse from the ellipse's `RenderTransformOrigin` when the
-//!   press state starts. One `PointerPressed` handler on the window's XAML
-//!   root, added with `handledEventsToo` (a Button marks its own presses
-//!   handled), moves that origin to the press point inside the pressed
-//!   button before the press animation renders its first frame. The root
-//!   is the `XamlRoot.Content` of the first element that takes focus
-//!   (`FocusManager.GotFocus`): Reactor hands out no native element.
-//! - **Focus within a sidebar row.** The same `GotFocus` records the
-//!   focused element and tells the window, which finds the row holding it
-//!   (automation id [`ROW_ID_PREFIX`], [`resolve_focused_row`]) so the row
-//!   shows its "⋯" to the keyboard as to the pointer; Shift+F10 or the
-//!   context-menu key opens its menu at the row ([`focused_row_anchor`]),
-//!   and keyboard focus goes back to the row when that menu closes without
-//!   a choice ([`focus_row`]).
-//! - **Elements by automation id.** [`find`] walks the content root
+//! - **Focus within a sidebar row.** One `FocusManager.GotFocus` handler
+//!   records the focused element and tells the window, which finds the row
+//!   holding it (automation id [`ROW_ID_PREFIX`], [`resolve_focused_row`])
+//!   so the row shows its "⋯" to the keyboard as to the pointer; Shift+F10
+//!   or the context-menu key opens its menu at the row
+//!   ([`focused_row_anchor`]), and keyboard focus goes back to the row when
+//!   that menu closes without a choice ([`focus_row`]).
+//! - **The content root.** The `XamlRoot.Content` of the first element that
+//!   takes focus: Reactor hands out no native element. [`find`] walks it
 //!   breadth-first for an automation id; [`element_bottom_left`] places a
 //!   menu under an element.
+//! - **Pointer presses.** One `PointerPressed` handler on that root, added
+//!   with `handledEventsToo` (a Button marks its own presses handled),
+//!   counts presses ([`presses`], [`last_press`]) so a popover closed by a
+//!   press does not reopen from the same click.
 //!
-//! Every call fails quietly: without the root the ripple grows from the
-//! centre and nothing is found. All of it runs on the UI thread.
+//! Every call fails quietly: without the root nothing is found. All of it
+//! runs on the UI thread.
 //!
 //! Interface ids and vtable slots are those of `Microsoft.UI.Xaml.winmd`
 //! (WinUI 2.3.0) and `Microsoft.UI.winmd` (Windows App SDK 2.1.3), read
@@ -32,7 +27,7 @@
 //! asserts its slot offsets.
 #![allow(
     unsafe_code,
-    reason = "Windows pointer motion requires the native input API."
+    reason = "Window focus and element lookup require the native XAML API."
 )]
 
 use std::cell::RefCell;
@@ -44,7 +39,6 @@ use windows_core::imp::ConstBuffer;
 use windows_core::{GUID, HRESULT, HSTRING, IInspectable, IUnknown, Interface};
 use windows_reference::IReference;
 
-use crate::ui::tokens::layout;
 use crate::winrt::{
     DelegateVtbl, Getter, InspectableSlots, Raw, borrowed, delegate, delegate_vtable, get,
     runtime_class, winrt_interface,
@@ -54,12 +48,10 @@ use crate::winrt::{
 /// row's key (`agent:<id>`, `project:<key>`; `ui::sidebar_ui`).
 pub const ROW_ID_PREFIX: &str = "eliot-row:";
 
-/// The button template's ripple ellipse (`app_resources::templates`).
-const RIPPLE_NAME: &str = "Ripple";
 const BUTTON_CLASS: &str = "Microsoft.UI.Xaml.Controls.Button";
-/// How far up from the pressed element a Button is looked for.
+/// How far up from the focused element its row is looked for.
 const MAX_ANCESTORS: usize = 24;
-/// How deep under the Button its ripple is looked for.
+/// How deep under a row its button is looked for.
 const MAX_TEMPLATE_DEPTH: usize = 8;
 
 /// `Windows.Foundation.Point`.
@@ -142,31 +134,6 @@ struct XamlRootVtbl {
 }
 
 #[repr(C)]
-struct RoutedEventArgsVtbl {
-    base: InspectableSlots,
-    /// 6 `get_OriginalSource`.
-    original_source: Getter,
-}
-
-#[repr(C)]
-struct PointerRoutedEventArgsVtbl {
-    base: InspectableSlots,
-    _6_10: [usize; 5],
-    /// 11 `GetCurrentPoint(UIElement)`.
-    get_current_point: unsafe extern "system" fn(Raw, Raw, *mut Raw) -> HRESULT,
-}
-const _: () = assert!(offset_of!(PointerRoutedEventArgsVtbl, get_current_point) == 11 * SLOT);
-
-#[repr(C)]
-struct PointerPointVtbl {
-    base: InspectableSlots,
-    _6_9: [usize; 4],
-    /// 10 `get_Position`.
-    position: unsafe extern "system" fn(Raw, *mut Point) -> HRESULT,
-}
-const _: () = assert!(offset_of!(PointerPointVtbl, position) == 10 * SLOT);
-
-#[repr(C)]
 struct VisualTreeHelperStaticsVtbl {
     base: InspectableSlots,
     _6_9: [usize; 4],
@@ -241,21 +208,6 @@ winrt_interface!(
     IXamlRoot,
     XamlRootVtbl,
     GUID::from_u128(0x60cb215a_ad15_520a_8b01_4416824f0441)
-);
-winrt_interface!(
-    IRoutedEventArgs,
-    RoutedEventArgsVtbl,
-    GUID::from_u128(0x0908c407_1c7d_5de3_9c50_d971c62ec8ec)
-);
-winrt_interface!(
-    IPointerRoutedEventArgs,
-    PointerRoutedEventArgsVtbl,
-    GUID::from_u128(0x66e78a9a_1bec_5f92_b1a1_ea6334ee511c)
-);
-winrt_interface!(
-    IPointerPoint,
-    PointerPointVtbl,
-    GUID::from_u128(0x0d430ee6_252c_59a4_b2a2_d44264dc6a40)
 );
 winrt_interface!(
     IVisualTreeHelperStatics,
@@ -348,7 +300,7 @@ pub fn install() -> Result<(), String> {
         STATE.with(|state| state.borrow_mut().got_focus = Some(handler));
         Ok(())
     };
-    run().map_err(|error| format!("motion: {error} ({:#010X})", error.code().0))
+    run().map_err(|error| format!("elements: {error} ({:#010X})", error.code().0))
 }
 
 fn on_got_focus(_sender: Raw, args: Raw) {
@@ -578,17 +530,6 @@ fn children(tree: &IVisualTreeHelperStatics, of: &IInspectable) -> Vec<IInspecta
         .collect()
 }
 
-fn name(of: &IInspectable) -> Option<HSTRING> {
-    let element: IFrameworkElement = of.cast().ok()?;
-    let mut out = HSTRING::new();
-    // SAFETY: slot 33 of IFrameworkElement is get_Name; it writes one owned
-    // handle into the empty, transparent HSTRING.
-    unsafe { (element.vtable().name)(element.as_raw(), &mut out) }
-        .ok()
-        .ok()?;
-    Some(out)
-}
-
 fn automation_id(statics: &IAutomationPropertiesStatics, of: &IInspectable) -> Option<HSTRING> {
     let of = dependency(of)?;
     let mut out = HSTRING::new();
@@ -623,83 +564,10 @@ fn now_ms() -> u64 {
         .map_or(0, |since| since.as_millis() as u64)
 }
 
-/// A press anywhere in the window: count it, and grow the pressed button's
-/// ripple from the press point.
-fn on_pointer_pressed(_sender: Raw, args: Raw) {
+/// A press anywhere in the window: count it.
+fn on_pointer_pressed(_sender: Raw, _args: Raw) {
     PRESSES.fetch_add(1, Ordering::SeqCst);
     PRESSED_MS.store(now_ms(), Ordering::SeqCst);
-    let _ = (|| -> Option<()> {
-        let pointer: IPointerRoutedEventArgs = borrowed(args)?;
-        let routed: IRoutedEventArgs = pointer.cast().ok()?;
-        // SAFETY: slot 6 of IRoutedEventArgs is get_OriginalSource.
-        let source = unsafe { get(&routed, routed.vtable().original_source) }.ok()?;
-        let tree = tree()?;
-        let mut button = source;
-        let mut steps = 0;
-        while !button
-            .GetRuntimeClassName()
-            .is_ok_and(|class| class == BUTTON_CLASS)
-        {
-            steps += 1;
-            if steps > MAX_ANCESTORS {
-                return None;
-            }
-            button = parent(&tree, &button)?;
-        }
-        let ripple = find_under(&tree, &button, MAX_TEMPLATE_DEPTH, &|element| {
-            name(element).is_some_and(|name| name == RIPPLE_NAME)
-        })?;
-        // The ripple overhangs its state layer by `RIPPLE_INSET` on every
-        // side (the template's margin), so the press point inside the
-        // state layer maps onto the ellipse's own box.
-        let layer = parent(&tree, &ripple)?;
-        let layer_element: IUIElement = layer.cast().ok()?;
-        let mut point = std::ptr::null_mut();
-        // SAFETY: slot 11 of IPointerRoutedEventArgs is GetCurrentPoint.
-        unsafe {
-            (pointer.vtable().get_current_point)(
-                pointer.as_raw(),
-                layer_element.as_raw(),
-                &mut point,
-            )
-        }
-        .ok()
-        .ok()?;
-        if point.is_null() {
-            return None;
-        }
-        // SAFETY: GetCurrentPoint returned one owned PointerPoint.
-        let point: IPointerPoint = unsafe { IInspectable::from_raw(point) }.cast().ok()?;
-        let mut position = Point::default();
-        // SAFETY: slot 10 of IPointerPoint is get_Position.
-        unsafe { (point.vtable().position)(point.as_raw(), &mut position) }
-            .ok()
-            .ok()?;
-        let frame: IFrameworkElement = layer.cast().ok()?;
-        let (mut width, mut height) = (0.0, 0.0);
-        // SAFETY: slots 13 and 14 of IFrameworkElement are the actual size.
-        unsafe {
-            (frame.vtable().actual_width)(frame.as_raw(), &mut width)
-                .ok()
-                .ok()?;
-            (frame.vtable().actual_height)(frame.as_raw(), &mut height)
-                .ok()
-                .ok()?;
-        }
-        let inset = layout::RIPPLE_INSET;
-        let origin = |at: f32, size: f64| {
-            ((f64::from(at) + inset) / (size + 2.0 * inset)).clamp(0.0, 1.0) as f32
-        };
-        let origin = Point {
-            x: origin(position.x, width),
-            y: origin(position.y, height),
-        };
-        let ripple: IUIElement = ripple.cast().ok()?;
-        // SAFETY: slot 20 of IUIElement is put_RenderTransformOrigin.
-        unsafe { (ripple.vtable().put_render_transform_origin)(ripple.as_raw(), origin) }
-            .ok()
-            .ok()
-    })();
 }
 
 /// The first element under `from` (depth-first, at most `depth` levels)

@@ -14,7 +14,6 @@
 
 use super::launch_ui::Pop;
 use super::*;
-use crate::theme::winui::Palette;
 use eliot_core::api::ProviderHoldsResponse;
 
 /// The Usage popover's reads: the provider holds and when the limits were
@@ -88,7 +87,7 @@ impl DesktopApp {
     /// used of the tightest window read; `error` under 20 % left), "Usage"
     /// and its word ("Codex 62% · 1 hold"); before any reading, a neutral
     /// ring and no word. It carries the Usage popover while that is open.
-    pub(super) fn usage_row(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
+    pub(super) fn usage_row(&self, context: &mut ViewContext<Self>) -> View {
         let tightest = self
             .tightest_windows()
             .into_iter()
@@ -107,13 +106,12 @@ impl DesktopApp {
             }
             word.push_str(&eliot_core::count_words(holds as u64, "hold", "holds"));
         }
-        let low = tightest
-            .as_ref()
-            .is_some_and(|tightest| (tightest.window.remaining as f64) < crate::theme::QUOTA_LOW);
+        let low = tightest.as_ref().is_some_and(|tightest| {
+            (tightest.window.remaining as f64) < crate::controls::QUOTA_LOW
+        });
         let open = self.launch.open == Some(Pop::Quotas);
         let ring: View = match &tightest {
-            // Reactor 0.100.0 has no brush setters on the ring: its arc and
-            // track come from the row's resources (`usage_row`).
+            // WinUI's own determinate ring: its accent arc and track.
             Some(tightest) => ProgressRing::new()
                 .is_indeterminate(false)
                 .minimum(0.0)
@@ -129,7 +127,7 @@ impl DesktopApp {
                 .width(tokens::layout::ROW_RING)
                 .height(tokens::layout::ROW_RING)
                 .corner_radius(tokens::layout::ROW_RING / 2.0)
-                .border_brush(palette.outline())
+                .border_brush(ThemeBrush::CardStroke)
                 .border_thickness(Thickness::uniform(tokens::layout::USAGE_RING_STROKE))
                 .vertical_alignment(VerticalAlignment::Center)
                 .into(),
@@ -139,8 +137,7 @@ impl DesktopApp {
         } else {
             format!("Usage: {word}")
         };
-        let row = Button::new()
-            .resource_overrides(palette.usage_row(open, low))
+        let row = controls::row(open)
             .height(tokens::height::CONTROL)
             .min_height(tokens::height::CONTROL)
             .horizontal_alignment(HorizontalAlignment::Stretch)
@@ -150,7 +147,7 @@ impl DesktopApp {
                 if open { "open" } else { "show limits" }
             ))
             .on_click(context.callback(|()| Message::Launch(LaunchMsg::Toggle(Pop::Quotas))));
-        let content = m3::sidebar_row(
+        let content = controls::sidebar_row(
             View::from(Border::new().width(tokens::icon::ROW).content(ring)),
             "Usage",
             open,
@@ -160,7 +157,7 @@ impl DesktopApp {
             if word.is_empty() {
                 None
             } else {
-                Some(m3::trailing(word, open).into())
+                Some(controls::trailing(word).into())
             },
         );
         let row = self.anchored_popover(
@@ -169,7 +166,6 @@ impl DesktopApp {
             open.then_some(Pop::Quotas),
             FlyoutPlacement::RightEdgeAlignedBottom,
             context,
-            palette,
         );
         // Keyed by its colors (a button's resources apply when its
         // template does) and by whether its flyout is attached; while it
@@ -191,7 +187,7 @@ impl DesktopApp {
     /// weekly", "62% left · resets Fri 09:00", a meter), "Quota unknown"
     /// where none is reported, and its hold ("On hold until 19:27"); holds
     /// of no harness listed; then Open usage settings.
-    pub(super) fn quotas_popover(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
+    pub(super) fn quotas_popover(&self, context: &mut ViewContext<Self>) -> View {
         let now = crate::handoff::now_ms();
         let reading = self.settings.quotas_reading();
         let catalog = self
@@ -251,10 +247,10 @@ impl DesktopApp {
                     .columns([GridLength::STAR, GridLength::Auto])
                     .column_spacing(tokens::spacing::SM)
                     .children((
-                        m3::body(title.clone())
+                        controls::body(title.clone())
                             .vertical_alignment(VerticalAlignment::Center)
                             .text_trimming(TextTrimming::CharacterEllipsis),
-                        m3::muted(right.clone(), tokens::text::LABEL)
+                        controls::text(right.clone(), tokens::text::LABEL)
                             .grid_column(1)
                             .vertical_alignment(VerticalAlignment::Center),
                     )),
@@ -263,13 +259,13 @@ impl DesktopApp {
                 let remaining = window.remaining as f64;
                 parts.push(KeyedView::new(
                     format!("meter:{}", window.remaining),
-                    m3::meter(palette, remaining, remaining < crate::theme::QUOTA_LOW),
+                    controls::meter(remaining, remaining < crate::controls::QUOTA_LOW),
                 ));
             }
             if let Some(held) = &held {
                 parts.push(KeyedView::new(
                     format!("hold:{held}"),
-                    m3::secondary(held.clone()).foreground(palette.attention()),
+                    controls::secondary(held.clone()).foreground(ThemeBrush::SystemCritical),
                 ));
             }
             rows.push(KeyedView::new(
@@ -292,16 +288,16 @@ impl DesktopApp {
             let line = format!("{}: {}", hold.scope, hold_line(hold).to_lowercase());
             rows.push(KeyedView::new(
                 format!("hold:{}", hold.scope),
-                m3::secondary(line)
-                    .foreground(palette.attention())
+                controls::secondary(line)
+                    .foreground(ThemeBrush::SystemCritical)
                     .text_wrapping(TextWrapping::Wrap),
             ));
         }
         if let Some(Err(error)) = &self.usage.holds {
             rows.push(KeyedView::new(
                 format!("holds-error:{error}"),
-                m3::secondary(format!("Holds not read: {error}"))
-                    .foreground(palette.attention())
+                controls::secondary(format!("Holds not read: {error}"))
+                    .foreground(ThemeBrush::SystemCritical)
                     .text_wrapping(TextWrapping::Wrap),
             ));
         }
@@ -314,31 +310,31 @@ impl DesktopApp {
             .columns([GridLength::STAR, GridLength::Auto, GridLength::Auto])
             .column_spacing(tokens::spacing::SM)
             .children((
-                m3::text("Usage", tokens::text::SMALL_TITLE)
+                controls::text("Usage", tokens::text::SMALL_TITLE)
                     .automation_heading_level(AutomationHeadingLevel::Level2)
                     .vertical_alignment(VerticalAlignment::Center),
-                m3::muted(updated, tokens::text::LABEL)
+                controls::text(updated, tokens::text::LABEL)
                     .grid_column(1)
                     .vertical_alignment(VerticalAlignment::Center),
-                m3::icon_button(palette)
+                controls::icon_button()
                     .grid_column(2)
                     .is_enabled(!reading && !self.usage.holds_loading)
                     .automation_name("Refresh the limits")
                     .on_click(context.message(Message::Shell(ShellMsg::UsageRefresh)))
-                    .content(m3::icon(m3::glyph::REFRESH)),
+                    .content(controls::icon(controls::glyph::REFRESH)),
             ));
         let footer = Border::new()
-            .border_brush(palette.outline())
+            .border_brush(ThemeBrush::CardStroke)
             .border_thickness(Thickness::new(0.0, tokens::layout::HAIRLINE, 0.0, 0.0))
             .padding(Thickness::new(0.0, tokens::spacing::SM, 0.0, 0.0))
             .content(
-                m3::text_button(palette)
+                controls::text_button()
                     .horizontal_alignment(HorizontalAlignment::Right)
                     .automation_name("Open usage settings")
                     .on_click(context.message(Message::Shell(ShellMsg::SettingsPage(
                         settings_ui::Page::Usage,
                     ))))
-                    .content(m3::label("Open usage settings")),
+                    .content(controls::label("Open usage settings")),
             );
         Border::new()
             .width(tokens::layout::USAGE_POPOVER_WIDTH)

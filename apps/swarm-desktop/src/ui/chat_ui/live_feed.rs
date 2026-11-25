@@ -242,7 +242,6 @@ impl DesktopApp {
         &self,
         column: Option<f64>,
         context: &mut ViewContext<Self>,
-        palette: Palette,
     ) -> Option<View> {
         let detail = self.chat.detail.as_ref()?;
         let agent = self.selected_agent_id()?;
@@ -267,63 +266,51 @@ impl DesktopApp {
                             .spacing(tokens::spacing::SM)
                             .horizontal_alignment(HorizontalAlignment::Center)
                             .children((
-                                m3::muted_icon(m3::glyph::RESTART),
-                                m3::secondary(words.to_owned())
+                                controls::muted_icon(controls::glyph::RESTART),
+                                controls::secondary(words.to_owned())
                                     .vertical_alignment(VerticalAlignment::Center)
                                     .text_trimming(TextTrimming::CharacterEllipsis),
                             )),
                     )
                     .into(),
             ),
-            eliot_core::AgentState::Failed => {
-                let (container, on) = palette.status_chip(crate::theme::StatusTone::Failed);
-                Some(
-                    place
-                        .background(container)
-                        .corner_radius(tokens::radius::CONTAINER)
-                        .padding(Thickness::new(
-                            tokens::spacing::INSET,
-                            tokens::layout::STRIP_INSET,
-                            tokens::layout::STRIP_INSET,
-                            tokens::layout::STRIP_INSET,
-                        ))
-                        .content(
-                            Grid::new()
-                                .columns([GridLength::Auto, GridLength::STAR, GridLength::Auto])
-                                .column_spacing(tokens::spacing::ROW)
-                                .children((
-                                    m3::carrier(
-                                        palette,
-                                        |s| s.on_error_container,
-                                        "",
-                                        tokens::icon::ROW,
-                                        m3::icon(m3::glyph::ERROR),
-                                    ),
-                                    StackPanel::new()
-                                        .grid_column(1)
-                                        .orientation(Orientation::Horizontal)
-                                        .spacing(tokens::spacing::XS)
-                                        .vertical_alignment(VerticalAlignment::Center)
-                                        .children((
-                                            m3::text("What went wrong", tokens::text::BUTTON)
-                                                .foreground(on),
-                                            m3::body(words.to_owned())
-                                                .foreground(on)
-                                                .text_trimming(TextTrimming::CharacterEllipsis),
-                                        )),
-                                    m3::text_button(palette)
-                                        .resource_overrides(palette.error_strip_button())
-                                        .grid_column(2)
-                                        .automation_name("Details")
-                                        .on_click(context.message(Message::Monitor(
-                                            MonitorMsg::PanelChosen(Panel::Details),
-                                        )))
-                                        .content(m3::label("Details")),
-                                )),
-                        )
-                        .into(),
-                )
-            }
+            eliot_core::AgentState::Failed => Some(
+                place
+                    .background(ThemeBrush::SystemCriticalBackground)
+                    .corner_radius(tokens::radius::CONTAINER)
+                    .padding(Thickness::new(
+                        tokens::spacing::INSET,
+                        tokens::layout::STRIP_INSET,
+                        tokens::layout::STRIP_INSET,
+                        tokens::layout::STRIP_INSET,
+                    ))
+                    .content(
+                        Grid::new()
+                            .columns([GridLength::Auto, GridLength::STAR, GridLength::Auto])
+                            .column_spacing(tokens::spacing::ROW)
+                            .children((
+                                controls::critical_icon(controls::glyph::ERROR, tokens::icon::ROW),
+                                StackPanel::new()
+                                    .grid_column(1)
+                                    .orientation(Orientation::Horizontal)
+                                    .spacing(tokens::spacing::XS)
+                                    .vertical_alignment(VerticalAlignment::Center)
+                                    .children((
+                                        controls::text("What went wrong", tokens::text::BUTTON),
+                                        controls::body(words.to_owned())
+                                            .text_trimming(TextTrimming::CharacterEllipsis),
+                                    )),
+                                controls::text_button()
+                                    .grid_column(2)
+                                    .automation_name("Details")
+                                    .on_click(context.message(Message::Monitor(
+                                        MonitorMsg::PanelChosen(Panel::Details),
+                                    )))
+                                    .content(controls::label("Details")),
+                            )),
+                    )
+                    .into(),
+            ),
             _ => None,
         }
     }

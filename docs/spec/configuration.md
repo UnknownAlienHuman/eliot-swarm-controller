@@ -1553,9 +1553,11 @@ daemon (including limits and retention), automation, mail, cloud_mcp, desktop,
 accounts, proxies and owner_rules.
 Rules/scripts remain files owned by their existing APIs; settings references and
 automation policy do not create a second executor. Desktop preferences use
-`[desktop]`: `theme` (`system`, `light`, `dark`, `amoled`, `purple`, `neon`,
-`matrix`: the desktop's six palettes, `system` following Windows between
-light and dark), `window` (`width`/`height`: the normal client size in DIPs, from
+`[desktop]`: `theme` (`system`, `light` or `dark`, `system` following Windows
+between light and dark; High Contrast always follows Windows; the retired
+palettes `amoled`, `purple`, `neon` and `matrix` are still accepted, the
+desktop shows `purple` as light and the others as dark and writes the normalized
+value at its next preference save), `window` (`width`/`height`: the normal client size in DIPs, from
 640 by 480 to 32768 by 32768; optional `x`/`y`: the normal outer top-left in physical
 screen pixels, from -32768 to 32768; optional `maximized`; out of these bounds the
 settings are refused and the desktop opens at its defaults), `startup` (`new_task`, or `last_conversation` to reopen the most

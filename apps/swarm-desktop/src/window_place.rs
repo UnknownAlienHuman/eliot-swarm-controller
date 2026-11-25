@@ -250,7 +250,7 @@ fn is_winui(window: HWND) -> bool {
     let length = unsafe { GetClassNameW(window, class.as_mut_ptr(), class.len() as i32) };
     length > 0
         && String::from_utf16_lossy(&class[..length as usize])
-            == crate::app_resources::WINUI_WINDOW_CLASS
+            == crate::app_window::WINUI_WINDOW_CLASS
 }
 
 /// The outer rectangle (x, y, width, height) for a saved top-left and

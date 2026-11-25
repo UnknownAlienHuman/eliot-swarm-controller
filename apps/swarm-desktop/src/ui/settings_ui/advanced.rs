@@ -1,19 +1,11 @@
 use super::*;
 
 impl DesktopApp {
-    pub(super) fn advanced_section(
-        &self,
-        context: &mut ViewContext<Self>,
-        palette: Palette,
-    ) -> View {
+    pub(super) fn advanced_section(&self, context: &mut ViewContext<Self>) -> View {
         // The settings file, opened selected in Swarm's data folder.
         let settings_file: View = match &self.data_dir {
-            Ok(path) => self.path_link(
-                context,
-                palette,
-                &path.join("config.toml").to_string_lossy(),
-            ),
-            Err(error) => m3::body(format!("unavailable: {error}"))
+            Ok(path) => self.path_link(context, &path.join("config.toml").to_string_lossy()),
+            Err(error) => controls::body(format!("unavailable: {error}"))
                 .text_wrapping(TextWrapping::Wrap)
                 .into(),
         };
@@ -29,16 +21,16 @@ impl DesktopApp {
                     Border::new()
                         .height(tokens::height::CONTROL)
                         .automation_name(format!("{headline}, {supporting}"))
-                        .content(m3::row_content(None, &headline, &supporting, None)),
+                        .content(controls::row_content(None, &headline, &supporting, None)),
                 )
             })
             .collect();
         let history_view: Option<View> = if !open {
             None
         } else if history.is_empty() {
-            Some(m3::secondary("No settings changes recorded yet.").into())
+            Some(controls::secondary("No settings changes recorded yet.").into())
         } else {
-            Some(m3::settings_card(palette, history))
+            Some(controls::settings_card(history))
         };
         let restart = if self.settings.restart_required.is_empty() {
             "Every section applies without a restart.".to_owned()
@@ -57,35 +49,34 @@ impl DesktopApp {
         StackPanel::new()
             .spacing(tokens::spacing::MD)
             .keyed_children(crate::views::slots([
-                Some(m3::settings_card(
-                    palette,
+                Some(controls::settings_card(
                     vec![
                         KeyedView::new(
                             "data",
-                            m3::form_row(
+                            controls::form_row(
                                 "Settings file",
                                 settings_file,
                                 Some(
-                                    m3::outlined(palette)
+                                    controls::outlined()
                                         .automation_name("Reload everything")
                                         .on_click(context.message(Message::Shell(
                                             ShellMsg::RefreshRequested,
                                         )))
-                                        .content(m3::label("Reload")).into(),
+                                        .content(controls::label("Reload")).into(),
                                 ),
                             ),
                         ),
                         KeyedView::new(
                             "data-help",
-                            m3::help(
+                            controls::help(
                                 "Swarm's data folder holds it; every change goes through the daemon's checks.",
                             ),
                         ),
                         KeyedView::new(
                             "history",
-                            m3::form_row(
+                            controls::form_row(
                                 "History",
-                                m3::body(format!(
+                                controls::body(format!(
                                     "{}: who changed which section, and when.",
                                     eliot_core::count_words(
                                         self.settings.history.len() as u64,
@@ -96,7 +87,7 @@ impl DesktopApp {
                                 .text_trimming(TextTrimming::CharacterEllipsis)
                                 .into(),
                                 Some(
-                                    m3::text_button(palette)
+                                    controls::text_button()
                                         .automation_name(if open {
                                             "Hide history"
                                         } else {
@@ -105,22 +96,22 @@ impl DesktopApp {
                                         .on_click(context.message(Message::Settings(
                                             SettingsMsg::HistoryToggled,
                                         )))
-                                        .content(m3::label(if open { "Hide" } else { "Show" })).into(),
+                                        .content(controls::label(if open { "Hide" } else { "Show" })).into(),
                                 ),
                             ),
                         ),
                     ],
                 )),
                 history_view,
-                Some(m3::settings_card(palette, vec![KeyedView::new("storage", self.storage_row())])),
-                Some(m3::section_heading(
+                Some(controls::settings_card(vec![KeyedView::new("storage", self.storage_row())])),
+                Some(controls::section_heading(
                     "All settings",
                     &format!(
                         "Every section of config.toml as JSON, including daemon, mail, accounts and proxies. {restart}"
                     ),
                     None,
                 )),
-                Some(m3::field()
+                Some(controls::field()
                     .accepts_return(true)
                     .text_wrapping(TextWrapping::NoWrap)
                     .min_height(tokens::layout::SOURCE_MIN_HEIGHT)
@@ -131,7 +122,7 @@ impl DesktopApp {
                     .on_text_changed(
                         crate::views::text_edits(context.callback(|text| Message::Settings(SettingsMsg::AllDraft(text)))),
                     ).into()),
-                Some(self.save_bar(Page::Advanced, dirty, context, palette)),
+                Some(self.save_bar(Page::Advanced, dirty, context)),
             ])).into()
     }
 }

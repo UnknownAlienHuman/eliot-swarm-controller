@@ -3,7 +3,6 @@ use std::cell::RefCell;
 use super::*;
 use crate::configure::locked_words;
 use crate::picker::{effort_label, effort_name};
-use crate::shadow::ShadowHost;
 use crate::state::Drafts;
 use eliot_core::api::{HarnessModelsResponse, ModelsCatalogResponse};
 use launch_ui::Pop;
@@ -61,7 +60,6 @@ impl DesktopApp {
         &self,
         column: Option<f64>,
         context: &mut ViewContext<Self>,
-        palette: Palette,
     ) -> View {
         let agent = self.selected_agent_id();
         // Only a readback of the open Agent binds its controls; until then
@@ -104,16 +102,14 @@ impl DesktopApp {
             })
         };
         let chips: Option<View> = match (agent.as_deref(), detail) {
-            (None, _) => {
-                Some(self.composer_chips(label(tokens::layout::HOME_BAR_FIXED), context, palette))
-            }
+            (None, _) => Some(self.composer_chips(label(tokens::layout::HOME_BAR_FIXED), context)),
             (Some(_), Some(detail)) => Some(
                 StackPanel::new()
                     .orientation(Orientation::Horizontal)
                     .spacing(tokens::spacing::CHIP_GAP)
                     .keyed_children(crate::views::slots([
-                        Some(self.model_chip(detail, running, label(0.0), context, palette)),
-                        access_chip(detail, palette),
+                        Some(self.model_chip(detail, running, label(0.0), context)),
+                        access_chip(detail),
                     ]))
                     .into(),
             ),
@@ -149,7 +145,6 @@ impl DesktopApp {
                 (None, _) => Primary::Start,
             };
         View::component::<Composer>(ComposerInput {
-            palette,
             drafts: views::Shared(Rc::clone(&self.chat.drafts)),
             version: self.chat.drafts.borrow().version(),
             primed: self.fields_primed,
@@ -176,8 +171,8 @@ impl DesktopApp {
                         .spacing(tokens::spacing::XS)
                         .vertical_alignment(VerticalAlignment::Center)
                         .keyed_children(crate::views::slots([
-                            self.usage_indicator(context, palette),
-                            self.context_ring(context, palette),
+                            self.usage_indicator(context),
+                            self.context_ring(context),
                         ]))
                         .into(),
                 )
@@ -204,7 +199,6 @@ impl DesktopApp {
         running: bool,
         label_width: f64,
         context: &mut ViewContext<Self>,
-        palette: Palette,
     ) -> View {
         let full = detail.settings.next_model().unwrap_or("Default model");
         // The chip names the model as the header does ("qwen4-max · high");
@@ -227,13 +221,13 @@ impl DesktopApp {
             return Border::new()
                 .vertical_alignment(VerticalAlignment::Center)
                 .content(
-                    m3::chip(palette)
+                    controls::chip()
                         .is_enabled(false)
                         .automation_name(format!(
                             "Model and effort: {name} (change the model between turns)"
                         ))
-                        .content(m3::chip_content(
-                            Some(m3::glyph::MODEL),
+                        .content(controls::chip_content(
+                            Some(controls::glyph::MODEL),
                             &label,
                             false,
                             label_width,
@@ -243,17 +237,16 @@ impl DesktopApp {
         }
         let open = self.launch.open == Some(Pop::Effort);
         self.popover_chip(
-            m3::chip(palette)
+            controls::chip()
                 .automation_name(format!(
                     "Model and effort: {name} ({})",
                     if open { "open" } else { "change" }
                 ))
                 .on_click(context.callback(|()| Message::Launch(LaunchMsg::Toggle(Pop::Effort)))),
-            m3::chip_content(Some(m3::glyph::MODEL), &label, true, label_width),
+            controls::chip_content(Some(controls::glyph::MODEL), &label, true, label_width),
             &[Pop::Effort, Pop::Model, Pop::Manage],
             FlyoutPlacement::TopEdgeAlignedLeft,
             context,
-            palette,
         )
     }
 
@@ -319,11 +312,7 @@ impl DesktopApp {
     /// words and the model, the effort steps, then Change model… into the
     /// searchable picker. What the harness keeps is hidden and said in one
     /// plain line.
-    pub(in crate::ui) fn effort_popover(
-        &self,
-        context: &mut ViewContext<Self>,
-        palette: Palette,
-    ) -> Option<View> {
+    pub(in crate::ui) fn effort_popover(&self, context: &mut ViewContext<Self>) -> Option<View> {
         let detail = self.bound_detail().ok()?;
         let harness = crate::picker::harness_label(&detail.harness);
         let read = self.agent_catalog();
@@ -337,9 +326,9 @@ impl DesktopApp {
         let current = detail.settings.next_effort();
         let shown = self.launch.effort_highlight.as_deref().or(current);
         let header = StackPanel::new().children((
-            m3::section_title(shown.map_or("default effort", effort_label))
+            controls::section_title(shown.map_or("default effort", effort_label))
                 .automation_name(shown.map_or_else(|| "default effort".to_owned(), effort_name)),
-            m3::secondary(detail.settings.next_model_words()),
+            controls::secondary(detail.settings.next_model_words()),
         ));
         let preview = self.agent_launch_catalog(&detail.harness);
         let efforts = match preview {
@@ -357,25 +346,25 @@ impl DesktopApp {
                 StackPanel::new()
                     .spacing(tokens::spacing::XS)
                     .children((
-                        m3::secondary(format!(
+                        controls::secondary(format!(
                             "Effort levels not read: {}",
                             crate::state::plain_error(error)
                         ))
-                        .foreground(palette.attention())
+                        .foreground(ThemeBrush::SystemCritical)
                         .text_wrapping(TextWrapping::Wrap),
-                        m3::text_button(palette)
+                        controls::text_button()
                             .automation_name("Retry reading effort levels")
                             .on_click(
                                 context.message(Message::Configure(ConfigureMsg::CatalogRetry)),
                             )
-                            .content(m3::label("Retry")),
+                            .content(controls::label("Retry")),
                     ))
                     .into(),
             ),
             _ if effort_locked || (!ready && efforts.is_empty()) => None,
             _ => {
                 if efforts.is_empty() {
-                    Some(m3::secondary("This model has no effort levels to choose.").into())
+                    Some(controls::secondary("This model has no effort levels to choose.").into())
                 } else {
                     let segments = efforts
                         .iter()
@@ -383,7 +372,7 @@ impl DesktopApp {
                             let selected = shown == Some(effort.as_str());
                             KeyedView::new(
                                 format!("effort:{effort}:{selected}"),
-                                m3::segment(palette, selected)
+                                controls::segment(selected)
                                     .is_enabled(enabled)
                                     .automation_name(format!(
                                         "Effort {}{}",
@@ -397,11 +386,11 @@ impl DesktopApp {
                                     .on_click(context.message(Message::Launch(
                                         LaunchMsg::EffortChosen(effort.clone()),
                                     )))
-                                    .content(m3::segment_label(effort_label(effort))),
+                                    .content(controls::segment_label(effort_label(effort))),
                             )
                         })
                         .collect();
-                    Some(m3::segmented(palette, segments))
+                    Some(controls::segmented(segments))
                 }
             }
         };
@@ -419,18 +408,18 @@ impl DesktopApp {
                     StackPanel::new()
                         .spacing(tokens::spacing::XS)
                         .children((
-                            m3::divider(palette),
-                            m3::row(palette, false)
+                            controls::divider(),
+                            controls::row(false)
                                 .is_enabled(!self.submitting())
                                 .automation_name("Change model")
                                 .on_click(
                                     context.message(Message::Launch(LaunchMsg::Toggle(Pop::Model))),
                                 )
-                                .content(m3::row_content(
-                                    Some(m3::glyph::MODEL),
+                                .content(controls::row_content(
+                                    Some(controls::glyph::MODEL),
                                     "Change model…",
                                     "",
-                                    m3::icon(m3::glyph::CHEVRON_RIGHT),
+                                    controls::icon(controls::glyph::CHEVRON_RIGHT),
                                 )),
                         ))
                         .into(),
@@ -441,7 +430,7 @@ impl DesktopApp {
         let hints: Option<View> = if effort_locked || !ready || efforts.is_empty() {
             None
         } else {
-            Some(m3::secondary("←→ effort   Enter apply   Esc close").into())
+            Some(controls::secondary("←→ effort   Enter apply   Esc close").into())
         };
         Some(
             StackPanel::new()
@@ -455,7 +444,11 @@ impl DesktopApp {
                     if note.is_empty() {
                         None
                     } else {
-                        Some(m3::secondary(note).text_wrapping(TextWrapping::Wrap).into())
+                        Some(
+                            controls::secondary(note)
+                                .text_wrapping(TextWrapping::Wrap)
+                                .into(),
+                        )
                     },
                     hints,
                     change_model,
@@ -466,11 +459,7 @@ impl DesktopApp {
 
     /// Codex's usage popover over the composer: where the usage comes from,
     /// the tightest limits with when each refreshes, and Manage usage.
-    pub(in crate::ui) fn usage_popover(
-        &self,
-        context: &mut ViewContext<Self>,
-        palette: Palette,
-    ) -> Option<View> {
+    pub(in crate::ui) fn usage_popover(&self, context: &mut ViewContext<Self>) -> Option<View> {
         let harness = self.composer_harness()?;
         let Some(Ok(reply)) = self.settings.quotas.get(&harness) else {
             return None;
@@ -503,10 +492,10 @@ impl DesktopApp {
                         .automation_name(format!("{name}: {left}, {resets}"))
                         .children((
                             StackPanel::new().children((
-                                m3::body(name).text_trimming(TextTrimming::CharacterEllipsis),
-                                m3::secondary(resets),
+                                controls::body(name).text_trimming(TextTrimming::CharacterEllipsis),
+                                controls::secondary(resets),
                             )),
-                            m3::body(left)
+                            controls::body(left)
                                 .grid_column(1)
                                 .vertical_alignment(VerticalAlignment::Top),
                         )),
@@ -527,20 +516,20 @@ impl DesktopApp {
                             0.0,
                         ))
                         .children((
-                            m3::secondary(source).text_wrapping(TextWrapping::Wrap),
+                            controls::secondary(source).text_wrapping(TextWrapping::Wrap),
                             StackPanel::new().keyed_children(rows),
                         )),
-                    m3::divider(palette),
-                    m3::row(palette, false)
+                    controls::divider(),
+                    controls::row(false)
                         .automation_name("Manage usage")
                         .on_click(context.message(Message::Shell(ShellMsg::SettingsPage(
                             settings_ui::Page::Usage,
                         ))))
-                        .content(m3::row_content(
+                        .content(controls::row_content(
                             None,
                             "Manage usage",
                             "",
-                            m3::icon(m3::glyph::CHEVRON_RIGHT),
+                            controls::icon(controls::glyph::CHEVRON_RIGHT),
                         )),
                 ))
                 .into(),
@@ -591,7 +580,7 @@ impl DesktopApp {
     /// real reading under the threshold on the account the task runs on; a
     /// neutral outline ring when that is not known or another provider's
     /// limits apply. Nothing when the harness reports no quota.
-    fn usage_indicator(&self, context: &mut ViewContext<Self>, palette: Palette) -> Option<View> {
+    fn usage_indicator(&self, context: &mut ViewContext<Self>) -> Option<View> {
         let harness = self.composer_harness()?;
         let Some(Ok(reply)) = self.settings.quotas.get(&harness) else {
             return None;
@@ -618,8 +607,7 @@ impl DesktopApp {
             ),
         };
         let ring: View = if applies {
-            // Reactor 0.100.0 has no brush setters on the ring: its arc and
-            // track come from this button's resources (`usage_ring`).
+            // WinUI's own determinate ring: its accent arc and track.
             ProgressRing::new()
                 .is_indeterminate(false)
                 .minimum(0.0)
@@ -635,14 +623,16 @@ impl DesktopApp {
                 .width(tokens::layout::USAGE_RING)
                 .height(tokens::layout::USAGE_RING)
                 .corner_radius(tokens::layout::USAGE_RING / 2.0)
-                .border_brush(palette.outline())
+                .border_brush(ThemeBrush::CardStroke)
                 .border_thickness(Thickness::uniform(tokens::layout::USAGE_RING_STROKE))
                 .horizontal_alignment(HorizontalAlignment::Center)
                 .vertical_alignment(VerticalAlignment::Center)
                 .into()
         };
         let button = Button::new()
-            .resource_overrides(palette.usage_ring(if applies { remaining } else { 100.0 }))
+            .padding(Thickness::uniform(
+                (tokens::height::CONTROL - tokens::layout::USAGE_RING) / 2.0,
+            ))
             .style(ButtonStyle::Subtle)
             .width(tokens::height::CONTROL)
             .height(tokens::height::CONTROL)
@@ -659,21 +649,18 @@ impl DesktopApp {
                 Some(Pop::Usage),
                 FlyoutPlacement::TopEdgeAlignedRight,
                 context,
-                palette,
             )
         } else {
             button.content(ring).tooltip(note)
         };
-        // Keyed by whether the reading applies (the ring's colors come from
-        // the button's resources, read when its template is applied) and
-        // by whether its flyout is open (a tooltip and a flyout do not
-        // share a button).
+        // Keyed by whether the reading applies and by whether its flyout is
+        // open (a tooltip and a flyout do not share a button).
         Some(
             Grid::new()
                 .keyed_children(vec![KeyedView::new(
                     format!(
                         "usage:{applies}:{}:{open}",
-                        remaining < crate::theme::QUOTA_LOW
+                        remaining < crate::controls::QUOTA_LOW
                     ),
                     button,
                 )])
@@ -685,7 +672,7 @@ impl DesktopApp {
     /// session's context is, as the harness reports it ("Context 34%",
     /// used and window in its tooltip); a click opens Details. Nothing
     /// when the harness reports no context fill.
-    fn context_ring(&self, context: &mut ViewContext<Self>, palette: Palette) -> Option<View> {
+    fn context_ring(&self, context: &mut ViewContext<Self>) -> Option<View> {
         let (used, window) = self.bound_detail().ok().and_then(|detail| detail.context)?;
         let share = (used as f64 / window as f64 * 100.0).clamp(0.0, 100.0);
         let words = format!(
@@ -696,7 +683,9 @@ impl DesktopApp {
         );
         Some(
             Button::new()
-                .resource_overrides(palette.context_ring())
+                .padding(Thickness::uniform(
+                    (tokens::height::CONTROL - tokens::layout::USAGE_RING) / 2.0,
+                ))
                 .style(ButtonStyle::Subtle)
                 .width(tokens::height::CONTROL)
                 .height(tokens::height::CONTROL)
@@ -723,17 +712,16 @@ impl DesktopApp {
 
 /// The open Agent's access, read only (`.chip.plain`): fixed for the
 /// Agent; changing it is a hand-off. None when the launch named no level.
-fn access_chip(detail: &UiDetail, palette: Palette) -> Option<View> {
+fn access_chip(detail: &UiDetail) -> Option<View> {
     let access = detail.settings.access.as_deref().and_then(|wire| {
         crate::settings::Access::ALL
             .into_iter()
             .find(|access| access.wire() == wire)
     })?;
     Some(
-        m3::fixed_chip(
-            palette,
+        controls::fixed_chip(
             access == crate::settings::Access::Full,
-            Some(m3::glyph::SHIELD),
+            Some(controls::glyph::SHIELD),
             access.label(),
             &format!("Access: {} (fixed for this Agent)", access.label()),
         )
@@ -814,7 +802,6 @@ pub(in crate::ui) enum Primary {
 /// the next and a render for anything else leaves the composer as it is.
 #[derive(Clone, PartialEq)]
 pub(in crate::ui) struct ComposerInput {
-    palette: Palette,
     /// The open Agent (`None`: the new task).
     agent: Option<String>,
     drafts: views::Shared<RefCell<Drafts>>,
@@ -854,10 +841,6 @@ pub(in crate::ui) struct ComposerInput {
 /// unresolved submission) and every control go to the window.
 pub(in crate::ui) struct Composer {
     input: ComposerInput,
-    /// The card's `elevation-1` and the main action's night glow: real
-    /// shadows on the theme's layers.
-    card_shadow: ShadowHost,
-    glow: ShadowHost,
 }
 
 impl Composer {
@@ -893,19 +876,11 @@ impl Component for Composer {
     fn create(input: &ComposerInput, _context: &ComponentContext<Self>) -> Self {
         Self {
             input: input.clone(),
-            card_shadow: ShadowHost::new(
-                tokens::radius::COMPOSER,
-                m3::elevation_layers(input.palette),
-            ),
-            glow: ShadowHost::new(tokens::radius::FAB, m3::glow_layers(input.palette)),
         }
     }
 
     fn input_changed(&mut self, input: &ComposerInput, _context: &ComponentContext<Self>) {
         self.input = input.clone();
-        self.card_shadow
-            .set_layers(m3::elevation_layers(input.palette));
-        self.glow.set_layers(m3::glow_layers(input.palette));
     }
 
     fn update(&mut self, message: Message, _context: &ComponentContext<Self>) {
@@ -918,7 +893,6 @@ impl Component for Composer {
     }
 
     fn view(&self, input: &ComposerInput, context: &mut ViewContext<Self>) -> View {
-        let palette = input.palette;
         let text = input
             .drafts
             .0
@@ -956,10 +930,10 @@ impl Component for Composer {
             .spacing(tokens::spacing::CHIP_GAP)
             .keyed_children(crate::views::slots([
                 Some(
-                    m3::icon_button(palette)
+                    controls::icon_button()
                         .automation_name("Attach files")
                         .on_click(context.message(Message::Launch(LaunchMsg::AttachRequested)))
-                        .content(m3::icon(m3::glyph::NEW_TASK))
+                        .content(controls::icon(controls::glyph::NEW_TASK))
                         .tooltip("Attach files"),
                 ),
                 input.chips.clone(),
@@ -973,7 +947,7 @@ impl Component for Composer {
                     .content(chips),
                 Border::new()
                     .grid_column(1)
-                    .content(composer_actions(input, blank, &self.glow, context)),
+                    .content(composer_actions(input, blank, context)),
             ));
         // Home (`Main.dc.html`): the field first, then one bar (+, the
         // project, place, model and access chips, Start task); a folder
@@ -987,7 +961,7 @@ impl Component for Composer {
         if !input.attached.is_empty() {
             rows.push(KeyedView::new(
                 format!("attached:{}", input.attached.len()),
-                attachment_chips(&input.attached, context, palette),
+                attachment_chips(&input.attached, context),
             ));
         }
         rows.push(KeyedView::new("field", field));
@@ -1002,9 +976,7 @@ impl Component for Composer {
             } else {
                 Thickness::new(0.0, tokens::spacing::INSET, 0.0, tokens::spacing::LG)
             })
-            .content(m3::composer_card(
-                palette,
-                &self.card_shadow,
+            .content(controls::composer_card(
                 Grid::new(),
                 StackPanel::new()
                     .spacing(tokens::spacing::SM)
@@ -1015,44 +987,25 @@ impl Component for Composer {
 }
 
 /// The composer's main action (`ComposerAction`), as in Codex: Send;
-/// while a turn runs, Stop turn (`error`, it interrupts that turn) with an
-/// empty field and Steer (`tertiary`) with text; Resume
-/// (`secondary-container`) for a stopped Agent, with the message when
-/// there is one. An unresolved submission shows Retry instead,
+/// while a turn runs, Stop turn (it interrupts that turn) with an empty
+/// field and Steer with text; Resume for a stopped Agent, with the message
+/// when there is one. An unresolved submission shows Retry instead,
 /// resubmitting its saved identity. Each is bound by the window from the
 /// detail on screen. Beside it, 2 DIPs apart, the ▾ with Add as a note.
 fn composer_actions(
     input: &ComposerInput,
     draft_blank: bool,
-    glow: &ShadowHost,
     context: &mut ViewContext<Composer>,
 ) -> View {
-    let (palette, enabled) = (input.palette, input.enabled);
-    // The 40-DIP square action glows in the night themes while it can be
-    // pressed (Send, Stop, Steer; not Resume or a disabled action).
-    let glows = match &input.primary {
-        Primary::Turn {
-            running: Some(_), ..
-        } => enabled,
-        Primary::Turn {
-            running: None,
-            held,
-            ..
-        } => enabled && !draft_blank && !held,
-        Primary::Start => enabled && !draft_blank,
-        Primary::Retry(_)
-        | Primary::Resume(..)
-        | Primary::ReadingResume
-        | Primary::ReadingRunning => false,
-    };
+    let enabled = input.enabled;
     let primary: View = match &input.primary {
-        Primary::Retry(agent) => m3::filled(palette)
+        Primary::Retry(agent) => controls::filled()
             .is_enabled(enabled)
             .automation_name("Retry (Enter)")
             .on_click(context.message(Message::Chat(ChatMsg::RetryPending(agent.clone()))))
-            .content(m3::label("Retry"))
+            .content(controls::label("Retry"))
             .tooltip("Retry with the same id"),
-        Primary::Resume(agent, generation) => m3::resume_button(palette)
+        Primary::Resume(agent, generation) => controls::resume_button()
             .is_enabled(enabled)
             .automation_name(if draft_blank {
                 "Resume (Enter)"
@@ -1065,44 +1018,44 @@ fn composer_actions(
                     generation: *generation,
                 },
             ))))
-            .content(m3::icon(m3::glyph::RESUME))
+            .content(controls::icon(controls::glyph::RESUME))
             .tooltip(if draft_blank {
                 "Resume"
             } else {
                 "Resume with this message"
             }),
-        Primary::ReadingResume => m3::resume_button(palette)
+        Primary::ReadingResume => controls::resume_button()
             .is_enabled(false)
             .automation_name("Resume")
-            .content(m3::icon(m3::glyph::RESUME))
+            .content(controls::icon(controls::glyph::RESUME))
             .into(),
-        Primary::ReadingRunning => m3::stop_button(palette)
+        Primary::ReadingRunning => controls::stop_button()
             .is_enabled(false)
             .automation_name("Stop turn")
-            .content(m3::stop_mark(palette))
+            .content(controls::stop_mark())
             .into(),
         Primary::Turn {
             agent,
             running,
             held,
         } => match running {
-            Some(bound) if draft_blank => m3::stop_button(palette)
+            Some(bound) if draft_blank => controls::stop_button()
                 .is_enabled(enabled)
                 .automation_name("Stop turn")
                 .on_click(
                     context.message(Message::Chat(ChatMsg::InterruptRequested(bound.clone()))),
                 )
-                .content(m3::stop_mark(palette))
+                .content(controls::stop_mark())
                 .tooltip("Stop turn"),
-            Some(bound) => m3::steer_button(palette)
+            Some(bound) => controls::steer_button()
                 .is_enabled(enabled)
                 .automation_name("Steer the running turn (Enter)")
                 .on_click(context.message(Message::Chat(ChatMsg::DraftRequested(
                     DraftAction::Steer(bound.clone()),
                 ))))
-                .content(m3::icon(m3::glyph::STEER))
+                .content(controls::icon(controls::glyph::STEER))
                 .tooltip("Steer"),
-            None => m3::send_button(palette)
+            None => controls::send_button()
                 .is_enabled(enabled && !draft_blank && !held)
                 .automation_name(if *held {
                     "Send: closed during the provider hold"
@@ -1114,21 +1067,21 @@ fn composer_actions(
                         agent: agent.clone(),
                     },
                 ))))
-                .content(m3::send_icon())
+                .content(controls::send_icon())
                 .tooltip(if *held {
                     "Closed during the provider hold"
                 } else {
                     "Send"
                 }),
         },
-        Primary::Start => start_split(palette, enabled, draft_blank, context),
+        Primary::Start => start_split(enabled, draft_blank, context),
     };
     // The hint before the ring and the action, while Enter steers.
     let hint: Option<View> = match &input.primary {
         Primary::Turn {
             running: Some(_), ..
         } if input.hint && !draft_blank => Some(
-            m3::secondary("Enter to steer")
+            controls::secondary("Enter to steer")
                 .vertical_alignment(VerticalAlignment::Center)
                 .into(),
         ),
@@ -1145,21 +1098,13 @@ fn composer_actions(
             } else {
                 MenuItem::disabled(NOTE_LABEL, NOTE_LABEL)
             };
-            let overrides = match primary {
-                Primary::Turn {
-                    running: Some(_), ..
-                } if draft_blank => palette.stop_fab(),
-                Primary::Turn {
-                    running: Some(_), ..
-                } => palette.steer_fab(),
-                Primary::Resume(..) | Primary::ReadingResume => palette.resume_fab(),
-                _ => palette.filled(),
-            };
+            // The ▾ takes its action's style: accent beside Send.
+            let accent = matches!(primary, Primary::Turn { running: None, .. });
             Some(
-                m3::send_menu_button(overrides)
+                controls::send_menu_button(accent)
                     .is_enabled(ready)
                     .automation_name("More send options: Add as a note")
-                    .content(m3::small_icon(m3::glyph::CHEVRON_DOWN))
+                    .content(controls::small_icon(controls::glyph::CHEVRON_DOWN))
                     .menu(Menu::new(
                         vec![item],
                         // Capture-free: one identity across renders.
@@ -1174,11 +1119,8 @@ fn composer_actions(
             )
         }
     };
-    // The glow's host shares the action's cell, under it; the action keeps
-    // its key whether it glows or not.
-    // The action and its menu are keyed by their kind: WinUI reads a
-    // button's colors only when its template is applied, so a Send turned
-    // Stop would keep Send's colors.
+    // The action is keyed by its kind: a Send turned Stop is a new button
+    // with its own style and name.
     let kind = match &input.primary {
         Primary::Retry(_) => "retry",
         Primary::Resume(..) | Primary::ReadingResume => "resume",
@@ -1191,11 +1133,7 @@ fn composer_actions(
         } => "steer",
         Primary::Turn { .. } | Primary::Start => "send",
     };
-    let mut action = Vec::new();
-    if glows {
-        action.push(KeyedView::new("glow", glow.view()));
-    }
-    action.push(KeyedView::new(format!("action:{kind}"), primary));
+    let action = vec![KeyedView::new(format!("action:{kind}"), primary)];
     StackPanel::new()
         .orientation(Orientation::Horizontal)
         .spacing(tokens::spacing::ROW)
@@ -1230,18 +1168,14 @@ const NOTE_LABEL: &str = "Add as a note";
 
 /// Files attached in the composer: one outlined chip each (file glyph,
 /// name, the full path in its tooltip); a click removes it.
-fn attachment_chips(
-    files: &[String],
-    context: &mut ViewContext<Composer>,
-    palette: Palette,
-) -> View {
+fn attachment_chips(files: &[String], context: &mut ViewContext<Composer>) -> View {
     let chips: Vec<KeyedView> = files
         .iter()
         .map(|path| {
             let name = crate::attachments::file_name(path);
             KeyedView::new(
                 path.clone(),
-                m3::chip(palette)
+                controls::chip()
                     .automation_name(format!("Remove attached file {name}"))
                     .on_click(
                         context
@@ -1252,13 +1186,13 @@ fn attachment_chips(
                             .orientation(Orientation::Horizontal)
                             .spacing(tokens::spacing::CHIP_GAP)
                             .children((
-                                m3::chip_content(
-                                    Some(m3::glyph::FILE),
+                                controls::chip_content(
+                                    Some(controls::glyph::FILE),
                                     name,
                                     false,
                                     tokens::layout::PROJECT_CHIP_WIDTH,
                                 ),
-                                m3::small_icon(m3::glyph::CLOSE),
+                                controls::small_icon(controls::glyph::CLOSE),
                             )),
                     )
                     .tooltip(path.clone()),
@@ -1277,12 +1211,7 @@ fn attachment_chips(
 /// DIPs after it, its 34-DIP menu: Queue it (the task as a queued intent)
 /// and Attach an existing session…, which the desktop does not have yet
 /// (disabled, the reason in its label).
-fn start_split(
-    palette: Palette,
-    enabled: bool,
-    draft_blank: bool,
-    context: &mut ViewContext<Composer>,
-) -> View {
+fn start_split(enabled: bool, draft_blank: bool, context: &mut ViewContext<Composer>) -> View {
     use super::menu_ui::{Action, Entry};
     let ready = enabled && !draft_blank;
     let items = vec![
@@ -1301,7 +1230,7 @@ fn start_split(
         .spacing(tokens::spacing::ROW_GAP)
         .vertical_alignment(VerticalAlignment::Center)
         .children((
-            m3::filled(palette)
+            controls::filled()
                 .is_enabled(ready)
                 .automation_name("Start task (Enter)")
                 .on_click(context.message(Message::Launch(LaunchMsg::LaunchRequested)))
@@ -1316,17 +1245,17 @@ fn start_split(
                             0.0,
                         ))
                         .children((
-                            m3::icon(m3::glyph::ARROW_UP),
-                            m3::text("Start task", tokens::text::EMPHASIZED)
+                            controls::icon(controls::glyph::ARROW_UP),
+                            controls::text("Start task", tokens::text::EMPHASIZED)
                                 .vertical_alignment(VerticalAlignment::Center),
                         )),
                 ),
-            m3::icon_button(palette)
-                .resource_overrides(palette.filled())
+            controls::icon_button()
+                .style(ButtonStyle::Accent)
                 .width(tokens::layout::SPLIT_MENU)
                 .is_enabled(ready)
                 .automation_name("More start options")
-                .content(m3::icon(m3::glyph::CHEVRON_DOWN))
+                .content(controls::icon(controls::glyph::CHEVRON_DOWN))
                 .menu(Menu::new(
                     items,
                     // Capture-free: one identity across renders.

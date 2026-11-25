@@ -6,7 +6,6 @@
 //! not there gets a plain sentence under its row instead.
 
 use super::*;
-use crate::theme::winui::Palette;
 
 /// What Explorer is asked to show, as Explorer reads paths.
 #[derive(Debug, PartialEq, Eq)]
@@ -196,16 +195,10 @@ const TOOLTIP: &str = "Open in Explorer";
 /// empty) and the open glyph at the end; hover and press states and
 /// Enter/Space come from the row button, and the tooltip says what a click
 /// does.
-pub(super) fn path_row(
-    palette: Palette,
-    title: &str,
-    note: &str,
-    path: &str,
-    open: Callback<()>,
-) -> View {
+pub(super) fn path_row(title: &str, note: &str, path: &str, open: Callback<()>) -> View {
     let shown = nav::display_path(path);
     let note = if note.is_empty() { &shown } else { note };
-    m3::row(palette, false)
+    controls::row(false)
         .height(tokens::height::TWO_LINE_ROW)
         .min_height(tokens::height::TWO_LINE_ROW)
         .automation_name(format!("Open {title} in Explorer: {shown}"))
@@ -218,15 +211,15 @@ pub(super) fn path_row(
                     StackPanel::new()
                         .vertical_alignment(VerticalAlignment::Center)
                         .children((
-                            m3::body(title.to_owned())
+                            controls::body(title.to_owned())
                                 .text_trimming(TextTrimming::CharacterEllipsis),
-                            m3::secondary(note.to_owned())
+                            controls::secondary(note.to_owned())
                                 .text_trimming(TextTrimming::CharacterEllipsis),
                         )),
                     Border::new()
                         .grid_column(1)
                         .vertical_alignment(VerticalAlignment::Center)
-                        .content(m3::icon(m3::glyph::OPEN_FOLDER)),
+                        .content(controls::icon(controls::glyph::OPEN_FOLDER)),
                 )),
         )
         .tooltip(TOOLTIP)
@@ -234,8 +227,8 @@ pub(super) fn path_row(
 
 /// A list item about a path whose lines wrap (a cleanup item): the whole
 /// item opens the path, as [`path_row`] does, at the height of its lines.
-pub(super) fn path_item(palette: Palette, name: &str, content: View, open: Callback<()>) -> View {
-    m3::row(palette, false)
+pub(super) fn path_item(name: &str, content: View, open: Callback<()>) -> View {
+    controls::row(false)
         .automation_name(format!("Open {name} in Explorer"))
         .on_click(open)
         .content(
@@ -247,18 +240,18 @@ pub(super) fn path_item(palette: Palette, name: &str, content: View, open: Callb
                     Border::new()
                         .grid_column(1)
                         .vertical_alignment(VerticalAlignment::Center)
-                        .content(m3::icon(m3::glyph::OPEN_FOLDER)),
+                        .content(controls::icon(controls::glyph::OPEN_FOLDER)),
                 )),
         )
         .tooltip(TOOLTIP)
 }
 
 /// A path inside a sentence's block (Automations, Details): the path in
-/// the link color with a state layer that hugs it; the label keeps the
+/// the link color with WinUI's own hover state; the label keeps the
 /// text's inset, so it lines up with the lines around it.
-pub(super) fn path_link(palette: Palette, path: &str, open: Callback<()>) -> View {
+pub(super) fn path_link(path: &str, open: Callback<()>) -> View {
     let shown = nav::display_path(path);
-    m3::text_button(palette)
+    controls::text_button()
         .style(ButtonStyle::Subtle)
         .min_height(0.0)
         .height(tokens::height::SUB_ROW)
@@ -272,8 +265,8 @@ pub(super) fn path_link(palette: Palette, path: &str, open: Callback<()>) -> Vie
                 .spacing(tokens::spacing::XS)
                 .margin(Thickness::xy(tokens::spacing::XS, 0.0))
                 .children((
-                    m3::icon(m3::glyph::OPEN_FOLDER),
-                    m3::text(shown.to_owned(), tokens::text::BODY)
+                    controls::icon(controls::glyph::OPEN_FOLDER),
+                    controls::text(shown.to_owned(), tokens::text::BODY)
                         .vertical_alignment(VerticalAlignment::Center)
                         .text_trimming(TextTrimming::CharacterEllipsis),
                 )),
@@ -283,11 +276,11 @@ pub(super) fn path_link(palette: Palette, path: &str, open: Callback<()>) -> Vie
 
 /// A square open-in-Explorer button beside a path field (Settings ›
 /// Projects' checkout folder).
-pub(super) fn path_button(palette: Palette, name: &str, open: Callback<()>) -> View {
-    m3::icon_button(palette)
+pub(super) fn path_button(name: &str, open: Callback<()>) -> View {
+    controls::icon_button()
         .automation_name(format!("Open {name} in Explorer"))
         .on_click(open)
-        .content(m3::icon(m3::glyph::OPEN_FOLDER))
+        .content(controls::icon(controls::glyph::OPEN_FOLDER))
         .tooltip(TOOLTIP)
 }
 
@@ -318,11 +311,11 @@ impl DesktopApp {
 
     /// Why the last open of `path` failed, in the error color; empty
     /// otherwise.
-    pub(super) fn reveal_note(&self, item: &str, palette: Palette) -> Option<View> {
+    pub(super) fn reveal_note(&self, item: &str) -> Option<View> {
         match &self.revealed {
             Some((failed, note)) if failed == item => Some(
-                m3::secondary(note.clone())
-                    .foreground(palette.attention())
+                controls::secondary(note.clone())
+                    .foreground(ThemeBrush::SystemCritical)
                     .text_wrapping(TextWrapping::Wrap)
                     .is_text_selection_enabled(true)
                     .into(),
@@ -335,7 +328,6 @@ impl DesktopApp {
     pub(super) fn path_row(
         &self,
         context: &mut ViewContext<Self>,
-        palette: Palette,
         title: &str,
         note: &str,
         path: &str,
@@ -343,24 +335,19 @@ impl DesktopApp {
         let open = self.reveal_message(context, path);
         StackPanel::new()
             .keyed_children(crate::views::slots([
-                Some(path_row(palette, title, note, path, open)),
-                self.reveal_note(path, palette),
+                Some(path_row(title, note, path, open)),
+                self.reveal_note(path),
             ]))
             .into()
     }
 
     /// [`path_link`] with its failure note under it.
-    pub(super) fn path_link(
-        &self,
-        context: &mut ViewContext<Self>,
-        palette: Palette,
-        path: &str,
-    ) -> View {
+    pub(super) fn path_link(&self, context: &mut ViewContext<Self>, path: &str) -> View {
         let open = self.reveal_message(context, path);
         StackPanel::new()
             .keyed_children(crate::views::slots([
-                Some(path_link(palette, path, open)),
-                self.reveal_note(path, palette),
+                Some(path_link(path, open)),
+                self.reveal_note(path),
             ]))
             .into()
     }

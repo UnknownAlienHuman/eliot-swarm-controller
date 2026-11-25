@@ -1,366 +1,239 @@
-//! The desktop's one size scale: the brand book "Eliot Swarm Material"
-//! (Material 3 Expressive, owner-approved 2026-11-24) on the Codex
-//! skeleton, compact desktop density, one 4-DIP grid. The values are the
-//! brand book's tokens (`crate::brand`, generated from
-//! `design/tokens.json`); this module names them for the views.
+//! The desktop's one set of layout constants (brand book
+//! `docs/design/fluent-design-system.md` §4.3–4.4): sizes, spacing, type
+//! ramp and the few shapes the app draws itself. Colors are not here: stock
+//! WinUI controls keep their own theme resources and states, and the few
+//! custom marks take Reactor's [`windows_reactor::ThemeBrush`] values, which
+//! follow System, Light, Dark and High Contrast by themselves.
 //!
-//! Every corner radius, height, type role, spacing, icon size, width and
-//! motion duration of the views comes from this module; `app_resources`
-//! writes the same values into the WinUI control styles. Touch comfort
-//! comes from hit areas, never from bigger visuals; tactility is the
-//! state layers, ripple, elevation and motion of `crate::theme`.
+//! Shapes, heights and padding of standard controls belong to their WinUI
+//! templates; a constant here only places things or sizes the app's own
+//! surfaces and marks.
 
-use crate::brand;
-
-/// Shape, in Google's names: full for buttons, rows and status pills,
-/// small for chips, medium for cards, menus, fields and the composer's
-/// action, extra-large for the main card, the composer and dialogs.
+/// Corners the app draws itself (§4.4 `content.radius`): standard controls
+/// keep their template's corners.
 pub mod radius {
-    use super::brand;
-
-    /// A theme swatch's corner.
-    pub const SWATCH: f64 = brand::RADIUS_SMALL;
-    /// A 32-DIP control, row or selection: full.
-    pub const PILL: f64 = super::height::CONTROL / 2.0;
-    /// A chip or segment.
-    pub const CHIP: f64 = brand::RADIUS_SMALL;
-    /// Every button and icon button while pressed.
-    pub const PRESSED: f64 = brand::RADIUS_SMALL;
-    /// The composer's 40-DIP main action and New task.
-    pub const FAB: f64 = brand::RADIUS_MEDIUM;
-    /// The header's 24-DIP status pill: full.
-    pub const BADGE: f64 = super::height::BADGE / 2.0;
-    /// Cards, tool rows, menus and popovers, the Details sections, code
-    /// blocks.
-    pub const CONTAINER: f64 = brand::RADIUS_MEDIUM;
-    /// Text fields that are not pills (forms, source editors).
-    pub const FIELD: f64 = brand::RADIUS_MEDIUM;
-    /// The composer and the main card.
-    pub const COMPOSER: f64 = brand::RADIUS_EXTRA_LARGE;
-    /// Dialogs.
-    pub const DIALOG: f64 = brand::RADIUS_EXTRA_LARGE;
-    /// A message bubble's corners, and the corner by its sender.
-    pub const BUBBLE: f64 = brand::RADIUS_LARGE_INCREASED;
-    pub const BUBBLE_TAIL: f64 = brand::RADIUS_EXTRA_SMALL;
-    /// The Stop square inside the FAB.
-    pub const STOP: f64 = brand::RADIUS_STOP_MARK;
-    pub const STATUS_MARK: f64 = brand::RADIUS_STATUS_MARK;
-    /// Check boxes keep the M3 corner.
-    pub const CHECK_BOX: f64 = brand::RADIUS_CHECKBOX;
+    /// A small app shape beside controls (a badge, a fixed chip, a status
+    /// pill): WinUI's `ControlCornerRadius`.
+    pub const CONTROL: f64 = 4.0;
+    /// A standalone app surface: the main card, a settings group, the
+    /// composer, a message bubble.
+    pub const CONTAINER: f64 = 8.0;
+    /// The failed state's rounded-square mark.
+    pub const STATUS_MARK: f64 = 2.0;
 }
 
-/// Heights in DIPs: Material 3's desktop density, as compact as Codex.
+/// Heights the layout reserves: minimums, never clipping heights for
+/// standard controls.
 pub mod height {
-    use super::brand;
-
-    /// Buttons, fields, every list and nav row, nested ones included.
-    pub const CONTROL: f64 = brand::SIZE_ROW;
-    /// A sidebar row under its project (same height as every row).
+    /// A row, a button, a menu entry.
+    pub const CONTROL: f64 = 32.0;
+    /// A row under its parent.
     pub const SUB_ROW: f64 = CONTROL;
-    /// Chips and segments.
-    pub const CHIP: f64 = brand::SIZE_CHIP;
-    /// The composer's Send, Stop and Steer.
-    pub const FAB: f64 = brand::SIZE_COMPOSER_ACTION;
+    /// A chip.
+    pub const CHIP: f64 = 32.0;
+    /// The composer's main action.
+    pub const FAB: f64 = 40.0;
     /// The New task button.
-    pub const NEW_TASK: f64 = brand::SIZE_NEW_TASK;
-    /// The ▾ beside the composer's main action.
-    pub const SEND_MENU: f64 = brand::SIZE_SEND_MENU;
+    pub const NEW_TASK: f64 = 40.0;
+    /// The composer's menu beside its main action.
+    pub const SEND_MENU: f64 = 32.0;
     /// The conversation header.
-    pub const HEADER: f64 = brand::SIZE_HEADER;
-    /// Standalone fields; the Home question's project button.
-    pub const FIELD: f64 = brand::SIZE_FIELD;
-    /// The sidebar's title row.
-    pub const TITLE_ROW: f64 = brand::SIZE_TITLE_ROW;
-    /// The header's status pill.
-    pub const BADGE: f64 = brand::SIZE_STATUS_PILL;
-    /// A form row: its label and its 32-DIP control.
-    pub const FORM_ROW: f64 = brand::SIZE_FORM_ROW;
-    /// A picker row with a supporting line under its title.
-    pub const TWO_LINE_ROW: f64 = brand::SIZE_TWO_LINE_ROW;
-    pub const SUGGESTION: f64 = brand::SIZE_NEW_TASK;
+    pub const HEADER: f64 = 52.0;
+    /// A text field.
+    pub const FIELD: f64 = 32.0;
+    /// A page's title row.
+    pub const TITLE_ROW: f64 = 40.0;
+    /// A status pill or file chip.
+    pub const BADGE: f64 = 24.0;
+    /// A labelled form row.
+    pub const FORM_ROW: f64 = 40.0;
+    /// A two-line list row.
+    pub const TWO_LINE_ROW: f64 = 48.0;
+    /// A suggestion card on Home.
+    pub const SUGGESTION: f64 = 40.0;
 }
 
-/// The type roles, from Google's Material 3 type scale in the brand book,
-/// set in Roboto (`crate::fonts`).
+/// The WinUI type ramp (§4.3) in the roles the views use; the font is the
+/// system UI font (Segoe UI Variable).
 pub mod text {
-    use super::brand;
-
-    pub use brand::TypeStyle;
-
-    /// The Home title.
-    pub const HERO: TypeStyle = brand::TITLE_LARGE;
-    /// Page and dialog titles, the conversation title.
-    pub const TITLE: TypeStyle = brand::TITLE_MEDIUM;
-    pub const HEADER: TypeStyle = brand::TITLE_MEDIUM;
-    pub const BODY: TypeStyle = brand::BODY_MEDIUM;
-    pub const BUTTON: TypeStyle = brand::LABEL_LARGE;
-    pub const CHIP: TypeStyle = brand::LABEL_LARGE;
-    pub const LABEL: TypeStyle = brand::LABEL_MEDIUM;
-    pub const CAPTION: TypeStyle = brand::BODY_SMALL;
-    /// Filled buttons, New task, the selected sidebar row.
-    pub const EMPHASIZED: TypeStyle = brand::LABEL_LARGE_EMPHASIZED;
-    /// A sidebar row's trailing word, age or +/− counts.
-    pub const TRAILING: TypeStyle = brand::LABEL_SMALL;
-    /// Badges and counters (the Inbox count).
-    pub const BADGE: TypeStyle = brand::LABEL_SMALL_EMPHASIZED;
-    /// A small card's or popover's title ("Usage").
-    pub const SMALL_TITLE: TypeStyle = brand::TITLE_SMALL;
-    /// The daemon screen's title.
-    pub const PAGE: TypeStyle = brand::HEADLINE_MEDIUM;
-    /// A worker row's label under its manager (the canvas's nested row).
-    pub const KID_SIZE: f64 = brand::SIZE_KID_TEXT;
-}
-
-/// The 4-DIP grid in DIPs.
-pub mod spacing {
-    use super::brand;
-
-    /// Between rows in the sidebar.
-    pub const ROW_GAP: f64 = brand::SPACE_ROW_GAP;
-    /// The half step: stacked text lines.
-    pub const XS: f64 = brand::SPACE_XS;
-    /// Inside a group: between chips, a glyph and its label.
-    pub const SM: f64 = brand::SPACE_SM;
-    /// Icon-to-label gap inside a chip.
-    pub const CHIP_GAP: f64 = brand::SPACE_CHIP_GAP;
-    /// Leading padding of WinUI's text field template.
-    pub const FIELD_LEADING_INSET: f64 = brand::SPACE_FIELD_LEADING;
-    /// A row's inset from its pill and the gap from its icon to its label
-    /// ("every sidebar row starts its icon at 10 DIP inside an 8-DIP
-    /// gutter").
-    pub const ROW: f64 = brand::SPACE_ROW;
-    /// The content inset of a control, card or menu.
-    pub const INSET: f64 = brand::SPACE_INSET;
-    /// The text inset of tabs, suggestion cards and message bubbles.
-    pub const TEXT_INSET: f64 = brand::SPACE_TEXT_INSET;
-    /// Between groups.
-    pub const MD: f64 = brand::SPACE_MD;
-    /// The conversation's side padding, page padding.
-    pub const LG: f64 = brand::SPACE_LG;
-    /// Between the Home title, suggestions and composer.
-    pub const HOME_GROUP_GAP: f64 = brand::SPACE_HOME_GAP;
-    /// The main area's side padding.
-    pub const XL: f64 = brand::SPACE_XL;
-}
-
-/// Icon sizes in DIPs.
-pub mod icon {
-    use super::brand;
-
-    /// In rows, buttons and icon buttons.
-    pub const ROW: f64 = brand::SIZE_ICON;
-    /// In chips, tool rows and fields.
-    pub const SMALL: f64 = brand::SIZE_ICON_SM;
-    /// A chip's or row's chevron, inline status icons.
-    pub const CHEVRON: f64 = brand::SIZE_ICON_XS;
-    /// The Stop square in the FAB.
-    pub const STOP: f64 = brand::SIZE_STOP_MARK;
-}
-
-/// The brand book's motion (Material 3 Expressive springs), which the
-/// control templates sample into key frames: the press scale, the pressed
-/// corner and the switch's knob on spatial-fast, state layers on
-/// effects-fast; the ripple grows on effects-slow's settle time with the
-/// emphasized easing. A popover's entrance is its WinUI flyout's own.
-pub mod motion {
-    use super::brand;
-
-    /// A Material spring: damping ratio, stiffness (unit mass, per second
-    /// squared) and its settle time, the brand book's `-ms` token.
+    /// A type role: size in DIPs and weight.
     #[derive(Clone, Copy, Debug, PartialEq)]
-    pub struct Spring {
-        pub damping: f64,
-        pub stiffness: f64,
-        pub settle_ms: u64,
+    pub struct TypeStyle {
+        pub size: f64,
+        pub weight: u16,
     }
 
-    /// Press changes of buttons, switches and segments.
-    pub const SPATIAL_FAST: Spring = Spring {
-        damping: brand::SPATIAL_FAST_DAMPING,
-        stiffness: brand::SPATIAL_FAST_STIFFNESS,
-        settle_ms: brand::SPATIAL_FAST_MS,
+    const CAPTION_RAMP: TypeStyle = TypeStyle {
+        size: 12.0,
+        weight: 400,
     };
-    /// State layers, hover and press colors.
-    pub const EFFECTS_FAST: Spring = Spring {
-        damping: brand::EFFECTS_FAST_DAMPING,
-        stiffness: brand::EFFECTS_FAST_STIFFNESS,
-        settle_ms: brand::EFFECTS_FAST_MS,
+    const BODY_RAMP: TypeStyle = TypeStyle {
+        size: 14.0,
+        weight: 400,
     };
-    pub const RIPPLE_MS: u64 = brand::EFFECTS_SLOW_MS;
-    pub const PRESS_SCALE: f64 = brand::SCALE_PRESS;
-    pub const FAB_PRESS_SCALE: f64 = brand::SCALE_PRESS_ACTION;
-    pub const EMPHASIZED: &str = crate::brand::EASING_EMPHASIZED;
-    pub const DECELERATE: &str = crate::brand::EASING_EMPHASIZED_DECELERATE;
-    /// The wave indicator's travel of one period.
-    pub const WAVE_MS: u64 = brand::WAVE_MS;
+    const BODY_STRONG_RAMP: TypeStyle = TypeStyle {
+        size: 14.0,
+        weight: 600,
+    };
+    const SUBTITLE_RAMP: TypeStyle = TypeStyle {
+        size: 20.0,
+        weight: 600,
+    };
+    const TITLE_RAMP: TypeStyle = TypeStyle {
+        size: 28.0,
+        weight: 600,
+    };
+
+    /// The Home title (Title).
+    pub const HERO: TypeStyle = TITLE_RAMP;
+    /// A card or dialog title (Body Strong).
+    pub const TITLE: TypeStyle = BODY_STRONG_RAMP;
+    /// A panel or conversation title (Subtitle).
+    pub const HEADER: TypeStyle = SUBTITLE_RAMP;
+    pub const BODY: TypeStyle = BODY_RAMP;
+    /// A button or row label (Body).
+    pub const BUTTON: TypeStyle = BODY_RAMP;
+    pub const CHIP: TypeStyle = BODY_RAMP;
+    /// A section label (Caption).
+    pub const LABEL: TypeStyle = CAPTION_RAMP;
+    pub const CAPTION: TypeStyle = CAPTION_RAMP;
+    /// A selected row's label (Body Strong).
+    pub const EMPHASIZED: TypeStyle = BODY_STRONG_RAMP;
+    /// A row's trailing word, age or count (Caption).
+    pub const TRAILING: TypeStyle = CAPTION_RAMP;
+    /// A group heading (Body Strong).
+    pub const SMALL_TITLE: TypeStyle = BODY_STRONG_RAMP;
+    /// A page title (Title).
+    pub const PAGE: TypeStyle = TITLE_RAMP;
+    /// A worker row's label under its manager (Caption size).
+    pub const KID_SIZE: f64 = CAPTION_RAMP.size;
 }
 
-/// The switch: Google's 52 × 32 track, a 16-DIP knob off, 24 on and 28
-/// while pressed, a 2-DIP outline off, and the knob's state layer at the
-/// pointer target's size.
-pub mod switch {
-    use super::brand;
-
-    pub const WIDTH: f64 = brand::SIZE_SWITCH_WIDTH;
-    pub const HEIGHT: f64 = brand::SIZE_SWITCH_HEIGHT;
-    pub const KNOB: f64 = brand::SIZE_SWITCH_KNOB;
-    pub const KNOB_ON: f64 = brand::SIZE_SWITCH_KNOB_ON;
-    pub const KNOB_PRESSED: f64 = brand::SIZE_SWITCH_KNOB_PRESSED;
-    pub const OUTLINE: f64 = brand::SIZE_SWITCH_OUTLINE;
-    pub const STATE_LAYER: f64 = brand::SIZE_TARGET;
+/// Spacing between and inside groups.
+pub mod spacing {
+    /// Between rows of one list.
+    pub const ROW_GAP: f64 = 2.0;
+    pub const XS: f64 = 4.0;
+    pub const SM: f64 = 8.0;
+    /// Between a chip's icon, label and chevron.
+    pub const CHIP_GAP: f64 = 6.0;
+    /// A field's leading text inset.
+    pub const FIELD_LEADING_INSET: f64 = 10.0;
+    /// A row's leading inset; icon to label.
+    pub const ROW: f64 = 10.0;
+    /// A small block's inset.
+    pub const INSET: f64 = 12.0;
+    /// A text block's inset.
+    pub const TEXT_INSET: f64 = 14.0;
+    pub const MD: f64 = 16.0;
+    pub const LG: f64 = 24.0;
+    /// Between Home's groups.
+    pub const HOME_GROUP_GAP: f64 = 28.0;
+    pub const XL: f64 = 32.0;
 }
 
-/// The wave indicator of a running turn and the straight track under it
-/// (and under a determinate bar).
-pub mod wave {
-    use super::brand;
-
-    pub const HEIGHT: f64 = brand::SIZE_WAVE_HEIGHT;
-    pub const LENGTH: f64 = brand::SIZE_WAVE_LENGTH;
-    pub const STROKE: f64 = brand::SIZE_WAVE_STROKE;
-    pub const TRACK: f64 = brand::SIZE_PROGRESS_TRACK;
+/// Glyph sizes (§4.4 `icon.inline`): the glyph itself, not its hit target.
+pub mod icon {
+    /// Rows, menus and icon buttons.
+    pub const ROW: f64 = 16.0;
+    /// Chips, tool rows and fields.
+    pub const SMALL: f64 = 16.0;
+    /// Chevrons and inline marks.
+    pub const CHEVRON: f64 = 12.0;
 }
 
-/// State layers of the content color over a container.
+/// Opacity the layout uses for a non-interactive overlay state.
 pub mod state {
-    use super::brand;
-
-    pub const HOVER: f64 = brand::STATE_HOVER;
-    pub const PRESSED: f64 = brand::STATE_PRESSED;
-    pub const DISABLED_CONTAINER: f64 = brand::DISABLED_CONTAINER;
-    /// Disabled selection marks and other non-text affordances.
-    pub const DISABLED_CONTENT: f64 = brand::DISABLED_CONTENT;
-    /// New task's shortcut hint over its label color.
-    pub const SHORTCUT: f64 = brand::SHORTCUT_OPACITY;
-    pub const SCRIM: f64 = brand::SCRIM_OPACITY;
-    pub const PLOT_STUB_OPACITY: f64 = brand::PLOT_STUB_OPACITY;
+    /// The sidebar's last list while the daemon is not reachable.
+    pub const DISABLED_CONTENT: f64 = 0.38;
+    /// A shortcut hint beside a label.
+    pub const SHORTCUT: f64 = 0.7;
+    /// The stub bar of an unknown chart sample.
+    pub const PLOT_STUB_OPACITY: f64 = 0.38;
 }
 
-/// Layout: the shell's widths, columns, limits and window size. Component
-/// sizes, shapes and motion are the brand book's (the modules above); a
-/// constant here only places things.
+/// Widths and placements of the app's own layout.
 pub mod layout {
     /// The sidebar, and the Settings navigation that replaces it.
-    pub const SIDEBAR_WIDTH: f64 = crate::brand::SIZE_SIDEBAR;
+    pub const SIDEBAR_WIDTH: f64 = 264.0;
     /// The sidebar's side gutter.
     pub const SIDEBAR_GUTTER: f64 = 8.0;
-    /// The sidebar's top and bottom padding.
     pub const SIDEBAR_PADDING: f64 = 12.0;
-    /// The right pane (Changes, Agents, Details, Terminal).
-    pub const PANEL_WIDTH: f64 = crate::brand::SIZE_PANE;
-    /// The right pane at its Wide width (the brand book: `size-reading`).
-    pub const PANEL_WIDE_WIDTH: f64 = crate::brand::SIZE_READING;
-    /// Below this window width the right pane lies over the main area
-    /// instead of beside it (skeleton, regions).
-    pub const PANEL_OVERLAY_BELOW: f64 = crate::brand::SIZE_PANE_OVERLAY;
-    /// The Filter files field of the Changes tab.
-    pub const FILTER_WIDTH: f64 = crate::brand::SIZE_FILTER_FIELD;
-    /// The open tab's indicator under its label.
-    pub const TAB_INDICATOR: f64 = crate::brand::SIZE_TAB_INDICATOR;
-    /// The narrowest the task area gets beside the full sidebar; a smaller
-    /// window folds the sidebar to its rail.
+    /// The right pane at its Normal and Wide widths.
+    pub const PANEL_WIDTH: f64 = 480.0;
+    pub const PANEL_WIDE_WIDTH: f64 = READING_WIDTH;
+    /// Below this window width the pane overlays the main area.
+    pub const PANEL_OVERLAY_BELOW: f64 = 1200.0;
+    pub const FILTER_WIDTH: f64 = 168.0;
+    /// The selected pane tab's underline.
+    pub const TAB_INDICATOR: f64 = 3.0;
+    /// The main area never narrows below this.
     pub const MAIN_MIN_WIDTH: f64 = 480.0;
-    /// The conversation's column and its composer.
-    pub const READING_WIDTH: f64 = crate::brand::SIZE_READING;
-    /// The home screen's composer and suggestions.
+    /// The conversation and composer column.
+    pub const READING_WIDTH: f64 = 720.0;
     pub const HOME_WIDTH: f64 = 760.0;
-    /// From the main card's top to the Home question.
-    pub const HOME_TOP: f64 = crate::brand::SIZE_HOME_TOP;
-    /// The main card's distance from the window's top, right and bottom
-    /// edges, beside the sidebar on the window ground.
+    pub const HOME_TOP: f64 = 168.0;
+    /// The main card's distance from the window's edges.
     pub const CARD_GAP: f64 = super::spacing::SM;
-    /// The main card's corner.
-    pub const CARD_RADIUS: f64 = crate::brand::RADIUS_EXTRA_LARGE;
-    /// The daemon screen's column.
-    pub const OFFLINE_WIDTH: f64 = crate::brand::SIZE_OFFLINE;
-    /// The Usage popover beside the sidebar.
-    pub const USAGE_POPOVER_WIDTH: f64 = crate::brand::SIZE_USAGE_POPOVER;
-    /// A thin quota meter.
-    pub const METER: f64 = crate::brand::SIZE_METER;
-    /// The brand mark in the sidebar's title row and the daemon screen's
-    /// shape.
-    pub const MARK: f64 = crate::brand::SIZE_MARK;
-    pub const MARK_LARGE: f64 = crate::brand::SIZE_MARK_LG;
-    /// A sidebar row's state-mark slot (the dots sit centred in it).
-    pub const MARK_SLOT: f64 = crate::brand::SIZE_ICON_XS;
-    /// A task row's dots: waiting for you, idle.
-    pub const DOT_WAIT: f64 = crate::brand::SIZE_DOT_WAIT;
-    pub const DOT_IDLE: f64 = crate::brand::SIZE_DOT;
-    /// The shape loader of a working row.
-    pub const LOADER_SMALL: f64 = crate::brand::SIZE_LOADER_SM;
-    /// The sidebar Usage row's ring.
-    pub const ROW_RING: f64 = crate::brand::SIZE_ROW_RING;
-    /// A badge's height and least width (the Inbox count).
-    pub const BADGE: f64 = crate::brand::SIZE_BADGE;
-    /// A worker row's step in under its manager: past the mark slot and
-    /// its gap, so its mark sits under the manager's title.
+    /// The main card's corner (§4.4 `content.radius`).
+    pub const CARD_RADIUS: f64 = super::radius::CONTAINER;
+    pub const OFFLINE_WIDTH: f64 = 480.0;
+    pub const USAGE_POPOVER_WIDTH: f64 = 340.0;
+    /// The daemon screen's marks.
+    pub const MARK: f64 = 22.0;
+    /// A row's state-mark slot.
+    pub const MARK_SLOT: f64 = 16.0;
+    pub const DOT_WAIT: f64 = 8.0;
+    pub const DOT_IDLE: f64 = 6.0;
+    pub const LOADER_SMALL: f64 = 12.0;
+    pub const ROW_RING: f64 = 18.0;
+    /// A worker row's indent past its manager's mark.
     pub const KID_INDENT: f64 = MARK_SLOT + super::spacing::SM;
-    /// The label column of every form.
     pub const LABEL_WIDTH: f64 = 200.0;
-    /// Where a form's controls start: past the label column and its gap
-    /// (a note or check under a field lines up with the field).
+    /// Help under a form row's control starts here.
     pub const FIELD_INDENT: f64 = LABEL_WIDTH + super::spacing::SM;
-    /// A confirmation dialog's width.
-    pub const DIALOG_WIDTH: f64 = crate::brand::SIZE_DIALOG;
-    /// A list of items inside a dialog before it scrolls.
+    pub const DIALOG_WIDTH: f64 = 420.0;
     pub const DIALOG_LIST_MAX_HEIGHT: f64 = 240.0;
     pub const MOVE_DIALOG_WIDTH: f64 = 480.0;
     pub const MOVE_LIST_MAX_HEIGHT: f64 = 320.0;
-    /// An enum dropdown ("low", "never", a role).
     pub const ENUM_WIDTH: f64 = 200.0;
-    /// A number box.
     pub const NUMBER_WIDTH: f64 = 120.0;
-    /// The composer's folder field (a new task outside the projects).
     pub const FOLDER_WIDTH: f64 = 280.0;
-    /// One nesting step of a Markdown list in an answer.
     pub const LIST_INDENT: f64 = 20.0;
-    /// A Markdown list's marker column ("•", "12."): the item's text starts
-    /// after it and wraps under itself.
+    /// A list item's marker column.
     pub const LIST_MARKER_WIDTH: f64 = 22.0;
-    /// A nested row's indent (a task under its project, a worker under its
-    /// manager): its label starts under its parent's label.
+    /// One level of the Agents tree.
     pub const TREE_INDENT: f64 = 28.0;
-    /// The composer's field grows with its text up to this height.
     pub const COMPOSER_MAX_HEIGHT: f64 = 200.0;
-    /// The composer's field below its first line (the design's 44 DIP).
     pub const COMPOSER_MIN_HEIGHT: f64 = 44.0;
-    /// The menu part of a split button (Start task ▾).
-    pub const SPLIT_MENU: f64 = crate::brand::SIZE_SPLIT_MENU;
-    /// Home's bar beside the trimmed project and model labels: +, the
-    /// place and access chips, Start task with its menu, the gaps and the
-    /// card insets, so the bar fits 760 with Auto (a layout budget).
+    pub const SPLIT_MENU: f64 = 34.0;
+    /// The Home bar's fixed part.
     pub const HOME_BAR_FIXED: f64 = 480.0;
-    /// Hide the keyboard hint in a composer narrower than this.
+    /// The composer shows its hint from this width.
     pub const COMPOSER_HINT_MIN_WIDTH: f64 = 560.0;
-    /// Bottom row space reserved for fixed controls, padding and gaps.
     pub const COMPOSER_ACTIONS_WIDTH: f64 = 190.0;
     pub const COMPOSER_LABEL_MIN_WIDTH: f64 = 80.0;
-    /// A multiline source editor (TOML, JSON, a script).
     pub const SOURCE_MIN_HEIGHT: f64 = 240.0;
     pub const SOURCE_MAX_HEIGHT: f64 = 420.0;
-    /// The hand-off dialog (`Handoff.dc.html`): ContentDialog's maximum.
+    /// The hand-off dialog: ContentDialog's maximum.
     pub const HANDOFF_DIALOG_WIDTH: f64 = 548.0;
     /// The hand-off dialog's scrolling body.
     pub const DIALOG_MAX_HEIGHT: f64 = 520.0;
     /// A dropdown inside the hand-off dialog.
     pub const DIALOG_PICKER_WIDTH: f64 = 136.0;
     /// A status dot in a row.
-    pub const DOT: f64 = crate::brand::SIZE_DOT_WAIT;
+    pub const DOT: f64 = DOT_WAIT;
     /// The dot of a status pill.
-    pub const BADGE_DOT: f64 = crate::brand::SIZE_DOT;
-    /// Dividers.
-    pub const HAIRLINE: f64 = crate::brand::SIZE_HAIRLINE;
-    /// The decision panel's `tertiary` outline.
+    pub const BADGE_DOT: f64 = DOT_IDLE;
+    /// Dividers and the app's own strokes (§4.4 `content.stroke`).
+    pub const HAIRLINE: f64 = 1.0;
+    /// The decision panel's outline.
     pub const DECISION_OUTLINE: f64 = 2.0;
-    /// The decision panel's leading inset inside its outline (the design's
-    /// 18 from the card's edge).
+    /// The decision panel's leading inset inside its outline.
     pub const DECISION_LEADING: f64 = 16.0;
     /// The attention strip's inset around its buttons.
     pub const STRIP_INSET: f64 = 6.0;
-    /// Extend the ripple past the control so its final frame fills the shape.
-    pub const RIPPLE_INSET: f64 = 24.0;
-    pub const FOCUS_RING: f64 = crate::brand::SIZE_FOCUS_RING;
-    pub const STATUS_STROKE: f64 = crate::brand::SIZE_STATUS_STROKE;
+    pub const STATUS_STROKE: f64 = 1.5;
     /// The indeterminate progress bar of a running turn.
     pub const PROGRESS_WIDTH: f64 = 160.0;
     /// A monitor chart's plot, and the stub of an unknown sample.
@@ -388,50 +261,43 @@ pub mod layout {
     pub const POPOVER_LIST_HEIGHT: f64 = 360.0;
     /// The check column of a popover row.
     pub const CHECK_COLUMN: f64 = 16.0;
-    /// How far the drawn wave reaches: the widest indeterminate bar it
-    /// fills (a 4K screen at 100 %); a bar clips it to its own width.
-    pub const WAVE_SPAN: f64 = 3840.0;
     /// A quota ring (Models & Usage).
-    pub const RING: f64 = crate::brand::SIZE_RING_SM;
+    pub const RING: f64 = 16.0;
     /// The composer's usage ring.
-    pub const USAGE_RING: f64 = crate::brand::SIZE_RING;
-    /// The neutral usage ring's stroke (the progress ring's track).
-    pub const USAGE_RING_STROKE: f64 = crate::brand::SIZE_RING_STROKE;
+    pub const USAGE_RING: f64 = 22.0;
+    /// A quota ring's stroke.
+    pub const USAGE_RING_STROKE: f64 = 2.0;
 }
 
-/// The pages in the main card (`screens.css` `.page`): Project, Inbox,
-/// Agents, Automations and Settings.
+/// The pages in the main card: Project, Inbox, Agents, Automations and
+/// Settings.
 pub mod page {
-    use super::brand;
+    use super::text::TypeStyle;
 
-    /// A list page's column at most, centred.
-    pub const WIDTH: f64 = brand::SIZE_PAGE;
+    /// A list page's column at most, centred (§4.4 `page.max`).
+    pub const WIDTH: f64 = 960.0;
     /// A Settings page's column at most, centred.
-    pub const SETTINGS_WIDTH: f64 = brand::SIZE_SETTINGS_PAGE;
+    pub const SETTINGS_WIDTH: f64 = 760.0;
     /// A dropdown at the end of a settings row.
-    pub const SETTINGS_CONTROL: f64 = brand::SIZE_SETTINGS_CONTROL;
+    pub const SETTINGS_CONTROL: f64 = 220.0;
     /// The key column of a key-value line in a card.
-    pub const KEY_COLUMN: f64 = brand::SIZE_KEY_COLUMN;
+    pub const KEY_COLUMN: f64 = 120.0;
     /// A page's search field (Agents).
-    pub const SEARCH: f64 = brand::SIZE_PAGE_SEARCH;
+    pub const SEARCH: f64 = 240.0;
     /// The rule editor's word column and its Repeat count.
-    pub const SENTENCE_WORD: f64 = brand::SIZE_SENTENCE_WORD;
-    pub const REPEAT_FIELD: f64 = brand::SIZE_REPEAT_FIELD;
+    pub const SENTENCE_WORD: f64 = 72.0;
+    pub const REPEAT_FIELD: f64 = 96.0;
     /// The Agents tree's Model, Activity, CPU and Memory columns.
-    pub const FLEET_MODEL: f64 = brand::SIZE_FLEET_MODEL;
-    pub const FLEET_ACTIVITY: f64 = brand::SIZE_FLEET_ACTIVITY;
-    pub const FLEET_NUMBER: f64 = brand::SIZE_FLEET_NUMBER;
+    pub const FLEET_MODEL: f64 = 190.0;
+    pub const FLEET_ACTIVITY: f64 = 290.0;
+    pub const FLEET_NUMBER: f64 = 60.0;
     /// A branch's preparation state on the project page.
-    pub const BRANCH_STATE: f64 = brand::SIZE_BRANCH_STATE;
-    /// A theme's swatch in Settings › General.
-    pub const THEME_SWATCH_WIDTH: f64 = brand::SIZE_THEME_SWATCH_WIDTH;
-    pub const THEME_SWATCH_HEIGHT: f64 = brand::SIZE_THEME_SWATCH_HEIGHT;
+    pub const BRANCH_STATE: f64 = 96.0;
 
-    /// Type roles of a page: its title (`headline-medium`), a section
-    /// heading (`title-small`, muted), a stat's number (`title-large`),
-    /// an age (`label-small`).
-    pub const TITLE: brand::TypeStyle = brand::HEADLINE_MEDIUM;
-    pub const HEADING: brand::TypeStyle = brand::TITLE_SMALL;
-    pub const STAT: brand::TypeStyle = brand::TITLE_LARGE;
-    pub const AGE: brand::TypeStyle = brand::LABEL_SMALL;
+    /// Type roles of a page: its title, a section heading, a stat's
+    /// number, an age.
+    pub const TITLE: TypeStyle = super::text::PAGE;
+    pub const HEADING: TypeStyle = super::text::SMALL_TITLE;
+    pub const STAT: TypeStyle = super::text::HEADER;
+    pub const AGE: TypeStyle = super::text::CAPTION;
 }

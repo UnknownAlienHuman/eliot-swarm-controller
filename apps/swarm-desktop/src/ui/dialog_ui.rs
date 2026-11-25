@@ -1,10 +1,9 @@
-//! One M3 dialog surface and footer in a native modal host. All callers use
-//! the same palette and controls; WinUI contains Tab focus and restores it.
+//! One dialog surface and footer in a native modal host. All callers use
+//! the same controls; WinUI contains Tab focus and restores it.
 //! Reactor 0.100.0 has no key events; Escape uses the existing UI-thread
 //! hook. Enter stays native and activates the focused control.
 use super::*;
 use crate::shortcuts::{Popover, PopoverKey};
-use crate::theme::winui::Palette;
 
 #[derive(Default)]
 pub(super) struct Focus {
@@ -17,7 +16,6 @@ pub(super) struct Focus {
 pub(super) fn surface(
     context: &mut ViewContext<DesktopApp>,
     epoch: u64,
-    palette: Palette,
     title: String,
     body: View,
     footer: View,
@@ -32,15 +30,14 @@ pub(super) fn surface(
         .on_closed(context.callback(move |_| Message::DialogClosed(epoch)))
         .content(
             Border::new()
-                .background(palette.container())
-                .corner_radius(tokens::radius::DIALOG)
+                .background(ThemeBrush::CardBackground)
+                .corner_radius(tokens::radius::CONTAINER)
                 .padding(Thickness::uniform(tokens::spacing::LG))
                 .max_width(width)
                 .automation_name(title.clone())
                 .content(
                     StackPanel::new().spacing(tokens::spacing::MD).children((
-                        m3::text(title, tokens::text::TITLE)
-                            .foreground(palette.text())
+                        controls::text(title, tokens::text::TITLE)
                             .text_wrapping(TextWrapping::Wrap),
                         ScrollViewer::new()
                             .max_height(tokens::layout::DIALOG_MAX_HEIGHT)

@@ -9,7 +9,6 @@ use std::collections::BTreeMap;
 use super::*;
 use crate::monitor::{Filter, MonitorRow, ProjectRef, Tree};
 use crate::nav::Checkout;
-use crate::theme::winui::Palette;
 use crate::ui::chat_ui::DraftAction;
 use eliot_core::AgentState;
 
@@ -812,7 +811,7 @@ impl DesktopApp {
     /// activity, CPU, memory, Stop) and Autonomy. The tree is its own
     /// component ([`monitor_view::MonitorList`]), redrawn only when a
     /// snapshot or a choice changes it.
-    pub(super) fn monitor_view(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
+    pub(super) fn monitor_view(&self, context: &mut ViewContext<Self>) -> View {
         let data = &self.monitor.data;
         // Ages and incidents as of the last read (the snapshot's time, not
         // the clock's), so the page changes only with a read.
@@ -850,25 +849,22 @@ impl DesktopApp {
                         "search",
                         Border::new()
                             .width(tokens::page::SEARCH)
-                            .content(m3::search_field(palette.tonal(), field)),
+                            .content(controls::search_field(field)),
                     ),
                     KeyedView::new(
                         "group",
-                        page_ui::choice(
-                            palette,
-                            &[
-                                (
-                                    "By state",
-                                    !by_project,
-                                    context.message(Message::Monitor(MonitorMsg::GroupBy(false))),
-                                ),
-                                (
-                                    "By project",
-                                    by_project,
-                                    context.message(Message::Monitor(MonitorMsg::GroupBy(true))),
-                                ),
-                            ],
-                        ),
+                        page_ui::choice(&[
+                            (
+                                "By state",
+                                !by_project,
+                                context.message(Message::Monitor(MonitorMsg::GroupBy(false))),
+                            ),
+                            (
+                                "By project",
+                                by_project,
+                                context.message(Message::Monitor(MonitorMsg::GroupBy(true))),
+                            ),
+                        ]),
                     ),
                 ],
             ),
@@ -888,15 +884,12 @@ impl DesktopApp {
             format!("stats:{working}:{waiting}:{holds}:{tokens_today}:{reporting}"),
             page_ui::grid(vec![
                 page_ui::stat_panel(
-                    palette,
                     page_ui::stat(working.to_string(), "Working", partial_tip.clone()),
                 ),
                 page_ui::stat_panel(
-                    palette,
                     page_ui::stat(waiting.to_string(), "Waiting for you", partial_tip),
                 ),
                 page_ui::stat_panel(
-                    palette,
                     page_ui::stat(
                         holds.to_string(),
                         "On provider hold",
@@ -904,7 +897,6 @@ impl DesktopApp {
                     ),
                 ),
                 page_ui::stat_panel(
-                    palette,
                     page_ui::stat(
                         crate::monitor::group(tokens_today),
                         "Tokens today",
@@ -925,7 +917,6 @@ impl DesktopApp {
                 KeyedView::new(
                     format!("{}:{selected}:{n}", filter.label()),
                     page_ui::filter_chip(
-                        palette,
                         filter.label(),
                         Some(n),
                         selected,
@@ -947,7 +938,7 @@ impl DesktopApp {
         };
         items.push(KeyedView::new(
             format!("waits:{waits}"),
-            m3::secondary(waits).text_wrapping(TextWrapping::Wrap),
+            controls::secondary(waits).text_wrapping(TextWrapping::Wrap),
         ));
         if data.read_at_ms.is_none() && self.monitor.refreshing && data.errors.is_empty() {
             items.push(KeyedView::new(
@@ -958,26 +949,20 @@ impl DesktopApp {
         if !data.errors.is_empty() {
             items.push(KeyedView::new(
                 "errors",
-                page_ui::error_line(
-                    palette,
-                    format!("Some reads failed: {}", data.errors.join("; ")),
-                ),
+                page_ui::error_line(format!("Some reads failed: {}", data.errors.join("; "))),
             ));
         }
         if !data.row_notes.is_empty() {
             items.push(KeyedView::new(
                 "row-notes",
-                page_ui::error_line(
-                    palette,
-                    format!(
-                        "Some rows were not read whole: {}",
-                        data.row_notes
-                            .iter()
-                            .map(|note| note.text.as_str())
-                            .collect::<Vec<_>>()
-                            .join("; ")
-                    ),
-                ),
+                page_ui::error_line(format!(
+                    "Some rows were not read whole: {}",
+                    data.row_notes
+                        .iter()
+                        .map(|note| note.text.as_str())
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                )),
             ));
         }
 
@@ -1089,8 +1074,8 @@ impl DesktopApp {
         items.push(KeyedView::new(
             "tree",
             Border::new()
-                .background(palette.tonal())
-                .border_brush(palette.outline())
+                .background(ThemeBrush::CardBackground)
+                .border_brush(ThemeBrush::CardStroke)
                 .border_thickness(Thickness::uniform(tokens::layout::HAIRLINE))
                 .corner_radius(tokens::radius::CONTAINER)
                 .padding(Thickness::uniform(
@@ -1100,7 +1085,6 @@ impl DesktopApp {
                 .content(View::component::<monitor_view::MonitorList>(
                     monitor_view::MonitorListInput {
                         entries,
-                        palette,
                         open: context.callback(|id| Message::Monitor(MonitorMsg::RowOpened(id))),
                         resume: context.callback(|(id, generation)| {
                             Message::Monitor(MonitorMsg::ResumeRequested(id, generation))
@@ -1129,7 +1113,6 @@ impl DesktopApp {
                         .clone()
                         .unwrap_or(crate::autonomy_view::Report::Reading),
                     reading: autonomy.reading,
-                    palette,
                     toggle: context.callback(|()| Message::Monitor(MonitorMsg::AutonomyToggled)),
                     window: context
                         .callback(|week: bool| Message::Monitor(MonitorMsg::AutonomyWindow(week))),
@@ -1145,11 +1128,7 @@ impl DesktopApp {
     /// wrong, Activity & resources, Context, Heavy work, Technical). Ids and
     /// readback text live here, not in the conversation. Moving it under
     /// another task is a menu action ([`super::move_ui`]).
-    pub(super) fn details_view(
-        &self,
-        context: &mut ViewContext<Self>,
-        palette: Palette,
-    ) -> Option<View> {
+    pub(super) fn details_view(&self, context: &mut ViewContext<Self>) -> Option<View> {
         let id = self.monitor.selected.clone()?;
         let mut items: Vec<KeyedView> = Vec::new();
         let mut technical = vec![format!("ID {id}")];
@@ -1185,7 +1164,7 @@ impl DesktopApp {
         if let Some(status) = monitor::read_status(read_at, now) {
             items.push(KeyedView::new(
                 "refresh",
-                m3::secondary(status).text_wrapping(TextWrapping::Wrap),
+                controls::secondary(status).text_wrapping(TextWrapping::Wrap),
             ));
         }
         let errors: Vec<_> = data
@@ -1197,8 +1176,8 @@ impl DesktopApp {
         if !errors.is_empty() {
             items.push(KeyedView::new(
                 "read-errors",
-                m3::secondary(format!("Some reads failed: {}", errors.join(" · ")))
-                    .foreground(palette.attention())
+                controls::secondary(format!("Some reads failed: {}", errors.join(" · ")))
+                    .foreground(ThemeBrush::SystemCritical)
                     .text_wrapping(TextWrapping::Wrap),
             ));
         }
@@ -1260,7 +1239,7 @@ impl DesktopApp {
                 *line = said;
             }
         }
-        let body = m3::body(agent_lines.join("\n"))
+        let body = controls::body(agent_lines.join("\n"))
             .text_wrapping(TextWrapping::Wrap)
             .is_text_selection_enabled(true);
         let body = if agent_spoken == agent_lines {
@@ -1323,7 +1302,7 @@ impl DesktopApp {
         }
         items.push(KeyedView::new(
             "summary",
-            self.details_section("summary", "Summary", summary, context, palette),
+            self.details_section("summary", "Summary", summary, context),
         ));
 
         // Task: what the task record would hold, where the desktop can read
@@ -1362,14 +1341,14 @@ impl DesktopApp {
         }
         task.push(KeyedView::new(
             "record",
-            m3::secondary(
+            controls::secondary(
                 "The task's text, card and journal live in its record in Git; the desktop cannot read that record yet.",
             )
             .text_wrapping(TextWrapping::Wrap),
         ));
         items.push(KeyedView::new(
             "task",
-            self.details_section("task", "Task", task, context, palette),
+            self.details_section("task", "Task", task, context),
         ));
 
         // Goal: its state, rounds and turns of the budget, cost, the check
@@ -1377,20 +1356,20 @@ impl DesktopApp {
         // daemon has.
         let mut goal_rows: Vec<KeyedView> = Vec::new();
         match goal {
-            None => goal_rows.push(KeyedView::new("reading", m3::secondary("Reading…"))),
+            None => goal_rows.push(KeyedView::new("reading", controls::secondary("Reading…"))),
             Some(None) => {
-                goal_rows.push(KeyedView::new("none", m3::secondary("No goal.")));
+                goal_rows.push(KeyedView::new("none", controls::secondary("No goal.")));
                 goal_rows.push(KeyedView::new(
                     "set",
                     Border::new()
                         .horizontal_alignment(HorizontalAlignment::Left)
                         .content(
-                            m3::text_button(palette)
+                            controls::text_button()
                                 .is_enabled(false)
                                 .automation_name(
                                     "Set goal: setting a goal is not in the desktop yet",
                                 )
-                                .content(m3::label("Set goal…")),
+                                .content(controls::label("Set goal…")),
                         )
                         .tooltip(
                             "Setting a goal is not in the desktop yet: swarm goal set does it",
@@ -1399,12 +1378,12 @@ impl DesktopApp {
             }
             Some(Some(goal)) => {
                 goal_rows.extend(goal_lines(goal, now));
-                goal_rows.extend(self.goal_actions(goal, context, palette));
+                goal_rows.extend(self.goal_actions(goal, context));
             }
         }
         items.push(KeyedView::new(
             "goal",
-            self.details_section("goal", "Goal", goal_rows, context, palette),
+            self.details_section("goal", "Goal", goal_rows, context),
         ));
 
         // Work: the worktree (opens in Explorer) and its project's
@@ -1449,12 +1428,12 @@ impl DesktopApp {
             {
                 work_rows.push(KeyedView::new(
                     "worktree",
-                    self.path_row(context, palette, "Worktree", "", &worktree),
+                    self.path_row(context, "Worktree", "", &worktree),
                 ));
             }
             work_rows.push(KeyedView::new(
                 "project",
-                self.path_row(context, palette, "Project folder", "", &project),
+                self.path_row(context, "Project folder", "", &project),
             ));
         }
         if let Some(branch) = detail.and_then(|detail| detail.branch.clone()) {
@@ -1474,8 +1453,8 @@ impl DesktopApp {
         if let Some(incident) = no_code {
             work_rows.push(KeyedView::new(
                 "no-code",
-                m3::body(incident.words(now))
-                    .foreground(palette.attention())
+                controls::body(incident.words(now))
+                    .foreground(ThemeBrush::SystemCritical)
                     .text_wrapping(TextWrapping::Wrap)
                     .is_text_selection_enabled(true),
             ));
@@ -1485,7 +1464,7 @@ impl DesktopApp {
             if !lines.is_empty() {
                 work_rows.push(KeyedView::new(
                     "summary",
-                    m3::body(lines.join("\n"))
+                    controls::body(lines.join("\n"))
                         .text_wrapping(TextWrapping::Wrap)
                         .is_text_selection_enabled(true),
                 ));
@@ -1499,22 +1478,25 @@ impl DesktopApp {
         ));
         items.push(KeyedView::new(
             "work",
-            self.details_section("work", "Work", work_rows, context, palette),
+            self.details_section("work", "Work", work_rows, context),
         ));
 
         // Mail: this Agent's unread mail, read-only (reading marks nothing).
         let mut mail: Vec<KeyedView> = Vec::new();
         match read.map(|read| &read.mail) {
-            None => mail.push(KeyedView::new("reading", m3::secondary("Reading…"))),
+            None => mail.push(KeyedView::new("reading", controls::secondary("Reading…"))),
             Some(Err(error)) if error.is_empty() => {
-                mail.push(KeyedView::new("reading", m3::secondary("Reading…")));
+                mail.push(KeyedView::new("reading", controls::secondary("Reading…")));
             }
             Some(Err(error)) => mail.push(KeyedView::new(
                 "error",
-                page_ui::error_line(palette, format!("Mail not read: {error}")),
+                page_ui::error_line(format!("Mail not read: {error}")),
             )),
             Some(Ok(inbox)) if inbox.deliveries.is_empty() => {
-                mail.push(KeyedView::new("none", m3::secondary("No unread mail.")));
+                mail.push(KeyedView::new(
+                    "none",
+                    controls::secondary("No unread mail."),
+                ));
             }
             Some(Ok(inbox)) => {
                 for delivery in &inbox.deliveries {
@@ -1533,12 +1515,11 @@ impl DesktopApp {
                         StackPanel::new()
                             .spacing(tokens::spacing::ROW_GAP)
                             .children((
-                                m3::text(
+                                controls::text(
                                     format!("{sender}{thread} · {age} ago"),
                                     tokens::text::LABEL,
-                                )
-                                .foreground(palette.muted()),
-                                m3::body(delivery.text.clone())
+                                ),
+                                controls::body(delivery.text.clone())
                                     .text_wrapping(TextWrapping::Wrap)
                                     .max_lines(4)
                                     .is_text_selection_enabled(true),
@@ -1548,14 +1529,14 @@ impl DesktopApp {
                 if inbox.next.is_some() && inbox.deliveries.len() >= monitor::MAIL_ROWS {
                     mail.push(KeyedView::new(
                         "more",
-                        m3::secondary(format!("The first {} are shown.", monitor::MAIL_ROWS)),
+                        controls::secondary(format!("The first {} are shown.", monitor::MAIL_ROWS)),
                     ));
                 }
             }
         }
         items.push(KeyedView::new(
             "mail",
-            self.details_section("mail", "Mail", mail, context, palette),
+            self.details_section("mail", "Mail", mail, context),
         ));
 
         // What went wrong: why and where the Agent last failed, in one line
@@ -1572,23 +1553,25 @@ impl DesktopApp {
                     vec![
                         KeyedView::new(
                             "line",
-                            m3::body(line.clone())
+                            controls::body(line.clone())
                                 .text_wrapping(TextWrapping::Wrap)
                                 .is_text_selection_enabled(true),
                         ),
                         KeyedView::new(
                             "copy",
-                            m3::text_button(palette)
+                            controls::text_button()
                                 .horizontal_alignment(HorizontalAlignment::Left)
                                 .automation_name("Copy diagnosis")
                                 .on_click(context.message(Message::Pane(
                                     super::pane_ui::PaneMsg::Copy("the diagnosis".to_owned(), line),
                                 )))
-                                .content(m3::icon_label(m3::glyph::COPY, "Copy diagnosis")),
+                                .content(controls::icon_label(
+                                    controls::glyph::COPY,
+                                    "Copy diagnosis",
+                                )),
                         ),
                     ],
                     context,
-                    palette,
                 ),
             ));
         }
@@ -1609,10 +1592,10 @@ impl DesktopApp {
         let resources = if previous_generation {
             vec![KeyedView::new(
                 "new-session",
-                m3::secondary("No resource sample for this session yet."),
+                controls::secondary("No resource sample for this session yet."),
             )]
         } else {
-            monitor_view::resource_views(data, &id, palette)
+            monitor_view::resource_views(data, &id)
         };
         items.push(KeyedView::new(
             "resources",
@@ -1626,7 +1609,6 @@ impl DesktopApp {
                         .keyed_children(resources),
                 )],
                 context,
-                palette,
             ),
         ));
 
@@ -1646,7 +1628,7 @@ impl DesktopApp {
                     ),
                 ),
             ));
-            context_rows.push(KeyedView::new("meter", m3::meter(palette, percent, false)));
+            context_rows.push(KeyedView::new("meter", controls::meter(percent, false)));
         }
         let usage = match read {
             Some(read) => monitor_view::usage_lines(read),
@@ -1655,21 +1637,21 @@ impl DesktopApp {
         };
         context_rows.push(KeyedView::new(
             "usage",
-            m3::body(usage.join("\n"))
+            controls::body(usage.join("\n"))
                 .text_wrapping(TextWrapping::Wrap)
                 .is_text_selection_enabled(true),
         ));
         if let Some(growth) = read.and_then(|read| read.agent.session_growth.as_ref()) {
             context_rows.push(KeyedView::new(
                 "growth",
-                m3::body(format!(
+                controls::body(format!(
                     "The session grows fast: {}",
                     growth
                         .message
                         .as_deref()
                         .unwrap_or("its size crossed the warning threshold")
                 ))
-                .foreground(palette.attention())
+                .foreground(ThemeBrush::SystemCritical)
                 .text_wrapping(TextWrapping::Wrap),
             ));
         }
@@ -1696,18 +1678,18 @@ impl DesktopApp {
         {
             context_rows.push(KeyedView::new(
                 "instructions-head",
-                m3::text("Project instructions", tokens::text::LABEL).foreground(palette.muted()),
+                controls::text("Project instructions", tokens::text::LABEL),
             ));
             context_rows.push(KeyedView::new(
                 "instructions",
-                m3::body(lines.join("\n"))
+                controls::body(lines.join("\n"))
                     .text_wrapping(TextWrapping::Wrap)
                     .is_text_selection_enabled(true),
             ));
         }
         items.push(KeyedView::new(
             "context",
-            self.details_section("context", "Context", context_rows, context, palette),
+            self.details_section("context", "Context", context_rows, context),
         ));
 
         // Heavy work: only when heavy episodes were recorded.
@@ -1725,12 +1707,11 @@ impl DesktopApp {
                     "Heavy work",
                     vec![KeyedView::new(
                         "lines",
-                        m3::body(heavy.join("\n"))
+                        controls::body(heavy.join("\n"))
                             .text_wrapping(TextWrapping::Wrap)
                             .is_text_selection_enabled(true),
                     )],
                     context,
-                    palette,
                 ),
             ));
         }
@@ -1760,13 +1741,13 @@ impl DesktopApp {
                 vec![
                     KeyedView::new(
                         "lines",
-                        m3::body(text.clone())
+                        controls::body(text.clone())
                             .text_wrapping(TextWrapping::Wrap)
                             .is_text_selection_enabled(true),
                     ),
                     KeyedView::new(
                         "copy",
-                        m3::text_button(palette)
+                        controls::text_button()
                             .horizontal_alignment(HorizontalAlignment::Left)
                             .automation_name("Copy technical details")
                             .on_click(context.message(Message::Pane(
@@ -1775,11 +1756,10 @@ impl DesktopApp {
                                     text,
                                 ),
                             )))
-                            .content(m3::icon_label(m3::glyph::COPY, "Copy")),
+                            .content(controls::icon_label(controls::glyph::COPY, "Copy")),
                     ),
                 ],
                 context,
-                palette,
             ),
         ));
 

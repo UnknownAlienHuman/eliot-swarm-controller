@@ -23,16 +23,15 @@
 //! context-menu key (`crate::shortcuts`). WinUI gives the menu its keyboard
 //! (arrows, Enter, Esc), light dismiss and placement. Reactor's `MenuItem`
 //! is text only: before the menu opens, `crate::flyout` gives each native
-//! item its glyph (and the danger items the error color) and the menu its
-//! accessible name. Every item, here and in the conversation header's "…",
-//! is a typed [`Action`] with one fixed label; Reactor reports a chosen
+//! item its glyph and the menu its accessible name. Every item, here and in
+//! the conversation header's "…", is a typed [`Action`] with one fixed label; Reactor reports a chosen
 //! item only by that label, the labels are proven distinct at compile time,
 //! and the label maps back to its action, which runs only if the opened
 //! menu offered it. No project or task name is ever an item (the tags item
-//! only shows the current tags). More is a submenu. "Attach to project…" opens its own chooser, a WinUI
-//! `Flyout` at the row ([`DesktopApp::attach_anchor`]) whose rows are keyed
+//! only shows the current tags). More is a submenu. "Attach to project…"
+//! opens its own chooser, a WinUI `Flyout` at the row ([`DesktopApp::attach_anchor`]) whose rows are keyed
 //! by the project's id and checkout, never by its name. All modal
-//! confirmations use the common M3 body/footer and native focus host in
+//! confirmations use the common body/footer and native focus host in
 //! [`super::dialog_ui`].
 //!
 //! Rename writes an owner display name (`[desktop] display_names`); it
@@ -45,7 +44,6 @@
 //! project the settings writer's `projects` section (k92 contract §2).
 
 use super::*;
-use crate::theme::winui::Palette;
 
 /// What a right-click menu acts on, captured when it opened.
 #[derive(Clone, Debug, PartialEq)]
@@ -83,9 +81,9 @@ impl Target {
 }
 
 /// Declares [`Action`] from one list, so every action has exactly one label,
-/// glyph and danger flag, and [`Action::ALL`] lists every variant.
+/// and glyph, and [`Action::ALL`] lists every variant.
 macro_rules! actions {
-    ($($(#[$doc:meta])* $variant:ident => ($label:expr, $glyph:expr, $danger:expr),)*) => {
+    ($($(#[$doc:meta])* $variant:ident => ($label:expr, $glyph:expr),)*) => {
         /// One menu command of a row menu or the conversation header's "…".
         ///
         /// Reactor 0.100.0's `Menu` reports a chosen item only by its label
@@ -118,75 +116,66 @@ macro_rules! actions {
                     $(Action::$variant => $glyph,)*
                 }
             }
-
-            /// Deletes, removes or forces (the error color; a row menu ends
-            /// with it).
-            pub(super) const fn danger(self) -> bool {
-                match self {
-                    $(Action::$variant => $danger,)*
-                }
-            }
         }
     };
 }
 
 actions! {
-    NewTaskHere => ("New task here", m3::glyph::NEW_TASK, false),
-    OpenFolder => ("Open folder", m3::glyph::OPEN_FOLDER, false),
-    Rename => ("Rename", m3::glyph::RENAME, false),
+    NewTaskHere => ("New task here", controls::glyph::NEW_TASK),
+    OpenFolder => ("Open folder", controls::glyph::OPEN_FOLDER),
+    Rename => ("Rename", controls::glyph::RENAME),
     /// Expand a collapsed project.
-    Expand => ("Expand", m3::glyph::CHEVRON_DOWN, false),
+    Expand => ("Expand", controls::glyph::CHEVRON_DOWN),
     /// Collapse a project.
-    Collapse => ("Collapse", m3::glyph::CHEVRON_RIGHT, false),
+    Collapse => ("Collapse", controls::glyph::CHEVRON_RIGHT),
     /// Archive every finished task of the project or subproject.
-    ArchiveFinished => ("Archive finished tasks…", m3::glyph::ARCHIVE, false),
+    ArchiveFinished => ("Archive finished tasks…", controls::glyph::ARCHIVE),
     /// Delete every stopped task of the project or subproject.
-    DeleteStopped => ("Delete stopped tasks…", m3::glyph::DELETE, true),
-    RemoveProject => ("Remove from Swarm…", m3::glyph::DELETE, true),
+    DeleteStopped => ("Delete stopped tasks…", controls::glyph::DELETE),
+    RemoveProject => ("Remove from Swarm…", controls::glyph::DELETE),
     /// The Projects label's "…": archive every finished task.
-    ArchiveAllFinished => ("Archive all finished tasks…", m3::glyph::ARCHIVE, false),
+    ArchiveAllFinished => ("Archive all finished tasks…", controls::glyph::ARCHIVE),
     /// The Projects label's "…": delete every stopped task.
-    DeleteAllStopped => ("Delete all stopped tasks…", m3::glyph::DELETE, true),
+    DeleteAllStopped => ("Delete all stopped tasks…", controls::glyph::DELETE),
     /// The Projects label's "…": remove the projects no task uses.
-    RemoveUnused => ("Remove unused projects…", m3::glyph::DELETE, true),
+    RemoveUnused => ("Remove unused projects…", controls::glyph::DELETE),
     /// "Move under another task…": open the picker.
-    MoveUnder => ("Move under another task…", m3::glyph::MOVE, false),
+    MoveUnder => ("Move under another task…", controls::glyph::MOVE),
     /// "Attach to project…": open the project chooser at the row.
-    AttachMenu => ("Attach to project…", m3::glyph::FOLDER, false),
+    AttachMenu => ("Attach to project…", controls::glyph::FOLDER),
     /// Return the chat to the no-project bucket.
-    Detach => ("Detach from project", m3::glyph::FOLDER, false),
+    Detach => ("Detach from project", controls::glyph::FOLDER),
     /// Edit the Agent's tags inline (the item shows the current tags).
-    EditTags => ("Tags…", m3::glyph::TAG, false),
-    Archive => ("Archive", m3::glyph::ARCHIVE, false),
-    Unarchive => ("Unarchive", m3::glyph::ARCHIVE, false),
+    EditTags => ("Tags…", controls::glyph::TAG),
+    Archive => ("Archive", controls::glyph::ARCHIVE),
+    Unarchive => ("Unarchive", controls::glyph::ARCHIVE),
     /// Resume an ended task in its conversation.
-    Resume => ("Resume", m3::glyph::RESUME, false),
+    Resume => ("Resume", controls::glyph::RESUME),
     /// Stop the Agent itself (it asks first: the Agent's work ends).
-    Stop => ("Stop Agent…", m3::glyph::STOP, false),
+    Stop => ("Stop Agent…", controls::glyph::STOP),
     /// The More submenu (never chosen itself).
-    More => ("More", m3::glyph::MORE, false),
-    Delete => ("Delete…", m3::glyph::DELETE, true),
-    CopyId => ("Copy Agent ID", m3::glyph::COPY, false),
+    More => ("More", controls::glyph::MORE),
+    Delete => ("Delete…", controls::glyph::DELETE),
+    CopyId => ("Copy Agent ID", controls::glyph::COPY),
     /// The conversation header's Copy branch name.
-    CopyBranch => ("Copy branch name", m3::glyph::COPY, false),
+    CopyBranch => ("Copy branch name", controls::glyph::COPY),
     /// The conversation header's Agent details.
-    Details => ("Agent details", m3::glyph::INFO, false),
+    Details => ("Agent details", controls::glyph::INFO),
     /// The conversation header's handoff or switch.
-    Handoff => ("Hand off or switch model…", m3::glyph::FORWARD, false),
+    Handoff => ("Hand off or switch model…", controls::glyph::FORWARD),
     /// Detach Eliot's observer from an observed Agent (header only).
-    DetachObserver => ("Detach", m3::glyph::EXTERNAL, false),
+    DetachObserver => ("Detach", controls::glyph::EXTERNAL),
     /// The conversation header's Force stop (it asks first).
-    ForceStop => ("Force stop…", m3::glyph::STOP, true),
+    ForceStop => ("Force stop…", controls::glyph::STOP),
     /// Details › Goal's Clear (it asks first: the goal ends).
-    ClearGoal => ("Clear goal…", m3::glyph::GOAL, true),
+    ClearGoal => ("Clear goal…", controls::glyph::GOAL),
     /// Home's Start task menu: queue the task (`launch.enqueue`).
-    QueueLaunch => ("Queue it", m3::glyph::SCHEDULE, false),
+    QueueLaunch => ("Queue it", controls::glyph::SCHEDULE),
     /// Home's Start task menu: attach a running native session, which the
     /// desktop does not have yet (shown disabled, the reason in its label).
     AttachSession => (
         "Attach an existing session… (not in the desktop yet: swarm attach)",
-        m3::glyph::EXTERNAL,
-        false
+        controls::glyph::EXTERNAL
     ),
 }
 
@@ -294,8 +283,8 @@ pub(super) fn offers(entries: &[Entry], action: Action) -> bool {
     })
 }
 
-/// How each command of `entries` looks natively: its glyph, danger tint and
-/// display text, by label (`crate::flyout::MenuDress`).
+/// How each command of `entries` looks natively: its glyph and display
+/// text, by label (`crate::flyout::MenuDress`).
 fn entry_looks(entries: &[Entry], looks: &mut Vec<crate::flyout::MenuLook>) {
     for entry in entries {
         let action = entry.action();
@@ -310,7 +299,6 @@ fn entry_looks(entries: &[Entry], looks: &mut Vec<crate::flyout::MenuLook>) {
             label: action.label(),
             display,
             glyph: action.glyph(),
-            danger: action.danger(),
         });
     }
 }
@@ -424,7 +412,7 @@ pub(super) struct MenuState {
     /// An item of the last menu asked for was chosen.
     picked: bool,
     pub(super) hovered: Option<String>,
-    /// The sidebar row holding keyboard focus (`crate::motion`).
+    /// The sidebar row holding keyboard focus (`crate::elements`).
     pub(super) focused: Option<String>,
     /// The target being renamed and the text typed so far.
     pub(super) renaming: Option<(Target, String)>,
@@ -477,7 +465,7 @@ impl DesktopApp {
             MenuMsg::Opened(target) => {
                 // Under the "…" just pressed or invoked; at the pointer
                 // when it cannot be placed.
-                let (x, y) = crate::motion::element_bottom_left(&format!(
+                let (x, y) = crate::elements::element_bottom_left(&format!(
                     "{MORE_ID_PREFIX}{}",
                     target.name_key()
                 ))
@@ -509,13 +497,6 @@ impl DesktopApp {
                     let dress = crate::flyout::MenuDress {
                         name: &name,
                         items: &items,
-                        danger: self.palette().roles().map(|roles| {
-                            (
-                                roles.attention_text.r,
-                                roles.attention_text.g,
-                                roles.attention_text.b,
-                            )
-                        }),
                     };
                     crate::flyout::show_menu_at(
                         crate::flyout::MENU_ANCHOR,
@@ -612,7 +593,7 @@ impl DesktopApp {
                     && self.menu.renaming.is_none()
                     && self.menu.attach.is_none()
                     && self.dialog_kind() == 0
-                    && !crate::motion::focus_row(&open.target.name_key())
+                    && !crate::elements::focus_row(&open.target.name_key())
                 {
                     crate::startup::note("row menu closed: its row could not take focus back");
                 }
@@ -814,8 +795,8 @@ impl DesktopApp {
             self.alert("No registered project to attach this chat to.");
             return;
         }
-        let row = format!("{}agent:{}", crate::motion::ROW_ID_PREFIX, agent.id);
-        let (x, y) = crate::motion::element_bottom_left(&row)
+        let row = format!("{}agent:{}", crate::elements::ROW_ID_PREFIX, agent.id);
+        let (x, y) = crate::elements::element_bottom_left(&row)
             .or_else(|| {
                 self.menu
                     .open
@@ -1244,16 +1225,12 @@ impl DesktopApp {
         entries
     }
 
-    pub(super) fn task_dialog(
-        &self,
-        context: &mut ViewContext<Self>,
-        palette: Palette,
-    ) -> ContentDialog {
+    pub(super) fn task_dialog(&self, context: &mut ViewContext<Self>) -> ContentDialog {
         if let Some((target, action)) = &self.menu.confirm {
-            return self.confirm_dialog(target, *action, context, palette);
+            return self.confirm_dialog(target, *action, context);
         }
         if let Some(dialog) = &self.menu.moving {
-            return self.move_dialog(dialog, context, palette);
+            return self.move_dialog(dialog, context);
         }
         let epoch = self.dialog.epoch;
         ContentDialog::new()
@@ -1306,7 +1283,7 @@ impl DesktopApp {
     /// name is only shown ([`AttachRows`]). Enabled only then (a flyout
     /// opened at a disabled target would disable its content); it is out of
     /// the tab order otherwise.
-    pub(super) fn attach_anchor(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
+    pub(super) fn attach_anchor(&self, context: &mut ViewContext<Self>) -> View {
         let button = Button::new()
             .automation_id(crate::flyout::ATTACH_ANCHOR)
             .width(0.0)
@@ -1319,9 +1296,8 @@ impl DesktopApp {
             return button.is_enabled(false).into();
         };
         // A component: its rows render again only when the projects, the
-        // chat's placement or the palette change, not on every window render.
+        // chat's placement change, not on every window render.
         let content = View::component::<AttachRows>(AttachRowsInput {
-            palette,
             title: self.agent_label(&chooser.agent),
             current: chooser.agent.organization.clone(),
             choices: chooser.choices.clone(),
@@ -1340,7 +1316,6 @@ impl DesktopApp {
         target: &Target,
         action: Action,
         context: &mut ViewContext<Self>,
-        palette: Palette,
     ) -> ContentDialog {
         let (title, body, button) = match target {
             Target::Agent(agent) if action == Action::Stop => (
@@ -1384,22 +1359,23 @@ impl DesktopApp {
         super::dialog_ui::surface(
             context,
             self.dialog.epoch,
-            palette,
             title,
-            m3::secondary(body).text_wrapping(TextWrapping::Wrap).into(),
+            controls::secondary(body)
+                .text_wrapping(TextWrapping::Wrap)
+                .into(),
             super::dialog_ui::actions(
-                m3::text_button(palette)
+                controls::text_button()
                     .element_ref(&self.dialog.close)
                     .automation_name("Cancel")
                     .on_click(context.message(Message::Menu(MenuMsg::Confirmed(false))))
-                    .content(m3::label("Cancel"))
+                    .content(controls::label("Cancel"))
                     .into(),
                 View::from(
-                    m3::destructive(palette)
+                    controls::destructive()
                         .element_ref(&self.dialog.primary)
                         .automation_name(format!("{button}: {}", target.title()))
                         .on_click(context.message(Message::Menu(MenuMsg::Confirmed(true))))
-                        .content(m3::label(button)),
+                        .content(controls::label(button)),
                 ),
             ),
             tokens::layout::DIALOG_WIDTH,
@@ -1411,7 +1387,6 @@ impl DesktopApp {
         &self,
         column: Option<f64>,
         context: &mut ViewContext<Self>,
-        palette: Palette,
     ) -> Option<View> {
         let (agent, _, _) = self.menu.archived.as_ref()?;
         let text = format!("Archived “{}”", self.agent_label(agent));
@@ -1422,7 +1397,7 @@ impl DesktopApp {
                 .max_width(tokens::layout::READING_WIDTH)
                 .horizontal_alignment(HorizontalAlignment::Center)
                 .margin(Thickness::new(0.0, tokens::spacing::SM, 0.0, 0.0))
-                .background(palette.tonal())
+                .background(ThemeBrush::CardBackground)
                 .corner_radius(tokens::radius::CONTAINER)
                 .padding(Thickness::new(
                     tokens::spacing::MD,
@@ -1436,15 +1411,15 @@ impl DesktopApp {
                         .columns([GridLength::STAR, GridLength::Auto, GridLength::Auto])
                         .column_spacing(tokens::spacing::SM)
                         .children((
-                            m3::body(text)
+                            controls::body(text)
                                 .vertical_alignment(VerticalAlignment::Center)
                                 .text_trimming(TextTrimming::CharacterEllipsis),
-                            m3::text_button(palette)
+                            controls::text_button()
                                 .grid_column(1)
                                 .automation_name("Undo archive")
                                 .on_click(context.message(Message::Menu(MenuMsg::UndoArchive)))
-                                .content(m3::label("Undo")),
-                            m3::icon_button(palette)
+                                .content(controls::label("Undo")),
+                            controls::icon_button()
                                 .grid_column(2)
                                 .automation_name("Dismiss")
                                 .on_click(
@@ -1452,7 +1427,7 @@ impl DesktopApp {
                                         None,
                                     ))),
                                 )
-                                .content(m3::icon(m3::glyph::CLOSE)),
+                                .content(controls::icon(controls::glyph::CLOSE)),
                         )),
                 )
                 .into(),
@@ -1471,7 +1446,6 @@ impl DesktopApp {
 /// changes.
 #[derive(Clone, PartialEq)]
 pub(super) struct AttachRowsInput {
-    palette: Palette,
     /// The chat's name.
     title: String,
     /// The project the chat is placed in now.
@@ -1505,7 +1479,6 @@ impl Component for AttachRows {
     }
 
     fn view(&self, input: &AttachRowsInput, context: &mut ViewContext<Self>) -> View {
-        let palette = input.palette;
         let rows: Vec<KeyedView> = input
             .choices
             .iter()
@@ -1514,18 +1487,18 @@ impl Component for AttachRows {
                 let current = input.current.as_deref() == Some(choice.project.as_str());
                 KeyedView::new(
                     format!("{}\u{1f}{}", choice.project, choice.checkout),
-                    m3::row(palette, false)
+                    controls::row(false)
                         .automation_name(format!("{}, {path}", choice.name))
                         .on_click(context.message(Message::Menu(MenuMsg::AttachPicked(
                             choice.project.clone(),
                             choice.checkout.clone(),
                         ))))
-                        .content(m3::row_content(
-                            Some(m3::glyph::FOLDER),
+                        .content(controls::row_content(
+                            Some(controls::glyph::FOLDER),
                             &choice.name,
                             &path,
                             if current {
-                                Some(m3::icon(m3::glyph::CHECK))
+                                Some(controls::icon(controls::glyph::CHECK))
                             } else {
                                 None
                             },
@@ -1538,7 +1511,7 @@ impl Component for AttachRows {
             .spacing(tokens::spacing::XS)
             .automation_name(format!("Attach {} to a project", input.title))
             .children((
-                m3::secondary("Attach to project")
+                controls::secondary("Attach to project")
                     .margin(Thickness::xy(tokens::spacing::INSET, tokens::spacing::XS)),
                 ScrollViewer::new()
                     .max_height(tokens::layout::POPOVER_LIST_HEIGHT)

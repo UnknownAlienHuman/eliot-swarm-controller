@@ -10,21 +10,20 @@
 use windows_reactor::*;
 
 use crate::profiles::{self, FormField};
-use crate::theme::winui::Palette;
 use crate::ui::tokens;
 use eliot_core::api::{ProfileCommandIssue, ProfileSummary, RuleListEntry, TimerSchedule};
 
 /// A note: secondary text, wrapped and selectable.
 fn small(text: impl Into<String>) -> TextBlock {
-    crate::m3::secondary(text)
+    crate::controls::secondary(text)
         .text_wrapping(TextWrapping::Wrap)
         .is_text_selection_enabled(true)
 }
 
 /// A failure note: the secondary size at full emphasis in the error color.
-fn error_note(text: impl Into<String>, palette: Palette) -> TextBlock {
-    crate::m3::text(text, tokens::text::CAPTION)
-        .foreground(palette.attention())
+fn error_note(text: impl Into<String>) -> TextBlock {
+    crate::controls::text(text, tokens::text::CAPTION)
+        .foreground(ThemeBrush::SystemCritical)
         .text_wrapping(TextWrapping::Wrap)
         .is_text_selection_enabled(true)
 }
@@ -121,18 +120,17 @@ fn subagents_card(
     error: Option<(&str, &str)>,
     busy: bool,
     actions: &ProfilesActions,
-    palette: Palette,
 ) -> View {
     let error_for = |key: &str| {
         error
             .filter(|(field, _)| *field == key)
-            .map(|(_, words)| KeyedView::new(format!("error-{key}"), error_note(words, palette)))
+            .map(|(_, words)| KeyedView::new(format!("error-{key}"), error_note(words)))
     };
     let mut rows: Vec<KeyedView> = Vec::new();
 
     let mut start: Vec<KeyedView> = vec![KeyedView::new(
         "title",
-        crate::m3::setting_row(
+        crate::controls::setting_row(
             "Can start",
             "Presets this one may start as Swarm subagents.",
             None,
@@ -156,7 +154,7 @@ fn subagents_card(
                         .min_width(0.0)
                         .automation_name(format!("Can start {child}"))
                         .on_is_checked_changed(crate::views::check_changes(toggled.clone()))
-                        .content(crate::m3::label(&child)),
+                        .content(crate::controls::label(&child)),
                 ));
             }
         }
@@ -182,7 +180,7 @@ fn subagents_card(
     };
     let mut native = vec![KeyedView::new(
         "row",
-        crate::m3::setting_row(
+        crate::controls::setting_row(
             "The agent app's own subagents",
             &native_note,
             switch(
@@ -201,12 +199,12 @@ fn subagents_card(
     ));
 
     let control_row: View = match form.control.as_deref() {
-        None => crate::m3::setting_row(
+        None => crate::controls::setting_row(
             "Manages its subagents through Swarm",
             "Complex value: edit it as TOML",
             None,
         ),
-        Some(control) => crate::m3::setting_row(
+        Some(control) => crate::controls::setting_row(
             "Manages its subagents through Swarm",
             match control {
                 "self" => "Off: its Agents act on themselves only.",
@@ -230,14 +228,14 @@ fn subagents_card(
         "control",
         StackPanel::new().keyed_children(control),
     ));
-    crate::m3::settings_card(palette, rows)
+    crate::controls::settings_card(rows)
 }
 
 /// Models and profiles: one 32-DIP row per profile, the selected profile's
 /// form (a 200-DIP label column; dropdowns sized for their values, text the
 /// full width), and the full TOML source on request. Form and source edit
 /// one draft.
-pub fn profiles_screen(data: ProfilesData<'_>, actions: ProfilesActions, palette: Palette) -> View {
+pub fn profiles_screen(data: ProfilesData<'_>, actions: ProfilesActions) -> View {
     let names = profiles::profile_names(data.draft);
     // A form row with the reason its last change was refused under it,
     // in one card row (no divider between them).
@@ -246,7 +244,7 @@ pub fn profiles_screen(data: ProfilesData<'_>, actions: ProfilesActions, palette
             Some((_, words)) => StackPanel::new()
                 .children((
                     row,
-                    crate::m3::help(words.to_owned()).foreground(palette.attention()),
+                    crate::controls::help(words.to_owned()).foreground(ThemeBrush::SystemCritical),
                 ))
                 .into(),
             None => row,
@@ -263,7 +261,6 @@ pub fn profiles_screen(data: ProfilesData<'_>, actions: ProfilesActions, palette
                 data.field_error,
                 data.busy,
                 &actions,
-                palette,
             )
         });
     let new_preset = data.editable.then(|| {
@@ -275,13 +272,13 @@ pub fn profiles_screen(data: ProfilesData<'_>, actions: ProfilesActions, palette
             "new",
             with_error(
                 profiles::NEW_PRESET_ROW,
-                crate::m3::form_row(
+                crate::controls::form_row(
                     "New preset",
                     Grid::new()
                         .columns([GridLength::STAR, GridLength::Auto])
                         .column_spacing(tokens::spacing::SM)
                         .children((
-                            crate::m3::field()
+                            crate::controls::field()
                                 .text(data.new_name)
                                 .placeholder_text("New preset name")
                                 .automation_name("New preset name")
@@ -292,7 +289,7 @@ pub fn profiles_screen(data: ProfilesData<'_>, actions: ProfilesActions, palette
                                 .grid_column(1)
                                 .keyed_children(vec![KeyedView::new(
                                     format!("harness:{}", data.new_harness),
-                                    crate::m3::enum_width(ComboBox::new())
+                                    crate::controls::enum_width(ComboBox::new())
                                         .items_source(harnesses)
                                         .selected_index(data.new_harness)
                                         .is_enabled(!data.busy)
@@ -302,17 +299,17 @@ pub fn profiles_screen(data: ProfilesData<'_>, actions: ProfilesActions, palette
                         ))
                         .into(),
                     Some(
-                        crate::m3::outlined(palette)
+                        crate::controls::outlined()
                             .is_enabled(!data.busy)
                             .automation_name("Create preset")
                             .on_click(actions.create.clone())
-                            .content(crate::m3::label("Create"))
+                            .content(crate::controls::label("Create"))
                             .into(),
                     ),
                 ),
             ),
         )];
-        crate::m3::settings_card(palette, rows)
+        crate::controls::settings_card(rows)
     });
     let mut rows: Vec<KeyedView> = Vec::new();
     for (index, name) in names.iter().enumerate() {
@@ -322,12 +319,12 @@ pub fn profiles_screen(data: ProfilesData<'_>, actions: ProfilesActions, palette
         let select = actions.select.clone();
         rows.push(KeyedView::new(
             format!("{name}:{selected}"),
-            crate::m3::row(palette, selected)
+            crate::controls::row(selected)
                 .automation_name(format!("Profile {name}: {detail}"))
                 .on_click(move || {
                     select.call(Some(index));
                 })
-                .content(crate::m3::row_content(None, name, &detail, None)),
+                .content(crate::controls::row_content(None, name, &detail, None)),
         ));
     }
     if rows.is_empty() {
@@ -345,7 +342,7 @@ pub fn profiles_screen(data: ProfilesData<'_>, actions: ProfilesActions, palette
     if let Some(name) = data.selected.filter(|_| data.editable) {
         form.push(KeyedView::new(
             "name",
-            crate::m3::section_title(name.to_owned())
+            crate::controls::section_title(name.to_owned())
                 .height(tokens::height::FORM_ROW)
                 .vertical_alignment(VerticalAlignment::Center),
         ));
@@ -357,7 +354,7 @@ pub fn profiles_screen(data: ProfilesData<'_>, actions: ProfilesActions, palette
         {
             form.push(KeyedView::new(
                 "error",
-                error_note(format!("Cannot launch now: {error}"), palette),
+                error_note(format!("Cannot launch now: {error}")),
             ));
         } else if let Some(issue) = data.command_issue {
             form.push(KeyedView::new(
@@ -367,7 +364,6 @@ pub fn profiles_screen(data: ProfilesData<'_>, actions: ProfilesActions, palette
                         "Executable is missing at {}. Omit cmd in the profile source to follow the installed version.",
                         issue.configured_cmd
                     ),
-                    palette,
                 ),
             ));
         }
@@ -376,9 +372,9 @@ pub fn profiles_screen(data: ProfilesData<'_>, actions: ProfilesActions, palette
                 "field-harness",
                 with_error(
                     "harness",
-                    crate::m3::form_row(
+                    crate::controls::form_row(
                         "Agent app",
-                        crate::m3::body(harness.to_owned())
+                        crate::controls::body(harness.to_owned())
                             .automation_name(format!("Profile agent app: {harness}"))
                             .into(),
                         None,
@@ -389,7 +385,7 @@ pub fn profiles_screen(data: ProfilesData<'_>, actions: ProfilesActions, palette
         if let Some(model) = data.model {
             form.push(KeyedView::new(
                 "field-model",
-                with_error("model", crate::m3::form_row("Model", model, None)),
+                with_error("model", crate::controls::form_row("Model", model, None)),
             ));
         }
         for (index, field) in data.fields.iter().enumerate() {
@@ -419,7 +415,7 @@ pub fn profiles_screen(data: ProfilesData<'_>, actions: ProfilesActions, palette
                     Grid::new()
                         .keyed_children(vec![KeyedView::new(
                             format!("{}\u{1f}{selected}", choices.join("\u{1f}")),
-                            crate::m3::enum_width(ComboBox::new())
+                            crate::controls::enum_width(ComboBox::new())
                                 .items_source(choices)
                                 .selected_index(selected)
                                 .is_enabled(!data.busy)
@@ -431,27 +427,27 @@ pub fn profiles_screen(data: ProfilesData<'_>, actions: ProfilesActions, palette
             };
             form.push(KeyedView::new(
                 format!("field-{key}"),
-                with_error(key, crate::m3::form_row(field.label, control, None)),
+                with_error(key, crate::controls::form_row(field.label, control, None)),
             ));
         }
         form.push(KeyedView::new(
             "duplicate",
             with_error(
                 profiles::DUPLICATE_ROW,
-                crate::m3::form_row(
+                crate::controls::form_row(
                     "Duplicate as",
-                    crate::m3::field()
+                    crate::controls::field()
                         .text(data.duplicate_name)
                         .placeholder_text("New preset name")
                         .automation_name("Duplicate as")
                         .on_text_changed(crate::views::text_edits(actions.duplicate_name_changed))
                         .into(),
                     Some(
-                        crate::m3::outlined(palette)
+                        crate::controls::outlined()
                             .is_enabled(!data.busy)
                             .automation_name("Duplicate preset")
                             .on_click(actions.duplicate)
-                            .content(crate::m3::label("Duplicate"))
+                            .content(crate::controls::label("Duplicate"))
                             .into(),
                     ),
                 ),
@@ -469,7 +465,7 @@ pub fn profiles_screen(data: ProfilesData<'_>, actions: ProfilesActions, palette
         "Running Agents keep the settings they started with; the next task uses the saved ones."
             .to_owned()
     };
-    let toggle = crate::m3::text_button(palette)
+    let toggle = crate::controls::text_button()
         .horizontal_alignment(HorizontalAlignment::Left)
         .automation_name(if data.source_open {
             "Hide the TOML source"
@@ -477,13 +473,13 @@ pub fn profiles_screen(data: ProfilesData<'_>, actions: ProfilesActions, palette
             "Edit as TOML"
         })
         .on_click(actions.toggle_source)
-        .content(crate::m3::label(if data.source_open {
+        .content(crate::controls::label(if data.source_open {
             "Hide TOML"
         } else {
             "Edit as TOML"
         }));
     let source: Option<View> = data.source_open.then(|| {
-        crate::m3::field()
+        crate::controls::field()
             .text(data.view)
             .accepts_return(true)
             .text_wrapping(TextWrapping::NoWrap)
@@ -495,17 +491,14 @@ pub fn profiles_screen(data: ProfilesData<'_>, actions: ProfilesActions, palette
             .into()
     });
     // Only shown parts take a place, so no empty child adds a gap.
-    let mut parts = vec![KeyedView::new("profiles", crate::m3::list(palette, rows))];
+    let mut parts = vec![KeyedView::new("profiles", crate::controls::list(rows))];
     if !form.is_empty() {
-        parts.push(KeyedView::new(
-            "form",
-            crate::m3::settings_card(palette, form),
-        ));
+        parts.push(KeyedView::new("form", crate::controls::settings_card(form)));
     }
     if let Some(subagents) = subagents {
         parts.push(KeyedView::new(
             "subagents-title",
-            crate::m3::card_title("Subagents"),
+            crate::controls::card_title("Subagents"),
         ));
         parts.push(KeyedView::new("subagents", subagents));
     }
@@ -903,18 +896,18 @@ pub struct ScriptsActions {
 /// Scripts: pick an entry, edit it (Save replaces the file only while its
 /// revision matches; saving never runs it), open it in an editor, or run
 /// it through a timer that names it. Save is the page's one filled action.
-pub fn scripts_screen(data: ScriptsData<'_>, actions: ScriptsActions, palette: Palette) -> View {
+pub fn scripts_screen(data: ScriptsData<'_>, actions: ScriptsActions) -> View {
     let selected = data.selected.is_some();
-    let refresh = crate::m3::text_button(palette)
+    let refresh = crate::controls::text_button()
         .automation_name("Refresh script list")
         .on_click(actions.refresh)
-        .content(crate::m3::label("Refresh"));
+        .content(crate::controls::label("Refresh"));
     let mut parts: Vec<KeyedView> = Vec::new();
     let no_entries = data.labels.is_empty();
     if no_entries {
         parts.push(KeyedView::new(
             "none",
-            crate::m3::form_row(
+            crate::controls::form_row(
                 "Script",
                 small("No scripts yet. Put them in the scripts folder of Swarm's data folder, or in a project's .eliot\\scripts folder.")
                     .into(),
@@ -924,7 +917,7 @@ pub fn scripts_screen(data: ScriptsData<'_>, actions: ScriptsActions, palette: P
     } else {
         parts.push(KeyedView::new(
             format!("entries:{}", data.labels.join("\u{1f}")),
-            crate::m3::form_row(
+            crate::controls::form_row(
                 "Script",
                 ComboBox::new()
                     .items_source(data.labels)
@@ -941,7 +934,7 @@ pub fn scripts_screen(data: ScriptsData<'_>, actions: ScriptsActions, palette: P
     if !data.unavailable.is_empty() {
         parts.push(KeyedView::new(
             "unavailable",
-            crate::m3::help(format!("Not readable: {}", data.unavailable.join("; "))),
+            crate::controls::help(format!("Not readable: {}", data.unavailable.join("; "))),
         ));
     }
     if selected {
@@ -957,23 +950,23 @@ pub fn scripts_screen(data: ScriptsData<'_>, actions: ScriptsActions, palette: P
             ),
             _ => String::new(),
         };
-        parts.push(KeyedView::new("state", crate::m3::help(state)));
+        parts.push(KeyedView::new("state", crate::controls::help(state)));
         parts.push(KeyedView::new(
             "editor",
-            crate::m3::form_row(
+            crate::controls::form_row(
                 "Editor",
-                crate::m3::field()
+                crate::controls::field()
                     .text(data.editor_exe)
                     .placeholder_text("Editor .exe (absolute path)")
                     .automation_name("Editor executable")
                     .on_text_changed(crate::views::text_edits(actions.editor_changed))
                     .into(),
                 Some(
-                    crate::m3::outlined(palette)
+                    crate::controls::outlined()
                         .is_enabled(data.display_path.is_some())
                         .automation_name("Open in editor")
                         .on_click(actions.open_editor)
-                        .content(crate::m3::label("Open in editor"))
+                        .content(crate::controls::label("Open in editor"))
                         .into(),
                 ),
             ),
@@ -981,7 +974,7 @@ pub fn scripts_screen(data: ScriptsData<'_>, actions: ScriptsActions, palette: P
     }
     let mut page = vec![KeyedView::new(
         "picker",
-        crate::m3::settings_card(palette, parts),
+        crate::controls::settings_card(parts),
     )];
     let mut below: Vec<KeyedView> = Vec::new();
     if selected {
@@ -989,7 +982,7 @@ pub fn scripts_screen(data: ScriptsData<'_>, actions: ScriptsActions, palette: P
         // from the actions under it.
         page.push(KeyedView::new(
             "source",
-            crate::m3::field()
+            crate::controls::field()
                 .text(data.view)
                 .accepts_return(true)
                 .text_wrapping(TextWrapping::NoWrap)
@@ -1005,27 +998,27 @@ pub fn scripts_screen(data: ScriptsData<'_>, actions: ScriptsActions, palette: P
                 .orientation(Orientation::Horizontal)
                 .spacing(tokens::spacing::SM)
                 .children((
-                    crate::m3::filled(palette)
+                    crate::controls::filled()
                         .is_enabled(data.editable && data.dirty && !data.busy)
                         .automation_name("Save script")
                         .on_click(actions.save)
-                        .content(crate::m3::label("Save")),
-                    crate::m3::outlined(palette)
+                        .content(crate::controls::label("Save")),
+                    crate::controls::outlined()
                         .is_enabled(data.editable && !data.busy)
                         .automation_name("Validate script")
                         .on_click(actions.validate)
-                        .content(crate::m3::label("Validate")),
-                    crate::m3::text_button(palette)
+                        .content(crate::controls::label("Validate")),
+                    crate::controls::text_button()
                         .is_enabled(data.dirty && !data.busy)
                         .automation_name("Discard script changes")
                         .on_click(actions.reload)
-                        .content(crate::m3::label("Discard")),
+                        .content(crate::controls::label("Discard")),
                 )),
         ));
         for (index, issue) in data.rule_issues.iter().enumerate() {
             below.push(KeyedView::new(
                 format!("rule-issue-{index}"),
-                error_note(issue.clone(), palette),
+                error_note(issue.clone()),
             ));
         }
         if data.timers.is_empty() && data.rule_issues.is_empty() {
@@ -1037,12 +1030,12 @@ pub fn scripts_screen(data: ScriptsData<'_>, actions: ScriptsActions, palette: P
         for (index, (timer, callback)) in data.timers.iter().zip(actions.run).enumerate() {
             below.push(KeyedView::new(
                 format!("run-{index}"),
-                crate::m3::outlined(palette)
+                crate::controls::outlined()
                     .horizontal_alignment(HorizontalAlignment::Left)
                     .is_enabled(!data.run_busy && !data.dirty)
                     .automation_name(format!("Run via timer {timer}"))
                     .on_click(callback)
-                    .content(crate::m3::label(&format!("Run via timer {timer}"))),
+                    .content(crate::controls::label(&format!("Run via timer {timer}"))),
             ));
         }
     }

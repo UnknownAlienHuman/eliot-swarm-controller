@@ -3,8 +3,8 @@
 //! for their state and keys). The open Agent's effort and usage popovers
 //! are built by the conversation's composer. Every popover is a real
 //! WinUI `Flyout` on its chip ([`DesktopApp::popover_chip`]): its presenter
-//! gives the menu surface, edge, corner, inset and elevation
-//! (`app_resources`), so the content here is the rows alone. A flyout's
+//! gives the menu its surface, edge, corner and inset, so the content here
+//! is the rows alone. A flyout's
 //! content takes no tooltip (Reactor 0.100.0 refuses a tooltip under a
 //! flyout).
 
@@ -15,7 +15,6 @@ use super::launch_ui::{CHAT_PROJECT, OTHER_FOLDER, Pop};
 use super::*;
 use crate::picker::{self, Choice, Item, ItemKind, ManageGroup, Row};
 use crate::settings::Access;
-use crate::theme::winui::Palette;
 
 /// The picker's key hints (OpenCode's footer).
 const PICKER_HINTS: &str = "↑↓ move   ←→ effort   Enter choose   Ctrl+F favorite   Esc close";
@@ -42,7 +41,7 @@ impl DesktopApp {
     pub(super) fn composer_folder_row(&self, context: &mut ViewContext<Self>) -> Option<View> {
         (!self.launch.chat && (self.launch.custom_workspace || self.nav.projects.is_empty())).then(
             || {
-                m3::field()
+                controls::field()
                     .text(self.launch.workspace.clone())
                     .placeholder_text("Folder path")
                     .automation_name("Folder")
@@ -59,31 +58,25 @@ impl DesktopApp {
     }
 
     /// The new task's project chip (it opens the project list).
-    fn project_chip(
-        &self,
-        label_width: f64,
-        context: &mut ViewContext<Self>,
-        palette: Palette,
-    ) -> View {
+    fn project_chip(&self, label_width: f64, context: &mut ViewContext<Self>) -> View {
         let label = self.launch_project_label();
         let open = self.launch.open == Some(Pop::Project);
         let glyph = if self.launch.chat {
-            m3::glyph::CHAT
+            controls::glyph::CHAT
         } else {
-            m3::glyph::OPEN_FOLDER
+            controls::glyph::OPEN_FOLDER
         };
         self.popover_chip(
-            m3::chip(palette)
+            controls::chip()
                 .automation_name(format!(
                     "Project: {label} ({})",
                     if open { "list open" } else { "choose" }
                 ))
                 .on_click(context.callback(|()| Message::Launch(LaunchMsg::Toggle(Pop::Project)))),
-            m3::chip_content(Some(glyph), &label, false, label_width),
+            controls::chip_content(Some(glyph), &label, false, label_width),
             &[Pop::Project],
             FlyoutPlacement::TopEdgeAlignedLeft,
             context,
-            palette,
         )
     }
 
@@ -91,29 +84,28 @@ impl DesktopApp {
     /// or "Work locally"; a click switches between them where the folder
     /// lets it choose, and a project that starts each task in its own
     /// worktree shows that fixed fact.
-    fn place_chip(&self, context: &mut ViewContext<Self>, palette: Palette) -> Option<View> {
+    fn place_chip(&self, context: &mut ViewContext<Self>) -> Option<View> {
         match self.worktree_chip() {
             launch_ui::WorktreeChip::Hidden => None,
             launch_ui::WorktreeChip::Fixed => Some(
-                m3::fixed_chip(
-                    palette,
+                controls::fixed_chip(
                     false,
-                    Some(m3::glyph::WORKTREE),
+                    Some(controls::glyph::WORKTREE),
                     "New worktree",
                     "New worktree: this project starts each task in its own worktree",
                 )
                 .tooltip("This project starts each task in its own worktree."),
             ),
             launch_ui::WorktreeChip::Toggle(on) => Some(
-                m3::chip(palette)
+                controls::chip()
                     .automation_name(if on {
                         "New worktree: the task works in a new worktree (switch to work locally)"
                     } else {
                         "Work locally: the task works in this folder (switch to a new worktree)"
                     })
                     .on_click(context.callback(|()| Message::Launch(LaunchMsg::WorktreeToggled)))
-                    .content(m3::chip_content(
-                        Some(m3::glyph::WORKTREE),
+                    .content(controls::chip_content(
+                        Some(controls::glyph::WORKTREE),
                         if on { "New worktree" } else { "Work locally" },
                         false,
                         tokens::layout::PROJECT_CHIP_WIDTH,
@@ -132,12 +124,7 @@ impl DesktopApp {
     /// tooltip) and the access level (a preset's is read-only). The
     /// project's and the model's labels trim at `label_width` (the
     /// composer's room).
-    pub(super) fn composer_chips(
-        &self,
-        label_width: f64,
-        context: &mut ViewContext<Self>,
-        palette: Palette,
-    ) -> View {
+    pub(super) fn composer_chips(&self, label_width: f64, context: &mut ViewContext<Self>) -> View {
         let auto_profile = self.launch.auto_profile();
         let label = match self.launch.choice {
             Choice::Auto => "Auto".to_owned(),
@@ -145,17 +132,16 @@ impl DesktopApp {
         };
         let model_open = matches!(self.launch.open, Some(Pop::Model | Pop::Manage));
         let model = self.popover_chip(
-            m3::chip(palette)
+            controls::chip()
                 .automation_name(format!(
                     "Model: {} (Ctrl+M)",
                     self.launch.choice.chip_name(auto_profile)
                 ))
                 .on_click(context.callback(|()| Message::Launch(LaunchMsg::Toggle(Pop::Model)))),
-            m3::chip_content(Some(m3::glyph::MODEL), &label, false, label_width),
+            controls::chip_content(Some(controls::glyph::MODEL), &label, false, label_width),
             &[Pop::Model, Pop::Manage],
             FlyoutPlacement::TopEdgeAlignedLeft,
             context,
-            palette,
         );
         // Swarm's pick for Auto in the tooltip (a chip carrying its open
         // flyout takes none).
@@ -169,23 +155,17 @@ impl DesktopApp {
         let access: View = match &self.launch.choice {
             Choice::Model(_) => {
                 let access = self.launch.access();
-                let full = access == Access::Full;
-                // Keyed by level: a chip's colors apply when it is created.
+                // Keyed by level.
                 Grid::new()
                     .keyed_children(vec![KeyedView::new(
                         format!("access:{}", access.wire()),
                         self.popover_chip(
-                            if full {
-                                m3::attention_chip(palette)
-                            } else {
-                                m3::chip(palette)
-                            }
-                            .automation_name(format!("Access: {}", access.label()))
-                            .on_click(
-                                context
-                                    .callback(|()| Message::Launch(LaunchMsg::Toggle(Pop::Access))),
-                            ),
-                            m3::chip_content(
+                            controls::chip()
+                                .automation_name(format!("Access: {}", access.label()))
+                                .on_click(context.callback(|()| {
+                                    Message::Launch(LaunchMsg::Toggle(Pop::Access))
+                                })),
+                            controls::chip_content(
                                 Some(access_glyph(access)),
                                 access.label(),
                                 false,
@@ -194,7 +174,6 @@ impl DesktopApp {
                             &[Pop::Access],
                             FlyoutPlacement::TopEdgeAlignedLeft,
                             context,
-                            palette,
                         ),
                     )])
                     .into()
@@ -213,10 +192,9 @@ impl DesktopApp {
                 };
                 let full = permissions.and_then(SandboxPermissions::parse)
                     == Some(SandboxPermissions::DangerFullAccess);
-                m3::fixed_chip(
-                    palette,
+                controls::fixed_chip(
                     full,
-                    Some(m3::glyph::SHIELD),
+                    Some(controls::glyph::SHIELD),
                     &label,
                     &format!("Access: {label}, set by the preset"),
                 )
@@ -228,8 +206,8 @@ impl DesktopApp {
             .orientation(Orientation::Horizontal)
             .spacing(tokens::spacing::CHIP_GAP)
             .keyed_children(crate::views::slots([
-                Some(self.project_chip(label_width, context, palette)),
-                self.place_chip(context, palette),
+                Some(self.project_chip(label_width, context)),
+                self.place_chip(context),
                 Some(model),
                 Some(access),
             ]))
@@ -239,11 +217,11 @@ impl DesktopApp {
     /// The Home question's project name (`Main.dc.html`'s title button): a
     /// text button in the title's type with its chevron; it opens the same
     /// project list as the composer's chip, under itself.
-    pub(super) fn title_project(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
+    pub(super) fn title_project(&self, context: &mut ViewContext<Self>) -> View {
         let label = self.launch_project_label();
         let open = self.launch.open == Some(Pop::TitleProject);
         self.popover_chip(
-            m3::text_button(palette)
+            controls::text_button()
                 .height(tokens::height::FIELD)
                 .automation_name(format!(
                     "Project: {label} ({})",
@@ -260,17 +238,16 @@ impl DesktopApp {
                     0.0,
                 ))
                 .children((
-                    m3::text(label, tokens::text::HERO)
+                    controls::text(label, tokens::text::HERO)
                         .vertical_alignment(VerticalAlignment::Center)
                         .max_width(tokens::layout::PROJECT_CHIP_WIDTH)
                         .text_trimming(TextTrimming::CharacterEllipsis),
-                    m3::icon(m3::glyph::CHEVRON_DOWN),
+                    controls::icon(controls::glyph::CHEVRON_DOWN),
                 ))
                 .into(),
             &[Pop::TitleProject],
             FlyoutPlacement::Bottom,
             context,
-            palette,
         )
     }
 
@@ -287,13 +264,12 @@ impl DesktopApp {
         pops: &[Pop],
         placement: FlyoutPlacement,
         context: &mut ViewContext<Self>,
-        palette: Palette,
     ) -> View {
         let open = self
             .launch
             .open
             .filter(|pop| pops.contains(pop) && self.launch.preset.is_none());
-        self.anchored_popover(chip, label, open, placement, context, palette)
+        self.anchored_popover(chip, label, open, placement, context)
     }
 
     /// `chip` with its `label` content, carrying the flyout of `open`, if
@@ -305,26 +281,25 @@ impl DesktopApp {
         open: Option<Pop>,
         placement: FlyoutPlacement,
         context: &mut ViewContext<Self>,
-        palette: Palette,
     ) -> View {
         let Some(pop) = open else {
             return chip.content(label).into();
         };
         let content: Option<View> = match pop {
-            Pop::Model => Some(self.model_popover(context, palette)),
-            Pop::Manage => Some(self.manage_popover(context, palette)),
-            Pop::Access => Some(self.access_popover(context, palette)),
-            Pop::Project | Pop::TitleProject => Some(self.project_popover(context, palette)),
-            Pop::Quotas => Some(self.quotas_popover(context, palette)),
-            Pop::Effort => self.effort_popover(context, palette),
-            Pop::Usage => self.usage_popover(context, palette),
+            Pop::Model => Some(self.model_popover(context)),
+            Pop::Manage => Some(self.manage_popover(context)),
+            Pop::Access => Some(self.access_popover(context)),
+            Pop::Project | Pop::TitleProject => Some(self.project_popover(context)),
+            Pop::Quotas => Some(self.quotas_popover(context)),
+            Pop::Effort => self.effort_popover(context),
+            Pop::Usage => self.usage_popover(context),
         };
         chip.automation_id(crate::flyout::POPOVER_ANCHOR)
             .content(label)
             .flyout_with(Flyout::rich(Border::new().maybe_content(content)).placement(placement))
     }
 
-    pub(super) fn model_popover(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
+    pub(super) fn model_popover(&self, context: &mut ViewContext<Self>) -> View {
         let rows = self.picker_rows();
         // Titles are presentation only. Conversation rows and their actions
         // still use the Agent's scoped catalog and exact model ids.
@@ -355,7 +330,7 @@ impl DesktopApp {
                     collapsed,
                 } => items.push(KeyedView::new(
                     format!("{key}:{collapsed}"),
-                    group_heading(group, title, note, *collapsed, 0.0, context, palette),
+                    group_heading(group, title, note, *collapsed, 0.0, context),
                 )),
                 Row::Heading {
                     key, title, note, ..
@@ -376,12 +351,11 @@ impl DesktopApp {
                         *collapsed,
                         tokens::layout::CHECK_COLUMN,
                         context,
-                        palette,
                     ),
                 )),
                 Row::Note { key, text } => items.push(KeyedView::new(
                     key.clone(),
-                    m3::secondary(text.clone())
+                    controls::secondary(text.clone())
                         .text_wrapping(TextWrapping::Wrap)
                         .margin(Thickness::new(
                             tokens::spacing::INSET + tokens::layout::CHECK_COLUMN,
@@ -402,16 +376,16 @@ impl DesktopApp {
                             tokens::spacing::XS,
                         ))
                         .children((
-                            m3::secondary(text.clone())
-                                .foreground(palette.attention())
+                            controls::secondary(text.clone())
+                                .foreground(ThemeBrush::SystemCritical)
                                 .vertical_alignment(VerticalAlignment::Center)
                                 .text_wrapping(TextWrapping::Wrap),
-                            m3::text_button(palette)
+                            controls::text_button()
                                 .grid_column(1)
                                 .is_enabled(!self.launch.catalog_loading)
                                 .automation_name(format!("Retry: {text}"))
                                 .on_click(context.message(Message::Launch(LaunchMsg::CatalogRetry)))
-                                .content(m3::label(if self.launch.catalog_loading {
+                                .content(controls::label(if self.launch.catalog_loading {
                                     "Reading…"
                                 } else {
                                     "Retry"
@@ -434,7 +408,7 @@ impl DesktopApp {
                             .unwrap_or(id),
                         _ => &item.title,
                     };
-                    let choice = self.picker_row(item, title, highlighted, context, palette);
+                    let choice = self.picker_row(item, title, highlighted, context);
                     items.push(KeyedView::new(
                         format!("{}:{}:{title}", item.key, item.current),
                         choice,
@@ -442,7 +416,7 @@ impl DesktopApp {
                 }
             }
         }
-        let field = m3::field()
+        let field = controls::field()
             .element_ref(&self.launch.field_ref)
             .text(self.launch.query.clone())
             .placeholder_text("Search models")
@@ -452,13 +426,13 @@ impl DesktopApp {
             ));
         // OpenCode's sliders button at the right end of the search row: the
         // picker's one filter control (Manage models, and Auto's order).
-        let manage = m3::icon_button(palette)
+        let manage = controls::icon_button()
             .grid_column(1)
             .width(tokens::height::CONTROL)
             .height(tokens::height::CONTROL)
             .automation_name("Manage models")
             .on_click(context.message(Message::Launch(LaunchMsg::ManageOpened)))
-            .content(m3::icon(m3::glyph::SLIDERS));
+            .content(controls::icon(controls::glyph::SLIDERS));
         let search = Grid::new()
             .columns([GridLength::STAR, GridLength::Auto])
             .column_spacing(tokens::spacing::XS)
@@ -474,8 +448,8 @@ impl DesktopApp {
             .children((
                 search,
                 list,
-                m3::divider(palette),
-                m3::secondary(PICKER_HINTS).margin(Thickness::new(
+                controls::divider(),
+                controls::secondary(PICKER_HINTS).margin(Thickness::new(
                     tokens::spacing::SM,
                     0.0,
                     tokens::spacing::SM,
@@ -497,7 +471,6 @@ impl DesktopApp {
         title: &str,
         highlighted: bool,
         context: &mut ViewContext<Self>,
-        palette: Palette,
     ) -> View {
         let enabled = item.disabled.is_none();
         let note = item.disabled.as_deref().unwrap_or(&item.detail);
@@ -531,14 +504,14 @@ impl DesktopApp {
                 name.push_str(value);
             }
         }
-        let mut button = m3::row(palette, false)
+        let mut button = controls::row(false)
             .is_enabled(enabled)
             .automation_name(name)
             .on_click(context.message(Message::Launch(LaunchMsg::PickerChosen(item.key.clone()))));
         if highlighted {
             button = button.element_ref(&self.launch.row_ref);
         }
-        let check: Option<View> = item.current.then(|| m3::icon(m3::glyph::CHECK));
+        let check: Option<View> = item.current.then(|| controls::icon(controls::glyph::CHECK));
         let labels: Vec<_> = [
             (item.default, "Default"),
             (item.favorite, "Favorite"),
@@ -546,7 +519,7 @@ impl DesktopApp {
         ]
         .into_iter()
         .filter(|(show, _)| *show)
-        .map(|(_, label)| KeyedView::new(label, m3::badge(palette, label)))
+        .map(|(_, label)| KeyedView::new(label, controls::badge(label)))
         .collect();
         // The name takes the width it needs (the picker is sized for the
         // widest catalogue name); only the note gives way.
@@ -568,7 +541,7 @@ impl DesktopApp {
                         .text(title)
                         .vertical_alignment(VerticalAlignment::Center)
                         .text_trimming(TextTrimming::CharacterEllipsis),
-                    m3::secondary(note.to_owned())
+                    controls::secondary(note.to_owned())
                         .grid_column(2)
                         .vertical_alignment(VerticalAlignment::Center)
                         .text_trimming(TextTrimming::CharacterEllipsis),
@@ -589,7 +562,7 @@ impl DesktopApp {
                         let selected = item.effort.as_deref() == Some(effort);
                         KeyedView::new(
                             format!("effort:{effort}:{selected}"),
-                            m3::segment(palette, selected)
+                            controls::segment(selected)
                                 .style(ButtonStyle::Subtle)
                                 .height(tokens::height::CHIP)
                                 .min_height(tokens::height::CHIP)
@@ -604,13 +577,11 @@ impl DesktopApp {
                                 .content(chip_text(
                                     picker::effort_label(effort),
                                     &picker::effort_name(effort),
-                                    false,
                                 )),
                         )
                     })
                     .collect();
             Some(effort_chip(
-                palette,
                 StackPanel::new()
                     .orientation(Orientation::Horizontal)
                     .keyed_children(segments),
@@ -621,27 +592,27 @@ impl DesktopApp {
             None if model_row => Some(("Default", DEFAULT_EFFORT.to_owned())),
             None => None,
         } {
-            Some(effort_chip(palette, chip_text(label, &name, true)))
+            Some(effort_chip(chip_text(label, &name)))
         } else {
             None
         };
         let star: Option<View> = if highlighted && enabled && item.model_ref().is_some() {
             let (glyph, action) = if item.favorite {
                 (
-                    m3::glyph::STAR_FILLED,
+                    controls::glyph::STAR_FILLED,
                     format!("Remove {title} from favorites"),
                 )
             } else {
-                (m3::glyph::STAR, format!("Add {title} to favorites"))
+                (controls::glyph::STAR, format!("Add {title} to favorites"))
             };
             Some(
-                m3::icon_button(palette)
+                controls::icon_button()
                     .automation_name(action)
                     .on_click(
                         context
                             .message(Message::Launch(LaunchMsg::PickerFavorite(item.key.clone()))),
                     )
-                    .content(m3::icon(glyph))
+                    .content(controls::icon(glyph))
                     .into(),
             )
         } else {
@@ -666,9 +637,9 @@ impl DesktopApp {
                 .collect::<Vec<_>>(),
             );
         Border::new()
-            .corner_radius(tokens::radius::PILL)
+            .corner_radius(tokens::radius::CONTROL)
             .background(if highlighted {
-                palette.selected()
+                Brush::Theme(ThemeBrush::CardBackground)
             } else {
                 Brush::Solid(Color::transparent())
             })
@@ -688,40 +659,38 @@ impl DesktopApp {
 
     /// The Codex access menu: three levels, each with an icon, a title and
     /// one line of description; Full access in the warning color.
-    fn access_popover(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
+    fn access_popover(&self, context: &mut ViewContext<Self>) -> View {
         let current = self.launch.access();
         let mut rows: Vec<KeyedView> = vec![KeyedView::new(
             "title",
-            m3::secondary("How should the Agent's actions be approved?").margin(Thickness::new(
-                tokens::spacing::INSET,
-                tokens::spacing::XS,
-                tokens::spacing::INSET,
-                tokens::spacing::XS,
-            )),
+            controls::secondary("How should the Agent's actions be approved?").margin(
+                Thickness::new(
+                    tokens::spacing::INSET,
+                    tokens::spacing::XS,
+                    tokens::spacing::INSET,
+                    tokens::spacing::XS,
+                ),
+            ),
         )];
         for (access, refused) in self.access_levels() {
             let highlighted = self.launch.access_highlight == Some(access);
             let selected = access == current;
             let warn = access == Access::Full;
-            let title = m3::body(access.label());
-            let description = m3::secondary(refused.unwrap_or(access.description()))
+            let title = controls::body(access.label());
+            let description = controls::secondary(refused.unwrap_or(access.description()))
                 .text_wrapping(TextWrapping::Wrap);
             let (title, description) = if warn {
                 (
-                    title.foreground(palette.attention()),
-                    description.foreground(palette.attention()),
+                    title.foreground(ThemeBrush::SystemCritical),
+                    description.foreground(ThemeBrush::SystemCritical),
                 )
             } else {
                 (title, description)
             };
             // The icon takes the row's foreground (warning for Full).
-            let icon = m3::icon(access_glyph(access));
+            let icon = controls::icon(access_glyph(access));
             let row = Button::new()
-                .resource_overrides(if warn {
-                    palette.destructive_row(false)
-                } else {
-                    palette.row(false)
-                })
+                .style(ButtonStyle::Subtle)
                 .horizontal_alignment(HorizontalAlignment::Stretch)
                 .horizontal_content_alignment(HorizontalAlignment::Stretch)
                 .is_enabled(refused.is_none())
@@ -748,7 +717,9 @@ impl DesktopApp {
                             Border::new()
                                 .grid_column(2)
                                 .vertical_alignment(VerticalAlignment::Center)
-                                .maybe_content(selected.then(|| m3::icon(m3::glyph::CHECK))),
+                                .maybe_content(
+                                    selected.then(|| controls::icon(controls::glyph::CHECK)),
+                                ),
                         )),
                 );
             rows.push(KeyedView::new(
@@ -758,9 +729,9 @@ impl DesktopApp {
                     refused.is_some()
                 ),
                 Border::new()
-                    .corner_radius(tokens::radius::PILL)
+                    .corner_radius(tokens::radius::CONTROL)
                     .background(if highlighted {
-                        palette.selected()
+                        Brush::Theme(ThemeBrush::CardBackground)
                     } else {
                         Brush::Solid(Color::transparent())
                     })
@@ -778,7 +749,7 @@ impl DesktopApp {
 
     /// The project list: a search field, the registered projects (name and
     /// folder) and "Other folder…".
-    fn project_popover(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
+    fn project_popover(&self, context: &mut ViewContext<Self>) -> View {
         let current = self
             .selected_project()
             .map(|project| project.workspace.clone());
@@ -795,36 +766,36 @@ impl DesktopApp {
                         || (checkout == OTHER_FOLDER && self.launch.custom_workspace)
                 };
                 let glyph = match checkout.as_str() {
-                    OTHER_FOLDER => m3::glyph::OPEN_FOLDER,
-                    CHAT_PROJECT => m3::glyph::CHAT,
-                    _ => m3::glyph::FOLDER,
+                    OTHER_FOLDER => controls::glyph::OPEN_FOLDER,
+                    CHAT_PROJECT => controls::glyph::CHAT,
+                    _ => controls::glyph::FOLDER,
                 };
                 KeyedView::new(
                     format!("{checkout}:{highlighted}:{selected}"),
                     Border::new()
-                        .corner_radius(tokens::radius::PILL)
+                        .corner_radius(tokens::radius::CONTROL)
                         .background(if highlighted {
-                            palette.selected()
+                            Brush::Theme(ThemeBrush::CardBackground)
                         } else {
                             Brush::Solid(Color::transparent())
                         })
                         .content(
-                            m3::row(palette, false)
+                            controls::row(false)
                                 .automation_name(format!("{name}, {path}"))
                                 .on_click(context.message(Message::Launch(
                                     LaunchMsg::ProjectChosen(checkout.clone()),
                                 )))
-                                .content(m3::row_content(
+                                .content(controls::row_content(
                                     Some(glyph),
                                     &name,
                                     &path,
-                                    selected.then(|| m3::icon(m3::glyph::CHECK)),
+                                    selected.then(|| controls::icon(controls::glyph::CHECK)),
                                 )),
                         ),
                 )
             })
             .collect();
-        let search = m3::field()
+        let search = controls::field()
             .element_ref(&self.launch.field_ref)
             .text(self.launch.project_query.clone())
             .placeholder_text("Search projects")
@@ -850,7 +821,7 @@ impl DesktopApp {
     /// OpenCode's Manage models panel: the title and subtitle, a search
     /// field, then each provider group (collapsible, with its group toggle)
     /// and one toggle per model.
-    pub(super) fn manage_popover(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
+    pub(super) fn manage_popover(&self, context: &mut ViewContext<Self>) -> View {
         let groups = match self.launch.catalog.as_ref() {
             Some(Ok(reply)) => {
                 crate::picker::manage_groups(reply, &self.prefs, &self.launch.manage_query)
@@ -863,30 +834,30 @@ impl DesktopApp {
         if self.popover_agent().is_none() && self.launch.preset_target().is_none() {
             rows.push(KeyedView::new(
                 "auto-order",
-                m3::row(palette, false)
+                controls::row(false)
                     .automation_name("Edit Auto order")
                     .on_click(context.message(Message::Shell(ShellMsg::AutoSettings)))
-                    .content(m3::row_content(
-                        Some(m3::glyph::ROUTING),
+                    .content(controls::row_content(
+                        Some(controls::glyph::ROUTING),
                         "Edit Auto order",
                         "Settings › Routing",
-                        m3::icon(m3::glyph::CHEVRON_RIGHT),
+                        controls::icon(controls::glyph::CHEVRON_RIGHT),
                     )),
             ));
         }
         match self.launch.catalog.as_ref() {
             None => rows.push(KeyedView::new(
                 "loading",
-                m3::secondary("Reading the models…"),
+                controls::secondary("Reading the models…"),
             )),
             Some(Err(error)) => rows.push(KeyedView::new(
                 "error",
-                m3::secondary(format!("Models not read: {error}"))
+                controls::secondary(format!("Models not read: {error}"))
                     .text_wrapping(TextWrapping::Wrap),
             )),
             Some(Ok(_)) if groups.is_empty() => rows.push(KeyedView::new(
                 "none",
-                m3::secondary("No models match. Clear the search to see every model.")
+                controls::secondary("No models match. Clear the search to see every model.")
                     .margin(Thickness::xy(tokens::spacing::INSET, tokens::spacing::XS)),
             )),
             Some(Ok(_)) => {}
@@ -897,7 +868,7 @@ impl DesktopApp {
                     "group:{}:{}:{}:{}",
                     group.key, group.collapsed, group.visible, group.shown
                 ),
-                manage_group_row(group, context, palette),
+                manage_group_row(group, context),
             ));
             if group.collapsed {
                 continue;
@@ -921,7 +892,7 @@ impl DesktopApp {
                         .keyed_children(crate::views::slots([
                             None,
                             Some(
-                                m3::body(model.title.clone())
+                                controls::body(model.title.clone())
                                     .grid_column(1)
                                     .vertical_alignment(VerticalAlignment::Center)
                                     .text_trimming(TextTrimming::CharacterEllipsis)
@@ -952,7 +923,7 @@ impl DesktopApp {
             if group.models.len() > MANAGE_GROUP_ROWS {
                 rows.push(KeyedView::new(
                     format!("more:{}", group.key),
-                    m3::secondary(format!(
+                    controls::secondary(format!(
                         "{} more: search to find one.",
                         group.models.len() - MANAGE_GROUP_ROWS
                     ))
@@ -969,19 +940,19 @@ impl DesktopApp {
             .columns([GridLength::Auto, GridLength::STAR])
             .column_spacing(tokens::spacing::SM)
             .children((
-                m3::icon_button(palette)
+                controls::icon_button()
                     .width(tokens::height::CONTROL)
                     .height(tokens::height::CONTROL)
                     .vertical_alignment(VerticalAlignment::Top)
                     .automation_name("Back to the model selector")
                     .on_click(context.message(Message::Launch(LaunchMsg::ManageClosed)))
-                    .content(m3::icon(m3::glyph::BACK)),
+                    .content(controls::icon(controls::glyph::BACK)),
                 StackPanel::new().grid_column(1).children((
-                    m3::section_title("Manage models"),
-                    m3::secondary("Customize which models appear in the model selector"),
+                    controls::section_title("Manage models"),
+                    controls::secondary("Customize which models appear in the model selector"),
                 )),
             ));
-        let search = m3::field()
+        let search = controls::field()
             .element_ref(&self.launch.field_ref)
             .text(self.launch.manage_query.clone())
             .placeholder_text("Search models")
@@ -1007,19 +978,15 @@ impl DesktopApp {
 
 /// A Manage models group row: its chevron and title collapse it; the
 /// switch shows or hides the whole group (OpenCode's Manage models).
-fn manage_group_row(
-    group: &ManageGroup,
-    context: &mut ViewContext<DesktopApp>,
-    palette: Palette,
-) -> View {
+fn manage_group_row(group: &ManageGroup, context: &mut ViewContext<DesktopApp>) -> View {
     let (glyph, state) = if group.collapsed {
-        (m3::glyph::CHEVRON_RIGHT, "collapsed")
+        (controls::glyph::CHEVRON_RIGHT, "collapsed")
     } else {
-        (m3::glyph::CHEVRON_DOWN, "expanded")
+        (controls::glyph::CHEVRON_DOWN, "expanded")
     };
     let count = format!("{} of {} shown", group.shown, group.all.len());
     let key = group.key.clone();
-    let toggle = m3::row(palette, false)
+    let toggle = controls::row(false)
         .automation_name(format!("{}, {count}, {state}", group.title))
         .on_click(context.message(Message::Launch(LaunchMsg::GroupToggled(key.clone()))))
         .content(
@@ -1027,8 +994,8 @@ fn manage_group_row(
                 .columns([GridLength::Auto, GridLength::STAR])
                 .column_spacing(tokens::spacing::SM)
                 .children((
-                    m3::icon(glyph),
-                    Border::new().grid_column(1).content(m3::row_content(
+                    controls::icon(glyph),
+                    Border::new().grid_column(1).content(controls::row_content(
                         None,
                         &group.title,
                         &count,
@@ -1061,15 +1028,15 @@ fn group_heading(
     collapsed: bool,
     indent: f64,
     context: &mut ViewContext<DesktopApp>,
-    palette: Palette,
 ) -> View {
     let (glyph, state) = if collapsed {
-        (m3::glyph::CHEVRON_RIGHT, "collapsed")
+        (controls::glyph::CHEVRON_RIGHT, "collapsed")
     } else {
-        (m3::glyph::CHEVRON_DOWN, "expanded")
+        (controls::glyph::CHEVRON_DOWN, "expanded")
     };
-    let label = m3::section_label(title.to_owned()).font_weight(m3::weight(tokens::text::HEADER));
-    m3::sub_row(palette, false)
+    let label = controls::section_label(title.to_owned())
+        .font_weight(controls::weight(tokens::text::HEADER));
+    controls::sub_row(false)
         .margin(Thickness::new(indent, 0.0, 0.0, 0.0))
         .automation_name(format!("{title} models, {state}"))
         .on_click(context.message(Message::Launch(LaunchMsg::GroupToggled(group.to_owned()))))
@@ -1078,42 +1045,38 @@ fn group_heading(
                 .orientation(Orientation::Horizontal)
                 .spacing(tokens::spacing::SM)
                 .keyed_children(crate::views::slots([
-                    Some(m3::icon(glyph)),
+                    Some(controls::icon(glyph)),
                     Some(label.into()),
-                    (!note.is_empty()).then(|| m3::secondary(note.to_owned()).into()),
+                    (!note.is_empty()).then(|| controls::secondary(note.to_owned()).into()),
                 ])),
         )
         .into()
 }
 
 /// A filled effort chip container, shared by its static tag and segments.
-fn effort_chip(palette: Palette, content: impl Into<View>) -> View {
+fn effort_chip(content: impl Into<View>) -> View {
     Border::new()
         .height(tokens::height::CHIP)
-        .corner_radius(tokens::radius::CHIP)
-        .background(palette.container())
+        .corner_radius(tokens::radius::CONTROL)
+        .background(ThemeBrush::CardBackground)
         .vertical_alignment(VerticalAlignment::Center)
         .content(content)
         .into()
 }
 
 /// The short effort label, named in full words for accessibility.
-fn chip_text(label: &str, name: &str, muted: bool) -> TextBlock {
-    let text = if muted {
-        m3::muted(label.to_owned(), tokens::text::CHIP)
-    } else {
-        m3::text(label.to_owned(), tokens::text::CHIP)
-    };
-    text.automation_name(name)
+fn chip_text(label: &str, name: &str) -> TextBlock {
+    controls::text(label.to_owned(), tokens::text::CHIP)
+        .automation_name(name)
         .margin(Thickness::xy(tokens::spacing::SM, 0.0))
         .vertical_alignment(VerticalAlignment::Center)
 }
 
 fn access_glyph(access: Access) -> &'static str {
     match access {
-        Access::Ask => m3::glyph::LOCK,
-        Access::Auto => m3::glyph::SHIELD,
-        Access::Full => m3::glyph::WARNING,
+        Access::Ask => controls::glyph::LOCK,
+        Access::Auto => controls::glyph::SHIELD,
+        Access::Full => controls::glyph::WARNING,
     }
 }
 
@@ -1131,11 +1094,11 @@ fn heading(title: &str, note: &str) -> View {
         ))
         .keyed_children(crate::views::slots([
             Some(
-                m3::section_label(title.to_owned())
-                    .font_weight(m3::weight(tokens::text::HEADER))
+                controls::section_label(title.to_owned())
+                    .font_weight(controls::weight(tokens::text::HEADER))
                     .into(),
             ),
-            (!note.is_empty()).then(|| m3::secondary(note.to_owned()).into()),
+            (!note.is_empty()).then(|| controls::secondary(note.to_owned()).into()),
         ]))
         .into()
 }
