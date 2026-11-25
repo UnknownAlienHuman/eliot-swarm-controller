@@ -191,7 +191,7 @@ impl Store {
     }
 
     /// Return a bounded page of persisted due timers. The caller computes the
-    /// selected slot outside the Store lock and supplies it to commit_timer_slot.
+    /// selected slot outside the Store lock and supplies it to [`Self::commit_timer_slot_arbitrated`].
     pub fn list_due_timer_states(
         &self,
         principal: &str,
@@ -320,16 +320,6 @@ impl Store {
 
     /// Commit one scheduled slot with its ordinary rule-action child, fixed parent,
     /// action accounting, and numeric cursor in one writer transaction.
-    pub fn commit_timer_slot(
-        &mut self,
-        principal: &str,
-        state: &core::api::TimerStateView,
-        slot: TimerSlotCommit,
-        now: i64,
-    ) -> Result<TimerSlotAdmission> {
-        self.commit_timer_slot_arbitrated(principal, state, slot, None, now)
-    }
-
     pub fn commit_timer_slot_arbitrated(
         &mut self,
         principal: &str,

@@ -28,7 +28,7 @@ impl Store {
     /// the command ran under the frozen snapshot (revision 0). A nonzero
     /// revision without a retained row is corruption, never a silent
     /// snapshot fallback.
-    pub fn get_agent_config(
+    fn get_agent_config(
         &self,
         agent: &str,
         generation: i64,
@@ -166,7 +166,7 @@ impl Store {
     /// Retained configuration view for one turn's exact stamped generation
     /// and revision. `None` when the turn ran under the frozen snapshot.
     /// Reads only retained rows, so later revisions never rewrite it.
-    pub fn turn_config_view(&self, agent: &Agent, turn: &Turn) -> Result<Option<AgentConfigView>> {
+    fn turn_config_view(&self, agent: &Agent, turn: &Turn) -> Result<Option<AgentConfigView>> {
         if turn.config_revision == 0 {
             return Ok(None);
         }

@@ -16,7 +16,7 @@ use serde_json::json;
 use std::collections::{HashMap, HashSet};
 
 const MAX_ACTIVE_BACKGROUND_WAKES: i64 = 1_024;
-pub const MAX_BACKGROUND_WAKE_PAGE: usize = 128;
+const MAX_BACKGROUND_WAKE_PAGE: usize = 128;
 const BACKGROUND_WAKE_RETENTION_MS: i64 = 31 * 24 * 60 * 60 * 1_000;
 const MAX_PRE_ADMISSION_ATTEMPTS: u32 = 5;
 const MAX_DECLARATION_SCAN_ROWS: i64 = 128;
