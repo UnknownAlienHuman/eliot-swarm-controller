@@ -394,7 +394,7 @@ async fn run_owned(
 /// rule seeds, and the attention suspicion window. Nothing here is a live
 /// worker or channel.
 struct DaemonRuntime {
-    store: Arc<Mutex<eliot_store::Store>>,
+    store: crate::rpc_latency::StoreHandle,
     router: Router,
     policy: Arc<SecretPolicy>,
     daemon_config: crate::config::DaemonConfig,
@@ -521,7 +521,7 @@ async fn initialize_runtime(
     logging::record(&policy, "daemon.store_opened", &[], None);
     let capacity_root = data_dir.path().to_path_buf();
     store.set_capacity_policy(move || crate::config::load_scope_limits(&capacity_root));
-    let store = std::sync::Arc::new(Mutex::new(store));
+    let store = Arc::new(crate::rpc_latency::StoreLock::new(store));
     // Settle crash-left pending settings history rows once at startup: reads
     // never reconcile, so this plus the save path cover every pending row.
     {
@@ -1234,12 +1234,13 @@ async fn supervise(
             accepted = listener.accept(), if accept_retry_at.is_none() => {
                 match accepted {
                     Ok(stream) => {
+                        let accepted_at = Instant::now();
                         accept_failures = 0;
                         if connections.len() < MAX_CLIENTS {
                             let router = router.clone();
                             let policy = Arc::clone(&policy);
                             connections.spawn(async move {
-                                serve_connection(stream, router, policy).await;
+                                serve_connection(stream, router, policy, accepted_at).await;
                             });
                         } else {
                             // At the connection limit the request was never read or routed.
@@ -2104,8 +2105,20 @@ fn decode_client_result<R: DeserializeOwned>(method: &str, result: Result<Value>
     serde_json::from_value(result).map_err(|_| Error::new("unknown", context))
 }
 
-async fn serve_connection(stream: IpcStream, router: Router, policy: Arc<SecretPolicy>) {
-    serve_connection_with_write_timeout(stream, router, policy, RESPONSE_WRITE_TIMEOUT).await;
+async fn serve_connection(
+    stream: IpcStream,
+    router: Router,
+    policy: Arc<SecretPolicy>,
+    accepted_at: Instant,
+) {
+    serve_connection_with_write_timeout(
+        stream,
+        router,
+        policy,
+        accepted_at,
+        RESPONSE_WRITE_TIMEOUT,
+    )
+    .await;
 }
 
 /// Refuse one connection past the client limit without reading it into the
@@ -2175,6 +2188,7 @@ async fn serve_connection_with_write_timeout(
     mut stream: IpcStream,
     router: Router,
     policy: Arc<SecretPolicy>,
+    accepted_at: Instant,
     write_timeout: Duration,
 ) {
     let peer = stream.take_local_peer();
@@ -2189,6 +2203,7 @@ async fn serve_connection_with_write_timeout(
     let handle_started = Instant::now();
     let mut measured = false;
     let mut rpc_context = None;
+    let mut store_wait = Duration::ZERO;
     let response = match incoming {
         Ok(Some(Ok(line))) if line.len().saturating_add(1) <= MAX_RPC_FRAME_BYTES => {
             match decode_request(&line) {
@@ -2199,8 +2214,11 @@ async fn serve_connection_with_write_timeout(
                             request.params.get("mode").and_then(Value::as_str),
                             Some("prepare_restart" | "cancel_restart")
                         );
-                    let (result, context) =
-                        router.handle_rpc_with_log_context(&request, peer).await;
+                    let ((result, context), waited) = crate::rpc_latency::measure_store_wait(
+                        router.handle_rpc_with_log_context(&request, peer),
+                    )
+                    .await;
+                    store_wait = waited;
                     let response = match result {
                         Ok(result) => {
                             arm_shutdown = is_shutdown;
@@ -2303,7 +2321,13 @@ async fn serve_connection_with_write_timeout(
             }
         }
     };
-    if !wrote_response {
+    if wrote_response {
+        if let Some(context) = rpc_context.as_ref()
+            && context.principal != "unauthenticated"
+        {
+            router.record_rpc_latency(&context.method, accepted_at.elapsed(), store_wait);
+        }
+    } else {
         let (principal, method) = rpc_context
             .as_ref()
             .map(|context| (context.principal.as_str(), context.method.as_str()))

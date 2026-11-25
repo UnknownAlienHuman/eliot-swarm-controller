@@ -639,6 +639,8 @@ impl HarnessDoctorRequest {
 /// Read-only per-harness installation, version and contract report.
 #[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HarnessDoctorResponse {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rpc_latency: Option<super::RpcLatencyReport>,
     pub harnesses: Vec<DoctorHarnessEntry>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub profile_command_issues: Vec<ProfileCommandIssue>,

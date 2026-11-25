@@ -1281,7 +1281,8 @@ directory and never change checkout refs, index or working files.
 Swarm uses the existing context-note cursor and mail admission. Retained mail
 deduplicates by repository, topic branch and upstream tip. A conflict may wake
 an idle manager under the ordinary mail gates. For a retired base alone,
-waking requires queued input for that manager's bound branch and generation.
+waking requires queued input whose preceding retained Git observation identifies
+that manager's branch, workspace and generation.
 The [Owner settings](configuration.md#daemon-and-automation-settings) control
 delivery and waking. Fetch and rebase decisions remain Owner-controlled.
 

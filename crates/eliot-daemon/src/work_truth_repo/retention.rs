@@ -1,16 +1,16 @@
 use super::{WRITE_LANE, existing, repository_path};
 use crate::git_monitor::GitProbe;
 use eliot_core::{Error, Result};
-use eliot_store::{CheckpointRetentionGeneration, Store};
+use eliot_store::CheckpointRetentionGeneration;
 use std::{collections::HashSet, fmt::Write as _, path::Path, time::Duration};
-use tokio::{sync::Mutex, time::Instant};
+use tokio::time::Instant;
 
 const SCAN_LIMIT: usize = 32;
 const SWEEP_TIME: Duration = Duration::from_secs(15);
 const COLLECTION_TIME: Duration = Duration::from_secs(15);
 
 pub(crate) async fn maintain(
-    store: &Mutex<Store>,
+    store: &crate::rpc_latency::StoreLock,
     data_root: &Path,
     cutoff: Option<i64>,
     after: &mut Option<(i64, i64)>,

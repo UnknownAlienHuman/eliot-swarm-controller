@@ -11,7 +11,7 @@ use std::{
     sync::Arc,
     time::Duration,
 };
-use tokio::sync::{Mutex, watch};
+use tokio::sync::watch;
 
 /// One retention epoch loops bounded passes until a pass deletes nothing
 /// or a budget runs out.
@@ -33,7 +33,7 @@ fn maintenance_join_error(task: &str, error: &tokio::task::JoinError) -> Error {
 }
 
 pub(crate) async fn run(
-    store: Arc<Mutex<Store>>,
+    store: crate::rpc_latency::StoreHandle,
     data_root: PathBuf,
     policy: Arc<SecretPolicy>,
     initial: config::DaemonConfig,
@@ -295,7 +295,7 @@ async fn run_provider_maintenance(
 }
 
 async fn run_retention(
-    store: Arc<Mutex<Store>>,
+    store: crate::rpc_latency::StoreHandle,
     data_root: PathBuf,
     policy: Arc<SecretPolicy>,
     initial: config::DaemonConfig,
@@ -416,7 +416,7 @@ pub(crate) fn store_file_sizes(data_root: &Path) -> (u64, u64) {
 /// rejected reload fails the call so the owner fixes the config instead of
 /// pruning under stale windows.
 pub(crate) async fn run_now(
-    store: &Mutex<Store>,
+    store: &crate::rpc_latency::StoreLock,
     data_root: &Path,
     policy: &Arc<SecretPolicy>,
     now: i64,
@@ -457,7 +457,7 @@ fn checkpoint_cutoff(retention: &config::RetentionConfig, now: i64) -> Option<i6
 /// `stop_requested` is checked at the top of every epoch; the tick wires it
 /// to daemon shutdown, the RPC path stops after its first epoch.
 async fn run_epochs(
-    store: &Mutex<Store>,
+    store: &crate::rpc_latency::StoreLock,
     data_root: &Path,
     retention: &config::RetentionConfig,
     policy: &Arc<SecretPolicy>,
@@ -574,7 +574,7 @@ async fn run_epochs(
 /// Run one retention epoch now: bounded passes under the tick row and
 /// time budgets.
 pub(crate) async fn run_once(
-    store: &Mutex<Store>,
+    store: &crate::rpc_latency::StoreLock,
     retention: &config::RetentionConfig,
     policy: &SecretPolicy,
     now: i64,

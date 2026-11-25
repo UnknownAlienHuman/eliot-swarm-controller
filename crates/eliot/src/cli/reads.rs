@@ -612,6 +612,33 @@ pub(crate) async fn run_doctor(
         print_value(&value, true);
     } else {
         print_doctor_table(&response);
+        if let Some(latency) = &response.rpc_latency {
+            println!(
+                "\nLocal RPC latency (µs, rolling {} s)",
+                latency.window_seconds
+            );
+            for method in &latency.methods {
+                let call = method.duration_us;
+                let wait = method.store_wait_us;
+                println!(
+                    "{}  n={}  total {}/{}/{}  Store wait {}/{}/{}  (p50/p95/max)",
+                    method.method,
+                    method.count,
+                    call.p50,
+                    call.p95,
+                    call.max,
+                    wait.p50,
+                    wait.p95,
+                    wait.max,
+                );
+            }
+            if !latency.slowest.is_empty() {
+                println!("Slowest calls (µs)");
+                for call in &latency.slowest {
+                    println!("{}  {}", call.method, call.duration_us);
+                }
+            }
+        }
         print_foreign_data_dir_aces(&acl_entries);
     }
     Ok(0)

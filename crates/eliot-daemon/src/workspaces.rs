@@ -50,7 +50,7 @@ const CANCEL_TIME: Duration = Duration::from_secs(15);
 const GIT_TIME: Duration = Duration::from_secs(60);
 const PAGE_SIZE: usize = 100;
 
-type StoreHandle = Arc<AsyncMutex<eliot_store::Store>>;
+use crate::rpc_latency::StoreHandle;
 
 pub(crate) struct RemovalPreflight {
     pub(crate) tip: String,

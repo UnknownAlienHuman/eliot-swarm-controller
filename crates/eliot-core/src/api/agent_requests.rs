@@ -842,6 +842,9 @@ impl AgentEditsRequest {
 #[derive(schemars::JsonSchema, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DaemonStatusRequest {
+    /// Include the bounded local RPC latency report.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub rpc_latency: bool,
     /// Include the disk snapshot age and refresh state in the response.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub disk_usage_freshness: bool,

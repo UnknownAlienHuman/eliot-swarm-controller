@@ -15,9 +15,8 @@ use crate::{
     router::Router,
 };
 use eliot_core::{Error, Result, SecretPolicy};
-use eliot_store::{RetainedGeneration, Store};
+use eliot_store::RetainedGeneration;
 use std::{sync::Arc, time::Duration};
-use tokio::sync::Mutex;
 
 const RECHECK: Duration = Duration::from_secs(2);
 
@@ -170,7 +169,7 @@ pub(crate) async fn recheck(context: Reconcile) {
 }
 
 pub(crate) struct Reconcile {
-    pub store: Arc<Mutex<Store>>,
+    pub store: crate::rpc_latency::StoreHandle,
     pub bus: Bus,
     pub router: Router,
     pub policy: Arc<SecretPolicy>,

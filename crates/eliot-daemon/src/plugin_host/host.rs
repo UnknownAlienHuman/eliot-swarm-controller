@@ -182,7 +182,7 @@ pub(crate) type AgentCredentials = Arc<Mutex<HashMap<(String, i64), String>>>;
 
 pub(crate) type UnknownCommands = Arc<Mutex<HashSet<String>>>;
 
-type StoreHandle = Arc<AsyncMutex<eliot_store::Store>>;
+use crate::rpc_latency::StoreHandle;
 
 pub(crate) struct PluginHostOptions {
     data_root: PathBuf,

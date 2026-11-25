@@ -1003,6 +1003,10 @@ When `config.toml` cannot be read, status stays available with a redacted
 [configuration](configuration.md#daemon-and-automation-settings) for the defaults
 and the older-Store conversion.
 
+`daemon.status` accepts `rpc_latency: true` for the optional bounded
+[local RPC latency report](monitoring.md#local-rpc-latency). The CLI requests
+it for JSON status, and `harness.doctor` includes the same report.
+
 `daemon.status` accepts `disk_usage_freshness: true` for the scan start age
 and refresh state described in [monitoring](monitoring.md). Desktop Storage
 requests `disk_usage_scan_window: true` to include the scan end age as well.

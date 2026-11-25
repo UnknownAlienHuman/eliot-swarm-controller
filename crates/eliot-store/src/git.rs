@@ -12,11 +12,29 @@ impl Store {
             .map_err(sql_error)
     }
 
-    pub fn git_base_has_queued_input(&self, agent: &str, generation: i64) -> Result<bool> {
+    /// Require a retained branch observation preceding the queued input's
+    /// admission. A later branch switch alone does not bind earlier work.
+    pub fn git_base_has_queued_input(
+        &self,
+        agent: &str,
+        generation: i64,
+        workspace: &str,
+        branch: &str,
+    ) -> Result<bool> {
         self.connection.query_row(
-            "SELECT EXISTS(SELECT 1 FROM commands WHERE target=?1 AND generation=?2
-             AND state='queued' AND verb='send' AND COALESCE(json_extract(args,'$.notice_kind'),'')<>'mail')",
-            params![parse_agent_id(agent)?, generation], |row| row.get(0),
+            "SELECT EXISTS(SELECT 1 FROM commands c INDEXED BY commands_target
+             WHERE c.target=?1 AND c.generation=?2 AND c.state='queued' AND c.verb='send'
+             AND COALESCE(json_extract(c.args,'$.notice_kind'),'')<>'mail'
+             AND ?4 = (SELECT json_extract(g.data,'$.branch') FROM events g INDEXED BY events_agent
+               WHERE g.agent=c.target AND g.generation=c.generation AND g.kind='git.changed'
+                 AND g.source='git' AND json_extract(g.data,'$.workspace')=?3
+                 AND g.seq < (SELECT e.seq FROM events e INDEXED BY events_agent
+                   WHERE e.agent=c.target AND e.generation=c.generation AND e.source='daemon'
+                     AND e.kind='command.accepted' AND json_extract(e.data,'$.command_id')=
+                         CASE WHEN c.link_kind='send' THEN COALESCE(c.parent_command,c.id) ELSE c.id END
+                   ORDER BY e.seq DESC LIMIT 1)
+               ORDER BY g.seq DESC LIMIT 1))",
+            params![parse_agent_id(agent)?, generation, workspace, branch], |row| row.get(0),
         ).map_err(sql_error)
     }
 

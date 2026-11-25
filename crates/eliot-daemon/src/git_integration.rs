@@ -840,7 +840,7 @@ async fn update_fast_forward(
 
 pub(crate) async fn execute(
     data_root: &Path,
-    store: &Arc<tokio::sync::Mutex<eliot_store::Store>>,
+    store: &crate::rpc_latency::StoreHandle,
     command_id: &str,
     frozen: &FrozenGitIntegrate,
     registration: &ProjectRegistrationView,

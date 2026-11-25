@@ -1586,6 +1586,22 @@ report lists stored unknowns with no live process, turn or reader as
 retained-unresolved — with resolvability and owner action — instead of
 blocking on them; the stored outcome stays `unknown`.
 
+## Local RPC latency
+
+The daemon keeps a process-local rolling sample of authenticated local RPCs
+with successfully written replies. A sample measures transport acceptance
+through reply encoding and write. It also records the sum of waits for the
+shared Store mutex in the request task, including cancelled acquisitions.
+Store execution, independent read-only SQLite connections and background
+workers do not contribute to Store mutex wait.
+
+`swarm status --json` requests the report, and `swarm doctor` includes it.
+Each registered method retains up to its latest 128 samples from the last
+five minutes. Per-method counts describe the retained samples. Durations
+are integer microseconds, and p50 and p95 use nearest rank. The ten slowest
+retained calls contain method and duration only. Sampling adds no per-call
+log lines and resets on daemon restart.
+
 ## Swarm autonomy
 
 [`autonomy.get`](api.md#agent-and-daemon-read-views) reports the Store evidence for
