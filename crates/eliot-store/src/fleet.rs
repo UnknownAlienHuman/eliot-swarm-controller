@@ -454,7 +454,7 @@ impl Store {
         }
         let sql = format!(
             concat!(
-                "WITH {} SELECT a.id AS agent_id, a.generation AS agent_generation,
+                "SELECT a.id AS agent_id, a.generation AS agent_generation,
                     terminal.turn_id AS terminal_id, terminal.outcome AS terminal_outcome,
                     terminal.status AS terminal_status, terminal.usage AS terminal_usage,
                     terminal.resolution_source, usage.snapshot, w.repo_common_dir,
@@ -467,7 +467,7 @@ impl Store {
                     CASE WHEN a.origin = 'native' AND a.observe_only THEN EXISTS(",
                 native_children::native_open_turn_select!("a.id", "a.generation"),
                 ") ELSE 0 END AS native_open_turn,
-                    link.project AS organization, o.tags, o.revision AS organization_revision,
+                    {} AS organization, o.tags, o.revision AS organization_revision,
                     (SELECT substr(json_extract(args, '$.text'), 1, ?2)
                      FROM commands INDEXED BY commands_target
                      WHERE target = a.id AND verb = 'send' AND json_type(args, '$.text') = 'text'
@@ -492,16 +492,13 @@ impl Store {
              LEFT JOIN session_usage usage ON usage.agent = a.id AND usage.generation = a.generation
              LEFT JOIN workspaces w ON w.agent = a.id
              LEFT JOIN chat_organization o ON o.agent = a.id
-             LEFT JOIN organization_links link ON link.agent=a.id
              LEFT JOIN source_state source ON source.agent = a.id
                  AND source.generation = a.generation AND source.source = 'git'
                  AND a.workspace IS NOT NULL
              LEFT JOIN git_work_state work ON work.workspace = a.workspace
                  AND source.health NOT IN ('error', 'stale') AND source.last_store_seq IS NOT NULL"
             ),
-            organization::organization_links_sql(
-                "SELECT json_extract(value, '$[0]') FROM json_each(?1)"
-            )
+            organization::organization_group()
         );
         let mut statement = self.connection.prepare_cached(&sql).map_err(sql_error)?;
         statement
