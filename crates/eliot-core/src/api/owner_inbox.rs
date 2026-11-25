@@ -173,16 +173,21 @@ impl OwnerInboxRequest {
     pub fn effective_limit(&self) -> Result<usize> {
         let limit = self.limit.unwrap_or(50);
         if !(1..=Self::MAX_ROWS).contains(&limit)
-            || self.after.as_ref().is_some_and(|after| {
-                !valid_key(after)
-                    || !after
-                        .split_once('/')
-                        .is_some_and(|(priority, _)| matches!(priority, "0" | "1" | "2" | "3"))
-            })
+            || self.after.as_ref().is_some_and(|after| !valid_key(after))
         {
             return Err(Error::new("invalid", "invalid owner inbox page"));
         }
         Ok(limit)
+    }
+
+    /// Earlier inbox cursors use kind/subject and cannot resume blocker
+    /// ordering. The server starts those requests at the first page.
+    pub fn into_page_after(self) -> Option<String> {
+        self.after.filter(|after| {
+            after
+                .split_once('/')
+                .is_some_and(|(priority, _)| matches!(priority, "0" | "1" | "2" | "3"))
+        })
     }
 }
 

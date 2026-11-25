@@ -860,7 +860,7 @@ choice's displayed input fields. The same decision ID and payload reuse the
 same inner mutation ID. [Owner inbox DTOs](../../crates/eliot-core/src/api/owner_inbox.rs)
 
 Lost, failed, stopped, archived and handed-off Agents leave no general
-lifecycle reminder in the inbox. The Owner can still inspect an Agent and
+lifecycle reminder in the inbox. An explicit Owner Resume that failed or\nwas rejected leaves one item for a stopped, failed or lost Agent until a\nnewer non-cancelled Resume, a new generation, archiving or handoff\nsupersedes it. The item shows the exact latest failure and its receipt.\nThe Owner can still inspect an Agent and
 its latest failed Resume through `agent.get`, and inspect each exact command
 receipt. Open requests and ordinary Goal items require a current subject.
 Work-at-risk and unknown outcomes keep their own items. An applied handoff
@@ -882,8 +882,7 @@ subjects. The aged page filters subjects before grouping.
 The projection orders work blockers before other unknown outcomes and
 work-at-risk, then recommendations and remaining notices. Kind and stable
 subject or cause identity break ties. `after` is an exclusive opaque cursor
-from `next`. Clients with a cursor from the previous ordering restart at the
-first page. The reader bounds the page to `limit + 1` rows while folding
+from `next`. The server restarts at the first page for an old kind/subject cursor. The reader bounds the page to `limit + 1` rows while folding
 routing groups and counts in the same read snapshot. No Owner key is required.
 
 For a missing worktree with a retained checkpoint, the inbox instructions include

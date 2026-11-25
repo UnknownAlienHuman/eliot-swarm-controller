@@ -120,6 +120,7 @@ pub(super) fn project_into(
     project_harness_checks(connection, now, items, &mut liveness, &[])?;
     super::auth_login::project_harness_auth(connection, now, items, &mut liveness, &[])?;
     project_agents(connection, now, items, &mut liveness, &[])?;
+    project_resume_failures(connection, now, items, &mut liveness, &[])?;
     project_goals(connection, now, items, &mut liveness, &[])?;
     project_launch_intents(connection, now, items, &mut liveness, &[])?;
     project_assignment_waits(connection, now, items, &mut liveness, &[])?;
@@ -174,7 +175,7 @@ pub(crate) fn project_item(
         OwnerInboxKind::Hold => (project_holds, subject),
         OwnerInboxKind::HarnessCheck => (project_harness_checks, subject),
         OwnerInboxKind::HarnessAuth => (super::auth_login::project_harness_auth, subject),
-        OwnerInboxKind::Agent => return Ok(None),
+        OwnerInboxKind::Agent => (project_resume_failures, subject),
         OwnerInboxKind::BlockedGoal => (project_goals, subject),
         OwnerInboxKind::Handoff => (project_handoffs, subject),
         OwnerInboxKind::WorkNotInGit => (project_work_not_in_git, subject),
@@ -1448,6 +1449,109 @@ fn project_harness_checks(
             None,
             Vec::new(),
         ));
+    }
+    Ok(())
+}
+
+/// A failed Owner-requested Resume still needs a decision after the Agent
+/// stops. Only the newest non-cancelled Resume can open that decision.
+fn project_resume_failures(
+    db: &Connection,
+    now: i64,
+    items: &mut dyn OwnerInboxItemSink,
+    stats: &mut SwarmLiveness,
+    bindings: &[&dyn ToSql],
+) -> eliot_core::Result<()> {
+    let mut stmt = projection_query(
+        db,
+        "SELECT a.id,a.generation,c.id,c.updated_at,
+             a.state <> 'stopped' AND length(trim(a.native_scope)) > 0
+               AND length(trim(a.native_ref)) > 0 AND a.active_turn IS NULL
+               AND NOT EXISTS (SELECT 1 FROM commands start WHERE start.target=a.id
+                   AND (start.generation=a.generation OR start.expected_generation=a.generation)
+                   AND start.verb IN ('launch','resume')
+                   AND start.state IN ('accepted','queued','dispatched'))
+               AND NOT EXISTS (SELECT 1 FROM processes p WHERE p.owner IN
+                 ('agent:a'||a.id||'#'||a.generation,'workspace:a'||a.id||'#'||a.generation)
+                 AND p.state IN ('running','unknown'))
+         FROM commands c INDEXED BY owner_inbox_resume_tip
+         CROSS JOIN agents a ON a.id=c.target AND a.generation=c.generation
+         WHERE c.verb='resume' AND c.principal='owner' AND c.state<>'cancelled'
+           AND c.state IN ('failed','rejected')
+           AND a.state IN ('stopped','failed','lost') AND a.archived=0 AND a.observe_only=0
+           AND json_type(a.profile_snapshot,'$._harness_check') IS NULL
+           AND NOT EXISTS (SELECT 1 FROM agent_successors s
+               WHERE s.agent=a.id AND s.generation=a.generation)
+           AND c.id=(SELECT newest.id FROM commands newest INDEXED BY owner_inbox_resume_tip
+             WHERE newest.target=a.id AND newest.generation=a.generation
+               AND newest.verb='resume' AND newest.principal='owner' AND newest.state<>'cancelled'
+             ORDER BY newest.created_at DESC,newest.rowid DESC LIMIT 1)",
+        "a.id=?1",
+        bindings,
+    )?;
+    let rows = stmt
+        .query_map(bindings, |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, Option<bool>>(4)?.unwrap_or(false),
+            ))
+        })
+        .map_err(sql_error)?;
+    for row in rows {
+        let (agent, generation, id, since, resume_safe) = row.map_err(sql_error)?;
+        let command = super::load_command(db, &id)?.ok_or_else(|| {
+            crate::Error::new("source_integrity", "retained Resume failure disappeared")
+        })?;
+        let failure = eliot_core::api::AgentResumeFailure::from_command(&command)?;
+        let subject = format!("a{agent}");
+        let recommended =
+            (resume_safe && crate::unknown_start_command(db, agent)?.is_none()).then(|| {
+                action(
+                    "resume",
+                    "command.submit",
+                    json!({
+                        "verb":"resume","target":subject,"expected_generation":generation,"args":{}
+                    }),
+                )
+            });
+        let choices = recommended
+            .iter()
+            .cloned()
+            .chain([
+                action("inspect_agent", "agent.get", json!({"id":subject})),
+                action("inspect_command", "command.get", json!({"id":id})),
+            ])
+            .collect();
+        let seq = agent_inbox_revision_seq(db, agent, generation)?;
+        let mut projected = item(
+            OwnerInboxKind::Agent,
+            subject,
+            format!("g{generation}:resume:{id}:event:{seq}"),
+            now,
+            since,
+            "resume_failed",
+            recommended,
+            choices,
+        );
+        projected.blocks_work = true;
+        projected.detail = Some(match failure.detail {
+            Some(detail) => format!(
+                "Resume generation {generation} failed: {} — {detail}",
+                failure.reason
+            ),
+            None => format!("Resume generation {generation} failed: {}", failure.reason),
+        });
+        tally(
+            stats,
+            &Mover::Asked {
+                reason: "resume_failed",
+                item: OwnerInboxKind::Agent,
+            },
+        );
+        items.push(projected);
     }
     Ok(())
 }
