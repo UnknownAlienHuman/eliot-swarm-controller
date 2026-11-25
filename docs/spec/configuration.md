@@ -392,8 +392,9 @@ same validation applies to text read for delivery.
 `settings.read` includes `default_commit_only` in the `owner_rules` section only
 when it is explicitly configured, preserving the distinction between an unset
 value and explicit `true` or `false`. `settings.save` updates the keys supplied
-in `owner_rules` and keeps the rest. Clearing `text` preserves an explicit
-`default_commit_only` value.
+in `owner_rules` and keeps the rest. A `{}` patch keeps a valid section and its
+revision. Clearing `text` or sending an empty patch preserves an explicit
+`default_commit_only = false` until that key is edited.
 
 The Agent's Store record contains delivery metadata. `agent.get` and
 `swarm show` expose revision, digest, delivery method, status and delivered flag.
