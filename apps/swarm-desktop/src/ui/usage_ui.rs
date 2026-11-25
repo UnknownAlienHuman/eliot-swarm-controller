@@ -1,8 +1,7 @@
 //! The sidebar's Usage row and its popover (`Sidebar.dc.html` footer,
 //! `Hold.dc.html`; skeleton 5.12): the row shows the static Usage mark
 //! (§4.2) and a short word of the tightest harness window it knows ("Codex
-//! 62% · 1 hold"); it
-//! opens a real WinUI `Flyout` beside the sidebar
+//! 62% · 1 hold"); it opens a real WinUI `Flyout` beside the sidebar
 //! ([`DesktopApp::anchored_popover`], `Pop::Quotas`) that lists each
 //! harness's tightest window (its share left, when it resets, a meter that
 //! turns `error` under 20 %), "Quota unknown" where none is reported (never
