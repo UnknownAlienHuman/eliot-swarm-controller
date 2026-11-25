@@ -1181,22 +1181,23 @@ An unfamiliar method cannot establish a native turn binding.
 for an exact owned thread and generation, independently of turn state. Codex
 0.167.1 `warning` has an optional `threadId` and no turn ID, so a warning is
 thread-scoped, including after its turn has ended; it is never attached to a
-guessed or active turn. Codex supplies cumulative per-code counts with a bounded
-code inventory and the redacted, UTF-8-bounded message. A missing or mismatched
+guessed or active turn. Each notice is one occurrence: the adapter sends a
+unit count with a bounded code inventory and the redacted, UTF-8-bounded
+message. A missing or mismatched
 thread binding increments `unbound_warnings_dropped` in the native snapshot and
 retains no warning text. Malformed warning and startup-status payloads increment
 `malformed_warnings_dropped` and retain no payload text. Codex supplies no native
 identity for these notifications. The adapter assigns a content ID from the
 exact thread and a deterministic digest of the full redacted native code and
-message before display aggregation or truncation; the local count is excluded
-and no extra fields enter the persisted warning. Store accepts the neutral
+message before display aggregation or truncation; the occurrence count is
+excluded and no extra fields enter the persisted warning. Store accepts the neutral
 `native-warning-content:` marker only for a typed singleton stream warning on
 the current thread. A matching retained row for the same Agent and
 `stream` source returns its original one-event sequence as the acknowledgement without
 republishing, including when the same thread is reattached in a later
 generation. Count changes and the `other` display bucket do not alter identity.
-The retained row advances to the highest observed occurrence count, so repeated
-identical notices are counted in place without a second event.
+The retained row adds each incoming unit count, so repeated identical notices
+are counted in place without a second event and the total survives restarts.
 Legacy warning IDs keep their existing receipt behavior. Deduplication lasts
 only while the matching warning row is retained under the configured event-retention
 window; pruning that row permits a later identical warning to be admitted again. Different Agents, native threads,

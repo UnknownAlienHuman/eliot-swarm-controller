@@ -1005,7 +1005,7 @@ impl Router {
             return Ok(());
         }
         let now = now_ms();
-        let observations = {
+        let range = {
             let Ok(store) = tokio::time::timeout_at(deadline.into(), self.inner.store.lock()).await
             else {
                 return Ok(());
@@ -1019,11 +1019,18 @@ impl Router {
                 response.fetched_at_ms,
             )?
         };
+        if range.truncated {
+            // The bounded sparse range is incomplete: a partial overlay would
+            // present stale windows as live, so every projected window is
+            // unknown instead.
+            eliot_core::api::harness::mark_quota_windows_unknown(details, projection);
+            return Ok(());
+        }
         if login.is_current() {
             // A sparse watch update does not refresh the full read's timestamp
             // or its ordinary-usage authorization. Hold release still requires
             // the actual read to be newer than the hold.
-            for observation in observations {
+            for observation in range.observations {
                 Self::overlay_quota_windows(details, &observation, projection);
             }
         }

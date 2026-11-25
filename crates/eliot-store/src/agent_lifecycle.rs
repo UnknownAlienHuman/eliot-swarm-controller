@@ -1058,6 +1058,16 @@ fn delete_tree_tx(tx: &Transaction<'_>, members: &[i64], now: i64) -> Result<()>
     Ok(())
 }
 
+/// Bounded sparse quota update range. `truncated` means the final page was
+/// full, so more rows may follow the returned observations.
+pub struct QuotaObservationRange {
+    pub observations: Vec<core::api::harness::QuotaObservation>,
+    pub truncated: bool,
+}
+
+/// Maximum sparse quota pages per read; more rows mark the range truncated.
+const MAX_QUOTA_PAGES: usize = 16;
+
 impl Store {
     pub fn latest_quota_observation(
         &self,
@@ -1068,10 +1078,14 @@ impl Store {
     ) -> Result<Option<core::api::harness::QuotaObservation>> {
         Ok(self
             .quota_observations(harness, route_identity, snapshot, now, None)?
+            .observations
             .pop())
     }
 
-    /// Read the complete sparse update sequence since a confirmed read, oldest first.
+    /// Read the bounded sparse update sequence since a confirmed read, oldest
+    /// first. At most [`MAX_QUOTA_PAGES`] pages are read; `truncated` tells
+    /// the caller to mark the affected windows unknown instead of applying
+    /// a partial range.
     pub fn quota_observations_after(
         &self,
         harness: &str,
@@ -1080,7 +1094,7 @@ impl Store {
         now: i64,
         login_changed_at: i64,
         fetched_at: i64,
-    ) -> Result<Vec<core::api::harness::QuotaObservation>> {
+    ) -> Result<QuotaObservationRange> {
         self.quota_observations(
             harness,
             route_identity,
@@ -1097,9 +1111,15 @@ impl Store {
         snapshot: &Value,
         now: i64,
         read_bound: Option<(i64, i64)>,
-    ) -> Result<Vec<core::api::harness::QuotaObservation>> {
+    ) -> Result<QuotaObservationRange> {
         self.ensure_committed_reads()?;
         const MAX_ROLLING_UPDATES: i64 = 64;
+        let complete = |observations| {
+            Ok(QuotaObservationRange {
+                observations,
+                truncated: false,
+            })
+        };
         let Some((login_changed_at, observed_after)) = read_bound else {
             let mut query = self.connection.prepare_cached(
                 "SELECT e.data FROM events e JOIN agents a ON a.id=e.agent
@@ -1121,21 +1141,25 @@ impl Store {
                 .map_err(sql_error)?
                 .collect::<rusqlite::Result<Vec<_>>>()
                 .map_err(sql_error)?;
-            return rows
-                .into_iter()
-                .rev()
-                .map(decode_quota_observation)
-                .collect();
+            return complete(
+                rows.into_iter()
+                    .rev()
+                    .map(decode_quota_observation)
+                    .collect::<Result<_>>()?,
+            );
         };
         // Page ascending from the read bound so every sparse update applies in
-        // order, however many follow the full read. The cursor is the last
-        // returned (observedAtMs, seq) pair; seq is globally unique, so pages
-        // neither overlap nor skip. Starting past every sequence at the bound
-        // timestamp keeps the read bound strict on the first page.
+        // order, up to MAX_QUOTA_PAGES. The cursor is the last returned
+        // (observedAtMs, seq) pair; seq is globally unique, so pages neither
+        // overlap nor skip. Starting past every sequence at the bound
+        // timestamp keeps the read bound strict on the first page. A full
+        // final page means more rows may follow: stop and report the range
+        // truncated so the caller marks the affected windows unknown instead
+        // of applying a partial range.
         let mut observations = Vec::new();
         let mut cursor_ms = observed_after;
         let mut cursor_seq = i64::MAX;
-        loop {
+        for _ in 0..MAX_QUOTA_PAGES {
             let mut query = self.connection.prepare_cached(
                 "SELECT e.data, e.seq FROM events e JOIN agents a ON a.id=e.agent
              WHERE e.kind='quota.observed' AND a.harness=?1 AND a.generation=e.generation
@@ -1180,10 +1204,13 @@ impl Store {
                 observations.push(observation);
             }
             if !page_full {
-                break;
+                return complete(observations);
             }
         }
-        Ok(observations)
+        Ok(QuotaObservationRange {
+            observations,
+            truncated: true,
+        })
     }
 }
 

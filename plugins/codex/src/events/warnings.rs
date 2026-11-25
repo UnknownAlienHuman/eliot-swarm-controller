@@ -3,7 +3,7 @@ use eliot_core::{
 };
 use serde::Deserialize;
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::HashSet;
 
 const MAX_WARNING_CODES: usize = 16;
 
@@ -27,7 +27,7 @@ struct StartupStatus {
 
 #[derive(Default)]
 pub(super) struct Warnings {
-    counts: HashMap<String, u64>,
+    seen_codes: HashSet<String>,
     malformed_dropped: u64,
     unbound_dropped: u64,
 }
@@ -125,20 +125,21 @@ impl Warnings {
         let truncated = message.len() > MAX_NATIVE_WARNING_BYTES;
         let id = NativeWarning::stable_id_for_fields(thread, code, &message, truncated)?;
         let published_code =
-            if !self.counts.contains_key(code) && self.counts.len() >= MAX_WARNING_CODES - 1 {
+            if !self.seen_codes.contains(code) && self.seen_codes.len() >= MAX_WARNING_CODES - 1 {
                 "other"
             } else {
                 code
             };
-        let count = self.counts.entry(published_code.to_owned()).or_default();
-        *count = count.saturating_add(1);
+        self.seen_codes.insert(published_code.to_owned());
         if truncated {
             message.truncate(message.floor_char_boundary(MAX_NATIVE_WARNING_BYTES));
         }
+        // One notice is one occurrence. The Store counts repeats in the
+        // retained row, so the total survives plugin restarts.
         let warning = NativeWarning {
             thread_id: thread.to_owned(),
             code: published_code.to_owned(),
-            count: *count,
+            count: 1,
             message,
             truncated,
         };
