@@ -400,7 +400,13 @@ impl Router {
             to: vec![agent.to_owned()],
             mode: MailMode::Queue,
             wake: config.wake
-                && (!conflicts.is_empty() || store.git_base_has_queued_input(agent, generation)?),
+                && (!conflicts.is_empty()
+                    || store.git_base_has_queued_input(
+                        agent,
+                        generation,
+                        &moved.workspace,
+                        &moved.branch,
+                    )?),
             text: eliot_core::swarm_note(
                 &self.secret_policy_snapshot().redact_text(&text),
                 SWARM_MAIL_SENDER,
