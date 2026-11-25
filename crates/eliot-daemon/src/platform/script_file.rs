@@ -32,6 +32,16 @@ pub(crate) struct Directory {
     pub(crate) path: PathBuf,
 }
 
+#[cfg(unix)]
+const STAGED_FILE: &str = "data";
+
+struct StagedFile {
+    #[cfg(unix)]
+    directory: File,
+    name: String,
+    file: File,
+}
+
 impl Directory {
     pub(crate) fn open(path: &Path) -> Result<Self> {
         if !path.is_absolute() {
@@ -229,6 +239,51 @@ impl Directory {
             .map_err(|_| refused())
     }
 
+    fn stage_file(&self) -> Result<StagedFile> {
+        #[cfg(unix)]
+        {
+            let name = format!(".{}.stage", ulid::Ulid::new());
+            let directory = native::open(self.handle(), name.as_ref(), true, true).map_err(io)?;
+            // Another writer can substitute a directory between mkdir and open.
+            // Verify that it is private and owned before staging any bytes.
+            if !native::stage_is_private(&directory).map_err(io)? {
+                native::remove_stage_dir(self.handle(), &directory, &name);
+                return Err(refused());
+            }
+            let file = match native::open(&directory, STAGED_FILE.as_ref(), false, true) {
+                Ok(file) => file,
+                Err(error) => {
+                    native::remove_stage_dir(self.handle(), &directory, &name);
+                    return Err(io(error));
+                }
+            };
+            Ok(StagedFile {
+                directory,
+                name,
+                file,
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            let name = format!(".{}.tmp", ulid::Ulid::new());
+            let file = native::open(self.handle(), name.as_ref(), false, true).map_err(io)?;
+            Ok(StagedFile { name, file })
+        }
+    }
+
+    fn clean_stage(&self, stage: &StagedFile, discard: bool) {
+        #[cfg(unix)]
+        if discard {
+            native::remove_staged(self.handle(), &stage.directory, &stage.name, STAGED_FILE);
+        } else {
+            native::remove_stage_dir(self.handle(), &stage.directory, &stage.name);
+        }
+        #[cfg(not(unix))]
+        if discard {
+            native::remove(self.handle(), &stage.file, &stage.name);
+        }
+    }
+
     /// Temp write/sync precedes the final handle identity/revision recheck.
     /// Caller holds the daemon save mutex through this entire operation.
     pub(crate) fn replace(
@@ -244,39 +299,11 @@ impl Directory {
         let original_owner = (original_metadata.uid(), original_metadata.gid());
         #[cfg(unix)]
         let preserved = original_metadata.mode() & 0o777;
-        #[cfg(unix)]
-        let stage_name = format!(".{}.stage", ulid::Ulid::new());
-        #[cfg(unix)]
-        let stage = native::open(self.handle(), stage_name.as_ref(), true, true).map_err(io)?;
-        // The staging mkdir and open are separate operations, and another
-        // writer on the shared scripts directory can substitute a real
-        // directory between them (`O_NOFOLLOW` accepts that directory).
-        // Verify the opened directory is a private directory this process
-        // owns before writing anything into it; a substituted entry fails
-        // here and is never staged into.
-        #[cfg(unix)]
-        if !native::stage_is_private(&stage).map_err(io)? {
-            native::remove_stage_dir(self.handle(), &stage, &stage_name);
-            return Err(refused());
-        }
-        #[cfg(unix)]
-        let temp_name = "data";
-        #[cfg(unix)]
-        let mut temp = match native::open(&stage, temp_name.as_ref(), false, true) {
-            Ok(file) => file,
-            Err(error) => {
-                native::remove_stage_dir(self.handle(), &stage, &stage_name);
-                return Err(io(error));
-            }
-        };
-        #[cfg(not(unix))]
-        let temporary = format!(".{}.tmp", ulid::Ulid::new());
-        #[cfg(not(unix))]
-        let mut temp = native::open(self.handle(), temporary.as_ref(), false, true).map_err(io)?;
+        let mut stage = self.stage_file()?;
         let mut replaced = false;
         let result = (|| {
-            temp.write_all(bytes).map_err(io)?;
-            temp.sync_all().map_err(io)?;
+            stage.file.write_all(bytes).map_err(io)?;
+            stage.file.sync_all().map_err(io)?;
             let mut current = self.file(name).map_err(|_| conflict())?;
             if !native::same(original, &current).map_err(io)? || read(&mut current)? != expected {
                 return Err(conflict());
@@ -289,7 +316,7 @@ impl Directory {
                 {
                     return Err(conflict());
                 }
-                let staged = temp.metadata().map_err(io)?;
+                let staged = stage.file.metadata().map_err(io)?;
                 if (staged.uid(), staged.gid()) != original_owner {
                     return Err(Error::new(
                         "not_allowed",
@@ -298,17 +325,17 @@ impl Directory {
                 }
                 // Widen permissions only after the final conflict and owner
                 // checks, while the replacement is still private.
-                native::apply_mode(&temp, preserved).map_err(io)?;
-                temp.sync_all().map_err(io)?;
+                native::apply_mode(&stage.file, preserved).map_err(io)?;
+                stage.file.sync_all().map_err(io)?;
             }
             // Directory handle + single leaf name: never follows an ancestor.
             // The staging directory lives in the same parent, so the rename
             // stays on one filesystem.
             #[cfg(unix)]
-            native::replace_staged(self.handle(), &stage, temp_name, name)
+            native::replace_staged(self.handle(), &stage.directory, STAGED_FILE, name)
                 .map_err(|error| Error::new("unavailable", format!("script rename: {error}")))?;
             #[cfg(not(unix))]
-            native::replace(self.handle(), &temp, &temporary, name)
+            native::replace(self.handle(), &stage.file, &stage.name, name)
                 .map_err(|error| Error::new("unavailable", format!("script rename: {error}")))?;
             replaced = true;
             #[cfg(unix)]
@@ -321,7 +348,7 @@ impl Directory {
                 let verify = || -> Result<()> {
                     let mut installed = self.file(name)?;
                     let metadata = installed.metadata().map_err(io)?;
-                    if !native::same(&temp, &installed).map_err(io)?
+                    if !native::same(&stage.file, &installed).map_err(io)?
                         || read(&mut installed)? != bytes
                         || (metadata.uid(), metadata.gid()) != original_owner
                         || metadata.mode() & 0o7777 != preserved
@@ -340,59 +367,26 @@ impl Directory {
             native::sync(self.handle())
                 .map_err(|_| Error::new("unknown", "script replaced but directory sync failed"))
         })();
-        #[cfg(unix)]
-        {
-            if result.is_err() && !replaced {
-                native::remove_staged(self.handle(), &stage, &stage_name, temp_name);
-            } else {
-                native::remove_stage_dir(self.handle(), &stage, &stage_name);
-            }
-        }
-        #[cfg(not(unix))]
-        if result.is_err() && !replaced {
-            native::remove(self.handle(), &temp, &temporary);
-        }
+        self.clean_stage(&stage, result.is_err() && !replaced);
         result
     }
 
     /// Atomically publish a new leaf without replacing an existing entry.
     pub(crate) fn publish_new(&self, name: &str, bytes: &[u8]) -> Result<()> {
         plain(name)?;
-        #[cfg(unix)]
-        let stage_name = format!(".{}.stage", ulid::Ulid::new());
-        #[cfg(unix)]
-        let stage = native::open(self.handle(), stage_name.as_ref(), true, true).map_err(io)?;
-        #[cfg(unix)]
-        if !native::stage_is_private(&stage).map_err(io)? {
-            native::remove_stage_dir(self.handle(), &stage, &stage_name);
-            return Err(refused());
-        }
-        #[cfg(unix)]
-        let temp_name = "data";
-        #[cfg(unix)]
-        let mut temp = match native::open(&stage, temp_name.as_ref(), false, true) {
-            Ok(file) => file,
-            Err(error) => {
-                native::remove_stage_dir(self.handle(), &stage, &stage_name);
-                return Err(io(error));
-            }
-        };
-        #[cfg(not(unix))]
-        let temporary = format!(".{}.tmp", ulid::Ulid::new());
-        #[cfg(not(unix))]
-        let mut temp = native::open(self.handle(), temporary.as_ref(), false, true).map_err(io)?;
-
+        let mut stage = self.stage_file()?;
         let mut published = false;
         let result = (|| {
-            temp.write_all(bytes).map_err(io)?;
-            temp.sync_all().map_err(io)?;
+            stage.file.write_all(bytes).map_err(io)?;
+            stage.file.sync_all().map_err(io)?;
             #[cfg(unix)]
             {
-                if let Err(error) = native::publish_staged(self.handle(), &stage, temp_name, name) {
-                    if self
-                        .file(name)
-                        .is_ok_and(|installed| native::same(&temp, &installed).unwrap_or(false))
-                    {
+                if let Err(error) =
+                    native::publish_staged(self.handle(), &stage.directory, STAGED_FILE, name)
+                {
+                    if self.file(name).is_ok_and(|installed| {
+                        native::same(&stage.file, &installed).unwrap_or(false)
+                    }) {
                         published = true;
                         return Err(Error::new(
                             "unknown",
@@ -407,7 +401,7 @@ impl Directory {
             }
             #[cfg(not(unix))]
             {
-                if let Err(error) = native::publish_new(self.handle(), &temp, name) {
+                if let Err(error) = native::publish_new(self.handle(), &stage.file, name) {
                     if self.file(name).is_ok() {
                         return Err(conflict());
                     }
@@ -421,7 +415,7 @@ impl Directory {
             {
                 let verify = || -> Result<()> {
                     let mut installed = self.file(name)?;
-                    if !native::same(&temp, &installed).map_err(io)?
+                    if !native::same(&stage.file, &installed).map_err(io)?
                         || read(&mut installed)? != bytes
                     {
                         return Err(conflict());
@@ -439,18 +433,7 @@ impl Directory {
                 .map_err(|_| Error::new("unknown", "rule file published but directory sync failed"))
         })();
 
-        #[cfg(unix)]
-        {
-            if result.is_err() && !published {
-                native::remove_staged(self.handle(), &stage, &stage_name, temp_name);
-            } else {
-                native::remove_stage_dir(self.handle(), &stage, &stage_name);
-            }
-        }
-        #[cfg(not(unix))]
-        if result.is_err() && !published {
-            native::remove(self.handle(), &temp, &temporary);
-        }
+        self.clean_stage(&stage, result.is_err() && !published);
         result
     }
 

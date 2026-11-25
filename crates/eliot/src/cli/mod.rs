@@ -23,8 +23,9 @@ mod store;
 pub(crate) mod support;
 mod update;
 
-use self::args::{AuthCommand, CliCommand, DaemonAction, LsArgs, PageArgs, StandAction};
+use self::args::{AuthCommand, CliCommand, LsArgs, PageArgs, StandAction};
 use self::support::Failure;
+pub(crate) use daemon::run_daemon;
 pub(crate) use reads::report_doctor_acl;
 use std::path::{Path, PathBuf};
 
@@ -116,30 +117,8 @@ pub(crate) async fn dispatch(
         CliCommand::Auth(args) => match args.command {
             AuthCommand::Login { harness } => auth::login(harness, data_dir, json_output).await,
         },
-        CliCommand::Daemon(args) if args.interrupt_on_deadline => {
-            let Some(DaemonAction::Update {
-                release: Some(release),
-                wait_seconds,
-                ..
-            }) = args.action
-            else {
-                return Err(Failure::new(
-                    2,
-                    "--interrupt-on-deadline requires daemon update",
-                ));
-            };
-            if args.foreground || id.is_some() {
-                return Err(Failure::new(
-                    2,
-                    "--foreground and --id are invalid with daemon update",
-                ));
-            }
-            update::run_interrupting(release, data_dir, wait_seconds, json_output).await
-        }
-        CliCommand::Daemon(args) => {
-            // Daemon startup runs Store migrations on this thread. Keep its
-            // long-lived state off the caller's stack during SQLite setup.
-            Box::pin(daemon::run_daemon(args, data_dir, json_output, id)).await
+        CliCommand::Daemon(_) => {
+            unreachable!("daemon commands bypass general CLI dispatch")
         }
         CliCommand::Mcp(args) => daemon::run_mcp(args, data_dir, json_output).await,
         CliCommand::Status => daemon::run_status(data_dir, json_output).await,

@@ -194,7 +194,17 @@ async fn run_inner(cli: Cli) -> ExitCode {
                     *report = eliot_daemon::data_dir_acl_report(&data_dir);
                 }
             }
-            cli::dispatch(command, data_dir, json_output, id, doctor_acl_report).await
+            // The general dispatcher reserves stack for its other command
+            // branches even when polling daemon startup. Keep that frame off
+            // the main thread's Store initialization path.
+            match command {
+                CliCommand::Daemon(args) => {
+                    Box::pin(cli::run_daemon(args, data_dir, json_output, id)).await
+                }
+                command => {
+                    cli::dispatch(command, data_dir, json_output, id, doctor_acl_report).await
+                }
+            }
         }
     };
     report_exit(result)

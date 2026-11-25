@@ -589,101 +589,21 @@ impl Serialize for ActionDefinition {
         match self {
             Self::Agent(action) => action.serialize(serializer),
             Self::GitFetch { definition } => {
-                let mut fields =
-                    match serde_json::to_value(definition).map_err(serde::ser::Error::custom)? {
-                        Value::Object(fields) => fields,
-                        _ => {
-                            return Err(serde::ser::Error::custom(
-                                "git.fetch definition must serialize as an object",
-                            ));
-                        }
-                    };
-                fields.insert("action".to_owned(), Value::String("git.fetch".to_owned()));
-                Value::Object(fields).serialize(serializer)
+                serialize_action(serializer, "git.fetch", definition, false)
             }
             Self::GitIntegrate { definition } => {
-                let mut fields =
-                    match serde_json::to_value(definition).map_err(serde::ser::Error::custom)? {
-                        Value::Object(fields) => fields,
-                        _ => {
-                            return Err(serde::ser::Error::custom(
-                                "git.integrate definition must serialize as an object",
-                            ));
-                        }
-                    };
-                fields.insert(
-                    "action".to_owned(),
-                    Value::String("git.integrate".to_owned()),
-                );
-                Value::Object(fields).serialize(serializer)
+                serialize_action(serializer, "git.integrate", definition, false)
             }
             Self::GitPublish { definition } => {
-                let mut fields =
-                    match serde_json::to_value(definition).map_err(serde::ser::Error::custom)? {
-                        Value::Object(fields) => fields,
-                        _ => {
-                            return Err(serde::ser::Error::custom(
-                                "git.publish definition must serialize as an object",
-                            ));
-                        }
-                    };
-                fields.insert("action".to_owned(), Value::String("git.publish".to_owned()));
-                Value::Object(fields).serialize(serializer)
+                serialize_action(serializer, "git.publish", definition, false)
             }
-            Self::Run { definition } => {
-                let mut fields =
-                    match serde_json::to_value(definition).map_err(serde::ser::Error::custom)? {
-                        Value::Object(fields) => fields,
-                        _ => {
-                            return Err(serde::ser::Error::custom(
-                                "run definition must serialize as an object",
-                            ));
-                        }
-                    };
-                fields.insert("action".to_owned(), Value::String("run".to_owned()));
-                Value::Object(fields).serialize(serializer)
-            }
+            Self::Run { definition } => serialize_action(serializer, "run", definition, false),
             Self::Notify { definition } => {
-                let mut fields =
-                    match serde_json::to_value(definition).map_err(serde::ser::Error::custom)? {
-                        Value::Object(fields) => fields,
-                        _ => {
-                            return Err(serde::ser::Error::custom(
-                                "notify definition must serialize as an object",
-                            ));
-                        }
-                    };
-                fields.insert("action".to_owned(), Value::String("notify".to_owned()));
-                Value::Object(fields).serialize(serializer)
+                serialize_action(serializer, "notify", definition, false)
             }
-            Self::Emit { definition } => {
-                let mut fields =
-                    match serde_json::to_value(definition).map_err(serde::ser::Error::custom)? {
-                        Value::Object(fields) => fields,
-                        _ => {
-                            return Err(serde::ser::Error::custom(
-                                "emit definition must serialize as an object",
-                            ));
-                        }
-                    };
-                fields.insert("action".to_owned(), Value::String("emit".to_owned()));
-                Value::Object(fields).serialize(serializer)
-            }
+            Self::Emit { definition } => serialize_action(serializer, "emit", definition, false),
             Self::Mail { definition, note } => {
-                let mut fields =
-                    match serde_json::to_value(definition).map_err(serde::ser::Error::custom)? {
-                        Value::Object(fields) => fields,
-                        _ => {
-                            return Err(serde::ser::Error::custom(
-                                "mail.send definition must serialize as an object",
-                            ));
-                        }
-                    };
-                if *note {
-                    fields.insert("note".to_owned(), Value::Bool(true));
-                }
-                fields.insert("action".to_owned(), Value::String("mail.send".to_owned()));
-                Value::Object(fields).serialize(serializer)
+                serialize_action(serializer, "mail.send", definition, *note)
             }
             Self::LaunchResultInsertion(definition) => {
                 #[derive(Serialize)]
@@ -698,34 +618,32 @@ impl Serialize for ActionDefinition {
                 }
                 .serialize(serializer)
             }
-            Self::Var { definition } => {
-                let mut fields =
-                    match serde_json::to_value(definition).map_err(serde::ser::Error::custom)? {
-                        Value::Object(fields) => fields,
-                        _ => {
-                            return Err(serde::ser::Error::custom(
-                                "var.set definition must serialize as an object",
-                            ));
-                        }
-                    };
-                fields.insert("action".to_owned(), Value::String("var.set".to_owned()));
-                Value::Object(fields).serialize(serializer)
-            }
+            Self::Var { definition } => serialize_action(serializer, "var.set", definition, false),
             Self::Inject { definition } => {
-                let mut fields =
-                    match serde_json::to_value(definition).map_err(serde::ser::Error::custom)? {
-                        Value::Object(fields) => fields,
-                        _ => {
-                            return Err(serde::ser::Error::custom(
-                                "inject definition must serialize as an object",
-                            ));
-                        }
-                    };
-                fields.insert("action".to_owned(), Value::String("inject".to_owned()));
-                Value::Object(fields).serialize(serializer)
+                serialize_action(serializer, "inject", definition, false)
             }
         }
     }
+}
+
+fn serialize_action<S: serde::Serializer>(
+    serializer: S,
+    action: &str,
+    definition: &impl Serialize,
+    note: bool,
+) -> std::result::Result<S::Ok, S::Error> {
+    let Value::Object(mut fields) =
+        serde_json::to_value(definition).map_err(serde::ser::Error::custom)?
+    else {
+        return Err(serde::ser::Error::custom(format_args!(
+            "{action} definition must serialize as an object"
+        )));
+    };
+    if note {
+        fields.insert("note".to_owned(), Value::Bool(true));
+    }
+    fields.insert("action".to_owned(), Value::String(action.to_owned()));
+    Value::Object(fields).serialize(serializer)
 }
 
 #[derive(Deserialize)]

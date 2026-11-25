@@ -27,6 +27,26 @@ pub(crate) async fn run_daemon(
     json_output: bool,
     id: Option<String>,
 ) -> Result<u8, Failure> {
+    if args.interrupt_on_deadline {
+        let Some(DaemonAction::Update {
+            release: Some(release),
+            wait_seconds,
+            ..
+        }) = args.action
+        else {
+            return Err(Failure::new(
+                2,
+                "--interrupt-on-deadline requires daemon update",
+            ));
+        };
+        if args.foreground || id.is_some() {
+            return Err(Failure::new(
+                2,
+                "--foreground and --id are invalid with daemon update",
+            ));
+        }
+        return super::update::run_interrupting(release, data_dir, wait_seconds, json_output).await;
+    }
     let foreground = args.foreground;
     if matches!(
         &args.action,
