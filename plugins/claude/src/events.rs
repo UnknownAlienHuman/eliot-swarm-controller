@@ -2901,6 +2901,22 @@ impl EventProcessor {
         };
         self.refresh_terminal_deadline();
         let command_id = self.status.active_command_id.clone();
+        if let Err(error) = ClaudeClient::preflight_control_response(
+            request_id,
+            PermissionResult::Allow {
+                updated_input: body.input.clone().unwrap_or(Value::Null),
+            },
+        ) {
+            if error.code == "frame_too_large" {
+                self.deny_stray_request_with_message(
+                    request_id,
+                    "Claude permission input exceeds the outbound allow-response limit; denied without truncation",
+                )
+                .await;
+                return Ok(());
+            }
+            return Err(error);
+        }
         let policy = SecretPolicy::new(self.secrets.iter().cloned());
         // The public approval fact carries only a neutral summary (the
         // decision-relevant operation: command/description/cwd and file/path
@@ -2943,22 +2959,6 @@ impl EventProcessor {
             return self
                 .record_gap("Claude normalized request exceeded the persisted-event bound")
                 .await;
-        }
-        if let Err(error) = ClaudeClient::preflight_control_response(
-            request_id,
-            PermissionResult::Allow {
-                updated_input: body.input.clone().unwrap_or(Value::Null),
-            },
-        ) {
-            if error.code == "frame_too_large" {
-                self.deny_stray_request_with_message(
-                    request_id,
-                    "Claude permission input exceeds the outbound allow-response limit; denied without truncation",
-                )
-                .await;
-                return Ok(());
-            }
-            return Err(error);
         }
         let guard_command =
             eliot_plugin::session::shell_permission_command(&body.tool_name, body.input.as_ref());
