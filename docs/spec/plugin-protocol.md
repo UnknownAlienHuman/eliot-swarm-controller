@@ -266,6 +266,9 @@ The shared stream source requires a committed terminal before the receipt
 confirms a native session end. Adapters supply native close, reader drain,
 and local readback. Antigravity waits for notification of its exact turn's settlement after
 dispatching cancellation. Only an observed cancellation terminal confirms it.
+For a commandless native Stop hook, shared readback binds the hook and its
+ordered read barrier to the exact current or unresolved turn. Adapters
+translate the native hook and barrier reply.
 
 Steer on harnesses with a direct native steer RPC uses an ordered, bounded write followed
 by a correlated response wait. The host establishes one absolute plugin RPC deadline

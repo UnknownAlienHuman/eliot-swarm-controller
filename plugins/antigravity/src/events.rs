@@ -6,7 +6,7 @@ use std::{
 
 use eliot_core::{
     ContextItem, ContextOutcome, Error, InjectPoint, Result, SecretPolicy, SessionUsage,
-    SourceHealthUpdate,
+    SourceHealthUpdate, TurnOutcome,
     requests::{ApprovalArgs, ApprovalChoice, ApprovalDecision, ApprovalRequest},
 };
 use eliot_plugin::{
@@ -20,6 +20,8 @@ use eliot_plugin::{
         EVENT_DEADLINE, StreamSource, attach_final_text, event_id, is_blank_native_text,
         next_input_outcomes, rejected_control, request_event_id, unknown_control,
     },
+    settle::{PermissionRefusal, permission_fallback},
+    stop_readback::{OrderedStop, StopCandidate, StopProvenance, bind_stop},
 };
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -62,17 +64,17 @@ const MAX_STOP_REASON_BYTES: usize = 64;
 const MAX_STOP_ERROR_BYTES: usize = 2_048;
 const NATIVE_TRIGGER: &str = "PreInvocation";
 
-fn stop_status(reason: &str, has_error: bool) -> &'static str {
+fn stop_outcome(reason: &str, has_error: bool) -> TurnOutcome {
     if has_error || reason.eq_ignore_ascii_case("error") {
-        return "failed";
+        return TurnOutcome::Failure;
     }
     if ["no_tool_call", "model_stop", "max_steps_exceeded"]
         .iter()
         .any(|known| reason.eq_ignore_ascii_case(known))
     {
-        "completed"
+        TurnOutcome::Success
     } else {
-        "unknown"
+        TurnOutcome::Unknown
     }
 }
 
@@ -154,11 +156,9 @@ struct Pending {
 }
 
 struct NativeStop {
-    turn_id: String,
-    status: &'static str,
+    outcome: TurnOutcome,
     native_status: String,
     error: Option<Value>,
-    readback: bool,
 }
 
 struct UnknownNativeTurn {
@@ -237,20 +237,12 @@ fn cancelled_permission_outcome() -> Value {
     json!({"outcome": {"outcome": "cancelled"}})
 }
 
-/// Least-privilege fallback for an ask that can never be presented: a
-/// one-time refusal when the offer names one (else a standing refusal),
-/// else `cancelled`. Never selects a grant.
 fn fallback_permission_outcome(ask: &PermissionAsk) -> Value {
-    let selected = ask
-        .options
-        .iter()
-        .find(|option| option.kind == PermissionOptionKind::RejectOnce)
-        .or_else(|| {
-            ask.options
-                .iter()
-                .find(|option| option.kind == PermissionOptionKind::RejectAlways)
-        })
-        .map(|option| option.option_id.clone());
+    let selected = permission_fallback(ask.options.iter().filter_map(|option| match option.kind {
+        PermissionOptionKind::RejectOnce => Some(PermissionRefusal::Once(&option.option_id)),
+        PermissionOptionKind::RejectAlways => Some(PermissionRefusal::Standing(&option.option_id)),
+        _ => None,
+    }));
     match selected {
         Some(option_id) => json!({"outcome": {"outcome": "selected", "optionId": option_id}}),
         None => cancelled_permission_outcome(),
@@ -281,8 +273,7 @@ pub(crate) struct State {
     pub conversation: String,
     workspace: String,
     pending: Option<Pending>,
-    native_stop: Option<NativeStop>,
-    stop_barrier_request: Option<String>,
+    native_stop: OrderedStop<NativeStop>,
     stop_barrier_guard: Option<FencedGuard>,
     unknown_native_turn: Option<UnknownNativeTurn>,
     native_terminal_deadline: Option<Instant>,
@@ -401,8 +392,7 @@ impl State {
             conversation,
             workspace,
             pending: None,
-            native_stop: None,
-            stop_barrier_request: None,
+            native_stop: OrderedStop::default(),
             stop_barrier_guard: None,
             unknown_native_turn: None,
             native_terminal_deadline: None,
@@ -604,12 +594,8 @@ impl State {
             .filter(|pending| pending.turn == turn_id)
             .map(|pending| pending.opened_at)
             .ok_or_else(|| Error::new("stale_turn", "Antigravity native turn is no longer live"))?;
-        if let Some(stop) = self.native_stop.as_mut() {
-            if stop.turn_id != turn_id {
-                return Ok(());
-            }
-            // A hook without its ordered reply remains only readback evidence.
-            stop.readback = true;
+        if !self.native_stop.mark_turn_unresolved(turn_id) {
+            return Ok(());
         }
         self.close_pending_requests(Some(turn_id)).await?;
         self.close_open_tools_at_terminal(false).await?;
@@ -639,7 +625,7 @@ impl State {
             .pending
             .as_ref()
             .is_some_and(|pending| pending.command.is_none())
-            && self.native_stop.is_none()
+            && !self.native_stop.is_observed()
         {
             self.native_terminal_deadline =
                 Some(Instant::now() + eliot_plugin::session::native_terminal_inactivity());
@@ -736,7 +722,7 @@ impl State {
     }
 
     pub fn stop_order_pending(&self) -> bool {
-        self.native_stop.is_some() && self.stop_barrier_request.is_some()
+        self.native_stop.is_waiting()
     }
 
     async fn begin_native_run(
@@ -756,7 +742,7 @@ impl State {
             || self.stopping
             || self.stopped
             || self.pending.is_some()
-            || self.native_stop.is_some()
+            || self.native_stop.is_observed()
             || self.unknown_native_turn.is_some()
         {
             return Ok(None);
@@ -844,20 +830,28 @@ impl State {
             || self.writes_blocked
             || self.stopping
             || self.stopped
-            || self.native_stop.is_some()
+            || self.native_stop.is_observed()
         {
             return Ok(());
         }
-        let (turn_id, readback) = match self.pending.as_ref() {
-            Some(pending) if pending.command.is_none() && origin.start_time > pending.opened_at => {
-                (pending.turn.clone(), false)
-            }
-            _ => match self.unknown_native_turn.as_ref() {
-                Some(unknown) if origin.start_time > unknown.opened_at => {
-                    (unknown.turn_id.clone(), true)
-                }
-                _ => return Ok(()),
-            },
+        let active = self
+            .pending
+            .as_ref()
+            .filter(|pending| pending.command.is_none());
+        let Some(target) = bind_stop(
+            origin.start_time,
+            active.map(|pending| StopCandidate {
+                turn_id: &pending.turn,
+                opened_at: pending.opened_at,
+            }),
+            self.unknown_native_turn
+                .as_ref()
+                .map(|unknown| StopCandidate {
+                    turn_id: &unknown.turn_id,
+                    opened_at: unknown.opened_at,
+                }),
+        ) else {
+            return Ok(());
         };
         let reason = self.policy.redact_bounded(
             input.termination_reason.as_deref().unwrap_or_default(),
@@ -879,7 +873,7 @@ impl State {
                     "truncated": error.len() > MAX_STOP_ERROR_BYTES,
                 })
             });
-        let status = stop_status(&native_status, error.is_some());
+        let outcome = stop_outcome(&native_status, error.is_some());
         let prepared = client.prepare_fenced(
             "session/list",
             json!({"sessionId": self.conversation}),
@@ -887,17 +881,18 @@ impl State {
         )?;
         let request_id = prepared.request_id().to_owned();
         let (write, guard) = prepared.split();
-        self.native_stop = Some(NativeStop {
-            turn_id,
-            status,
-            native_status,
-            error,
-            readback,
-        });
-        if !readback {
+        if target.provenance == StopProvenance::Active {
             self.native_terminal_deadline = Some(Instant::now() + EVENT_DEADLINE);
         }
-        self.stop_barrier_request = Some(request_id);
+        self.native_stop.observe(
+            request_id,
+            target,
+            NativeStop {
+                outcome,
+                native_status,
+                error,
+            },
+        );
         self.stop_barrier_guard = Some(guard);
         client
             .dispatch_fenced_write(write, Instant::now() + EVENT_DEADLINE)
@@ -906,28 +901,28 @@ impl State {
     }
 
     async fn stop_barrier_passed(&mut self, request_id: &str, result: Result<Value>) -> Result<()> {
-        if self.stop_barrier_request.as_deref() != Some(request_id) {
-            return Err(Error::new(
-                "source_integrity",
-                "Antigravity Stop barrier did not match its exact request",
-            ));
+        let active = self
+            .pending
+            .as_ref()
+            .filter(|pending| pending.command.is_none())
+            .map(|pending| pending.turn.as_str());
+        let unresolved = self
+            .unknown_native_turn
+            .as_ref()
+            .map(|unknown| unknown.turn_id.as_str());
+        let settlement = self.native_stop.settle(
+            "Antigravity",
+            request_id,
+            result.map(|_| ()),
+            active,
+            unresolved,
+        );
+        if !self.native_stop.is_waiting() {
+            self.stop_barrier_guard = None;
         }
-        self.stop_barrier_request = None;
-        self.stop_barrier_guard = None;
-        if let Err(error) = result {
-            return Err(error.with_code("unknown"));
-        }
-        let stop = self
-            .native_stop
-            .take()
-            .ok_or_else(|| Error::new("source_integrity", "Antigravity Stop fact disappeared"))?;
-        if stop.readback {
-            if !self.native_unknown_turn_is(&stop.turn_id) {
-                return Err(Error::new(
-                    "stale_turn",
-                    "Antigravity Stop did not match the unsettled native turn",
-                ));
-            }
+        let (target, stop) = settlement?;
+        if target.provenance == StopProvenance::Readback {
+            let status = stop.outcome.terminal_status().unwrap_or("unknown");
             self.finish_assistant_text();
             let final_text = if self.text_unavailable.is_none() {
                 self.policy.redact_text(&self.text_accum)
@@ -935,16 +930,12 @@ impl State {
                 String::new()
             };
             let mut data = json!({
-                "turn_id": stop.turn_id,
-                "status": stop.status,
-                "outcome": match stop.status {
-                    "completed" => "success",
-                    "failed" => "failure",
-                    _ => "unknown",
-                },
+                "turn_id": target.turn_id,
+                "status": status,
+                "outcome": stop.outcome,
                 "native_status": stop.native_status,
             });
-            let missing_text = reply_unavailable(self.text_unavailable, stop.status, &final_text);
+            let missing_text = reply_unavailable(self.text_unavailable, status, &final_text);
             if let Some(marker) = missing_text {
                 data["final_text_unavailable"] = json!(marker);
             }
@@ -954,11 +945,11 @@ impl State {
             if missing_text.is_none() {
                 attach_final_text(&mut data, &final_text);
             }
-            let final_text = self.commit_turn_completed(&stop.turn_id, data).await?;
+            let final_text = self.commit_turn_completed(&target.turn_id, data).await?;
             self.last_turn = Some(TurnFacts {
                 command_id: None,
-                turn_id: stop.turn_id.clone(),
-                status: stop.status.to_owned(),
+                turn_id: target.turn_id.clone(),
+                status: status.to_owned(),
                 native_status: stop.native_status,
                 final_text_unavailable: missing_text,
                 final_text,
@@ -966,23 +957,13 @@ impl State {
                 terminal: true,
             });
             self.unknown_native_turn = None;
-            self.record_settlement(stop.turn_id.clone(), false);
-            return self.commit_turn_session_usage(&stop.turn_id).await;
+            self.record_settlement(target.turn_id.clone(), false);
+            return self.commit_turn_session_usage(&target.turn_id).await;
         }
-        self.settle_native_stop(stop).await
+        self.settle_native_stop(target.turn_id, stop).await
     }
 
-    async fn settle_native_stop(&mut self, stop: NativeStop) -> Result<()> {
-        if self
-            .pending
-            .as_ref()
-            .is_none_or(|pending| pending.command.is_some() || pending.turn != stop.turn_id)
-        {
-            return Err(Error::new(
-                "stale_turn",
-                "Antigravity Stop does not match the exact self-started turn",
-            ));
-        }
+    async fn settle_native_stop(&mut self, turn_id: String, stop: NativeStop) -> Result<()> {
         self.finish_assistant_text();
         let observed_at = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -990,7 +971,7 @@ impl State {
             .and_then(|elapsed| i64::try_from(elapsed.as_millis()).ok());
         let restriction = (self.text_unavailable.is_none()
             && !self.text_truncated
-            && matches!(stop.status, "completed" | "failed"))
+            && matches!(stop.outcome, TurnOutcome::Success | TurnOutcome::Failure))
         .then(|| crate::quota::turn_restriction(&self.text_accum, observed_at.unwrap_or(0)))
         .flatten()
         .map(|mut restriction| {
@@ -999,14 +980,15 @@ impl State {
             }
             restriction
         });
-        let status = if restriction.is_some() {
-            "failed"
+        let outcome = if restriction.is_some() {
+            TurnOutcome::Failure
         } else {
-            stop.status
+            stop.outcome
         };
+        let status = outcome.terminal_status().unwrap_or("unknown");
         self.last_turn = Some(TurnFacts {
             command_id: None,
-            turn_id: stop.turn_id.clone(),
+            turn_id: turn_id.clone(),
             status: status.to_owned(),
             native_status: stop.native_status.clone(),
             final_text: String::new(),
@@ -1018,18 +1000,13 @@ impl State {
             ),
             terminal: true,
         });
-        self.close_pending_requests(Some(&stop.turn_id)).await?;
+        self.close_pending_requests(Some(&turn_id)).await?;
         self.close_open_tools_at_terminal(status == "completed")
             .await?;
         let text = self.policy.redact_text(&self.text_accum);
         let missing_text = self.text_unavailable;
-        let outcome = match status {
-            "completed" => "success",
-            "failed" => "failure",
-            _ => "unknown",
-        };
         let mut data = json!({
-            "turn_id": stop.turn_id.clone(),
+            "turn_id": turn_id.clone(),
             "status": status,
             "outcome": outcome,
             "native_status": stop.native_status.clone(),
@@ -1074,13 +1051,13 @@ impl State {
         if (self.text_truncated || !is_blank_native_text(&text)) && missing_text.is_none() {
             attach_final_text(&mut data, &text);
         }
-        let final_text = self.commit_turn_completed(&stop.turn_id, data).await?;
-        let session_usage = self.commit_turn_session_usage(&stop.turn_id).await;
+        let final_text = self.commit_turn_completed(&turn_id, data).await?;
+        let session_usage = self.commit_turn_session_usage(&turn_id).await;
         self.reject_pending_steer("Antigravity run ended before its next PreInvocation");
         if let Some(last) = self.last_turn.as_mut() {
             last.final_text = final_text;
         }
-        self.record_settlement(stop.turn_id, false);
+        self.record_settlement(turn_id, false);
         self.pending = None;
         self.unknown_native_turn = None;
         self.native_terminal_deadline = None;
@@ -1189,7 +1166,7 @@ impl State {
         if self.source_unknown || self.failure.is_some() {
             return Err(Error::new("unknown", "Antigravity stream is unresolved"));
         }
-        if self.native_stop.is_some() || self.unknown_native_turn.is_some() {
+        if self.native_stop.is_observed() || self.unknown_native_turn.is_some() {
             return Err(Error::new(
                 "unknown",
                 "Antigravity native turn is unresolved",

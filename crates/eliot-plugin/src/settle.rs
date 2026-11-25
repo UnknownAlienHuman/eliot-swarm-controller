@@ -9,6 +9,28 @@
 
 use eliot_core::{Error, ProviderRestrictionKind, TurnOutcome};
 
+pub enum PermissionRefusal<'a> {
+    Once(&'a str),
+    Standing(&'a str),
+}
+
+/// Choose the least-privilege reply for an unpresentable native ask.
+/// No refusal option means the adapter must cancel the ask.
+pub fn permission_fallback<'a>(
+    refusals: impl IntoIterator<Item = PermissionRefusal<'a>>,
+) -> Option<&'a str> {
+    let mut standing = None;
+    for refusal in refusals {
+        match refusal {
+            PermissionRefusal::Once(id) => return Some(id),
+            PermissionRefusal::Standing(id) => {
+                standing.get_or_insert(id);
+            }
+        }
+    }
+    standing
+}
+
 /// A turn can end normally after a definitive billing/quota refusal. The
 /// terminal reason still describes the native lifecycle; the task failed.
 pub fn terminal_outcome(
