@@ -491,7 +491,8 @@ the preceding generation's starts from its retained start to the observed checko
 window. Only matched candidates count toward the evidence limit. The prior branch is the branch in
 the preceding generation's durable ready outcome; the requested branch remains the
 frozen cleanup identity. Shell wrappers, chains, background tools, and file hints
-alone cannot establish authorship. A matching different Agent is named with its generation;
+alone cannot establish authorship. A matching different Agent bound to the same
+worktree is named with its generation;
 OS Git changes without a matching native principal remain explicitly external or
 unattributed. A dirty checkout, detached or inconsistent HEAD, duplicate or incomplete
 registration, or changed owner or path remains refused, with both branch names in the

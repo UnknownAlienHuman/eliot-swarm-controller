@@ -2779,8 +2779,8 @@ impl Store {
     }
 
     /// Read one checkout's native evidence near its observed reflog transition.
-    /// The owner is scoped to the preceding generation, and foreign principals
-    /// are considered only in turns overlapping the transition.
+    /// The owner is scoped to the preceding generation. Other Agents must be
+    /// bound to the same worktree, with a turn overlapping the transition.
     pub fn native_branch_switch_candidates(
         &self,
         agent: &str,
@@ -2816,16 +2816,20 @@ impl Store {
         let verbatim_workspace = core::verbatim_path(std::path::Path::new(workspace))
             .to_string_lossy()
             .into_owned();
-        let legacy_cwd = "json_extract(c.data, '$.git_branch_switch.cwd')";
-        let legacy_workspace_filter = if cfg!(windows) {
-            format!(
-                "lower(replace({legacy_cwd}, char(92), '/')) IN (
-                    lower(replace(?6, char(92), '/')), lower(replace(?7, char(92), '/')),
-                    lower(replace(?8, char(92), '/')))"
-            )
-        } else {
-            format!("{legacy_cwd} IN (?6, ?7, ?8)")
+        let workspace_filter = |column: &str| {
+            if cfg!(windows) {
+                format!(
+                    "lower(replace({column}, char(92), '/')) IN (
+                        lower(replace(?6, char(92), '/')), lower(replace(?7, char(92), '/')),
+                        lower(replace(?8, char(92), '/')))"
+                )
+            } else {
+                format!("{column} IN (?6, ?7, ?8)")
+            }
         };
+        let bound_workspace_filter = workspace_filter("a.workspace");
+        let legacy_workspace_filter =
+            workspace_filter("json_extract(c.data, '$.git_branch_switch.cwd')");
         // These predicates match the existing partial indexes. Seek starts by
         // generation and time, then seek the matching terminal in that turn.
         let index_kinds = "'turn.started', 'turn.completed', 'message.completed',
@@ -2834,13 +2838,22 @@ impl Store {
         let mut statement = self
             .connection
             .prepare(&format!(
-                "SELECT c.agent, c.generation, c.seq, s.seq, s.ts, s.data, c.data
-                 FROM turns t
+                "WITH scoped_turns AS (
+                     SELECT t.agent, t.generation, t.turn_id, t.started_at
+                     FROM turns t INDEXED BY turns_agent_result_order
+                     WHERE t.agent = ?1 AND t.generation = ?2
+                       AND t.started_at <= ?5 AND (t.completed_at IS NULL OR t.completed_at >= ?4)
+                     UNION ALL
+                     SELECT t.agent, t.generation, t.turn_id, t.started_at
+                     FROM agents a CROSS JOIN turns t INDEXED BY turns_agent_result_order
+                     WHERE a.id <> ?1 AND {bound_workspace_filter} AND t.agent = a.id
+                       AND t.started_at <= ?5 AND (t.completed_at IS NULL OR t.completed_at >= ?4)
+                 )
+                 SELECT c.agent, c.generation, c.seq, s.seq, s.ts, s.data, c.data
+                 FROM scoped_turns t
                  CROSS JOIN events s INDEXED BY events_native_progress_time
                  CROSS JOIN events c INDEXED BY attention_native_turn_activity
-                 WHERE ((t.agent = ?1 AND t.generation = ?2) OR t.agent <> ?1)
-                   AND t.started_at <= ?5 AND (t.completed_at IS NULL OR t.completed_at >= ?4)
-                   AND s.agent = t.agent AND s.generation = t.generation
+                 WHERE s.agent = t.agent AND s.generation = t.generation
                    AND s.ts BETWEEN CASE WHEN t.agent = ?1 THEN MAX(t.started_at, ?3)
                                          ELSE t.started_at END AND ?5
                    AND s.kind = 'tool.started' AND s.source = 'stream' AND s.native_id IS NOT NULL
