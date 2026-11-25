@@ -552,8 +552,12 @@ adds the switch's `continued_from` pointer).
   the existing switch/handoff path. A chat's placement, tags, and original
   execution scope stay attached to its original identity.
 
-Migration is resolved on read from retained facts. This preserves every
-Agent and worktree ID, execution scope, dirty state, and command outcome.
+The membership index is built from the same retained facts as Agent readback.
+Store updates it in the transaction that changes an Agent's execution or
+ancestry, its placement, the retained workspace, or registration keys. Both
+named groups and the unplaced bucket select member IDs and count matching
+rows through this index. Agent and worktree IDs, execution scope, dirty
+state, and command history remain on their existing records.
 The vacant assignment readback identifies competing roots and shows
 `needs_assignment` until an explicit claim. Uncertain custody still counts
 as a competing writer. Rename and archive reuse their existing paths;

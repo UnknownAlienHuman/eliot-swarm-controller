@@ -577,8 +577,9 @@ unsupported. CLI callers use `swarm project assignment get|claim|launch|release`
 semantics as ordinary launch. The CLI exposes them as `--no-policy REASON` and
 `--goal-json JSON_OBJECT`. Only an Owner may override `check`, `check_cwd` or
 `escalation`; explicit safe fields and opt-out remain available to permitted launch
-principals. An explicit Owner claim supplies the Agent ID, generation, and
-`expected_revision` from assignment readback. A stale revision yields
+principals. An explicit claim supplies the Agent ID, generation, and
+`expected_revision` from assignment readback. An Agent can name only itself
+and must hold the self-claim grant. A stale revision yields
 `stale_assignment`. Claim and fresh manager launch refuse
 `legacy_project_writers` while another root or its workers retain independent
 control or unsettled custody. A successful claim links the selected Agent's ready
@@ -639,8 +640,9 @@ workspace and history of every Agent keep their retained values.
 work by project assignment, manager, repository or worktree, and ancestry, and
 returns the ready projection with event-watermark readback, so no client
 repeats Git discovery or grouping. The optional `project` reads back one
-registered project through an index-scoped member query with its exact total
-from the same scoped predicates; `archived` includes
+registered project by seeking its indexed membership with an exact total
+from the same scoped predicates. The unplaced bucket uses the same index,
+and pages read counts only for the groups they include. `archived` includes
 archived rows (default hides them). Groups carry at most 200 members each and
 1,000 across the projection. The all-project read pages its group list: `after`
 takes the previous page's `next_after`, and a truncated page sets

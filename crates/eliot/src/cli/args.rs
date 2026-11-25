@@ -2123,7 +2123,7 @@ pub(crate) struct ProjectAssignmentArgs {
 pub(crate) enum ProjectAssignmentCommand {
     /// Read a project's current assignment.
     Get { project: String },
-    /// Claim as the current Agent, or explicitly name an Agent as Owner.
+    /// Claim as the current Agent, or explicitly name a manager at a revision.
     Claim {
         project: String,
         #[arg(value_name = "AGENT", requires_all = ["generation", "revision"])]

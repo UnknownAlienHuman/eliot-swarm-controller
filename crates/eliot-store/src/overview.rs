@@ -184,16 +184,44 @@ pub(super) fn list_overview_projects(
     filter: Option<&str>,
     after: Option<&str>,
 ) -> Result<Vec<String>> {
+    if let Some(project) = filter {
+        if after.is_some_and(|cursor| project <= cursor) {
+            return Ok(Vec::new());
+        }
+        let exists: bool = conn
+            .prepare_cached(
+                "SELECT EXISTS(SELECT 1 FROM project_registrations WHERE id = ?1)
+                     OR EXISTS(SELECT 1 FROM project_assignments WHERE project = ?1)
+                     OR EXISTS(SELECT 1 FROM agents WHERE project = ?1 AND project <> '')",
+            )
+            .map_err(sql_error)?
+            .query_row([project], |row| row.get(0))
+            .map_err(sql_error)?;
+        return Ok(exists.then(|| project.to_owned()).into_iter().collect());
+    }
+    // Merge one bounded window from each source. Seek past each distinct
+    // execution label so a large team's Agent rows do not fill the window.
     let mut stmt = conn
-        .prepare(&format!(
-            "SELECT project FROM ({PROJECTS})
-         WHERE (?1 IS NULL OR project = ?1) AND (?2 IS NULL OR project > ?2)
-         ORDER BY project LIMIT ?3"
-        ))
+        .prepare_cached(
+            "WITH RECURSIVE execution_projects(project) AS (
+                 SELECT (SELECT MIN(project) FROM agents WHERE project > ?1)
+                 UNION ALL
+                 SELECT (SELECT MIN(a.project) FROM agents a WHERE a.project > e.project)
+                 FROM execution_projects e WHERE e.project IS NOT NULL LIMIT ?2
+             )
+             SELECT id AS project FROM (
+                 SELECT id FROM project_registrations WHERE id > ?1 ORDER BY id LIMIT ?2
+             )
+             UNION SELECT project FROM (
+                 SELECT project FROM project_assignments WHERE project > ?1 ORDER BY project LIMIT ?2
+             )
+             UNION SELECT project FROM execution_projects WHERE project IS NOT NULL
+             ORDER BY project LIMIT ?2",
+        )
         .map_err(sql_error)?;
     let rows = stmt
         .query_map(
-            params![filter, after, PROJECTS_PER_PAGE as i64 + 1],
+            params![after.unwrap_or_default(), PROJECTS_PER_PAGE as i64 + 1],
             |row| row.get(0),
         )
         .map_err(sql_error)?;

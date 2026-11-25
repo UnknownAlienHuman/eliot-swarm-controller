@@ -17,6 +17,9 @@ use eliot_core::api::{
 };
 use std::collections::BTreeMap;
 
+mod membership;
+pub(super) use membership::membership_index_migration;
+
 pub(super) const CHAT_ATTACH_METHOD: &str = "chat.attach";
 pub(super) const CHAT_DETACH_METHOD: &str = "chat.detach";
 pub(super) const CHAT_TAG_METHOD: &str = "chat.tag";
@@ -153,11 +156,12 @@ impl LinkRequest<'_> {
 /// Retained controlled roots grouped by the same evidence as their rows.
 fn organization_roots(conn: &Connection, project: &str, archived: &str) -> Result<Vec<i64>> {
     let mut statement = conn
-        .prepare(&format!(
-            "SELECT a.id FROM agents a WHERE a.parent IS NULL AND a.observe_only = 0
-             AND a.chat = 0 AND {} = ?1 AND {archived}
-             ORDER BY a.id LIMIT ?2",
-            retained_project("a")
+        .prepare_cached(&format!(
+            "SELECT m.agent FROM organization_membership m INDEXED BY organization_membership_project
+             CROSS JOIN agents a ON a.id = m.agent
+             WHERE m.project = ?1 AND a.parent IS NULL AND a.observe_only = 0
+               AND a.chat = 0 AND {archived}
+             ORDER BY m.agent LIMIT ?2",
         ))
         .map_err(sql_error)?;
     let rows = statement
@@ -271,7 +275,7 @@ fn retained_project(agent: &str) -> String {
     )
 }
 
-/// One grouping key for pages, totals, and Agent list readback. Execution
+/// One grouping key for the membership index and Agent list readback. Execution
 /// labels and the scope that authorizes effects stay on the retained Agent.
 pub(super) fn organization_group() -> String {
     format!(
@@ -317,35 +321,20 @@ fn organization_count(
     read: &GroupRead<'_>,
 ) -> Result<usize> {
     let archived = read.archived;
-    let sql = |predicate: &str, first: usize| {
-        format!(
-            "SELECT COUNT(*) FROM agents a LEFT JOIN chat_organization o ON o.agent = a.id
-             WHERE {archived} AND {predicate}{}",
-            read.query_suffix(first)
-        )
-    };
-    let total: i64 = match project {
-        Some(name) => {
-            let predicate = format!("{} = ?1", organization_group());
-            let mut statement = conn.prepare(&sql(&predicate, 2)).map_err(sql_error)?;
-            let mut params: Vec<rusqlite::types::Value> = vec![name.to_owned().into()];
-            params.extend(read.query_params());
-            statement
-                .query_row(rusqlite::params_from_iter(params.iter()), |row| row.get(0))
-                .map_err(sql_error)?
-        }
-        None => {
-            let mut statement = conn
-                .prepare(&sql(&format!("{} IS NULL", organization_group()), 1))
-                .map_err(sql_error)?;
-            statement
-                .query_row(
-                    rusqlite::params_from_iter(read.query_params().iter()),
-                    |row| row.get(0),
-                )
-                .map_err(sql_error)?
-        }
-    };
+    let mut statement = conn
+        .prepare_cached(&format!(
+            "SELECT COUNT(*) FROM organization_membership m INDEXED BY organization_membership_project
+             CROSS JOIN agents a ON a.id = m.agent
+             WHERE m.project IS ?1 AND {archived}{}",
+            read.query_suffix(2),
+        ))
+        .map_err(sql_error)?;
+    let mut params =
+        vec![project.map_or(rusqlite::types::Value::Null, |name| name.to_owned().into())];
+    params.extend(read.query_params());
+    let total: i64 = statement
+        .query_row(rusqlite::params_from_iter(params.iter()), |row| row.get(0))
+        .map_err(sql_error)?;
     Ok(total as usize)
 }
 
@@ -424,33 +413,29 @@ fn organization_members(
     let archived = read.archived;
     let take = i64::try_from(take)
         .map_err(|_| Error::new("internal", "organization page bound is invalid"))?;
-    let group = organization_group();
-    let (condition, limit, first_query_param) = match project {
-        Some(_) => ("= ?1", "?2", 3),
-        None => ("IS NULL", "?1", 2),
-    };
-    // Stream membership in Agent id order. The inner limit selects the
-    // page's IDs before fetching member fields. Counts stream the same
-    // indexed membership lookup without materializing all evidence.
+    // The index seeks either a project or the unplaced bucket. Fetch full
+    // member fields only after the inner scan has selected the page's IDs.
     let mut statement = conn
-        .prepare(&format!(
+        .prepare_cached(&format!(
             "SELECT a.id, a.generation, a.state, a.harness, a.parent, a.root, a.project,
                     a.chat, a.archived, a.observe_only, a.workspace,
                     o.project_link, o.tags, o.continued_from
              FROM (
-                 SELECT a.id FROM agents a LEFT JOIN chat_organization o ON o.agent=a.id
-                 WHERE {group} {condition} AND {archived}{}
-                 ORDER BY a.id LIMIT {limit}
+                 SELECT m.agent AS id
+                 FROM organization_membership m INDEXED BY organization_membership_project
+                 CROSS JOIN agents a ON a.id = m.agent
+                 WHERE m.project IS ?1 AND {archived}{}
+                 ORDER BY m.agent LIMIT ?2
              ) page JOIN agents a ON a.id=page.id
              LEFT JOIN chat_organization o ON o.agent=a.id
              ORDER BY a.id",
-            read.query_suffix(first_query_param)
+            read.query_suffix(3)
         ))
         .map_err(sql_error)?;
-    let mut params: Vec<rusqlite::types::Value> = match project {
-        Some(name) => vec![name.to_owned().into(), take.into()],
-        None => vec![take.into()],
-    };
+    let mut params = vec![
+        project.map_or(rusqlite::types::Value::Null, |name| name.to_owned().into()),
+        take.into(),
+    ];
     params.extend(read.query_params());
     let rows: Vec<OrgMemberRow> = statement
         .query_map(rusqlite::params_from_iter(params.iter()), |row| {
@@ -613,7 +598,7 @@ impl Store {
     }
 
     /// Every group in page order (projects first, unplaced last) with exact
-    /// per-group totals from one aggregate pass. `list_overview_projects`
+    /// totals for this page's groups. `list_overview_projects`
     /// returns one row past the page bound, so a longer group list reads
     /// back truncated with the cursor for the next page.
     fn all_projects_organization(
@@ -622,37 +607,10 @@ impl Store {
         after: Option<&str>,
         read: &GroupRead<'_>,
     ) -> Result<ChatOrganizationResponse> {
-        let archived = read.archived;
         let mut keys = overview::list_overview_projects(conn, None, after)?;
         let groups_truncated = keys.len() > MAX_PAGE_ENTRIES;
         if groups_truncated {
             keys.truncate(MAX_PAGE_ENTRIES);
-        }
-        // Exact per-group totals without materializing rows: the key
-        // expression mirrors the member queries below. Chats group by
-        // their overlay link alone; a retained execution label never
-        // places a chat. The search predicate matches the member pages.
-        let mut counts: BTreeMap<Option<String>, usize> = BTreeMap::new();
-        {
-            let mut totals = conn
-                .prepare(&format!(
-                    "SELECT {}, COUNT(*)
-                     FROM agents a LEFT JOIN chat_organization o ON o.agent = a.id
-                     WHERE {archived}{} GROUP BY 1",
-                    organization_group(),
-                    read.query_suffix(1),
-                ))
-                .map_err(sql_error)?;
-            let rows = totals
-                .query_map(
-                    rusqlite::params_from_iter(read.query_params().iter()),
-                    |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, i64>(1)?)),
-                )
-                .map_err(sql_error)?;
-            for row in rows {
-                let (key, total) = row.map_err(sql_error)?;
-                counts.insert(key, total as usize);
-            }
         }
         let next_after = groups_truncated.then(|| {
             keys.last()
@@ -663,6 +621,10 @@ impl Store {
         if !groups_truncated {
             order.push(None);
         }
+        let counts = order
+            .iter()
+            .map(|key| Ok((key.clone(), organization_count(conn, key.as_deref(), read)?)))
+            .collect::<Result<BTreeMap<_, _>>>()?;
         self.organization_page(
             conn,
             OrganizationPage {
