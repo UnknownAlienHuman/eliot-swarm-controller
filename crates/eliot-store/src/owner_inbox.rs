@@ -132,6 +132,7 @@ pub(super) fn project_into(
     if let Some(item) = artifact_capacity_item(connection)? {
         items.push(item);
     }
+    project_unknown_project_checks(connection, now, items, &mut liveness, &[])?;
 
     Ok(liveness)
 }
@@ -166,6 +167,7 @@ pub(crate) fn project_item(
                 Ok(None)
             };
         }
+        OwnerInboxKind::ProjectCheck => (project_unknown_project_checks, subject),
         OwnerInboxKind::HarnessRequest => (project_requests, subject),
         OwnerInboxKind::UnknownCommand => match subject.strip_prefix("checkpoint_restore:") {
             Some(id) => (project_unknown_restores, id),
@@ -244,6 +246,15 @@ pub(crate) fn project_item(
             };
             projector(db, now, &mut items, &mut stats, &[&agent, &generation])?;
         }
+        "project_check" => {
+            let Some(seq) = key
+                .strip_prefix('c')
+                .and_then(|value| value.parse::<i64>().ok())
+            else {
+                return Ok(None);
+            };
+            projector(db, now, &mut items, &mut stats, &[&seq])?;
+        }
         "blocked_goal" | "goal" => {
             let Some((agent, mode)) = key.split_once(':') else {
                 return Ok(None);
@@ -281,6 +292,53 @@ pub(crate) fn project_item(
     Ok(items
         .into_iter()
         .find(|item| item.kind == kind && item.subject == subject))
+}
+
+fn project_unknown_project_checks(
+    db: &Connection,
+    now: i64,
+    items: &mut dyn OwnerInboxItemSink,
+    _stats: &mut SwarmLiveness,
+    bindings: &[&dyn ToSql],
+) -> eliot_core::Result<()> {
+    let mut statement = projection_query(
+        db,
+        "SELECT completion_seq, agent, generation, turn_id, fingerprint, settled_at
+         FROM project_check_obligations WHERE state='settled' AND outcome='unknown'",
+        "completion_seq=?1",
+        bindings,
+    )?;
+    let rows = statement
+        .query_map(bindings, |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, Option<i64>>(5)?.unwrap_or_default(),
+            ))
+        })
+        .map_err(sql_error)?;
+    for row in rows {
+        let (seq, agent, generation, turn, fingerprint, settled_at) = row.map_err(sql_error)?;
+        let mut projected = item(
+            OwnerInboxKind::ProjectCheck,
+            format!("c{seq}"),
+            format!("unknown:{settled_at}"),
+            now,
+            settled_at,
+            "project_check_outcome_unknown",
+            None,
+            Vec::new(),
+        );
+        projected.outcome_unknown = true;
+        projected.detail = Some(format!(
+            "Check for turn {turn} on Agent a{agent} generation {generation} ended without verified completion. Its captured worktree was {fingerprint}; do not replay it. Inspect event sequence {seq}."
+        ));
+        items.push(projected);
+    }
+    Ok(())
 }
 
 fn project_repeated_failures(

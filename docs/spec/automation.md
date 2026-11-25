@@ -996,6 +996,15 @@ command is short enough to rule out truncation. Fact counters use later
 confirmed check, command or Git evidence where available. Without a confirming
 fact, correction remains unverified.
 
+Successful turn-end checks create durable completion obligations before the
+event is acknowledged. The daemon claims an obligation before running its
+checker only after acquiring the workspace permit. Shutdown while waiting for
+that permit leaves the obligation `not_started`; no durable claim has been made.
+Uncertain results settle as unknown without replay. Unknown outcomes appear in the Owner inbox as
+`project_check_outcome_unknown`, bound to the retained completion event. A
+rejected rule or project-registration read does not settle an obligation as
+stale; inventory readiness returns only after a successful reload.
+
 For [#881 item 2](https://github.com/UnknownAlienHuman/eliot-swarm-controller/issues/881),
 the next-input move at turn end substitutes for a Claude Stop hook. Pending
 inserts can still be delivered by the before-tool and after-tool callbacks.

@@ -4573,9 +4573,13 @@ impl Router {
     }
 
     pub(crate) fn mark_rule_inventory_ready(&self) {
+        self.set_rule_inventory_ready(true);
+    }
+
+    pub(crate) fn set_rule_inventory_ready(&self, ready: bool) {
         self.inner
             .rule_inventory_ready
-            .store(true, Ordering::Release);
+            .store(ready, Ordering::Release);
     }
 
     pub(crate) fn rule_inventory_ready(&self) -> bool {

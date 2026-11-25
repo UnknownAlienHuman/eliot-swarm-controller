@@ -466,6 +466,9 @@ pub(crate) async fn run_project_checks(
                     driver.in_flight.remove(&completion.key);
                     if !is_live_generation(&*router.inner.store.lock().await, &completion.key) {
                         settle_project_check_obligations(&router, &completion.review_events, "stale").await;
+                        driver.review_event_count = driver
+                            .review_event_count
+                            .saturating_sub(completion.review_event_count);
                         if let Some(pending) = driver.pending.remove(&completion.key) {
                             driver.review_event_count = driver.review_event_count.saturating_sub(pending.review.len());
                         }
@@ -844,27 +847,6 @@ async fn start_due_checks(
         let Some(edit) = driver.pending.remove(&key) else {
             continue;
         };
-        let mut claimed = Vec::new();
-        if !edit.review.is_empty() {
-            let mut store = router.inner.store.lock().await;
-            for event in &edit.review {
-                if store.claim_project_check_obligation(event)? {
-                    claimed.push(event.clone());
-                }
-            }
-            if claimed.is_empty() {
-                driver.review_event_count =
-                    driver.review_event_count.saturating_sub(edit.review.len());
-                continue;
-            }
-        }
-        driver.review_event_count = driver
-            .review_event_count
-            .saturating_sub(edit.review.len() - claimed.len());
-        let edit = PendingEdit {
-            review: claimed,
-            ..edit
-        };
         let prior_fingerprint = driver
             .check_states
             .get(&key)
@@ -876,19 +858,22 @@ async fn start_due_checks(
         let task_router = router.clone();
         let task_shutdown = shutdown.clone();
         let task_key = key.clone();
+        let event_seq = edit.seq;
+        let review_event_count = edit.review.len();
+        let review_events = edit.review.clone();
         driver.in_flight.insert(key);
         driver.tasks.spawn(async move {
             let disposition = check_after_edit(
                 &task_router,
                 &task_key,
-                &edit,
+                edit,
                 prior_fingerprint.as_deref(),
                 prior_pass,
                 task_shutdown,
             )
             .await;
             let mut unknown_fingerprints = if disposition.uncertain {
-                edit.review
+                review_events
                     .iter()
                     .filter_map(|event| event.data["worktree"]["fingerprint"].as_str())
                     .map(str::to_owned)
@@ -904,12 +889,12 @@ async fn start_due_checks(
             }
             WorkCompletion {
                 key: task_key,
-                event_seq: edit.seq,
+                event_seq,
                 uncertain: disposition.uncertain,
                 fingerprint: disposition.fingerprint,
                 passed: disposition.passed,
-                review_event_count: edit.review.len(),
-                review_events: edit.review.clone(),
+                review_event_count,
+                review_events,
                 unknown_fingerprints,
             }
         });
@@ -920,23 +905,51 @@ async fn start_due_checks(
 async fn check_after_edit(
     router: &Router,
     key: &WorkKey,
-    edit: &PendingEdit,
+    mut edit: PendingEdit,
     prior_fingerprint: Option<&str>,
     prior_pass: Option<ProjectCheckPass>,
     mut shutdown: watch::Receiver<bool>,
 ) -> CheckDisposition {
     let event_seq = edit.seq;
-    let expected_workspace = &edit.workspace;
-    let lock = router.workspace_check_lock(expected_workspace);
+    let expected_workspace = edit.workspace.clone();
+    let lock = router.workspace_check_lock(&expected_workspace);
     let _permit = tokio::select! {
         biased;
         _ = wait_for_check_shutdown(&mut shutdown) => {
-            settle_project_check_obligations(router, &edit.review, "unknown").await;
             return CheckDisposition { uncertain: false, fingerprint: None, passed: None };
         }
         permit = lock.lock_owned() => permit,
     };
-    let work = match load_project_work(router, key, expected_workspace, edit.review.first()).await {
+    let mut claimed = Vec::new();
+    if !edit.review.is_empty() {
+        let mut store = router.inner.store.lock().await;
+        for event in &edit.review {
+            match store.claim_project_check_obligation(event) {
+                Ok(true) => claimed.push(event.clone()),
+                Ok(false) => {}
+                Err(error) => log_error(
+                    router,
+                    "daemon.project_check_claim_failed",
+                    key,
+                    event.seq,
+                    &error,
+                ),
+            }
+        }
+        if claimed.is_empty() {
+            return CheckDisposition {
+                uncertain: false,
+                fingerprint: None,
+                passed: None,
+            };
+        }
+        edit = PendingEdit {
+            review: claimed,
+            ..edit
+        };
+    }
+    let work = match load_project_work(router, key, &expected_workspace, edit.review.first()).await
+    {
         Ok(Some(work)) => work,
         Ok(None) => {
             settle_project_check_obligations(router, &edit.review, "refused").await;
