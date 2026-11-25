@@ -178,16 +178,7 @@ impl Router {
                         agent
                     }
                     _ => {
-                        self.inner
-                            .monitoring
-                            .release_background_wake_pin(&wake.agent, wake.generation);
-                        let _ = store.background_wake_finish(
-                            &wake.id,
-                            wake.generation,
-                            None,
-                            "stale",
-                            now,
-                        )?;
+                        self.settle_held_wake(&mut store, wake, None, "stale", now)?;
                         self.signal_progress();
                         return Ok(());
                     }
@@ -238,16 +229,7 @@ impl Router {
                     }
                 }
                 Some(record) if record.state == ProcessState::Unknown => {
-                    self.inner
-                        .monitoring
-                        .release_background_wake_pin(&wake.agent, wake.generation);
-                    let _ = self.inner.store.lock().await.background_wake_finish(
-                        &wake.id,
-                        wake.generation,
-                        None,
-                        "unknown",
-                        now,
-                    )?;
+                    self.settle_wake(wake, None, "unknown", now).await?;
                     self.signal_progress();
                 }
                 _ if now >= wake.expires_at => {
@@ -304,16 +286,8 @@ impl Router {
         let retained = self.inner.store.lock().await.get_command(command_id)?;
         if let Some(command) = retained {
             if !matches_background_wake_command(&command, wake) {
-                self.inner
-                    .monitoring
-                    .release_background_wake_pin(&wake.agent, wake.generation);
-                let _ = self.inner.store.lock().await.background_wake_finish(
-                    &wake.id,
-                    wake.generation,
-                    Some(command_id),
-                    "unknown",
-                    now,
-                )?;
+                self.settle_wake(wake, Some(command_id), "unknown", now)
+                    .await?;
                 self.signal_progress();
                 return Ok(());
             }
@@ -323,16 +297,8 @@ impl Router {
         }
 
         if wake.state == "delivery_pending" {
-            self.inner
-                .monitoring
-                .release_background_wake_pin(&wake.agent, wake.generation);
-            let _ = self.inner.store.lock().await.background_wake_finish(
-                &wake.id,
-                wake.generation,
-                Some(command_id),
-                "unknown",
-                now,
-            )?;
+            self.settle_wake(wake, Some(command_id), "unknown", now)
+                .await?;
             self.signal_progress();
             return Ok(());
         }
@@ -357,16 +323,7 @@ impl Router {
                     .flatten()
                 }
                 _ => {
-                    self.inner
-                        .monitoring
-                        .release_background_wake_pin(&wake.agent, wake.generation);
-                    let _ = store.background_wake_finish(
-                        &wake.id,
-                        wake.generation,
-                        None,
-                        "stale",
-                        now,
-                    )?;
+                    self.settle_held_wake(&mut store, wake, None, "stale", now)?;
                     self.signal_progress();
                     return Ok(());
                 }
@@ -374,16 +331,7 @@ impl Router {
         };
 
         let Some(note_body) = wake.note_text.as_deref() else {
-            self.inner
-                .monitoring
-                .release_background_wake_pin(&wake.agent, wake.generation);
-            let _ = self.inner.store.lock().await.background_wake_finish(
-                &wake.id,
-                wake.generation,
-                None,
-                "unknown",
-                now,
-            )?;
+            self.settle_wake(wake, None, "unknown", now).await?;
             self.signal_progress();
             return Ok(());
         };
@@ -451,16 +399,8 @@ impl Router {
                 .await;
         }
         if submitted.is_ok() {
-            self.inner
-                .monitoring
-                .release_background_wake_pin(&wake.agent, wake.generation);
-            let _ = self.inner.store.lock().await.background_wake_finish(
-                &wake.id,
-                wake.generation,
-                Some(command_id),
-                "unknown",
-                now,
-            )?;
+            self.settle_wake(wake, Some(command_id), "unknown", now)
+                .await?;
         } else {
             let _ = self
                 .inner
@@ -482,21 +422,12 @@ impl Router {
         let mut store = self.inner.store.lock().await;
         match command.state {
             CommandState::Applied => {
-                self.inner
-                    .monitoring
-                    .release_background_wake_pin(&wake.agent, wake.generation);
                 let final_state = if wake.outcome_kind.as_deref() == Some("expired") {
                     "expired"
                 } else {
                     "delivered"
                 };
-                let _ = store.background_wake_finish(
-                    &wake.id,
-                    wake.generation,
-                    Some(&command.id),
-                    final_state,
-                    now,
-                )?;
+                self.settle_held_wake(&mut store, wake, Some(&command.id), final_state, now)?;
             }
             CommandState::Accepted | CommandState::Queued | CommandState::Dispatched => {
                 let _ = store.background_wake_mark_delivery_pending(
@@ -507,43 +438,56 @@ impl Router {
                 )?;
             }
             CommandState::Unknown => {
-                self.inner
-                    .monitoring
-                    .release_background_wake_pin(&wake.agent, wake.generation);
-                let _ = store.background_wake_finish(
-                    &wake.id,
-                    wake.generation,
-                    Some(&command.id),
-                    "unknown",
-                    now,
-                )?;
+                self.settle_held_wake(&mut store, wake, Some(&command.id), "unknown", now)?;
             }
             CommandState::Cancelled => {
-                self.inner
-                    .monitoring
-                    .release_background_wake_pin(&wake.agent, wake.generation);
-                let _ = store.background_wake_finish(
-                    &wake.id,
-                    wake.generation,
-                    Some(&command.id),
-                    "cancelled",
-                    now,
-                )?;
+                self.settle_held_wake(&mut store, wake, Some(&command.id), "cancelled", now)?;
             }
             CommandState::Rejected | CommandState::Failed => {
-                self.inner
-                    .monitoring
-                    .release_background_wake_pin(&wake.agent, wake.generation);
-                let _ = store.background_wake_finish(
-                    &wake.id,
-                    wake.generation,
-                    Some(&command.id),
-                    "failed",
-                    now,
-                )?;
+                self.settle_held_wake(&mut store, wake, Some(&command.id), "failed", now)?;
             }
         }
         self.signal_progress();
+        Ok(())
+    }
+
+    /// Release the wake pin and mark the wake settled while the caller holds
+    /// the Store guard. The caller signals progress after settlement.
+    fn settle_held_wake(
+        &self,
+        store: &mut eliot_store::Store,
+        wake: &BackgroundWakeRecord,
+        command_id: Option<&str>,
+        outcome: &str,
+        now: i64,
+    ) -> Result<()> {
+        self.inner
+            .monitoring
+            .release_background_wake_pin(&wake.agent, wake.generation);
+        let _ =
+            store.background_wake_finish(&wake.id, wake.generation, command_id, outcome, now)?;
+        Ok(())
+    }
+
+    /// Release the wake pin and mark the wake settled without a held Store
+    /// guard. The caller signals progress after settlement.
+    async fn settle_wake(
+        &self,
+        wake: &BackgroundWakeRecord,
+        command_id: Option<&str>,
+        outcome: &str,
+        now: i64,
+    ) -> Result<()> {
+        self.inner
+            .monitoring
+            .release_background_wake_pin(&wake.agent, wake.generation);
+        let _ = self.inner.store.lock().await.background_wake_finish(
+            &wake.id,
+            wake.generation,
+            command_id,
+            outcome,
+            now,
+        )?;
         Ok(())
     }
 }
