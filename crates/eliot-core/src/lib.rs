@@ -2814,9 +2814,7 @@ pub fn apply(agent: &Agent, event: &NativeEvent, now: i64) -> Result<(Agent, Vec
             }
         }
         NATIVE_WARNING_EVENT => {
-            let warning: NativeWarning = serde_json::from_value(event.data.clone())
-                .map_err(|_| Error::new("invalid", "native warning schema is invalid"))?;
-            warning.validate_for_thread(agent.native_ref.as_deref())?;
+            NativeWarning::validate_data(&event.data, agent.native_ref.as_deref())?;
         }
         UNCLASSIFIED_NATIVE_EVENT => {}
         "tool.file.edited" => {

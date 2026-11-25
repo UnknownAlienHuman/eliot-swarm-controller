@@ -20,6 +20,12 @@ pub struct NativeWarning {
 }
 
 impl NativeWarning {
+    pub fn validate_data(data: &Value, thread: Option<&str>) -> Result<()> {
+        let warning: Self = serde_json::from_value(data.clone())
+            .map_err(|_| Error::new("invalid", "native warning schema is invalid"))?;
+        warning.validate_for_thread(thread)
+    }
+
     pub fn validate_for_thread(&self, thread: Option<&str>) -> Result<()> {
         if self.thread_id.is_empty() || Some(self.thread_id.as_str()) != thread {
             return Err(Error::new(
