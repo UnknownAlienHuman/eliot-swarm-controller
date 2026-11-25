@@ -1065,7 +1065,10 @@ whose optional `git` value uses [`ProjectGitView` and `GitCredentialHelper`](../
 The read-only `origin` is the validated basename of the local `origin` remote's path,
 with `.git` stripped. Malformed and pathless remotes produce no name. The daemon
 reads each common directory in the Git probe's sanitized environment after releasing
-the Store lock. The readback carries only the name. The
+the Store lock. An observed readback can be reused while the watched checkout
+bindings and Git metadata revision still agree with the live registered
+checkout HEAD and index stamps. Missing coverage or a changed stamp takes the
+live Git path. The readback carries only the name. The
 `ProjectRegistrationView.policy_usage` field carries
 `applied`, `total`, `opted_out` and `opt_outs` for the last 24 hours. `total` counts distinct
 retained launched Agent IDs, including stopped Agents; attaches and resumed
@@ -3176,7 +3179,10 @@ when only Git path coverage is partial. For a shared workspace, the list uses on
 the target generation's attributed edit paths and remains incomplete; it does not
 claim all workspace changes belong to that Agent. Claims are live state, so the
 digest does not reconstruct which claim was active when an edit occurred. A requested
-stale generation still returns `stale_generation`.
+stale generation still returns `stale_generation`. Interactive reads reuse Git's
+patch input only within the same filesystem observation revision, checkout HEAD,
+and index stamp. Claims and attribution are read for the current request. Guarded
+review keeps its fresh worktree fingerprint.
 
 `agent.diff` accepts [AgentDiffRequest](../../crates/eliot-core/src/api/git.rs)
 and returns `AgentDiffResponse` for that Agent's current workspace and generation.

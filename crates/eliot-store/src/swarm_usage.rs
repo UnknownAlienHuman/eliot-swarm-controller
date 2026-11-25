@@ -273,6 +273,8 @@ impl Store {
     }
 
     /// Read recent exact-turn call/refusal counts with a fixed response bound.
+    /// SQLite requires the partial-index terms as literals. Generate new SQL
+    /// from the wire constants; migration 146 retains its historical literals.
     pub fn swarm_mcp_turn_usage(
         &self,
         pairs: &[(i64, i64)],
@@ -282,7 +284,7 @@ impl Store {
         }
         let pair_json = serde_json::to_string(pairs)
             .map_err(|_| Error::new("internal", "usage scope could not be encoded"))?;
-        let sql = "
+        let sql = format!("
             WITH wanted AS (
                 SELECT CAST(json_extract(value, '$[0]') AS INTEGER) AS agent,
                        CAST(json_extract(value, '$[1]') AS INTEGER) AS generation
@@ -299,8 +301,8 @@ impl Store {
                   ON w.agent = e.agent AND w.generation = e.generation
                 WHERE e.source = 'daemon'
                   AND e.kind IN ('tool.started', 'tool.completed')
-                  AND json_extract(e.data, '$.origin') = 'swarm_mcp'
-                  AND json_extract(e.data, '$.tool') = 'swarm'
+                  AND json_extract(e.data, '$.origin') = '{origin}'
+                  AND json_extract(e.data, '$.tool') = '{tool}'
                   AND json_type(e.data, '$.turn_id') = 'text'
                 GROUP BY e.agent, e.generation, turn_id, call_id
             ), per_turn AS (
@@ -313,8 +315,11 @@ impl Store {
                 HAVING calls > 0
             )
             SELECT agent, generation, turn_id, calls, refusals
-            FROM per_turn ORDER BY latest DESC LIMIT ?2";
-        let mut statement = self.connection.prepare_cached(sql).map_err(sql_error)?;
+            FROM per_turn ORDER BY latest DESC LIMIT ?2",
+            origin = eliot_core::api::SWARM_MCP_EVENT_ORIGIN,
+            tool = eliot_core::api::SWARM_MCP_EVENT_TOOL,
+        );
+        let mut statement = self.connection.prepare_cached(&sql).map_err(sql_error)?;
         let rows = statement
             .query_map(
                 rusqlite::params![pair_json, (MAX_SWARM_MCP_TURNS + 1) as i64],

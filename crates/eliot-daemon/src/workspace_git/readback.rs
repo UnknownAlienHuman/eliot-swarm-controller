@@ -362,7 +362,6 @@ impl WorkspaceGit {
         stream::iter(groups)
             .for_each_concurrent(4, |(common_dir, registrations)| {
                 let git = &git;
-                let cache = cache;
                 async move {
                     if Instant::now() >= deadline {
                         return;
