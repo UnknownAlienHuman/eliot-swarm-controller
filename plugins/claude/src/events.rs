@@ -6,7 +6,8 @@ use self::hooks::{
 };
 
 use eliot_core::{
-    ContextItem, ContextOutcome, Error, InjectPoint, NativeEvent, Result, SecretPolicy, TurnUsage,
+    ContextEditPath, ContextItem, ContextOutcome, Error, InjectPoint, NativeEvent, Result,
+    SecretPolicy, TurnUsage,
     limits::{MAX_COMMAND_ID_BYTES, MAX_TOOL_COMMAND_BYTES, NATIVE_TERMINAL_DEADLINE_REASON},
     requests::{ApprovalChoice, ApprovalDecision, ApprovalRequest},
 };
@@ -437,10 +438,10 @@ struct EventProcessor {
     cancelled_hook_requests: HashSet<String>,
     tool_use_turns: HashMap<String, ToolUseBinding>,
     tool_use_tracking_fenced: bool,
-    /// Native tool names by invocation id for the exact active turn, taken
+    /// Native tool names and safe edit paths by invocation id for the exact active turn, taken
     /// from the assistant `tool_use` blocks. The matching `user`
     /// `tool_result` blocks carry no name, so completions read it back here.
-    tool_names: HashMap<String, String>,
+    tool_names: HashMap<String, (String, Option<String>)>,
     /// Invocations with a committed `tool.started` in this turn.
     tools_started: HashSet<String>,
     /// Invocations with a committed `tool.completed` in this turn.
@@ -1870,7 +1871,24 @@ impl EventProcessor {
         for tool_use in assistant_tool_uses(record) {
             self.tool_names
                 .entry(tool_use.id.clone())
-                .or_insert_with(|| tool_use.name.clone());
+                .or_insert_with(|| {
+                    let path = tool_use.edit_path.as_deref().and_then(|path| {
+                        let policy = SecretPolicy::new(self.secrets.iter().cloned());
+                        match eliot_plugin::edit_path::evidence(
+                            &self.workspace.to_string_lossy(),
+                            path,
+                            &policy,
+                        ) {
+                            Some(ContextEditPath::Relative { path })
+                                if eliot_core::api::valid_diff_path(&path) =>
+                            {
+                                Some(path)
+                            }
+                            _ => None,
+                        }
+                    });
+                    (tool_use.name.clone(), path)
+                });
             if !self.tools_started.insert(tool_use.id.clone()) {
                 continue;
             }
@@ -1962,7 +1980,7 @@ impl EventProcessor {
         let mut unknown = false;
         let mut events = Vec::new();
         for result in results {
-            let Some(tool) = self.tool_names.get(&result.tool_use_id).cloned() else {
+            let Some((tool, edit_path)) = self.tool_names.get(&result.tool_use_id).cloned() else {
                 unknown = true;
                 continue;
             };
@@ -1978,6 +1996,11 @@ impl EventProcessor {
             });
             if tool == "Bash" {
                 data["tool_kind"] = json!("shell");
+            }
+            if result.is_error != Some(true)
+                && let Some(path) = edit_path
+            {
+                data["changed_paths"] = json!([path]);
             }
             self.scope_turn_command(&mut data);
             if let Some(at) = eliot_plugin::quota::rfc3339_ms(record.get("timestamp")) {

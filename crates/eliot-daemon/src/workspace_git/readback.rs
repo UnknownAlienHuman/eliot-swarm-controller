@@ -8,6 +8,116 @@ use std::collections::BTreeMap;
 const MAX_CHECKOUTS: usize = 1_000;
 const CHECKOUT_READBACK_BYTES: usize = 900 * 1024;
 
+/// The worktree and Git administration directories stay pinned through the
+/// patch read. Resolve the files-format HEAD without another Git process.
+pub(crate) struct DiffCheckout {
+    pub root: Directory,
+    git_dir: Directory,
+    common_dir: Directory,
+}
+
+impl DiffCheckout {
+    pub(crate) fn open(workspace: &str, expected_common: Option<&str>) -> Result<Self> {
+        let rejected = || problem("unavailable", "cannot bind the exact Git checkout for diff");
+        let path = canonical_root(workspace)?;
+        let root = Directory::open(&path)?;
+        let dot_git = path.join(".git");
+        let (git_dir, common) = if fs::symlink_metadata(&dot_git).is_ok_and(|m| m.is_dir()) {
+            (dot_git.clone(), dot_git)
+        } else {
+            let admin = gitfile_target(&path).ok_or_else(rejected)?;
+            let registry = admin.parent().ok_or_else(rejected)?;
+            let common = registry.parent().ok_or_else(rejected)?.to_path_buf();
+            let common_pointer = metadata_line(&admin.join("commondir"))?;
+            let backlink = metadata_line(&admin.join("gitdir"))?;
+            if registry.file_name().and_then(|name| name.to_str()) != Some("worktrees")
+                || !pointer_path(&admin, &common_pointer).is_some_and(|p| same_path(&p, &common))
+                || !pointer_path(&admin, &backlink).is_some_and(|p| same_path(&p, &dot_git))
+            {
+                return Err(rejected());
+            }
+            (admin, common)
+        };
+        if let Some(expected) = expected_common
+            && !same_path(&canonical_root(expected)?, &common)
+        {
+            return Err(rejected());
+        }
+        Ok(Self {
+            root,
+            git_dir: Directory::open(&git_dir)?,
+            common_dir: Directory::open(&common)?,
+        })
+    }
+
+    pub(crate) fn binding(&self) -> GitBinding<'_> {
+        GitBinding {
+            git_dir: &self.git_dir.path,
+            common_dir: &self.common_dir.path,
+        }
+    }
+
+    pub(crate) fn same_identity(&self, other: &Self) -> bool {
+        [&self.root, &self.git_dir, &self.common_dir]
+            .into_iter()
+            .zip([&other.root, &other.git_dir, &other.common_dir])
+            .all(|(left, right)| {
+                same_path(&left.path, &right.path)
+                    && left.directory_identities(1).is_ok_and(|identity| {
+                        right
+                            .directory_identities(1)
+                            .is_ok_and(|other| identity == other)
+                    })
+            })
+    }
+
+    pub(crate) fn head(&self) -> Result<String> {
+        let no_head = || problem("unavailable", "cannot resolve the checkout HEAD for diff");
+        let head = line(&read_diff_metadata(self.git_dir.file("HEAD")?, 4096)?)?;
+        if is_git_oid(&head) {
+            return Ok(head);
+        }
+        let reference = head
+            .strip_prefix("ref: ")
+            .filter(|value| {
+                value.starts_with("refs/heads/") && eliot_core::api::valid_diff_path(value)
+            })
+            .ok_or_else(no_head)?;
+        let loose = self.common_dir.path.join(reference);
+        let oid = match fs::symlink_metadata(&loose) {
+            Ok(_) => {
+                let (dir, name) = Directory::open(&self.common_dir.path)?.descend(reference)?;
+                line(&read_diff_metadata(dir.file(&name)?, 4096)?)?
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let bytes = read_diff_metadata(self.common_dir.file("packed-refs")?, 1024 * 1024)?;
+                std::str::from_utf8(&bytes)
+                    .map_err(|_| no_head())?
+                    .lines()
+                    .filter_map(|entry| entry.split_once(' '))
+                    .find_map(|(oid, name)| (name == reference).then_some(oid.to_owned()))
+                    .ok_or_else(no_head)?
+            }
+            Err(_) => return Err(no_head()),
+        };
+        is_git_oid(&oid).then_some(oid).ok_or_else(no_head)
+    }
+}
+
+fn read_diff_metadata(file: fs::File, limit: u64) -> Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    file.take(limit + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| problem("unavailable", "Git diff metadata could not be read"))?;
+    if bytes.len() as u64 > limit {
+        return Err(problem(
+            "unavailable",
+            "Git diff metadata exceeds its bound",
+        ));
+    }
+    Ok(bytes)
+}
+
 impl WorkspaceGit {
     pub(crate) async fn fill_project_readbacks(registrations: &mut [ProjectRegistrationView]) {
         if registrations.is_empty() {

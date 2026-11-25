@@ -1077,6 +1077,56 @@ impl GitProbe {
         self.patch_read_inner(workspace, base, false).await
     }
 
+    pub(crate) async fn diff_output(
+        &self,
+        checkout: &crate::workspace_git::DiffCheckout,
+        base: &str,
+        paths: &[&str],
+    ) -> Result<(Vec<u8>, bool)> {
+        let mut args = vec![
+            "diff",
+            "--raw",
+            "-z",
+            "--patch",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--no-color",
+            "--find-renames",
+            "--no-relative",
+            "--src-prefix=a/",
+            "--dst-prefix=b/",
+            "--submodule=short",
+            "--unified=3",
+            base,
+            "--",
+        ];
+        args.extend_from_slice(paths);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        // The command cannot spawn even when repository config changes between
+        // binding and execution. The leaf capture refuses Git diagnostics.
+        let command = self.build_command(
+            &checkout.root.path,
+            &args,
+            &[("core.quotepath".to_owned(), "false".to_owned())],
+            Some(checkout.binding()),
+        )?;
+        let (code, bytes) = Self::capture_git(command, &[], deadline, |stdout| async move {
+            let mut bytes = Vec::new();
+            stdout
+                .take((OUTPUT_BYTES + 1) as u64)
+                .read_to_end(&mut bytes)
+                .await
+                .map_err(|_| unavailable("Git diff output could not be read"))?;
+            Ok(bytes)
+        })
+        .await?;
+        let truncated = bytes.len() > OUTPUT_BYTES;
+        if code != 0 && !truncated {
+            return Err(unavailable("Git could not read the workspace diff"));
+        }
+        Ok((bytes, truncated))
+    }
+
     /// The same bounded patch read, with its status snapshot bound to the
     /// worktree fingerprint used by completion events.
     pub(crate) async fn patch_read_with_fingerprint(

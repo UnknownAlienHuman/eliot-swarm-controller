@@ -10,6 +10,128 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::Path;
 
+pub const MAX_DIFF_TEXT_BYTES: usize = 256 * 1024;
+pub const MAX_DIFF_TEXT_FILES: usize = 100;
+pub const MAX_DIFF_TEXT_HUNKS: usize = 1_000;
+
+#[derive(
+    schemars::JsonSchema, Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize,
+)]
+#[serde(rename_all = "kebab-case")]
+pub enum GitDiffSource {
+    #[default]
+    Uncommitted,
+    Branch,
+    LastTurn,
+}
+
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentDiffRequest {
+    pub id: String,
+    #[serde(default)]
+    pub generation: Option<i64>,
+    #[serde(default)]
+    pub source: GitDiffSource,
+    #[serde(default)]
+    pub path: Option<String>,
+}
+
+impl AgentDiffRequest {
+    pub fn validate(&self) -> Result<()> {
+        crate::parse_agent_id(&self.id)?;
+        if self.generation.is_some_and(|generation| generation < 0)
+            || self
+                .path
+                .as_deref()
+                .is_some_and(|path| !valid_diff_path(path))
+        {
+            return Err(Error::new(
+                "invalid",
+                "diff requires a generation and a literal workspace-relative path when supplied",
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn validate_response(&self, response: &AgentDiffResponse) -> Result<()> {
+        self.validate()?;
+        if response.agent != self.id
+            || response.generation < 0
+            || self
+                .generation
+                .is_some_and(|generation| generation != response.generation)
+            || response.source != self.source
+            || response.path != self.path
+            || !is_git_oid(&response.base)
+            || !is_git_oid(&response.head)
+            || (self.source == GitDiffSource::LastTurn) != response.turn_id.is_some()
+            || self.source == GitDiffSource::Uncommitted && response.base != response.head
+            || response.files.len() > MAX_DIFF_TEXT_FILES
+            || response.files.iter().any(|file| {
+                !valid_diff_path(&file.path)
+                    || file
+                        .original_path
+                        .as_deref()
+                        .is_some_and(|path| !valid_diff_path(path))
+                    || file.hunks > MAX_DIFF_TEXT_HUNKS
+                    || file.truncated && !response.truncated
+                    || self.path.as_ref().is_some_and(|path| {
+                        path != &file.path && file.original_path.as_ref() != Some(path)
+                    })
+            })
+            || response
+                .files
+                .iter()
+                .map(|file| file.text.len())
+                .sum::<usize>()
+                > MAX_DIFF_TEXT_BYTES
+            || response.files.iter().map(|file| file.hunks).sum::<usize>() > MAX_DIFF_TEXT_HUNKS
+        {
+            return Err(Error::new(
+                "invalid",
+                "diff reply does not match the requested bounded workspace view",
+            ));
+        }
+        Ok(())
+    }
+}
+
+pub fn valid_diff_path(path: &str) -> bool {
+    path.len() <= super::MAX_PATCH_DIGEST_PATH_BYTES
+        && !path.contains(['\\', ':'])
+        && !path.chars().any(char::is_control)
+        && path
+            .split('/')
+            .all(|part| !matches!(part, "" | "." | "..") && !part.eq_ignore_ascii_case(".git"))
+}
+
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentDiffResponse {
+    pub agent: String,
+    pub generation: i64,
+    pub source: GitDiffSource,
+    pub path: Option<String>,
+    pub base: String,
+    pub head: String,
+    pub turn_id: Option<String>,
+    pub files: Vec<GitDiffFile>,
+    pub truncated: bool,
+}
+
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitDiffFile {
+    pub path: String,
+    pub original_path: Option<String>,
+    /// Six-digit Git modes, including 000000 for a missing side.
+    pub old_mode: String,
+    pub new_mode: String,
+    pub binary: bool,
+    pub hunks: usize,
+    pub text: String,
+    pub truncated: bool,
+}
+
 /// Default for the optional rule-authored fetch timeout.
 pub const DEFAULT_GIT_FETCH_TIMEOUT_MS: i64 = 10 * 60 * 1_000;
 /// Default for one local publication, push, and optional PR creation.

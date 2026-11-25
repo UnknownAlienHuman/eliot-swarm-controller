@@ -1,6 +1,95 @@
 use super::*;
+use std::collections::BTreeSet;
 
 impl Store {
+    /// The latest visible completed turn and the same native edit-path facts
+    /// carried by its tool rows. Tool output and input content are never read.
+    pub fn latest_diff_turn(
+        &self,
+        agent: &str,
+        generation: i64,
+    ) -> Result<Option<(String, Vec<String>, bool)>> {
+        const MAX_TOOL_ROWS: usize = 512;
+        let num = parse_agent_id(agent)?;
+        let turn: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT turn_id FROM turns WHERE agent=?1 AND generation=?2
+                 AND state='completed' AND (final_text IS NOT NULL OR outcome='failure')
+             ORDER BY COALESCE(started_at, completed_at, 0) DESC, turn_id DESC LIMIT 1",
+                params![num, generation],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(sql_error)?;
+        let Some(turn) = turn else { return Ok(None) };
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT json_extract(data,'$.tool'),
+                    CASE WHEN json_type(data,'$.changed_paths')='array'
+                         THEN json_extract(data,'$.changed_paths') END,
+                    COALESCE(json_extract(data,'$.changed_paths_truncated')=1,0)
+             FROM events WHERE agent=?1 AND generation=?2 AND family='tool'
+                 AND kind IN ('tool.started','tool.completed')
+                 AND json_extract(data,'$.turn_id')=?3
+             ORDER BY seq LIMIT ?4",
+            )
+            .map_err(sql_error)?;
+        let rows = statement
+            .query_map(
+                params![num, generation, &turn, MAX_TOOL_ROWS as i64 + 1],
+                |r| {
+                    Ok((
+                        r.get::<_, Option<String>>(0)?,
+                        r.get::<_, Option<String>>(1)?,
+                        r.get::<_, bool>(2)?,
+                    ))
+                },
+            )
+            .map_err(sql_error)?;
+        let mut paths = BTreeSet::new();
+        let mut partial = false;
+        for (index, row) in rows.enumerate() {
+            if index == MAX_TOOL_ROWS {
+                partial = true;
+                break;
+            }
+            let (tool, entries, truncated) = row.map_err(sql_error)?;
+            if !tool.as_deref().is_some_and(|tool| {
+                matches!(
+                    tool.to_ascii_lowercase().as_str(),
+                    "filechange"
+                        | "edit"
+                        | "write"
+                        | "multiedit"
+                        | "notebookedit"
+                        | "apply_patch"
+                        | "patch"
+                        | "replace"
+                        | "write_file"
+                        | "edit_file"
+                        | "str_replace_editor"
+                )
+            }) {
+                continue;
+            }
+            if let Some(entries) = entries {
+                let entries: Vec<Value> = serde_json::from_str(&entries)
+                    .map_err(|_| Error::new("source_integrity", "tool edit paths are invalid"))?;
+                partial |= truncated || entries.len() > 20;
+                for path in entries.iter().take(20).filter_map(Value::as_str) {
+                    if paths.len() == core::api::MAX_DIFF_TEXT_FILES {
+                        partial |= !paths.contains(path);
+                    } else {
+                        paths.insert(path.to_owned());
+                    }
+                }
+            }
+        }
+        Ok(Some((turn, paths.into_iter().collect(), partial)))
+    }
+
     /// Commit OIDs already observed and committed for this live Git binding.
     pub fn observed_git_commits(
         &self,

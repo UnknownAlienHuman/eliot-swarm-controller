@@ -656,6 +656,7 @@ pub(crate) struct ToolUseBlock {
     /// The shell command of a command tool (`input.command`: Bash,
     /// PowerShell); `None` for other tools.
     pub command: Option<String>,
+    pub edit_path: Option<String>,
     /// `input.run_in_background`: Claude tracks this call as its own
     /// background task and wakes itself when the task ends.
     pub run_in_background: bool,
@@ -693,10 +694,23 @@ pub(crate) fn assistant_tool_uses(record: &Value) -> Vec<ToolUseBlock> {
                 .and_then(|input| input.get("run_in_background"))
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
+            let edit_path = match name.as_str() {
+                "Write" | "Edit" | "MultiEdit" => "file_path",
+                "NotebookEdit" => "notebook_path",
+                _ => "",
+            };
+            let edit_path = block
+                .input
+                .as_ref()
+                .and_then(|input| input.get(edit_path))
+                .and_then(Value::as_str)
+                .filter(|path| !edit_path.is_empty() && path.len() <= 4096)
+                .map(ToOwned::to_owned);
             Some(ToolUseBlock {
                 id,
                 name,
                 command,
+                edit_path,
                 run_in_background,
             })
         })

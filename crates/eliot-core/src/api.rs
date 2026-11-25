@@ -122,9 +122,11 @@ pub use digests::{
     digest_text, digest_thread, fair_excerpt_cap,
 };
 pub use git::{
-    DEFAULT_GIT_FETCH_TIMEOUT_MS, DEFAULT_GIT_PUBLISH_TIMEOUT_MS, FrozenGitFetch, FrozenGitPublish,
+    AgentDiffRequest, AgentDiffResponse, DEFAULT_GIT_FETCH_TIMEOUT_MS,
+    DEFAULT_GIT_PUBLISH_TIMEOUT_MS, FrozenGitFetch, FrozenGitPublish, GitDiffFile, GitDiffSource,
     GitFetchDefinitionArgs, GitFetchOutcome, GitPublishDefinitionArgs, GitPublishOutcome,
-    GitPublishTrigger, MAX_GIT_PUBLISH_SUBJECT_BYTES, ProjectCheckPassed, is_git_oid,
+    GitPublishTrigger, MAX_DIFF_TEXT_BYTES, MAX_DIFF_TEXT_FILES, MAX_DIFF_TEXT_HUNKS,
+    MAX_GIT_PUBLISH_SUBJECT_BYTES, ProjectCheckPassed, is_git_oid, valid_diff_path,
     validate_git_publish_subject,
 };
 pub use git_integrate::{

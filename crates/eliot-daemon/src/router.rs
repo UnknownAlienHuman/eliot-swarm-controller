@@ -841,6 +841,7 @@ impl Router {
             "usage.summary" => self.usage_summary(&params, &principal).await,
             "observe.heavy" => self.observe_heavy(&params, &principal).await,
             "agent.git" => self.agent_git(&params, &principal).await,
+            "agent.diff" => self.agent_diff(&params, &principal).await,
             "checkpoint.restore" => self.checkpoint_restore(&params, &principal).await,
             "agent.patch_digest" => self.agent_patch_digest(&params, &principal).await,
             "agent.edits" => self.agent_edits(&params, &principal).await,

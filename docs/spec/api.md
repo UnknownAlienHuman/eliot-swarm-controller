@@ -498,6 +498,7 @@ command id frozen at claim. The settled event's persisted `kind` is exactly
 | `agent.git/edits` | current Git snapshot with complete work line counts when available, and paginated native-attributed edits |
 | `checkpoint.restore` | Owner-only restoration of a retained checkpoint's separate staged and worktree layers into a clean worktree at its captured HEAD and repository |
 | `agent.patch_digest` | review digest of the Agent's patch against its worktree base (else HEAD): changed files and packages, new dependencies, public-interface lines, checker/lint configuration changes, suppressions and paths outside active claim globs, each list bounded; an attention filter, not a quality score |
+| `agent.diff` | one bounded unified patch for an Agent's current workspace and generation, optionally limited to one literal path |
 | `workspace.list` | owner-only page of the managed worktrees Swarm created |
 | `command.submit/get` | implemented immutable admission and command readback |
 | `turn.get` | implemented running/completed/unknown turn read |
@@ -3064,6 +3065,26 @@ claim all workspace changes belong to that Agent. Claims are live state, so the
 digest does not reconstruct which claim was active when an edit occurred. A requested
 stale generation still returns `stale_generation`.
 
+`agent.diff` accepts [AgentDiffRequest](../../crates/eliot-core/src/api/git.rs)
+and returns `AgentDiffResponse` for that Agent's current workspace and generation.
+It uses the same Owner, self and managed Agent scope as `agent.git` and
+`agent.patch_digest`. The reply names the resolved base and HEAD commits.
+
+- `uncommitted` compares HEAD to the worktree, including staged and unstaged changes.
+- `branch` compares the managed worktree's frozen base to the worktree, matching
+  the review digest's scope. A workspace with no frozen base uses HEAD.
+- `last-turn` limits the branch patch to the completed turn's reported edit paths
+  and names that turn. These paths scope the current patch. They convey no
+  historical hunk attribution. Commands without reported paths add no files.
+
+The optional `path` selects one literal workspace-relative path, including
+either side of a detected rename. The patch includes binary notices, rename
+paths and Git modes. Untracked additions use the current complete `agent.git`
+file observation. Missing observation coverage or any output limit sets
+`truncated`. Core bounds the returned text to 256 KiB, 100 files and 1,000
+hunks. The daemon starts at most one owned Git process per call with a
+five-second deadline and bounded cleanup. The desktop reads on open or Refresh.
+
 `who` composes existing L3 projections per current worker: the roster
 holds every non-terminal Agent in scope (at most 100, oldest first, with
 a `truncated` flag instead of a cursor), including private chats, which
@@ -3466,6 +3487,7 @@ swarm stats A [--generation N]
 swarm git integrate --project P --base BRANCH [--fast-forward-to BRANCH] [--timeout DURATION] [--wait --timeout-seconds N] BRANCH...
 swarm git-status A [--generation N]
 swarm patch-digest A [--generation N]
+swarm diff A [--generation N] [--source uncommitted|branch|last-turn] [--path P]
 swarm edits A [--generation N] [--after PATH] [--limit N]
 swarm send A TEXT [--probe] [--wait] [--timeout-seconds N] [--generation N]
 swarm steer A TEXT [--generation N] [--turn ID]
