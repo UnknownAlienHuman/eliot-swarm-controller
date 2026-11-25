@@ -583,16 +583,19 @@ apply the same policy before truncation. Native outcomes, recovery text and
 daemon diagnostics use the same matcher and scoped literal set.
 
 The latest batch receipt retains bounded, redacted canonical content beside
-the digest. On a same-ID retry with an exact cursor, a digest mismatch can
-compare this receipt under the current run-local literal policy. Text already
-masked by the retained literal marker is opaque. The comparison requires all
-visible text, keys, typed values and event identities to agree. It only returns
-the existing receipt and never applies an effect. Legacy receipts without
-comparison data still require the original digest. Digests exclude transport
-IDs and timing. The Store rejects shaped credentials in command arguments
-before hashing or admission. Its common command-outcome and event writers
-sanitize text before encoding and refuse credential-bearing event keys or
-bindings.
+the digest. On a same-ID retry with the exact cursor, the Store compares the
+incoming prepared batch and the retained receipt after redacting both with
+the current run-local policy. Every canonical value must agree. A retained
+marker cannot match different text, and an exact credential removed from the
+current policy can cause a source-integrity refusal. A successful comparison
+only returns the existing ACK. Legacy receipts without comparison data
+still require the original digest. Digests exclude transport IDs and timing.
+
+The common Store command writer rejects shaped credentials in arguments
+without redacting them. The same check runs before command hashing. Callers
+that accept Owner text must reject exact run-local literals before admission.
+The Store sanitizes command outcomes and event text before encoding and
+refuses credential-bearing event keys and bindings.
 
 A source permits at most one unacknowledged batch. Keep later input in a bounded spool.
 

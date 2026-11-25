@@ -51,12 +51,7 @@ impl PreparedSourceBatch {
             if protected_data_has_secret(&event.data, &policy, false) {
                 return Err(secret_in_batch_binding());
             }
-            if policy.redact_values(&mut event.data) {
-                let data = event.data.as_object_mut().ok_or_else(|| {
-                    Error::new("invalid", "redacted native event data must be an object")
-                })?;
-                data.insert("redacted".to_owned(), Value::Bool(true));
-            }
+            redact_event_data(&policy, &mut event.data)?;
         }
         Ok(Self {
             batch,
@@ -68,6 +63,16 @@ impl PreparedSourceBatch {
     pub fn as_batch(&self) -> &SourceBatch {
         &self.batch
     }
+}
+
+fn redact_event_data(policy: &core::SecretPolicy, value: &mut Value) -> Result<()> {
+    if policy.redact_values(value) {
+        let data = value
+            .as_object_mut()
+            .ok_or_else(|| Error::new("invalid", "redacted native event data must be an object"))?;
+        data.insert("redacted".to_owned(), Value::Bool(true));
+    }
+    Ok(())
 }
 
 fn secret_in_batch_binding() -> Error {
@@ -1606,82 +1611,13 @@ fn replay_matches(
         return Ok(false);
     };
     let mut stored = decode_json(&stored)?;
-    policy.redact_values(&mut stored);
-    let (Some(stored), Some(incoming)) = (stored.as_array(), incoming.as_array()) else {
-        return Err(Error::new(
-            "source_integrity",
-            "native replay receipt is invalid",
-        ));
-    };
-    Ok(stored.len() == incoming.len()
-        && stored.iter().zip(incoming).all(|(left, right)| {
-            left["kind"] == right["kind"]
-                && left["native_id"] == right["native_id"]
-                && left["ts"] == right["ts"]
-                && replay_body_matches(&left["data"], &right["data"])
-        }))
-}
-
-fn replay_body_matches(retained: &Value, incoming: &Value) -> bool {
-    let (Some(retained), Some(incoming)) = (retained.as_object(), incoming.as_object()) else {
-        return replay_text_matches(retained, incoming);
-    };
-    // This top-level flag tells readers that some value was masked. It is
-    // not a native fact and varies with the run-local literal scope.
-    let fields = |object: &Map<String, Value>| {
-        object
-            .keys()
-            .filter(|key| key.as_str() != "redacted")
-            .count()
-    };
-    fields(retained) == fields(incoming)
-        && retained.iter().all(|(key, left)| {
-            key == "redacted"
-                || incoming
-                    .get(key)
-                    .is_some_and(|right| replay_text_matches(left, right))
-        })
-}
-
-fn replay_text_matches(retained: &Value, incoming: &Value) -> bool {
-    match (retained, incoming) {
-        (Value::String(retained), Value::String(incoming)) => {
-            let marker = core::api::REDACTION_MARKER;
-            let Some((prefix, tail)) = retained.split_once(marker) else {
-                return retained == incoming;
-            };
-            let (middle, suffix) = tail.rsplit_once(marker).unwrap_or(("", tail));
-            let Some(mut content) = incoming
-                .strip_prefix(prefix)
-                .and_then(|text| text.strip_suffix(suffix))
-            else {
-                return false;
-            };
-            for part in middle.split(marker).filter(|part| !part.is_empty()) {
-                let Some((_, rest)) = content.split_once(part) else {
-                    return false;
-                };
-                content = rest;
-            }
-            true
-        }
-        (Value::Array(left), Value::Array(right)) => {
-            left.len() == right.len()
-                && left
-                    .iter()
-                    .zip(right)
-                    .all(|(left, right)| replay_text_matches(left, right))
-        }
-        (Value::Object(left), Value::Object(right)) => {
-            left.len() == right.len()
-                && left.iter().all(|(key, value)| {
-                    right
-                        .get(key)
-                        .is_some_and(|right| replay_text_matches(value, right))
-                })
-        }
-        _ => retained == incoming,
+    let invalid_receipt = || Error::new("source_integrity", "native replay receipt is invalid");
+    let events = stored.as_array_mut().ok_or_else(invalid_receipt)?;
+    for event in events {
+        let data = event.get_mut("data").ok_or_else(invalid_receipt)?;
+        redact_event_data(policy, data)?;
     }
+    Ok(&stored == incoming)
 }
 
 fn read_native_wake_cancellation(
