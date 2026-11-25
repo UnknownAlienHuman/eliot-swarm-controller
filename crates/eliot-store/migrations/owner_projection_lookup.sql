@@ -9,3 +9,6 @@ CREATE INDEX artifacts_unknown_agent ON artifacts(agent)
   WHERE json_extract(body, '$.state') = 'unknown';
 CREATE INDEX agents_list_visible ON agents(archived, id)
   WHERE json_type(profile_snapshot, '$._harness_check') IS NULL;
+CREATE INDEX artifacts_ledger_state ON artifacts(json_extract(body, '$.state'));
+CREATE INDEX commands_pending_send_page ON commands(target, generation, created_at, id)
+  WHERE verb = 'send' AND state IN ('accepted', 'queued');

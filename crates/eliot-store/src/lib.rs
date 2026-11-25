@@ -2178,6 +2178,32 @@ impl Store {
         self.list_commands_matching(RETAINED_UNKNOWN_PREDICATE, limit)
     }
 
+    /// Observation mode for one bounded drain page. The caller holds the
+    /// Store writer from the retained-command predicate through this read.
+    pub fn drain_agent_observation_modes(
+        &self,
+        page: &[Command],
+    ) -> Result<BTreeMap<String, bool>> {
+        let agents = page
+            .iter()
+            .filter_map(|command| command.target.as_deref())
+            .map(parse_agent_id)
+            .collect::<Result<Vec<_>>>()?;
+        let mut statement = self
+            .connection
+            .prepare_cached(
+                "SELECT id,observe_only FROM agents WHERE id IN (SELECT value FROM json_each(?1))",
+            )
+            .map_err(sql_error)?;
+        statement
+            .query_map([encode_json(&agents)?], |row| {
+                Ok((format_agent_id(row.get(0)?), row.get(1)?))
+            })
+            .map_err(sql_error)?
+            .collect::<rusqlite::Result<BTreeMap<_, _>>>()
+            .map_err(sql_error)
+    }
+
     /// Return unsettled commands without letting terminal history consume the limit.
     pub fn list_unsettled_commands(&self, limit: usize) -> Result<Vec<Command>> {
         self.list_commands_matching(UNSETTLED_COMMANDS_WHERE, limit)

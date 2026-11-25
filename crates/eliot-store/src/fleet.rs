@@ -1142,7 +1142,7 @@ fn agent_list_select(
             "(agents.state IN ({}) AND agents.id IN (SELECT value FROM json_each(?)))",
             super::agent_lifecycle::CUSTODY_VISIBLE_STATES,
         );
-        let extra_params = vec![rusqlite::types::Value::from(encode_json(custody_ids)?)];
+        let extra_params = vec![rusqlite::types::Value::from(encode_json(&custody_ids)?)];
         Some((extra_sql, extra_params))
     };
     let (archived_held, held_params) = branch(1, held_extra);

@@ -1645,7 +1645,8 @@ pub(super) fn artifact_capacity(connection: &Connection) -> Result<ArtifactCapac
             "SELECT COUNT(*) FILTER (WHERE state IN ('registered','unknown')),
                     COUNT(*) FILTER (WHERE state = 'ownership_root'),
                     COUNT(*) FILTER (WHERE state = 'removed')
-             FROM (SELECT json_extract(body, '$.state') AS state FROM artifacts)",
+             FROM (SELECT json_extract(body, '$.state') AS state
+                   FROM artifacts INDEXED BY artifacts_ledger_state)",
             [],
             |row| {
                 Ok(ArtifactCapacityView {

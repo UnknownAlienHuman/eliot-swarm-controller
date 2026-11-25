@@ -29,19 +29,9 @@ fn queued_sends_blocked_by(
     generation: i64,
     blocker_id: &str,
 ) -> eliot_core::Result<Vec<(String, String)>> {
-    // The unbound-turn exception can change turn blockers, but it never
-    // changes whether this command fences SEND for the generation.
-    if !crate::send_outcome_gate_blockers(db, agent, generation, None)?
-        .iter()
-        .any(|blocker| {
-            blocker.kind == "command" && blocker.id == blocker_id && blocker.state == "unknown"
-        })
-    {
-        return Ok(Vec::new());
-    }
     let mut statement = db
         .prepare_cached(
-            "SELECT id FROM commands
+            "SELECT id FROM commands INDEXED BY commands_pending_send_page
          WHERE target = ?1 AND generation = ?2 AND verb = 'send'
            AND state IN ('accepted','queued')
          ORDER BY created_at, id LIMIT 64",
@@ -50,9 +40,22 @@ fn queued_sends_blocked_by(
     let rows = statement
         .query_map([agent, generation], |row| row.get::<_, String>(0))
         .map_err(crate::sql_error)?;
-    rows.map(|row| row.map(|send_id| (send_id, "send".to_owned())))
+    let sends = rows
+        .map(|row| row.map(|send_id| (send_id, "send".to_owned())))
         .collect::<rusqlite::Result<Vec<_>>>()
-        .map_err(crate::sql_error)
+        .map_err(crate::sql_error)?;
+    // No queued SEND can display a blocker on an empty page. Resolve the
+    // full outcome gate only when the generation has input to annotate.
+    if sends.is_empty()
+        || !crate::send_outcome_gate_blockers(db, agent, generation, None)?
+            .iter()
+            .any(|blocker| {
+                blocker.kind == "command" && blocker.id == blocker_id && blocker.state == "unknown"
+            })
+    {
+        return Ok(Vec::new());
+    }
+    Ok(sends)
 }
 
 fn artifact_capacity_item(connection: &Connection) -> eliot_core::Result<Option<OwnerInboxItem>> {
