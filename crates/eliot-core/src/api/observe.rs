@@ -14,6 +14,7 @@ pub const MAX_OBSERVE_WINDOW_SECS: u64 = 7 * 24 * 3600;
 pub const MAX_HEAVY_EPISODES: usize = 500;
 /// Most harnesses reported by one doctor response.
 pub const MAX_DOCTOR_HARNESSES: usize = 16;
+pub const MAX_UNCONFIGURED_PROJECT_CHECKS: usize = 32;
 /// Longest retained category or basis text on the wire.
 pub const MAX_OBSERVE_TEXT_BYTES: usize = 128;
 /// Longest retained growth/drift message on the wire.
@@ -632,6 +633,9 @@ impl HarnessDoctorRequest {
         if let Some(attention) = &reply.attention_thresholds {
             attention.validate()?;
         }
+        if let Some(checks) = &reply.project_checks {
+            checks.validate()?;
+        }
         Ok(())
     }
 }
@@ -660,6 +664,47 @@ pub struct HarnessDoctorResponse {
     pub owner_rules_drift: Vec<OwnerRulesGlobalFile>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub owner_rules_check_unavailable: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_checks: Option<ProjectCheckConfiguration>,
+}
+
+/// Coverage of configured project checks, independently of launch or run history.
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum ProjectCheckConfiguration {
+    Available {
+        registered: usize,
+        configured: usize,
+        unconfigured_projects: Vec<String>,
+    },
+    Unavailable,
+}
+
+impl ProjectCheckConfiguration {
+    fn validate(&self) -> Result<()> {
+        if let Self::Available {
+            registered,
+            configured,
+            unconfigured_projects,
+        } = self
+            && (registered
+                .checked_sub(*configured)
+                .map(|missing| missing.min(MAX_UNCONFIGURED_PROJECT_CHECKS))
+                != Some(unconfigured_projects.len())
+                || unconfigured_projects
+                    .iter()
+                    .any(|id| id.is_empty() || id.len() > 128 || id.chars().any(char::is_control))
+                || unconfigured_projects
+                    .windows(2)
+                    .any(|pair| pair[0] >= pair[1]))
+        {
+            return Err(Error::new(
+                "invalid",
+                "doctor project check coverage is invalid",
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// Metadata-only comparison of a harness's global instruction file with the
