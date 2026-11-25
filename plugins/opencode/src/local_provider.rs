@@ -1,0 +1,124 @@
+//! OpenCode local provider configuration checks shared by settings and native startup.
+
+use eliot_core::{api::HarnessCapabilities, local_provider::LocalProvider};
+use reqwest::Url;
+use std::collections::HashSet;
+
+pub(crate) fn validate(provider: &LocalProvider, pass_env: &[String]) -> Result<(), String> {
+    if provider.id.len() > 64
+        || !provider
+            .id
+            .starts_with(|ch: char| ch.is_ascii_alphanumeric())
+        || !provider
+            .id
+            .bytes()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, b'-' | b'_'))
+    {
+        return Err("local provider id must be a slug of 1–64 ASCII characters".into());
+    }
+    if !valid_package_name(&provider.package) {
+        return Err("local provider package must be an npm package name".into());
+    }
+    if !valid_base_url(&provider.base_url) {
+        return Err("local provider base_url must be an absolute HTTP(S) URL without userinfo, a query, a fragment or substitutions".into());
+    }
+    if let Some(name) = provider.api_key_env.as_deref() {
+        if !valid_key_env(name) {
+            return Err(
+                "local provider api_key_env must name a non-reserved environment variable".into(),
+            );
+        }
+        if !pass_env
+            .iter()
+            .any(|allowed| allowed == name || (cfg!(windows) && allowed.eq_ignore_ascii_case(name)))
+        {
+            return Err("local provider api_key_env must be listed in frozen pass_env".into());
+        }
+    }
+
+    if provider.models.is_empty() {
+        return Err("local provider must declare at least one model".into());
+    }
+    let mut ids = HashSet::new();
+    for model in &provider.models {
+        if model.id.len() > 256
+            || model.id.split('/').any(str::is_empty)
+            || model.id.contains(['{', '}', '\\', '#'])
+            || model
+                .id
+                .chars()
+                .any(|ch| ch.is_whitespace() || ch.is_control())
+        {
+            return Err("local provider model ids must be single tokens of 1–256 bytes with non-empty slash segments and no substitutions".into());
+        }
+        if !ids.insert(&model.id) {
+            return Err("local provider model ids must be distinct".into());
+        }
+        // The native config decodes limits as JavaScript integers.
+        const MAX_SAFE_INTEGER: u64 = (1 << 53) - 1;
+        if [model.context_limit, model.output_limit]
+            .into_iter()
+            .flatten()
+            .any(|limit| limit > MAX_SAFE_INTEGER)
+        {
+            return Err("local provider model limits must be safe JavaScript integers".into());
+        }
+    }
+    Ok(())
+}
+
+fn valid_package_name(package: &str) -> bool {
+    fn component(value: &str) -> bool {
+        !value.is_empty()
+            && !matches!(value, "." | "..")
+            && value.bytes().all(|ch| {
+                ch.is_ascii_lowercase() || ch.is_ascii_digit() || matches!(ch, b'-' | b'_' | b'.')
+            })
+    }
+
+    if package.len() > 214 {
+        return false;
+    }
+    if let Some(scoped) = package.strip_prefix('@') {
+        return scoped.split_once('/').is_some_and(|(scope, name)| {
+            !scope.starts_with(['.', '_']) && component(scope) && component(name)
+        });
+    }
+    !package.starts_with(['.', '_']) && component(package)
+}
+
+fn valid_base_url(value: &str) -> bool {
+    if value.contains(['{', '}', '\\'])
+        || value
+            .chars()
+            .any(|ch| ch.is_whitespace() || ch.is_control())
+    {
+        return false;
+    }
+    let Some((_, location)) = value.split_once("://") else {
+        return false;
+    };
+    let authority = location.split(['/', '?', '#']).next().unwrap_or_default();
+    !authority.is_empty()
+        && !authority.contains('@')
+        && Url::parse(value).is_ok_and(|url| {
+            matches!(url.scheme(), "http" | "https")
+                && url.has_host()
+                && url.query().is_none()
+                && url.fragment().is_none()
+        })
+}
+
+fn valid_key_env(name: &str) -> bool {
+    name.len() <= 256
+        && name.starts_with(|ch: char| ch.is_ascii_alphabetic() || ch == '_')
+        && name
+            .bytes()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == b'_')
+        && !name.to_ascii_uppercase().starts_with("ELIOT_")
+        && !name.eq_ignore_ascii_case("PATH")
+        && !HarnessCapabilities::declarations()
+            .iter()
+            .flat_map(|(_, caps)| caps.profile.environment.local_provider_reserved_env)
+            .any(|reserved| name.eq_ignore_ascii_case(reserved))
+}

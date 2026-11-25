@@ -86,6 +86,9 @@ pub struct ProfileSummary {
     /// Requested model; absent means the harness native default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// Exact models the Owner may select when launching on this saved route.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub launch_models: Vec<String>,
     /// Requested effort; absent means the native default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort: Option<String>,

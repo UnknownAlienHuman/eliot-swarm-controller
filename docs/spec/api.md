@@ -1741,6 +1741,23 @@ Agent principals keep the profile and `child_profiles` rules and cannot
 ad-hoc launch. Same-ID retries bind the exact requested payload: a changed
 ad-hoc model is `id_conflict`, while the frozen snapshot stays replay-stable.
 
+An Owner may select a saved route and one of its approved models with
+`swarm launch --profile P --model M`. The API sends `args.profile = P`
+and `args.profile_model = M`; `args.model` still denotes an ad-hoc
+selection. The saved profile's `launch_models` list must contain the exact
+ID. A selection outside that bound returns `model_outside_launch_bounds`
+before admission. This selection is only for parentless Owner launches.
+The profile's route, credentials, effort, permissions and delegation remain
+the source of authority. A caller cannot combine it with a role, harness
+or native overrides.
+
+`profile.list` exposes each valid profile's permitted launch models.
+`command.get` retains the request's `profile` and `profile_model` plus the
+selected model in the frozen launch snapshot. `agent.get` reports that
+frozen profile and the effective native model when observed. An exact
+same-ID retry uses the retained profile and selection. A changed selection
+under that ID returns `id_conflict`.
+
 Without `worktree`, `workspace` remains the existing execution directory. With it,
 `workspace` names the source repository; the daemon chooses the managed destination.
 `base` requires `worktree`. Omitted `base` means local `HEAD`, resolved and frozen to a
@@ -2753,7 +2770,7 @@ can publish either code as its waiting reason before admission.
 `profile.list` (`ProfileListRequest`/`ProfileListResponse`, no params) returns the
 current `config.toml` revision, whether it parses, and per profile the name,
 harness, requested model/effort (absent = native default), permissions,
-approval policy (the resolved harness-native value: Codex `approval_policy`, Muse `approval`, Claude `permission_mode`; absent when the harness has no mapping or the profile does not resolve), control, proxy/account names, `max_live`, `child_profiles`
+approval policy (the resolved harness-native value: Codex `approval_policy`, Muse `approval`, Claude `permission_mode`; absent when the harness has no mapping or the profile does not resolve), control, proxy/account names, `max_live`, `child_profiles`, `launch_models`
 and whether launch-time resolution succeeds now (`launchable`, else `error`).
 It reads no environment value, and a profile whose summary would carry a value
 known to the daemon's secret policy is omitted from the list; parse diagnostics

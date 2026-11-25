@@ -259,6 +259,7 @@ pub fn is_deterministic_pre_admission_rejection(code: &str) -> bool {
             | "invalid"
             | "not_allowed"
             | "not_found"
+            | "model_outside_launch_bounds"
             | "provider_held"
             | "quota_reserve"
             | "quota_unknown"

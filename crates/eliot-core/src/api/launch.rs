@@ -21,6 +21,9 @@ pub struct LaunchCommandArgs {
     pub harness: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// Owner-only model selector within the explicitly named saved profile.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub profile_model: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub effort: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -89,6 +92,12 @@ impl LaunchCommandArgs {
             role: text("role"),
             harness: text("harness"),
             model: text("model"),
+            profile_model: optional_field(
+                args,
+                "profile_model",
+                Value::is_string,
+                "an exact model ID",
+            )?,
             effort: text("effort"),
             auth: text("auth"),
             access: text("access"),

@@ -1654,6 +1654,8 @@ struct ProfileEntry {
     #[serde(default)]
     model: Option<String>,
     #[serde(default)]
+    launch_models: Vec<String>,
+    #[serde(default)]
     effort: Option<String>,
     #[serde(default)]
     approval: Option<String>,
@@ -1767,6 +1769,17 @@ pub(crate) fn resolve_profile_cached(
     data_root: &Path,
     name: &str,
 ) -> core::Result<Value> {
+    resolve_profile_for_launch(cache, data_root, name, None)
+}
+
+/// Resolve the route and validate the explicit model against the same config
+/// revision. Cache only the unmodified preset for the next call.
+pub(crate) fn resolve_profile_for_launch(
+    cache: &Mutex<ProfileCache>,
+    data_root: &Path,
+    name: &str,
+    model: Option<&str>,
+) -> core::Result<Value> {
     validate_profile_name(name)?;
     let current_source = read_config_source(data_root)?;
     let current_revision = current_source.as_deref().map(profiles_edit::revision_of);
@@ -1777,11 +1790,12 @@ pub(crate) fn resolve_profile_cached(
         if let Some(cached) = guard.cached.as_ref()
             && cached.revision == current_revision
         {
-            if let Some(hit) = cached.snapshots.get(name) {
-                return Ok(hit.clone());
-            }
-            if let (Some(config), source) = (cached.config.as_ref(), cached.source.as_str()) {
-                return resolve_profile_in(config, source, name);
+            if let Some(config) = cached.config.as_ref() {
+                let snapshot = match cached.snapshots.get(name) {
+                    Some(hit) => hit.clone(),
+                    None => resolve_profile_in(config, &cached.source, name)?,
+                };
+                return select_launch_model(config, name, model, snapshot);
             }
             return Err(core::Error::new(
                 "profile_error",
@@ -1806,16 +1820,17 @@ pub(crate) fn resolve_profile_cached(
     };
     let config = parse_config(&source)?;
     let snapshot = resolve_profile_in(&config, &source, name)?;
+    let selected = select_launch_model(&config, name, model, snapshot.clone())?;
     let mut guard = cache
         .lock()
         .map_err(|_| core::Error::new("internal", "profile cache poisoned"))?;
     match guard.cached.as_mut() {
         Some(cached) if cached.revision == current_revision => {
-            cached.snapshots.insert(name.to_owned(), snapshot.clone());
+            cached.snapshots.insert(name.to_owned(), snapshot);
         }
         _ => {
             let mut snapshots = HashMap::new();
-            snapshots.insert(name.to_owned(), snapshot.clone());
+            snapshots.insert(name.to_owned(), snapshot);
             guard.cached = Some(CachedProfileConfig {
                 revision: current_revision,
                 source,
@@ -1823,6 +1838,28 @@ pub(crate) fn resolve_profile_cached(
                 snapshots,
             });
         }
+    }
+    Ok(selected)
+}
+
+fn select_launch_model(
+    config: &FileConfig,
+    name: &str,
+    model: Option<&str>,
+    mut snapshot: Value,
+) -> core::Result<Value> {
+    if let Some(model) = model {
+        if !config
+            .profiles
+            .get(name)
+            .is_some_and(|profile| profile.get_ref().launch_models.iter().any(|id| id == model))
+        {
+            return Err(core::Error::new(
+                "model_outside_launch_bounds",
+                "requested model is outside the saved profile's launch_models",
+            ));
+        }
+        snapshot["model"] = json!(model);
     }
     Ok(snapshot)
 }
@@ -2432,7 +2469,8 @@ fn snapshot_from_entry(
         &[
             (
                 "local_provider",
-                !ProfileCapabilities::of(harness).local_provider && entry.local_provider.is_some(),
+                ProfileCapabilities::of(harness).local_provider.is_none()
+                    && entry.local_provider.is_some(),
                 "local providers have no mapping on this harness",
             ),
             (
@@ -2492,6 +2530,7 @@ fn snapshot_from_entry(
     if let Some(freeze_native_route) = mapping.route {
         freeze_native_route(&native, &tail.pass_env, &mut snapshot).map_err(native_refusal)?;
     }
+    validate_launch_models(site, &entry.launch_models, &native, harness, mapping.model)?;
     let control = || validated_control(name, entry.control.as_deref(), source, table_offset);
     let early_control = mapping.control_before_mcp.then(control).transpose()?;
     freeze_mcp_policy(
@@ -2506,6 +2545,46 @@ fn snapshot_from_entry(
     snapshot.insert("control".to_owned(), json!(control));
     insert_profile_tail(&mut snapshot, tail, &entry.setup)?;
     Ok(Value::Object(snapshot))
+}
+
+fn validate_launch_models(
+    site: ProfileSite<'_>,
+    models: &[String],
+    profile: &NativeProfileInput<'_>,
+    harness: &str,
+    validate_native: Option<fn(&str) -> core::api::native_profile::NativeProfileResult<()>>,
+) -> core::Result<()> {
+    use core::api::harness::LaunchModelScope;
+    if models.is_empty() {
+        return Ok(());
+    }
+    let invalid = |reason: &str| site.error("launch_models", reason, "profile_error");
+    let scope = ProfileCapabilities::of(harness).launch_model_scope;
+    if matches!(scope, LaunchModelScope::Unsupported) {
+        return Err(invalid(
+            "this harness does not support per-launch model selection",
+        ));
+    }
+    if profile.model.is_none() || models.len() > 32 {
+        return Err(invalid(
+            "requires a saved model and allows at most 32 exact model IDs",
+        ));
+    }
+    let mut distinct = HashSet::new();
+    for model in models {
+        if !valid_model_selector(model) || !distinct.insert(model) {
+            return Err(invalid("must contain distinct, nonempty model IDs"));
+        }
+        if let Some(validate) = validate_native {
+            validate(model).map_err(|error| invalid(&error.reason))?;
+        }
+        if let LaunchModelScope::Check(stays_on_route) = scope
+            && !stays_on_route(profile, model)
+        {
+            return Err(invalid("every model must use the saved provider route"));
+        }
+    }
+    Ok(())
 }
 
 /// Start the frozen profile with its validated shared selectors. The wire
@@ -2871,10 +2950,7 @@ fn validate_profile_name(name: &str) -> core::Result<()> {
     Ok(())
 }
 fn validate_model(profile: &str, model: &str, source: &str, offset: usize) -> core::Result<()> {
-    if model.is_empty()
-        || model.len() > MAX_MODEL_LEN
-        || model.chars().any(|c| c.is_whitespace() || c.is_control())
-    {
+    if !valid_model_selector(model) {
         return Err(profile_field_error(
             source,
             offset,
@@ -2885,6 +2961,12 @@ fn validate_model(profile: &str, model: &str, source: &str, offset: usize) -> co
         ));
     }
     Ok(())
+}
+
+pub(crate) fn valid_model_selector(model: &str) -> bool {
+    !model.is_empty()
+        && model.len() <= MAX_MODEL_LEN
+        && !model.chars().any(|c| c.is_whitespace() || c.is_control())
 }
 
 /// Whether a profile names an environment variable owned by Eliot.

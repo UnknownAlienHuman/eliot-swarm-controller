@@ -260,7 +260,9 @@ fn has_unsafe_profile_or_proxy(config: &super::FileConfig) -> bool {
                 .flatten()
                 .map(|name| name.trim().to_owned())
                 .collect();
-            provider.validate(&pass_env).is_err()
+            super::ProfileCapabilities::of(entry.harness.trim())
+                .local_provider
+                .is_none_or(|validate| validate(provider, &pass_env).is_err())
         })
     }) || config.proxies.iter().any(|(name, entry)| {
         let proxy = entry.get_ref();
@@ -312,6 +314,11 @@ pub(crate) fn list(data_root: &Path, policy: &SecretPolicy) -> core::Result<Prof
                 name: name.clone(),
                 harness: entry.harness.trim().to_owned(),
                 model: entry.model.clone(),
+                launch_models: if resolved.is_ok() {
+                    entry.launch_models.clone()
+                } else {
+                    Vec::new()
+                },
                 effort: entry.effort.clone(),
                 permissions: entry.permissions.clone(),
                 // The display policy is the harness-native resolved value, never the raw entry fallback: a launchable profile must not advertise a policy the frozen snapshot omits.

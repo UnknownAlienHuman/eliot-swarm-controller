@@ -899,6 +899,20 @@ fn admit_launch_tx(
             ));
         }
     };
+    if let Some(model) = launch.profile_model.as_deref() {
+        if principal != "owner" || parent_link.is_some() {
+            return Err(Error::new(
+                "not_allowed",
+                "saved profile model selection requires a parentless Owner launch",
+            ));
+        }
+        if profile_snapshot.get("model").and_then(Value::as_str) != Some(model) {
+            return Err(Error::new(
+                "invalid",
+                "profile_model does not match the frozen launch model",
+            ));
+        }
+    }
     let encoded_profile_snapshot = encode_json(&profile_snapshot)?;
     let workspace = match preparation {
         Some(input) => {

@@ -40,6 +40,9 @@ pub fn declaration() -> HarnessCapabilities {
         native_route: NativeRoute::AuthIntegration,
         profile: ProfileCapabilities {
             named_profile: Some(crate::profile_config::MAPPING),
+            launch_model_scope: eliot_core::api::harness::LaunchModelScope::Check(
+                crate::profile_config::launch_model_stays_on_route,
+            ),
             environment: eliot_core::api::harness::ProfileEnvironment {
                 store_paths: &[
                     "XDG_CONFIG_HOME",
@@ -69,7 +72,7 @@ pub fn declaration() -> HarnessCapabilities {
                 ..Default::default()
             },
             route_scope_secret_names: &["OPENCODE_CONFIG_CONTENT"],
-            local_provider: true,
+            local_provider: Some(crate::local_provider::validate),
             native_subagents_policy: Some(NativeSubagentsPolicy::deny_by_default()),
             ..ProfileCapabilities::default()
         },
