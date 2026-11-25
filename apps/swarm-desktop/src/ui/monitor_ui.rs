@@ -857,12 +857,13 @@ impl DesktopApp {
                 .filter(|row| filter.keeps(row, incident(row)))
                 .count()
         };
-        let count = |filter: FleetFilter| {
-            filter
-                .states()
-                .and_then(total_of)
-                .unwrap_or_else(|| loaded(filter))
+        // The count, and whether it counts only the loaded rows of a
+        // partial read (its label then says "(loaded)"): one guard for both.
+        let counted = |filter: FleetFilter| match filter.states().and_then(total_of) {
+            Some(total) => (total, false),
+            None => (loaded(filter), partial),
         };
+        let count = |filter: FleetFilter| counted(filter).0;
         let mut items: Vec<KeyedView> = Vec::new();
 
         // Title row: search and grouping.
@@ -947,8 +948,8 @@ impl DesktopApp {
             .into_iter()
             .map(|filter| {
                 let selected = fleet == filter;
-                let n = count(filter);
-                let label = if partial && filter.states().and_then(total_of).is_none() {
+                let (n, loaded_only) = counted(filter);
+                let label = if loaded_only {
                     format!("{} (loaded)", filter.label())
                 } else {
                     filter.label().to_owned()

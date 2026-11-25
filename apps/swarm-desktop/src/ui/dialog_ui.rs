@@ -34,13 +34,16 @@ pub(super) fn surface(
     // `ActualTheme`), so no card of our own repaints it.
     ContentDialog::new()
         .is_open(true)
-        .title(title)
+        .title(&title)
         .default_button(ContentDialogButton::None)
         .on_closed(context.callback(move |_| Message::DialogClosed(epoch)))
         .content(
             StackPanel::new()
                 .spacing(tokens::spacing::MD)
                 .max_width(width)
+                // Reactor's ContentDialog has no automation name of its
+                // own: the content carries the title for UI Automation.
+                .automation_name(title.clone())
                 .children((
                     ScrollViewer::new()
                         .max_height(tokens::layout::DIALOG_MAX_HEIGHT)

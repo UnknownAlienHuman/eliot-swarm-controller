@@ -125,6 +125,8 @@ impl DesktopApp {
                 {
                     keep_admitted_input(convo, &outcome, &harness);
                 }
+                // A refusal the feed delivered before this reply.
+                self.report_refused_steers();
                 self.rebuild_items();
                 self.set_status(format!(
                     "{} {} ({}){}{}.",
@@ -214,9 +216,20 @@ impl DesktopApp {
             return;
         };
         let agent = convo.agent().to_owned();
-        for steer in convo.take_refused_steers() {
-            // Only a steer this window sent has its exact text.
+        // A steer to this Agent still waits for its reply, which brings
+        // its command and text.
+        let sending = self.in_flight_key.as_deref().is_some_and(|key| {
+            let mut fields = key.split(':');
+            fields.next() == Some("steer") && fields.next() == Some(agent.as_str())
+        });
+        for steer in convo.take_refused_steers(sending) {
+            // Only a steer this window sent has its exact text; another's
+            // refusal is said with its reason alone.
             let Some(text) = steer.text else {
+                self.alert(format!(
+                    "Steer not applied: {}.",
+                    steer.reason.trim_end_matches('.')
+                ));
                 continue;
             };
             let restored = {

@@ -1005,14 +1005,16 @@ pub struct Conversation {
     /// The exact text of the steers this window sent, kept while their
     /// turn shows them, so a refused one goes back to the composer whole.
     steer_exact: HashMap<String, String>,
-    /// Steers refused since the last [`Conversation::take_refused_steers`].
+    /// Steers refused and not reported yet
+    /// ([`Conversation::take_refused_steers`]).
     refused: Vec<RefusedSteer>,
 }
 
-/// A steer the turn did not take: why, and its exact text when this window
-/// sent it.
+/// A steer the turn did not take: its command, why, and its exact text
+/// when this window sent it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RefusedSteer {
+    pub command: String,
     pub reason: String,
     pub text: Option<String>,
 }
@@ -1119,6 +1121,7 @@ impl Conversation {
         let inputs = std::mem::take(&mut self.inputs);
         let pending_exact = std::mem::take(&mut self.pending_exact);
         let steer_exact = std::mem::take(&mut self.steer_exact);
+        let refused = std::mem::take(&mut self.refused);
         let notes = std::mem::take(&mut self.local_notes);
         let failures = std::mem::take(&mut self.local_failures);
         *self = Self::new(&self.agent);
@@ -1131,6 +1134,19 @@ impl Conversation {
         self.local_failures = failures;
         let cursor = self.coverage.cursor;
         let mut invalidation = self.apply_events(events);
+        // The snapshot's refusals are history, shown in their turns' steer
+        // rows; only a steer this window sent (its text still held) is new.
+        // Refusals not reported yet stay.
+        self.refused.retain(|steer| steer.text.is_some());
+        for steer in refused {
+            if !self
+                .refused
+                .iter()
+                .any(|known| known.command == steer.command)
+            {
+                self.refused.push(steer);
+            }
+        }
         self.coverage.cursor = cursor.max(self.applied_seq);
         self.apply_turns(turns);
         let referenced: HashSet<String> = self
@@ -1345,23 +1361,40 @@ impl Conversation {
                 }
             }
         }
-        if found {
+        if found && !self.refused.iter().any(|known| known.command == command) {
             self.refused.push(RefusedSteer {
+                command: command.to_owned(),
                 reason,
                 text: self.steer_exact.remove(command),
             });
         }
     }
 
-    /// The steers refused since the last call, each once.
-    pub fn take_refused_steers(&mut self) -> Vec<RefusedSteer> {
-        std::mem::take(&mut self.refused)
+    /// The refused steers to report now, each once. One without its text
+    /// waits while `sending` (this window's steer reply may still bring
+    /// it, [`Self::note_steer_text`]); otherwise it goes with its reason
+    /// only.
+    pub fn take_refused_steers(&mut self, sending: bool) -> Vec<RefusedSteer> {
+        let (ready, waiting) = std::mem::take(&mut self.refused)
+            .into_iter()
+            .partition(|steer| steer.text.is_some() || !sending);
+        self.refused = waiting;
+        ready
     }
 
     /// Keep the exact text of a steer this window sent until its turn
-    /// takes or refuses it.
+    /// takes or refuses it; a refusal the feed delivered before this reply
+    /// takes it at once.
     pub fn note_steer_text(&mut self, command: &str, text: &str) {
-        self.steer_exact.insert(command.to_owned(), text.to_owned());
+        if let Some(steer) = self
+            .refused
+            .iter_mut()
+            .find(|steer| steer.command == command && steer.text.is_none())
+        {
+            steer.text = Some(text.to_owned());
+        } else {
+            self.steer_exact.insert(command.to_owned(), text.to_owned());
+        }
     }
 
     /// A delivered Swarm note (`command.applied` whose outcome says
