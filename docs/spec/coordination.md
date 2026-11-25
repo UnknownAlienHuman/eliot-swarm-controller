@@ -1536,8 +1536,11 @@ the target registration revision and assignment epoch. An active local
 assignment accepts a projectless root chat with no controlled children or
 transferable SENDs. Its successor is a new worker of the recorded manager
 generation, in a separate prepared worktree of the target repository and
-under that project's profile and capacity gates. The switch rechecks the
+under that project's profile and capacity gates. The Owner supplies a
+project-approved named profile at reservation. The switch rechecks the
 binding during preparation, before launch, at dispatch and before handoff.
+Worktree and capacity reservations commit with launch admission. A refusal
+rolls them back before Git creates the worktree.
 A changed binding or open transfer refuses the affected phase. A vacant
 project still gets a new worktree and retains the source authorization scope.
 

@@ -20,7 +20,8 @@ pub struct SwitchLaunch {
     pub access: Option<String>,
     /// Registered execution project for B. The Owner can continue a
     /// projectless root chat as a worker of the exact active assignment.
-    /// The worker gets a prepared worktree and receives a bounded brief.
+    /// Select a named profile approved by the project. The worker gets a
+    /// prepared worktree and receives a bounded brief.
     /// A vacant target instead retains A's authorization scope.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project: Option<String>,

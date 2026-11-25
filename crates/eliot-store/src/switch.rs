@@ -320,6 +320,21 @@ fn require_switch_project(
     }
 }
 
+fn require_assignment_launch_profile(
+    registration: &core::api::ProjectRegistrationView,
+    profile: Option<&str>,
+) -> Result<()> {
+    if profile.is_none_or(|profile| !registration.profiles.iter().any(|name| name == profile))
+        || !registration.actions.iter().any(|action| action == "launch")
+    {
+        return Err(Error::new(
+            "not_allowed",
+            "continuation into an assigned project requires a project-approved named profile",
+        ));
+    }
+    Ok(())
+}
+
 fn decode_switch(mut args: Value) -> Result<RetainedSwitch> {
     let malformed = || Error::new("source_integrity", "switch request malformed");
     let args_map = args.as_object_mut().ok_or_else(malformed)?;
@@ -1007,19 +1022,7 @@ fn reserve_switch_tx(
                     "continuing into an assignment requires a projectless root chat with no controlled children or transferable SENDs",
                 ));
             }
-            if !registration.actions.iter().any(|action| action == "launch")
-                || request.launch.harness.is_some()
-                || request
-                    .launch
-                    .profile
-                    .as_ref()
-                    .is_some_and(|profile| !registration.profiles.contains(profile))
-            {
-                return Err(Error::new(
-                    "not_allowed",
-                    "continuation requires a project-approved launch profile or role",
-                ));
-            }
+            require_assignment_launch_profile(&registration, request.launch.profile.as_deref())?;
         }
         args[TARGET_PROJECT] = json!(binding);
     }
@@ -1938,20 +1941,17 @@ impl Store {
                         "switch target registration changed",
                     ));
                 }
-                if manager.is_some()
-                    && (preparation.is_none()
-                        || !registration.actions.iter().any(|action| action == "launch")
-                        || request.args["profile"].as_str().is_none_or(|profile| {
-                            !registration
-                                .profiles
-                                .iter()
-                                .any(|allowed| allowed == profile)
-                        }))
-                {
-                    return Err(Error::new(
-                        "not_allowed",
-                        "continuation requires a prepared worktree and a project-approved profile",
-                    ));
+                if manager.is_some() {
+                    require_assignment_launch_profile(
+                        &registration,
+                        source.launch.profile.as_deref(),
+                    )?;
+                    if preparation.is_none() {
+                        return Err(Error::new(
+                            "not_allowed",
+                            "continuation requires a prepared worktree",
+                        ));
+                    }
                 }
                 // The frozen checkout admitted here must already be the
                 // target registration's checkout: a changed registration or
@@ -2032,6 +2032,8 @@ impl Store {
                     .remove(core::api::SWITCH_BLANK_SCOPE_ARG);
             }
             super::work_truth::require_no_checkpoint_intent_tx(&tx, &agent)?;
+            // Roll back the launch, worktree reservation and capacity together
+            // on any refusal before commit. Git creation follows admission.
             let admission = admission::submit_switch_launch_tx(
                 &tx,
                 "owner",
