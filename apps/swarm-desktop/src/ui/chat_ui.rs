@@ -87,6 +87,8 @@ pub(super) enum ChatMsg {
     LiveRetry,
     /// Add the draft as a note (`inject`).
     NoteRequested,
+    /// A control that bound nothing, and why (shown in the alert).
+    Refused(String),
     /// A note's admission: the Agent, the draft revision it cleared.
     NoteSubmitted(String, u64, eliot_core::Result<String>),
     AnswerRequested(UiPending),
@@ -1060,6 +1062,7 @@ impl DesktopApp {
             }
             ChatMsg::LiveRetry => self.start_snapshot(context),
             ChatMsg::NoteRequested => self.add_note(context),
+            ChatMsg::Refused(reason) => self.alert(reason),
             ChatMsg::NoteSubmitted(agent, revision, outcome) => {
                 self.settle_mutation(
                     outcome
@@ -1228,15 +1231,17 @@ impl DesktopApp {
                 }
             },
             ChatMsg::AgentMenu(action) => {
-                // Bound now, to the Agent and generation the header shows.
-                let binding = self.selected_agent_id().zip(self.chat.detail.as_ref()).map(
-                    |(agent, detail)| MenuBinding {
-                        agent,
-                        generation: detail.generation,
-                    },
-                );
-                if let Some(binding) = binding {
-                    self.agent_menu(action, binding, context);
+                // Bound now, to the Agent and generation the header shows,
+                // taken together from one readback of that Agent.
+                match self.bound_detail() {
+                    Ok(detail) => {
+                        let binding = MenuBinding {
+                            agent: detail.agent.clone(),
+                            generation: detail.generation,
+                        };
+                        self.agent_menu(action, binding, context);
+                    }
+                    Err(reason) => self.alert(reason),
                 }
             }
             ChatMsg::ForceStopAnswered(confirmed) => {
@@ -1277,11 +1282,16 @@ impl DesktopApp {
         if self.submitting() {
             return;
         }
-        let (Some(agent), Some(generation), Ok(data_dir)) = (
-            self.selected_agent_id(),
-            self.chat.detail.as_ref().map(|detail| detail.generation),
-            self.data_dir.clone(),
-        ) else {
+        // The Agent and generation together, from one readback of the open
+        // Agent.
+        let (agent, generation) = match self.bound_detail() {
+            Ok(detail) => (detail.agent.clone(), detail.generation),
+            Err(reason) => {
+                self.alert(reason);
+                return;
+            }
+        };
+        let Ok(data_dir) = self.data_dir.clone() else {
             return;
         };
         let text = profiles::normalize_newlines(self.chat.drafts.borrow().text(Some(&agent)));
@@ -1307,6 +1317,28 @@ impl DesktopApp {
             .map(|reply| submit_note(&reply));
             Message::Chat(ChatMsg::NoteSubmitted(agent, revision, outcome))
         });
+    }
+
+    /// The open Agent's readback, when it is of that Agent: a control takes
+    /// its Agent, generation and turn from it together. Otherwise why not,
+    /// in words the window shows (a readback still in flight, or one of
+    /// another Agent after a switch).
+    pub(super) fn bound_detail(&self) -> Result<&UiDetail, String> {
+        let agent = self
+            .selected_agent_id()
+            .ok_or_else(|| "No task is open.".to_owned())?;
+        let detail = self
+            .chat
+            .detail
+            .as_ref()
+            .ok_or_else(|| "The task's details are still being read; try again.".to_owned())?;
+        if detail.agent != agent {
+            return Err(format!(
+                "The details shown are of {}, not of the open task {agent}; nothing was sent. Try again once they are read.",
+                detail.agent
+            ));
+        }
+        Ok(detail)
     }
 
     /// Stop this Agent generation (its process and session), from the
@@ -1638,6 +1670,10 @@ impl DesktopApp {
     /// down in one frame. Back to tasks builds it again from its end.
     pub(super) fn chat_view(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
         let column = self.reading_width();
+        // The running seconds tick only while a conversation is on screen.
+        views::clock::set_shown(
+            self.main == Main::Conversation && self.selected_agent_id().is_some(),
+        );
         let transcript = self.transcript_view(column, context, palette);
         if self.main != Main::Conversation {
             let content = match self.main {

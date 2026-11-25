@@ -158,6 +158,9 @@ struct UiPending {
 /// Readback for the selected Agent.
 #[derive(Clone, Debug)]
 struct UiDetail {
+    /// The Agent this readback is of: every control checks it against the
+    /// open Agent before binding to the generation and turn below.
+    agent: String,
     generation: i64,
     active_turn: Option<String>,
     pending: Vec<UiPending>,
@@ -716,6 +719,7 @@ fn detail_from(reply: &AgentGetResponse) -> UiDetail {
         })
         .collect();
     UiDetail {
+        agent: reply.agent.id.clone(),
         generation: reply.agent.generation,
         active_turn: reply.agent.active_turn.clone(),
         pending,

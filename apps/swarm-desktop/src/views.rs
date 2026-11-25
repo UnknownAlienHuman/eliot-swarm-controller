@@ -34,8 +34,45 @@ pub enum RenderedBlock {
     Heading(u8, String),
     Code(usize, String),
     Rule,
-    /// A table's header cells and body rows.
-    Table(Vec<String>, Vec<Vec<String>>),
+    /// A table, bounded and shared: its grid is its own component, built
+    /// once per message revision.
+    Table(Rc<TableData>),
+}
+
+/// Most body rows and columns a table draws; the rest are counted and Copy
+/// table copies them all.
+const TABLE_ROWS: usize = 200;
+const TABLE_COLUMNS: usize = 20;
+
+/// One answer table as drawn: at most [`TABLE_ROWS`] × [`TABLE_COLUMNS`],
+/// how many rows and columns were left out, and the whole table as
+/// tab-separated text.
+pub struct TableData {
+    head: Vec<String>,
+    rows: Vec<Vec<String>>,
+    hidden_rows: usize,
+    hidden_columns: usize,
+    text: String,
+}
+
+impl TableData {
+    fn new(head: &[String], rows: &[Vec<String>]) -> Self {
+        let columns = head.len().max(rows.iter().map(Vec::len).max().unwrap_or(0));
+        let cut = |row: &[String]| row.iter().take(TABLE_COLUMNS).cloned().collect::<Vec<_>>();
+        let text = std::iter::once(head)
+            .chain(rows.iter().map(Vec::as_slice))
+            .filter(|row| !row.is_empty())
+            .map(|row| row.join("\t"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        Self {
+            head: cut(head),
+            rows: rows.iter().take(TABLE_ROWS).map(|row| cut(row)).collect(),
+            hidden_rows: rows.len().saturating_sub(TABLE_ROWS),
+            hidden_columns: columns.saturating_sub(TABLE_COLUMNS),
+            text,
+        }
+    }
 }
 
 /// One rendered part; immutable once built, replaced on a new revision.
@@ -119,7 +156,7 @@ fn render_doc(doc: &Doc) -> Vec<RenderedBlock> {
             }
             Block::Rule => blocks.push(RenderedBlock::Rule),
             Block::Table { head, rows } => {
-                blocks.push(RenderedBlock::Table(head.clone(), rows.clone()));
+                blocks.push(RenderedBlock::Table(Rc::new(TableData::new(head, rows))));
             }
         }
     }
@@ -347,7 +384,10 @@ fn block_views(
                     ))
                 }
                 RenderedBlock::Rule => crate::m3::divider(palette).into(),
-                RenderedBlock::Table(head, rows) => table_view(head, rows, palette),
+                RenderedBlock::Table(table) => View::component::<TableView>(TableInput {
+                    table: Shared(Rc::clone(table)),
+                    palette,
+                }),
             };
             KeyedView::new(index, view)
         })
@@ -565,9 +605,77 @@ fn generation_glyph(line: &str) -> &'static str {
     }
 }
 
-/// A table (`.md table`): the header in `label-large` on-surface-variant,
-/// the cells in `body-medium`, a hairline under every row.
-fn table_view(head: &[String], rows: &[Vec<String>], palette: Palette) -> View {
+/// A table's input: its bounded data (compared by identity) and palette.
+#[derive(Clone, PartialEq)]
+pub struct TableInput {
+    pub table: Shared<TableData>,
+    pub palette: Palette,
+}
+
+/// An answer table (`.md table`) as its own component: a hover or another
+/// part's change re-renders its message, never its grid. The header in
+/// `label-large` on-surface-variant, the cells in `body-medium`, a hairline
+/// under every row; past the bound, how many rows and columns are left out
+/// and Copy table (every row, tab-separated).
+pub struct TableView;
+
+impl Component for TableView {
+    type Input = TableInput;
+    /// Copy table.
+    type Message = ();
+
+    fn create(_input: &TableInput, _context: &ComponentContext<Self>) -> Self {
+        Self
+    }
+
+    fn update(&mut self, (): (), _context: &ComponentContext<Self>) {}
+
+    fn view(&self, input: &TableInput, context: &mut ViewContext<Self>) -> View {
+        let table = &*input.table.0;
+        let grid = table_grid(&table.head, &table.rows, input.palette);
+        if table.hidden_rows == 0 && table.hidden_columns == 0 {
+            return grid;
+        }
+        let mut left_out = Vec::new();
+        if table.hidden_rows > 0 {
+            left_out.push(crate::chat::count_words(
+                table.hidden_rows,
+                "more row",
+                "more rows",
+            ));
+        }
+        if table.hidden_columns > 0 {
+            left_out.push(crate::chat::count_words(
+                table.hidden_columns,
+                "more column",
+                "more columns",
+            ));
+        }
+        let text = table.text.clone();
+        let copy = context.callback(move |()| {
+            let _ = crate::clipboard::set_text(&text);
+        });
+        StackPanel::new().spacing(tokens::spacing::XS).children((
+            grid,
+            StackPanel::new()
+                .orientation(Orientation::Horizontal)
+                .spacing(tokens::spacing::SM)
+                .children((
+                    crate::m3::secondary(left_out.join(" \u{b7} "))
+                        .vertical_alignment(VerticalAlignment::Center),
+                    crate::m3::text_button(input.palette)
+                        .automation_name("Copy table: every row, tab-separated")
+                        .on_click(copy)
+                        .content(crate::m3::label("Copy table"))
+                        .tooltip("Copies every row, tab-separated"),
+                )),
+        ))
+    }
+}
+
+/// The grid of a bounded table: one hairline per row, one cell per drawn
+/// cell.
+fn table_grid(head: &[String], rows: &[Vec<String>], palette: Palette) -> View {
     let columns = head
         .len()
         .max(rows.iter().map(Vec::len).max().unwrap_or(0))
@@ -1343,8 +1451,71 @@ impl Component for PartView {
     }
 }
 
-/// Between two redraws of a running tool row's seconds.
-const ELAPSED_TICK_MS: u64 = 1_000;
+/// The conversation's one clock: a single ticker thread advances it once a
+/// second while the conversation is shown and the window is not minimized,
+/// and every running step's and log head's time waits on it, so nothing
+/// ticks while it cannot be seen.
+pub mod clock {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Condvar, Mutex, Once};
+    use std::time::Duration;
+
+    static TICK: Mutex<u64> = Mutex::new(0);
+    static NEXT: Condvar = Condvar::new();
+    static SHOWN: AtomicBool = AtomicBool::new(false);
+    static STARTED: Once = Once::new();
+
+    const PERIOD: Duration = Duration::from_secs(1);
+
+    /// Whether a conversation is on screen (the window says so each render).
+    pub fn set_shown(shown: bool) {
+        SHOWN.store(shown, Ordering::Relaxed);
+    }
+
+    fn minimized() -> bool {
+        crate::app_resources::window_minimized()
+    }
+
+    fn start() {
+        STARTED.call_once(|| {
+            let _ = std::thread::Builder::new()
+                .name("conversation-clock".to_owned())
+                .spawn(|| {
+                    loop {
+                        std::thread::sleep(PERIOD);
+                        if !SHOWN.load(Ordering::Relaxed) || minimized() {
+                            continue;
+                        }
+                        if let Ok(mut tick) = TICK.lock() {
+                            *tick += 1;
+                        }
+                        NEXT.notify_all();
+                    }
+                });
+        });
+    }
+
+    /// The clock's count now.
+    pub fn now() -> u64 {
+        start();
+        TICK.lock().map_or(0, |tick| *tick)
+    }
+
+    /// Wait until the clock passes `seen`, or `cancelled`: the new count.
+    pub fn next(seen: u64, cancelled: &dyn Fn() -> bool) -> u64 {
+        start();
+        let Ok(mut tick) = TICK.lock() else {
+            return seen;
+        };
+        while *tick <= seen && !cancelled() {
+            match NEXT.wait_timeout(tick, PERIOD) {
+                Ok((guard, _)) => tick = guard,
+                Err(_) => return seen,
+            }
+        }
+        *tick
+    }
+}
 
 /// A running tool row's start and the palette its caption takes.
 #[derive(Clone, PartialEq)]
@@ -1356,32 +1527,33 @@ pub struct ElapsedInput {
     pub words: Option<String>,
 }
 
-/// A running step's time or a running log's head: its own one-second clock, so the tick redraws this
-/// caption only, never the transcript or the window around it.
+/// A running step's time or a running log's head, redrawn on the shared
+/// [`clock`]: the tick redraws this caption only, never the transcript or
+/// the window around it, and stops while the conversation is not shown.
 pub struct Elapsed {
     now_ms: i64,
 }
 
-fn tick_later(context: &ComponentContext<Elapsed>) {
-    let _task = context.spawn_background(|cancel| {
-        let _ = crate::feed::backoff(ELAPSED_TICK_MS, &|| cancel.is_cancelled());
-    });
+fn tick_later(seen: u64, context: &ComponentContext<Elapsed>) {
+    let _task =
+        context.spawn_background(move |cancel| clock::next(seen, &|| cancel.is_cancelled()));
 }
 
 impl Component for Elapsed {
     type Input = ElapsedInput;
-    type Message = ();
+    /// The shared clock's new count.
+    type Message = u64;
 
     fn create(_input: &ElapsedInput, context: &ComponentContext<Self>) -> Self {
-        tick_later(context);
+        tick_later(clock::now(), context);
         Self {
             now_ms: crate::handoff::now_ms(),
         }
     }
 
-    fn update(&mut self, (): (), context: &ComponentContext<Self>) {
+    fn update(&mut self, tick: u64, context: &ComponentContext<Self>) {
         self.now_ms = crate::handoff::now_ms();
-        tick_later(context);
+        tick_later(tick, context);
     }
 
     fn view(&self, input: &ElapsedInput, _context: &mut ViewContext<Self>) -> View {

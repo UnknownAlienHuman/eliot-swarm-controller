@@ -57,7 +57,7 @@ impl DesktopApp {
     /// The decision panel's items: the open Agent's pending requests, then
     /// its unconfirmed outcomes from `owner.inbox`.
     fn decisions(&self) -> Vec<Decision<'_>> {
-        let (Some(agent), Some(detail)) = (self.selected_agent_id(), self.chat.detail.as_ref())
+        let (Some(agent), Some(detail)) = (self.selected_agent_id(), self.bound_detail().ok())
         else {
             return Vec::new();
         };
@@ -274,7 +274,7 @@ impl DesktopApp {
     /// scope); `None` unless exactly one matches.
     fn hold_scope(&self) -> Option<String> {
         let agent = self.selected_agent_id()?;
-        let hold = self.chat.detail.as_ref()?.provider_hold.as_ref()?;
+        let hold = self.bound_detail().ok()?.provider_hold.as_ref()?;
         let (read, holds) = self.chat.holds.as_ref()?;
         if *read != agent {
             return None;
@@ -301,7 +301,7 @@ impl DesktopApp {
         if items.is_empty() {
             return None;
         }
-        let detail = self.chat.detail.as_ref()?;
+        let detail = self.bound_detail().ok()?;
         let at = self.chat.decision_at.min(items.len() - 1);
         let harness = crate::picker::harness_label(&detail.harness).to_owned();
         let enabled = !self.submitting();
@@ -931,7 +931,7 @@ impl DesktopApp {
     ) -> Option<View> {
         use eliot_core::ProviderRestrictionKind as Kind;
         let agent = self.selected_agent_id()?;
-        let detail = self.chat.detail.as_ref()?;
+        let detail = self.bound_detail().ok()?;
         let hold = detail.provider_hold.as_ref()?;
         if self
             .chat

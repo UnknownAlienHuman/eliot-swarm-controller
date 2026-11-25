@@ -1908,6 +1908,10 @@ fn generation_item(generation: i64, line: &str) -> TurnItem {
 }
 
 /// `n` and the noun in the right number: "1 tool", "3 tools".
+pub fn count_words(n: usize, one: &str, many: &str) -> String {
+    count(n, one, many)
+}
+
 fn count(n: usize, one: &str, many: &str) -> String {
     format!("{n} {}", if n == 1 { one } else { many })
 }

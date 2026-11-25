@@ -699,6 +699,24 @@ pub mod winui {
             }
         }
 
+        /// The composer's usage ring: a text button whose `ProgressRing`
+        /// takes its arc (primary; attention under 20 % left) and its
+        /// track (the outline) from this button's own resources, which
+        /// WinUI's ring template resolves before the application's.
+        pub fn usage_ring(self, remaining: f64) -> ResourceOverrides {
+            self.with(|r| {
+                let arc = if remaining < super::QUOTA_LOW {
+                    r.attention
+                } else {
+                    r.primary
+                };
+                Family::new(None, r.variant)
+                    .overrides(r)
+                    .set("ProgressRingForegroundThemeBrush", color(arc))
+                    .set("ProgressRingBackgroundThemeBrush", color(r.outline))
+            })
+        }
+
         /// The composer's context ring (`.ring`): its arc in `primary`, its
         /// track in `surface-container-highest`, which WinUI's ring template
         /// reads from the button's own resources.

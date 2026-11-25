@@ -23,40 +23,15 @@ impl DesktopApp {
 
         match action {
             Action::Details => self.show_details(&binding.agent, context),
+            // No sidebar row to stop through: the same question, bound to
+            // the generation the header shows.
+            Action::Stop => {
+                if let Some(agent) = self.header_agent(&binding) {
+                    self.menu.confirm = Some((menu_ui::Target::Agent(agent), Action::Stop));
+                }
+            }
             Action::MoveUnder => {
-                // Bound to the generation the header shows.
-                let agent = self.find_agent(&binding.agent).cloned().or_else(|| {
-                    self.chat
-                        .detail
-                        .as_ref()
-                        .filter(|detail| detail.generation == binding.generation)
-                        .map(|detail| UiAgent {
-                            id: binding.agent.clone(),
-                            generation: binding.generation,
-                            harness: detail.harness.clone(),
-                            state: detail.state,
-                            status_line: None,
-                            project_id: detail.project.clone(),
-                            project_scope: detail.project_scope.clone(),
-                            repo_common_dir: None,
-                            workspace: detail.workspace.clone(),
-                            parent: detail.parent.clone(),
-                            updated_at: 0,
-                            title: self.agent_title(&binding.agent),
-                            native_child: detail.observe_only,
-                            tokens: None,
-                            chat: false,
-                            archived: false,
-                            pending: false,
-                            organization: None,
-                            tags: Vec::new(),
-                            organization_revision: None,
-                            model: detail.settings.effective_model.clone(),
-                            work: None,
-                        })
-                });
-                if let Some(mut agent) = agent {
-                    agent.generation = binding.generation;
+                if let Some(agent) = self.header_agent(&binding) {
                     self.move_update(super::move_ui::MoveMsg::Open(agent), context);
                 }
             }
@@ -92,7 +67,6 @@ impl DesktopApp {
                     .map(|reply| submit_note(&reply))
                 });
             }
-            Action::Stop => self.stop_agent(&bound.agent, bound.generation, context),
             Action::ForceStop => {
                 let title = self.agent_title(&binding.agent);
                 self.chat.confirm_force = Some((bound, title));
@@ -102,7 +76,9 @@ impl DesktopApp {
                     .chat
                     .detail
                     .as_ref()
-                    .filter(|detail| detail.generation == binding.generation)
+                    .filter(|detail| {
+                        detail.agent == binding.agent && detail.generation == binding.generation
+                    })
                     .and_then(|detail| detail.branch.clone());
                 match branch.map(|branch| (crate::clipboard::set_text(&branch), branch)) {
                     Some((Ok(()), branch)) => self.set_status(format!("Copied {branch}.")),
@@ -112,6 +88,45 @@ impl DesktopApp {
             }
             _ => {}
         }
+    }
+
+    /// The open Agent as a row bound to the generation the header shows:
+    /// its sidebar row, else built from its readback of that generation.
+    fn header_agent(&self, binding: &MenuBinding) -> Option<UiAgent> {
+        let mut agent = self.find_agent(&binding.agent).cloned().or_else(|| {
+            self.chat
+                .detail
+                .as_ref()
+                .filter(|detail| {
+                    detail.agent == binding.agent && detail.generation == binding.generation
+                })
+                .map(|detail| UiAgent {
+                    id: binding.agent.clone(),
+                    generation: binding.generation,
+                    harness: detail.harness.clone(),
+                    state: detail.state,
+                    status_line: None,
+                    project_id: detail.project.clone(),
+                    project_scope: detail.project_scope.clone(),
+                    repo_common_dir: None,
+                    workspace: detail.workspace.clone(),
+                    parent: detail.parent.clone(),
+                    updated_at: 0,
+                    title: self.agent_title(&binding.agent),
+                    native_child: detail.observe_only,
+                    tokens: None,
+                    chat: false,
+                    archived: false,
+                    pending: false,
+                    organization: None,
+                    tags: Vec::new(),
+                    organization_revision: None,
+                    model: detail.settings.effective_model.clone(),
+                    work: None,
+                })
+        })?;
+        agent.generation = binding.generation;
+        Some(agent)
     }
 
     /// The header's "…" entries, in the skeleton's order (5.2): Rename,
@@ -199,7 +214,7 @@ impl DesktopApp {
         palette: Palette,
     ) -> View {
         let title = self.agent_title(agent);
-        let detail = self.chat.detail.as_ref();
+        let detail = self.bound_detail().ok();
         // While its detail is read, the sidebar row's state stands in, so
         // opening a task never flashes "Unknown".
         let row = self.find_agent(agent);

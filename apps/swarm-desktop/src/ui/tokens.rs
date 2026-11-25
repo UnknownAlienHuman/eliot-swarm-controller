@@ -371,6 +371,7 @@ pub mod layout {
     pub const PROJECT_CHIP_WIDTH: f64 = 280.0;
     /// The access and project menus above the composer.
     pub const MENU_WIDTH: f64 = 420.0;
+    pub const USAGE_MENU_WIDTH: f64 = 320.0;
     pub const EFFORT_MENU_MIN_WIDTH: f64 = 300.0;
     /// The scrolling list of a popover.
     pub const POPOVER_LIST_HEIGHT: f64 = 360.0;

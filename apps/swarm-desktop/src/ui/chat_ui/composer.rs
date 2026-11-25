@@ -8,6 +8,9 @@ use crate::state::Drafts;
 use eliot_core::api::{HarnessModelsResponse, ModelsCatalogResponse};
 use launch_ui::Pop;
 
+/// Limits the usage popover lists (the tightest first).
+const USAGE_ROWS: usize = 3;
+
 impl DesktopApp {
     /// What Send (the button, or Enter) does now: retry the unresolved
     /// submission with its saved identity, or start the task, resume a
@@ -23,7 +26,12 @@ impl DesktopApp {
         if self.chat.pending_retry.contains_key(&agent) {
             return Some(Message::Chat(ChatMsg::RetryPending(agent)));
         }
-        let detail = self.chat.detail.as_ref()?;
+        let detail = match self.bound_detail() {
+            Ok(detail) => detail,
+            Err(reason) => {
+                return Some(Message::Chat(ChatMsg::Refused(reason)));
+            }
+        };
         let action = match (&detail.active_turn, resumable(detail)) {
             (_, true) => DraftAction::Resume {
                 agent,
@@ -56,7 +64,9 @@ impl DesktopApp {
         palette: Palette,
     ) -> View {
         let agent = self.selected_agent_id();
-        let detail = self.chat.detail.as_ref();
+        // Only a readback of the open Agent binds its controls; until then
+        // the card keeps the shape its sidebar row implies.
+        let detail = self.bound_detail().ok();
         let home = agent.is_none();
         let running =
             detail.is_some_and(|detail| detail.active_turn.is_some() && !detail.observe_only);
@@ -152,10 +162,19 @@ impl DesktopApp {
             chips,
             // Home's bar is the design's (+, the chips, Start task): the
             // limits are the sidebar's Usage row there.
+            // The task's quota ring (its harness's tightest window, with
+            // its popover) and the context ring.
             usage: if home {
                 View::empty()
             } else {
-                self.context_ring(context, palette)
+                StackPanel::new()
+                    .orientation(Orientation::Horizontal)
+                    .spacing(tokens::spacing::XS)
+                    .vertical_alignment(VerticalAlignment::Center)
+                    .children((
+                        self.usage_indicator(context, palette),
+                        self.context_ring(context, palette),
+                    ))
             },
             // Add as a note: a live Agent the daemon can take a note for.
             note: detail
@@ -239,7 +258,7 @@ impl DesktopApp {
             return None;
         }
         self.selected_agent_id()?;
-        self.chat.detail.as_ref()
+        self.bound_detail().ok()
     }
 
     /// The open Agent's route catalogue, read for its exact generation:
@@ -247,7 +266,7 @@ impl DesktopApp {
     /// or at once from its Retry).
     pub(in crate::ui) fn agent_catalog(&self) -> Option<&Result<HarnessModelsResponse, String>> {
         let agent = self.selected_agent_id()?;
-        let generation = self.chat.detail.as_ref()?.generation;
+        let generation = self.bound_detail().ok()?.generation;
         self.configure
             .catalog
             .as_ref()
@@ -282,7 +301,7 @@ impl DesktopApp {
 
     /// Confirmed effort steps of the open Agent's next model.
     pub(in crate::ui) fn agent_efforts(&self) -> Vec<String> {
-        match (self.agent_catalog(), self.chat.detail.as_ref()) {
+        match (self.agent_catalog(), self.bound_detail().ok()) {
             (Some(Ok(reply)), Some(detail)) if reply.configure.effort_refusal.is_none() => {
                 configure::options(reply, detail.settings.next_model()).1
             }
@@ -299,7 +318,7 @@ impl DesktopApp {
         context: &mut ViewContext<Self>,
         palette: Palette,
     ) -> View {
-        let Some(detail) = self.chat.detail.as_ref() else {
+        let Some(detail) = self.bound_detail().ok() else {
             return View::empty();
         };
         let harness = crate::picker::harness_label(&detail.harness);
@@ -424,12 +443,228 @@ impl DesktopApp {
             ))
     }
 
+    /// Codex's usage popover over the composer: where the usage comes from,
+    /// the tightest limits with when each refreshes, and Manage usage.
+    pub(in crate::ui) fn usage_popover(
+        &self,
+        context: &mut ViewContext<Self>,
+        palette: Palette,
+    ) -> View {
+        let Some(harness) = self.composer_harness() else {
+            return View::empty();
+        };
+        let Some(Ok(reply)) = self.settings.quotas.get(&harness) else {
+            return View::empty();
+        };
+        let label = crate::picker::harness_label(&harness);
+        let mut source = match crate::quota::plan(reply) {
+            Some(plan) => format!("Usage source: {label} · {plan} plan"),
+            None => format!("Usage source: {label}"),
+        };
+        if let Some(observed) = crate::quota::observed_note(reply) {
+            source = format!("{source} · {observed}");
+        }
+        let now = crate::handoff::now_ms();
+        let mut windows = crate::quota::windows(reply);
+        windows.sort_by_key(|window| window.remaining);
+        let rows: Vec<KeyedView> = windows
+            .iter()
+            .take(USAGE_ROWS)
+            .enumerate()
+            .map(|(index, window)| {
+                let name = window.name();
+                let left = format!("{}% left", window.remaining);
+                let resets = crate::quota::sentence(&window.resets_in(now));
+                KeyedView::new(
+                    format!("{index}:{name}:{left}:{resets}"),
+                    Grid::new()
+                        .columns([GridLength::STAR, GridLength::Auto])
+                        .column_spacing(tokens::spacing::MD)
+                        .margin(Thickness::xy(0.0, tokens::spacing::XS))
+                        .automation_name(format!("{name}: {left}, {resets}"))
+                        .children((
+                            StackPanel::new().children((
+                                m3::body(name).text_trimming(TextTrimming::CharacterEllipsis),
+                                m3::secondary(resets),
+                            )),
+                            m3::body(left)
+                                .grid_column(1)
+                                .vertical_alignment(VerticalAlignment::Top),
+                        )),
+                )
+            })
+            .collect();
+        StackPanel::new()
+            .width(tokens::layout::USAGE_MENU_WIDTH)
+            .spacing(tokens::spacing::XS)
+            .automation_name("Usage")
+            .children((
+                StackPanel::new()
+                    .margin(Thickness::new(
+                        tokens::spacing::SM,
+                        tokens::spacing::SM,
+                        tokens::spacing::SM,
+                        0.0,
+                    ))
+                    .children((
+                        m3::secondary(source).text_wrapping(TextWrapping::Wrap),
+                        StackPanel::new().keyed_children(rows),
+                    )),
+                m3::divider(palette),
+                m3::row(palette, false)
+                    .automation_name("Manage usage")
+                    .on_click(context.message(Message::Shell(ShellMsg::SettingsPage(
+                        settings_ui::Page::Usage,
+                    ))))
+                    .content(m3::row_content(
+                        None,
+                        "Manage usage",
+                        "",
+                        m3::icon(m3::glyph::CHEVRON_RIGHT),
+                    )),
+            ))
+    }
+
+    /// The harness the composer talks to: the open Agent's, else the new
+    /// task's choice (a preset's or Auto's pick included).
+    fn composer_harness(&self) -> Option<String> {
+        if self.selected_agent_id().is_some() {
+            return self
+                .chat
+                .detail
+                .as_ref()
+                .map(|detail| detail.harness.clone());
+        }
+        match &self.launch.choice {
+            crate::picker::Choice::Model(pick) => Some(pick.harness.clone()),
+            _ => self.launch.profile().map(|profile| profile.harness.clone()),
+        }
+    }
+
+    /// Whether the harness account's limits govern the composer's target:
+    /// `Some(false)` when its preset runs through a proxy (another
+    /// provider's limits apply), `None` when the preset is not known.
+    fn own_account(&self) -> Option<(bool, Option<String>)> {
+        let summary = match self.selected_agent_id() {
+            Some(_) => {
+                let name = &self.chat.detail.as_ref()?.settings.profile;
+                self.launch
+                    .profile_summaries
+                    .iter()
+                    .find(|profile| &profile.name == name)?
+            }
+            None => match &self.launch.choice {
+                // An ad-hoc harness runs on its own account.
+                crate::picker::Choice::Model(_) => return Some((true, None)),
+                _ => self.launch.profile()?,
+            },
+        };
+        Some((summary.proxy.is_none(), summary.proxy.clone()))
+    }
+
+    /// Codex's usage indicator beside Send: the tightest quota window of
+    /// the composer's harness as a small ring and the share left; it opens
+    /// the usage popover as its flyout (without its tooltip meanwhile: a
+    /// flyout's chip takes none). The attention color only for a
+    /// real reading under the threshold on the account the task runs on; a
+    /// neutral outline ring when that is not known or another provider's
+    /// limits apply. Nothing when the harness reports no quota.
+    fn usage_indicator(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
+        let Some(harness) = self.composer_harness() else {
+            return View::empty();
+        };
+        let Some(Ok(reply)) = self.settings.quotas.get(&harness) else {
+            return View::empty();
+        };
+        let Some(window) = crate::quota::tightest(reply) else {
+            return View::empty();
+        };
+        let label = crate::picker::harness_label(&harness);
+        let open = self.launch.open == Some(Pop::Usage);
+        let remaining = window.remaining as f64;
+        let (applies, note) = match self.own_account() {
+            Some((true, _)) => (
+                true,
+                format!("{} {}% left", window.name(), window.remaining),
+            ),
+            Some((false, proxy)) => (
+                false,
+                format!(
+                    "{label} limits don't apply here: this preset runs through {}",
+                    proxy.as_deref().unwrap_or("a proxy")
+                ),
+            ),
+            None => (
+                false,
+                format!("Not known whether {label} limits apply here"),
+            ),
+        };
+        let ring: View = if applies {
+            // Reactor 0.100.0 has no brush setters on the ring: its arc and
+            // track come from this button's resources (`usage_ring`).
+            ProgressRing::new()
+                .is_indeterminate(false)
+                .minimum(0.0)
+                .maximum(100.0)
+                .value(remaining)
+                .width(tokens::layout::USAGE_RING)
+                .height(tokens::layout::USAGE_RING)
+                .horizontal_alignment(HorizontalAlignment::Center)
+                .vertical_alignment(VerticalAlignment::Center)
+                .into()
+        } else {
+            Border::new()
+                .width(tokens::layout::USAGE_RING)
+                .height(tokens::layout::USAGE_RING)
+                .corner_radius(tokens::layout::USAGE_RING / 2.0)
+                .border_brush(palette.outline())
+                .border_thickness(Thickness::uniform(tokens::layout::USAGE_RING_STROKE))
+                .horizontal_alignment(HorizontalAlignment::Center)
+                .vertical_alignment(VerticalAlignment::Center)
+                .into()
+        };
+        let button = Button::new()
+            .resource_overrides(palette.usage_ring(if applies { remaining } else { 100.0 }))
+            .style(ButtonStyle::Subtle)
+            .width(tokens::height::CONTROL)
+            .height(tokens::height::CONTROL)
+            .automation_name(format!(
+                "Usage: {label}, {note} ({})",
+                if open { "open" } else { "show limits" }
+            ))
+            .on_click(context.callback(|()| Message::Launch(LaunchMsg::Toggle(Pop::Usage))));
+        let open = open && self.launch.preset.is_none();
+        let button = if open {
+            self.anchored_popover(
+                button,
+                ring,
+                Some(Pop::Usage),
+                FlyoutPlacement::TopEdgeAlignedRight,
+                context,
+                palette,
+            )
+        } else {
+            button.content(ring).tooltip(note)
+        };
+        // Keyed by whether the reading applies (the ring's colors come from
+        // the button's resources, read when its template is applied) and
+        // by whether its flyout is open (a tooltip and a flyout do not
+        // share a button).
+        Grid::new().keyed_children(vec![KeyedView::new(
+            format!(
+                "usage:{applies}:{}:{open}",
+                remaining < crate::theme::QUOTA_LOW
+            ),
+            button,
+        )])
+    }
+
     /// The context ring beside the main action (`.ring`): how full the
     /// session's context is, as the harness reports it ("Context 34%",
     /// used and window in its tooltip); a click opens Details. Nothing
     /// when the harness reports no context fill.
     fn context_ring(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
-        let Some((used, window)) = self.chat.detail.as_ref().and_then(|detail| detail.context)
+        let Some((used, window)) = self.bound_detail().ok().and_then(|detail| detail.context)
         else {
             return View::empty();
         };
@@ -498,7 +733,7 @@ impl DesktopApp {
     /// implies: the card keeps the shape it will have (Resume for an ended
     /// task, Stop for a working one), so an open never flashes another.
     fn reading_row(&self) -> Option<RowMode> {
-        if self.chat.detail.is_some() {
+        if self.bound_detail().is_ok() {
             return None;
         }
         let row = self.find_agent(&self.selected_agent_id()?)?;
