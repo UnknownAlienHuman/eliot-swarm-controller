@@ -763,6 +763,7 @@ pub(super) fn require_current_project_team(
         // Existing projects without a managed assignment keep their usual scope.
         return Ok(());
     };
+    project_transfer::fence(conn, principal, "launch", Some(&caller), None)?;
     if !assignment_team_member(conn, &caller, project, manager.zip(manager_generation))? {
         return Err(Error::new(
             "stale_assignment",

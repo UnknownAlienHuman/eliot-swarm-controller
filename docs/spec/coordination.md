@@ -1058,7 +1058,7 @@ or refusal. Use a fresh mutation ID to check a changed condition. Remote grants
 remain unsupported.
 
 - **Begin** retains an intent, keeps the assignment occupied and fences new A
-  controls and automated work addressed to A. Owner readback, replies,
+  controls, queued launches and automated work addressed to A. Owner readback, replies,
   interrupt and stop remain available. Other workers can finish work in their
   existing native sessions. Unsettled commands, approvals, unresolved Goal
   rounds and a blocked source Goal are reported. Source custody must close when
