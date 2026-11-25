@@ -88,6 +88,7 @@ impl Router {
         let mut items = Vec::new();
         for agent in agents {
             if let Some(artifact) = self.agent_delete_session(agent).await? {
+                self.require_cleanup_ownership(&artifact).await?;
                 items.push(CleanupCandidate {
                     artifact,
                     bytes: None,

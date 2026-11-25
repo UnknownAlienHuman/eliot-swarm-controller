@@ -266,6 +266,7 @@ impl Router {
     ) -> Result<Option<OwnedRootWalk>> {
         let path = self
             .verify_discovery_root(root)
+            .await
             .map_err(|error| if walk.is_some() { stale_scan() } else { error })?;
         let daemon_root = self.inner.data_root.clone();
         let root = root.clone();
@@ -306,7 +307,8 @@ impl Router {
         remaining
     }
 
-    fn verify_discovery_root(&self, root: &ArtifactView) -> Result<PathBuf> {
+    async fn verify_discovery_root(&self, root: &ArtifactView) -> Result<PathBuf> {
+        self.require_cleanup_ownership(root).await?;
         let path = Path::new(&root.path);
         validate_cleanup_path(path)?;
         let directory = Directory::open(path)?;
@@ -344,7 +346,7 @@ impl Router {
             .await
             .agent_artifact_root(&artifact.agent, artifact.generation)?
             .ok_or_else(|| Error::new("not_allowed", "cleanup child has no exact owned root"))?;
-        let root = self.verify_discovery_root(&root)?;
+        let root = self.verify_discovery_root(&root).await?;
         let source = Path::new(&artifact.path);
         validate_cleanup_path(source)?;
         // Hold the original path against renames while normalizing it. The

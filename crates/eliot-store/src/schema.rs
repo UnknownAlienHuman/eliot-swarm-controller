@@ -1,6 +1,6 @@
 use super::*;
 
-pub(super) const CURRENT_SCHEMA_VERSION: i64 = AUTONOMY_OUTCOMES_VERSION;
+pub(super) const CURRENT_SCHEMA_VERSION: i64 = CLEANUP_PATH_CUSTODY_VERSION;
 const HARNESS_CHECK_SCHEMA_VERSION: i64 = 112;
 const WORK_TRUTH_VERSION: i64 = 113;
 const WORK_TRUTH_INTENT_VERSION: i64 = 114;
@@ -44,6 +44,7 @@ const PROJECT_CHECK_OBLIGATIONS_VERSION: i64 = 151;
 const ASSIGNMENT_USAGE_VERSION: i64 = 152;
 const REMOTE_MANAGERS_VERSION: i64 = 153;
 const AUTONOMY_OUTCOMES_VERSION: i64 = 154;
+const CLEANUP_PATH_CUSTODY_VERSION: i64 = 155;
 
 fn has_restart_continuation_brief_column(connection: &Connection) -> Result<bool> {
     connection
@@ -2828,6 +2829,12 @@ impl Store {
         }
         if current < AUTONOMY_OUTCOMES_VERSION {
             self.migrate_sql(autonomy::OUTCOME_INDEXES, Some(AUTONOMY_OUTCOMES_VERSION))?;
+        }
+        if current < CLEANUP_PATH_CUSTODY_VERSION {
+            self.migrate_sql(
+                "ALTER TABLE artifacts ADD COLUMN custody_namespace TEXT;",
+                Some(CLEANUP_PATH_CUSTODY_VERSION),
+            )?;
         }
         Ok(())
     }

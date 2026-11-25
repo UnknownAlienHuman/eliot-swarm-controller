@@ -1683,21 +1683,33 @@ impl Router {
                 (model.harness.clone(), format!("profile:{profile}"))
             })
             .collect();
-        if !scopes.is_empty() {
-            let exact_scopes: Vec<_> = scopes.values().cloned().collect();
+        let mut exact_scopes: Vec<_> = scopes.values().cloned().collect();
+        for profile in models.iter().filter_map(|model| model.profile.as_deref()) {
+            let scope = format!("profile:{profile}");
+            if !exact_scopes.contains(&scope) {
+                exact_scopes.push(scope);
+            }
+        }
+        if !exact_scopes.is_empty() {
             let holds = tokio::time::timeout_at(deadline.into(), self.inner.store.lock())
                 .await
                 .map_err(|_| crate::adhoc::discovery_timeout())?
                 .provider_holds_for_scopes(&exact_scopes)?;
             let now = now_ms();
-            for model in models.iter_mut().filter(|model| model.profile.is_none()) {
-                let held = scopes
-                    .get(&model.harness)
-                    .map(|scope| holds.contains_key(scope));
-                let quota = (!stale)
-                    .then(|| snapshot.quotas.get(&model.harness))
-                    .flatten();
-                model.availability = availability(held, quota, &model.id, now).to_owned();
+            for model in models.iter_mut() {
+                if let Some(profile) = model.profile.as_deref() {
+                    let scope = format!("profile:{profile}");
+                    let held = Some(holds.contains_key(&scope));
+                    model.availability = availability(held, None, &model.id, now).to_owned();
+                } else {
+                    let held = scopes
+                        .get(&model.harness)
+                        .map(|scope| holds.contains_key(scope));
+                    let quota = (!stale)
+                        .then(|| snapshot.quotas.get(&model.harness))
+                        .flatten();
+                    model.availability = availability(held, quota, &model.id, now).to_owned();
+                }
             }
         }
         let response = ModelsCatalogResponse {

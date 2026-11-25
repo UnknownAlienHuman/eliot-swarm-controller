@@ -1030,6 +1030,16 @@ impl PinnedStandRoot {
         &self.identity
     }
 
+    /// Dispose of an exclusively created stand before it is ever started.
+    pub fn discard_unstarted(self) -> std::io::Result<()> {
+        let parent = self.root.parent().ok_or(std::io::ErrorKind::InvalidInput)?;
+        let parent =
+            crate::platform::script_file::Directory::open(parent).map_err(std::io::Error::other)?;
+        let Self { root, dir, .. } = self;
+        drop(dir);
+        crate::router::remove_dir_all(&parent, &root)
+    }
+
     /// Read `name` relative to the held root; `None` when it does not exist.
     fn read(&self, name: &str) -> Result<Option<Vec<u8>>> {
         if fs::symlink_metadata(self.root.join(name))
@@ -1343,6 +1353,8 @@ pub fn check_nested_roots(root: &Path) -> Result<()> {
 }
 
 pub fn remove_offline_stand_root(root: &Path, offline: DaemonLock) -> Result<()> {
+    let registration = locate_stand_registration(root)?.record;
+    let pinned = pinned_stand_root(root, &registration)?;
     let io_fail = |error| {
         Error::new(
             "platform_io",
@@ -1365,7 +1377,7 @@ pub fn remove_offline_stand_root(root: &Path, offline: DaemonLock) -> Result<()>
         if metadata.is_dir() && (is_reparse_point(&metadata) || metadata.file_type().is_symlink()) {
             fs::remove_dir(path).map_err(io_fail)?;
         } else if metadata.is_dir() {
-            crate::router::remove_dir_all(&path).map_err(io_fail)?;
+            crate::router::remove_dir_all(&pinned.dir, &path).map_err(io_fail)?;
         } else {
             fs::remove_file(path).map_err(io_fail)?;
         }
@@ -1378,6 +1390,7 @@ pub fn remove_offline_stand_root(root: &Path, offline: DaemonLock) -> Result<()>
             Err(error) => return Err(io_fail(error)),
         }
     }
+    drop(pinned);
     fs::remove_dir(root).map_err(io_fail)
 }
 

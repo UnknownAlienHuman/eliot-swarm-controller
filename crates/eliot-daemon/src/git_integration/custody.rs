@@ -1,5 +1,5 @@
 use super::{GitProbe, WorkspaceGit, path_text, unavailable, worktree_registered};
-use crate::platform::{OwnedChild, custody::AgentSpawnError};
+use crate::platform::{OwnedChild, custody::AgentSpawnError, script_file::Directory};
 use eliot_core::{Error, Result};
 use eliot_store::IntegrationCustody;
 use std::{
@@ -261,6 +261,9 @@ pub(crate) async fn reconcile(
         .parent()
         .ok_or_else(|| unavailable("integration worktree registry has no parent"))?;
     let registered = directory_present(registry)? && directory_present(&scratch.registration)?;
+    // Scratch::paths binds the retained request to this data root. The
+    // external registry is the exact repository's uniquely named Git child.
+    let registry_pin = registered.then(|| Directory::open(registry)).transpose()?;
     let listed = worktree_registered(&git, Path::new(&checkout), &scratch.worktree).await?;
     if listed && !registered {
         return Err(unavailable(
@@ -271,12 +274,13 @@ pub(crate) async fn reconcile(
         verify_registration_link(&scratch)?;
     }
     if directory_present(&scratch.root)? {
-        crate::router::remove_dir_all(&scratch.root).map_err(|_| {
+        let parent = Directory::open(Path::new(&record.data_root))?;
+        crate::router::remove_dir_all(&parent, &scratch.root).map_err(|_| {
             unavailable("integration checkout or private index removal is incomplete")
         })?;
     }
-    if registered {
-        crate::router::remove_dir_all(&scratch.registration)
+    if let Some(parent) = registry_pin {
+        crate::router::remove_dir_all(&parent, &scratch.registration)
             .map_err(|_| unavailable("integration worktree registration removal is incomplete"))?;
     }
     if worktree_registered(&git, Path::new(&checkout), &scratch.worktree).await? {

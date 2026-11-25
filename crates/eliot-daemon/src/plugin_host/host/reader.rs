@@ -388,10 +388,9 @@ impl ReaderTransport {
             .finish(bounded_deadline(close_until, RPC_GRACE))
             .await;
         host.remove_plugin_secret(&self.credential);
-        let removed = self
-            .model_catalogue_dir
-            .as_deref()
-            .is_none_or(|dir| reaped && empty && remove_model_catalogue_dir(dir));
+        let removed = self.model_catalogue_dir.as_deref().is_none_or(|dir| {
+            reaped && empty && remove_model_catalogue_dir(&self.instance_dir, dir)
+        });
         if removed {
             remove_empty_instance_dir(&self.instance_dir);
         }
@@ -402,8 +401,12 @@ impl ReaderTransport {
     }
 }
 
-fn remove_model_catalogue_dir(dir: &std::path::Path) -> bool {
-    let _ = crate::router::cleanup::remove_dir_all(dir);
+fn remove_model_catalogue_dir(instance: &std::path::Path, dir: &std::path::Path) -> bool {
+    // This directory was created exclusively by this live reader. Reader
+    // transports and their temporary paths are never loaded from Store.
+    if let Ok(parent) = crate::platform::script_file::Directory::open(instance) {
+        let _ = crate::router::cleanup::remove_dir_all(&parent, dir);
+    }
     std::fs::symlink_metadata(dir).is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
 }
 
