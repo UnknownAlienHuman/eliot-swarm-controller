@@ -183,7 +183,8 @@ pub use instructions::{
 };
 pub use maintenance::{
     MaintenancePurgeLegacyAttentionRequest, MaintenancePurgeLegacyAttentionResponse,
-    MaintenanceRunRequest, MaintenanceRunResponse,
+    MaintenanceRunRequest, MaintenanceRunResponse, RetentionPreviewRequest,
+    RetentionPreviewResponse, RetentionPreviewRow,
 };
 pub use monitor_views::{
     AttentionThreshold, AttentionThresholdPair, AttentionThresholdsResponse,

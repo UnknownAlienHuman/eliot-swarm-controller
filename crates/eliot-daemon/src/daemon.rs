@@ -111,13 +111,7 @@ pub struct StoreCompactionOutcome {
     pub freelist_pages: u64,
 }
 
-/// Compact an existing private Store while holding its normal DataDir lock.
-/// The callback reports the shared disk-space preflight before SQLite can run
-/// VACUUM. This local path never starts or contacts a daemon.
-pub fn compact_store_offline(
-    path: &Path,
-    before_vacuum: impl FnMut(&StoreCompactionSpaceEstimate),
-) -> Result<StoreCompactionOutcome> {
+pub(crate) fn require_local_store_owner(operation: &str) -> Result<()> {
     if AGENT_IDENTITY_ENV
         .iter()
         .chain(&RUN_IDENTITY_ENV)
@@ -128,9 +122,20 @@ pub fn compact_store_offline(
     {
         return Err(Error::new(
             "not_allowed",
-            "offline Store compaction requires the local Owner",
+            format!("offline Store {operation} requires the local Owner"),
         ));
     }
+    Ok(())
+}
+
+/// Compact an existing private Store while holding its normal DataDir lock.
+/// The callback reports the shared disk-space preflight before SQLite can run
+/// VACUUM. This local path never starts or contacts a daemon.
+pub fn compact_store_offline(
+    path: &Path,
+    before_vacuum: impl FnMut(&StoreCompactionSpaceEstimate),
+) -> Result<StoreCompactionOutcome> {
+    require_local_store_owner("compaction")?;
     let data_dir = DataDir::open_existing(path)?;
     let _daemon_lock = data_dir.acquire_daemon_lock()?;
     let store_path = data_dir.path().join("eliot.db");

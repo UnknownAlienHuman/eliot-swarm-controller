@@ -129,3 +129,63 @@ impl MaintenancePurgeLegacyAttentionResponse {
         Ok(())
     }
 }
+
+/// Proposed windows for an offline SQLite retention preview.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RetentionPreviewRequest {
+    pub events_days: Option<i64>,
+    pub events_seconds: Option<i64>,
+    pub processes_seconds: Option<i64>,
+    pub commands_days: Option<i64>,
+    pub mail_days: Option<i64>,
+}
+
+impl RetentionPreviewRequest {
+    pub fn validate(&self) -> Result<()> {
+        if self.events_days.is_some() && self.events_seconds.is_some() {
+            return Err(Error::new("invalid", "set only one event retention window"));
+        }
+        if [
+            self.events_days,
+            self.events_seconds,
+            self.processes_seconds,
+            self.commands_days,
+            self.mail_days,
+        ]
+        .into_iter()
+        .flatten()
+        .any(|value| value <= 0)
+        {
+            return Err(Error::new("invalid", "retention windows must be positive"));
+        }
+        Ok(())
+    }
+
+    pub fn event_window_seconds(&self) -> Option<i64> {
+        self.events_seconds
+            .or_else(|| self.events_days.map(|days| days.saturating_mul(86_400)))
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetentionPreviewRow {
+    pub table: String,
+    pub class: String,
+    pub would_delete: i64,
+    pub kept: i64,
+    /// Mutually exclusive reasons for rows held inside the examined window.
+    pub protected: std::collections::BTreeMap<String, i64>,
+    pub oldest_kept_ms: Option<i64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetentionPreviewResponse {
+    pub as_of_ms: i64,
+    pub rows: Vec<RetentionPreviewRow>,
+    pub current_pruned_through: i64,
+    /// An explicit event cursor below this value would receive history_gap.
+    pub projected_pruned_through: i64,
+    pub first_kept_event_seq: Option<i64>,
+    pub first_kept_event_ms: Option<i64>,
+}

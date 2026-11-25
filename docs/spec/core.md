@@ -1101,6 +1101,17 @@ The [physical retention increment](../roadmap.md#l7--qualification-repair-and-re
 is implemented by daemon maintenance through the existing Store writer. The following
 is its contract; bounded read pages alone do not bound stored history.
 
+The offline preview applies the same SQLite deletion predicates and
+whole-set decisions to a read snapshot. It lifts per-pass row limits to
+estimate the current backlog. Its report counts tables and retention classes
+separately, identifies protection reasons among examined candidates, and
+gives their oldest surviving timestamps in Unix milliseconds. The event
+history projection reports the current and estimated exclusive replay floors.
+An explicit cursor below the projected floor would receive `history_gap`.
+Physical space reclamation and Git/filesystem effects are outside this
+SQLite preview. Future changes to custody or rule cursors can change the
+forecast.
+
 Cleanup uses bounded batches through the existing Store writer. Delete only an expired,
 contiguous event prefix below every enabled current/retiring rule cursor. Rules
 traverse the global event log; their cursors protect unconsumed history until

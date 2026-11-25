@@ -315,6 +315,23 @@ fn open_stand_copy(stand: &Path) -> Result<Store> {
     Store::open_read_only(&path)
 }
 
+/// Inspect a Store without taking the daemon lock, starting it, or saving windows.
+pub fn preview_store_retention(
+    root: &Path,
+    request: &eliot_core::api::RetentionPreviewRequest,
+) -> Result<eliot_core::api::RetentionPreviewResponse> {
+    request.validate()?;
+    let store = if read_only_stand_exists(root)? {
+        open_stand_copy(root)?
+    } else {
+        crate::daemon::require_local_store_owner("preview")?;
+        let data = DataDir::open_existing(root)?;
+        crate::platform::data_dir::validate_store_files(data.path())?;
+        Store::open_read_only(&data.path().join("eliot.db"))?
+    };
+    store.preview_retention(request, crate::common::now_ms())
+}
+
 pub fn stand_copy_event_high_water(stand: &Path) -> Result<i64> {
     open_stand_copy(stand)?.high_water()
 }
