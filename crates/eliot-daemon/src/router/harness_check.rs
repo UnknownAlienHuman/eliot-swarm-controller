@@ -67,7 +67,10 @@ impl Router {
                     store.note_harness_installed(harness, candidate.version.as_deref(), now)?;
                 }
             }
-            let orphans = Self::orphaned_harness_check_agents(&store)?;
+            let orphans = Self::orphaned_harness_check_agents(
+                &store,
+                available.min(eliot_core::HARNESS_CHECK_BATCH_LIMIT),
+            )?;
             if !orphans.is_empty() {
                 return Ok((Vec::new(), orphans));
             }
@@ -124,18 +127,23 @@ impl Router {
     }
 
     /// With no live drives, every retained check Agent needs cleanup.
-    fn orphaned_harness_check_agents(store: &eliot_store::Store) -> Result<Vec<String>> {
+    fn orphaned_harness_check_agents(
+        store: &eliot_store::Store,
+        max: usize,
+    ) -> Result<Vec<String>> {
         let mut orphans = Vec::new();
         let mut after: Option<String> = None;
+        let page_limit = max.min(64);
+        if page_limit == 0 {
+            return Ok(orphans);
+        }
         loop {
-            let (page, more) = store.list_agents(after.as_deref(), 64)?;
-            after = page.last().map(|agent| agent.id.clone());
-            orphans.extend(
-                page.into_iter()
-                    .filter(Agent::is_harness_check)
-                    .map(|agent| agent.id),
-            );
-            if !more || after.is_none() {
+            let (page, next, more) =
+                store.list_harness_check_agents(after.as_deref(), page_limit)?;
+            orphans.extend(page.into_iter().map(|agent| agent.id));
+            after = next;
+            if orphans.len() >= max || !more || after.is_none() {
+                orphans.truncate(max);
                 return Ok(orphans);
             }
         }

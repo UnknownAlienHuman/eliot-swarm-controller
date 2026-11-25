@@ -7,7 +7,9 @@
 //! while inconclusive outcomes can retry once. A repeated attributable failure
 //! blocks automatic routing until a subsequent pass.
 
-use super::{Error, Result, Store, commit_transaction, sql_error};
+use super::{
+    Error, Result, Store, agent_from_record, agent_record_from_row, commit_transaction, sql_error,
+};
 use eliot_core::{
     self as core, HARNESS_CHECK_QUOTA_RETRY_SECS, MAX_HARNESS_CHECK_ERROR_BYTES,
     MAX_HARNESS_CHECK_VERSION_BYTES, NOT_CHECKED_NEW_VERSION, NOT_CHECKED_QUOTA, OUTCOME_FAILED,
@@ -135,6 +137,56 @@ const COLUMNS: &str = "harness, installed_version, outcome, not_checked_reason, 
      checked_version, checked_at, check_profile, failure_step, failure_error, updated_at";
 
 impl Store {
+    /// Page only the bounded set of rows that can be harness-check Agents.
+    ///
+    /// The SQL predicate is deliberately only a candidate filter. The final
+    /// predicate remains `Agent::is_harness_check`, so Rust's trim semantics
+    /// and the marker contract stay authoritative. The returned cursor is the
+    /// last inspected row, including candidates rejected by that predicate.
+    pub fn list_harness_check_agents(
+        &self,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<(Vec<eliot_core::Agent>, Option<String>, bool)> {
+        super::validate_limit(limit)?;
+        let after_num = after.map(core::parse_agent_id).transpose()?.unwrap_or(0);
+        let mut statement = self
+            .connection
+            .prepare(concat!(
+                "SELECT ",
+                agent_record_columns!(),
+                " FROM agents
+                 WHERE id > ?1 AND chat = 1 AND observe_only = 0
+                   AND project = '' AND parent IS NULL
+                   AND json_extract(profile_snapshot, '$._harness_check.harness') = harness
+                 ORDER BY id LIMIT ?2"
+            ))
+            .map_err(sql_error)?;
+        let rows = statement
+            .query_map(
+                params![after_num, (limit + 1) as i64],
+                agent_record_from_row,
+            )
+            .map_err(sql_error)?;
+        let mut inspected = Vec::new();
+        for row in rows {
+            inspected.push(agent_from_record(
+                &self.connection,
+                row.map_err(sql_error)?,
+            )?);
+        }
+        let more = inspected.len() > limit;
+        if more {
+            inspected.pop();
+        }
+        let next = inspected.last().map(|agent| agent.id.clone());
+        let candidates = inspected
+            .into_iter()
+            .filter(eliot_core::Agent::is_harness_check)
+            .collect();
+        Ok((candidates, next, more))
+    }
+
     /// Record the installed version probe for one harness. A changed version
     /// is accepted and marked "not checked", never refused. Returns true when
     /// a check run is due for the current installed version.
