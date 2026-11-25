@@ -1080,11 +1080,26 @@ optional Git fetch approval. They do not create or modify registrations. Their p
 values use Core [`ProjectRegistrationView`](../../crates/eliot-core/src/api/agent_views.rs),
 
 whose optional `git` value uses [`ProjectGitView` and `GitCredentialHelper`](../../crates/eliot-core/src/api/agent_views.rs).
-The read-only `origin` is the validated basename of the local `origin` remote's path,
-with `.git` stripped. Malformed and pathless remotes produce no name. The daemon
-reads each common directory in the Git probe's sanitized environment after releasing
-the Store lock. The readback carries only the name. The
-`ProjectRegistrationView.policy_usage` field carries
+Git monitoring refreshes checkout identities and the read-only `origin`
+basename in the background. The Store lock is released before filesystem or
+Git work. `project.list` and `project.get` return the verified projection
+only for its observed watcher revision. A cached read may lag a filesystem
+change until the watcher notification arrives and is processed. The OS
+sets no fixed delivery deadline. Before publication, monitoring
+checks the registered checkout HEAD and index stamps on both sides of the
+Git read. Git configuration and checkout inventory changes depend on watcher
+coverage. Legacy callers get a bounded live Git read on a cache miss. Callers
+that send `include_git_state: true` receive `git_refreshing: true` without
+origin or checkout details while a watched observation is pending. They can
+poll again on their normal refresh cadence. When monitoring cannot cover or
+verify a repository, the daemon uses the bounded live Git read and includes
+`git_watch_unsupported: true` for opted-in callers. This fallback also
+starts after three consecutive attempts invalidated by a moving revision.
+A new verified observation restores the cached path.
+Malformed and pathless remotes produce no name, and the origin URL itself
+never leaves the daemon.
+
+The `ProjectRegistrationView.policy_usage` field carries
 `applied`, `total`, `opted_out` and `opt_outs` for the last 24 hours. `total` counts distinct
 retained launched Agent IDs, including stopped Agents; attaches and resumed
 generations do not add another launch. `applied` counts those Agents that inherited
@@ -3194,7 +3209,14 @@ when only Git path coverage is partial. For a shared workspace, the list uses on
 the target generation's attributed edit paths and remains incomplete; it does not
 claim all workspace changes belong to that Agent. Claims are live state, so the
 digest does not reconstruct which claim was active when an edit occurred. A requested
-stale generation still returns `stale_generation`.
+stale generation still returns `stale_generation`. Interactive reads reuse Git's
+patch input only within the same filesystem observation revision, checkout HEAD,
+and index stamp. The same watcher notification latency bounds staleness.
+The revision depends on filesystem watcher coverage for Git
+configuration, attributes, and tracked and untracked worktree changes. The
+HEAD and index stamps do not attest to those inputs on their own. Claims and
+attribution are read for the current request. Guarded review keeps its fresh
+worktree fingerprint.
 
 `agent.diff` accepts [AgentDiffRequest](../../crates/eliot-core/src/api/git.rs)
 and returns `AgentDiffResponse` for that Agent's current workspace and generation.

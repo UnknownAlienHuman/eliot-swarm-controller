@@ -91,11 +91,23 @@ pub struct ProjectGetRequest {
     /// Nonempty project registration id.
     #[schemars(length(min = 1), pattern(r"\S"), extend("x-nonBlank" = true))]
     pub id: String,
+    /// Include a marker when Git metadata is refreshing.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub include_git_state: bool,
 }
 
+/// Empty request for clients using the original list reply.
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ProjectListRequest {}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectListViewRequest {
+    /// Include a marker when Git metadata is refreshing.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub include_git_state: bool,
+}
 
 impl MethodHelpRequest {
     pub fn validate(&self) -> Result<()> {

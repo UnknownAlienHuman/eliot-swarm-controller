@@ -141,7 +141,7 @@ use tokio::{
     time::{Instant, timeout_at},
 };
 
-const PAGE_MAX: usize = 1_000;
+pub(crate) const PAGE_MAX: usize = 1_000;
 const EVENT_SCAN_MAX: usize = 1_000;
 const EVENT_RESPONSE_MAX_BYTES: usize = 900 * 1024;
 const EVENT_RESPONSE_WRAPPER_RESERVE_BYTES: usize = 4 * 1024;
@@ -304,6 +304,7 @@ struct RouterInner {
     launch_arbitration: watch::Sender<u64>,
     direct_launches: Mutex<launch_queue::DirectLaunches>,
     usage_summary_cache: Mutex<UsageSummaryCache>,
+    recent_patch_reads: patch_digest::PatchReadCache,
 }
 
 const USAGE_SUMMARY_CACHE_CAPACITY: usize = 8;
@@ -428,7 +429,7 @@ enum SubmissionScope {
     DirectRpc,
 }
 
-use eliot_core::api::discovery::{ProjectGetRequest, ProjectListRequest};
+use eliot_core::api::discovery::{ProjectGetRequest, ProjectListViewRequest};
 
 /// One locked snapshot of a frozen wait set: per-entry results plus the
 /// wake filter (watched Agents and commands, and the caller's mailbox for a
@@ -664,6 +665,7 @@ impl Router {
                 launch_arbitration,
                 direct_launches: Mutex::new(launch_queue::DirectLaunches::default()),
                 usage_summary_cache: Mutex::new(UsageSummaryCache::default()),
+                recent_patch_reads: Default::default(),
             }),
         })
     }
@@ -4526,9 +4528,9 @@ impl Router {
             registration.policy_usage = store.project_policy_usage(&registration.id, now_ms())?;
             registration
         };
-        // Git reads run after the Store lock is released.
         let mut registrations = [registration];
-        crate::workspace_git::WorkspaceGit::fill_project_readbacks(&mut registrations).await;
+        self.project_git_readbacks(&mut registrations, true, request.include_git_state)
+            .await;
         display_project_registration(&mut registrations[0]);
         let [registration] = registrations;
         registration.validate()?;
@@ -4538,7 +4540,8 @@ impl Router {
 
     async fn project_list(&self, params: &Value, principal: &Principal) -> Result<Value> {
         require_owner(principal)?;
-        let _: ProjectListRequest = eliot_core::api::discovery::decode_params(params.clone())?;
+        let request: ProjectListViewRequest =
+            eliot_core::api::discovery::decode_params(params.clone())?;
         let mut registrations = {
             let store = self.inner.store.lock().await;
             let mut registrations = store.list_project_registrations("owner", None, PAGE_MAX)?;
@@ -4553,8 +4556,8 @@ impl Router {
             }
             registrations
         };
-        // Git reads run after the Store lock is released.
-        crate::workspace_git::WorkspaceGit::fill_project_readbacks(&mut registrations).await;
+        self.project_git_readbacks(&mut registrations, false, request.include_git_state)
+            .await;
         for registration in &mut registrations {
             display_project_registration(registration);
         }
@@ -4563,6 +4566,22 @@ impl Router {
         }
         serde_json::to_value(registrations)
             .map_err(|_| Error::new("internal", "project registrations could not be encoded"))
+    }
+
+    async fn project_git_readbacks(
+        &self,
+        registrations: &mut [ProjectRegistrationView],
+        single: bool,
+        include_git_state: bool,
+    ) {
+        let reporter = crate::daemon::workers::WorkerReporter::new(
+            self.clone(),
+            self.secret_policy_snapshot(),
+        );
+        self.inner
+            .monitoring
+            .project_readbacks(registrations, single, include_git_state, &reporter)
+            .await;
     }
 
     /// Owner page of the worktrees Swarm manages, from the retained

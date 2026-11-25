@@ -1725,15 +1725,21 @@ pub struct ProjectRegistrationView {
     #[serde(default)]
     pub policy_usage: ProjectPolicyUsageView,
     /// The repository's name from its `origin` remote URL (the last path
-    /// segment without `.git`), read live from Git by `project.list` and
+    /// segment without `.git`), observed by Git monitoring for `project.list` and
     /// `project.get`. Read-only: never stored or settable, never the URL
     /// itself (which may embed credentials); absent without an `origin`
     /// remote or when Git cannot read it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origin: Option<String>,
-    /// Live checkout identities verified against this registration's common directory.
+    /// Checkout identities verified against this registration's common directory.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub checkouts: Vec<ProjectCheckoutView>,
+    /// Opt-in marker. Git monitoring has no current observation for this registration.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub git_refreshing: bool,
+    /// Opt-in marker. This read used bounded live Git because monitoring cannot verify the scope.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub git_watch_unsupported: bool,
 }
 
 #[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1850,6 +1856,14 @@ impl ProjectRegistrationView {
     /// Pure readback grammar. Store/daemon own canonical repository identity and
     /// the authority checks for the explicit profile/action allowsets.
     pub fn validate(&self) -> Result<()> {
+        if self.git_refreshing
+            && (self.git_watch_unsupported || self.origin.is_some() || !self.checkouts.is_empty())
+        {
+            return Err(Error::new(
+                "invalid",
+                "refreshing project readback carries Git data",
+            ));
+        }
         text(&self.id)?;
         text(&self.checkout)?;
         text(&self.repo_common_dir)?;

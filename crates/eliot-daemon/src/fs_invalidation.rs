@@ -1,4 +1,4 @@
-//! Filesystem wake hints only; Git readback remains authoritative.
+//! Filesystem observations and wake hints; Git readback remains authoritative.
 //!
 //! Keep one instance per admitted workspace. The monitor owns debounce,
 //! bounded reconciliation, and fallback polling.
@@ -7,7 +7,7 @@
 use eliot_core::{self as core, Error};
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
 };
 
 #[cfg(any(windows, target_os = "linux"))]
@@ -15,9 +15,25 @@ use notify::{Config, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 #[cfg(any(windows, target_os = "linux"))]
 use std::path::{Path, PathBuf};
 
+/// Only comparable inside one watcher lifetime. Consuming a dirty hint
+/// cannot consume this observation or make an old revision current again.
+#[derive(Clone)]
+pub(crate) struct FilesystemRevision {
+    source: Arc<AtomicU64>,
+    observed: u64,
+}
+
+impl PartialEq for FilesystemRevision {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.source, &other.source) && self.observed == other.observed
+    }
+}
+impl Eq for FilesystemRevision {}
+
 pub(crate) struct WorkspaceInvalidation {
     dirty: Arc<AtomicBool>,
     degraded: Arc<AtomicBool>,
+    revision: Arc<AtomicU64>,
     #[cfg(any(windows, target_os = "linux"))]
     _watcher: RecommendedWatcher,
 }
@@ -66,32 +82,51 @@ impl WorkspaceInvalidation {
             }
             scope.linked = Some((admin, common));
         }
+        Self::watch_paths(paths, None, move |path| {
+            (scope.includes(path), scope.binding_changed(path))
+        })
+    }
+
+    /// Used by the repository readback and the managed workspace monitor.
+    /// A binding change invalidates the proof until the paths are registered again.
+    #[cfg(any(windows, target_os = "linux"))]
+    pub(crate) fn watch_paths(
+        paths: Vec<(PathBuf, RecursiveMode)>,
+        wake: Option<Arc<tokio::sync::Notify>>,
+        classify: impl Fn(&Path) -> (bool, bool) + Send + 'static,
+    ) -> core::Result<Self> {
+        use crate::git_monitor::reject_links;
         let dirty = Arc::new(AtomicBool::new(true));
         let degraded = Arc::new(AtomicBool::new(false));
+        let revision = Arc::new(AtomicU64::new(0));
         let callback_dirty = Arc::clone(&dirty);
         let callback_degraded = Arc::clone(&degraded);
+        let callback_revision = Arc::clone(&revision);
         let mut watcher = RecommendedWatcher::new(
-            move |result: notify::Result<notify::Event>| match result {
-                Ok(event) => {
-                    let rescan = event.need_rescan();
-                    let mutation = !matches!(event.kind, EventKind::Access(_));
-                    if rescan
-                        || (mutation && event.paths.iter().any(|path| scope.binding_changed(path)))
-                    {
-                        callback_degraded.store(true, Ordering::Release);
+            move |result: notify::Result<notify::Event>| {
+                let (changed, binding) = match result {
+                    Ok(event) if event.need_rescan() => (true, true),
+                    Ok(event) if !matches!(event.kind, EventKind::Access(_)) => {
+                        event.paths.iter().fold(
+                            (event.paths.is_empty(), false),
+                            |(changed, binding), path| {
+                                let (relevant, rebound) = classify(path);
+                                (changed || relevant, binding || rebound)
+                            },
+                        )
                     }
-                    // Git's own reads must not create a refresh feedback loop.
-                    if rescan
-                        || (mutation
-                            && (event.paths.is_empty()
-                                || event.paths.iter().any(|path| scope.includes(path))))
-                    {
-                        callback_dirty.store(true, Ordering::Release);
-                    }
-                }
-                Err(_) => {
+                    Ok(_) => (false, false),
+                    Err(_) => (true, true),
+                };
+                if binding {
                     callback_degraded.store(true, Ordering::Release);
+                }
+                if binding || changed {
+                    callback_revision.fetch_add(1, Ordering::AcqRel);
                     callback_dirty.store(true, Ordering::Release);
+                    if let Some(wake) = &wake {
+                        wake.notify_one();
+                    }
                 }
             },
             Config::default().with_follow_symlinks(false),
@@ -106,6 +141,7 @@ impl WorkspaceInvalidation {
         Ok(Self {
             dirty,
             degraded,
+            revision,
             _watcher: watcher,
         })
     }
@@ -116,6 +152,14 @@ impl WorkspaceInvalidation {
             "unavailable",
             "native filesystem invalidation is unavailable on this platform; continue Git polling",
         ))
+    }
+
+    pub(crate) fn revision(&self) -> Option<FilesystemRevision> {
+        let observed = self.revision.load(Ordering::Acquire);
+        (!self.is_degraded()).then(|| FilesystemRevision {
+            source: Arc::clone(&self.revision),
+            observed,
+        })
     }
 
     /// Consume coalesced hints before the Git read. Changes during the read

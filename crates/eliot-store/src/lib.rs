@@ -2707,7 +2707,7 @@ impl Store {
                  WHERE agent = ?1 AND generation = ?2 AND kind IN ('agent.failed', 'agent.lost')
                  UNION ALL
                  SELECT seq, ts, kind, agent, generation, source, native_id, data, subject, cause
-                 FROM events INDEXED BY events_kind
+                 FROM events INDEXED BY events_agent
                  WHERE agent = ?1 AND generation = ?2 AND kind = 'agent.stopped'
                    AND json_extract(data, '$.reason') = 'owned_exit_before_restart'
                  ORDER BY seq DESC LIMIT ?3",

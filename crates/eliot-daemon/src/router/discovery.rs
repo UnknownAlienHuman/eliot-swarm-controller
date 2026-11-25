@@ -297,7 +297,7 @@ const METHODS: &[Method] = &[
     method!("workspace.list", WorkspaceListRequest, WorkspaceListResponse, true, false, "Page the managed worktrees Swarm created, with total and cursor.", {"limit":100}),
     method!(
         "project.list",
-        ProjectListRequest,
+        ProjectListViewRequest,
         Vec<ProjectRegistrationView>,
         true,
         false,
