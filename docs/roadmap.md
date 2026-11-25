@@ -224,8 +224,9 @@ Checked layers record delivered increments, not full crash/load qualification.
   detaches and tags under the link revision it read; a capacity refusal offers Queue
   it, and a lost Queue it reply resolves its intent before the draft returns.
   Headless legacy grouping uses retained registration, worktree and parent
-  evidence. Independent roots surface before a revision-checked Owner claim;
-  assignment leaves historical IDs and outcomes reachable.
+  evidence. Independent roots surface before an explicit manager claim,
+  which requires the current assignment revision. Organization member pages
+  and exact totals seek the retained membership index.
 - [x] **6. Project overview.** Read scoped workspace Git status and retained
   turn usage coverage with project and fleet totals in one Store snapshot.
 

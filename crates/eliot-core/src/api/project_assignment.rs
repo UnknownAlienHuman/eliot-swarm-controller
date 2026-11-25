@@ -71,7 +71,7 @@ pub struct ProjectAssignmentClaimRequest {
     pub id: String,
     pub project: String,
     pub manager: Option<ProjectManagerIdentity>,
-    /// Assignment revision read by the Owner before explicitly selecting a manager.
+    /// Assignment revision read before explicitly selecting a manager.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expected_revision: Option<i64>,
 }

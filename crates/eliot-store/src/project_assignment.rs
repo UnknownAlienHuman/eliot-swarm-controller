@@ -108,10 +108,10 @@ impl Store {
                 ));
             }
             let current = read_assignment(tx, &request.project)?;
-            if principal == "owner" && request.expected_revision.is_none() {
+            if request.manager.is_some() && request.expected_revision.is_none() {
                 return Err(Error::new(
                     "invalid",
-                    "Owner claim requires the current assignment revision",
+                    "explicit manager claim requires the current assignment revision",
                 ));
             }
             if request
