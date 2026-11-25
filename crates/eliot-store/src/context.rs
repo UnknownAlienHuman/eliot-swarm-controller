@@ -1169,26 +1169,25 @@ impl Store {
             ));
         }
         validate_id_age(consumer_id, now)?;
-        if !turn_accepts_context_tx(&tx, agent_num, generation, turn_id)? {
-            return Err(Error::new(
-                "stale_generation",
-                "context callback's captured turn is no longer running",
-            ));
-        }
+        let running_turn = turn_accepts_context_tx(&tx, agent_num, generation, turn_id)?;
 
         let mut events = Vec::new();
         let mut selected: Vec<ContextItem> = Vec::new();
         let mut selected_ids = Vec::new();
         let mut payload_bytes = 0_usize;
         let in_flight_stop = has_in_flight_stop_tx(&tx, agent_num, generation)?;
-        let mut pending_candidates = pending_context_batch(
-            &tx,
-            agent_num,
-            generation,
-            InjectPoint::TurnSafePoint,
-            Some(turn_id),
-        )?;
-        if agent.steers_at_turn_safe_point() {
+        let mut pending_candidates = if running_turn {
+            pending_context_batch(
+                &tx,
+                agent_num,
+                generation,
+                InjectPoint::TurnSafePoint,
+                Some(turn_id),
+            )?
+        } else {
+            Vec::new()
+        };
+        if running_turn && agent.steers_at_turn_safe_point() {
             pending_candidates.extend(pending_turn_steers(&tx, agent_num, generation, turn_id)?);
             pending_candidates.sort_by_key(|(created_at, rowid, _)| (*created_at, *rowid));
         }

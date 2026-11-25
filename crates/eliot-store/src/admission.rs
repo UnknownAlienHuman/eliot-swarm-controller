@@ -1996,6 +1996,16 @@ pub(super) fn admit_control_tx(
             "expected turn does not match the current Agent turn",
         ));
     }
+    if request.verb == "steer"
+        && agent.steers_at_turn_safe_point()
+        && let Some(turn_id) = turn_id.as_deref()
+        && !context::turn_accepts_context_tx(tx, agent_num, agent.generation, turn_id)?
+    {
+        return Err(Error::new(
+            "stale_generation",
+            "safe-point steer requires a running turn",
+        ));
+    }
 
     let request_id = match request.verb.as_str() {
         "steer" | "interrupt" => {
