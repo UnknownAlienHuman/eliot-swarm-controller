@@ -54,6 +54,7 @@ pub(super) enum InboxMsg {
     /// Open an item's Agent (an answer is given in its question form).
     OpenAgent(String),
     Refresh,
+    NextPage,
     /// Show one group only (`None`: every group).
     Filter(Option<OwnerInboxKind>),
     /// Select several items (or stop selecting).
@@ -95,8 +96,8 @@ pub(super) struct InboxState {
     pub(super) counts: BTreeMap<OwnerInboxKind, usize>,
     pub(super) profile_command_issues: Vec<ProfileCommandIssue>,
     items: Vec<OwnerInboxItem>,
-    /// More items than the first page.
-    more: bool,
+    /// The server cursor for the next page in blocker order.
+    next: Option<String>,
     error: Option<String>,
     loaded: bool,
     /// Tags reads: an older read's reply is dropped.
@@ -251,7 +252,7 @@ impl DesktopApp {
                 inbox.reading = false;
                 match read {
                     Ok(read) => {
-                        inbox.more = read.next.is_some();
+                        inbox.next = read.next;
                         inbox.items = read.items;
                         inbox.error = None;
                         inbox.loaded = true;
@@ -434,6 +435,12 @@ impl DesktopApp {
                 self.read_inbox(context);
                 self.read_inbox_counts(context);
             }
+            InboxMsg::NextPage => {
+                if let Some(after) = self.inbox.next.clone().filter(|_| !self.inbox.reading) {
+                    self.inbox.selected.clear();
+                    self.read_inbox_page(Some(after), context);
+                }
+            }
             InboxMsg::Filter(kind) => self.inbox.filter = kind,
             InboxMsg::SelectToggled => {
                 let inbox = &mut self.inbox;
@@ -594,6 +601,10 @@ impl DesktopApp {
     /// Read the first inbox page (in the sidebar's batch when one is being
     /// collected).
     pub(super) fn read_inbox(&mut self, context: &ComponentContext<Self>) {
+        self.read_inbox_page(None, context);
+    }
+
+    fn read_inbox_page(&mut self, after: Option<String>, context: &ComponentContext<Self>) {
         let Ok(data_dir) = self.data_dir.clone() else {
             return;
         };
@@ -601,7 +612,7 @@ impl DesktopApp {
         self.inbox.reading = true;
         let seq = self.inbox.seq;
         self.spawn_read(context, move || {
-            let read = client::block_on(client::owner_inbox(&data_dir, None))
+            let read = client::block_on(client::owner_inbox(&data_dir, after))
                 .map_err(|error| error.user_message());
             ShellMsg::Inbox(InboxMsg::Loaded(seq, read))
         });
@@ -815,21 +826,30 @@ impl DesktopApp {
         } else if inbox.loaded && shown.is_empty() {
             items.push(KeyedView::new(
                 "empty",
-                page_ui::quiet("Nothing waits for you."),
+                page_ui::quiet(if inbox.next.is_some() {
+                    "No matching items on this page."
+                } else {
+                    "Nothing waits for you."
+                }),
             ));
         }
-        for kind in OwnerInboxKind::ALL {
+        for (priority, title) in [
+            (0, "Blocking work"),
+            (1, "Unresolved outcomes and work at risk"),
+            (2, "Recommended actions"),
+            (3, "Other decisions"),
+        ] {
             let group: Vec<&OwnerInboxItem> = shown
                 .iter()
                 .copied()
-                .filter(|item| item.kind == kind)
+                .filter(|item| item.page_key().0 == priority)
                 .collect();
             if group.is_empty() {
                 continue;
             }
             items.push(KeyedView::new(
-                format!("kind:{}", kind.as_str()),
-                page_ui::group_heading(kind_title(kind)),
+                format!("priority:{priority}"),
+                page_ui::group_heading(title),
             ));
             let rows: Vec<KeyedView> = group
                 .into_iter()
@@ -841,16 +861,19 @@ impl DesktopApp {
                 })
                 .collect();
             items.push(KeyedView::new(
-                format!("list:{}", kind.as_str()),
+                format!("list:{priority}"),
                 StackPanel::new()
                     .spacing(tokens::spacing::ROW_GAP)
                     .keyed_children(rows),
             ));
         }
-        if inbox.more {
+        if inbox.next.is_some() {
             items.push(KeyedView::new(
                 "more",
-                page_ui::quiet("More items wait beyond these; they show as these are decided."),
+                m3::text_button(palette)
+                    .is_enabled(!inbox.reading)
+                    .on_click(context.message(Message::Inbox(InboxMsg::NextPage)))
+                    .content(m3::label("Next page")),
             ));
         }
         page_ui::page("Owner inbox", self.page_width(tokens::page::WIDTH), items)
