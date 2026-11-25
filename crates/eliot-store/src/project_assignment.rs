@@ -759,13 +759,11 @@ pub(super) fn require_current_project_team(
                 "queued launch caller is not authorized for the current project assignment",
             )
         })?;
-    let assignment = read_assignment(conn, project)?;
-    if !assignment_team_member(
-        conn,
-        &caller,
-        project,
-        assignment.manager.zip(assignment.generation),
-    )? {
+    let Some((manager, manager_generation, _, _)) = load_row(conn, project)? else {
+        // Existing projects without a managed assignment keep their usual scope.
+        return Ok(());
+    };
+    if !assignment_team_member(conn, &caller, project, manager.zip(manager_generation))? {
         return Err(Error::new(
             "stale_assignment",
             "queued launch caller is not authorized for the current project assignment",
