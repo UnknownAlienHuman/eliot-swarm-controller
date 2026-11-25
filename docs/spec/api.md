@@ -3221,7 +3221,8 @@ the short 120-second inactivity lease within an absolute ceiling of the wait
 budget plus 60 seconds. While still quiescing, expiry or confirmed cancellation releases the parked
 rows to the old daemon and reopens admission. At its deadline the CLI cancels by
 default. The CLI prints the preparation ID; the Owner can cancel immediately
-with `swarm daemon update --cancel PREPARE_ID` on the same data directory.
+with Ctrl-C (Ctrl-Break also works on Windows) or with
+`swarm daemon update --cancel PREPARE_ID` on the same data directory.
 The CLI checks the running daemon advertises `drain_seconds` in
 full method help before preparing. A daemon without the field yields
 `unsupported`.
@@ -3231,10 +3232,13 @@ settlement interval before cancellation.
 
 Parked rows are durable before the online backup. The seal transaction repeats
 the readiness check before writing its receipt. After an applied Resume on the
-same native subject, parked SENDs retain their original IDs and FIFO order and
-receive the new execution generation. An applied Resume with a changed native
+same live native subject, parked SENDs retain their original IDs and FIFO
+order and receive the new execution generation. If the session is already busy
+or waiting, normal SEND gates control when the rebound input dispatches. An applied Resume with a changed native
 subject rejects those inputs with `restart_native_subject_changed`. The
-original command receipts report that the input was never dispatched. A held,
+original command receipts report that the input was never dispatched. An
+applied Resume without a live binding rejects the input with
+`restart_resumed_session_unavailable`. A held,
 failed or uncertain Resume keeps
 the parked rows pending. Dispatched and unknown input is excluded from parking
 and remains subject to normal recovery.

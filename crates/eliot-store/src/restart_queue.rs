@@ -112,7 +112,8 @@ pub(super) fn release_after_resume(
             "UPDATE commands SET generation=?2, updated_at=?3
          WHERE target=?1 AND generation<?2 AND verb='send' AND state IN ('accepted','queued')
            AND EXISTS (SELECT 1 FROM restart_deferred_sends d
-               JOIN agents a ON a.id=?1 AND a.generation=?2 AND a.state='idle'
+               JOIN agents a ON a.id=?1 AND a.generation=?2
+                 AND a.state IN ('idle','busy','waiting')
                  AND a.native_scope=d.native_scope AND a.native_ref=d.native_ref
                WHERE d.command_id=commands.id)
          RETURNING id",
@@ -139,32 +140,45 @@ pub(super) fn release_after_resume(
         )?);
     }
 
-    // An applied Resume may legally bind the Agent to another native subject.
-    // These original receipts were proven never dispatched, but cannot be
-    // rebound to the replacement subject. Settle only still-pending parked
-    // inputs; dispatched/unknown and earlier failed attempts are untouched.
+    // The matching, live bindings above now carry the new generation.
+    // Any older pending receipt after an applied Resume cannot use it.
     let mut statement = tx
         .prepare_cached(
-            "SELECT c.id, c.generation
+            "SELECT c.id, c.generation,
+                    a.native_scope IS NOT d.native_scope OR a.native_ref IS NOT d.native_ref
                FROM commands c
                JOIN restart_deferred_sends d ON d.command_id=c.id
                JOIN agents a ON a.id=c.target AND a.generation=?2
               WHERE c.target=?1 AND c.generation<?2 AND c.verb='send'
-                AND c.state IN ('accepted','queued')
-                AND (a.native_scope IS NOT d.native_scope OR a.native_ref IS NOT d.native_ref)",
+                AND c.state IN ('accepted','queued')",
         )
         .map_err(sql_error)?;
-    let mismatched = statement
+    let remaining = statement
         .query_map(params![agent, generation], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, bool>(2)?,
+            ))
         })
         .map_err(sql_error)?
         .collect::<rusqlite::Result<Vec<_>>>()
         .map_err(sql_error)?;
-    for (id, original_generation) in mismatched {
+    for (id, original_generation, changed_subject) in remaining {
+        let (code, message) = if changed_subject {
+            (
+                "restart_native_subject_changed",
+                "The resumed session has a different native identity. The queued input was never dispatched.",
+            )
+        } else {
+            (
+                "restart_resumed_session_unavailable",
+                "The resumed session cannot accept queued input. The input was never dispatched.",
+            )
+        };
         let outcome = json!({
-            "code": "restart_native_subject_changed",
-            "message": "The resumed session has a different native identity. The queued input was never dispatched.",
+            "code": code,
+            "message": message,
             "native_dispatched": false
         });
         update_command_state(tx, &id, CommandState::Rejected, Some(&outcome), None, now)?;

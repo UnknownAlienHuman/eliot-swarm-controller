@@ -587,12 +587,55 @@ async fn quiesce(
     interrupt_on_deadline: bool,
     stopped: &mut Vec<StoppedAgent>,
 ) -> Result<(), Failure> {
-    call_shutdown(path, prepare).await?;
+    let mut signal = Box::pin(wait_for_update_cancel());
+    let mut preparing = Box::pin(call_shutdown(path, prepare));
+    tokio::select! {
+        result = &mut preparing => result?,
+        interrupted = &mut signal => {
+            // The request may already be admitted. Let this bounded RPC
+            // settle before the caller cancels its exact preparation.
+            let _ = preparing.await;
+            return Err(update_cancel_failure(interrupted));
+        }
+    }
     eprintln!(
-        "Update drain {} . Cancel with daemon update --cancel {}",
+        "Update drain {}. Cancel with Ctrl-C or daemon update --cancel {}",
         prepare.id, prepare.id
     );
-    let mut interrupt_on_deadline = interrupt_on_deadline;
+    tokio::select! {
+        result = Box::pin(drain_prepared(path, old, commit, wait, interrupt_on_deadline, stopped)) => result,
+        interrupted = &mut signal => Err(update_cancel_failure(interrupted)),
+    }
+}
+
+async fn wait_for_update_cancel() -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        let mut ctrl_break = tokio::signal::windows::ctrl_break()?;
+        tokio::select! {
+            signal = tokio::signal::ctrl_c() => signal,
+            _ = ctrl_break.recv() => Ok(()),
+        }
+    }
+    #[cfg(not(windows))]
+    tokio::signal::ctrl_c().await
+}
+
+fn update_cancel_failure(signal: std::io::Result<()>) -> Failure {
+    match signal {
+        Ok(()) => Failure::new(130, "daemon update cancelled by console interrupt"),
+        Err(error) => Failure::new(4, format!("listen for daemon update cancellation: {error}")),
+    }
+}
+
+async fn drain_prepared(
+    path: &Path,
+    old: &DaemonInfo,
+    commit: &DaemonShutdownRequest,
+    wait: Duration,
+    mut interrupt_on_deadline: bool,
+    stopped: &mut Vec<StoppedAgent>,
+) -> Result<(), Failure> {
     let mut deadline = Instant::now() + wait;
     let mut next_report = Instant::now();
     loop {
