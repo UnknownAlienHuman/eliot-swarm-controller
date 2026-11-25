@@ -478,8 +478,10 @@ pub(crate) async fn run_project_checks(
                     state.unknown_fingerprints = completion.unknown_fingerprints;
                     state.fingerprint = completion.fingerprint;
                     state.passed = completion.passed;
-                    if completion.uncertain {
-                        driver.pending.remove(&completion.key);
+                    if completion.uncertain
+                        && let Some(pending) = driver.pending.remove(&completion.key)
+                    {
+                        driver.review_event_count = driver.review_event_count.saturating_sub(pending.review.len());
                     }
                 }
                 Err(_) => {
@@ -814,18 +816,31 @@ async fn start_due_checks(
             break;
         }
         if driver.check_states.get(&key).is_some_and(|state| {
-            (state.uncertain
-                && driver.pending.get(&key).is_none_or(|edit| {
-                    edit.review
-                        .iter()
-                        .all(|event| event.seq <= state.checked_seq)
-                }))
-                || driver
-                    .pending
-                    .get(&key)
-                    .is_some_and(|edit| edit.seq <= state.checked_seq)
+            let Some(edit) = driver.pending.get(&key) else {
+                return state.uncertain;
+            };
+            let has_independent_review = edit.review.iter().any(|event| {
+                event.data["worktree"]["fingerprint"]
+                    .as_str()
+                    .is_some_and(|fingerprint| {
+                        !state
+                            .unknown_fingerprints
+                            .iter()
+                            .any(|unknown| unknown == fingerprint)
+                    })
+            });
+            (state.uncertain && !has_independent_review)
+                || (edit.review.is_empty() && edit.seq <= state.checked_seq)
         }) {
             if let Some(edit) = driver.pending.remove(&key) {
+                if !edit.review.is_empty()
+                    && driver
+                        .check_states
+                        .get(&key)
+                        .is_some_and(|state| state.uncertain)
+                {
+                    settle_project_check_obligations(router, &edit.review, "stale").await;
+                }
                 driver.review_event_count =
                     driver.review_event_count.saturating_sub(edit.review.len());
             }
