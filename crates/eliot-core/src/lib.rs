@@ -1518,6 +1518,9 @@ pub struct BatchAck {
     pub cursor: Option<String>,
     #[serde(default)]
     pub dropped_unclassified: i64,
+    /// Input positions whose native kind or ID could not be bound.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub refused_native_fields: Vec<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub permission_refusal: Option<PermissionRefusal>,
     /// Stop the exact commandless wake before handling its output.

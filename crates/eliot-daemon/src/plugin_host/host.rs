@@ -17,8 +17,8 @@ use crate::platform::OwnedChild;
 use crate::platform::custody::{AgentCustodies, AgentSpawnError, LocalPeer};
 use actor::run_agent_inner;
 use eliot_core::{
-    Agent, Command, ContextItem, Error, InjectPoint, Result, SecretPolicy, SourceBatch, SourceGap,
-    SourceGapAck, StderrSource,
+    Agent, Command, ContextItem, Error, InjectPoint, Result, SecretPolicy, SourceGap, SourceGapAck,
+    StderrSource,
     api::{ArtifactKind, ArtifactView},
 };
 use eliot_plugin::{
@@ -2796,63 +2796,6 @@ fn safe_cause_code(code: &str) -> String {
     }
 }
 
-fn redact_source_batch(batch: &mut SourceBatch, credentials: &[String]) -> Result<()> {
-    fn protected_data(value: &Value, policy: &SecretPolicy) -> bool {
-        match value {
-            Value::Object(values) => values.iter().any(|(key, value)| {
-                policy.contains_text(key)
-                    || (matches!(
-                        key.as_str(),
-                        "agent_id"
-                            | "command_id"
-                            | "turn_id"
-                            | "request_id"
-                            | "item_id"
-                            | "native_scope"
-                            | "native_ref"
-                    ) && policy.contains_value(value))
-                    || protected_data(value, policy)
-            }),
-            Value::Array(values) => values.iter().any(|value| protected_data(value, policy)),
-            _ => false,
-        }
-    }
-
-    let policy = SecretPolicy::new(credentials);
-    // Validate the whole batch before changing text: dedup/correlation identities
-    // and object keys must never be rewritten into a different durable payload.
-    if [&batch.batch_id, &batch.agent_id, &batch.source]
-        .into_iter()
-        .any(|value| policy.contains_text(value))
-        || batch
-            .cursor
-            .as_deref()
-            .is_some_and(|value| policy.contains_text(value))
-        || batch.events.iter().any(|event| {
-            policy.contains_text(&event.native_id)
-                || policy.contains_text(&event.kind)
-                || protected_data(&event.data, &policy)
-        })
-    {
-        return Err(Error::new(
-            "secret_in_payload",
-            "native source payload contains a known secret in immutable metadata",
-        ));
-    }
-    for event in &mut batch.events {
-        if policy.redact_values(&mut event.data) {
-            let Some(data) = event.data.as_object_mut() else {
-                return Err(Error::new(
-                    "invalid",
-                    "redacted native event data must be an object",
-                ));
-            };
-            data.insert("redacted".to_owned(), Value::Bool(true));
-        }
-    }
-    Ok(())
-}
-
 async fn record_source_gap(
     store: &StoreHandle,
     bus: &Bus,
@@ -2980,15 +2923,15 @@ fn redact_source_gap(gap: &mut SourceGap, credentials: &[String]) -> Result<()> 
     if [&gap.gap_id, &gap.agent_id, &gap.source]
         .into_iter()
         .chain(gap.families.iter())
-        .any(|value| policy.contains_text(value))
+        .any(|value| policy.contains_native_secret(value))
         || [&gap.from, &gap.to]
             .into_iter()
             .flatten()
-            .any(|value| policy.contains_text(value))
+            .any(|value| policy.contains_native_secret(value))
     {
         return Err(Error::new(
             "secret_in_payload",
-            "native source payload contains a known secret in immutable metadata",
+            "native source payload contains a credential in immutable metadata",
         ));
     }
     gap.reason = policy.redact_text(&gap.reason);
@@ -3044,7 +2987,7 @@ fn redact_native_error(error: Error, credentials: &[String]) -> Error {
     // The boundary behind every persisted outcome, event and log record:
     // redacted message, origin evidence and stderr tails, normalized
     // `where`, every bound re-applied.
-    error.sanitized(&SecretPolicy::new(credentials))
+    crate::redaction::redact_native_error(error, &SecretPolicy::new(credentials))
 }
 
 fn diagnose_error(error: Error, stderr: &StderrView, credentials: &[String]) -> Error {

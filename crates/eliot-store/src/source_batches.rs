@@ -5,15 +5,120 @@ use eliot_core::limits::{
 };
 use std::borrow::Cow;
 
+const NATIVE_FIELD_REFUSED: &str = "source.native_field_refused";
+
+/// The only native event input accepted by the writer. Preparing before
+/// acquiring the writer keeps classification outside the transaction and
+/// gives every direct, observed, child and grouped batch the same digest input.
+pub struct PreparedSourceBatch {
+    batch: SourceBatch,
+    refused: Vec<usize>,
+    replay_policy: core::SecretPolicy,
+}
+
+impl PreparedSourceBatch {
+    pub fn new(mut batch: SourceBatch, exact_secrets: &[String]) -> Result<Self> {
+        // Callers can add run-local exact values. Shape matching is built in.
+        let policy = core::SecretPolicy::new(exact_secrets);
+        if [&batch.batch_id, &batch.agent_id, &batch.source]
+            .into_iter()
+            .chain(batch.cursor.iter())
+            .any(|value| policy.contains_native_secret(value))
+        {
+            return Err(secret_in_batch_binding());
+        }
+        let mut refused = Vec::new();
+        for (index, event) in batch.events.iter_mut().enumerate() {
+            let id = policy.contains_native_secret(&event.native_id);
+            let kind = policy.contains_native_secret(&event.kind);
+            if id || kind {
+                // Native kind and ID are authority and deduplication inputs.
+                // Keep this batch position as a diagnostic without assigning
+                // a different native identity to a fact that can have effects.
+                event.data = json!({
+                    "source": policy.redact_bounded(&batch.source, 128),
+                    "batch_id": policy.redact_bounded(&batch.batch_id, 128),
+                    "position": index,
+                    "native_id": id.then(|| policy.redact_bounded(&event.native_id, 128)),
+                    "kind": kind.then(|| policy.redact_bounded(&event.kind, 128)),
+                    "reason": "credential_in_native_metadata",
+                });
+                event.native_id = format!("refused:{index}");
+                event.kind = NATIVE_FIELD_REFUSED.to_owned();
+                refused.push(index);
+                continue;
+            }
+            if protected_data_has_secret(&event.data, &policy, false) {
+                return Err(secret_in_batch_binding());
+            }
+            redact_event_data(&policy, &mut event.data)?;
+        }
+        Ok(Self {
+            batch,
+            refused,
+            replay_policy: policy,
+        })
+    }
+
+    pub fn as_batch(&self) -> &SourceBatch {
+        &self.batch
+    }
+}
+
+fn redact_event_data(policy: &core::SecretPolicy, value: &mut Value) -> Result<()> {
+    if policy.redact_values(value) {
+        let data = value
+            .as_object_mut()
+            .ok_or_else(|| Error::new("invalid", "redacted native event data must be an object"))?;
+        data.insert("redacted".to_owned(), Value::Bool(true));
+    }
+    Ok(())
+}
+
+fn secret_in_batch_binding() -> Error {
+    Error::new(
+        "secret_in_payload",
+        "native source payload contains a credential in immutable metadata",
+    )
+}
+
+fn protected_data_has_secret(value: &Value, policy: &core::SecretPolicy, bound: bool) -> bool {
+    match value {
+        Value::Object(values) => values.iter().any(|(key, value)| {
+            policy.contains_native_secret(key)
+                || protected_data_has_secret(
+                    value,
+                    policy,
+                    bound
+                        || matches!(
+                            key.as_str(),
+                            "agent_id"
+                                | "command_id"
+                                | "turn_id"
+                                | "request_id"
+                                | "item_id"
+                                | "native_scope"
+                                | "native_ref"
+                        ),
+                )
+        }),
+        Value::Array(values) => values
+            .iter()
+            .any(|value| protected_data_has_secret(value, policy, bound)),
+        Value::String(value) => bound && policy.contains_native_secret(value),
+        _ => false,
+    }
+}
+
 /// A source batch sized before it waits for the Store writer.
 pub struct ReadyToolBatch {
-    batch: SourceBatch,
+    batch: PreparedSourceBatch,
     encoded_bytes: usize,
 }
 
 impl ReadyToolBatch {
-    pub fn new(batch: SourceBatch) -> Result<Self> {
-        let encoded_bytes = encode_json(&batch)?.len();
+    pub fn new(batch: PreparedSourceBatch) -> Result<Self> {
+        let encoded_bytes = encode_json(batch.as_batch())?.len();
         Ok(Self {
             batch,
             encoded_bytes,
@@ -24,7 +129,7 @@ impl ReadyToolBatch {
         self.encoded_bytes
     }
 
-    pub fn into_batch(self) -> SourceBatch {
+    pub fn into_batch(self) -> PreparedSourceBatch {
         self.batch
     }
 }
@@ -701,7 +806,7 @@ impl Store {
 
     /// Commit one complete native batch, its reducer projections, derived
     /// command/turn facts, source cursor, and last-batch acknowledgement.
-    pub fn put_batch(&mut self, batch: SourceBatch, now: i64) -> Result<BatchCommit> {
+    pub fn put_batch(&mut self, batch: PreparedSourceBatch, now: i64) -> Result<BatchCommit> {
         self.ensure_writer_healthy()?;
         let result = self.put_batch_inner(batch, None, None, None, None, now);
         self.fault_on_persistence_error(&result);
@@ -726,7 +831,7 @@ impl Store {
                     .sum::<usize>()
                     > MAX_TOOL_GROUP_BYTES
                 || batches.iter().any(|ready| {
-                    let batch = &ready.batch;
+                    let batch = ready.batch.as_batch();
                     batch.source != "stream"
                         || !(1..=MAX_TOOL_EVENTS_PER_BATCH).contains(&batch.events.len())
                         || batch.events.iter().any(|event| {
@@ -771,7 +876,7 @@ impl Store {
 
     pub fn put_batch_with_completion_capture(
         &mut self,
-        batch: SourceBatch,
+        batch: PreparedSourceBatch,
         worktree: Option<CompletionWorktreeCapture>,
         project_check: Option<bool>,
         now: i64,
@@ -784,7 +889,7 @@ impl Store {
 
     pub fn put_observed_batch(
         &mut self,
-        batch: SourceBatch,
+        batch: PreparedSourceBatch,
         expected_subject: (&str, &str),
         now: i64,
     ) -> Result<BatchCommit> {
@@ -798,7 +903,7 @@ impl Store {
         &mut self,
         producer: &str,
         producer_generation: i64,
-        batch: SourceBatch,
+        batch: PreparedSourceBatch,
         now: i64,
     ) -> Result<BatchCommit> {
         self.ensure_writer_healthy()?;
@@ -816,7 +921,7 @@ impl Store {
 
     fn put_batch_inner(
         &mut self,
-        batch: SourceBatch,
+        batch: PreparedSourceBatch,
         expected_subject: Option<(&str, &str)>,
         native_producer: Option<(&str, i64)>,
         completion_worktree: Option<CompletionWorktreeCapture>,
@@ -847,13 +952,18 @@ impl Store {
 
     fn put_batch_tx(
         tx: &Transaction<'_>,
-        mut batch: SourceBatch,
+        prepared: PreparedSourceBatch,
         expected_subject: Option<(&str, &str)>,
         native_producer: Option<(&str, i64)>,
         completion_worktree: Option<CompletionWorktreeCapture>,
         project_check: Option<bool>,
         now: i64,
     ) -> Result<BatchCommit> {
+        let PreparedSourceBatch {
+            mut batch,
+            refused,
+            replay_policy,
+        } = prepared;
         let observed = expected_subject.is_some() || native_producer.is_some();
         if let Some(worktree) = completion_worktree.as_ref() {
             worktree.validate()?;
@@ -883,15 +993,17 @@ impl Store {
                 "native batch exceeds 900 KiB",
             ));
         }
-        let event_payload_digests = batch
+        let replay_events: Vec<_> = batch
             .events
             .iter()
-            .map(|event| canonical::digest(&event.semantic_value()))
+            .map(core::NativeEvent::semantic_value)
+            .collect();
+        let event_payload_digests = replay_events
+            .iter()
+            .map(canonical::digest)
             .collect::<Result<Vec<_>>>()?;
-        let batch_digest = batch
-            .semantic_digest()
-            .map_err(|error| Error::new("invalid", error.to_string()))?
-            .to_vec();
+        let replay_payload = Value::Array(replay_events);
+        let batch_digest = canonical::digest(&replay_payload)?;
         for event in batch
             .events
             .iter_mut()
@@ -905,7 +1017,11 @@ impl Store {
         let agent_num = parse_agent_id(&batch.agent_id)?;
         let mut native_ids = HashSet::with_capacity(batch.events.len());
         let mut publication = Vec::with_capacity(batch.events.len());
-        for event in &batch.events {
+        for (index, event) in batch.events.iter().enumerate() {
+            if refused.binary_search(&index).is_ok() {
+                publication.push(Cow::Borrowed(event));
+                continue;
+            }
             require_nonempty(&event.kind, "event kind")?;
             require_nonempty(&event.native_id, "native_id")?;
             if event.kind == core::UNCLASSIFIED_NATIVE_EVENT {
@@ -958,7 +1074,9 @@ impl Store {
             let families = batch
                 .events
                 .iter()
-                .map(|event| family_for_kind(&event.kind).map(str::to_owned))
+                .enumerate()
+                .filter(|(index, _)| refused.binary_search(index).is_err())
+                .map(|(_, event)| family_for_kind(&event.kind).map(str::to_owned))
                 .collect::<Result<Vec<_>>>()?;
             native_children::require_families(&families)?;
             for event in &batch.events {
@@ -979,7 +1097,9 @@ impl Store {
             let families = batch
                 .events
                 .iter()
-                .map(|event| {
+                .enumerate()
+                .filter(|(index, _)| refused.binary_search(index).is_err())
+                .map(|(_, event)| {
                     let family = family_for_kind(&event.kind)?;
                     if family == "session" && event.kind != core::UNCLASSIFIED_NATIVE_EVENT {
                         return Err(Error::new(
@@ -990,7 +1110,14 @@ impl Store {
                     Ok(family.to_owned())
                 })
                 .collect::<Result<Vec<_>>>()?;
-            observer_live::require_transcript_families(tx, &projection, &batch.source, &families)?;
+            if !families.is_empty() || batch.source != "transcript" {
+                observer_live::require_transcript_families(
+                    tx,
+                    &projection,
+                    &batch.source,
+                    &families,
+                )?;
+            }
         } else {
             observer::require_controlled(&projection)?;
         }
@@ -1021,8 +1148,16 @@ impl Store {
             .ok_or_else(|| Error::new("source_integrity", "source has no committed state"))?;
 
         if source.last_batch_id.as_deref() == Some(batch.batch_id.as_str()) {
-            if source.last_batch_digest.as_deref() == Some(batch_digest.as_slice())
-                && source.cursor == batch.cursor
+            if source.cursor == batch.cursor
+                && (source.last_batch_digest.as_deref() == Some(batch_digest.as_slice())
+                    || replay_matches(
+                        tx,
+                        agent_num,
+                        batch.generation,
+                        &batch.source,
+                        &replay_policy,
+                        &replay_payload,
+                    )?)
             {
                 let mut native_wake_cancel = read_native_wake_cancellation(
                     tx,
@@ -1065,6 +1200,7 @@ impl Store {
                     })?,
                     cursor: source.cursor,
                     dropped_unclassified: source.last_batch_dropped,
+                    refused_native_fields: refused,
                     permission_refusal: None,
                     native_wake_cancel,
                 };
@@ -1100,7 +1236,10 @@ impl Store {
                      )",
                 )
                 .map_err(sql_error)?;
-            for event in &batch.events {
+            for (index, event) in batch.events.iter().enumerate() {
+                if refused.binary_search(&index).is_ok() {
+                    continue;
+                }
                 if event.data.get("native_wake_cancel").is_some() {
                     return Err(Error::new(
                         "invalid",
@@ -1141,6 +1280,18 @@ impl Store {
         let mut dropped_unclassified = 0;
         for (index, (source_event, published)) in batch.events.iter().zip(&publication).enumerate()
         {
+            if refused.binary_search(&index).is_ok() {
+                committed_events.push(insert_daemon_event(
+                    tx,
+                    now,
+                    NATIVE_FIELD_REFUSED,
+                    "source",
+                    Some(agent_num),
+                    Some(batch.generation),
+                    source_event.data.clone(),
+                )?);
+                continue;
+            }
             if source_event.kind == core::UNCLASSIFIED_NATIVE_EVENT
                 && !admit_native_diagnostic(tx, &projection)?
             {
@@ -1364,8 +1515,8 @@ impl Store {
 
         let first_seq = committed_events.first().map_or(0, |event| event.seq);
         let last_seq = committed_events.last().map_or(0, |event| event.seq);
-        // Keep native batch ACKs scoped to native rows; the associated command
-        // event follows those rows but commits in the same transaction.
+        // The ACK spans one receipt per admitted input position, including
+        // refused native fields. Derived command rows follow that range.
         for command_event in command_events {
             committed_events.push(command_event.commit(tx, agent_num, batch.generation, now)?);
         }
@@ -1406,7 +1557,7 @@ impl Store {
              SET cursor = ?1, last_store_seq = COALESCE(NULLIF(?2, 0), last_store_seq), last_batch_id = ?3,
                  last_batch_digest = ?4, last_batch_first_seq = ?5,
                  last_batch_last_seq = ?6, state = ?7, updated_at = ?8,
-                 last_batch_dropped = ?12
+                 last_batch_dropped = ?12, last_batch_replay = ?13
              WHERE agent = ?9 AND generation = ?10 AND source = ?11",
             params![
                 batch.cursor,
@@ -1421,6 +1572,7 @@ impl Store {
                 batch.generation,
                 batch.source,
                 dropped_unclassified,
+                encode_json(&replay_payload)?,
             ],
         ));
         let native_wake_cancel =
@@ -1431,12 +1583,41 @@ impl Store {
                 last_seq,
                 cursor: batch.cursor,
                 dropped_unclassified,
+                refused_native_fields: refused,
                 permission_refusal: None,
                 native_wake_cancel,
             },
             events: committed_events,
         })
     }
+}
+
+/// A retry can have a different scoped literal set. Compare only the
+/// safe, retained canonical payload, never a digest of unredacted text.
+fn replay_matches(
+    tx: &Transaction<'_>,
+    agent: i64,
+    generation: i64,
+    source: &str,
+    policy: &core::SecretPolicy,
+    incoming: &Value,
+) -> Result<bool> {
+    let stored: Option<String> = tx.query_row(
+        "SELECT last_batch_replay FROM source_state WHERE agent=?1 AND generation=?2 AND source=?3",
+        params![agent, generation, source], |row| row.get(0),
+    ).map_err(sql_error)?;
+    let Some(stored) = stored else {
+        // Earlier receipts still require the exact original digest.
+        return Ok(false);
+    };
+    let mut stored = decode_json(&stored)?;
+    let invalid_receipt = || Error::new("source_integrity", "native replay receipt is invalid");
+    let events = stored.as_array_mut().ok_or_else(invalid_receipt)?;
+    for event in events {
+        let data = event.get_mut("data").ok_or_else(invalid_receipt)?;
+        redact_event_data(policy, data)?;
+    }
+    Ok(&stored == incoming)
 }
 
 fn read_native_wake_cancellation(

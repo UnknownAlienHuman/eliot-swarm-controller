@@ -114,27 +114,27 @@ impl SourceHandoff {
             self.mechanism.as_str(),
         ]
         .into_iter()
-        .any(|value| policy.contains_text(value))
+        .any(|value| policy.contains_native_secret(value))
             || self
                 .families
                 .iter()
-                .any(|family| policy.contains_text(family))
+                .any(|family| policy.contains_native_secret(family))
             || self
                 .cursor
                 .as_deref()
-                .is_some_and(|cursor| policy.contains_text(cursor))
+                .is_some_and(|cursor| policy.contains_native_secret(cursor))
             || self.gap.as_ref().is_some_and(|gap| {
-                policy.contains_text(&gap.gap_id)
+                policy.contains_native_secret(&gap.gap_id)
                     || [&gap.from, &gap.to]
                         .into_iter()
                         .flatten()
-                        .any(|cursor| policy.contains_text(cursor))
+                        .any(|cursor| policy.contains_native_secret(cursor))
             });
         // Check every immutable field before redacting even the mutable reason.
         if immutable_secret {
             return Err(Error::new(
                 "secret_in_payload",
-                "source.handoff contains a known secret in immutable metadata",
+                "source.handoff contains a credential in immutable metadata",
             ));
         }
         if let Some(gap) = self.gap.as_mut() {

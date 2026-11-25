@@ -1,6 +1,9 @@
-//! Immutable literal-secret policy shared by admission, transports and logging.
+//! Shared complete-text redaction and streaming literal-secret protection.
+
+mod credentials;
 
 use serde_json::Value;
+use std::borrow::Cow;
 
 const MARKER: &[u8] = b"[REDACTED]";
 
@@ -30,13 +33,20 @@ impl SecretPolicy {
         self.values.iter().any(|secret| text.contains(secret))
     }
 
-    /// Redact complete input before applying any bound. Complete redaction
-    /// markers are preserved across repeated sanitization. Streaming callers
-    /// must retain the unfinished suffix from `redact_prefix(_, false)`;
-    /// guessing whether an arbitrary text suffix is a secret is unsafe.
+    /// Redact recognizable shapes and the scoped set of exact secrets.
+    /// Call on complete text before truncation, hashing or persistence.
     pub fn redact_text(&self, text: &str) -> String {
-        let (safe, _) = self.redact_prefix(text.as_bytes(), true);
-        String::from_utf8_lossy(&safe).into_owned()
+        self.redact_field_text(text, None).into_owned()
+    }
+
+    fn redact_field_text<'a>(&self, text: &'a str, field: Option<&str>) -> Cow<'a, str> {
+        let shaped = credentials::redact_field(text, field);
+        if self.contains_text(&shaped) {
+            let (safe, _) = self.redact_prefix(shaped.as_bytes(), true);
+            Cow::Owned(String::from_utf8_lossy(&safe).into_owned())
+        } else {
+            shaped
+        }
     }
 
     /// Redact complete text, then bound it to `max_bytes` at a character
@@ -45,6 +55,47 @@ impl SecretPolicy {
         let mut safe = self.redact_text(text);
         safe.truncate(safe.floor_char_boundary(max_bytes));
         safe
+    }
+
+    /// Check exact credentials and recognizable shapes without altering an identity.
+    pub fn contains_native_secret(&self, text: &str) -> bool {
+        self.contains_text(text) || credentials::contains(text)
+    }
+
+    /// Redact string values with context from explicit secret fields.
+    /// Object keys remain intact for the caller's metadata validation.
+    pub fn redact_values(&self, value: &mut Value) -> bool {
+        self.redact_field(value, None)
+    }
+
+    fn redact_field(&self, value: &mut Value, field: Option<&str>) -> bool {
+        match value {
+            Value::String(text) => {
+                let Cow::Owned(safe) = self.redact_field_text(text, field) else {
+                    return false;
+                };
+                if *text == safe {
+                    return false;
+                }
+                *text = safe;
+                true
+            }
+            Value::Array(values) => {
+                let mut changed = false;
+                for value in values {
+                    changed |= self.redact_field(value, field);
+                }
+                changed
+            }
+            Value::Object(values) => {
+                let mut changed = false;
+                for (key, value) in values {
+                    changed |= self.redact_field(value, Some(key));
+                }
+                changed
+            }
+            _ => false,
+        }
     }
 
     /// Inspect both string keys and string values; other JSON scalars stay typed.
@@ -59,33 +110,48 @@ impl SecretPolicy {
         }
     }
 
-    /// Redact string values, never object keys. Returns whether values changed.
-    pub fn redact_values(&self, value: &mut Value) -> bool {
+    /// Recognize credentials in a structured input without changing its bindings.
+    pub fn contains_native_value(&self, value: &Value) -> bool {
+        self.contains_native_field(value, None)
+    }
+
+    fn contains_native_field(&self, value: &Value, field: Option<&str>) -> bool {
         match value {
-            Value::String(text) => {
-                let safe = self.redact_text(text);
-                if safe == *text {
-                    return false;
-                }
-                *text = safe;
-                true
-            }
-            Value::Array(values) => {
-                let mut changed = false;
-                for value in values {
-                    changed |= self.redact_values(value);
-                }
-                changed
-            }
-            Value::Object(values) => {
-                let mut changed = false;
-                for value in values.values_mut() {
-                    changed |= self.redact_values(value);
-                }
-                changed
-            }
+            Value::String(text) => matches!(self.redact_field_text(text, field), Cow::Owned(_)),
+            Value::Array(values) => values
+                .iter()
+                .any(|value| self.contains_native_field(value, field)),
+            Value::Object(values) => values.iter().any(|(key, value)| {
+                self.contains_native_secret(key) || self.contains_native_field(value, Some(key))
+            }),
             _ => false,
         }
+    }
+
+    /// Publishing keys is safe only if they are credential-free. Keys carry
+    /// schema and must never be silently replaced with another key.
+    pub fn contains_native_key(&self, value: &Value) -> bool {
+        match value {
+            Value::Object(values) => values.iter().any(|(key, value)| {
+                self.contains_native_secret(key) || self.contains_native_key(value)
+            }),
+            Value::Array(values) => values.iter().any(|value| self.contains_native_key(value)),
+            _ => false,
+        }
+    }
+
+    /// Prepare an owned display value before applying a caller's size bound.
+    pub fn redacted_values(&self, mut value: Value) -> Value {
+        self.redact_values(&mut value);
+        value
+    }
+
+    /// Compare public offer values using the same text as their retained view.
+    pub fn same_redacted_values(&self, left: &Value, right: &Value) -> bool {
+        if left == right {
+            return true;
+        }
+        self.redacted_values(left.clone()) == self.redacted_values(right.clone())
     }
 
     /// Return safe output and the number of ORIGINAL bytes consumed. The caller

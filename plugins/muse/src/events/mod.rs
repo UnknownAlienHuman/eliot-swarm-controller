@@ -16,8 +16,8 @@ use eliot_plugin::{
     session::{
         EVENT_DEADLINE, MessageCommit, StreamSource, attach_final_text, attach_native_error,
         attach_provider_restriction, event_id as shared_event_id, native_no_write,
-        next_input_outcomes, redact_request_details_for_commit, rejected_control, request_event_id,
-        request_reply_applied, unknown_control,
+        next_input_outcomes, rejected_control, request_event_id, request_reply_applied,
+        unknown_control,
     },
 };
 use serde::Serialize;
@@ -1819,12 +1819,13 @@ impl EventProcessor {
         // offer and its current requirement).
         let reissued = self.pending_requests.contains_key(&request_id);
         if reissued {
+            let policy = SecretPolicy::new(self.secrets.iter().cloned());
             let same = request.kind != "approval"
                 || self
                     .pending_requests
                     .get(&request_id)
                     .is_some_and(|existing| {
-                        same_approval_offer(&existing.request.details, &params)
+                        same_approval_offer(&existing.request.details, &params, &policy)
                     });
             let observed = self.observe();
             let (prior, newer) = self
@@ -1903,7 +1904,7 @@ impl EventProcessor {
             "request_id": request.id,
             "turn_id": request.turn_id,
             "kind": public_kind,
-            "details": redact_request_details_for_commit(&public_details, &policy),
+            "details": policy.redacted_values(public_details),
         });
         if let Some(command_id) = command_id {
             data["command_id"] = json!(command_id);
@@ -2602,7 +2603,7 @@ impl EventProcessor {
             "request_id": entry.id,
             "turn_id": entry.turn_id,
             "kind": public_kind,
-            "details": redact_request_details_for_commit(&public_details, &policy),
+            "details": policy.redacted_values(public_details),
         });
         if let Some(command_id) = command_id {
             data["command_id"] = json!(command_id);
@@ -3969,13 +3970,14 @@ impl EventProcessor {
                 .await;
         };
         let observed = self.observe();
+        let policy = SecretPolicy::new(self.secrets.iter().cloned());
         let (prior, same, newer) = self
             .pending_requests
             .get(&request_id)
             .map(|entry| {
                 (
                     entry.reply_state,
-                    same_approval_offer(&entry.request.details, &raw),
+                    same_approval_offer(&entry.request.details, &raw, &policy),
                     is_newer_approval_requirement(&entry.request.details, &raw),
                 )
             })
@@ -4666,7 +4668,7 @@ impl EventProcessor {
             "request_id": refreshed.id,
             "turn_id": refreshed.turn_id,
             "kind": public_kind,
-            "details": redact_request_details_for_commit(&public_details, &policy),
+            "details": policy.redacted_values(public_details),
         });
         if let Some(command_id) = command_id {
             data["command_id"] = json!(command_id);

@@ -36,7 +36,7 @@ use eliot_plugin::{
     session::{
         EVENT_DEADLINE, StreamSource, attach_final_text, attach_native_error, event_id,
         is_blank_native_text, native_terminal_inactivity, next_input_outcomes,
-        redact_request_details_for_commit, with_claimed_context,
+        with_claimed_context,
     },
     turn_readback::{HistoryMessage, HistoryPage, TurnHistory, read_turn_history},
 };
@@ -3104,7 +3104,7 @@ impl EventProcessor {
     }
 
     /// Durably open a described native request. Details commit redacted;
-    /// the raw offer stays in memory for choice matching.
+    /// Raw offer values stay available for exact native replies.
     async fn open_request(&mut self, pending: CorePending) -> Result<()> {
         if self.resolved_native_ids.contains(&pending.id) {
             self.record_gap("OpenCode native request was re-issued after resolution")
@@ -3114,10 +3114,11 @@ impl EventProcessor {
                 "OpenCode native request identity is ambiguous",
             ));
         }
+        let secrets = SecretPolicy::new(self.secrets.iter().cloned());
         if let Some(existing) = self.pending_requests.get(&pending.id) {
             if existing.request.turn_id != pending.turn_id
                 || existing.request.kind != pending.kind
-                || existing.request.details != pending.details
+                || !secrets.same_redacted_values(&existing.request.details, &pending.details)
             {
                 self.record_gap("OpenCode native request offer changed after opening")
                     .await?;
@@ -3164,8 +3165,7 @@ impl EventProcessor {
                 "OpenCode public request view could not be normalized",
             ));
         };
-        let secrets = SecretPolicy::new(self.secrets.iter().cloned());
-        let committed = redact_request_details_for_commit(&public_details, &secrets);
+        let committed = secrets.redacted_values(public_details);
         let guard_commands = (pending.kind == "approval"
             && pending.details["action"].as_str().is_some_and(|action| {
                 action.eq_ignore_ascii_case("shell") || action.eq_ignore_ascii_case("bash")

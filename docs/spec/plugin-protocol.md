@@ -563,8 +563,60 @@ become `events.put` records.
 ### Commit acknowledgement
 
 Normalize one native record into one atomic batch. Each event carries stable native id,
-kind/family, timestamp, exact correlations and bounded data. The daemon computes
-canonical event/batch digests, excluding transport ids/timing; cursor is compared too.
+kind/family, timestamp, exact correlations and bounded data. The host applies
+the shared [native redaction policy](../../crates/eliot-core/src/secrets.rs) to
+semantic values before the Store computes canonical event and batch digests.
+Recognized provider and GitHub keys, JWTs, Bearer values, query credential values
+and high-entropy values in named secret fields become
+`[REDACTED:<kind>:<original byte length>]`. The digest sees the marker and
+surrounding text. Ordinary Git SHAs and ULIDs remain intact. The Store accepts
+only prepared batches, including direct, observed, child and grouped intake.
+Store preparation always applies the shape detector. Producers supply only
+their scoped exact credentials for the same redaction pass.
+A credential in a batch binding, an immutable payload correlation or an object
+key rejects the batch with `secret_in_payload`. A credential in an event's
+`native_id` or `kind` refuses that field and writes a
+`source.native_field_refused` diagnostic at the same batch position.
+The affected fact cannot drive native effects. Other positions retain normal
+commit order and the ACK identifies refused positions. Bounded adapter views
+apply the same policy before truncation. Native outcomes, recovery text and
+daemon diagnostics use the same matcher and scoped literal set.
+
+The latest batch receipt retains bounded, redacted canonical content beside
+the digest. On a same-ID retry with the exact cursor, the Store compares the
+incoming prepared batch and the retained receipt after redacting both with
+the current run-local policy. Every canonical value must agree. A retained
+marker cannot match different text, and an exact credential removed from the
+current policy can cause a source-integrity refusal. A successful comparison
+only returns the existing ACK. Legacy receipts without comparison data
+still require the original digest. Digests exclude transport IDs and timing.
+
+The common Store command writer rejects shaped credentials in arguments
+without redacting them. The same check runs before command hashing. Callers
+that accept Owner text must reject exact run-local literals before admission.
+The Store sanitizes command outcomes and event text before encoding and
+refuses credential-bearing event keys and bindings.
+
+Owner-text caller checks for the Store command writer
+
+- [Direct submission](../../crates/eliot-daemon/src/router.rs) checks exact
+  literals in keys and values, including Owner SEND, steer, inject, run,
+  launch and coordination command arguments. The direct launch path checks
+  again after freezing the request.
+- [Queued launch](../../crates/eliot-daemon/src/router/launch_queue.rs) checks
+  the original intent arguments. [Assignment launch and staged transfer
+  launch](../../crates/eliot-daemon/src/router/project_assignment.rs) check
+  the prepared launch, including any resolved Goal inputs.
+- [Handoff](../../crates/eliot-daemon/src/router/handoff.rs) and
+  [Switch](../../crates/eliot-daemon/src/router/switch.rs) check the submitted
+  or prepared command arguments. Their generated briefs also use the scoped
+  policy during preparation.
+- [Rule catch-up and timer run](../../crates/eliot-daemon/src/router/rules.rs)
+  check the incoming keys and values. [Coordination
+  requests](../../crates/eliot-daemon/src/router/coordination.rs) do the same
+  for their own typed write paths. Goal definitions are stored by their
+  [Goal API](../../crates/eliot-daemon/src/router/goals.rs).
+
 A source permits at most one unacknowledged batch. Keep later input in a bounded spool.
 
 For a planned daemon restart, while holding the Store writer lock, the daemon
@@ -692,7 +744,7 @@ its own background task; `tool.background_ended` (`turn_id`, `item_id`) reports 
 task ended and may commit after that turn. A command tool's `tool.started` may carry `command`, the command text the
 harness reports (Codex: its parsed `commandActions[].command`, one per line, else the raw
 `command`; Claude: the `tool_use` `input.command`; OpenCode: the
-`session.tool.called` tool input string `command`, the shell tool), redacted with the secret policy and
+`session.tool.called` tool input string `command`, the shell tool), redacted with the shared native policy and
 bounded to [`MAX_TOOL_COMMAND_BYTES`](../../crates/eliot-core/src/limits.rs); command
 output is never persisted, except the bounded, redacted tail of a failed Codex
 `commandExecution` (`error_tail`): the whole native output is redacted, then the
@@ -759,8 +811,8 @@ The private authenticated `source.state` readback includes paired nullable
 first handoff, and all current generation owner/mechanism rows.
 `SourceHandoff::prepare(&mut self, policy:&SecretPolicy)->CoreResult<()>` is the shared,
 idempotent normalization step. It rejects known secrets in immutable fields before
-mutation and redacts only `gap.reason`; the canonical digest includes the full prepared
-request, including the redacted reason. The host uses the same prepare path.
+mutation and redacts the semantic `gap.reason`; the canonical digest includes the full
+prepared request, including the redacted reason. The host uses the same prepare path.
 A reader with an uncertain handoff reply stops publishing on that source. It may
 publish successor facts only after a validated acknowledgement. The public Agent
 `source_states` projection omits the digest and ACK. No source epoch or open-id layer.
@@ -1039,6 +1091,9 @@ Public requests and answers are universal: `request.opened` details and kinds us
 shared [`eliot_core::requests`](../../crates/eliot-core/src/requests.rs) shapes
 (`QuestionRequest`/`ApprovalRequest`), and `answer` args use `AnswerArgs`. Only the
 plugin translates between these shapes and its vendor format in both directions.
+The Store redacts request summaries, questions and choices before publication.
+Adapters compare reissued offer text in its redacted form and retain exact
+private native bindings for replies.
 The desktop consumes the nested question DTOs: text entry, one-choice lists,
 multiple-choice checkboxes, number text entry without rounding, and a Yes/No choice. Unedited
 questions stay omitted from partial answers; Leave unanswered removes an

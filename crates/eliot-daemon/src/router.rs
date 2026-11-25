@@ -3432,16 +3432,7 @@ impl Router {
     }
 
     fn reject_secret_command_args(&self, request: &SubmitCommand) -> Result<()> {
-        // User-event data and coordination values can have arbitrary keys.
-        let secret_hit = if matches!(
-            request.verb.as_str(),
-            "notify" | "emit" | "attention.emit" | "mail.send" | "var.set"
-        ) {
-            contains_known_secret_including_keys(&request.args, &self.inner.secrets)
-        } else {
-            contains_known_secret(&request.args, &self.inner.secrets)
-        };
-        if secret_hit {
+        if contains_known_secret_including_keys(&request.args, &self.inner.secrets) {
             return Err(Error::new(
                 "secret_in_payload",
                 "durable command text contains a known credential",

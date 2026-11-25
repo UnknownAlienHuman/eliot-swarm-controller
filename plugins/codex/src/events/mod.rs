@@ -1248,7 +1248,12 @@ impl EventProcessor {
         request_details.remove("native_method");
         let request_id = request.id.clone();
         if let Some(existing) = self.pending_requests.get(&request_id) {
-            if existing.request == request && existing.transport_id == transport_id {
+            let policy = SecretPolicy::new(self.secrets.iter().cloned());
+            if existing.transport_id == transport_id
+                && existing.request.turn_id == request.turn_id
+                && existing.request.kind == request.kind
+                && policy.same_redacted_values(&existing.request.details, &request.details)
+            {
                 return Ok(());
             }
             return Err(Error::new(

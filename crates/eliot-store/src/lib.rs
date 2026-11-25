@@ -342,7 +342,7 @@ mod resolution;
 mod retention;
 mod schema;
 mod source_batches;
-pub use source_batches::{CompletionWorktreeCapture, ReadyToolBatch};
+pub use source_batches::{CompletionWorktreeCapture, PreparedSourceBatch, ReadyToolBatch};
 mod source_handoff;
 mod source_install;
 mod switch;
@@ -5652,6 +5652,16 @@ fn admit_linked_send(
     Ok((request.id, event))
 }
 
+fn reject_shaped_command_args(args: &Value) -> Result<()> {
+    if core::SecretPolicy::default().contains_native_value(args) {
+        return Err(Error::new(
+            "secret_in_payload",
+            "command arguments contain a credential",
+        ));
+    }
+    Ok(())
+}
+
 fn insert_command(
     tx: &Transaction<'_>,
     command: &CommandInsert<'_>,
@@ -5664,10 +5674,11 @@ fn insert_command(
             "ordinary command admission must start at cause depth zero",
         ));
     }
+    reject_shaped_command_args(command.args)?;
     let project_binding = projects::capture_project_command_binding_tx(tx, command)?;
     let assignment_binding = project_assignment::capture_binding(tx, command)?;
     let args = encode_json(command.args)?;
-    let outcome = command.outcome.map(encode_json).transpose()?;
+    let outcome = encode_command_outcome(command.outcome)?;
     let cause = encode_json(cause)?;
     db!(tx.execute(
         "INSERT INTO commands(
@@ -5828,6 +5839,21 @@ fn update_owner_rules_input_status(
     Ok(())
 }
 
+fn encode_command_outcome(outcome: Option<&Value>) -> Result<Option<String>> {
+    let policy = core::SecretPolicy::default();
+    outcome
+        .map(|value| {
+            if policy.contains_native_key(value) {
+                return Err(Error::new(
+                    "secret_in_payload",
+                    "command outcome key contains a credential",
+                ));
+            }
+            encode_json(&policy.redacted_values(value.clone()))
+        })
+        .transpose()
+}
+
 fn write_command_state(
     tx: &Transaction<'_>,
     id: &str,
@@ -5836,7 +5862,7 @@ fn write_command_state(
     generation: Option<i64>,
     now: i64,
 ) -> Result<()> {
-    let encoded_outcome = outcome.map(encode_json).transpose()?;
+    let encoded_outcome = encode_command_outcome(outcome)?;
     db!(tx.execute(
         "UPDATE commands
          SET state = ?1, outcome = ?2, generation = COALESCE(?3, generation), updated_at = ?4
@@ -6018,6 +6044,25 @@ fn insert_event(tx: &Transaction<'_>, mut event: EventInsert<'_>) -> Result<Even
                 .or_insert_with(|| json!(cause.command_id));
         }
     }
+    let policy = core::SecretPolicy::default();
+    if [
+        Some(event.kind),
+        Some(event.source),
+        event.family,
+        event.native_id,
+        event.cursor,
+    ]
+    .into_iter()
+    .flatten()
+    .any(|value| policy.contains_native_secret(value))
+        || policy.contains_native_key(&event.data)
+    {
+        return Err(Error::new(
+            "secret_in_payload",
+            "event binding contains a credential",
+        ));
+    }
+    policy.redact_values(&mut event.data);
     let data_json = encode_json(&event.data)?;
     if data_json.len() > MAX_EVENT_BYTES {
         return Err(Error::new(
@@ -6030,6 +6075,16 @@ fn insert_event(tx: &Transaction<'_>, mut event: EventInsert<'_>) -> Result<Even
         validate_event_cause_shape(cause, None)?;
     }
     let cause_json = event.cause.as_ref().map(encode_json).transpose()?;
+    if [&subject_json, &cause_json]
+        .into_iter()
+        .flatten()
+        .any(|value| policy.contains_native_secret(value))
+    {
+        return Err(Error::new(
+            "secret_in_payload",
+            "event subject or cause contains a credential",
+        ));
+    }
     let mut insert = db!(tx.prepare_cached(
         "INSERT INTO events(ts, kind, family, agent, generation, source, native_id,
                             cursor, payload_digest, data, subject, cause)

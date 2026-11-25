@@ -58,7 +58,7 @@ pub(crate) fn redact_outcome(value: &mut Value, secrets: &[String]) {
 pub(crate) fn attach_stderr(
     value: &mut Value,
     source: StderrSource,
-    snapshot: StderrSnapshot,
+    mut snapshot: StderrSnapshot,
     secrets: &[String],
 ) {
     let mut tails = take_diagnostics(value);
@@ -68,8 +68,18 @@ pub(crate) fn attach_stderr(
     // Capture snapshots are already sanitized before retention. Replace only
     // this source; a Harness tail received from the plugin remains distinct.
     tails.retain(|tail| tail.source != source);
+    snapshot.text = policy.redact_text(&snapshot.text);
     tails.push(StderrDiagnostic { source, snapshot });
     put_diagnostics(value, tails, eliot_plugin::MAX_EVENT_BYTES);
+}
+
+pub(crate) fn redact_native_error(mut error: Error, policy: &SecretPolicy) -> Error {
+    *error.message = policy.redact_text(&error.message);
+    if let Some(evidence) = &mut error.origin_evidence {
+        *evidence = policy.redact_text(evidence).into_boxed_str();
+    }
+    redact_tails(&mut error.diagnostics, policy);
+    error.sanitized(policy)
 }
 
 pub(crate) fn bound_outcome_diagnostics(value: &mut Value, max_encoded_bytes: usize) {

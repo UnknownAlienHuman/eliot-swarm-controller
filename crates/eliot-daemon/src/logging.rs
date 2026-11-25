@@ -486,7 +486,9 @@ fn encode_record(
     if let Some(detail) = detail
         && !detail.is_empty()
     {
-        value["detail"] = Value::Object(detail);
+        let mut detail = Value::Object(detail);
+        policy.redact_values(&mut detail);
+        value["detail"] = detail;
     }
     if let Some(error) = error {
         value["cause"] = json!(bounded_text(policy, &error.message, 1024));

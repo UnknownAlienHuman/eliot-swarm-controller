@@ -8,8 +8,7 @@
 use super::{
     AgentKey, Bus, EventSource, HostState, PluginConnection, RPC_GRACE, StoreHandle, deadline,
     fence_runtime_generation, late_batch_error, record_source_gap, record_store_batch_rejection,
-    redact_native_error, redact_source_batch, redact_source_gap, safe_cause_code, signal_progress,
-    source_state_binding,
+    redact_native_error, redact_source_gap, safe_cause_code, signal_progress, source_state_binding,
 };
 use super::{native_children, observation, source_handoff};
 
@@ -26,7 +25,7 @@ use eliot_plugin::protocol::{
     HookEvent, HookResponse, SessionUsageSampleAck, SessionUsageSampleRequest,
 };
 use eliot_plugin::sync::LockExt;
-use eliot_store::{BatchCommit, ReadyToolBatch, family_for_kind};
+use eliot_store::{BatchCommit, PreparedSourceBatch, ReadyToolBatch, family_for_kind};
 use serde_json::{Value, json};
 
 use std::collections::HashMap;
@@ -58,7 +57,7 @@ struct QueuedToolBatch {
 }
 
 enum ToolBatchOutcome {
-    Direct(SourceBatch),
+    Direct(PreparedSourceBatch),
     Committed {
         result: Result<BatchCommit>,
         wait: Duration,
@@ -826,43 +825,50 @@ async fn put_events(
         .map_err(|_| invalid_batch())
         .and_then(|mut batch| {
             permission_refusal = apply_command_guard(&mut batch, guard_policy, credentials)?;
-            redact_source_batch(&mut batch, credentials)?;
-            Ok(batch)
+            PreparedSourceBatch::new(batch, credentials)
         });
-    let batch: SourceBatch = match batch {
+    let batch = match batch {
         Ok(batch) => batch,
         Err(error) => {
             *rejected = rejection_gap(gap, &error.code, credentials);
             return Err(error);
         }
     };
+    let ready = batch.as_batch();
+    permission_refusal = permission_refusal.filter(|refusal| {
+        ready.events.iter().any(|event| {
+            event.kind == "request.opened"
+                && event.data["request_id"] == refusal.request_id
+                && event.data["turn_id"] == refusal.turn_id
+        })
+    });
     let (completion_worktree, project_check) = if !is_child && subject.is_none() {
-        completion_capture(intake.host, store, &batch, until).await
+        completion_capture(intake.host, store, ready, until).await
     } else {
         (None, None)
     };
-    let batch_id = batch.batch_id.clone();
-    let event_kinds = batch
+    let batch_id = ready.batch_id.clone();
+    let event_kinds = ready
         .events
         .iter()
         .take(4)
         .map(|event| event.kind.chars().take(48).collect::<String>())
         .collect::<Vec<_>>()
         .join(",");
-    let contains_session_usage = batch
+    let contains_session_usage = ready
         .events
         .iter()
         .any(|event| event.kind == "session.usage");
-    let native_events = batch.events.len() as u64;
+    let native_events = ready.events.len() as u64;
     if let Some(cutoff) = planned_restart_cutoff(intake.host) {
         record_planned_restart_cutoff(credentials, &gap, &batch_id, &event_kinds, &cutoff);
         return Err(planned_restart_cutoff_error(&cutoff));
     }
     let ready_group = if !is_child
         && subject.is_none()
-        && batch.source == "stream"
-        && (1..=MAX_TOOL_EVENTS_PER_BATCH).contains(&batch.events.len())
-        && batch
+        && ready.source == "stream"
+        && (1..=MAX_TOOL_EVENTS_PER_BATCH).contains(&ready.events.len())
+        && ready
             .events
             .iter()
             .all(|event| matches!(event.kind.as_str(), "tool.started" | "tool.completed"))
@@ -1216,7 +1222,7 @@ fn rejection_gap(mut gap: SourceGap, cause: &str, credentials: &[String]) -> Opt
     if gap
         .to
         .as_deref()
-        .is_some_and(|cursor| policy.contains_text(cursor))
+        .is_some_and(|cursor| policy.contains_native_secret(cursor))
     {
         gap.to = None;
     }
