@@ -6382,13 +6382,29 @@ impl Store {
                 |row| row.get::<_, String>(0),
             )
             .map_err(sql_error)?;
-        project_heavy_rollup(count, rows.map(|row| row.map_err(sql_error)))
+        project_heavy_rollup(
+            count,
+            rows.map(|row| {
+                serde_json::from_str(&row.map_err(sql_error)?).map_err(heavy_rollup_error)
+            }),
+        )
     }
+}
+
+#[derive(serde::Deserialize)]
+struct HeavyRollupEpisode {
+    category: Option<Value>,
+    ended_at: Option<Value>,
+    cpu_ms: u64,
+}
+
+fn heavy_rollup_error(_: serde_json::Error) -> Error {
+    Error::new("internal", "heavy episode data is malformed")
 }
 
 fn project_heavy_rollup(
     count: i64,
-    rows: impl IntoIterator<Item = Result<String>>,
+    rows: impl IntoIterator<Item = Result<HeavyRollupEpisode>>,
 ) -> Result<Option<HeavySummaryView>> {
     if count <= 0 {
         return Ok(None);
@@ -6397,21 +6413,16 @@ fn project_heavy_rollup(
     let mut latest_ended_at = None;
     let mut total_cpu_ms: u64 = 0;
     for row in rows {
-        let raw = row?;
-        let data: Value = serde_json::from_str(&raw)
-            .map_err(|_| Error::new("internal", "heavy episode data is malformed"))?;
+        let episode = row?;
         if latest_category.is_none() {
-            latest_category = data
-                .get("category")
+            latest_category = episode
+                .category
+                .as_ref()
                 .and_then(Value::as_str)
                 .map(str::to_owned);
-            latest_ended_at = data.get("ended_at").and_then(Value::as_i64);
+            latest_ended_at = episode.ended_at.as_ref().and_then(Value::as_i64);
         }
-        total_cpu_ms = total_cpu_ms.saturating_add(
-            data.get("cpu_ms")
-                .and_then(Value::as_u64)
-                .ok_or_else(|| Error::new("internal", "heavy episode data is malformed"))?,
-        );
+        total_cpu_ms = total_cpu_ms.saturating_add(episode.cpu_ms);
     }
     let Some(category) = latest_category.filter(|category| !category.trim().is_empty()) else {
         return Err(Error::new("internal", "heavy episode data is malformed"));

@@ -810,13 +810,19 @@ fn project_unknown_turns(
     stats: &mut SwarmLiveness,
     bindings: &[&dyn ToSql],
 ) -> eliot_core::Result<()> {
-    let mut stmt = projection_query(db,
+    let mut stmt = projection_query(
+        db,
         "SELECT t.agent,t.generation,t.turn_id,COALESCE(t.completed_at,t.started_at,a.updated_at),
-                COALESCE((SELECT MAX(e.seq) FROM events e WHERE e.agent=t.agent AND e.generation=t.generation
+                COALESCE((SELECT e.seq FROM events e INDEXED BY owner_inbox_turn_events
+                  WHERE e.agent=t.agent AND e.generation=t.generation
                   AND json_type(e.data,'$.turn_id')='text'
-                  AND CAST(json_extract(e.data,'$.turn_id') AS TEXT)=t.turn_id),0)
+                  AND CAST(json_extract(e.data,'$.turn_id') AS TEXT)=t.turn_id
+                  ORDER BY e.seq DESC LIMIT 1),0)
          FROM turns t CROSS JOIN agents a INDEXED BY owner_inbox_ordinary_agent ON a.id=t.agent
-         WHERE t.state='unknown' AND json_type(a.profile_snapshot, '$._harness_check') IS NULL", "t.agent=?1 AND t.generation=?2 AND t.turn_id=?3", bindings)?;
+         WHERE t.state='unknown' AND json_type(a.profile_snapshot, '$._harness_check') IS NULL",
+        "t.agent=?1 AND t.generation=?2 AND t.turn_id=?3",
+        bindings,
+    )?;
     let rows = stmt
         .query_map(bindings, |r| {
             Ok((
@@ -1457,7 +1463,9 @@ fn project_agents(
                AND newest.verb='resume' AND newest.principal='owner' AND newest.state<>'cancelled'
              ORDER BY newest.created_at DESC,newest.rowid DESC LIMIT 1
          ) END AND resume.state IN ('rejected','failed')
-         LEFT JOIN agent_wakes aw ON aw.agent=a.id AND aw.generation=a.generation
+         LEFT JOIN agent_wakes aw INDEXED BY agent_wakes_one_open_per_generation
+            ON aw.agent=a.id AND aw.generation=a.generation
+            AND aw.state IN ('waiting','satisfied','delivery_pending')
             AND aw.state='waiting' AND EXISTS(
                 SELECT 1 FROM turns wt
                 WHERE wt.agent=aw.agent AND wt.generation=aw.generation AND wt.turn_id=aw.turn_id

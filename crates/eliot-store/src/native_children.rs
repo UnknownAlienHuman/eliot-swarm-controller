@@ -8,8 +8,19 @@ use eliot_core::{NativeChildActivity, NativeChildActivityState};
 use std::collections::BTreeMap;
 
 pub const NATIVE_CHILD_ATTENTION_PAGE_SIZE: usize = 32;
-const OPEN_TURN_SQL: &str = "SELECT 1 FROM turns WHERE agent = ?1 AND generation = ?2
-    AND state IN ('running', 'unknown') LIMIT 1";
+macro_rules! native_open_turn_select {
+    ($agent:literal, $generation:literal) => {
+        concat!(
+            "SELECT 1 FROM turns WHERE agent = ",
+            $agent,
+            " AND generation = ",
+            $generation,
+            " AND state IN ('running', 'unknown') LIMIT 1"
+        )
+    };
+}
+pub(super) use native_open_turn_select;
+const OPEN_TURN_SQL: &str = native_open_turn_select!("?1", "?2");
 // Newest progress spans all turns in the generation. The time-ordered
 // index lets this stop at the first row without sorting turn activity.
 macro_rules! native_progress_select {
@@ -88,6 +99,36 @@ pub(super) fn activity(
         .map_err(sql_error)?
         .is_some();
     let last_progress_at = native_progress(connection, child, generation)?;
+    let terminal = if stopped || has_open_turn {
+        None
+    } else {
+        connection
+            .query_row(TERMINAL_ACTIVITY_SQL, params![child, generation], |row| {
+                row.get(0)
+            })
+            .optional()
+            .map_err(sql_error)?
+    };
+    activity_from_facts(
+        connection,
+        (child, generation),
+        stopped,
+        has_open_turn,
+        last_progress_at,
+        terminal
+            .as_ref()
+            .map(|status: &Option<String>| status.as_deref()),
+    )
+}
+
+pub(super) fn activity_from_facts(
+    connection: &Connection,
+    (child, generation): (i64, i64),
+    stopped: bool,
+    has_open_turn: bool,
+    last_progress_at: Option<i64>,
+    terminal: Option<Option<&str>>,
+) -> Result<NativeChildActivity> {
     let state = if stopped {
         NativeChildActivityState::Stopped
     } else if has_open_turn {
@@ -114,16 +155,8 @@ pub(super) fn activity(
             NativeChildActivityState::Lost
         }
     } else {
-        let terminal: Option<Option<String>> = connection
-            .query_row(TERMINAL_ACTIVITY_SQL, params![child, generation], |row| {
-                row.get(0)
-            })
-            .optional()
-            .map_err(sql_error)?;
         match terminal {
-            Some(Some(status)) if matches!(status.as_str(), "interrupted" | "cancelled") => {
-                NativeChildActivityState::Interrupted
-            }
+            Some(Some("interrupted" | "cancelled")) => NativeChildActivityState::Interrupted,
             Some(_) => NativeChildActivityState::Idle,
             None => NativeChildActivityState::Unknown,
         }
