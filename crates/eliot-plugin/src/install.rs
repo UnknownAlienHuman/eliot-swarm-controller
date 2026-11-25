@@ -16,6 +16,11 @@ use std::{
     sync::OnceLock,
 };
 
+#[cfg(windows)]
+mod authenticode;
+#[cfg(windows)]
+pub use authenticode::authenticode_signer_matches;
+
 /// Stage and atomically publish one exclusively owned file without replacing
 /// an existing destination. The staged contents are synced before publication.
 pub fn write_new_file(

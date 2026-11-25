@@ -28,8 +28,8 @@ pub fn discovery() -> InstallDiscovery {
         strategy: InstallStrategy::FirstExisting,
         cli_identity: Some(CLI_STEM),
         version_identity: Some(InstallIdentity {
-            matches_file: has_cli_module,
-            refusal: "executable did not establish Antigravity CLI Go module identity and version",
+            matches_file: matches_cli_image,
+            refusal: "executable did not establish Antigravity CLI identity and version",
         }),
         allow_script_wrapper: false,
         ide_hint_subpath: Some(IDE_HINT_SUBPATH),
@@ -43,20 +43,24 @@ pub fn discovery() -> InstallDiscovery {
     }
 }
 
-/// Locate Go's build-info section before reading its framed main-module record.
-/// Modern Go stores the compiler version and module info as two length-prefixed strings.
-fn has_cli_module(program: &Path, deadline: Instant) -> bool {
-    cli_build_module_matches(program, deadline).unwrap_or(false)
+fn matches_cli_image(program: &Path, deadline: Instant) -> bool {
+    verify_cli_image(program, deadline).is_some()
 }
 
-fn cli_build_module_matches(program: &Path, deadline: Instant) -> Option<bool> {
+/// Verify the installed console image without running it. Some Windows vendor
+/// builds omit the Go module record, so authenticate the publisher there.
+fn verify_cli_image(program: &Path, deadline: Instant) -> Option<()> {
     use object::{BinaryFormat, Object, ObjectSection, ReadRef, SectionFlags, read::ReadCache};
     let file = std::fs::File::open(program).ok()?;
     if file.metadata().ok()?.len() > 512 * 1024 * 1024 || Instant::now() >= deadline {
         return None;
     }
-    let cache = ReadCache::new(file);
+    let cache = ReadCache::new(&file);
     let image = object::File::parse(&cache).ok()?;
+    #[cfg(windows)]
+    if !is_windows_console(&image) {
+        return None;
+    }
     let section = match image.format() {
         BinaryFormat::Elf => image.section_by_name(".go.buildinfo"),
         BinaryFormat::MachO => image.section_by_name("__go_buildinfo"),
@@ -86,18 +90,50 @@ fn cli_build_module_matches(program: &Path, deadline: Instant) -> Option<bool> {
     }
     let (version, rest) = take_go_build_string(bytes.get(header + 32..)?)?;
     let (module, _) = take_go_build_string(rest)?;
-    if !version.starts_with(b"go") {
+    if !version.starts_with(b"go")
+        || !(matches_main_module(module) || cfg!(windows) && module.is_empty())
+        || Instant::now() >= deadline
+    {
         return None;
     }
+    #[cfg(windows)]
+    if !eliot_plugin::install::authenticode_signer_matches(
+        &file,
+        program,
+        "Google LLC",
+        "Google LLC",
+    ) {
+        return None;
+    }
+    (Instant::now() < deadline).then_some(())
+}
+
+#[cfg(windows)]
+fn is_windows_console<'data>(image: &object::File<'data, impl object::ReadRef<'data>>) -> bool {
+    use object::read::pe::{ImageNtHeaders, ImageOptionalHeader};
+    let subsystem = match image {
+        object::File::Pe32(pe) => pe.nt_headers().optional_header().subsystem(),
+        object::File::Pe64(pe) => pe.nt_headers().optional_header().subsystem(),
+        _ => return false,
+    };
+    subsystem == object::pe::IMAGE_SUBSYSTEM_WINDOWS_CUI
+}
+
+fn matches_main_module(module: &[u8]) -> bool {
     // Go's cmd/go/internal/modload frames the tab-separated module records.
-    let module = module
-        .strip_prefix(b"\x30\x77\xaf\x0c\x92\x74\x08\x02\x41\xe1\xc1\x07\xe6\xd6\x18\xe6")?
-        .strip_suffix(b"\xf9\x32\x43\x31\x86\x18\x20\x72\x00\x82\x42\x10\x41\x16\xd8\xf2")?;
-    Some(module.split(|byte| *byte == b'\n').any(|line| {
+    let Some(module) = module
+        .strip_prefix(b"\x30\x77\xaf\x0c\x92\x74\x08\x02\x41\xe1\xc1\x07\xe6\xd6\x18\xe6")
+        .and_then(|record| {
+            record.strip_suffix(b"\xf9\x32\x43\x31\x86\x18\x20\x72\x00\x82\x42\x10\x41\x16\xd8\xf2")
+        })
+    else {
+        return false;
+    };
+    module.split(|byte| *byte == b'\n').any(|line| {
         line.strip_prefix(b"mod\t")
             .and_then(|record| record.split(|byte| *byte == b'\t').next())
             == Some(b"google-antigravity/antigravity-cli")
-    }))
+    })
 }
 
 fn take_go_build_string(input: &[u8]) -> Option<(&[u8], &[u8])> {

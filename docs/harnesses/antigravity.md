@@ -600,11 +600,14 @@ an explicit profile `cmd` is a saved pin. A missing pin never falls back to a
 different executable. An IDE-only install reports `unsupported`
 naming the IDE path with guidance to install `agy`: the IDE executable does
 not implement the native ACP/model CLI and is never launched for discovery.
-Install discovery requires the `agy` filename and the matching main module
-in its Go build-info record. It reads bounded `--version` metadata from the
-executable's directory after that check. A build with missing module
-metadata or an unparseable CLI version is refused. The controlled launch
-performs the ACP `initialize` exchange under native process custody.
+Install discovery requires the `agy` filename and reads the executable's Go
+build-info record. On Windows it requires a PE console image and a valid
+Authenticode signature from Google LLC, verified with Windows trust data
+without network retrieval. A Windows build may omit its Go module record.
+When a module record exists, the main module must match on every platform.
+Other platforms require that module record. After verifying the file,
+discovery reads bounded `--version` metadata from the executable's directory.
+The controlled launch performs ACP `initialize` under native process custody.
 `swarm models --harness antigravity` returns the live
 read-only catalogue from `agy models` (exact argv `models`, bounded time and
 output, same environment construction as launch): tab-separated native ids
