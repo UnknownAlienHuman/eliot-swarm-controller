@@ -109,7 +109,6 @@ pub(super) fn project_into(
     project_requests(connection, now, items, &mut liveness, &[])?;
     project_unknown_commands(connection, now, items, &mut liveness, &[])?;
     project_unknown_restores(connection, now, items, &mut liveness, &[])?;
-    project_resume_failures(connection, now, items, &[])?;
     project_unknown_turns(connection, now, items, &mut liveness, &[])?;
     project_holds(connection, now, items, &mut liveness, &[])?;
     project_harness_checks(connection, now, items, &mut liveness, &[])?;
@@ -138,13 +137,6 @@ pub(crate) fn project_item(
     subject: &str,
     now: i64,
 ) -> eliot_core::Result<Option<OwnerInboxItem>> {
-    if kind == OwnerInboxKind::Agent
-        && let Some(command_id) = subject.strip_prefix("resume:")
-    {
-        let mut items = Vec::new();
-        project_resume_failures(db, now, &mut items, &[&command_id])?;
-        return Ok(items.pop());
-    }
     if kind == OwnerInboxKind::Stuck
         && let Some(cause) = subject.strip_prefix("repeat:")
     {
@@ -282,67 +274,6 @@ pub(crate) fn project_item(
     Ok(items
         .into_iter()
         .find(|item| item.kind == kind && item.subject == subject))
-}
-
-fn project_resume_failures(
-    db: &Connection,
-    now: i64,
-    items: &mut dyn OwnerInboxItemSink,
-    bindings: &[&dyn ToSql],
-) -> eliot_core::Result<()> {
-    let mut stmt = projection_query(
-        db,
-        "SELECT c.id,c.updated_at
-         FROM commands c
-         WHERE c.verb='resume' AND c.principal='owner' AND c.state IN ('rejected','failed')",
-        "c.id=?1",
-        bindings,
-    )?;
-    let rows = stmt
-        .query_map(bindings, |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-        })
-        .map_err(sql_error)?;
-    for row in rows {
-        let (command_id, updated_at) = row.map_err(sql_error)?;
-        let command = super::load_command(db, &command_id)?.ok_or_else(|| {
-            crate::Error::new("source_integrity", "retained Resume failure disappeared")
-        })?;
-        let failure = eliot_core::api::AgentResumeFailure::from_command(&command)?;
-        let agent = command.target.as_deref().ok_or_else(|| {
-            crate::Error::new("source_integrity", "retained Resume failure has no Agent")
-        })?;
-        let mut entry = item(
-            OwnerInboxKind::Agent,
-            format!("resume:{command_id}"),
-            format!(
-                "{}:{}:{}",
-                super::command_state_name(failure.state),
-                failure.reason,
-                failure.detail.as_deref().unwrap_or("")
-            ),
-            now,
-            updated_at,
-            "resume_failed",
-            None,
-            vec![
-                action("inspect_agent", "agent.get", json!({"id":agent})),
-                action("inspect_command", "command.get", json!({"id":command_id})),
-            ],
-        );
-        entry.detail = Some(match failure.detail {
-            Some(detail) => format!(
-                "Resume generation {} failed: {} — {}",
-                failure.generation, failure.reason, detail
-            ),
-            None => format!(
-                "Resume generation {} failed: {}",
-                failure.generation, failure.reason
-            ),
-        });
-        items.push(entry);
-    }
-    Ok(())
 }
 
 fn project_repeated_failures(
@@ -1437,8 +1368,14 @@ fn project_agents(
                   SELECT 1 FROM processes p WHERE p.owner='agent:a'||a.id||'#'||a.generation
                     AND p.role='plugin' AND p.state='running') ELSE 0 END,
                 aw.expires_at,aw.created_at,json_extract(aw.condition,'$.kind'),
-                json_extract(aw.condition,'$.seconds')
+                json_extract(aw.condition,'$.seconds'), resume.id, resume.updated_at
          FROM agents a
+         LEFT JOIN commands resume ON resume.id = CASE WHEN a.state IN ('failed','lost','stopped') THEN (
+             SELECT newest.id FROM commands newest INDEXED BY commands_target
+             WHERE newest.target=a.id AND newest.generation=a.generation
+               AND newest.verb='resume' AND newest.principal='owner' AND newest.state<>'cancelled'
+             ORDER BY newest.created_at DESC,newest.rowid DESC LIMIT 1
+         ) END AND resume.state IN ('rejected','failed')
          LEFT JOIN agent_wakes aw ON aw.agent=a.id AND aw.generation=a.generation
             AND aw.state='waiting' AND EXISTS(
                 SELECT 1 FROM turns wt
@@ -1456,7 +1393,8 @@ fn project_agents(
                   ))
          WHERE a.observe_only=0 AND a.archived=0
             AND json_type(a.profile_snapshot, '$._harness_check') IS NULL
-            AND a.state IN ('created','starting','idle','busy','waiting','failed','lost','unknown')", "a.id=?1", bindings)?;
+            AND (a.state IN ('created','starting','idle','busy','waiting','failed','lost','unknown')
+                 OR resume.id IS NOT NULL)", "a.id=?1", bindings)?;
     let rows = stmt
         .query_map(bindings, |r| {
             Ok((
@@ -1482,6 +1420,8 @@ fn project_agents(
                 r.get::<_, Option<i64>>(19)?,
                 r.get::<_, Option<String>>(20)?,
                 r.get::<_, Option<i64>>(21)?,
+                r.get::<_, Option<String>>(22)?,
+                r.get::<_, Option<i64>>(23)?,
             ))
         })
         .map_err(sql_error)?;
@@ -1509,6 +1449,8 @@ fn project_agents(
             wake_created_at,
             wake_kind,
             wake_seconds,
+            resume_failure_id,
+            resume_failed_at,
         ) = row.map_err(sql_error)?;
         let state = match raw_state.as_str() {
             "created" => eliot_core::AgentState::Created,
@@ -1518,6 +1460,7 @@ fn project_agents(
             "waiting" => eliot_core::AgentState::Waiting,
             "failed" => eliot_core::AgentState::Failed,
             "lost" => eliot_core::AgentState::Lost,
+            "stopped" => eliot_core::AgentState::Stopped,
             "unknown" => eliot_core::AgentState::Unknown,
             _ => {
                 return Err(crate::Error::new(
@@ -1528,15 +1471,18 @@ fn project_agents(
         };
         if matches!(
             state,
-            eliot_core::AgentState::Lost | eliot_core::AgentState::Failed
+            eliot_core::AgentState::Lost
+                | eliot_core::AgentState::Failed
+                | eliot_core::AgentState::Stopped
         ) {
             // A handoff closes this item: the work continues on the successor.
             if archived || crate::handoff::current_successor(db, id)?.is_some() {
                 continue;
             }
-            let resume_safe = native_scope
-                .as_deref()
-                .is_some_and(|s| !s.trim().is_empty())
+            let resume_safe = state != eliot_core::AgentState::Stopped
+                && native_scope
+                    .as_deref()
+                    .is_some_and(|s| !s.trim().is_empty())
                 && native_ref.as_deref().is_some_and(|s| !s.trim().is_empty())
                 && active_turn.is_none()
                 && !launch_queued
@@ -1564,32 +1510,64 @@ fn project_agents(
                 }
             } else if raw_state == "lost" {
                 "lost_agent_needs_owner_attention"
+            } else if state == eliot_core::AgentState::Stopped {
+                "resume_failed"
             } else {
                 "failed_agent_needs_owner_attention"
             };
-            let result = liveness::mover(
-                &LivenessObject::Agent {
-                    state,
-                    since: terminal_at,
-                    owner_item: true,
-                    launch_queued: false,
-                    active_turn: false,
-                    wait_evidence: None,
-                },
-                now,
-            );
-            tally(stats, &result);
+            if state != eliot_core::AgentState::Stopped {
+                let result = liveness::mover(
+                    &LivenessObject::Agent {
+                        state,
+                        since: terminal_at,
+                        owner_item: true,
+                        launch_queued: false,
+                        active_turn: false,
+                        wait_evidence: None,
+                    },
+                    now,
+                );
+                tally(stats, &result);
+            }
             let event_seq = agent_inbox_revision_seq(db, id, generation)?;
-            items.push(item(
+            let subject = format!("a{id}");
+            let mut choices: Vec<_> = choice.iter().cloned().collect();
+            let mut detail = None;
+            if let Some(command_id) = resume_failure_id {
+                let command = super::load_command(db, &command_id)?.ok_or_else(|| {
+                    crate::Error::new("source_integrity", "retained Resume failure disappeared")
+                })?;
+                let failure = eliot_core::api::AgentResumeFailure::from_command(&command)?;
+                detail = Some(match failure.detail {
+                    Some(detail) => format!(
+                        "Resume generation {generation} failed: {} — {detail}",
+                        failure.reason
+                    ),
+                    None => format!("Resume generation {generation} failed: {}", failure.reason),
+                });
+                choices.push(action("inspect_agent", "agent.get", json!({"id":subject})));
+                choices.push(action(
+                    "inspect_command",
+                    "command.get",
+                    json!({"id":command_id}),
+                ));
+            }
+            let mut entry = item(
                 OwnerInboxKind::Agent,
-                format!("a{id}"),
+                subject,
                 format!("g{generation}:updated:{since}:event:{event_seq}"),
                 now,
-                terminal_at,
+                if state == eliot_core::AgentState::Stopped {
+                    resume_failed_at.unwrap_or(terminal_at)
+                } else {
+                    terminal_at
+                },
                 reason,
-                choice.clone(),
-                choice.into_iter().collect(),
-            ));
+                choice,
+                choices,
+            );
+            entry.detail = detail;
+            items.push(entry);
         } else {
             let result = liveness::mover(
                 &LivenessObject::Agent {
