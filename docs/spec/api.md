@@ -3423,6 +3423,22 @@ be restored only before a replacement can admit writes; after admission, rollbac
 uses the current Store and retains its writes rather than restoring the older
 backup over them.
 
+After the replacement becomes ready, the CLI reads the initial `on_restart`
+continuation outcomes for up to 30 seconds. When that pass requested no
+continuations, it checks one retained managed subject per harness against
+the local Resume or Launch validators. These readiness probes create no
+Agent, start no native process, and submit no model input. The exact retained
+generation and startup inputs bind the comparison to the previous daemon's
+accepted validation. The report exposes that binding, the outcomes, and
+any incomplete coverage under `startup_health`.
+
+A deterministic Swarm validation refusal for a previously accepted matching
+subject invokes the existing published-candidate rollback. A same-schema
+rollback uses the current Store. If the replacement advanced the schema,
+the current Store and backup remain available for a compatible recovery.
+Provider, transient, unsupported comparison, and uncertain outcomes leave
+the release running. Unconfirmed outcomes remain unknown in the report.
+
 After commit, the old daemon retires its owned Agent processes and leaves
 the existing Store recovery facts for the next boot. Startup and rollback
 both honor `on_restart` and continue eligible Agents with interrupted work,

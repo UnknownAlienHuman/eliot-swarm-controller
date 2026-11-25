@@ -1020,7 +1020,16 @@ impl CodexPlugin {
             .initialized
             .as_ref()
             .ok_or_else(|| not_initialized("Codex"))?;
-        let plan = validate_start_plan(&params, initialized)?;
+        let plan = validate_start_plan(&params, initialized).map_err(|error| {
+            if error.code == "profile_error" && error.origin.is_none() {
+                error.with_origin(
+                    eliot_core::FailureOrigin::Swarm,
+                    "local Codex start-plan validation",
+                )
+            } else {
+                error
+            }
+        })?;
         let session = self.spawn_owned_session(&plan, &params, peer).await?;
 
         let dispatched = self.dispatch_thread_start(session, &params, &plan).await?;

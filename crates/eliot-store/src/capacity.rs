@@ -675,6 +675,46 @@ impl Store {
             .map_err(sql_error)
     }
 
+    /// Active managed Agents plus the latest reusable subject in each harness.
+    /// Read only the bounded roster. Probe/check Agents and observers are excluded.
+    pub fn update_readiness_agents(&self) -> Result<(Vec<Agent>, Vec<Agent>)> {
+        const MANAGED: &str = "observe_only=0 AND archived=0 AND generation>0
+            AND json_type(profile_snapshot,'$._harness_check') IS NULL
+            AND json_extract(profile_snapshot,'$._provider_probe') IS NOT 1";
+        let live_sql = format!(
+            "SELECT id FROM agents WHERE {MANAGED} AND state IN ('starting','idle','busy','waiting')
+             ORDER BY id LIMIT ?1"
+        );
+        let sample_sql = format!(
+            "SELECT id FROM (
+               SELECT id, row_number() OVER(PARTITION BY harness ORDER BY
+                 (native_scope IS NOT NULL AND native_ref IS NOT NULL) DESC, updated_at DESC, id DESC) AS rank
+               FROM agents WHERE {MANAGED}
+             ) WHERE rank=1 ORDER BY id LIMIT ?1"
+        );
+        let read = |sql: &str, limit: usize| {
+            let mut statement = self.connection.prepare(sql).map_err(sql_error)?;
+            let ids = statement
+                .query_map([limit as i64], |row| row.get::<_, i64>(0))
+                .map_err(sql_error)?;
+            ids.filter_map(|id| {
+                match id
+                    .map_err(sql_error)
+                    .and_then(|id| load_agent_by_num(&self.connection, id))
+                {
+                    Ok(None) => None,
+                    Ok(Some(agent)) => Some(Ok(agent)),
+                    Err(error) => Some(Err(error)),
+                }
+            })
+            .collect::<Result<Vec<_>>>()
+        };
+        Ok((
+            read(&live_sql, core::api::UPDATE_HEALTH_MAX_SUBJECTS + 1)?,
+            read(&sample_sql, core::api::SUPPORTED_HARNESSES.len())?,
+        ))
+    }
+
     /// Commit custody closure that the daemon verified outside the Store lock,
     /// then release or transfer that generation's reservation in the same
     /// transaction. A newer reservation or an Agent that is neither lost nor

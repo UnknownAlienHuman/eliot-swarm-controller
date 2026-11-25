@@ -3875,24 +3875,51 @@ fn data_root_only_mcp_environment(environment: &Value) -> Result<Value> {
     Ok(Value::Object(scoped))
 }
 
-fn build_target_environment(
-    data_root: &Path,
-    stand_store_root: Option<&Path>,
-    agent: &Agent,
-    agent_token: &str,
-) -> Result<(Value, Value)> {
+pub(crate) fn validate_managed_start_profile(agent: &Agent) -> Result<Map<String, Value>> {
+    let refusal = |message: String| {
+        Error::new("profile_error", message)
+            .with_where("plugin_host.start.profile")
+            .with_origin(
+                eliot_core::FailureOrigin::Swarm,
+                "local frozen profile validation",
+            )
+    };
+    if agent
+        .profile_snapshot
+        .get("harness")
+        .and_then(Value::as_str)
+        != Some(agent.harness.as_str())
+    {
+        return Err(refusal(
+            "retained profile does not match its Agent harness".to_owned(),
+        ));
+    }
     if HarnessCapabilities::of(&agent.harness).requires_pass_env
         && !agent
             .profile_snapshot
             .get("pass_env")
             .is_some_and(Value::is_array)
     {
-        return Err(Error::new(
-            "invalid",
-            "frozen profile pass_env must be an array of names",
+        return Err(refusal(
+            "frozen profile pass_env must be an array of names".to_owned(),
         ));
     }
-    let mut environment = build_process_environment(&agent.profile_snapshot)?;
+    build_process_environment(&agent.profile_snapshot).map_err(|error| {
+        if error.code == "invalid" {
+            refusal(*error.message)
+        } else {
+            error
+        }
+    })
+}
+
+fn build_target_environment(
+    data_root: &Path,
+    stand_store_root: Option<&Path>,
+    agent: &Agent,
+    agent_token: &str,
+) -> Result<(Value, Value)> {
+    let mut environment = validate_managed_start_profile(agent)?;
     let mut mcp_environment = Map::new();
     let home = data_root
         .to_str()

@@ -55,6 +55,8 @@ mod swarm_usage;
 mod switch;
 mod task_card;
 mod tool_incident;
+mod update_health;
+mod update_probe;
 mod wake;
 mod work_truth;
 
@@ -213,6 +215,7 @@ pub(crate) struct Router {
 
 struct RouterInner {
     rpc_latencies: crate::rpc_latency::RpcLatencies,
+    update_boot: Mutex<update_health::BootHealth>,
     acl_notices: Arc<crate::acl_notice::AclNotices>,
     data_root: PathBuf,
     stand_store_root: Option<PathBuf>,
@@ -526,6 +529,7 @@ impl Router {
                     data_root.join("eliot.db"),
                 )),
                 rpc_latencies: Default::default(),
+                update_boot: Default::default(),
                 acl_notices,
                 data_root,
                 stand_store_root,
@@ -776,6 +780,7 @@ impl Router {
             "api.methods" => self.methods(&params, &principal).await,
             "api.help" => self.method_help(&params, &principal).await,
             "api.identity" => self.caller_identity(&params, &principal).await,
+            "daemon.update.health" => self.update_health(params, &principal).await,
             "daemon.status" => {
                 require_owner(&principal)?;
                 let request: DaemonStatusRequest =
@@ -1367,6 +1372,8 @@ impl Router {
                         .await?;
                     depth = candidate.depth;
                 }
+                self.note_update_boot_request(&candidate.agent, candidate.generation)
+                    .await;
                 if let Some(admission) = self.prepare_restart_resume(&candidate).await
                     && admission.is_new
                     && command_needs_worker(&admission.command)
@@ -1418,6 +1425,11 @@ impl Router {
                 continue;
             }
             let result = self.inner.store.lock().await.get_command(&id);
+            if let Some((agent, generation)) = target.as_ref()
+                && let Ok(Some(command)) = &result
+            {
+                self.note_update_boot_command(agent, *generation, command);
+            }
             match result {
                 Ok(Some(command))
                     if matches!(command.state, CommandState::Rejected | CommandState::Failed) =>
@@ -1562,6 +1574,7 @@ impl Router {
 
     async fn report_restart_resume_blocked(&self, agent: &str, generation: i64, error: Error) {
         let error = self.sanitized_failure(&error, "daemon.restart.resume");
+        self.note_update_boot_refusal(agent, generation, &error);
         let policy = self.secret_policy_snapshot();
         let generation_field = generation.to_string();
         let fields = [("agent", agent), ("generation", generation_field.as_str())];
@@ -8291,6 +8304,11 @@ fn validate_retained_resume_agent(agent: &Agent, command: &Command) -> Result<i6
             "resume requires a terminal Agent without an active turn",
         ));
     }
+    validate_retained_resume_subject(agent)?;
+    Ok(generation)
+}
+
+fn validate_retained_resume_subject(agent: &Agent) -> Result<()> {
     let native_scope = agent
         .native_scope
         .as_deref()
@@ -8343,7 +8361,7 @@ fn validate_retained_resume_agent(agent: &Agent, command: &Command) -> Result<i6
             "non-Codex resume cannot use a Codex native store binding",
         ));
     }
-    Ok(generation)
+    Ok(())
 }
 
 fn validate_project_rule_resume_profile(

@@ -1,5 +1,7 @@
 //! Replace a running daemon without replaying an Agent input.
 
+mod health;
+
 use super::daemon::{STARTUP_WAIT, daemon_now_ms, shutdown_daemon};
 use super::operator::{
     agents, check_same_daemon, require_running, start_owned, start_update, status, wait_for_exit,
@@ -75,6 +77,22 @@ fn print_update_value(value: &Value, json_output: bool) {
         if let Some(agents) = value.get("agents_before").and_then(Value::as_array) {
             println!("Agents before restart: {}", agents.len());
             print_update_agents(agents);
+        }
+        if let Some(state) = value["startup_health"]["state"].as_str() {
+            println!("Startup health: {state}");
+            if let Some(evidence) = value["startup_health"]["evidence"].as_array() {
+                for row in evidence {
+                    println!(
+                        "  {} · {} · {}{}",
+                        row["subject"]["agent"].as_str().unwrap_or("?"),
+                        row["subject"]["harness"].as_str().unwrap_or("?"),
+                        row["state"].as_str().unwrap_or("unknown"),
+                        row["code"]
+                            .as_str()
+                            .map_or(String::new(), |code| format!(" ({code})")),
+                    );
+                }
+            }
         }
         if let Some(interruptions) = value.get("interrupted_agents").and_then(Value::as_array) {
             for interruption in interruptions {
@@ -227,6 +245,8 @@ async fn run_update(
         .filter(|agent| !agent.state.is_terminal())
         .map(|agent| json!({"agent": agent.id, "generation": agent.generation, "state": agent.state}))
         .collect::<Vec<_>>();
+    let previous_health = Box::pin(health::capture_previous(&data_dir)).await;
+    check_same_daemon(&data_dir, &old)?;
     let mut prepare = DaemonShutdownRequest::new(mutation_id(None)?, ShutdownMode::PrepareRestart);
     prepare.drain_seconds = Some(wait_seconds);
     let mut commit = DaemonShutdownRequest::new(mutation_id(None)?, ShutdownMode::Restart);
@@ -314,6 +334,7 @@ async fn run_update(
                         before,
                         stopped,
                         mode,
+                        health: None,
                     },
                     json_output,
                 )
@@ -348,6 +369,7 @@ async fn run_update(
                     before,
                     stopped,
                     mode,
+                    health: None,
                 },
                 json_output,
             )
@@ -365,11 +387,38 @@ async fn run_update(
                 before,
                 stopped,
                 mode,
+                health: None,
             },
             json_output,
         )
         .await);
     }
+    let startup_health = Box::pin(health::assess_update(&startup_path, previous_health)).await;
+    if let Some(evidence) = startup_health.refusal() {
+        let error = format!(
+            "replacement refused the previously accepted {} generation {} {} startup ({})",
+            evidence.subject.agent,
+            evidence.subject.generation,
+            evidence.subject.harness,
+            evidence.code.as_deref().unwrap_or("validation"),
+        );
+        return Ok(rollback(
+            &startup_path,
+            &previous,
+            &backup,
+            RollbackStore::Published(&replacement, candidate.store_schema),
+            error,
+            UpdateAgents {
+                before,
+                stopped,
+                mode,
+                health: Some(startup_health),
+            },
+            json_output,
+        )
+        .await);
+    }
+    let health_uncertain = !startup_health.is_ready();
     let backup_cleanup = discard_update_backup(&startup_path, backup.id).err();
     let (interruptions, resume_failed) = Box::pin(resume_interrupted(
         &data_dir,
@@ -384,7 +433,8 @@ async fn run_update(
     let (desktop, desktop_failed) = (None::<Value>, false);
     print_update_value(
         &json!({
-            "state": if desktop_failed || backup_cleanup.is_some() || resume_failed { "partial" } else { "ready" },
+            "state": if desktop_failed || backup_cleanup.is_some() || resume_failed || health_uncertain { "partial" } else { "ready" },
+            "startup_health": startup_health,
             "previous_pid": old.pid, "pid": replacement.pid,
             "deadline_policy": mode, "interrupted_agents": interruptions,
             "commit_reply_uncertain": commit_reply_uncertain,
@@ -397,7 +447,7 @@ async fn run_update(
         json_output,
     );
     Ok(u8::from(
-        desktop_failed || backup_cleanup.is_some() || resume_failed,
+        desktop_failed || backup_cleanup.is_some() || resume_failed || health_uncertain,
     ))
 }
 
@@ -418,6 +468,7 @@ struct UpdateAgents {
     before: Vec<Value>,
     stopped: Vec<StoppedAgent>,
     mode: &'static str,
+    health: Option<health::HealthReport>,
 }
 
 struct StoppedAgent {
@@ -1120,6 +1171,7 @@ async fn rollback(
             "rollback_error": rollback_error, "binary": eliot_core::display_path(&previous.binary.to_string_lossy()),
             "sha256": previous.sha256, "agents_before": agents_at_update.before,
             "deadline_policy": agents_at_update.mode, "interrupted_agents": interruptions,
+            "startup_health": agents_at_update.health,
             "store_restored": store_restored, "backup": backup.retained(), "backup_cleanup_error": cleanup,
             "candidate_pid": retained_candidate,
             "agents_after": if pid.is_some() { observe_agents(path, &agents_at_update.before).await } else { Value::Null },

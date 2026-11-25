@@ -147,6 +147,12 @@ pub use git_integrate::{
     MAX_GIT_INTEGRATE_CHECK_TAIL_BYTES, MAX_GIT_INTEGRATE_CONFLICT_PATHS,
     validate_integration_branch,
 };
+mod update_health;
+pub use update_health::{
+    UPDATE_HEALTH_MAX_SUBJECTS, UpdateHealthRequest, UpdateHealthResponse, UpdateProbeKind,
+    UpdateStartEvidence, UpdateStartState, UpdateStartSubject,
+};
+
 pub use goals::{
     AssignmentGoal, CHECK_SPAWN_RETRYABLE, DEFAULT_GOAL_CHECK_TIMEOUT_MS, GOAL_CHECK_HISTORY_LIMIT,
     GOAL_CHECK_HISTORY_MIN_SAMPLES, GoalCheckDeadlineSource, GoalCheckDeadlineStatus,
