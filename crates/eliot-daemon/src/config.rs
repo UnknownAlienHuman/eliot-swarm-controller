@@ -1575,10 +1575,51 @@ pub(crate) struct CapacityProjectEntry {
     pub(crate) manager_priority_max: Option<u8>,
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 struct ProxyBaseUrls {
-    codex: String,
+    provider_url: String,
+}
+
+impl<'de> Deserialize<'de> for ProxyBaseUrls {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct EndpointVisitor {
+            keys: &'static [&'static str],
+        }
+        impl<'de> serde::de::Visitor<'de> for EndpointVisitor {
+            type Value = ProxyBaseUrls;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("an adopted proxy endpoint table")
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut fields: A,
+            ) -> Result<Self::Value, A::Error> {
+                use serde::de::Error;
+                let expected = self.keys[0];
+                let mut provider_url = None;
+                while let Some(key) = fields.next_key::<String>()? {
+                    if key != expected {
+                        return Err(A::Error::unknown_field(&key, self.keys));
+                    }
+                    if provider_url.is_some() {
+                        return Err(A::Error::duplicate_field(expected));
+                    }
+                    provider_url = Some(fields.next_value()?);
+                }
+                Ok(ProxyBaseUrls {
+                    provider_url: provider_url.ok_or_else(|| A::Error::missing_field(expected))?,
+                })
+            }
+        }
+
+        let keys = core::api::HarnessCapabilities::declarations()
+            .iter()
+            .map(|(_, caps)| caps.native_route.proxy_endpoint_keys())
+            .find(|keys| !keys.is_empty())
+            .ok_or_else(|| serde::de::Error::custom("adopted proxy endpoints are unsupported"))?;
+        deserializer.deserialize_map(EndpointVisitor { keys })
+    }
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -2667,7 +2708,9 @@ fn bind_route_and_capacity(
     }
 
     if let Some(proxy_name) = entry.proxy.as_deref() {
-        let route = core::api::HarnessCapabilities::of(entry.harness.trim()).native_route;
+        let harness = entry.harness.trim();
+        let caps = core::api::HarnessCapabilities::of(harness);
+        let route = caps.native_route;
         if !matches!(route, NativeRoute::ResponsesProxy { .. }) {
             return Err(fail(
                 "proxy",
@@ -2676,9 +2719,13 @@ fn bind_route_and_capacity(
         }
         validate_profile_name(proxy_name).map_err(|_| fail("proxy", "invalid proxy reference"))?;
         if route.reserves_proxy_provider(proxy_name) {
+            let provider = caps
+                .profile
+                .named_profile
+                .map_or(harness, |profile| profile.name);
             return Err(fail(
                 "proxy",
-                "proxy name collides with a builtin Codex provider",
+                &format!("proxy name collides with a builtin {provider} provider"),
             ));
         }
         let proxy = config
@@ -2730,7 +2777,7 @@ fn bind_route_and_capacity(
             name: proxy_name.to_owned(),
             endpoint: proxy.attach.clone(),
             readiness_path: proxy.health.clone(),
-            provider_base_url: proxy.base_url_for.codex.clone(),
+            provider_base_url: proxy.base_url_for.provider_url.clone(),
             client_key_env_name,
         };
         route

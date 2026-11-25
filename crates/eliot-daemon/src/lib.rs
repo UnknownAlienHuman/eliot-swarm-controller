@@ -41,7 +41,6 @@ mod workspaces;
 
 /// The closed Claude Code `--effort` vocabulary (ad-hoc launches and the
 /// desktop picker; Claude Code has no live model catalogue).
-pub use adhoc::CLAUDE_EFFORT_LEVELS;
 pub use config::desktop_window_in_bounds;
 pub use config::load_cloud_access_config;
 pub use config::recovery::{read_settings_for_repair, save_settings_for_repair};

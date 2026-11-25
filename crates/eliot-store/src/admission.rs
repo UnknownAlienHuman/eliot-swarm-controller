@@ -322,7 +322,9 @@ pub(super) fn resolve_configure(
     {
         return Err(Error::new(
             "invalid",
-            "Muse effort is not a supported reasoning tier",
+            eliot_core::api::HarnessCapabilities::of(harness)
+                .configure_invalid_effort
+                .unwrap_or("effort is not a supported reasoning tier"),
         ));
     }
     let original_model = snapshot

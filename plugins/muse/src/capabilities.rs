@@ -86,6 +86,7 @@ pub fn declaration() -> HarnessCapabilities {
         launch_default_policy: LaunchDefaultPolicy::OmitForServerDefault,
         guard_refusal_point: Some(InjectPoint::ActiveTurn),
         guard_refusal_choice_error: Some("Muse guarded request offers multiple refusal options"),
+        configure_invalid_effort: Some("Muse effort is not a supported reasoning tier"),
         allowed_configure_efforts: Some(&crate::native::types::REASONING_EFFORT_TIERS),
         configure_session_mode: ConfigureSessionMode::WhenModelPresent,
         configure_requires_idle_turn: true,
@@ -100,8 +101,11 @@ pub fn declaration() -> HarnessCapabilities {
             source: crate::allowance::STREAM_SOURCE,
             unavailable: crate::allowance::unavailable,
         }),
-        view_projection_gap_recovery: true,
-        native_child_families: &eliot_core::MUSE_NATIVE_CHILD_FAMILIES,
+        view_projection_recovery: Some(eliot_core::api::harness::ViewProjectionRecovery {
+            unavailable_prefix: VIEW_UNAVAILABLE_REASON_PREFIX,
+            unresolved_reason: "Muse native view recovery did not prove live delivery after the recorded gap",
+        }),
+        native_child_families: &["turn"],
         native_child_history_refusal: Some(
             "native history is unsupported for Muse child observations",
         ),
@@ -178,3 +182,5 @@ fn native_access_bounds(snapshot: &Value) -> Option<NativeAccessBounds> {
         _ => None,
     }
 }
+
+pub(super) const VIEW_UNAVAILABLE_REASON_PREFIX: &str = "Muse native view is unavailable";

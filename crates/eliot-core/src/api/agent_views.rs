@@ -722,9 +722,12 @@ impl DaemonPanicTestResponse {
 )]
 #[serde(rename_all = "snake_case")]
 pub enum OwnerRulesDeliveryMethod {
-    CodexDeveloperInstructions,
-    ClaudeAppendSystemPromptFile,
-    OpenCodeAgentsFile,
+    #[serde(rename = "codex_developer_instructions")]
+    DeveloperInstructions,
+    #[serde(rename = "claude_append_system_prompt_file")]
+    AppendSystemPromptFile,
+    #[serde(rename = "open_code_agents_file")]
+    SessionInstructionsFile,
     #[default]
     FirstInput,
 }

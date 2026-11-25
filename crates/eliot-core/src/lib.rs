@@ -85,9 +85,8 @@ pub use naming::{
     standard_branch, standard_leaf, task_slug,
 };
 pub use native_child::{
-    CODEX_NATIVE_CHILD_FAMILIES, ChildRegistration, ChildRegistrationAck,
-    MUSE_NATIVE_CHILD_FAMILIES, NATIVE_CHILD_FAMILIES, NativeChildActivity,
-    NativeChildActivityState, native_child_families_for_harness,
+    ChildRegistration, ChildRegistrationAck, NativeChildActivity, NativeChildActivityState,
+    native_child_families_for_harness,
 };
 pub use native_data::{
     UNCLASSIFIED_NATIVE_EVENT, is_native_discriminator, validate_unclassified_native_data,
@@ -1580,9 +1579,6 @@ pub struct CompactionUsageEcho {
 /// three outcomes are exactly countable from the journal (see the Muse
 /// harness page). Prefixes (not full reasons) are matched
 /// so cursor-bearing suffixes stay free to evolve without breaking the count.
-pub const MUSE_VIEW_UNAVAILABLE_REASON_PREFIX: &str = "Muse native view is unavailable";
-pub const MUSE_VIEW_UNKNOWN_REASON_PREFIX: &str =
-    "Muse native view recovery did not prove live delivery after the recorded gap";
 /// Marker key the readback-recovery path attaches to an otherwise unchanged
 /// `turn.completed`; its only legal value is [`VIEW_RECOVERY_READBACK`].
 pub const VIEW_RECOVERY_MARKER_FIELD: &str = "view_recovery";

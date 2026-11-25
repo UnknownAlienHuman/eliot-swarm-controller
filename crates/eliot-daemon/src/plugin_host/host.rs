@@ -1,8 +1,8 @@
 use super::{PluginClient, PluginConnection};
 use eliot_core::is_start_verb;
 mod actor;
-mod antigravity_mcp;
 mod discovery;
+mod mcp_sources;
 mod native_children;
 mod observation;
 mod reader;
@@ -395,7 +395,7 @@ struct AgentActorConfig {
     instance_dir: String,
     store_root: PathBuf,
     plugin_credential: String,
-    _prepared_mcp: Option<antigravity_mcp::PreparedConfig>,
+    _prepared_mcp: Option<mcp_sources::PreparedConfig>,
     target_environment: Value,
     mcp_environment: Option<Value>,
     pass_agent_identity_to_shell: bool,
@@ -790,17 +790,18 @@ impl PluginHost {
             remove_empty_instance_dir(&instance_dir);
             return Err(error);
         }
-        let prepared_mcp = if HarnessCapabilities::of(&agent.harness).prepared_mcp_config {
-            match antigravity_mcp::prepare(&agent, &target_environment, &instance_dir) {
-                Ok(config) => config,
-                Err(error) => {
-                    remove_empty_instance_dir(&instance_dir);
-                    return Err(error.with_code("native_not_dispatched"));
+        let prepared_mcp =
+            if let Some(layout) = HarnessCapabilities::of(&agent.harness).prepared_mcp_config {
+                match mcp_sources::prepare(layout, &agent, &target_environment, &instance_dir) {
+                    Ok(config) => config,
+                    Err(error) => {
+                        remove_empty_instance_dir(&instance_dir);
+                        return Err(error.with_code("native_not_dispatched"));
+                    }
                 }
-            }
-        } else {
-            None
-        };
+            } else {
+                None
+            };
         let source_credentials = source_secret_snapshot(
             &agent.profile_snapshot,
             &target_environment,

@@ -119,6 +119,13 @@ pub struct AdhocLaunchDefaults {
     pub installed_profile_mcp: crate::McpPolicy,
 }
 
+/// Bounded metadata-only native integration inventory.
+#[derive(Clone, Copy, Debug)]
+pub struct NativeAuthInventory {
+    pub arguments: &'static [&'static str],
+    pub decode_ids: fn(&[u8]) -> Option<Vec<String>>,
+}
+
 /// Reasoning effort accepted by an ad-hoc launch.
 #[derive(Clone, Copy, Debug)]
 pub enum AdhocEffort {
@@ -263,6 +270,7 @@ pub struct ProfileEnvironment {
     pub cleanup_roots: &'static [&'static str],
     pub protected_env: &'static [&'static str],
     pub protected_home_paths: &'static [&'static str],
+    pub local_provider_reserved_env: &'static [&'static str],
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -276,11 +284,37 @@ pub struct FrozenStoreEnvironment {
     pub binding_refusal: &'static str,
 }
 
+/// Native MCP config locations and JSON keys translated by the adapter.
+/// The host owns bounded scanning, reserved identities and private publication.
+#[derive(Clone, Copy, Debug)]
+pub struct NativeMcpSources {
+    pub name: &'static str,
+    pub file: &'static str,
+    pub global_dir: &'static str,
+    pub workspace_layers: &'static [&'static str],
+    pub workspace_settings: &'static str,
+    pub redirected_home_key: &'static str,
+    pub plugins_directory: &'static str,
+    pub plugins_manifest: &'static str,
+    pub redirect_keys: &'static [&'static str],
+    pub servers_key: &'static str,
+    pub disabled_key: &'static str,
+    pub http_keys: &'static [&'static str],
+}
+
+/// Adapter-specific diagnostic vocabulary retained by older turn and gap records.
+#[derive(Clone, Copy, Debug)]
+pub struct ViewProjectionRecovery {
+    pub unavailable_prefix: &'static str,
+    pub unresolved_reason: &'static str,
+}
+
 /// Native profile vocabulary used by the daemon and the desktop editor.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ProfileCapabilities {
     pub environment: ProfileEnvironment,
     pub named_profile: Option<super::native_profile::NativeProfileMapping>,
+    pub read_only_markers: &'static [(&'static str, &'static str)],
     pub route_selectors_resolved: bool,
     pub route_scope_secret_names: &'static [&'static str],
     pub latest_cmd: bool,
@@ -307,6 +341,7 @@ pub enum NativeRoute {
     FixedCredential(&'static str),
     ResponsesProxy {
         reserved_providers: &'static [&'static str],
+        endpoint_keys: &'static [&'static str],
     },
     AuthIntegration,
 }
@@ -314,10 +349,19 @@ pub enum NativeRoute {
 impl NativeRoute {
     pub fn reserves_proxy_provider(self, name: &str) -> bool {
         match self {
-            Self::ResponsesProxy { reserved_providers } => reserved_providers
+            Self::ResponsesProxy {
+                reserved_providers, ..
+            } => reserved_providers
                 .iter()
                 .any(|provider| name.eq_ignore_ascii_case(provider)),
             _ => false,
+        }
+    }
+
+    pub fn proxy_endpoint_keys(self) -> &'static [&'static str] {
+        match self {
+            Self::ResponsesProxy { endpoint_keys, .. } => endpoint_keys,
+            _ => &[],
         }
     }
 }
@@ -356,6 +400,7 @@ pub struct HarnessCapabilities {
     pub profile: ProfileCapabilities,
     pub native_route: NativeRoute,
     pub native_auth: Option<NativeAuthCapability>,
+    pub auth_inventory: Option<NativeAuthInventory>,
     /// How to freeze a launch without a saved profile and seed its installed preset.
     pub adhoc_launch: Option<AdhocLaunchDefaults>,
     /// `None` when the adapter has no ad-hoc effort mapping.
@@ -382,6 +427,7 @@ pub struct HarnessCapabilities {
     pub initial_model_refusal_cleanup: bool,
     /// Supported reasoning-effort vocabulary when `configure` restricts it.
     pub allowed_configure_efforts: Option<&'static [&'static str]>,
+    pub configure_invalid_effort: Option<&'static str>,
     /// How `configure` interacts with the live native session.
     pub configure_session_mode: ConfigureSessionMode,
     /// Live native `configure` requires an idle session with no active turn.
@@ -407,7 +453,8 @@ pub struct HarnessCapabilities {
     /// Failed turns backfill `native_error_message` / `effective_model` on readback.
     pub backfill_failed_turn_readback: bool,
     /// Supports `source.gap` view-projection recovery on active turns.
-    pub view_projection_gap_recovery: bool,
+    pub view_projection_recovery: Option<ViewProjectionRecovery>,
+    pub oversized_frame_prefixes: &'static [&'static str],
     /// Stream families granted for `observe` attachment.
     pub observed_families: &'static [&'static str],
     /// Stream families granted for live `observe` publication.
@@ -444,7 +491,7 @@ pub struct HarnessCapabilities {
     /// The adapter is waiting on a route repair before unattended checks.
     pub defer_harness_check: bool,
     /// Writes a prepared MCP configuration before start.
-    pub prepared_mcp_config: bool,
+    pub prepared_mcp_config: Option<NativeMcpSources>,
     /// Resolves the launch executable through reader discovery.
     pub reader_executable_discovery: bool,
     /// Resumes with a command-scoped config overlay.
@@ -613,6 +660,17 @@ impl HarnessCapabilities {
         Self::registered()
             .iter()
             .any(|(_, caps)| caps.native_route.reserves_proxy_provider(name))
+    }
+
+    /// Exact registered provider label for a reserved route name.
+    pub fn reserved_proxy_provider(name: &str) -> Option<&'static str> {
+        Self::registered().iter().find_map(|(harness, caps)| {
+            caps.native_route.reserves_proxy_provider(name).then(|| {
+                caps.profile
+                    .named_profile
+                    .map_or(*harness, |profile| profile.name)
+            })
+        })
     }
 }
 

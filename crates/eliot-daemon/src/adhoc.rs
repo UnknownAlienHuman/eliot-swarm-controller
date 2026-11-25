@@ -97,7 +97,6 @@ fn validate_adhoc_model(model: &str) -> core::Result<String> {
 /// Closed Claude Code `--effort` vocabulary, mirroring the profile freeze
 /// (`claude_snapshot_from_entry` in config.rs): `claude --help` documents
 /// `--effort <level>` and the frozen profile accepts exactly these levels.
-pub use core::api::native_profile::CLAUDE_EFFORT_LEVELS;
 
 fn validate_adhoc_effort(harness: &str, effort: &str) -> core::Result<String> {
     // OpenCode efforts are the installed per-model `Model.Variant` ids
@@ -219,7 +218,7 @@ pub(crate) fn adhoc_snapshot(
     if defaults.model == AdhocModel::Explicit && model.is_none() && !catalogue_only {
         return Err(core::Error::new(
             "profile_error",
-            "ad-hoc antigravity launch requires an explicit model",
+            format!("ad-hoc {harness} launch requires an explicit model"),
         ));
     }
     if let Some(model) = model.as_deref()
@@ -228,7 +227,9 @@ pub(crate) fn adhoc_snapshot(
     {
         return Err(core::Error::new(
             "profile_error",
-            "ad-hoc opencode model must be provider/model with non-empty slash segments and no variant suffix",
+            format!(
+                "ad-hoc {harness} model must be provider/model with non-empty slash segments and no variant suffix"
+            ),
         ));
     }
 
@@ -253,13 +254,13 @@ pub(crate) fn adhoc_snapshot(
             let selector = match explicit {
                 Some(selector) => selector,
                 None => {
-                    let ids = opencode_auth_ids(&validated).ok_or_else(|| {
-                        core::Error::new(
+                    let ids = core::api::HarnessCapabilities::of(&harness).auth_inventory
+                        .and_then(|inventory| native_auth_ids(&validated, inventory))
+                        .ok_or_else(|| core::Error::new(
                             "profile_error",
-                            "ad-hoc opencode launch needs --auth <integration>; the native auth list could not be read",
-                        )
-                    })?;
-                    resolve_opencode_default(model.as_deref(), &ids)?
+                            format!("ad-hoc {harness} launch needs --auth <integration>; the native auth list could not be read"),
+                        ))?;
+                    resolve_default_integration(&harness, model.as_deref(), &ids)?
                 }
             };
             snapshot.insert("auth_integration".to_owned(), Value::from(selector));
@@ -1273,24 +1274,19 @@ const MAX_AUTH_LIST_BYTES: usize = 64 * 1024;
 /// reads. Only nonsecret ids leave this function; connection bodies stay
 /// unread. `None` when the helper cannot be spawned, times out, exits
 /// non-zero, or its document is unreadable.
-pub(crate) fn opencode_auth_ids(program: &str) -> Option<Vec<String>> {
+pub(crate) fn native_auth_ids(
+    program: &str,
+    inventory: eliot_core::api::harness::NativeAuthInventory,
+) -> Option<Vec<String>> {
     let stdout = native_read(
         program,
-        &["auth", "list", "--format", "json", "--standalone"],
+        inventory.arguments,
         Instant::now() + AUTH_LIST_TIMEOUT,
     )?;
     if stdout.len() > MAX_AUTH_LIST_BYTES {
         return None;
     }
-    let entries: Vec<Value> = serde_json::from_slice(&stdout).ok()?;
-    Some(
-        entries
-            .iter()
-            .filter_map(|entry| entry.get("id")?.as_str())
-            .filter(|id| !id.is_empty())
-            .map(str::to_owned)
-            .collect(),
-    )
+    (inventory.decode_ids)(&stdout)
 }
 
 /// Human-countable integration list for refusal messages: ids only, no
@@ -1313,7 +1309,11 @@ fn describe_integrations(ids: &[String]) -> String {
 /// another provider's credential: a missing prefix, an absent model, or an
 /// unreadable list refuses with a typed error naming `--auth` and the
 /// available integration ids.
-fn resolve_opencode_default(model: Option<&str>, ids: &[String]) -> core::Result<String> {
+fn resolve_default_integration(
+    harness: &str,
+    model: Option<&str>,
+    ids: &[String],
+) -> core::Result<String> {
     let prefix = model
         .and_then(split_provider_model)
         .map(|(provider, _)| provider.to_owned());
@@ -1322,14 +1322,14 @@ fn resolve_opencode_default(model: Option<&str>, ids: &[String]) -> core::Result
         Some(prefix) => Err(core::Error::new(
             "profile_error",
             format!(
-                "ad-hoc opencode launch needs --auth <integration> for provider '{prefix}'; available integrations: {}",
+                "ad-hoc {harness} launch needs --auth <integration> for provider '{prefix}'; available integrations: {}",
                 describe_integrations(ids)
             ),
         )),
         None => Err(core::Error::new(
             "profile_error",
             format!(
-                "ad-hoc opencode launch needs --auth <integration>; available integrations: {}",
+                "ad-hoc {harness} launch needs --auth <integration>; available integrations: {}",
                 describe_integrations(ids)
             ),
         )),

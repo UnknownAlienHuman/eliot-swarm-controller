@@ -8,7 +8,7 @@
 //! content takes no tooltip (Reactor 0.100.0 refuses a tooltip under a
 //! flyout).
 
-use eliot_core::api::native_profile::CodexPermissions;
+use eliot_core::api::native_profile::SandboxPermissions;
 use std::collections::HashMap;
 
 use super::launch_ui::{CHAT_PROJECT, OTHER_FOLDER, Pop};
@@ -204,8 +204,8 @@ impl DesktopApp {
                     Some(_) => launch_ui::access_label(permissions),
                     None => "Access from the preset".to_owned(),
                 };
-                let full = permissions.and_then(CodexPermissions::parse)
-                    == Some(CodexPermissions::DangerFullAccess);
+                let full = permissions.and_then(SandboxPermissions::parse)
+                    == Some(SandboxPermissions::DangerFullAccess);
                 m3::fixed_chip(
                     palette,
                     full,

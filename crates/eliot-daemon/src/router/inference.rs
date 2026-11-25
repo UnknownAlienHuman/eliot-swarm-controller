@@ -23,7 +23,7 @@ use std::{
 };
 #[expect(
     clippy::disallowed_types,
-    reason = "The Memory inference path owns the Claude child after durable admission."
+    reason = "The Memory inference path owns the native child after durable admission."
 )]
 use tokio::process::Command;
 
@@ -35,12 +35,6 @@ struct CredentialFile {
     token_version: i64,
     credential: String,
     operation_id: String,
-}
-
-#[derive(Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Route {
-    claude_executable: PathBuf,
 }
 
 fn scope(principal: &Principal) -> Result<(&str, i64)> {
@@ -345,38 +339,24 @@ impl Router {
             ));
         }
         let adapter = text_inference::configured()?;
-        let route: Route = serde_json::from_slice(&read_private_bytes(
+        let executable = (adapter.decode_route)(&read_private_bytes(
             &self.inner.data_root.join("inference.json"),
             4096,
         )?)
-        .map_err(|_| Error::new("invalid", "invalid inference.json route"))?;
-        if !route.claude_executable.is_absolute() || !route.claude_executable.is_file() {
-            return Err(Error::new(
-                "invalid",
-                "inference requires the installed absolute Claude executable",
-            ));
+        .ok_or_else(|| Error::new("invalid", "invalid inference.json route"))?;
+        if !executable.is_absolute() || !executable.is_file() {
+            return Err(Error::new("invalid", adapter.invalid_executable));
         }
         let native_home = self.inner.data_root.join("inference-native");
         ensure_private_root(&native_home)?;
-        // Native OAuth refresh replaces this owned file, inheriting our private
-        // directory ACL. Re-establish protected file permissions before reading;
-        // the existing helper rejects reparse points and foreign ownership.
-        ensure_private_file(&native_home.join(".credentials.json"))?;
-        // The owner provisions a private native login here. Never mutate the
-        // owner's global Claude settings or distribute their identity to a tool.
-        let native: Value = serde_json::from_slice(&read_private_bytes(
-            &native_home.join(".credentials.json"),
-            128 * 1024,
-        )?)
-        .map_err(|_| Error::new("not_allowed", "private Claude login is unavailable"))?;
-        for key in ["accessToken", "refreshToken"] {
-            if let Some(secret) = native
-                .get("claudeAiOauth")
-                .and_then(|v| v.get(key))
-                .and_then(Value::as_str)
-            {
-                self.inner.secrets.lock_recover().insert(secret.to_owned());
-            }
+        // A refresh may replace the file, inheriting the private directory ACL.
+        // Re-establish its protection before collecting secrets for redaction.
+        let credentials = native_home.join(adapter.credentials_file);
+        ensure_private_file(&credentials)?;
+        let native: Value = serde_json::from_slice(&read_private_bytes(&credentials, 128 * 1024)?)
+            .map_err(|_| Error::new("not_allowed", adapter.credentials_unavailable))?;
+        for secret in (adapter.credential_values)(&native).into_iter().flatten() {
+            self.inner.secrets.lock_recover().insert(secret.to_owned());
         }
         if contains_known_secret_including_keys(params, &self.inner.secrets) {
             return Err(Error::new(
@@ -384,7 +364,7 @@ impl Router {
                 "inference request contains a known credential",
             ));
         }
-        let frozen = encode(&route)?;
+        let frozen = serde_json::json!({(adapter.executable_key): encode(&executable)?});
         let mut store = self.inner.store.lock().await;
         if self.inner.mode.load(Ordering::SeqCst) != MODE_OPEN {
             return Err(Error::new("unavailable", "daemon admission is closed"));
@@ -417,7 +397,7 @@ impl Router {
                     id,
                     tokio::spawn(async move {
                         router
-                            .run_inference(client, request, route, adapter, deadline)
+                            .run_inference(client, request, executable, adapter, deadline)
                             .await;
                     }),
                 );
@@ -430,7 +410,7 @@ impl Router {
         &self,
         client: String,
         request: InferenceTextRequest,
-        route: Route,
+        executable: PathBuf,
         adapter: text_inference::TextInferenceAdapter,
         deadline: tokio::time::Instant,
     ) {
@@ -440,7 +420,7 @@ impl Router {
         // fence below.
         let quiescent = if let Ok(_single) = single {
             match self
-                .run_inference_inner(&client, &request, route, adapter, deadline)
+                .run_inference_inner(&client, &request, executable, adapter, deadline)
                 .await
             {
                 Ok(quiescent) => quiescent,
@@ -486,13 +466,13 @@ impl Router {
 
     #[expect(
         clippy::disallowed_types,
-        reason = "This effect runner starts the admitted Claude inference command."
+        reason = "This effect runner starts the admitted native inference command."
     )]
     async fn run_inference_inner(
         &self,
         client: &str,
         request: &InferenceTextRequest,
-        route: Route,
+        executable: PathBuf,
         adapter: text_inference::TextInferenceAdapter,
         deadline: tokio::time::Instant,
     ) -> Result<bool> {
@@ -530,7 +510,7 @@ impl Router {
             clippy::disallowed_methods,
             reason = "This statement constructs a process owned by this module."
         )]
-        let mut command = Command::new(route.claude_executable);
+        let mut command = Command::new(executable);
         command
             .args((adapter.arguments)())
             .current_dir(&cwd)

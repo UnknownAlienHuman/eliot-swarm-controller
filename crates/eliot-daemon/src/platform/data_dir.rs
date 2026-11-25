@@ -1159,10 +1159,11 @@ pub(crate) fn remove_abandoned_mcp_temps(data: &DataDir, lock: &DaemonLock) -> R
     }
     let entries =
         fs::read_dir(&plugins).map_err(|error| io_error("read plugin directory", error))?;
-    let prefix = format!(
-        ".{}.",
-        eliot_plugin::native_cli::ANTIGRAVITY_MCP_CONFIG_FILE
-    );
+    let prefixes: Vec<_> = eliot_core::api::HarnessCapabilities::declarations()
+        .iter()
+        .filter_map(|(_, caps)| caps.prepared_mcp_config)
+        .map(|layout| format!(".{}.", layout.file))
+        .collect();
     for entry in entries {
         let entry = entry.map_err(|error| io_error("read plugin instance", error))?;
         let name = entry.file_name();
@@ -1180,10 +1181,13 @@ pub(crate) fn remove_abandoned_mcp_temps(data: &DataDir, lock: &DaemonLock) -> R
         {
             let file = file.map_err(|error| io_error("read plugin instance entry", error))?;
             let name = file.file_name();
-            let is_mcp_temp = name
-                .to_str()
-                .and_then(|name| name.strip_prefix(&prefix)?.strip_suffix(".tmp"))
-                .is_some_and(|id| ulid::Ulid::from_string(id).is_ok());
+            let is_mcp_temp = name.to_str().is_some_and(|name| {
+                prefixes.iter().any(|prefix| {
+                    name.strip_prefix(prefix)
+                        .and_then(|id| id.strip_suffix(".tmp"))
+                        .is_some_and(|id| ulid::Ulid::from_string(id).is_ok())
+                })
+            });
             if is_mcp_temp && file.file_type().is_ok_and(|kind| kind.is_file()) {
                 match fs::remove_file(file.path()) {
                     Ok(()) => (),

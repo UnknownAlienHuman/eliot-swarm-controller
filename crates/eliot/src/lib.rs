@@ -16,3 +16,10 @@ pub fn register_harness_capabilities() -> eliot_core::Result<()> {
         ),
     ])
 }
+
+/// Native profile vocabulary for the desktop editor.
+pub mod profile_vocabulary {
+    pub use eliot_plugin_antigravity::ANTIGRAVITY_MODES;
+    pub use eliot_plugin_claude::{CLAUDE_EFFORT_LEVELS, CLAUDE_EFFORTS, CLAUDE_PERMISSION_MODES};
+    pub use eliot_plugin_muse::{MUSE_APPROVALS, MUSE_PERMISSIONS};
+}

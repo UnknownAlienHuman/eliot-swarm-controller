@@ -1,10 +1,10 @@
 //! Named profile settings for this adapter.
 
 use eliot_core::api::native_profile::{
-    ANTIGRAVITY_MODES, NativeProfileInput, NativeProfileMapping, NativeProfileResult, ProfileEffort,
+    NativeProfileInput, NativeProfileMapping, NativeProfileResult, ProfileEffort,
 };
 use eliot_plugin::capabilities::reject_unmapped_native_fields;
-use serde_json::{Map as JsonMap, Value, json};
+use serde_json::{Map as JsonMap, Value};
 
 pub(super) const MAPPING: NativeProfileMapping = NativeProfileMapping {
     name: "Antigravity",
@@ -64,3 +64,6 @@ fn fields(
     );
     Ok(())
 }
+
+/// Antigravity `mode` values.
+pub const ANTIGRAVITY_MODES: [&str; 3] = ["plan", "auto", "accept-edits"];

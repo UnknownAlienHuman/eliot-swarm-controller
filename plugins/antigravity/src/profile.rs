@@ -3,7 +3,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use eliot_core::api::native_profile::ANTIGRAVITY_MODES;
+use crate::ANTIGRAVITY_MODES;
 use eliot_core::{Error, Result, SecretPolicy};
 use eliot_plugin::{
     AgentStartParams,

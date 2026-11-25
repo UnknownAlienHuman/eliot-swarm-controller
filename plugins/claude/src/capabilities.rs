@@ -1,12 +1,13 @@
 //! Claude native adapter capability declaration.
 
+use crate::CLAUDE_EFFORT_LEVELS;
 use eliot_core::McpPolicy;
 use eliot_core::api::harness::{
     AdhocEffort, AdhocLaunchDefaults, DocumentedModelCatalog, ModelReaderOptions,
     NativeAccessBounds, NativeAuthCapability, NativeAuthCheck, NativeAuthCommand,
     NativeAuthInvocation, NativeAuthState, NativeQuotaReadback, NativeRoute, ProfileCapabilities,
 };
-use eliot_core::api::native_profile::{CLAUDE_EFFORT_LEVELS, NativeSubagentsPolicy};
+use eliot_core::api::native_profile::NativeSubagentsPolicy;
 use eliot_core::api::{ConfigureSessionMode, HarnessCapabilities, InputTokenAccounting};
 use eliot_plugin::capabilities::{adhoc_launch, quota_readback, sandbox_permissions};
 use serde_json::Value;
@@ -33,6 +34,7 @@ pub fn declaration() -> HarnessCapabilities {
         }),
         native_route: NativeRoute::FixedCredential("claude-cli-oauth"),
         profile: ProfileCapabilities {
+            read_only_markers: &[("permission_mode", "plan")],
             named_profile: Some(crate::profile_config::MAPPING),
             environment: eliot_core::api::harness::ProfileEnvironment {
                 store_paths: &["CLAUDE_CONFIG_DIR"],
@@ -119,8 +121,7 @@ pub fn declaration() -> HarnessCapabilities {
         native_access_bounds: Some(native_access_bounds),
         effort: true,
         manager_preference: Some(1),
-        owner_rules_delivery:
-            eliot_core::api::OwnerRulesDeliveryMethod::ClaudeAppendSystemPromptFile,
+        owner_rules_delivery: eliot_core::api::OwnerRulesDeliveryMethod::AppendSystemPromptFile,
         project_instruction_read: crate::instructions::PROJECT_READ,
         user_instruction_files: crate::instructions::USER_FILES,
         resume_config: true,

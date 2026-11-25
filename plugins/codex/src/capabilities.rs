@@ -80,6 +80,7 @@ pub fn declaration() -> HarnessCapabilities {
             }),
         }),
         native_route: NativeRoute::ResponsesProxy {
+            endpoint_keys: &["codex"],
             reserved_providers: &[
                 "openai",
                 "amazon-bedrock",
@@ -90,6 +91,7 @@ pub fn declaration() -> HarnessCapabilities {
             ],
         },
         profile: ProfileCapabilities {
+            read_only_markers: &[("collaboration_mode", "plan")],
             named_profile: Some(crate::profile_config::MAPPING),
             environment: eliot_core::api::harness::ProfileEnvironment {
                 auth_scope: CODEX_PROXY_SELECTOR_ENV_NAMES,
@@ -134,7 +136,7 @@ pub fn declaration() -> HarnessCapabilities {
         provider_response_withholding: true,
         provider_response_route_identity: Some(response_route_identity),
         route_client_key_env_selector: Some(is_route_selector_env_name),
-        owner_rules_delivery: eliot_core::api::OwnerRulesDeliveryMethod::CodexDeveloperInstructions,
+        owner_rules_delivery: eliot_core::api::OwnerRulesDeliveryMethod::DeveloperInstructions,
         project_instruction_read: crate::instructions::PROJECT_READ,
         user_instruction_files: crate::instructions::USER_FILES,
         requires_pass_env: true,
@@ -163,7 +165,7 @@ pub fn declaration() -> HarnessCapabilities {
         compact: true,
         observed_families: eliot_core::OBSERVED_ROLLOUT_FAMILIES,
         observed_live_families: eliot_core::OBSERVED_ROLLOUT_FAMILIES,
-        native_child_families: &eliot_core::CODEX_NATIVE_CHILD_FAMILIES,
+        native_child_families: NATIVE_CHILD_FAMILIES,
         executable_stems: &["codex"],
         version_prefixes: &["codex-cli", "codex"],
         input_token_accounting: InputTokenAccounting::IncludesCacheReads,
@@ -206,3 +208,5 @@ fn native_access_bounds(snapshot: &Value) -> Option<NativeAccessBounds> {
         _ => None,
     }
 }
+
+pub(super) const NATIVE_CHILD_FAMILIES: &[&str] = &["session", "turn", "message"];

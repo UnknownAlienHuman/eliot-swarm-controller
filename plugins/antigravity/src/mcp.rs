@@ -5,7 +5,7 @@ use std::{
 };
 
 use eliot_core::{Error, Result};
-use eliot_plugin::native_cli::ANTIGRAVITY_MCP_CONFIG_FILE;
+pub(super) const MCP_CONFIG_FILE: &str = "mcp_config.json";
 
 use crate::{profile::Plan, session::without_verbatim_prefix};
 
@@ -13,7 +13,7 @@ pub(crate) struct OwnedConfig(PathBuf);
 
 impl Drop for OwnedConfig {
     fn drop(&mut self) {
-        let _ = fs::remove_file(self.0.join("config").join(ANTIGRAVITY_MCP_CONFIG_FILE));
+        let _ = fs::remove_file(self.0.join("config").join(MCP_CONFIG_FILE));
         let _ = fs::remove_dir(self.0.join("config"));
         // Native conversations/logs survive for exact session/load on resume.
         let _ = fs::remove_dir(&self.0);
@@ -80,8 +80,8 @@ pub(crate) fn install(plan: &Plan, instance: &Path) -> Result<Option<OwnedConfig
         ));
     }
     fs::rename(
-        instance.join(ANTIGRAVITY_MCP_CONFIG_FILE),
-        config_dir.join(ANTIGRAVITY_MCP_CONFIG_FILE),
+        instance.join(MCP_CONFIG_FILE),
+        config_dir.join(MCP_CONFIG_FILE),
     )
     .inspect_err(|_| {
         let _ = fs::remove_dir(&config_dir);

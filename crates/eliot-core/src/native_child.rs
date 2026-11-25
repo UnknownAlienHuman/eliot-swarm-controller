@@ -6,10 +6,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::collections::BTreeMap;
 
-pub const CODEX_NATIVE_CHILD_FAMILIES: [&str; 3] = ["session", "turn", "message"];
-pub const MUSE_NATIVE_CHILD_FAMILIES: [&str; 1] = ["turn"];
-pub const NATIVE_CHILD_FAMILIES: [&str; 3] = CODEX_NATIVE_CHILD_FAMILIES;
-
 /// Committed observation only; this never grants native child control.
 #[derive(schemars::JsonSchema, Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

@@ -286,12 +286,10 @@ impl Router {
         }
         if let Some(gap) = store.latest_stream_gap(agent, generation)?
             && let Some(message) = gap.data.get("reason").and_then(Value::as_str)
-            && [
-                "Antigravity stream ended on an oversized frame (frame_oversized ",
-                "Antigravity stream contained an invalid frame (frame_oversized ",
-            ]
-            .iter()
-            .any(|prefix| message.starts_with(prefix))
+            && eliot_core::api::HarnessCapabilities::declarations()
+                .iter()
+                .flat_map(|(_, caps)| caps.oversized_frame_prefixes)
+                .any(|prefix| message.starts_with(prefix))
         {
             steps.push(DiagnoseStep {
                 kind: "source".to_owned(),

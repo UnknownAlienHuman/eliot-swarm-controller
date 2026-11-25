@@ -1,8 +1,8 @@
 //! Named profile settings for this adapter.
 
 use eliot_core::api::native_profile::{
-    CodexApprovalPolicy, CodexCollaborationMode, CodexPermissions, NativeProfileInput,
-    NativeProfileMapping, NativeProfileResult, ProfileEffort,
+    CollaborationMode, NativeProfileInput, NativeProfileMapping, NativeProfileResult,
+    ProfileEffort, SandboxApprovalPolicy, SandboxPermissions,
 };
 use eliot_plugin::capabilities::reject_unmapped_native_fields;
 use serde_json::{Map as JsonMap, Value, json};
@@ -27,26 +27,26 @@ fn fields(
     let collaboration_mode = validated_native_choice(
         "collaboration_mode",
         entry.collaboration_mode,
-        &CodexCollaborationMode::ALL.map(CodexCollaborationMode::as_str),
+        &CollaborationMode::ALL.map(CollaborationMode::as_str),
         "must be default or plan",
         "profile_error",
     )?;
     let permissions = validated_native_choice(
         "permissions",
         entry.permissions,
-        &CodexPermissions::ALL.map(CodexPermissions::as_str),
+        &SandboxPermissions::ALL.map(SandboxPermissions::as_str),
         "unsupported permission mode",
         "unsupported",
     )?
-    .unwrap_or(CodexPermissions::default().as_str());
+    .unwrap_or(SandboxPermissions::default().as_str());
     let approval_policy = validated_native_choice(
         "approval_policy",
         entry.approval_policy,
-        &CodexApprovalPolicy::ALL.map(CodexApprovalPolicy::as_str),
+        &SandboxApprovalPolicy::ALL.map(SandboxApprovalPolicy::as_str),
         "must be never or on-request",
         "profile_error",
     )?
-    .unwrap_or(CodexApprovalPolicy::default().as_str());
+    .unwrap_or(SandboxApprovalPolicy::default().as_str());
     reject_unmapped_native_fields(&[
         (
             "approval",
@@ -82,4 +82,24 @@ fn fields(
         Value::String(approval_policy.to_owned()),
     );
     Ok(())
+}
+
+/// The Codex-specific fields of a frozen profile, decoded once at the plugin
+/// boundary. Other keys of the snapshot are read by their own owners.
+#[derive(Clone, Debug, Default, serde::Deserialize)]
+pub(super) struct ProfileFields {
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub daemon_model: Option<String>,
+    #[serde(default)]
+    pub effort: Option<String>,
+    #[serde(default)]
+    pub collaboration_mode: Option<CollaborationMode>,
+    #[serde(default)]
+    pub permissions: SandboxPermissions,
+    #[serde(default)]
+    pub approval_policy: SandboxApprovalPolicy,
+    #[serde(default)]
+    pub native_subagents: Option<String>,
 }

@@ -5,7 +5,7 @@ use eliot_core::api::harness::{
     ProjectInstructionRead, QuotaEvidenceReader, QuotaUsageWindows,
 };
 use eliot_core::api::native_profile::{
-    CodexApprovalPolicy, CodexPermissions, NativeProfileRefusal, NativeProfileResult,
+    NativeProfileRefusal, NativeProfileResult, SandboxApprovalPolicy, SandboxPermissions,
 };
 use eliot_core::{Error, McpPolicy, Result, api::InstructionReadStatus};
 use serde_json::{Map, Value};
@@ -76,14 +76,14 @@ pub fn apply_adhoc_permissions(
             values,
         } => {
             let sandbox = if full && full_changes_sandbox {
-                CodexPermissions::DangerFullAccess
+                SandboxPermissions::DangerFullAccess
             } else {
-                CodexPermissions::default()
+                SandboxPermissions::default()
             };
             snapshot.insert("permissions".to_owned(), Value::from(sandbox.as_str()));
             snapshot.insert(
                 "approval_policy".to_owned(),
-                Value::from(CodexApprovalPolicy::default().as_str()),
+                Value::from(SandboxApprovalPolicy::default().as_str()),
             );
             if let Some(access) = access {
                 let [ask, auto, full] = values;

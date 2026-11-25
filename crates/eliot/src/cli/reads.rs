@@ -292,9 +292,9 @@ pub(crate) async fn run_show(
 fn print_owner_rules_delivery(delivery: &eliot_core::api::OwnerRulesDeliveryView) {
     use eliot_core::api::{OwnerRulesDeliveryMethod as Method, OwnerRulesDeliveryStatus as Status};
     let method = match delivery.method {
-        Method::CodexDeveloperInstructions => "codex developer_instructions",
-        Method::ClaudeAppendSystemPromptFile => "claude append-system-prompt-file",
-        Method::OpenCodeAgentsFile => "OpenCode isolated AGENTS.md",
+        Method::DeveloperInstructions => "codex developer_instructions",
+        Method::AppendSystemPromptFile => "claude append-system-prompt-file",
+        Method::SessionInstructionsFile => "OpenCode isolated AGENTS.md",
         Method::FirstInput => "first-input fallback",
     };
     let status = match delivery.status {

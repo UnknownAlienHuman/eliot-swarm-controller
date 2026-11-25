@@ -5,10 +5,10 @@ use std::{
 };
 
 use eliot_core::{
-    Agent, Error, McpPolicy, Result, display_path, is_swarm_reserved_server_name,
-    parse_snapshot_allow_list, parse_snapshot_cloud_hostname,
+    Agent, Error, McpPolicy, Result, api::harness::NativeMcpSources, display_path,
+    is_swarm_reserved_server_name, parse_snapshot_allow_list, parse_snapshot_cloud_hostname,
 };
-use eliot_plugin::{native_cli::ANTIGRAVITY_MCP_CONFIG_FILE, owner_scan};
+use eliot_plugin::owner_scan;
 use serde_json::{Map, Value, json};
 
 use crate::platform::data_dir::replace_private_file;
@@ -24,14 +24,17 @@ impl Drop for PreparedConfig {
 }
 
 pub(super) fn prepare(
+    layout: NativeMcpSources,
     agent: &Agent,
     environment: &Value,
     instance: &Path,
 ) -> Result<Option<PreparedConfig>> {
-    let profile = agent
-        .profile_snapshot
-        .as_object()
-        .ok_or_else(|| Error::new("profile_error", "Antigravity requires a frozen profile"))?;
+    let profile = agent.profile_snapshot.as_object().ok_or_else(|| {
+        Error::new(
+            "profile_error",
+            format!("{} requires a frozen profile", layout.name),
+        )
+    })?;
     let policy = McpPolicy::parse_snapshot(profile)?;
     let allow = parse_snapshot_allow_list(profile)?;
     if policy == McpPolicy::Inherit && !allow.is_empty() {
@@ -41,10 +44,16 @@ pub(super) fn prepare(
         .workspace
         .as_deref()
         .and_then(|path| fs::canonicalize(path).ok())
-        .ok_or_else(|| Error::new("profile_error", "Antigravity workspace is unavailable"))?;
+        .ok_or_else(|| {
+            Error::new(
+                "profile_error",
+                format!("{} workspace is unavailable", layout.name),
+            )
+        })?;
     let controller = std::env::current_exe().ok();
     let cloud = parse_snapshot_cloud_hostname(profile);
     let mut sources = Sources {
+        layout,
         policy,
         allow: &allow,
         controller: controller.as_deref(),
@@ -53,8 +62,8 @@ pub(super) fn prepare(
         selected: Map::new(),
     };
     if policy == McpPolicy::Inherit || !allow.is_empty() {
-        let config = gemini_config_dir(environment)?;
-        sources.read_servers(&config.join(ANTIGRAVITY_MCP_CONFIG_FILE), Source::Global)?;
+        let config = global_config_dir(environment, layout)?;
+        sources.read_servers(&config.join(layout.file), Source::Global)?;
         if policy == McpPolicy::Inherit {
             sources.scan_plugins(&config)?;
         }
@@ -69,19 +78,24 @@ pub(super) fn prepare(
     {
         return Err(Error::new(
             "profile_error",
-            "Antigravity mcp_allow names an unavailable server",
+            format!("{} mcp_allow names an unavailable server", layout.name),
         ));
     }
 
-    let bytes = serde_json::to_vec(&json!({"mcpServers": sources.selected}))
-        .map_err(|_| Error::new("internal", "Could not encode Antigravity MCP config"))?;
-    let path = instance.join(ANTIGRAVITY_MCP_CONFIG_FILE);
-    replace_private_file(instance, ANTIGRAVITY_MCP_CONFIG_FILE, &bytes).map_err(|error| {
+    let bytes =
+        serde_json::to_vec(&json!({(layout.servers_key): sources.selected})).map_err(|_| {
+            Error::new(
+                "internal",
+                format!("Could not encode {} MCP config", layout.name),
+            )
+        })?;
+    let path = instance.join(layout.file);
+    replace_private_file(instance, layout.file, &bytes).map_err(|error| {
         source_error(
             &error.code,
             &format!(
-                "Could not publish private Antigravity MCP config ({})",
-                error.message
+                "Could not publish private {} MCP config ({})",
+                layout.name, error.message
             ),
             &path,
         )
@@ -89,7 +103,7 @@ pub(super) fn prepare(
     Ok(Some(PreparedConfig(path)))
 }
 
-fn gemini_config_dir(environment: &Value) -> Result<PathBuf> {
+fn global_config_dir(environment: &Value, layout: NativeMcpSources) -> Result<PathBuf> {
     let home_name = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
     environment
         .as_object()
@@ -102,13 +116,22 @@ fn gemini_config_dir(environment: &Value) -> Result<PathBuf> {
         })
         .map(Path::new)
         .filter(|home| home.is_absolute() && home.is_dir())
-        .map(|home| home.join(".gemini/config"))
-        .ok_or_else(|| Error::new("profile_error", "Antigravity native home is unavailable"))
+        .map(|home| home.join(layout.global_dir))
+        .ok_or_else(|| {
+            Error::new(
+                "profile_error",
+                format!("{} native home is unavailable", layout.name),
+            )
+        })
 }
 
-fn read(path: &Path) -> Result<Option<Value>> {
-    owner_scan::read_jsonc_document(path, "Antigravity MCP source", owner_scan::MAX_SCAN_BYTES)
-        .map_err(|error| source_error(&error.code, &error.message, path))
+fn read(path: &Path, layout: NativeMcpSources) -> Result<Option<Value>> {
+    owner_scan::read_jsonc_document(
+        path,
+        &format!("{} MCP source", layout.name),
+        owner_scan::MAX_SCAN_BYTES,
+    )
+    .map_err(|error| source_error(&error.code, &error.message, path))
 }
 
 fn source_error(code: &str, reason: &str, path: &Path) -> Error {
@@ -122,22 +145,22 @@ fn mcp_refusal(reason: &str, name: &str, path: &Path) -> Error {
     owner_scan::refusal_error(reason, name, &display_path(&path.to_string_lossy()))
 }
 
-fn reject_plugins(layer: &Path) -> Result<()> {
-    for entry in ["plugins", "plugins.json"] {
+fn reject_plugins(layer: &Path, layout: NativeMcpSources) -> Result<()> {
+    for entry in [layout.plugins_directory, layout.plugins_manifest] {
         let path = layer.join(entry);
         match path.try_exists() {
             Ok(false) => (),
             Ok(true) => {
                 return Err(source_error(
                     "unsupported",
-                    "Antigravity minimal cannot filter plugin MCP sources",
+                    &format!("{} minimal cannot filter plugin MCP sources", layout.name),
                     &path,
                 ));
             }
             Err(_) => {
                 return Err(source_error(
                     "profile_error",
-                    "Antigravity plugin source is unreadable",
+                    &format!("{} plugin source is unreadable", layout.name),
                     &path,
                 ));
             }
@@ -154,6 +177,7 @@ enum Source {
 }
 
 struct Sources<'a> {
+    layout: NativeMcpSources,
     policy: McpPolicy,
     allow: &'a [String],
     controller: Option<&'a Path>,
@@ -168,19 +192,24 @@ impl Sources<'_> {
             .ancestors()
             .find(|path| path.join(".git").exists());
         for root in workspace.ancestors() {
-            for alias in [".agents", ".agent", "_agents", "_agent"] {
+            for alias in self.layout.workspace_layers {
                 let layer = root.join(alias);
-                self.read_servers(&layer.join(ANTIGRAVITY_MCP_CONFIG_FILE), Source::Workspace)?;
+                self.read_servers(&layer.join(self.layout.file), Source::Workspace)?;
                 match self.policy {
                     McpPolicy::Inherit => self.scan_plugins(&layer)?,
-                    McpPolicy::Minimal => reject_plugins(&layer)?,
+                    McpPolicy::Minimal => reject_plugins(&layer, self.layout)?,
                 }
             }
-            let config = root.join(".gemini/config.json");
-            if read(&config)?.is_some_and(|doc| doc.get("personal_customization_dir").is_some()) {
+            let config = root.join(self.layout.workspace_settings);
+            if read(&config, self.layout)?
+                .is_some_and(|doc| doc.get(self.layout.redirected_home_key).is_some())
+            {
                 return Err(source_error(
                     "unsupported",
-                    "Antigravity cannot check the personal customization directory declared in",
+                    &format!(
+                        "{} cannot check the personal customization directory declared in",
+                        self.layout.name
+                    ),
                     &config,
                 ));
             }
@@ -192,10 +221,10 @@ impl Sources<'_> {
     }
 
     fn scan_plugins(&mut self, layer: &Path) -> Result<()> {
-        let manifest = layer.join("plugins.json");
-        if read(&manifest)?.is_some_and(|document| {
+        let manifest = layer.join(self.layout.plugins_manifest);
+        if read(&manifest, self.layout)?.is_some_and(|document| {
             !document.is_object()
-                || ["entries", "inherits"].iter().any(|field| {
+                || self.layout.redirect_keys.iter().any(|field| {
                     document
                         .get(field)
                         .is_some_and(|value| !value.as_array().is_some_and(Vec::is_empty))
@@ -203,18 +232,21 @@ impl Sources<'_> {
         }) {
             return Err(source_error(
                 "unsupported",
-                "Antigravity cannot check redirected plugin MCP sources declared in",
+                &format!(
+                    "{} cannot check redirected plugin MCP sources declared in",
+                    self.layout.name
+                ),
                 &manifest,
             ));
         }
-        let path = layer.join("plugins");
+        let path = layer.join(self.layout.plugins_directory);
         let plugins = match fs::read_dir(&path) {
             Ok(plugins) => plugins,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
             Err(_) => {
                 return Err(source_error(
                     "profile_error",
-                    "Antigravity plugin directory is unreadable",
+                    &format!("{} plugin directory is unreadable", self.layout.name),
                     &path,
                 ));
             }
@@ -223,13 +255,16 @@ impl Sources<'_> {
             owner_scan::ensure_total_entries(
                 index + 1,
                 owner_scan::MAX_SCAN_SERVERS,
-                "Antigravity plugin directory exceeds its scan bound",
+                &format!(
+                    "{} plugin directory exceeds its scan bound",
+                    self.layout.name
+                ),
             )?;
             let plugin = plugin
                 .map_err(|_| {
                     source_error(
                         "profile_error",
-                        "Antigravity plugin directory is unreadable",
+                        &format!("{} plugin directory is unreadable", self.layout.name),
                         &path,
                     )
                 })?
@@ -238,41 +273,46 @@ impl Sources<'_> {
                 .map_err(|_| {
                     source_error(
                         "profile_error",
-                        "Antigravity plugin entry is unreadable",
+                        &format!("{} plugin entry is unreadable", self.layout.name),
                         &plugin,
                     )
                 })?
                 .is_dir()
             {
-                self.read_servers(&plugin.join(ANTIGRAVITY_MCP_CONFIG_FILE), Source::Plugin)?;
+                self.read_servers(&plugin.join(self.layout.file), Source::Plugin)?;
             }
         }
         Ok(())
     }
 
     fn read_servers(&mut self, path: &Path, source: Source) -> Result<()> {
-        // AGY can initialize its global MCP file at zero bytes.
+        // The native host can initialize its global MCP file at zero bytes.
         if source == Source::Global && path.metadata().is_ok_and(|m| m.is_file() && m.len() == 0) {
             return Ok(());
         }
-        let Some(document) = read(path)? else {
+        let Some(document) = read(path, self.layout)? else {
             return Ok(());
         };
-        let Some(servers) =
-            owner_scan::table_object(document.get("mcpServers"), "Antigravity MCP servers")?
+        let Some(servers) = owner_scan::table_object(
+            document.get(self.layout.servers_key),
+            &format!("{} MCP servers", self.layout.name),
+        )?
         else {
             return Ok(());
         };
         owner_scan::ensure_total_entries(
             servers.len(),
             owner_scan::MAX_SCAN_SERVERS,
-            "Antigravity MCP source exceeds its server bound",
+            &format!("{} MCP source exceeds its server bound", self.layout.name),
         )?;
         let minimal = self.policy == McpPolicy::Minimal;
         for (name, entry) in servers {
             let table = entry.as_object().ok_or_else(|| {
                 mcp_refusal(
-                    "Antigravity expects an MCP entry object for server",
+                    &format!(
+                        "{} expects an MCP entry object for server",
+                        self.layout.name
+                    ),
                     name,
                     path,
                 )
@@ -283,21 +323,25 @@ impl Sources<'_> {
                     self.global_names.insert(name.clone());
                 } else if self.global_names.contains(name) {
                     return Err(mcp_refusal(
-                        "Antigravity minimal refuses workspace override of global MCP server",
+                        &format!(
+                            "{} minimal refuses workspace override of global MCP server",
+                            self.layout.name
+                        ),
                         name,
                         path,
                     ));
                 }
             }
-            // AGY suspends disabled entries before connecting any server.
-            if table.get("disabled") == Some(&Value::Bool(true)) {
+            // Disabled native entries do not open a connection.
+            if table.get(self.layout.disabled_key) == Some(&Value::Bool(true)) {
                 continue;
             }
             let (command, args) =
                 owner_scan::project_string_command_args(table.get("command"), table.get("args"));
-            // AGY documents serverUrl and url. Scan the Gemini CLI spelling
-            // too, and check each supplied alias.
-            let owner_http = ["serverUrl", "url", "httpUrl"]
+            // Check all declared transport aliases.
+            let owner_http = self
+                .layout
+                .http_keys
                 .iter()
                 .filter_map(|key| table.get(*key).and_then(Value::as_str))
                 .any(|url| eliot_core::is_owner_swarm_http(Some(url), self.cloud));
@@ -310,7 +354,10 @@ impl Sources<'_> {
                 )
             {
                 return Err(mcp_refusal(
-                    "Antigravity cannot exclude Owner or reserved Swarm MCP server",
+                    &format!(
+                        "{} cannot exclude Owner or reserved Swarm MCP server",
+                        self.layout.name
+                    ),
                     name,
                     path,
                 ));
@@ -318,7 +365,10 @@ impl Sources<'_> {
             if minimal && !allowed {
                 if source == Source::Workspace {
                     return Err(mcp_refusal(
-                        "Antigravity minimal cannot suppress workspace MCP server",
+                        &format!(
+                            "{} minimal cannot suppress workspace MCP server",
+                            self.layout.name
+                        ),
                         name,
                         path,
                     ));

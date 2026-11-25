@@ -153,8 +153,10 @@ fn import_argv() -> [&'static str; 3] {
 
 /// `auth list --format json --standalone`: nonsecret integration metadata
 /// on stdout. Only IDs and connection counts are ever interpreted.
+pub const LIST_ARGUMENTS: [&str; 5] = ["auth", "list", "--format", "json", "--standalone"];
+
 pub fn list_argv() -> [&'static str; 5] {
-    ["auth", "list", "--format", "json", "--standalone"]
+    LIST_ARGUMENTS
 }
 
 /// Move the selected canonical credential into the isolated native store.

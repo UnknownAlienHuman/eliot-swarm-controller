@@ -1,8 +1,8 @@
 //! Named profile settings for this adapter.
 
 use eliot_core::api::native_profile::{
-    CLAUDE_EFFORT_LEVELS, CLAUDE_PERMISSION_MODES, CodexApprovalPolicy, CodexPermissions,
     NativeProfileInput, NativeProfileMapping, NativeProfileResult, ProfileEffort,
+    SandboxApprovalPolicy, SandboxPermissions,
 };
 use eliot_plugin::capabilities::reject_unmapped_native_fields;
 use serde_json::{Map as JsonMap, Value};
@@ -42,14 +42,14 @@ fn fields(
     validated_native_choice(
         "permissions",
         entry.permissions,
-        &[CodexPermissions::WorkspaceWrite.as_str()],
+        &[SandboxPermissions::WorkspaceWrite.as_str()],
         "the Claude slice runs the CLI-default permission posture",
         "unsupported",
     )?;
     validated_native_choice(
         "approval_policy",
         entry.approval_policy,
-        &[CodexApprovalPolicy::Never.as_str()],
+        &[SandboxApprovalPolicy::Never.as_str()],
         "the Claude slice leaves approvals unconnected",
         "unsupported",
     )?;
@@ -67,14 +67,29 @@ fn fields(
     ])?;
     snapshot.insert(
         "permissions".to_owned(),
-        Value::String(CodexPermissions::WorkspaceWrite.as_str().to_owned()),
+        Value::String(SandboxPermissions::WorkspaceWrite.as_str().to_owned()),
     );
     snapshot.insert(
         "approval_policy".to_owned(),
-        Value::String(CodexApprovalPolicy::Never.as_str().to_owned()),
+        Value::String(SandboxApprovalPolicy::Never.as_str().to_owned()),
     );
     if let Some(mode) = permission_mode {
         snapshot.insert("permission_mode".to_owned(), Value::String(mode.to_owned()));
     }
     Ok(())
 }
+
+/// Claude Code `--permission-mode` values (profile key `approval`).
+pub const CLAUDE_PERMISSION_MODES: [&str; 6] = [
+    "manual",
+    "auto",
+    "acceptEdits",
+    "plan",
+    "dontAsk",
+    "bypassPermissions",
+];
+
+/// Claude Code `--effort` levels: the CLI's closed vocabulary.
+pub const CLAUDE_EFFORTS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
+
+pub const CLAUDE_EFFORT_LEVELS: &[&str] = &CLAUDE_EFFORTS;

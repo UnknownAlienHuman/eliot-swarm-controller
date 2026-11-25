@@ -1,8 +1,8 @@
 //! Named profile settings for this adapter.
 
 use eliot_core::api::native_profile::{
-    CodexApprovalPolicy, CodexPermissions, MUSE_APPROVALS, MUSE_PERMISSIONS, NativeProfileInput,
-    NativeProfileMapping, NativeProfileResult, ProfileEffort,
+    NativeProfileInput, NativeProfileMapping, NativeProfileResult, ProfileEffort,
+    SandboxApprovalPolicy, SandboxPermissions,
 };
 use eliot_plugin::capabilities::reject_unmapped_native_fields;
 use serde_json::{Map as JsonMap, Value};
@@ -39,15 +39,15 @@ fn fields(
     let permissions = validated_native_choice(
         "permissions",
         entry.permissions,
-        &MUSE_PERMISSIONS.map(CodexPermissions::as_str),
+        &MUSE_PERMISSIONS.map(SandboxPermissions::as_str),
         "the Muse slice supports only workspace-write or danger-full-access",
         "unsupported",
     )?
-    .unwrap_or(CodexPermissions::default().as_str());
+    .unwrap_or(SandboxPermissions::default().as_str());
     validated_native_choice(
         "approval_policy",
         entry.approval_policy,
-        &[CodexApprovalPolicy::Never.as_str()],
+        &[SandboxApprovalPolicy::Never.as_str()],
         "the Muse slice leaves approvals unconnected",
         "unsupported",
     )?;
@@ -72,7 +72,16 @@ fn fields(
     );
     snapshot.insert(
         "approval_policy".to_owned(),
-        Value::String(CodexApprovalPolicy::Never.as_str().to_owned()),
+        Value::String(SandboxApprovalPolicy::Never.as_str().to_owned()),
     );
     Ok(())
 }
+
+/// Muse `approval` modes.
+pub const MUSE_APPROVALS: [&str; 4] = ["onRequest", "promptUnmatched", "denyUnmatched", "allowAll"];
+
+/// Muse `permissions`: the subset of the Codex sandbox modes Muse maps.
+pub const MUSE_PERMISSIONS: [SandboxPermissions; 2] = [
+    SandboxPermissions::WorkspaceWrite,
+    SandboxPermissions::DangerFullAccess,
+];

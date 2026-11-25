@@ -1,7 +1,11 @@
 //! Composition binding for the native translator used by one-shot inference.
 
 use eliot_core::{Error, Result};
-use std::{ffi::OsString, path::Path, sync::OnceLock};
+use std::{
+    ffi::OsString,
+    path::{Path, PathBuf},
+    sync::OnceLock,
+};
 
 pub struct TextResult {
     pub text: String,
@@ -10,6 +14,12 @@ pub struct TextResult {
 
 #[derive(Clone, Copy)]
 pub struct TextInferenceAdapter {
+    pub executable_key: &'static str,
+    pub decode_route: fn(&[u8]) -> Option<PathBuf>,
+    pub invalid_executable: &'static str,
+    pub credentials_file: &'static str,
+    pub credentials_unavailable: &'static str,
+    pub credential_values: fn(&serde_json::Value) -> [Option<&str>; 2],
     pub arguments: fn() -> Vec<String>,
     pub environment: fn(&Path) -> Vec<(&'static str, OsString)>,
     pub result: fn(&[u8], usize) -> Result<TextResult>,

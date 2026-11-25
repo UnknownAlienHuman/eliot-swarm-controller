@@ -14,3 +14,5 @@ mod quota;
 pub async fn run_claude() -> eliot_core::Result<()> {
     host::run().await
 }
+
+pub use profile_config::{CLAUDE_EFFORT_LEVELS, CLAUDE_EFFORTS, CLAUDE_PERMISSION_MODES};

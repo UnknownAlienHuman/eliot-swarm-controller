@@ -3,8 +3,7 @@ mod provider;
 mod workflow_child;
 
 use eliot_core::{
-    ContextItem, Error, MUSE_VIEW_UNAVAILABLE_REASON_PREFIX, ProviderRestriction, Result,
-    SecretPolicy, SessionUsage, SourceHealthUpdate,
+    ContextItem, Error, ProviderRestriction, Result, SecretPolicy, SessionUsage, SourceHealthUpdate,
 };
 use eliot_plugin::{
     CommitSink, MAX_EVENT_BYTES, PeerClient,
@@ -1151,7 +1150,8 @@ impl EventProcessor {
             // The projection failure is distinct from an earlier transport gap.
             self.gap_reported = false;
             self.record_gap(&format!(
-                "{MUSE_VIEW_UNAVAILABLE_REASON_PREFIX} ({reason_label})"
+                "{} ({reason_label})",
+                crate::capabilities::VIEW_UNAVAILABLE_REASON_PREFIX
             ))
             .await?;
         }

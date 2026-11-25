@@ -21,3 +21,5 @@ pub async fn run() -> eliot_core::Result<()> {
 pub async fn run_hook_helper() -> eliot_core::Result<()> {
     hooks::run_helper().await
 }
+
+pub use profile_config::ANTIGRAVITY_MODES;

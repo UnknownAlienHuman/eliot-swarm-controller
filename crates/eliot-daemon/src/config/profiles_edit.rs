@@ -268,7 +268,7 @@ fn has_unsafe_profile_or_proxy(config: &super::FileConfig) -> bool {
             name: name.clone(),
             endpoint: proxy.attach.clone(),
             readiness_path: proxy.health.clone(),
-            provider_base_url: proxy.base_url_for.codex.clone(),
+            provider_base_url: proxy.base_url_for.provider_url.clone(),
             client_key_env_name: None,
         }
         .validate()
