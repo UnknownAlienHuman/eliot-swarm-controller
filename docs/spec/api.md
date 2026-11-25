@@ -3192,7 +3192,7 @@ fence before the CLI submits any Agent Stop commands. A new launch, including
 and an instruction to retry after the update. Previously queued launches stay
 queued. The writer accepts `restart` after Agent starts, unsettled commands
 and daemon-owned workers settle. Queued commands left on stopped or handed-off
-Agents are excluded from this gate. A restart refusal names the blocking
+Agents, and commands queued for an older generation, are excluded from this gate. A restart refusal names the blocking
 commands by verb, ID and state, with a bounded list. Claude requires a native terminal before
 replacement. The CLI stops an exact busy Claude generation under the fence
 and verifies its terminal, process exit, and reader drain while the Store is

@@ -140,22 +140,26 @@ const UNSETTLED_COMMANDS_WHERE: &str = "state IN ('accepted', 'queued', 'dispatc
                         AND s.source NOT IN ('daemon','os','git','workspace_process') AND s.state = 'open'))
                   AND NOT (state = 'queued' AND target IS NOT NULL AND EXISTS (
                     SELECT 1 FROM agents a WHERE a.id = commands.target
-                      AND a.generation = commands.generation
-                      AND (a.state IN ('stopped','failed','lost')
-                        OR EXISTS(SELECT 1 FROM agent_successors h WHERE h.agent = a.id
-                            AND h.generation = commands.generation))))";
+                      AND (commands.generation < a.generation OR (
+                        commands.generation = a.generation AND (
+                          a.state IN ('stopped','failed','lost')
+                          OR EXISTS(SELECT 1 FROM agent_successors h WHERE h.agent = a.id
+                              AND h.generation = commands.generation))))))";
 // Deferred Swarm notes can wait for a post-restart safe point. A claimed
 // note is dispatched and remains subject to the ordinary settlement gate.
+// Older-generation queued rows cannot dispatch. Future-generation inputs
+// may still acquire their binding and must retain their drain gate.
 const RESTART_COMMANDS_WHERE: &str = "state = 'dispatched'
     OR (state IN ('accepted', 'queued') AND NOT (
             verb = 'inject' AND principal GLOB 'swarm_note:*'
             AND COALESCE(json_extract(args, '$.point'), '') IN ('next_input', 'turn_safe_point')
         ) AND NOT (state = 'queued' AND target IS NOT NULL AND EXISTS (
             SELECT 1 FROM agents a WHERE a.id = commands.target
-              AND a.generation = commands.generation
-              AND (a.state IN ('stopped','failed','lost')
-                OR EXISTS(SELECT 1 FROM agent_successors h WHERE h.agent = a.id
-                    AND h.generation = commands.generation))
+              AND (commands.generation < a.generation OR (
+                commands.generation = a.generation AND (
+                  a.state IN ('stopped','failed','lost')
+                  OR EXISTS(SELECT 1 FROM agent_successors h WHERE h.agent = a.id
+                      AND h.generation = commands.generation))))
         )))";
 const COMMAND_RECORD_SELECT: &str = command_record_select!();
 /// Live Agent rows that can still produce work. Shared by the bounded drain
