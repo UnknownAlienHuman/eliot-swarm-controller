@@ -449,8 +449,8 @@ existing writers before claiming exclusive workspace custody. An Owner
 selects one exact generation with `project assignment claim --revision`.
 Only a root already authorized for the execution project can acquire its
 assignment. Claim binds a ready retained managed worktree in the same
-transaction. A competing live or custody-held root blocks claim or fresh
-manager launch. Assignment is Swarm control authority. Filesystem isolation depends on the native sandbox.
+transaction. A competing root whose team retains live control or custody blocks claim or
+fresh manager launch. Assignment is Swarm control authority. Filesystem isolation depends on the native sandbox.
 
 A manager launch in managed multi-project mode reserves the assignment,
 the workspace and capacity in one Store transaction before any external

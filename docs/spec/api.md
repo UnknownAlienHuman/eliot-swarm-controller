@@ -574,8 +574,8 @@ semantics as ordinary launch. The CLI exposes them as `--no-policy REASON` and
 principals. An explicit Owner claim supplies the Agent ID, generation, and
 `expected_revision` from assignment readback. A stale revision yields
 `stale_assignment`. Claim and fresh manager launch refuse
-`legacy_project_writers` while another root retains independent control or
-unsettled custody. A successful claim links the selected Agent's ready
+`legacy_project_writers` while another root or its workers retain independent
+control or unsettled custody. A successful claim links the selected Agent's ready
 managed worktree when it has an exact retained match. A scoped claim omits
 the manager to select the caller. The project action
 `project.assignment.claim` grants self-claim under the configured profile allowlist.

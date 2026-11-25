@@ -182,11 +182,14 @@ pub(super) fn retained_root_writers(
         .prepare_cached(&format!(
             "SELECT a.id FROM agents a WHERE a.parent IS NULL AND a.observe_only=0 AND a.chat=0
                AND a.id IS NOT ?2
-               AND (a.state IN ('created','starting','idle','busy','waiting','unknown')
-                    OR a.capacity_generation IS NOT NULL
-                    OR EXISTS (SELECT 1 FROM processes p WHERE p.state <> 'exited'
-                        AND p.owner IN ('agent:a' || a.id || '#' || a.generation,
-                                        'workspace:a' || a.id || '#' || a.generation)))
+               AND EXISTS (
+                   SELECT 1 FROM agents member WHERE member.observe_only=0
+                   AND (member.id=a.id OR member.root=a.id)
+                   AND (member.state IN ('created','starting','idle','busy','waiting','unknown')
+                        OR member.capacity_generation IS NOT NULL
+                        OR EXISTS (SELECT 1 FROM processes p WHERE p.state <> 'exited'
+                            AND p.owner IN ('agent:a' || member.id || '#' || member.generation,
+                                            'workspace:a' || member.id || '#' || member.generation))))
                AND (a.project=?1 OR (NOT EXISTS (
                     SELECT 1 FROM project_registrations known WHERE known.id=a.project)
                     AND EXISTS (SELECT 1 FROM project_registrations r WHERE r.id=?1 AND ({evidence}))))
