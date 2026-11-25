@@ -915,6 +915,10 @@ impl ClaudePlugin {
                             "timeout": events::TOOL_HOOK_TIMEOUT_SECONDS,
                         }],
                         "PostToolUse": [{
+                            "hookCallbackIds": [callback_id.clone()],
+                            "timeout": events::TOOL_HOOK_TIMEOUT_SECONDS,
+                        }],
+                        "PostToolUseFailure": [{
                             "hookCallbackIds": [callback_id],
                             "timeout": events::TOOL_HOOK_TIMEOUT_SECONDS,
                         }]
