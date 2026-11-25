@@ -3511,6 +3511,31 @@ detached with the same target data directory. For subsequent updates, the
 operator closes a changed companion only when it can verify the process it
 started for that directory.
 
+Before release metadata inspection, the updater hashes the selected executable
+and stages those exact bytes as a read-only, content-addressed
+`.swarm-release-<sha256>` file beside it, preserving executable permissions.
+The selected release directory remains the child working directory. Metadata
+inspection, Store preflight and candidate spawn all use the staged path. A
+pre-existing artifact is reused only when it is a regular non-symlink file and
+its bytes match the digest in its name. An incomplete artifact created by the
+current attempt is removed on staging failure; if that cleanup fails, the
+result is uncertain and the failure reports the retained path. Validated
+versioned artifacts are retained after success, refusal and rollback. The
+updater does not prune them; an operator may remove one only after confirming
+that no running process executes that image.
+
+The updater binds the reported release hash to the launched process image as
+well as to the staged file. On Windows it opens the staged file with read
+sharing only before preflight and holds that handle through candidate health
+validation, denying replacement, writes and deletion for that interval. On
+Linux, after candidate publication and again at healthy admission, it hashes
+`/proc/<published-pid>/exe` while rechecking that PID's recorded daemon identity;
+this reads the inode mapped by that exact process even if the source pathname
+has since changed. If the process image cannot be read or its hash differs,
+the updater does not apply the staged release's Store schema to rollback
+decisions. It leaves the candidate, current Store and backup in place, keeps
+interrupted Agents held, and reports the candidate PID for Owner recovery.
+
 **Private stand (#837).** `stand up` creates a fresh private daemon directory
 and a scratch Git repository inside it. Repeat `--profile NAME` to import
 profiles from the current settings or from `--settings FILE`. The private

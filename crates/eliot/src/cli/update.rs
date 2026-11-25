@@ -391,12 +391,33 @@ async fn run_update(
             .await);
         }
     };
-    if let Err(error) = check_health(&startup_path, &replacement).await {
+    if let Err(error) = verify_running_release(&startup_path, &replacement, &sha256) {
         return Ok(rollback(
             &startup_path,
             &previous,
             &backup,
-            RollbackStore::Published(&replacement, candidate.store_schema),
+            RollbackStore::PublishedIdentityUnknown(&replacement),
+            error.message,
+            UpdateAgents {
+                before,
+                stopped,
+                mode,
+            },
+            json_output,
+        )
+        .await);
+    }
+    if let Err(error) = check_health(&startup_path, &replacement, &sha256).await {
+        let store = if error.code.as_deref() == Some("release_identity_mismatch") {
+            RollbackStore::PublishedIdentityUnknown(&replacement)
+        } else {
+            RollbackStore::Published(&replacement, candidate.store_schema)
+        };
+        return Ok(rollback(
+            &startup_path,
+            &previous,
+            &backup,
+            store,
             error.message,
             UpdateAgents {
                 before,
@@ -497,6 +518,7 @@ enum RollbackStore<'a> {
     Current,
     Unpublished,
     Published(&'a DaemonInfo, i64),
+    PublishedIdentityUnknown(&'a DaemonInfo),
 }
 
 struct UpdateAgents {
@@ -526,7 +548,11 @@ impl StoreBackup<'_> {
     }
 }
 
-async fn check_health(path: &Path, replacement: &DaemonInfo) -> Result<(), Failure> {
+async fn check_health(
+    path: &Path,
+    replacement: &DaemonInfo,
+    expected_sha256: &str,
+) -> Result<(), Failure> {
     let readiness_deadline = Instant::now() + STARTUP_WAIT;
     let mut healthy_since = None;
     loop {
@@ -542,6 +568,7 @@ async fn check_health(path: &Path, replacement: &DaemonInfo) -> Result<(), Failu
                 let since = healthy_since.get_or_insert_with(Instant::now);
                 if since.elapsed() >= Duration::from_secs(3) {
                     check_same_daemon(path, replacement)?;
+                    verify_running_release(path, replacement, expected_sha256)?;
                     return Ok(());
                 }
             }
@@ -565,6 +592,56 @@ async fn check_health(path: &Path, replacement: &DaemonInfo) -> Result<(), Failu
         )]
         sleep(Duration::from_millis(250)).await;
     }
+}
+
+fn verify_running_release(
+    path: &Path,
+    candidate: &DaemonInfo,
+    expected_sha256: &str,
+) -> Result<(), Failure> {
+    let image = {
+        #[cfg(target_os = "linux")]
+        {
+            PathBuf::from(format!("/proc/{}/exe", candidate.pid))
+        }
+        #[cfg(windows)]
+        {
+            running_binary(candidate).map_err(|error| {
+                release_identity_failure(format!("cannot read candidate process image: {error}"))
+            })?
+        }
+        #[cfg(not(any(target_os = "linux", windows)))]
+        {
+            let _ = candidate;
+            return Err(release_identity_failure(
+                "running image verification is unsupported on this platform".to_owned(),
+            ));
+        }
+    };
+    check_same_daemon(path, candidate).map_err(|error| release_identity_failure(error.message))?;
+    if !daemon_alive(candidate).map_err(|error| {
+        release_identity_failure(format!("cannot verify candidate process identity: {error}"))
+    })? {
+        return Err(release_identity_failure(
+            "candidate process exited before its running image could be verified".to_owned(),
+        ));
+    }
+    let running_sha256 = binary_sha256(&image).map_err(|error| {
+        release_identity_failure(format!("cannot hash candidate process image: {error}"))
+    })?;
+    check_same_daemon(path, candidate).map_err(|error| release_identity_failure(error.message))?;
+    if running_sha256 != expected_sha256 {
+        return Err(release_identity_failure(format!(
+            "candidate process image SHA-256 {running_sha256} does not match verified release {expected_sha256}"
+        )));
+    }
+    Ok(())
+}
+
+fn release_identity_failure(message: String) -> Failure {
+    let mut failure = Failure::new(4, message);
+    failure.code = Some("release_identity_mismatch".to_owned());
+    failure
 }
 
 async fn finish_committed_restart(path: &Path, old: &DaemonInfo) -> Result<(), Failure> {
@@ -1193,11 +1270,18 @@ async fn rollback(
     json_output: bool,
 ) -> u8 {
     let mut store_restored = false;
-    let published = match store {
-        RollbackStore::Published(candidate, _) => Some(candidate),
+    let retained_candidate = match store {
+        RollbackStore::Published(candidate, schema) if schema != previous.store_schema => {
+            Some(candidate.pid)
+        }
+        RollbackStore::PublishedIdentityUnknown(candidate) => Some(candidate.pid),
+        RollbackStore::Published(candidate, _) => Some(candidate.pid),
         _ => None,
     };
-    let retained_candidate = published.map(|candidate| candidate.pid);
+    let published = match store {
+        RollbackStore::Published(candidate, _) | RollbackStore::PublishedIdentityUnknown(candidate) => Some(candidate),
+        _ => None,
+    };
     let mut pending = json!({
         "restart_id": backup.restart_id, "state": "rollback_requested",
         "candidate_pid": retained_candidate, "startup_health": agents_at_update.health,
@@ -1218,6 +1302,12 @@ async fn rollback(
                 return Err(Failure::new(4, "the candidate published a newer Store schema and may still be serving; the current Store and backup are retained"));
             }
             retire_failed_candidate(path, current).await?;
+        }
+        if matches!(store, RollbackStore::PublishedIdentityUnknown(_)) {
+            return Err(Failure::new(
+                4,
+                "candidate executable identity is unverified; candidate, current Store, and backup are retained",
+            ));
         }
         // Do not race a surviving candidate or open a second writer.
         let offline = lock_offline(path).map_err(Failure::for_read)?;
@@ -1354,46 +1444,76 @@ fn prepare_update_release(source: &Path) -> Result<(PathBuf, String), Failure> {
             ));
         }
     };
-    if artifact_metadata.is_none() {
-        let mut input = std::fs::File::open(source)
-            .map_err(|error| Failure::new(2, format!("open selected release: {error}")))?;
-        let output = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&artifact)
-            .map_err(|error| {
-                if error.kind() == std::io::ErrorKind::AlreadyExists {
-                    Failure::new(2, "versioned release image appeared while staging")
-                } else {
-                    Failure::new(2, format!("create versioned release image: {error}"))
-                }
-            })?;
-        if let Err(error) = std::io::copy(&mut input, &mut output).and_then(|_| output.sync_all()) {
-            let _ = std::fs::remove_file(&artifact);
+    let needs_stage = artifact_metadata.is_none();
+    let mut created_by_attempt = false;
+    let staged = (|| {
+        if needs_stage {
+            let mut input = std::fs::File::open(source)
+                .map_err(|error| Failure::new(2, format!("open selected release: {error}")))?;
+            let output = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&artifact)
+                .map_err(|error| {
+                    if error.kind() == std::io::ErrorKind::AlreadyExists {
+                        Failure::new(2, "versioned release image appeared while staging")
+                    } else {
+                        Failure::new(2, format!("create versioned release image: {error}"))
+                    }
+                })?;
+            created_by_attempt = true;
+            std::io::copy(&mut input, &output)
+                .and_then(|_| output.sync_all())
+                .map_err(|error| {
+                    Failure::new(2, format!("stage versioned release image: {error}"))
+                })?;
+        }
+        let staged_digest = binary_sha256(&artifact).map_err(Failure::for_read)?;
+        if staged_digest != digest {
             return Err(Failure::new(
                 2,
-                format!("stage versioned release image: {error}"),
+                "versioned release image bytes do not match the selected release",
             ));
         }
+        let mut permissions = std::fs::metadata(source)
+            .map_err(|error| Failure::new(2, format!("inspect selected release: {error}")))?
+            .permissions();
+        permissions.set_readonly(true);
+        std::fs::set_permissions(&artifact, permissions).map_err(|error| {
+            Failure::new(2, format!("protect versioned release image: {error}"))
+        })?;
+        Ok((artifact.clone(), staged_digest))
+    })();
+    if created_by_attempt {
+        match staged {
+            Err(mut failure) => {
+                if let Err(error) = remove_incomplete_release(&artifact) {
+                    failure.exit_code = 4;
+                    failure.message = format!(
+                        "{}; incomplete release image cleanup failed for {}: {error}",
+                        failure.message,
+                        artifact.display()
+                    );
+                }
+                Err(failure)
+            }
+            result => result,
+        }
+    } else {
+        staged
     }
-    let mut permissions = std::fs::metadata(source)
-        .map_err(|error| Failure::new(2, format!("inspect selected release: {error}")))?
-        .permissions();
-    permissions.set_readonly(true);
-    if let Err(error) = std::fs::set_permissions(&artifact, permissions) {
-        return Err(Failure::new(
-            2,
-            format!("protect versioned release image: {error}"),
-        ));
+}
+
+fn remove_incomplete_release(path: &Path) -> std::io::Result<()> {
+    if let Ok(metadata) = std::fs::metadata(path) {
+        let mut permissions = metadata.permissions();
+        permissions.set_readonly(false);
+        std::fs::set_permissions(path, permissions)?;
     }
-    let staged_digest = binary_sha256(&artifact).map_err(Failure::for_read)?;
-    if staged_digest != digest {
-        return Err(Failure::new(
-            2,
-            "versioned release image bytes do not match the selected release",
-        ));
+    match std::fs::remove_file(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        result => result,
     }
-    Ok((artifact, staged_digest))
 }
 
 /// Keep a Windows handle open from before preflight through candidate health
