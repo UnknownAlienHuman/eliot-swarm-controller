@@ -1160,8 +1160,11 @@ The host binds chunks to a committed live turn of the authenticated plugin.
 At most 64 live turns hold the latest message's preview, with 32 KiB of input
 per turn and 2 KiB per chunk. The host uses the same source credentials as
 committed messages, redacts accumulated text across chunk boundaries,
-and withholds dangling literal-secret prefixes and up to 128 bytes of an
-unfinished word. It coalesces updates at 100 ms and drops the preview on turn end or
+and withholds dangling literal-secret prefixes and the whole trailing
+unbroken run (no whitespace) while it exceeds the 128-byte tail, until
+whitespace arrives or the run reaches a 4 KiB cap; at the cap the complete
+run is shown only after redaction runs over it. It coalesces updates at
+100 ms and drops the preview on turn end or
 generation change. Preview bytes have no Store rows, sequence numbers, or replay.
 The existing message-completion path still commits only the completed message.
 Its optional `data.message_id` correlates the native message with its preview.

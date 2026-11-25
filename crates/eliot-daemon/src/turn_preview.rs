@@ -17,7 +17,10 @@ const MAX_WAITERS: usize = 32;
 const MAX_WAITERS_PER_PRINCIPAL: usize = 4;
 // Known literals use exact prefix protection. The shape matcher sees the
 // full retained prefix, while an unfinished ordinary word costs at most this tail.
+// A trailing unbroken run longer than the tail is withheld whole until
+// whitespace or the run cap; at the cap the complete run is redacted and shown.
 const SHAPE_TAIL_BYTES: usize = 128;
+const MAX_UNBROKEN_RUN_BYTES: usize = 4096;
 const COALESCE: Duration = Duration::from_millis(100);
 
 #[derive(Clone)]
@@ -109,7 +112,15 @@ impl Snapshot {
         let (_, end) = policy.redact_prefix(self.text.as_bytes(), false);
         let mut text = policy.redact_text(&self.text[..self.text.floor_char_boundary(end)]);
         let unfinished = text.len() - text.trim_end_matches(|ch: char| !ch.is_whitespace()).len();
-        let limit = (text.len() - unfinished.min(SHAPE_TAIL_BYTES)).min(MAX_TURN_PREVIEW_BYTES);
+        let tail = unfinished.min(SHAPE_TAIL_BYTES);
+        let withheld = if unfinished >= MAX_UNBROKEN_RUN_BYTES {
+            0
+        } else if unfinished > tail {
+            unfinished
+        } else {
+            tail
+        };
+        let limit = (text.len() - withheld).min(MAX_TURN_PREVIEW_BYTES);
         text.truncate(text.floor_char_boundary(limit));
         Some(TurnPreview {
             message_id: self.message_id.clone(),
