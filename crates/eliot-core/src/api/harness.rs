@@ -1748,16 +1748,14 @@ pub enum CatalogueProvider {
     ModelPrefix,
 }
 
-/// Provider display label for a model catalogue ID.
+/// Provider label for a model ID, resolved through the registered adapters.
+/// Panics if the built-in adapter declarations are not registered.
 pub fn catalog_provider(harness: &str, id: &str) -> String {
+    let strategy = HarnessCapabilities::of(harness).catalogue_provider;
     let prefix = id.split_once('/').map(|(provider, _)| provider);
     if let Some(provider) = prefix.filter(|provider| !provider.trim().is_empty()) {
         return provider.to_owned();
     }
-    let strategy = BUILTIN_CAPABILITIES
-        .get()
-        .and_then(|_| HarnessCapabilities::for_harness(harness))
-        .map_or(CatalogueProvider::Harness, |caps| caps.catalogue_provider);
     match strategy {
         CatalogueProvider::Harness => harness,
         CatalogueProvider::Fixed(provider) => provider,

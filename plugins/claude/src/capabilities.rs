@@ -54,7 +54,14 @@ pub fn declaration() -> HarnessCapabilities {
                     "ANTHROPIC_VERTEX_BASE_URL",
                     "ANTHROPIC_VERTEX_PROJECT_ID",
                 ],
-                binary_modes: &EXTERNAL_ROUTE_MARKERS[3..],
+                binary_modes: &[
+                    "CLAUDE_CODE_USE_ANTHROPIC_AWS",
+                    "CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD",
+                    "CLAUDE_CODE_USE_BEDROCK",
+                    "CLAUDE_CODE_USE_VERTEX",
+                    "CLAUDE_CODE_USE_FOUNDRY",
+                    "CLAUDE_CODE_USE_MANTLE",
+                ],
                 credential_presence: &[
                     "ANTHROPIC_API_KEY",
                     "ANTHROPIC_AUTH_TOKEN",

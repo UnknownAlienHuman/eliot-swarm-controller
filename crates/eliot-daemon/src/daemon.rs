@@ -454,7 +454,16 @@ async fn initialize_runtime(
         })
     })
     .await
-    .map_err(|_| Error::new("internal", "startup Store open did not complete"))??;
+    .map_err(|error| {
+        let evidence = Error::new("internal", error.to_string());
+        logging::record(
+            &policy,
+            "daemon.store_open_join_failed",
+            &[],
+            Some(&evidence),
+        );
+        Error::new("internal", "startup Store open did not complete")
+    })??;
     store.interrupt_bulk_cleanup_jobs(now_ms())?;
     let provider_scopes = crate::config::configured_provider_account_scopes(data_dir.path())
         .map_err(startup_config_failure)?;
