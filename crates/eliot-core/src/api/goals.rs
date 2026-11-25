@@ -1023,7 +1023,7 @@ impl GoalRoundCloseRequest {
     }
 
     pub fn validate_response(&self, response: &GoalRoundCloseResponse) -> Result<()> {
-        if response.id != self.id
+        if super::agent_lifecycle::validate_ulid(&response.id).is_err()
             || response.agent != self.agent
             || response.round != self.round
             || response.generation < 1
@@ -1043,6 +1043,7 @@ impl GoalRoundCloseRequest {
 
 #[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GoalRoundCloseResponse {
+    /// The original assertion id, including when read back through a fresh request id.
     pub id: String,
     pub agent: String,
     pub round: String,

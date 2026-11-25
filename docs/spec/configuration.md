@@ -2260,8 +2260,10 @@ never spawned. Without exact checker evidence, the fence remains and
 `swarm why` names the blocking round. After verifying that the checker and
 its descendants have exited or never started, the Owner can record
 `swarm goal round close A --round KEY`. Add `--generation` and `--revision`
-when more than one historical marker matches. The receipt records an Owner
-assertion, distinct from observed checker closure.
+when more than one historical marker matches. Swarm refuses an assertion
+while retained process custody for that generation is running or uncertain.
+The receipt records an Owner assertion, distinct from observed checker
+closure. Repeating the same bound assertion returns its original receipt.
 The round key remains burned and the Goal remains
 paused until its unresolved work is settled. Hold leaves those sessions for
 explicit resume. Previously admitted commands still follow durable command

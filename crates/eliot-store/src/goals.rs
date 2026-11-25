@@ -1795,21 +1795,64 @@ impl Store {
                     )
                 });
             };
-            let already_closed = tx
+            let prior = tx
                 .query_row(
-                    "SELECT EXISTS(SELECT 1 FROM events INDEXED BY events_agent
+                    "SELECT seq, kind, json_extract(data,'$.id')
+                 FROM events INDEXED BY events_agent
                  WHERE agent=?1 AND generation=?2 AND ts=?3 AND source='daemon'
-                   AND kind IN ('goal.check_custody_closed','goal.check_custody_asserted')
+                   AND (kind='goal.check_custody_closed'
+                     OR (kind='goal.check_custody_asserted' AND json_extract(data,'$.principal')='owner'))
                    AND json_extract(data,'$.mode')='eliot'
-                   AND json_extract(data,'$.revision')=?4 AND json_extract(data,'$.round_key')=?5)",
+                   AND json_extract(data,'$.revision')=?4 AND json_extract(data,'$.round_key')=?5
+                 ORDER BY seq DESC LIMIT 1",
                     params![agent, generation, updated_at, revision, request.round],
-                    |row| row.get::<_, bool>(0),
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, Option<String>>(2)?)),
                 )
+                .optional()
                 .map_err(sql_error)?;
-            if already_closed {
+            if let Some((event_seq, closure_kind, id)) = prior {
+                if closure_kind == "goal.check_custody_asserted" {
+                    let id = id.ok_or_else(|| {
+                        Error::new("source_integrity", "Goal assertion lacks its write id")
+                    })?;
+                    validate_ulid(&id)?;
+                    let value = GoalRoundCloseResponse {
+                        id,
+                        agent: request.agent.clone(),
+                        round: request.round.clone(),
+                        generation: *generation,
+                        revision: *revision,
+                        event_seq,
+                    };
+                    retain_goal_result(&tx, &request.id, OWNER, METHOD, &digest, &value, now)?;
+                    commit_transaction(tx, &self.write_faulted)?;
+                    return Ok(Change {
+                        value,
+                        events: Vec::new(),
+                    });
+                }
                 return Err(Error::new(
                     "bad_state",
                     "Goal round custody is already closed",
+                ));
+            }
+            // Legacy rows cannot identify the checker more finely than its
+            // owned generation. Treat all unexited custody there as a fence.
+            let live = tx
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM processes INDEXED BY processes_owner
+                 WHERE owner IN (?1, ?2) AND state IN ('running', 'unknown'))",
+                    params![
+                        ProcessSourceKind::Agent.owner(&request.agent, *generation),
+                        ProcessSourceKind::Workspace.owner(&request.agent, *generation),
+                    ],
+                    |row| row.get::<_, bool>(0),
+                )
+                .map_err(sql_error)?;
+            if live {
+                return Err(Error::new(
+                    "busy",
+                    "historical Goal generation still owns unexited processes",
                 ));
             }
             db!(tx.execute(
