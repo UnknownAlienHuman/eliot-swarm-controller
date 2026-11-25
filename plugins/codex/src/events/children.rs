@@ -1211,11 +1211,12 @@ impl EventProcessor {
                     .child_states
                     .get_mut(child_thread)
                     .ok_or_else(|| Error::new("bad_state", "Codex child state missing"))?;
-                if let Some((id, data)) =
-                    state
-                        .warnings
-                        .observe(Some(child_thread), params, &policy)?
-                {
+                let malformed_before = state.warnings.malformed_dropped();
+                let observed = state
+                    .warnings
+                    .observe(Some(child_thread), params, &policy)?;
+                let malformed = state.warnings.malformed_dropped() > malformed_before;
+                if let Some((id, data)) = observed {
                     state
                         .commit_event(
                             &mut self.sink,
@@ -1227,6 +1228,10 @@ impl EventProcessor {
                         )
                         .await?;
                 }
+                if malformed {
+                    self.warnings.record_malformed_dropped();
+                }
+                self.status.malformed_warnings_dropped = self.warnings.malformed_dropped();
             }
             "mcpServer/startupStatus/updated" => {
                 let policy = SecretPolicy::new(self.secrets.iter().cloned());
@@ -1234,11 +1239,13 @@ impl EventProcessor {
                     .child_states
                     .get_mut(child_thread)
                     .ok_or_else(|| Error::new("bad_state", "Codex child state missing"))?;
-                if let Some((id, data)) =
+                let malformed_before = state.warnings.malformed_dropped();
+                let observed =
                     state
                         .warnings
-                        .observe_startup_status(Some(child_thread), params, &policy)?
-                {
+                        .observe_startup_status(Some(child_thread), params, &policy)?;
+                let malformed = state.warnings.malformed_dropped() > malformed_before;
+                if let Some((id, data)) = observed {
                     state
                         .commit_event(
                             &mut self.sink,
@@ -1250,6 +1257,10 @@ impl EventProcessor {
                         )
                         .await?;
                 }
+                if malformed {
+                    self.warnings.record_malformed_dropped();
+                }
+                self.status.malformed_warnings_dropped = self.warnings.malformed_dropped();
             }
             _ if is_advisory_notification(method) => {}
             _ => {

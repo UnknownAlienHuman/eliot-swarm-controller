@@ -29,7 +29,7 @@ struct StartupStatus {
 #[derive(Default)]
 pub(super) struct Warnings {
     counts: HashMap<String, u64>,
-    sequence: u64,
+    malformed_dropped: u64,
     unbound_dropped: u64,
 }
 
@@ -41,6 +41,7 @@ impl Warnings {
         policy: &SecretPolicy,
     ) -> Result<Option<(String, Value)>> {
         let Ok(notification) = serde_json::from_value::<Notification>(params) else {
+            self.record_malformed_dropped();
             return Ok(None);
         };
         let code = notification
@@ -64,6 +65,7 @@ impl Warnings {
         policy: &SecretPolicy,
     ) -> Result<Option<(String, Value)>> {
         let Ok(notification) = serde_json::from_value::<StartupStatus>(params) else {
+            self.record_malformed_dropped();
             return Ok(None);
         };
         if notification.status != "failed" {
@@ -90,6 +92,14 @@ impl Warnings {
 
     pub(super) fn unbound_dropped(&self) -> u64 {
         self.unbound_dropped
+    }
+
+    pub(super) fn malformed_dropped(&self) -> u64 {
+        self.malformed_dropped
+    }
+
+    fn record_malformed_dropped(&mut self) {
+        self.malformed_dropped = self.malformed_dropped.saturating_add(1);
     }
 
     pub(super) fn record_unbound_dropped(&mut self) {
@@ -130,14 +140,15 @@ impl Warnings {
             message,
             truncated,
         };
-        self.sequence = self
-            .sequence
-            .checked_add(1)
-            .ok_or_else(|| Error::new("source_integrity", "Codex warning sequence exhausted"))?;
+        // Codex supplies no identity for these session-scoped advisory
+        // notifications. Give each observed occurrence its own identity so
+        // repeated identical warnings remain distinct and processor restarts
+        // cannot reuse a process-local counter value.
+        let occurrence_id = ulid::Ulid::new();
         let id = super::event_id(
             thread,
             "session",
-            &format!("warning-{}", self.sequence),
+            &format!("warning-{occurrence_id}"),
             NATIVE_WARNING_EVENT,
         )?;
         let data = serde_json::to_value(warning)

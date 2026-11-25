@@ -810,7 +810,12 @@ records a running count per bounded code and redacts the message before
 truncating it. The schema has no code field, so uncoded notifications use
 `warning`. The diagnostic remains thread-scoped and visible in retained events
 after the turn ends. Missing or mismatched thread bindings increment
-`unbound_warnings_dropped` in the native snapshot; their message is discarded.
+`unbound_warnings_dropped` in the native snapshot; malformed notification or
+startup-status payloads increment `malformed_warnings_dropped`. Both discard
+the payload text. Codex provides no native ID for these notices, so every
+accepted occurrence receives a fresh occurrence ID; identical repeated
+warnings remain separate facts, and adapter retries do not replay uncertain
+event writes.
 
 The installed schema describes `account/rateLimits/updated` as a sparse rolling
 update. An owned direct account stream translates the primary and secondary

@@ -65,6 +65,7 @@ pub(crate) struct EventStatus {
     pub batch_unknown: bool,
     pub source_unknown: bool,
     pub unbound_warnings_dropped: u64,
+    pub malformed_warnings_dropped: u64,
     pub stopped: bool,
     pub session_history_failure_at: Option<Instant>,
     pub compaction: Option<CompactionProgress>,
@@ -1809,6 +1810,7 @@ impl EventProcessor {
                     self.commit_event(NATIVE_WARNING_EVENT, id, data).await?;
                 }
                 self.status.unbound_warnings_dropped = self.warnings.unbound_dropped();
+                self.status.malformed_warnings_dropped = self.warnings.malformed_dropped();
             }
             "mcpServer/startupStatus/updated" => {
                 let policy = SecretPolicy::new(self.secrets.iter().cloned());
@@ -1820,6 +1822,7 @@ impl EventProcessor {
                     self.commit_event(NATIVE_WARNING_EVENT, id, data).await?;
                 }
                 self.status.unbound_warnings_dropped = self.warnings.unbound_dropped();
+                self.status.malformed_warnings_dropped = self.warnings.malformed_dropped();
             }
             _ if is_advisory_notification(method) => {}
             _ => {
