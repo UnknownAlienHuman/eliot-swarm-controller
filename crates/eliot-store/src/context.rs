@@ -78,6 +78,71 @@ pub struct TurnInsertionEvidence {
 }
 
 impl Store {
+    /// Expire a bounded slice of unclaimed next-input items without a SEND.
+    pub fn expire_next_input_contexts(&mut self, now: i64) -> Result<Vec<Event>> {
+        const DUE: &str = "SELECT id, target, generation
+            FROM commands INDEXED BY commands_next_input_context_expiry
+            WHERE verb='inject' AND state IN ('accepted','queued')
+              AND target IS NOT NULL AND generation IS NOT NULL AND turn_id IS NULL
+              AND json_extract(args, '$.point')='next_input'
+              AND json_type(args, '$.expires_at_ms')='integer'
+              AND json_extract(args, '$.expires_at_ms') <= ?1
+            ORDER BY json_extract(args, '$.expires_at_ms'), rowid LIMIT ?2";
+        const BATCH: i64 = 32;
+
+        self.ensure_writer_healthy()?;
+        let result = (|| {
+            if !self
+                .connection
+                .prepare_cached(DUE)
+                .map_err(sql_error)?
+                .exists(params![now, 1])
+                .map_err(sql_error)?
+            {
+                return Ok(Vec::new());
+            }
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            let due = tx
+                .prepare_cached(DUE)
+                .map_err(sql_error)?
+                .query_map(params![now, BATCH], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                })
+                .map_err(sql_error)?
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(sql_error)?;
+            let mut events = Vec::with_capacity(due.len());
+            for (id, target, generation) in due {
+                let record = load_command_record(&tx, &id)?.ok_or_else(|| {
+                    Error::new("source_integrity", "expired next-input command disappeared")
+                })?;
+                settle_pending_context_refusal(
+                    &tx,
+                    &record,
+                    target,
+                    generation,
+                    (
+                        "expired",
+                        Some("next-input delivery deadline elapsed before claim"),
+                    ),
+                    now,
+                    &mut events,
+                )?;
+            }
+            commit_transaction(tx, &self.write_faulted)?;
+            Ok(events)
+        })();
+        self.fault_on_persistence_error(&result);
+        result
+    }
+
     pub fn session_ready_event(&self, agent: &str, generation: i64) -> Result<Option<Event>> {
         let record = self
             .connection

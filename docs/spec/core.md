@@ -597,7 +597,10 @@ The ordinary router dispatches each `active_turn` command as
 one immediate native effect with no queue consumer. Admission or queue acceptance
 does not establish application.
 
-For `next_input`, the router claims eligible, unexpired items as part of dispatching the
+The daemon's one-second maintenance tick settles due, unclaimed `next_input`
+items as rejected with `expired` in bounded batches. Store commits the expiry
+and command event together. For `next_input`, the router claims eligible,
+unexpired items as part of dispatching the
 next ordinary SEND and the adapter prepends them inside that same native send. An item that
 is unfit even alone is rejected with `frame_too_large` so it cannot wedge the queue; anything
 that fits alone but not with the current batch ends the entire scan and stays pending for a

@@ -206,6 +206,9 @@ async fn run_provider_maintenance(
                 continue;
             }
             _ = provider_ticker.tick() => {
+                if let Err(error) = router.expire_next_input_contexts().await {
+                    logging::record(&policy, "daemon.context_expiry_failed", &[], Some(&error));
+                }
                 router.flush_repeat_failures(false).await;
                 let available = eliot_store::PROVIDER_PROBE_BATCH_LIMIT
                     .saturating_sub(provider_probe_tasks.len());
