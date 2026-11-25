@@ -2171,38 +2171,12 @@ impl Store {
     /// with the same predicate as the total. The caller marks truncation
     /// honestly against the total for any omission reason.
     pub fn list_retained_unknown_commands(&self, limit: usize) -> Result<Vec<Command>> {
-        validate_limit(limit)?;
-        let sql = format!(
-            "{COMMAND_RECORD_SELECT} WHERE {RETAINED_UNKNOWN_PREDICATE} ORDER BY created_at, rowid LIMIT ?1"
-        );
-        let mut statement = self.connection.prepare(&sql).map_err(sql_error)?;
-        let rows = statement
-            .query_map([limit as i64], command_record_from_row)
-            .map_err(sql_error)?;
-        let mut commands = Vec::new();
-        for row in rows {
-            commands.push(command_from_raw(row.map_err(sql_error)?)?.command);
-        }
-        enforce_page_bytes(&mut commands)?;
-        Ok(commands)
+        self.list_commands_matching(RETAINED_UNKNOWN_PREDICATE, limit)
     }
 
     /// Return unsettled commands without letting terminal history consume the limit.
     pub fn list_unsettled_commands(&self, limit: usize) -> Result<Vec<Command>> {
-        validate_limit(limit)?;
-        let sql = format!(
-            "{COMMAND_RECORD_SELECT} WHERE {UNSETTLED_COMMANDS_WHERE} ORDER BY created_at, rowid LIMIT ?1"
-        );
-        let mut statement = self.connection.prepare(&sql).map_err(sql_error)?;
-        let rows = statement
-            .query_map([limit as i64], command_record_from_row)
-            .map_err(sql_error)?;
-        let mut commands = Vec::new();
-        for row in rows {
-            commands.push(command_from_raw(row.map_err(sql_error)?)?.command);
-        }
-        enforce_page_bytes(&mut commands)?;
-        Ok(commands)
+        self.list_commands_matching(UNSETTLED_COMMANDS_WHERE, limit)
     }
 
     /// Return unsettled commands with retained-unresolved unknowns excluded in
@@ -2213,9 +2187,16 @@ impl Store {
     /// returned page and keep blocking while unlisted commands remain: an
     /// unlisted id is never excused.
     pub fn list_unsettled_commands_excluding_retained(&self, limit: usize) -> Result<Vec<Command>> {
+        self.list_commands_matching(
+            &format!("{UNSETTLED_COMMANDS_WHERE} AND NOT ({RETAINED_UNKNOWN_PREDICATE})"),
+            limit,
+        )
+    }
+
+    fn list_commands_matching(&self, predicate: &str, limit: usize) -> Result<Vec<Command>> {
         validate_limit(limit)?;
         let sql = format!(
-            "{COMMAND_RECORD_SELECT} WHERE {UNSETTLED_COMMANDS_WHERE} AND NOT ({RETAINED_UNKNOWN_PREDICATE}) ORDER BY created_at, rowid LIMIT ?1"
+            "{COMMAND_RECORD_SELECT} WHERE {predicate} ORDER BY created_at, rowid LIMIT ?1"
         );
         let mut statement = self.connection.prepare(&sql).map_err(sql_error)?;
         let rows = statement
