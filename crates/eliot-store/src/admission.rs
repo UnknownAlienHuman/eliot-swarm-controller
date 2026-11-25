@@ -1,6 +1,18 @@
 use super::*;
 use eliot_core::{is_attachment_verb, is_request_reply_verb, is_start_verb};
 
+fn require_expected_generation(expected: Option<i64>, current: i64) -> Result<()> {
+    if let Some(expected) = expected
+        && expected != current
+    {
+        return Err(Error::new(
+            "stale_generation",
+            format!("expected generation {expected}, current is {current}"),
+        ));
+    }
+    Ok(())
+}
+
 pub(super) fn command_semantic_payload(request: &SubmitCommand, mut args: Value) -> Result<Value> {
     // The resolved Goal is daemon-owned. Replays still bind the original
     // explicit Goal fields and opt-out reason carried by the caller.
@@ -1288,17 +1300,7 @@ fn admit_send_stop_tx(
     let agent_num = parse_agent_id(target)?;
     let agent = load_agent_by_num(tx, agent_num)?
         .ok_or_else(|| Error::new("not_found", format!("Agent {target} was not found")))?;
-    if let Some(expected) = request.expected_generation
-        && expected != agent.generation
-    {
-        return Err(Error::new(
-            "stale_generation",
-            format!(
-                "expected generation {expected}, current is {}",
-                agent.generation
-            ),
-        ));
-    }
+    require_expected_generation(request.expected_generation, agent.generation)?;
     if let Some(expected_turn) = request.expected_turn_id.as_deref() {
         let turn = if principal == "owner" && request.verb == "stop" {
             owner_control_turn(tx, &agent)?
@@ -1544,17 +1546,7 @@ fn admit_resume_tx(
             "resume is only supported for Codex, Muse, Claude, OpenCode, or Antigravity Agents with a retained native subject",
         ));
     }
-    if let Some(expected) = request.expected_generation
-        && expected != agent.generation
-    {
-        return Err(Error::new(
-            "stale_generation",
-            format!(
-                "expected generation {expected}, current is {}",
-                agent.generation
-            ),
-        ));
-    }
+    require_expected_generation(request.expected_generation, agent.generation)?;
     if request.expected_turn_id.is_some() {
         return Err(Error::new(
             "stale_generation",
@@ -1702,17 +1694,7 @@ fn admit_configure_tx(
     let agent_num = parse_agent_id(target)?;
     let agent = load_agent_by_num(tx, agent_num)?
         .ok_or_else(|| Error::new("not_found", format!("Agent {target} was not found")))?;
-    if let Some(expected) = request.expected_generation
-        && expected != agent.generation
-    {
-        return Err(Error::new(
-            "stale_generation",
-            format!(
-                "expected generation {expected}, current is {}",
-                agent.generation
-            ),
-        ));
-    }
+    require_expected_generation(request.expected_generation, agent.generation)?;
     if principal != "owner" {
         return Err(Error::new(
             "not_allowed",
@@ -1956,17 +1938,7 @@ pub(super) fn admit_control_tx(
     // Control-verb support is owned by the PluginHost manifest check;
     // Store admits every known control verb and retains the live
     // generation, state, turn, and request checks below.
-    if let Some(expected) = request.expected_generation
-        && expected != agent.generation
-    {
-        return Err(Error::new(
-            "stale_generation",
-            format!(
-                "expected generation {expected}, current is {}",
-                agent.generation
-            ),
-        ));
-    }
+    require_expected_generation(request.expected_generation, agent.generation)?;
     let turn_id =
         if principal == "owner" && request.verb == "interrupt" {
             if agent.native_ref.is_none() || agent.is_terminal() {
