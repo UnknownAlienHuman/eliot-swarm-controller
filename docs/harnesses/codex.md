@@ -164,10 +164,10 @@ an Agent create, replace, remove or corrupt loose objects or packs used by any r
 
 Each controlled Agent generation receives one generated server named
 `eliot_swarm_<start-command-ulid>`, using the existing authenticated loopback bridge
-when its URL is available, there is no configured HTTP proxy, the Agent token is
-already in the scoped MCP authority, and `pass_agent_identity_to_shell` is explicitly
-false. Codex then uses native streamable HTTP with `ELIOT_AGENT_TOKEN` as its bearer
-token environment reference and the exact Agent id and generation in request headers.
+when its URL is available, no HTTP proxy is configured, and the Agent token is already
+in the daemon-provided native launch environment. Codex then uses native streamable
+HTTP with `ELIOT_AGENT_TOKEN` as its bearer token environment reference and the exact
+Agent id and generation in request headers.
 Codex uses the daemon-provided scoped launch environment; the token is never written
 into config or argv. Shell access follows the existing
 `pass_agent_identity_to_shell` policy. If any condition is unavailable or unsafe,
