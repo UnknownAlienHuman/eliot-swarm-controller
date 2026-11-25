@@ -3511,6 +3511,54 @@ detached with the same target data directory. For subsequent updates, the
 operator closes a changed companion only when it can verify the process it
 started for that directory.
 
+Before release metadata inspection, under the updater transition lock, the
+updater validates or creates the private `update-images` directory under the
+selected data root. It hashes the selected executable and stages those exact
+bytes there as a read-only, content-addressed `.swarm-release-<sha256>` file,
+preserving executable permissions. Metadata inspection, Store preflight and
+candidate spawn all use the staged path; the selected release directory remains
+the daemon's working directory. A
+pre-existing artifact is reused only when it is a regular non-symlink file and
+its bytes match the digest in its name. A mismatched regular file or symlink at
+the exact updater-owned artifact path is removed before staging; a directory
+or an artifact that cannot be safely removed causes refusal. An incomplete
+artifact created by the current attempt is removed on staging failure; if that
+cleanup fails, the result is uncertain and the failure reports the retained
+path. The data-root path and `update-images` directory are checked as private
+real directories; symlink or reparse-point paths are refused. On Windows the
+optional desktop companion is staged, hash-verified and pinned by the same
+rules before launch, while retaining the selected release directory as its
+working directory. After startup is ready and the desktop start attempt has
+settled, Windows and Linux prune verified inactive images from this shared directory.
+It retains the active and previous daemon images and the active desktop image.
+The previous desktop image is retained by the exact digest in its private
+`DesktopRecord`; if that record is missing or unresolved, desktop images are
+retained. Windows refuses deletion of a mapped or otherwise in-use image and
+the updater restores its read-only protection. Linux unlinks inactive image
+paths; a process that still maps an image keeps its inode until exit. Other
+platforms leave images in place.
+
+The updater binds the reported release hash to the launched process image as
+well as to the staged file. On Windows it opens the staged file with read
+sharing only before preflight and holds that handle through candidate health
+validation, denying replacement, writes and deletion for that interval. On
+Linux, after candidate publication and again at healthy admission, it hashes
+`/proc/<published-pid>/exe` while rechecking that PID's recorded daemon identity;
+this reads the inode mapped by that exact process even if the source pathname
+has since changed. Unsupported platforms fail closed when verifying the running
+image and attempt the ordinary candidate rollback. If the process image cannot
+be read or its hash differs, the
+updater does not apply the staged release's Store schema to rollback decisions.
+It first attempts the ordinary lossless drain and waits for confirmed
+candidate exit. If drain or exit is unconfirmed, the unconfirmed candidate is
+held for settlement and the current Store and backup remain intact. After confirmed exit,
+it checks the previous executable against a copy of the current Store. Only a
+successful compatibility check permits that executable to restart on the
+current Store; this path never replaces the Store with the older backup.
+Proven incompatibility leaves the current Store and backup intact, keeps
+interrupted Agents held, and reports the candidate PID and recovery error for
+Owner action.
+
 **Private stand (#837).** `stand up` creates a fresh private daemon directory
 and a scratch Git repository inside it. Repeat `--profile NAME` to import
 profiles from the current settings or from `--settings FILE`. The private

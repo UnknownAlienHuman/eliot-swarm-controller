@@ -308,6 +308,16 @@ impl DataDir {
         &self.path
     }
 
+    /// Create or validate the fixed updater image directory under this already
+    /// verified private root. The CLI holds the operator transition lock.
+    pub(crate) fn update_images_directory(&self) -> Result<PathBuf> {
+        validate_private_root(&self.path)?;
+        let directory = self.path.join("update-images");
+        ensure_private_root(&directory)?;
+        validate_private_root(&directory)?;
+        Ok(directory)
+    }
+
     /// Read the bearer token from the current-user-only owner.token file.
     pub fn owner_token(&self) -> &str {
         self.owner_token

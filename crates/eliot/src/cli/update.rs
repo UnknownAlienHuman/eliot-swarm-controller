@@ -215,12 +215,30 @@ async fn run_update(
     if identity.principal != "owner" {
         return Err(Failure::new(3, "daemon update requires the local Owner"));
     }
+    let _transition = lock_transition(&data_dir).map_err(Failure::for_read)?;
     require_lossless_restart_drain(&data_dir).await?;
     let previous_binary = running_binary(&old).map_err(Failure::for_read)?;
     let previous_hash = binary_sha256(&previous_binary).map_err(Failure::for_read)?;
     let binary = release_binary(&source)?;
+    let working_directory = binary
+        .parent()
+        .ok_or_else(|| Failure::new(2, "invalid release working directory"))?
+        .to_owned();
+    let image_directory =
+        eliot_daemon::operator::update_images_directory(&data_dir).map_err(Failure::for_read)?;
+    #[cfg(windows)]
+    let previous_desktop_hash =
+        eliot_daemon::operator::recorded_desktop_sha256(&data_dir).map_err(Failure::for_read)?;
+    #[cfg(target_os = "linux")]
+    let previous_desktop_hash: Option<String> = None;
+    // Stage a content-addressed copy before inspecting it. The original path can
+    // change while the update drains; metadata, preflight, and spawn must all use
+    // the same staged bytes.
+    let (launch_binary, sha256) = prepare_update_release(&binary, &image_directory)?;
+    #[cfg(windows)]
+    let _launch_pin = pin_update_release(&launch_binary, &sha256)?;
     let previous = release_info(&previous_binary).await?;
-    let candidate = release_info(&binary).await?;
+    let candidate = release_info(&launch_binary).await?;
     if candidate.store_schema < previous.store_schema {
         return Err(Failure::new(
             2,
@@ -236,14 +254,19 @@ async fn run_update(
             "both releases must support updates with a Store backup",
         ));
     }
-    let sha256 = binary_sha256(&binary).map_err(Failure::for_read)?;
     #[cfg(windows)]
-    let desktop = desktop_binary(&binary)?;
-    let _transition = lock_transition(&data_dir).map_err(Failure::for_read)?;
+    let desktop = desktop_binary(&binary, &image_directory)?;
+    #[cfg(target_os = "linux")]
+    let desktop: Option<(PathBuf, String)> = None;
+    #[cfg(windows)]
+    let _desktop_pin = desktop
+        .as_ref()
+        .map(|(path, hash)| pin_update_release(path, hash))
+        .transpose()?;
     check_same_daemon(&data_dir, &old)?;
     let startup_path = replacement_data_dir(&data_dir, &old).map_err(Failure::for_read)?;
-    preflight_store(&startup_path, &binary).await?;
-    if binary_sha256(&binary).map_err(Failure::for_read)? != sha256 {
+    preflight_store(&startup_path, &launch_binary).await?;
+    if binary_sha256(&launch_binary).map_err(Failure::for_read)? != sha256 {
         return Err(Failure::new(
             2,
             "replacement binary changed during preflight",
@@ -366,32 +389,55 @@ async fn run_update(
         );
         return Ok(error.exit_code);
     }
-    let replacement = match start_update(&startup_path, &binary, backup.id).await {
-        Ok(info) => info,
-        Err(error) => {
-            return Ok(rollback(
-                &startup_path,
-                &previous,
-                &backup,
-                RollbackStore::Unpublished,
-                error.message,
-                UpdateAgents {
-                    before,
-                    stopped,
-                    mode,
-                    health: None,
-                },
-                json_output,
-            )
-            .await);
-        }
-    };
-    if let Err(error) = check_health(&startup_path, &replacement).await {
+    let replacement =
+        match start_update(&startup_path, &launch_binary, backup.id, &working_directory).await {
+            Ok(info) => info,
+            Err(error) => {
+                return Ok(rollback(
+                    &startup_path,
+                    &previous,
+                    &backup,
+                    RollbackStore::Unpublished,
+                    error.message,
+                    UpdateAgents {
+                        before,
+                        stopped,
+                        mode,
+                        health: None,
+                    },
+                    json_output,
+                )
+                .await);
+            }
+        };
+    if let Err(error) = verify_running_release(&startup_path, &replacement, &sha256) {
         return Ok(rollback(
             &startup_path,
             &previous,
             &backup,
-            RollbackStore::Published(&replacement, candidate.store_schema),
+            RollbackStore::PublishedIdentityUnknown(&replacement),
+            error.message,
+            UpdateAgents {
+                before,
+                stopped,
+                mode,
+                health: None,
+            },
+            json_output,
+        )
+        .await);
+    }
+    if let Err(error) = check_health(&startup_path, &replacement, &sha256).await {
+        let store = if error.code.as_deref() == Some("release_identity_mismatch") {
+            RollbackStore::PublishedIdentityUnknown(&replacement)
+        } else {
+            RollbackStore::Published(&replacement, candidate.store_schema)
+        };
+        return Ok(rollback(
+            &startup_path,
+            &previous,
+            &backup,
+            store,
             error.message,
             UpdateAgents {
                 before,
@@ -455,19 +501,43 @@ async fn run_update(
     .await;
 
     #[cfg(windows)]
-    let (desktop, desktop_failed) = start_companion(&data_dir, desktop);
+    let (desktop_result, desktop_failed) =
+        start_companion(&data_dir, desktop.clone(), &working_directory);
     #[cfg(not(windows))]
-    let (desktop, desktop_failed) = (None::<Value>, false);
+    let (desktop_result, desktop_failed) = (None::<Value>, false);
+    #[cfg(any(windows, target_os = "linux"))]
+    let image_cleanup = {
+        if desktop_failed || backup_cleanup.is_some() || resume_failed || health_uncertain {
+            None
+        } else {
+            let mut retained = vec![sha256.as_str(), previous_hash.as_str()];
+            if let Some((_, desktop_hash)) = desktop.as_ref() {
+                retained.push(desktop_hash.as_str());
+            }
+            if let Some(hash) = previous_desktop_hash.as_deref() {
+                retained.push(hash);
+            }
+            super::cleanup::prune_update_images(
+                &data_dir,
+                &retained,
+                previous_desktop_hash.is_none(),
+            )
+            .err()
+        }
+    };
+    #[cfg(not(any(windows, target_os = "linux")))]
+    let image_cleanup: Option<String> = None;
     let reply = json!({
-            "state": if desktop_failed || backup_cleanup.is_some() || resume_failed || health_uncertain || decision_failed { "partial" } else { "ready" },
+            "state": if desktop_failed || backup_cleanup.is_some() || image_cleanup.is_some() || resume_failed || health_uncertain || decision_failed { "partial" } else { "ready" },
             "startup_health": startup_health, "restart_id": prepare.id,
             "health_decision_error": health_record["health_decision_error"],
             "previous_pid": old.pid, "pid": replacement.pid,
             "deadline_policy": mode, "interrupted_agents": interruptions,
             "commit_reply_uncertain": commit_reply_uncertain,
-            "binary": eliot_core::display_path(&binary.to_string_lossy()), "version": candidate.version,
-            "sha256": sha256, "desktop": desktop,
+            "binary": eliot_core::display_path(&launch_binary.to_string_lossy()), "version": candidate.version,
+            "sha256": sha256, "desktop": desktop_result,
             "backup": backup.retained(), "backup_cleanup_error": backup_cleanup.as_ref().map(ToString::to_string),
+            "staged_image_cleanup_error": image_cleanup.as_ref(),
             "agents_before": before, "agents_after": observe_agents(&data_dir, &before).await,
             "continuation": "boot recovery applies the configured on_restart policy",
     });
@@ -475,6 +545,7 @@ async fn run_update(
     Ok(u8::from(
         desktop_failed
             || backup_cleanup.is_some()
+            || image_cleanup.is_some()
             || resume_failed
             || health_uncertain
             || decision_failed,
@@ -492,6 +563,7 @@ enum RollbackStore<'a> {
     Current,
     Unpublished,
     Published(&'a DaemonInfo, i64),
+    PublishedIdentityUnknown(&'a DaemonInfo),
 }
 
 struct UpdateAgents {
@@ -521,7 +593,11 @@ impl StoreBackup<'_> {
     }
 }
 
-async fn check_health(path: &Path, replacement: &DaemonInfo) -> Result<(), Failure> {
+async fn check_health(
+    path: &Path,
+    replacement: &DaemonInfo,
+    expected_sha256: &str,
+) -> Result<(), Failure> {
     let readiness_deadline = Instant::now() + STARTUP_WAIT;
     let mut healthy_since = None;
     loop {
@@ -537,6 +613,7 @@ async fn check_health(path: &Path, replacement: &DaemonInfo) -> Result<(), Failu
                 let since = healthy_since.get_or_insert_with(Instant::now);
                 if since.elapsed() >= Duration::from_secs(3) {
                     check_same_daemon(path, replacement)?;
+                    verify_running_release(path, replacement, expected_sha256)?;
                     return Ok(());
                 }
             }
@@ -560,6 +637,56 @@ async fn check_health(path: &Path, replacement: &DaemonInfo) -> Result<(), Failu
         )]
         sleep(Duration::from_millis(250)).await;
     }
+}
+
+fn verify_running_release(
+    path: &Path,
+    candidate: &DaemonInfo,
+    expected_sha256: &str,
+) -> Result<(), Failure> {
+    let image = {
+        #[cfg(target_os = "linux")]
+        {
+            PathBuf::from(format!("/proc/{}/exe", candidate.pid))
+        }
+        #[cfg(windows)]
+        {
+            running_binary(candidate).map_err(|error| {
+                release_identity_failure(format!("cannot read candidate process image: {error}"))
+            })?
+        }
+        #[cfg(not(any(target_os = "linux", windows)))]
+        {
+            let _ = candidate;
+            return Err(release_identity_failure(
+                "running image verification is unsupported on this platform".to_owned(),
+            ));
+        }
+    };
+    check_same_daemon(path, candidate).map_err(|error| release_identity_failure(error.message))?;
+    if !daemon_alive(candidate).map_err(|error| {
+        release_identity_failure(format!("cannot verify candidate process identity: {error}"))
+    })? {
+        return Err(release_identity_failure(
+            "candidate process exited before its running image could be verified".to_owned(),
+        ));
+    }
+    let running_sha256 = binary_sha256(&image).map_err(|error| {
+        release_identity_failure(format!("cannot hash candidate process image: {error}"))
+    })?;
+    check_same_daemon(path, candidate).map_err(|error| release_identity_failure(error.message))?;
+    if running_sha256 != expected_sha256 {
+        return Err(release_identity_failure(format!(
+            "candidate process image SHA-256 {running_sha256} does not match verified release {expected_sha256}"
+        )));
+    }
+    Ok(())
+}
+
+fn release_identity_failure(message: String) -> Failure {
+    let mut failure = Failure::new(4, message);
+    failure.code = Some("release_identity_mismatch".to_owned());
+    failure
 }
 
 async fn finish_committed_restart(path: &Path, old: &DaemonInfo) -> Result<(), Failure> {
@@ -1188,11 +1315,19 @@ async fn rollback(
     json_output: bool,
 ) -> u8 {
     let mut store_restored = false;
-    let published = match store {
-        RollbackStore::Published(candidate, _) => Some(candidate),
+    let retained_candidate = match store {
+        RollbackStore::Published(candidate, schema) if schema != previous.store_schema => {
+            Some(candidate.pid)
+        }
+        RollbackStore::PublishedIdentityUnknown(candidate) => Some(candidate.pid),
+        RollbackStore::Published(candidate, _) => Some(candidate.pid),
         _ => None,
     };
-    let retained_candidate = published.map(|candidate| candidate.pid);
+    let published = match store {
+        RollbackStore::Published(candidate, _)
+        | RollbackStore::PublishedIdentityUnknown(candidate) => Some(candidate),
+        _ => None,
+    };
     let mut pending = json!({
         "restart_id": backup.restart_id, "state": "rollback_requested",
         "candidate_pid": retained_candidate, "startup_health": agents_at_update.health,
@@ -1213,6 +1348,18 @@ async fn rollback(
                 return Err(Failure::new(4, "the candidate published a newer Store schema and may still be serving; the current Store and backup are retained"));
             }
             retire_failed_candidate(path, current).await?;
+        }
+        if let RollbackStore::PublishedIdentityUnknown(candidate) = store {
+            retire_failed_candidate(path, candidate).await?;
+            preflight_store(path, previous.binary).await.map_err(|error| {
+                Failure::new(
+                    4,
+                    format!(
+                        "previous release cannot safely open the current Store: {}",
+                        error.message
+                    ),
+                )
+            })?;
         }
         // Do not race a surviving candidate or open a second writer.
         let offline = lock_offline(path).map_err(Failure::for_read)?;
@@ -1271,7 +1418,7 @@ async fn rollback(
         "health_decision_error": pending["health_decision_error"],
         "agents_after": if pid.is_some() { observe_agents(path, &agents_at_update.before).await } else { Value::Null },
         "continuation": if state == "rollback_held" {
-            "candidate work is retained for normal settlement"
+            "unconfirmed candidate is held for settlement"
         } else if retained_candidate.is_some() && pid.is_none() {
             "run swarm daemon update with a healthy release that supports the current Store schema"
         } else { "boot recovery applies the configured on_restart policy" },
@@ -1321,6 +1468,175 @@ fn release_binary(source: &Path) -> Result<PathBuf, Failure> {
         ));
     }
     Ok(path)
+}
+
+/// Create or verify a versioned launch image in the private updater directory.
+/// The caller separately preserves the selected release's working directory.
+fn prepare_update_release(source: &Path, directory: &Path) -> Result<(PathBuf, String), Failure> {
+    prepare_update_image(source, directory, ".swarm-release-")
+}
+
+fn prepare_update_image(
+    source: &Path,
+    directory: &Path,
+    prefix: &str,
+) -> Result<(PathBuf, String), Failure> {
+    let digest = binary_sha256(source).map_err(Failure::for_read)?;
+    let artifact = directory.join(format!("{prefix}{digest}{}", std::env::consts::EXE_SUFFIX));
+    let artifact_metadata = match std::fs::symlink_metadata(&artifact) {
+        Ok(metadata) if metadata.file_type().is_file() => Some(metadata),
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            std::fs::remove_file(&artifact).map_err(|error| {
+                Failure::new(
+                    4,
+                    format!(
+                        "remove invalid staged image link {}: {error}",
+                        artifact.display()
+                    ),
+                )
+            })?;
+            None
+        }
+        Ok(_) => {
+            return Err(Failure::new(
+                2,
+                "versioned release image path is not a regular file",
+            ));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => {
+            return Err(Failure::new(
+                2,
+                format!("inspect versioned release image path: {error}"),
+            ));
+        }
+    };
+    let mut needs_stage = artifact_metadata.is_none();
+    if artifact_metadata.is_some() {
+        eliot_daemon::operator::validate_update_image(&artifact).map_err(Failure::for_read)?;
+        let staged_digest = binary_sha256(&artifact).map_err(Failure::for_read)?;
+        if staged_digest != digest {
+            remove_incomplete_release(&artifact).map_err(|error| {
+                Failure::new(
+                    4,
+                    format!(
+                        "invalid staged release image is retained at {}: {error}",
+                        artifact.display()
+                    ),
+                )
+            })?;
+            needs_stage = true;
+        }
+    }
+    let mut created_by_attempt = false;
+    let staged = (|| {
+        if needs_stage {
+            let mut input = std::fs::File::open(source)
+                .map_err(|error| Failure::new(2, format!("open selected release: {error}")))?;
+            let mut output = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&artifact)
+                .map_err(|error| {
+                    if error.kind() == std::io::ErrorKind::AlreadyExists {
+                        Failure::new(2, "versioned release image appeared while staging")
+                    } else {
+                        Failure::new(2, format!("create versioned release image: {error}"))
+                    }
+                })?;
+            created_by_attempt = true;
+            std::io::copy(&mut input, &mut output)
+                .and_then(|_| output.sync_all())
+                .map_err(|error| {
+                    Failure::new(2, format!("stage versioned release image: {error}"))
+                })?;
+        }
+        eliot_daemon::operator::validate_update_image(&artifact).map_err(Failure::for_read)?;
+        let staged_digest = binary_sha256(&artifact).map_err(Failure::for_read)?;
+        if staged_digest != digest {
+            return Err(Failure::new(
+                2,
+                "versioned release image bytes do not match the selected release",
+            ));
+        }
+        let mut permissions = std::fs::metadata(source)
+            .map_err(|error| Failure::new(2, format!("inspect selected release: {error}")))?
+            .permissions();
+        permissions.set_readonly(true);
+        std::fs::set_permissions(&artifact, permissions).map_err(|error| {
+            Failure::new(2, format!("protect versioned release image: {error}"))
+        })?;
+        Ok((artifact.clone(), staged_digest))
+    })();
+    if created_by_attempt {
+        match staged {
+            Err(mut failure) => {
+                if let Err(error) = remove_incomplete_release(&artifact) {
+                    failure.exit_code = 4;
+                    failure.message = format!(
+                        "{}; incomplete release image cleanup failed for {}: {error}",
+                        failure.message,
+                        artifact.display()
+                    );
+                }
+                Err(failure)
+            }
+            result => result,
+        }
+    } else {
+        staged
+    }
+}
+
+fn remove_incomplete_release(path: &Path) -> std::io::Result<()> {
+    #[cfg(windows)]
+    let was_readonly = std::fs::metadata(path).map(|metadata| metadata.permissions().readonly());
+    #[cfg(windows)]
+    if let Ok(metadata) = std::fs::metadata(path) {
+        let mut permissions = metadata.permissions();
+        #[expect(
+            clippy::permissions_set_readonly_false,
+            reason = "Windows must clear the read-only attribute before deleting the failed image"
+        )]
+        permissions.set_readonly(false);
+        std::fs::set_permissions(path, permissions)?;
+    }
+    match std::fs::remove_file(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => {
+            #[cfg(windows)]
+            if let Ok(was_readonly) = was_readonly
+                && let Ok(metadata) = std::fs::metadata(path)
+            {
+                let mut permissions = metadata.permissions();
+                permissions.set_readonly(was_readonly);
+                let _ = std::fs::set_permissions(path, permissions);
+            }
+            Err(error)
+        }
+        Ok(()) => Ok(()),
+    }
+}
+
+/// Keep a Windows handle open from before preflight through candidate health
+/// validation. Allowing readers lets the image loader run; denying write/delete
+/// prevents replacement of the verified path while the update is in flight.
+#[cfg(windows)]
+fn pin_update_release(path: &Path, expected_sha256: &str) -> Result<std::fs::File, Failure> {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    let pin = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(1) // FILE_SHARE_READ
+        .open(path)
+        .map_err(|error| Failure::new(2, format!("pin versioned release image: {error}")))?;
+    if binary_sha256(path).map_err(Failure::for_read)? != expected_sha256 {
+        return Err(Failure::new(
+            2,
+            "versioned release image changed before it could be pinned",
+        ));
+    }
+    Ok(pin)
 }
 
 #[derive(serde::Deserialize)]
@@ -1444,24 +1760,33 @@ async fn release_info(binary: &Path) -> Result<ReleaseInfo, Failure> {
 }
 
 #[cfg(windows)]
-fn desktop_binary(binary: &Path) -> Result<Option<(PathBuf, String)>, Failure> {
+fn desktop_binary(binary: &Path, directory: &Path) -> Result<Option<(PathBuf, String)>, Failure> {
     let desktop = binary.with_file_name("swarm-desktop.exe");
     if !desktop.is_file() {
         return Ok(None);
     }
-    let hash = binary_sha256(&desktop).map_err(Failure::for_read)?;
-    Ok(Some((desktop, hash)))
+    let (staged, hash) = prepare_update_image(&desktop, directory, ".swarm-desktop-release-")?;
+    Ok(Some((staged, hash)))
 }
 
 #[cfg(windows)]
-fn start_companion(data_dir: &Path, desktop: Option<(PathBuf, String)>) -> (Option<Value>, bool) {
+fn start_companion(
+    data_dir: &Path,
+    desktop: Option<(PathBuf, String)>,
+    working_directory: &Path,
+) -> (Option<Value>, bool) {
     let Some((binary, sha256)) = desktop else {
         return (
             Some(json!({"reason": "release contains no desktop companion"})),
             false,
         );
     };
-    match eliot_daemon::operator::start_desktop(data_dir, &binary, sha256.clone()) {
+    match eliot_daemon::operator::start_desktop_in_directory(
+        data_dir,
+        &binary,
+        working_directory,
+        sha256.clone(),
+    ) {
         Ok(pid) => (Some(json!({"pid": pid, "sha256": sha256})), false),
         Err(error) => (Some(json!({"reason": error.to_string()})), true),
     }

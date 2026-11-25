@@ -453,13 +453,13 @@ async fn stand_shutdown(
 }
 
 pub(super) async fn start_owned(data_dir: &Path, binary: &Path) -> Result<u32, Failure> {
-    start_owned_inner(data_dir, binary, None, false)
+    start_owned_inner(data_dir, binary, None, false, None)
         .await
         .map(|info| info.pid)
 }
 
 pub(super) async fn start_owned_stand(data_dir: &Path, binary: &Path) -> Result<u32, Failure> {
-    start_owned_inner(data_dir, binary, None, true)
+    start_owned_inner(data_dir, binary, None, true, None)
         .await
         .map(|info| info.pid)
 }
@@ -468,8 +468,16 @@ pub(super) async fn start_update(
     data_dir: &Path,
     binary: &Path,
     attempt: &str,
+    working_directory: &Path,
 ) -> Result<DaemonInfo, Failure> {
-    start_owned_inner(data_dir, binary, Some(attempt), false).await
+    start_owned_inner(
+        data_dir,
+        binary,
+        Some(attempt),
+        false,
+        Some(working_directory),
+    )
+    .await
 }
 
 async fn start_owned_inner(
@@ -477,6 +485,7 @@ async fn start_owned_inner(
     binary: &Path,
     attempt: Option<&str>,
     use_stand_owner: bool,
+    working_directory: Option<&Path>,
 ) -> Result<DaemonInfo, Failure> {
     let start_ms = daemon_now_ms();
     let previous = daemon_info(data_dir).map_err(Failure::for_read)?;
@@ -500,10 +509,20 @@ async fn start_owned_inner(
             std::ffi::OsStr::new(attempt),
         ]);
     }
+    let default_working_directory = binary
+        .parent()
+        .ok_or_else(|| Failure::new(2, "invalid release path"))?;
+    let working_directory = working_directory.unwrap_or(default_working_directory);
     #[cfg(windows)]
     let (pid, birth) = {
-        let pid = eliot_daemon::operator::start_detached(binary, &args, true, None)
-            .map_err(Failure::for_read)?;
+        let pid = eliot_daemon::operator::start_detached_in_directory(
+            binary,
+            working_directory,
+            &args,
+            true,
+            None,
+        )
+        .map_err(Failure::for_read)?;
         let birth = match eliot_daemon::operator::candidate_birth(pid) {
             Ok(birth) => birth,
             Err(error) if error.code == "process_gone" => {
@@ -530,11 +549,7 @@ async fn start_owned_inner(
         let mut command = tokio::process::Command::new(binary);
         command
             .args(args)
-            .current_dir(
-                binary
-                    .parent()
-                    .ok_or_else(|| Failure::new(2, "invalid release path"))?,
-            )
+            .current_dir(working_directory)
             .process_group(0)
             .stdin(Stdio::null())
             .stdout(Stdio::null())

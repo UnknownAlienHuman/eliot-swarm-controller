@@ -571,6 +571,29 @@ pub fn binary_sha256(path: &Path) -> Result<String> {
         .collect())
 }
 
+/// Private, reparse-checked updater staging directory beneath the selected data
+/// root. The CLI caller holds the updater transition lock.
+pub fn update_images_directory(path: &Path) -> Result<PathBuf> {
+    DataDir::open_existing(path)?.update_images_directory()
+}
+
+/// Refuse updater image paths that are not regular files or traverse a
+/// platform reparse point.
+pub fn validate_update_image(path: &Path) -> Result<()> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|error| Error::new("platform_io", format!("inspect staged image: {error}")))?;
+    if !metadata.is_file()
+        || metadata.file_type().is_symlink()
+        || crate::platform::is_reparse_point(&metadata)
+    {
+        return Err(Error::new(
+            "unsafe_private_file",
+            "staged image must be a regular file without a reparse point",
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(windows)]
 const DESKTOP_RECORD: &str = "operator-desktop.json";
 
@@ -624,6 +647,25 @@ pub fn stop_desktop(path: &Path) -> Result<()> {
     }
 }
 
+/// Return the exact companion image digest in the private desktop record.
+/// Missing or unresolved startup custody is represented as `None`.
+#[cfg(windows)]
+pub fn recorded_desktop_sha256(path: &Path) -> Result<Option<String>> {
+    match desktop_record(path)? {
+        Some(DesktopRecord::Started(record))
+            if record.sha256.len() == 64
+                && record.sha256.bytes().all(|byte| byte.is_ascii_hexdigit()) =>
+        {
+            Ok(Some(record.sha256))
+        }
+        Some(DesktopRecord::Started(_)) => Err(Error::new(
+            "process_identity",
+            "desktop ownership record has an invalid image digest",
+        )),
+        Some(DesktopRecord::Starting) | None => Ok(None),
+    }
+}
+
 #[cfg(windows)]
 fn close_desktop(record: &DesktopProcess) -> Result<()> {
     if !crate::platform::windows::recorded_process_alive(record.pid, record.start_time)? {
@@ -655,6 +697,19 @@ if (!$process.CloseMainWindow() -or !$process.WaitForExit(5000)) { exit 1 }
 /// Start the release companion after the daemon is ready.
 #[cfg(windows)]
 pub fn start_desktop(path: &Path, executable: &Path, sha256: String) -> Result<u32> {
+    let directory = executable
+        .parent()
+        .ok_or_else(|| Error::new("invalid", "desktop release must have a parent directory"))?;
+    start_desktop_in_directory(path, executable, directory, sha256)
+}
+
+#[cfg(windows)]
+pub fn start_desktop_in_directory(
+    path: &Path,
+    executable: &Path,
+    directory: &Path,
+    sha256: String,
+) -> Result<u32> {
     if let Some(DesktopRecord::Started(record)) = desktop_record(path)?
         && record.sha256 == sha256
         && crate::platform::windows::recorded_process_alive(record.pid, record.start_time)?
@@ -665,7 +720,7 @@ pub fn start_desktop(path: &Path, executable: &Path, sha256: String) -> Result<u
     // If launch or the later write is interrupted, teardown must retain the
     // directory until the companion's exit can be established.
     write_desktop_record(path, &DesktopRecord::Starting)?;
-    let pid = start_detached(executable, &[], false, Some(path))?;
+    let pid = start_detached_in_directory(executable, directory, &[], false, Some(path))?;
     let start_time = crate::platform::windows::process_start_time(pid)?;
     let record = DesktopRecord::Started(DesktopProcess {
         pid,
@@ -707,6 +762,20 @@ pub fn start_detached(
     hidden: bool,
     home: Option<&Path>,
 ) -> Result<u32> {
+    let directory = executable
+        .parent()
+        .ok_or_else(|| Error::new("invalid", "release binary must have a parent directory"))?;
+    start_detached_in_directory(executable, directory, args, hidden, home)
+}
+
+#[cfg(windows)]
+pub fn start_detached_in_directory(
+    executable: &Path,
+    directory: &Path,
+    args: &[&std::ffi::OsStr],
+    hidden: bool,
+    home: Option<&Path>,
+) -> Result<u32> {
     const WMI_START: &str = r#"
 $ErrorActionPreference = 'Stop'
 [Console]::InputEncoding = [System.Text.Encoding]::UTF8
@@ -737,9 +806,6 @@ if ($created.ReturnValue -ne 0) {
     line.pop();
     let line = String::from_utf16(&line)
         .map_err(|_| Error::new("invalid", "release command contains invalid Unicode"))?;
-    let directory = executable
-        .parent()
-        .ok_or_else(|| Error::new("invalid", "release binary must have a parent directory"))?;
     let mut environment: Vec<_> = std::env::vars_os()
         .filter_map(|(name, value)| {
             let name = name.into_string().ok()?;
