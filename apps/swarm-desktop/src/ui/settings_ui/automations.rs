@@ -223,23 +223,35 @@ impl DesktopApp {
             "title",
             page_ui::toolbar(
                 page_ui::title("Automations"),
-                vec![KeyedView::new(
-                    format!("new:{busy}"),
-                    m3::filled(palette)
-                        .is_enabled(!busy)
-                        .automation_name("New automation")
-                        .content(m3::icon_label(m3::glyph::NEW_TASK, "New automation"))
-                        .menu(Menu::new(
-                            new_menu,
-                            context.callback(|key: String| {
-                                if key == "queue" {
-                                    Message::Automation(AutomationMsg::FormOpened(None))
-                                } else {
-                                    Message::Automation(AutomationMsg::Rule(RuleMsg::New))
-                                }
-                            }),
-                        )),
-                )],
+                vec![
+                    KeyedView::new(
+                        "refresh",
+                        m3::icon_button(palette)
+                            .automation_name("Refresh automations")
+                            .on_click(context.message(Message::Automation(
+                                AutomationMsg::AutomationRefreshRequested,
+                            )))
+                            .content(m3::icon(m3::glyph::REFRESH))
+                            .tooltip("Refresh automations"),
+                    ),
+                    KeyedView::new(
+                        format!("new:{busy}"),
+                        m3::filled(palette)
+                            .is_enabled(!busy)
+                            .automation_name("New automation")
+                            .content(m3::icon_label(m3::glyph::NEW_TASK, "New automation"))
+                            .menu(Menu::new(
+                                new_menu,
+                                context.callback(|key: String| {
+                                    if key == "queue" {
+                                        Message::Automation(AutomationMsg::FormOpened(None))
+                                    } else {
+                                        Message::Automation(AutomationMsg::Rule(RuleMsg::New))
+                                    }
+                                }),
+                            )),
+                    ),
+                ],
             ),
         )];
         let tabs: Vec<KeyedView> = [("Automations", false), ("Scripts", true)]
@@ -281,7 +293,12 @@ impl DesktopApp {
             return page_ui::page("Automations", self.page_width(tokens::page::WIDTH), items);
         }
         let cards = self.automation_cards();
-        let mut left: Vec<KeyedView> = Vec::new();
+        let mut left: Vec<KeyedView> = vec![KeyedView::new(
+            "intro",
+            page_ui::quiet(
+                "Each automation starts work for you. Switch one off to stop new work; work already running finishes.",
+            ),
+        )];
         if !self.automation.read() {
             left.push(KeyedView::new(
                 "reading",

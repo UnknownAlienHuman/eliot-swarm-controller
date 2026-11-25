@@ -118,6 +118,7 @@ impl DesktopApp {
             .iter()
             .map(|startup| startup.label().to_owned())
             .collect();
+        let shown_startup = self.prefs.startup;
         let startup_picker = Grid::new().keyed_children(vec![KeyedView::new(
             format!("startup:{startup:?}"),
             ComboBox::new()
@@ -125,11 +126,12 @@ impl DesktopApp {
                 .items_source(startup_labels)
                 .selected_index(startup)
                 .automation_name("On startup")
-                .on_selection_changed(context.callback(|index: Option<usize>| {
+                // No selection is the value shown, never New task.
+                .on_selection_changed(context.callback(move |index: Option<usize>| {
                     Message::Shell(ShellMsg::StartupChosen(
                         index
                             .and_then(|index| Startup::ALL.get(index).copied())
-                            .unwrap_or_default(),
+                            .unwrap_or(shown_startup),
                     ))
                 })),
         )]);

@@ -921,11 +921,14 @@ impl DesktopApp {
                 // A theme of the same polarity raises no scheme change.
                 self.palette_changed(before, context);
             }
-            ShellMsg::StartupChosen(startup) => {
+            // The list reports the value it shows when it is built: only a
+            // change saves.
+            ShellMsg::StartupChosen(startup) if startup != self.prefs.startup => {
                 self.prefs.startup = startup;
                 self.prefs_rev += 1;
                 self.save_preferences(context);
             }
+            ShellMsg::StartupChosen(_) => {}
             ShellMsg::PreferencesSaved(saved, window, result) => {
                 self.prefs_saving = false;
                 if let Err(error) = &result {
@@ -2338,6 +2341,8 @@ impl DesktopApp {
             self.fresh_confirmation(context, palette)
         } else if self.inbox.confirm.is_some() {
             self.inbox_confirmation(context, palette)
+        } else if self.settings.daemon_confirm.is_some() {
+            self.daemon_confirmation(context, palette)
         } else {
             self.task_dialog(context, palette)
         };

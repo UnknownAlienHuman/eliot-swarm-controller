@@ -41,6 +41,41 @@ use crate::client::{self, MAX_CONCURRENT_READS};
 
 /// Refresh period while the monitor is open.
 pub const PERIOD_MS: u64 = 2_000;
+/// Without an event, the fleet (its CPU and memory samples) is read again
+/// after this long; an event reads it at once (no sooner than
+/// [`PERIOD_MS`] after the last read).
+pub const QUIET_PERIOD_MS: u64 = 10_000;
+/// While the window is minimized or hidden the reads pause; it is checked
+/// this often, locally (no daemon request).
+pub const HIDDEN_CHECK_MS: u64 = 500;
+/// The events that change what the fleet shows: lifecycle, turns,
+/// requests and attention reports (not tool or token traffic).
+pub const FLEET_KINDS: [&str; 14] = [
+    "agent.created",
+    "agent.failed",
+    "agent.lost",
+    "agent.stopped",
+    "session.ready",
+    "session.ended",
+    "turn.started",
+    "turn.completed",
+    "turn.unknown",
+    "turn.resolved",
+    "request.opened",
+    "request.closed",
+    "request.resolved",
+    ATTENTION_KIND,
+];
+
+/// The event filter the fleet follows: every Agent's [`FLEET_KINDS`], or
+/// one Agent's while only its Details show.
+pub fn fleet_filter(agent: Option<&str>) -> eliot_core::api::EventsFilter {
+    eliot_core::api::EventsFilter {
+        agents: agent.map(str::to_owned).into_iter().collect(),
+        kinds: FLEET_KINDS.iter().map(|kind| (*kind).to_owned()).collect(),
+        sources: Vec::new(),
+    }
+}
 /// Rows displayed per live state from the bounded fleet page.
 pub const ROWS_PER_STATE: usize = 100;
 /// Total live rows read in one page; per-state counts reveal any shortfall.
@@ -952,6 +987,9 @@ pub struct DetailRead {
     pub agent: AgentGetResponse,
     pub usage: Result<UsageSummaryResponse, String>,
     pub diagnosis: Result<DiagnoseResponse, String>,
+    /// Usage and diagnosis were read this time (a selection change); else
+    /// the last ones of the same generation stay.
+    pub fresh: bool,
 }
 
 /// Last successful reads of the selected Agent and its supplemental data.
@@ -1026,6 +1064,10 @@ pub struct MonitorSnapshot {
     /// `swarm why` summaries of the lost or failed generations it read.
     pub losses: Vec<((String, i64), Result<DiagnoseResponse, String>)>,
     pub read_at_ms: i64,
+    /// The fleet was read (the Agents page shows); else only Details.
+    pub fleet: bool,
+    /// The event cursor the next wait starts from.
+    pub event_cursor: Option<i64>,
 }
 
 /// One monitor section: its top-level rows (each with its nested
@@ -1408,6 +1450,14 @@ impl Monitor {
     }
 
     pub fn apply(&mut self, snapshot: MonitorSnapshot) {
+        if !snapshot.fleet {
+            // Only Details were read: the fleet, its reports and the
+            // stopped rows stay as last read.
+            if let Some(detail) = snapshot.detail {
+                self.take_detail(detail, snapshot.read_at_ms);
+            }
+            return;
+        }
         self.refreshes += 1;
         self.errors.clear();
         match snapshot.stopped {
@@ -1523,18 +1573,34 @@ impl Monitor {
                 return;
             }
         };
-        if let Err(error) = &read.usage {
-            self.detail_errors.push(format!("usage: {error}"));
-        }
-        if let Err(error) = &read.diagnosis {
-            self.detail_errors.push(format!("diagnosis: {error}"));
-        }
         let identity = &read.agent.agent;
         let previous = self.detail.take().filter(|last| {
             last.read.agent.agent.id == identity.id
                 && last.read.agent.agent.generation == identity.generation
         });
         let (mut usage_ms, mut diagnosis_ms) = (read_at_ms, read_at_ms);
+        if !read.fresh {
+            // Not read this time: the last ones of this generation stay.
+            if let Some(last) = previous {
+                read.usage = last.read.usage;
+                read.diagnosis = last.read.diagnosis;
+                usage_ms = last.usage_ms;
+                diagnosis_ms = last.diagnosis_ms;
+            }
+            self.detail = Some(CachedDetail {
+                read,
+                identity_ms: read_at_ms,
+                usage_ms,
+                diagnosis_ms,
+            });
+            return;
+        }
+        if let Err(error) = &read.usage {
+            self.detail_errors.push(format!("usage: {error}"));
+        }
+        if let Err(error) = &read.diagnosis {
+            self.detail_errors.push(format!("diagnosis: {error}"));
+        }
         if let Some(last) = previous {
             if read.usage.is_err() && last.read.usage.is_ok() {
                 read.usage = last.read.usage;
@@ -1709,7 +1775,13 @@ fn take_fleet(snapshot: &mut MonitorSnapshot, page: Result<AgentListResponse, St
 /// What one refresh reads besides the fixed live set.
 #[derive(Clone, Debug, Default)]
 pub struct RefreshPlan {
+    /// The Agents page shows: read the fleet, its attention reports and
+    /// (now and then) the stopped rows.
+    pub fleet: bool,
     pub selected: Option<String>,
+    /// Read the selected Agent's usage and diagnosis too (its selection or
+    /// generation changed); else only `agent.get`.
+    pub detail_full: bool,
     pub stopped: bool,
     pub attention_cursor: Option<i64>,
     /// Lost or failed generations whose loss origin to read.
@@ -1724,13 +1796,15 @@ pub async fn refresh(
 ) -> Option<MonitorSnapshot> {
     let read_at_ms = crate::handoff::now_ms();
     let RefreshPlan {
+        fleet,
         selected,
+        detail_full,
         stopped,
         attention_cursor,
         losses,
     } = plan;
     let mut reads: Vec<ReadFuture<'_>> = Vec::new();
-    if stopped {
+    if fleet && stopped {
         reads.push(Box::pin(async move {
             if cancelled() {
                 return Read::Cancelled;
@@ -1743,22 +1817,24 @@ pub async fn refresh(
             )
         }));
     }
-    reads.push(Box::pin(async move {
-        if cancelled() {
-            return Read::Cancelled;
-        }
-        Read::Attention(read_attention(data_dir, attention_cursor, read_at_ms, cancelled).await)
-    }));
-    reads.push(Box::pin(async move {
-        if cancelled() {
-            return Read::Cancelled;
-        }
-        Read::Fleet(
-            client::list_agents(data_dir, &fleet_request())
-                .await
-                .map_err(|error| error.to_string()),
-        )
-    }));
+    if fleet {
+        reads.push(Box::pin(async move {
+            if cancelled() {
+                return Read::Cancelled;
+            }
+            Read::Attention(read_attention(data_dir, attention_cursor, read_at_ms, cancelled).await)
+        }));
+        reads.push(Box::pin(async move {
+            if cancelled() {
+                return Read::Cancelled;
+            }
+            Read::Fleet(
+                client::list_agents(data_dir, &fleet_request())
+                    .await
+                    .map_err(|error| error.to_string()),
+            )
+        }));
+    }
     if let Some(agent) = selected {
         reads.push(Box::pin(async move {
             if cancelled() {
@@ -1768,6 +1844,14 @@ pub async fn refresh(
                 Ok(read) => read,
                 Err(error) => return Read::Detail(Box::new(Err(error.to_string()))),
             };
+            if !detail_full {
+                return Read::Detail(Box::new(Ok(DetailRead {
+                    agent: read,
+                    usage: Err(String::new()),
+                    diagnosis: Err(String::new()),
+                    fresh: false,
+                })));
+            }
             if cancelled() {
                 return Read::Cancelled;
             }
@@ -1784,6 +1868,7 @@ pub async fn refresh(
                 agent: read,
                 usage,
                 diagnosis,
+                fresh: true,
             })))
         }));
     }
@@ -1810,6 +1895,8 @@ pub async fn refresh(
         detail: None,
         losses: Vec::new(),
         read_at_ms,
+        fleet,
+        event_cursor: None,
     };
     if cancelled() || results.iter().any(|read| matches!(read, Read::Cancelled)) {
         return None;

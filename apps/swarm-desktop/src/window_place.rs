@@ -49,8 +49,8 @@ use windows_sys::Win32::UI::HiDpi::{
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CBT_CREATEWNDW, CallNextHookEx, GetClassNameW, GetForegroundWindow, GetWindowPlacement,
-    HCBT_ACTIVATE, HCBT_CREATEWND, HCBT_DESTROYWND, HHOOK, IsIconic, IsZoomed, SW_HIDE,
-    SW_MINIMIZE, SW_SHOWMAXIMIZED, SW_SHOWMINIMIZED, SW_SHOWMINNOACTIVE, SW_SHOWNA,
+    HCBT_ACTIVATE, HCBT_CREATEWND, HCBT_DESTROYWND, HHOOK, IsIconic, IsWindowVisible, IsZoomed,
+    SW_HIDE, SW_MINIMIZE, SW_SHOWMAXIMIZED, SW_SHOWMINIMIZED, SW_SHOWMINNOACTIVE, SW_SHOWNA,
     SW_SHOWNOACTIVATE, SetWindowPlacement, SetWindowsHookExW, UnhookWindowsHookEx, WH_CBT,
     WINDOWPLACEMENT, WPF_RESTORETOMAXIMIZED, WS_CHILD,
 };
@@ -202,6 +202,16 @@ pub fn held_focus_ready() -> bool {
     let window = WINDOW_ID.load(Ordering::Relaxed);
     // SAFETY: a plain query.
     focus_held() && window != 0 && unsafe { GetForegroundWindow() } as isize == window
+}
+
+/// Whether the window is minimized or hidden now (any thread): the
+/// Agents page's reads pause then.
+pub fn hidden() -> bool {
+    let window = WINDOW_ID.load(Ordering::Relaxed) as HWND;
+    // SAFETY: read-only queries on this process's window handle; a closed
+    // window answers false, which only resumes the reads.
+    !window.is_null()
+        && (unsafe { IsIconic(window) } != 0 || unsafe { IsWindowVisible(window) } == 0)
 }
 
 /// Whether the window is maximized now (on the UI thread).

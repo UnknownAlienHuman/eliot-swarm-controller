@@ -993,13 +993,8 @@ pub enum DaemonEdit {
     Choice(&'static str, &'static str),
     /// Text; empty removes the key.
     Text(&'static str, String),
-}
-
-impl DaemonEdit {
-    /// Whether it is typed (saved when typing rests).
-    pub fn typed(&self) -> bool {
-        matches!(self, Self::Number(..) | Self::Text(..))
-    }
+    /// A control reported nothing to change (no selection).
+    Unchanged,
 }
 
 /// The value at `pointer` in the `[daemon]` draft.
@@ -1042,6 +1037,7 @@ pub fn apply_daemon_edit(daemon: &mut Value, edit: DaemonEdit) -> bool {
             let text = text.trim().to_owned();
             (pointer, (!text.is_empty()).then(|| json!(text)))
         }
+        DaemonEdit::Unchanged => return false,
     };
     if daemon.pointer(pointer) == value.as_ref() {
         return false;

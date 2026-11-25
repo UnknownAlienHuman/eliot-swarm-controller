@@ -294,6 +294,8 @@ pub(super) enum SettingsMsg {
     DaemonEdit(model::DaemonEdit),
     /// The owner rules text as typed (saved with Save).
     OwnerRulesText(String),
+    /// The daemon page's confirmation: save (true) or not.
+    DaemonConfirmed(bool),
     Loaded(Fallible<SettingsReadResponse>),
     Reload,
     RemoveInvalidSections(Vec<Section>),
@@ -544,6 +546,8 @@ pub(super) struct SettingsState {
     /// and `[owner_rules]`.
     pub(super) daemon: Value,
     pub(super) owner_rules: Value,
+    /// The daemon page whose Save waits for its confirmation.
+    pub(super) daemon_confirm: Option<Page>,
     /// Advanced: every section as pretty JSON, and its read form.
     all: String,
     all_base: String,
@@ -1176,6 +1180,11 @@ impl DesktopApp {
             SettingsMsg::RemoveInvalidSections(sections) => {
                 self.remove_invalid_sections(sections, context);
             }
+            SettingsMsg::Save(page, dry_run)
+                if !dry_run && matches!(page, Page::Attention | Page::Daemon | Page::Retention) =>
+            {
+                s.daemon_confirm = Some(page);
+            }
             SettingsMsg::Save(page, dry_run) => self.save_page(page, dry_run, context),
             SettingsMsg::AutoSave(page, seq) => {
                 if self.settings.rested(page, seq) {
@@ -1478,15 +1487,20 @@ impl DesktopApp {
                 }
             }
             SettingsMsg::HistoryToggled => s.history_open = !s.history_open,
+            // The daemon's own pages keep their changes as a draft: Save
+            // asks first (Retention deletes history; Attention and Daemon
+            // apply at the daemon's next start).
             SettingsMsg::DaemonEdit(edit) => {
-                let typed = edit.typed();
-                if model::apply_daemon_edit(&mut s.daemon, edit) {
+                if !s.busy() && model::apply_daemon_edit(&mut s.daemon, edit) {
                     let page = self.settings_page;
-                    if typed {
-                        self.autosave_later(page, context);
-                    } else {
-                        self.autosave(page, context);
-                    }
+                    s.notes.remove(&page);
+                }
+            }
+            SettingsMsg::DaemonConfirmed(save) => {
+                if let Some(page) = s.daemon_confirm.take()
+                    && save
+                {
+                    self.save_page(page, false, context);
                 }
             }
             SettingsMsg::OwnerRulesText(text) => {
@@ -2269,7 +2283,11 @@ impl DesktopApp {
     /// every editable page but the raw editors.
     fn autosaves(&self, page: Page) -> bool {
         match page {
-            Page::Advanced | Page::OwnerRules => false,
+            Page::Advanced
+            | Page::OwnerRules
+            | Page::Attention
+            | Page::Daemon
+            | Page::Retention => false,
             Page::Models => !self.editor.source_open && !self.editor.raw_dirty,
             _ => true,
         }

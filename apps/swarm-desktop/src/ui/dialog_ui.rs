@@ -76,6 +76,8 @@ impl DesktopApp {
             7
         } else if self.inbox.confirm.is_some() {
             8
+        } else if self.settings.daemon_confirm.is_some() {
+            9
         } else {
             0
         }
@@ -163,6 +165,7 @@ impl DesktopApp {
             }
             7 => self.fresh_confirmed(false, context),
             8 => self.inbox_update(inbox_ui::InboxMsg::BulkConfirmed(false), context),
+            9 => self.settings_update(SettingsMsg::DaemonConfirmed(false), context),
             _ => {}
         }
     }

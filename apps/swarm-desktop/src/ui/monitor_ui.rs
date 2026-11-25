@@ -81,6 +81,10 @@ pub(super) struct MonitorState {
     /// What the list is narrowed to (a group, a project, or both).
     pub(super) filter: Filter,
     pub(super) technical_open: bool,
+    /// The event cursor the next scheduled read waits from.
+    pub(super) event_cursor: Option<i64>,
+    /// Read the selected Agent's usage and diagnosis at the next read.
+    pub(super) detail_due: bool,
     /// The Agents page's filter chip and grouping.
     pub(super) fleet: FleetFilter,
     pub(super) by_project: bool,
@@ -150,16 +154,20 @@ enum FleetGroup {
     Held,
     Ready,
     Failed,
+    /// Native subagents whose parent is not shown (observed, not
+    /// controlled).
+    Unparented,
     Stopped,
 }
 
 impl FleetGroup {
-    const ALL: [Self; 6] = [
+    const ALL: [Self; 7] = [
         Self::Working,
         Self::Waiting,
         Self::Held,
         Self::Ready,
         Self::Failed,
+        Self::Unparented,
         Self::Stopped,
     ];
 
@@ -173,9 +181,12 @@ impl FleetGroup {
         }
     }
 
-    /// A row's group: a provider hold first, else its state's.
+    /// A top-level row's group: a native subagent without its parent, a
+    /// provider hold, else its state's.
     fn of_row(row: &MonitorRow) -> Self {
-        if page_ui::held(row.status_line.as_deref()) {
+        if row.native_child && row.state != AgentState::Stopped {
+            Self::Unparented
+        } else if page_ui::held(row.status_line.as_deref()) {
             Self::Held
         } else {
             Self::of(row.state)
@@ -184,7 +195,7 @@ impl FleetGroup {
 
     fn states(self) -> &'static [AgentState] {
         match self {
-            Self::Held => &[],
+            Self::Held | Self::Unparented => &[],
             Self::Working => &[AgentState::Busy, AgentState::Starting, AgentState::Created],
             Self::Waiting => &[AgentState::Waiting],
             Self::Ready => &[AgentState::Idle],
@@ -200,6 +211,7 @@ impl FleetGroup {
             Self::Held => "On provider hold",
             Self::Ready => "Ready",
             Self::Failed => "Failed or lost",
+            Self::Unparented => "Subagents without a visible parent",
             Self::Stopped => "Recently stopped",
         }
     }
@@ -214,8 +226,7 @@ impl DesktopApp {
                 }
                 self.monitor.refreshing = false;
                 if let Some(snapshot) = snapshot {
-                    // The state filter stays as the owner chose it, even
-                    // while no Agent is in that state.
+                    self.monitor.event_cursor = snapshot.event_cursor;
                     self.monitor.data.apply(*snapshot);
                     // A refresh with errors asks whether the daemon runs
                     // (itself paced) and waits longer before the next, with
@@ -395,6 +406,7 @@ impl DesktopApp {
             self.monitor.selected = Some(agent.to_owned());
             self.monitor.data.detail_errors.clear();
             self.monitor.technical_open = false;
+            self.monitor.detail_due = true;
         }
         let was_closed = !self.monitor_panel();
         self.panel = Panel::Details;
@@ -471,26 +483,108 @@ impl DesktopApp {
             }
         };
         let epoch = self.monitor.epoch;
+        // The fleet only while the Agents page shows; the selected Agent
+        // only while its Details show; its usage and diagnosis only when
+        // the selection or its generation changed.
+        let fleet = self.main == Main::Agents;
+        let selected = self
+            .monitor
+            .selected
+            .clone()
+            .filter(|_| self.panel == Panel::Details);
+        let cached = self.monitor.data.detail.as_ref().map(|detail| {
+            (
+                detail.read.agent.agent.id.clone(),
+                detail.read.agent.agent.generation,
+            )
+        });
+        let current = selected.as_ref().and_then(|id| {
+            self.monitor
+                .data
+                .rows
+                .iter()
+                .find(|row| &row.id == id)
+                .map(|row| row.generation)
+        });
+        let detail_full = std::mem::take(&mut self.monitor.detail_due)
+            || selected.as_ref().is_some_and(|id| {
+                cached.as_ref().is_none_or(|(cached_id, generation)| {
+                    cached_id != id || current.is_some_and(|current| current != *generation)
+                })
+            });
+        let filter = monitor::fleet_filter(if fleet { None } else { selected.as_deref() });
         let plan = monitor::RefreshPlan {
-            selected: self.monitor.selected.clone(),
+            fleet,
+            selected,
+            detail_full,
             stopped: self.monitor.data.wants_stopped(),
             attention_cursor: self.monitor.data.attention_cursor,
-            losses: self.monitor.data.loss_reads(),
+            losses: if fleet {
+                self.monitor.data.loss_reads()
+            } else {
+                Vec::new()
+            },
         };
+        let cursor = self.monitor.event_cursor;
         let refresh_gate = self.monitor.refresh_gate.clone();
         self.monitor.refreshing = true;
         self.monitor.task = Some(context.spawn_background(move |cancel| {
             let cancelled = || cancel.is_cancelled();
+            // A scheduled read (`delay_ms` > 0) waits at least that long,
+            // then for one of the fleet's events, at most QUIET_PERIOD_MS
+            // in all. Nothing is read while the window is minimized or
+            // hidden; the first read after it shows again is immediate.
             if delay_ms > 0 && !feed::backoff(delay_ms, &cancelled) {
                 return Message::Monitor(MonitorMsg::MonitorLoaded(epoch, None));
             }
+            let paused = |cancelled: &dyn Fn() -> bool| -> bool {
+                let mut paused = false;
+                while crate::window_place::hidden() {
+                    paused = true;
+                    if !feed::backoff(monitor::HIDDEN_CHECK_MS, cancelled) {
+                        break;
+                    }
+                }
+                paused
+            };
+            let woke = paused(&cancelled);
             let snapshot = client::block_on(async {
                 // A cancelled epoch may still have an IPC read in flight.
                 let _guard = refresh_gate.lock().await;
                 if cancelled() {
                     return None;
                 }
-                monitor::refresh(&data_dir, plan, &cancelled).await
+                if delay_ms > 0 && !woke {
+                    let wait = monitor::QUIET_PERIOD_MS.saturating_sub(delay_ms);
+                    // Wait from the tip read before the last read: an event
+                    // committed since wakes it at once. Without a cursor, or
+                    // when the wait fails, the quiet period passes instead.
+                    let waited = match cursor {
+                        Some(after) => client::events_wait(&data_dir, after, &filter, wait)
+                            .await
+                            .is_ok(),
+                        None => false,
+                    };
+                    if !waited && !feed::backoff(wait, &cancelled) {
+                        return None;
+                    }
+                    paused(&cancelled);
+                    if cancelled() {
+                        return None;
+                    }
+                }
+                // The tip before this read: the next wait starts there, so
+                // nothing committed during the read is missed.
+                let tip = client::events_bounds(&data_dir, &filter)
+                    .await
+                    .ok()
+                    .map(|bounds| bounds.hi);
+                monitor::refresh(&data_dir, plan, &cancelled)
+                    .await
+                    .map(|mut snapshot| {
+                        snapshot.event_cursor = tip;
+                        snapshot
+                    })
             });
             Message::Monitor(MonitorMsg::MonitorLoaded(epoch, snapshot.map(Box::new)))
         }));
@@ -684,8 +778,9 @@ impl DesktopApp {
     /// snapshot or a choice changes it.
     pub(super) fn monitor_view(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
         let data = &self.monitor.data;
-        let now = crate::handoff::now_ms();
-        let read_at = data.read_at_ms.unwrap_or(now);
+        // Ages and incidents as of the last read (the snapshot's time, not
+        // the clock's), so the page changes only with a read.
+        let read_at = data.read_at_ms.unwrap_or_default();
         let checkouts = self.checkouts();
         let project_of = |row: &MonitorRow| self.monitor_project(row, &checkouts);
         let partial = data.partial();

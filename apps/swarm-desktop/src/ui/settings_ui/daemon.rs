@@ -73,13 +73,15 @@ fn daemon_choice(
             .items_source(labels)
             .selected_index(Some(index))
             .automation_name(name.to_owned())
+            // A selection WinUI reports for the list it was given is the
+            // value shown: the edit then changes nothing.
             .on_selection_changed(context.callback(move |index: Option<usize>| {
-                match index.and_then(|index| choices.get(index)) {
-                    Some((value, _)) => Message::Settings(SettingsMsg::DaemonEdit(
-                        DaemonEdit::Choice(pointer, value),
-                    )),
-                    None => Message::Settings(SettingsMsg::Reload),
-                }
+                Message::Settings(SettingsMsg::DaemonEdit(
+                    match index.and_then(|index| choices.get(index)) {
+                        Some((value, _)) => DaemonEdit::Choice(pointer, value),
+                        None => DaemonEdit::Unchanged,
+                    },
+                ))
             })),
     )])
 }
@@ -162,7 +164,244 @@ const ATTENTION: [Kind; 8] = [
     },
 ];
 
+/// How a `[daemon]` value reads in the confirmation.
+#[derive(Clone, Copy)]
+enum Unit {
+    /// A switch, on by default or not.
+    Switch(bool),
+    Seconds,
+    /// A retention window: unset keeps everything.
+    Days,
+    WindowSeconds,
+    Choice(&'static [(&'static str, &'static str)]),
+    Text,
+}
+
+/// What a change does, as the confirmation says it.
+#[derive(Clone, Copy)]
+enum Effect {
+    NextStart,
+    AtOnce,
+    /// A retention window: shortening it deletes history.
+    Deletes,
+}
+
+const RESTART_CHOICES: &[(&str, &str)] = &[("continue", "Continue"), ("hold", "Hold")];
+const LOG_CHOICES: &[(&str, &str)] = &[("standard", "Standard"), ("debug", "Debug")];
+
+/// Every `[daemon]` key the three pages edit, for the confirmation.
+fn daemon_fields() -> Vec<(&'static str, String, Unit, Effect)> {
+    let mut fields = Vec::new();
+    for kind in &ATTENTION {
+        fields.push((
+            kind.enabled,
+            kind.title.to_owned(),
+            Unit::Switch(true),
+            Effect::NextStart,
+        ));
+        if let Some(threshold) = kind.threshold {
+            fields.push((
+                threshold,
+                format!("{}: wait", kind.title),
+                Unit::Seconds,
+                Effect::NextStart,
+            ));
+        }
+        if let Some((pointer, title, _)) = kind.step {
+            fields.push((
+                pointer,
+                title.to_owned(),
+                Unit::Switch(false),
+                Effect::NextStart,
+            ));
+        }
+    }
+    fields.extend([
+        (
+            "/on_restart",
+            "On restart".to_owned(),
+            Unit::Choice(RESTART_CHOICES),
+            Effect::NextStart,
+        ),
+        (
+            "/log_level",
+            "Log level".to_owned(),
+            Unit::Choice(LOG_CHOICES),
+            Effect::AtOnce,
+        ),
+        (
+            "/chats_root",
+            "Chats folder".to_owned(),
+            Unit::Text,
+            Effect::NextStart,
+        ),
+        (
+            "/retention/events_days",
+            "Events kept".to_owned(),
+            Unit::Days,
+            Effect::Deletes,
+        ),
+        (
+            "/retention/commands_days",
+            "Commands kept".to_owned(),
+            Unit::Days,
+            Effect::Deletes,
+        ),
+        (
+            "/retention/mail_days",
+            "Mail kept".to_owned(),
+            Unit::Days,
+            Effect::Deletes,
+        ),
+        (
+            "/retention/processes_seconds",
+            "Exited processes kept".to_owned(),
+            Unit::WindowSeconds,
+            Effect::Deletes,
+        ),
+        (
+            "/retention/interval_seconds",
+            "Retention check every".to_owned(),
+            Unit::Seconds,
+            Effect::AtOnce,
+        ),
+        (
+            "/retention/compact_on_start",
+            "Compact at start".to_owned(),
+            Unit::Switch(false),
+            Effect::NextStart,
+        ),
+    ]);
+    fields
+}
+
+/// A value in words.
+fn value_words(value: Option<&Value>, unit: Unit) -> String {
+    match (unit, value) {
+        (Unit::Switch(default), value) => {
+            if value.and_then(Value::as_bool).unwrap_or(default) {
+                "on".to_owned()
+            } else {
+                "off".to_owned()
+            }
+        }
+        (Unit::Days, Some(value)) => format!("{value} days"),
+        (Unit::WindowSeconds | Unit::Seconds, Some(value)) => format!("{value} s"),
+        (Unit::Days | Unit::WindowSeconds, None) => "forever".to_owned(),
+        (Unit::Seconds, None) => "the default".to_owned(),
+        (Unit::Choice(choices), value) => {
+            let value = value.and_then(Value::as_str).unwrap_or(choices[0].0);
+            choices
+                .iter()
+                .find(|(key, _)| *key == value)
+                .map_or_else(|| value.to_owned(), |(_, label)| (*label).to_owned())
+        }
+        (Unit::Text, Some(value)) => value.as_str().unwrap_or_default().to_owned(),
+        (Unit::Text, None) => "the default".to_owned(),
+    }
+}
+
+/// The changes between the saved `[daemon]` section and the draft, one
+/// sentence each, and whether one of them deletes history.
+pub(super) fn daemon_changes(base: &Value, draft: &Value) -> (Vec<String>, bool) {
+    let mut lines = Vec::new();
+    let mut deletes = false;
+    for (pointer, label, unit, effect) in daemon_fields() {
+        let (before, after) = (base.pointer(pointer), draft.pointer(pointer));
+        let (was, now) = (value_words(before, unit), value_words(after, unit));
+        if was == now {
+            continue;
+        }
+        let effect = match effect {
+            Effect::NextStart => "Applies at the daemon's next start.".to_owned(),
+            Effect::AtOnce => "Applies at once.".to_owned(),
+            Effect::Deletes => {
+                let shorter = match (
+                    before.and_then(Value::as_i64),
+                    after.and_then(Value::as_i64),
+                ) {
+                    (Some(before), Some(after)) => after < before,
+                    (None, Some(_)) => true,
+                    _ => false,
+                };
+                if shorter {
+                    deletes = true;
+                    "Older history is deleted at the next retention pass and cannot be read back."
+                        .to_string()
+                } else {
+                    "Nothing more is deleted.".to_owned()
+                }
+            }
+        };
+        lines.push(format!("{label}: {was} → {now}. {effect}"));
+    }
+    (lines, deletes)
+}
+
 impl DesktopApp {
+    /// The confirmation before the daemon's settings save: each change and
+    /// what it does (Retention deletes history; the rest apply at the
+    /// daemon's next start or at once).
+    pub(in crate::ui) fn daemon_confirmation(
+        &self,
+        context: &mut ViewContext<Self>,
+        palette: Palette,
+    ) -> View {
+        let (lines, deletes) =
+            daemon_changes(&self.settings.base(Section::Daemon), &self.settings.daemon);
+        let mut rows: Vec<KeyedView> = lines
+            .iter()
+            .enumerate()
+            .map(|(index, line)| {
+                KeyedView::new(
+                    index,
+                    m3::body(format!("• {line}")).text_wrapping(TextWrapping::Wrap),
+                )
+            })
+            .collect();
+        if rows.is_empty() {
+            rows.push(KeyedView::new(
+                "none",
+                m3::body("Nothing changed on this page.").text_wrapping(TextWrapping::Wrap),
+            ));
+        }
+        let save = if deletes {
+            m3::destructive(palette)
+        } else {
+            m3::filled(palette)
+        };
+        super::super::dialog_ui::surface(
+            context,
+            self.dialog.epoch,
+            palette,
+            if deletes {
+                "Save and delete older history?".to_owned()
+            } else {
+                "Save these daemon settings?".to_owned()
+            },
+            StackPanel::new()
+                .spacing(tokens::spacing::SM)
+                .keyed_children(rows),
+            super::super::dialog_ui::actions(
+                m3::text_button(palette)
+                    .element_ref(&self.dialog.close)
+                    .automation_name("Cancel")
+                    .on_click(
+                        context.message(Message::Settings(SettingsMsg::DaemonConfirmed(false))),
+                    )
+                    .content(m3::label("Cancel")),
+                save.element_ref(&self.dialog.primary)
+                    .is_enabled(!lines.is_empty())
+                    .automation_name("Save the daemon settings")
+                    .on_click(
+                        context.message(Message::Settings(SettingsMsg::DaemonConfirmed(true))),
+                    )
+                    .content(m3::label("Save")),
+            ),
+            tokens::layout::DIALOG_WIDTH,
+        )
+    }
+
     /// Owner rules: the text every agent receives at its start.
     pub(super) fn owner_rules_page(
         &self,
@@ -255,8 +494,14 @@ impl DesktopApp {
         StackPanel::new().spacing(tokens::spacing::SM).children((
             m3::card_title("Reactions"),
             m3::settings_card(palette, rows),
-            m3::secondary("The daemon applies a change at its next start.")
+            m3::secondary("The daemon applies a change at its next start. Save asks first.")
                 .text_wrapping(TextWrapping::Wrap),
+            self.save_bar(
+                Page::Attention,
+                self.settings.dirty(Page::Attention),
+                context,
+                palette,
+            ),
         ))
     }
 
@@ -332,8 +577,8 @@ impl DesktopApp {
     /// Daemon: what a restart does, how much the log says, where chats
     /// work.
     pub(super) fn daemon_page(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
-        const RESTART: &[(&str, &str)] = &[("continue", "Continue"), ("hold", "Hold")];
-        const LOG: &[(&str, &str)] = &[("standard", "Standard"), ("debug", "Debug")];
+        const RESTART: &[(&str, &str)] = RESTART_CHOICES;
+        const LOG: &[(&str, &str)] = LOG_CHOICES;
         let daemon = &self.settings.daemon;
         let chats = model::daemon_text(daemon, "/chats_root");
         StackPanel::new()
@@ -379,8 +624,11 @@ impl DesktopApp {
                         ),
                     ],
                 ),
-                m3::secondary("On restart and the chats folder apply at the next start.")
-                    .text_wrapping(TextWrapping::Wrap),
+                m3::secondary(
+                    "On restart and the chats folder apply at the next start. Save asks first.",
+                )
+                .text_wrapping(TextWrapping::Wrap),
+                self.save_bar(Page::Daemon, self.settings.dirty(Page::Daemon), context, palette),
             ))
     }
 
@@ -444,7 +692,16 @@ impl DesktopApp {
         StackPanel::new().spacing(tokens::spacing::SM).children((
             m3::card_title("History"),
             m3::settings_card(palette, rows),
-            m3::secondary("Retention windows apply at once.").text_wrapping(TextWrapping::Wrap),
+            m3::secondary(
+                "Retention windows apply at once; a shorter one deletes older history. Save asks first.",
+            )
+            .text_wrapping(TextWrapping::Wrap),
+            self.save_bar(
+                Page::Retention,
+                self.settings.dirty(Page::Retention),
+                context,
+                palette,
+            ),
         ))
     }
 }
