@@ -3517,12 +3517,19 @@ and stages those exact bytes as a read-only, content-addressed
 The selected release directory remains the child working directory. Metadata
 inspection, Store preflight and candidate spawn all use the staged path. A
 pre-existing artifact is reused only when it is a regular non-symlink file and
-its bytes match the digest in its name. An incomplete artifact created by the
-current attempt is removed on staging failure; if that cleanup fails, the
-result is uncertain and the failure reports the retained path. Validated
-versioned artifacts are retained after success, refusal and rollback. The
-updater does not prune them; an operator may remove one only after confirming
-that no running process executes that image.
+its bytes match the digest in its name. A mismatched regular file or symlink at
+the exact updater-owned artifact path is removed before staging; a directory
+or an artifact that cannot be safely removed causes refusal. An incomplete
+artifact created by the current attempt is removed on staging failure; if that
+cleanup fails, the result is uncertain and the failure reports the retained
+path. On Windows the optional desktop companion is staged, hash-verified and
+pinned by the same rules before launch. After a successful update, Windows
+prunes verified inactive images in the selected release directory while
+retaining the running and previous daemon images and the active and previous
+desktop companions. A mapped or otherwise undeletable image is retained.
+Staging currently lives beside the selected release, so pruning does not reach
+artifacts in other source directories; non-Windows pruning is deferred because
+the updater cannot prove that an old image is not mapped by another process.
 
 The updater binds the reported release hash to the launched process image as
 well as to the staged file. On Windows it opens the staged file with read
@@ -3531,10 +3538,17 @@ validation, denying replacement, writes and deletion for that interval. On
 Linux, after candidate publication and again at healthy admission, it hashes
 `/proc/<published-pid>/exe` while rechecking that PID's recorded daemon identity;
 this reads the inode mapped by that exact process even if the source pathname
-has since changed. If the process image cannot be read or its hash differs,
-the updater does not apply the staged release's Store schema to rollback
-decisions. It leaves the candidate, current Store and backup in place, keeps
-interrupted Agents held, and reports the candidate PID for Owner recovery.
+has since changed. If the process image cannot be read or its hash differs, the
+updater does not apply the staged release's Store schema to rollback decisions.
+It first attempts the ordinary lossless drain and waits for confirmed
+candidate exit. If drain or exit is unconfirmed, the candidate remains in
+service and the current Store and backup remain intact. After confirmed exit,
+it checks the previous executable against a copy of the current Store. Only a
+successful compatibility check permits that executable to restart on the
+current Store; this path never replaces the Store with the older backup.
+Proven incompatibility leaves the current Store and backup intact, keeps
+interrupted Agents held, and reports the candidate PID and recovery error for
+Owner action.
 
 **Private stand (#837).** `stand up` creates a fresh private daemon directory
 and a scratch Git repository inside it. Repeat `--profile NAME` to import
