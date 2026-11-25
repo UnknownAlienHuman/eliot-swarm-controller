@@ -1072,8 +1072,8 @@ unresolved probe once the bound generation ends and its native custody drains, o
 after the Owner resolves the exact inactive turn. It preserves the Agent, turn and
 workspace. An uncertain probe is never replayed.
 An unknown cleanup artifact keeps deletion fenced. Probe recovery reports the
-Agent and artifact and ends that cleanup attempt immediately. A live custody
-blocker is eligible for the bounded drain wait.
+Agent and artifact once process and source custody have drained. A live
+custody blocker takes priority and is eligible for the bounded drain wait.
 If a minimal request cannot be prepared safely for the frozen profile, the daemon
 paces background preparation with a five-minute defer. The persisted deadline
 for a fresh launch and the admission budget stay available. A maintenance probe
@@ -1614,10 +1614,12 @@ An unchanged Stuck candidate becomes reportable after two consecutive sweeps.
 Swarm logs `daemon.liveness_stuck` once per episode and exposes the current
 subject in the Owner inbox. Each command has at most one current command item.
 An active Goal with a running turn on its bound Agent generation waits for that
-turn while the native source is open or an owned process is running and the
-Goal has no unresolved round. This applies when a cadence slot becomes due
-during a long tool call. A start with neither a dispatcher nor running custody
-still qualifies for Stuck after confirmation.
+turn when the Goal has no unresolved round and an owned process is running or
+an open native source is healthy or slow. A stale or failed source alone
+supplies no execution evidence for the Agent or Goal. The wait keeps the
+cadence due time when a slot becomes due during a long tool call. A start with
+neither a dispatcher nor running custody still qualifies for Stuck after
+confirmation.
 The `swarm status` liveness summary includes the number of confirmed commands
 without a dispatcher and the oldest command's ID and age, including snoozed
 items (#929, #883).

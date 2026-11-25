@@ -837,7 +837,7 @@ pub(super) fn custody_blocker_tx(
     workspace_cleanup_generation: Option<i64>,
 ) -> Result<Option<CustodyBlocker>> {
     tx.query_row(
-        "SELECT state||' '||role||' process '||pid||' ('||owner||')',0 FROM processes
+        "SELECT state||' '||role||' process '||pid||' ('||owner||')',0 AS unknown_artifact FROM processes
              WHERE state IN ('running','unknown')
                AND (owner GLOB 'agent:a'||?1||'#*' OR owner GLOB 'workspace:a'||?1||'#*')
          UNION ALL SELECT 'unknown artifact '||id,1 FROM artifacts WHERE agent=?1 AND json_extract(body,'$.state')='unknown'
@@ -845,7 +845,7 @@ pub(super) fn custody_blocker_tx(
              WHERE agent=?1 AND state='open' AND source!='daemon'
                AND (?2 OR source NOT IN ('os','git','workspace_process'))
                AND NOT (source='workspace_process' AND generation IS ?3)
-         LIMIT 1",
+         ORDER BY unknown_artifact LIMIT 1",
         params![agent, observers, workspace_cleanup_generation],
         |row| Ok(CustodyBlocker {
             detail: row.get(0)?,

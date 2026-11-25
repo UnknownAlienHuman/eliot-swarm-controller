@@ -1423,7 +1423,8 @@ fn project_agents(
                 EXISTS(SELECT 1 FROM turns t WHERE t.agent=a.id AND t.generation=a.generation
                   AND t.turn_id=a.active_turn AND t.state='running'),
                 EXISTS(SELECT 1 FROM source_state s WHERE s.agent=a.id AND s.generation=a.generation
-                  AND s.state='open' AND s.source NOT IN ('daemon','os','git','workspace_process')),
+                  AND s.state='open' AND s.health IN ('ok','slow')
+                  AND s.source NOT IN ('daemon','os','git','workspace_process')),
                 CASE WHEN a.state IN ('busy','waiting') AND a.active_turn IS NULL THEN EXISTS(
                   SELECT 1 FROM turns t WHERE t.agent=a.id AND t.generation=a.generation
                   AND t.state IN ('running','unknown')) ELSE 0 END,
@@ -1455,7 +1456,7 @@ fn project_agents(
                              'agent:a'||a.id||'#'||a.generation,
                              'workspace:a'||a.id||'#'||a.generation) AND wp.state='running')
                         OR EXISTS(SELECT 1 FROM source_state ws WHERE ws.agent=a.id
-                             AND ws.generation=a.generation AND ws.state='open'
+                             AND ws.generation=a.generation AND ws.state='open' AND ws.health IN ('ok','slow')
                              AND ws.source NOT IN ('daemon','os','git','workspace_process'))))
                   ))
          WHERE a.observe_only=0 AND a.archived=0
@@ -1762,7 +1763,8 @@ fn project_goals(
            AND t.turn_id=a.active_turn AND t.state='running'
        ) AND (
          EXISTS(SELECT 1 FROM source_state s WHERE s.agent=a.id AND s.generation=a.generation
-           AND s.state='open' AND s.source NOT IN ('daemon','os','git','workspace_process'))
+           AND s.state='open' AND s.health IN ('ok','slow')
+           AND s.source NOT IN ('daemon','os','git','workspace_process'))
          OR EXISTS(SELECT 1 FROM processes p WHERE p.owner IN (
            'agent:a'||a.id||'#'||a.generation,'workspace:a'||a.id||'#'||a.generation)
            AND p.state='running')
