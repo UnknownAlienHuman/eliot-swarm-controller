@@ -1113,7 +1113,7 @@ impl Store {
         read_bound: Option<(i64, i64)>,
     ) -> Result<QuotaObservationRange> {
         self.ensure_committed_reads()?;
-        const MAX_ROLLING_UPDATES: i64 = 64;
+        const MAX_QUOTA_ROWS_PER_PAGE: i64 = 64;
         let complete = |observations| {
             Ok(QuotaObservationRange {
                 observations,
@@ -1189,14 +1189,14 @@ impl Store {
                         login_changed_at,
                         cursor_ms,
                         cursor_seq,
-                        MAX_ROLLING_UPDATES
+                        MAX_QUOTA_ROWS_PER_PAGE
                     ],
                     |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
                 )
                 .map_err(sql_error)?
                 .collect::<rusqlite::Result<Vec<_>>>()
                 .map_err(sql_error)?;
-            let page_full = rows.len() >= MAX_ROLLING_UPDATES as usize;
+            let page_full = rows.len() >= MAX_QUOTA_ROWS_PER_PAGE as usize;
             for (data, seq) in rows {
                 let observation = decode_quota_observation(data)?;
                 cursor_ms = observation.observed_at_ms;

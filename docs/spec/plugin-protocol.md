@@ -1199,7 +1199,9 @@ republishing, including when the same thread is reattached in a later
 generation. Count changes and the `other` display bucket do not alter identity.
 The retained row adds each incoming unit count in place, like other
 retained-row annotations, so repeated identical notices are counted without a
-second event and the total survives restarts. Each notice carries a
+second event and the total survives restarts. The row's `payload_digest`
+still covers the first observation after these in-place increments; no
+reader re-verifies it against the merged data. Each notice carries a
 per-submission batch nonce, and the retained row records the last batch
 identity that incremented it, so an exact resend merges without incrementing
 twice. Only the last uncommitted batch is ever resent, so a resend of an older
