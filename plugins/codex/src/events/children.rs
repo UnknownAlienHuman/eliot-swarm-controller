@@ -75,6 +75,35 @@ impl ChildState {
         source.commit_event(kind, native_id, data).await
     }
 
+    async fn commit_warning(
+        &mut self,
+        sink: &mut CommitSink,
+        host: &PeerClient,
+        credential: &str,
+        batch: warnings::WarningBatch,
+    ) -> Result<()> {
+        let mut source = StreamSource {
+            sink,
+            host,
+            credential,
+            agent_id: &self.binding.agent_id,
+            generation: self.binding.agent_generation,
+            harness: "Codex",
+            id_prefix: "codex",
+            families: crate::capabilities::NATIVE_CHILD_FAMILIES,
+            writes_blocked: &mut self.writes_blocked,
+            gap_reported: &mut self.gap_reported,
+            gap_number: &mut self.gap_number,
+            source_unknown: &mut self.source_unknown,
+            batch_unknown: &mut self.batch_unknown,
+            failure: &mut self.failure,
+        };
+        source
+            .commit_singleton_batch(NATIVE_WARNING_EVENT, batch.id, batch.data, &batch.nonce)
+            .await
+            .map(|_| ())
+    }
+
     async fn commit_message(
         &mut self,
         sink: &mut CommitSink,
@@ -1211,22 +1240,20 @@ impl EventProcessor {
                     .child_states
                     .get_mut(child_thread)
                     .ok_or_else(|| Error::new("bad_state", "Codex child state missing"))?;
-                if let Some((id, data)) =
+                let malformed_before = state.warnings.malformed_dropped();
+                let observed = state
+                    .warnings
+                    .observe(Some(child_thread), params, &policy)?;
+                let malformed = state.warnings.malformed_dropped() > malformed_before;
+                if let Some(batch) = observed {
                     state
-                        .warnings
-                        .observe(Some(child_thread), params, &policy)?
-                {
-                    state
-                        .commit_event(
-                            &mut self.sink,
-                            &self.host,
-                            &self.credential,
-                            NATIVE_WARNING_EVENT,
-                            id,
-                            data,
-                        )
+                        .commit_warning(&mut self.sink, &self.host, &self.credential, batch)
                         .await?;
                 }
+                if malformed {
+                    self.warnings.record_malformed_dropped();
+                }
+                self.status.malformed_warnings_dropped = self.warnings.malformed_dropped();
             }
             "mcpServer/startupStatus/updated" => {
                 let policy = SecretPolicy::new(self.secrets.iter().cloned());
@@ -1234,22 +1261,21 @@ impl EventProcessor {
                     .child_states
                     .get_mut(child_thread)
                     .ok_or_else(|| Error::new("bad_state", "Codex child state missing"))?;
-                if let Some((id, data)) =
+                let malformed_before = state.warnings.malformed_dropped();
+                let observed =
                     state
                         .warnings
-                        .observe_startup_status(Some(child_thread), params, &policy)?
-                {
+                        .observe_startup_status(Some(child_thread), params, &policy)?;
+                let malformed = state.warnings.malformed_dropped() > malformed_before;
+                if let Some(batch) = observed {
                     state
-                        .commit_event(
-                            &mut self.sink,
-                            &self.host,
-                            &self.credential,
-                            NATIVE_WARNING_EVENT,
-                            id,
-                            data,
-                        )
+                        .commit_warning(&mut self.sink, &self.host, &self.credential, batch)
                         .await?;
                 }
+                if malformed {
+                    self.warnings.record_malformed_dropped();
+                }
+                self.status.malformed_warnings_dropped = self.warnings.malformed_dropped();
             }
             _ if is_advisory_notification(method) => {}
             _ => {

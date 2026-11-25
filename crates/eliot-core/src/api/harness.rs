@@ -227,6 +227,39 @@ pub struct QuotaWindowProjection {
     pub slots: &'static [QuotaWindowSlot],
 }
 
+/// Mark every projected window unknown after a truncated sparse range. A
+/// partial range must not present stale windows as live; null is the
+/// established unknown representation for these detail keys.
+pub fn mark_quota_windows_unknown(
+    details: &mut serde_json::Value,
+    projection: QuotaWindowProjection,
+) {
+    let Some(details) = details.as_object_mut() else {
+        return;
+    };
+    let Some(container) = details
+        .get_mut(projection.container_key)
+        .and_then(serde_json::Value::as_object_mut)
+    else {
+        return;
+    };
+    for slot in projection.slots {
+        let entry = container
+            .entry(slot.selector_key.to_owned())
+            .or_insert_with(|| serde_json::json!({}));
+        let Some(fields) = entry.as_object_mut() else {
+            continue;
+        };
+        fields.insert(slot.used_percent_key.to_owned(), serde_json::Value::Null);
+        if let Some(key) = slot.reset_key {
+            fields.insert(key.to_owned(), serde_json::Value::Null);
+        }
+        if let Some(key) = slot.duration_mins_key {
+            fields.insert(key.to_owned(), serde_json::Value::Null);
+        }
+    }
+}
+
 type QuotaRouteRefusal = fn(&serde_json::Value, &serde_json::Value) -> Option<&'static str>;
 
 /// Adapter readback shape and route preflight for provider quota.

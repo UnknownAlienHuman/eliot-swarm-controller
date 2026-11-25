@@ -65,6 +65,7 @@ pub(crate) struct EventStatus {
     pub batch_unknown: bool,
     pub source_unknown: bool,
     pub unbound_warnings_dropped: u64,
+    pub malformed_warnings_dropped: u64,
     pub stopped: bool,
     pub session_history_failure_at: Option<Instant>,
     pub compaction: Option<CompactionProgress>,
@@ -1802,24 +1803,26 @@ impl EventProcessor {
             }
             "warning" => {
                 let policy = SecretPolicy::new(self.secrets.iter().cloned());
-                if let Some((id, data)) =
+                if let Some(batch) =
                     self.warnings
                         .observe(self.status.thread_id.as_deref(), params, &policy)?
                 {
-                    self.commit_event(NATIVE_WARNING_EVENT, id, data).await?;
+                    self.commit_warning_batch(batch).await?;
                 }
                 self.status.unbound_warnings_dropped = self.warnings.unbound_dropped();
+                self.status.malformed_warnings_dropped = self.warnings.malformed_dropped();
             }
             "mcpServer/startupStatus/updated" => {
                 let policy = SecretPolicy::new(self.secrets.iter().cloned());
-                if let Some((id, data)) = self.warnings.observe_startup_status(
+                if let Some(batch) = self.warnings.observe_startup_status(
                     self.status.thread_id.as_deref(),
                     params,
                     &policy,
                 )? {
-                    self.commit_event(NATIVE_WARNING_EVENT, id, data).await?;
+                    self.commit_warning_batch(batch).await?;
                 }
                 self.status.unbound_warnings_dropped = self.warnings.unbound_dropped();
+                self.status.malformed_warnings_dropped = self.warnings.malformed_dropped();
             }
             _ if is_advisory_notification(method) => {}
             _ => {
@@ -2393,6 +2396,13 @@ impl EventProcessor {
         self.stream_source()
             .commit_event(kind, native_id, data)
             .await
+    }
+
+    async fn commit_warning_batch(&mut self, batch: warnings::WarningBatch) -> Result<()> {
+        self.stream_source()
+            .commit_singleton_batch(NATIVE_WARNING_EVENT, batch.id, batch.data, &batch.nonce)
+            .await
+            .map(|_| ())
     }
 
     async fn record_gap(&mut self, reason: &str) -> Result<()> {

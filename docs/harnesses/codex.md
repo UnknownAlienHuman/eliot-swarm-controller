@@ -806,11 +806,28 @@ retained as a bounded diagnostic on its exact owned thread.
 `warning` has a required `message`, optional `threadId`, and no turn binding in
 the installed 0.167.1 schema. It produces a typed `session.native_warning`
 diagnostic only when `threadId` matches the exact owned thread. The adapter
-records a running count per bounded code and redacts the message before
-truncating it. The schema has no code field, so uncoded notifications use
-`warning`. The diagnostic remains thread-scoped and visible in retained events
+sends one occurrence per notice with a bounded code and redacts the message
+before truncating it. The schema has no code field, so uncoded notifications
+use `warning`. Identity uses the exact thread, accepted native code before the
+bounded display `other` bucket, and the full redacted message before the 1,024
+byte display truncation. Its deterministic content digest excludes the
+occurrence count; persisted warning fields and credentials are unchanged.
+A repeated identical notice adds its unit count to the retained row instead
+of writing a second event, so the total survives adapter restarts.
+A matching retained warning on the same Agent's `stream` is acknowledged by
+its original sequence without a second event, including across generations
+when the same native thread is reattached. The lookback ends when the warning
+row is pruned by the configured event-retention window; a later identical
+notice can then be admitted again. Other
+Agents, threads and sources remain separate. Legacy warning IDs keep their
+existing behavior. The diagnostic remains thread-scoped and visible in retained events
 after the turn ends. Missing or mismatched thread bindings increment
-`unbound_warnings_dropped` in the native snapshot; their message is discarded.
+`unbound_warnings_dropped` in the native snapshot; malformed notification or
+startup-status payloads increment `malformed_warnings_dropped`. Both discard
+the payload text. Codex provides no native ID for these notices. The adapter
+names the transport occurrence and Store binds the diagnostic to its batch.
+Identical warnings remain separate facts and the adapter does not replay
+uncertain writes.
 
 The installed schema describes `account/rateLimits/updated` as a sparse rolling
 update. An owned direct account stream translates the primary and secondary

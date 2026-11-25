@@ -1575,7 +1575,10 @@ The switch parent is Accepted at reservation and Dispatched while orchestrating.
 Store reserves the launch and handoff IDs in the shared mutation ID space in
 the parent admission transaction, before the receipt or any source Stop. A
 linked child consumes only its own reservation in the transaction that binds
-the child command. Exact switch replay returns the original IDs.
+the child command. A rejected switch releases unused child IDs in the same
+transaction as its refusal. Exact replay keeps the original receipt without
+reserving those IDs again. Boot recovery also releases unused IDs retained by
+older rejected switches.
 Applied means the H2 Store transfer committed, not that the brief/task succeeded.
 A lost or failed source qualifies once
 [custody proves its process tree exited](monitoring.md#work-recorded-in-git). Its unknown

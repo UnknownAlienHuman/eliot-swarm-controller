@@ -1,10 +1,10 @@
 use eliot_core::{
-    Error, MAX_NATIVE_WARNING_BYTES, NATIVE_WARNING_EVENT, NativeWarning, Result, SecretPolicy,
-    is_native_discriminator,
+    Error, MAX_NATIVE_WARNING_BYTES, NativeWarning, Result, SecretPolicy, is_native_discriminator,
 };
 use serde::Deserialize;
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::HashSet;
+use ulid::Ulid;
 
 const MAX_WARNING_CODES: usize = 16;
 
@@ -26,10 +26,19 @@ struct StartupStatus {
     failure_reason: Option<String>,
 }
 
+/// One observed notice with its per-submission batch nonce. The nonce is
+/// minted once per notice, so an exact resend carries the same batch identity
+/// while a later notice never does.
+pub(super) struct WarningBatch {
+    pub(super) id: String,
+    pub(super) data: Value,
+    pub(super) nonce: String,
+}
+
 #[derive(Default)]
 pub(super) struct Warnings {
-    counts: HashMap<String, u64>,
-    sequence: u64,
+    seen_codes: HashSet<String>,
+    malformed_dropped: u64,
     unbound_dropped: u64,
 }
 
@@ -39,8 +48,9 @@ impl Warnings {
         bound_thread: Option<&str>,
         params: Value,
         policy: &SecretPolicy,
-    ) -> Result<Option<(String, Value)>> {
+    ) -> Result<Option<WarningBatch>> {
         let Ok(notification) = serde_json::from_value::<Notification>(params) else {
+            self.record_malformed_dropped();
             return Ok(None);
         };
         let code = notification
@@ -62,8 +72,9 @@ impl Warnings {
         bound_thread: Option<&str>,
         params: Value,
         policy: &SecretPolicy,
-    ) -> Result<Option<(String, Value)>> {
+    ) -> Result<Option<WarningBatch>> {
         let Ok(notification) = serde_json::from_value::<StartupStatus>(params) else {
+            self.record_malformed_dropped();
             return Ok(None);
         };
         if notification.status != "failed" {
@@ -92,6 +103,14 @@ impl Warnings {
         self.unbound_dropped
     }
 
+    pub(super) fn malformed_dropped(&self) -> u64 {
+        self.malformed_dropped
+    }
+
+    pub(super) fn record_malformed_dropped(&mut self) {
+        self.malformed_dropped = self.malformed_dropped.saturating_add(1);
+    }
+
     pub(super) fn record_unbound_dropped(&mut self) {
         self.unbound_dropped = self.unbound_dropped.saturating_add(1);
     }
@@ -103,7 +122,7 @@ impl Warnings {
         code: &str,
         source_message: &str,
         policy: &SecretPolicy,
-    ) -> Result<Option<(String, Value)>> {
+    ) -> Result<Option<WarningBatch>> {
         let Some(thread) = bound_thread.filter(|thread| Some(*thread) == notification_thread)
         else {
             self.record_unbound_dropped();
@@ -112,36 +131,35 @@ impl Warnings {
         if source_message.is_empty() {
             return Ok(None);
         }
-        let mut code = code;
-        if !self.counts.contains_key(code) && self.counts.len() >= MAX_WARNING_CODES - 1 {
-            code = "other";
-        }
-        let count = self.counts.entry(code.to_owned()).or_default();
-        *count = count.saturating_add(1);
         let mut message = policy.redact_text(source_message);
         let truncated = message.len() > MAX_NATIVE_WARNING_BYTES;
+        let id = NativeWarning::stable_id_for_fields(thread, code, &message, truncated)?;
+        let published_code =
+            if !self.seen_codes.contains(code) && self.seen_codes.len() >= MAX_WARNING_CODES - 1 {
+                "other"
+            } else {
+                code
+            };
+        self.seen_codes.insert(published_code.to_owned());
         if truncated {
             message.truncate(message.floor_char_boundary(MAX_NATIVE_WARNING_BYTES));
         }
+        // One notice is one occurrence. The Store counts repeats in the
+        // retained row, so the total survives plugin restarts.
         let warning = NativeWarning {
             thread_id: thread.to_owned(),
-            code: code.to_owned(),
-            count: *count,
+            code: published_code.to_owned(),
+            count: 1,
             message,
             truncated,
+            last_batch_id: None,
         };
-        self.sequence = self
-            .sequence
-            .checked_add(1)
-            .ok_or_else(|| Error::new("source_integrity", "Codex warning sequence exhausted"))?;
-        let id = super::event_id(
-            thread,
-            "session",
-            &format!("warning-{}", self.sequence),
-            NATIVE_WARNING_EVENT,
-        )?;
         let data = serde_json::to_value(warning)
             .map_err(|_| Error::new("internal", "Codex warning could not be encoded"))?;
-        Ok(Some((id, data)))
+        Ok(Some(WarningBatch {
+            id,
+            data,
+            nonce: Ulid::new().to_string(),
+        }))
     }
 }

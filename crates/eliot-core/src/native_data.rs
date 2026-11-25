@@ -5,6 +5,7 @@ use crate::{Error, Result, api::REDACTION_MARKER};
 
 pub const UNCLASSIFIED_NATIVE_EVENT: &str = "session.native_unclassified";
 pub const NATIVE_WARNING_EVENT: &str = "session.native_warning";
+pub const NATIVE_WARNING_CONTENT_PREFIX: &str = "native-warning-content:";
 pub const MAX_NATIVE_WARNING_BYTES: usize = 1024;
 const MAX_LABEL_BYTES: usize = 128;
 
@@ -17,9 +18,46 @@ pub struct NativeWarning {
     pub count: u64,
     pub message: String,
     pub truncated: bool,
+    /// Last submission batch that incremented the retained row. Store merge
+    /// bookkeeping, never producer input: the producer always omits it and
+    /// the Store stamps the committing batch identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_batch_id: Option<String>,
 }
 
 impl NativeWarning {
+    /// Stable native warning identity uses redacted fields before display aggregation
+    /// or truncation. The local display count is deliberately excluded.
+    pub fn stable_id_for_fields(
+        thread: &str,
+        code: &str,
+        message: &str,
+        truncated: bool,
+    ) -> Result<String> {
+        let digest = crate::canonical_json_sha256(&serde_json::json!([
+            thread, code, message, truncated,
+        ]))
+        .map_err(|_| Error::new("internal", "native warning identity could not be encoded"))?;
+        let digest = digest
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        Ok(format!("{NATIVE_WARNING_CONTENT_PREFIX}{digest}"))
+    }
+
+    pub fn has_stable_id_shape(id: &str) -> bool {
+        id.strip_prefix(NATIVE_WARNING_CONTENT_PREFIX)
+            .is_some_and(|digest| crate::is_lowercase_hex(digest, 64))
+    }
+
+    /// A restarted producer may have a different display count or overflow bucket.
+    pub fn matches_retained_diagnostic(&self, other: &Self) -> bool {
+        self.thread_id == other.thread_id
+            && (self.code == other.code || self.code == "other" || other.code == "other")
+            && self.message == other.message
+            && self.truncated == other.truncated
+    }
+
     pub fn validate_data(data: &Value, thread: Option<&str>) -> Result<()> {
         let warning: Self = serde_json::from_value(data.clone())
             .map_err(|_| Error::new("invalid", "native warning schema is invalid"))?;

@@ -1005,7 +1005,7 @@ impl Router {
             return Ok(());
         }
         let now = now_ms();
-        let observations = {
+        let range = {
             let Ok(store) = tokio::time::timeout_at(deadline.into(), self.inner.store.lock()).await
             else {
                 return Ok(());
@@ -1019,11 +1019,18 @@ impl Router {
                 response.fetched_at_ms,
             )?
         };
+        // A truncated range is checked before the login state: an incomplete
+        // range can neither decorate a current read nor leave a stale read's
+        // values standing, so the windows are unknown either way.
+        if range.truncated {
+            eliot_core::api::harness::mark_quota_windows_unknown(details, projection);
+            return Ok(());
+        }
         if login.is_current() {
             // A sparse watch update does not refresh the full read's timestamp
             // or its ordinary-usage authorization. Hold release still requires
             // the actual read to be newer than the hold.
-            for observation in observations {
+            for observation in range.observations {
                 Self::overlay_quota_windows(details, &observation, projection);
             }
         }
@@ -1038,6 +1045,10 @@ impl Router {
         observation: &eliot_core::api::harness::QuotaObservation,
         projection: eliot_core::api::harness::QuotaWindowProjection,
     ) {
+        // Sparse values cannot safely decorate an incomplete/non-object full read.
+        let Some(details) = details.as_object_mut() else {
+            return;
+        };
         let Some(container) = details
             .get_mut(projection.container_key)
             .and_then(Value::as_object_mut)
@@ -1070,7 +1081,10 @@ impl Router {
                 fields.insert(key.to_owned(), json!(window.window_duration_mins));
             }
         }
-        details[projection.observed_at_key] = json!(observation.observed_at_ms);
+        details.insert(
+            projection.observed_at_key.to_owned(),
+            json!(observation.observed_at_ms),
+        );
     }
 
     /// Page the installed harness catalogues for the current settings revision.

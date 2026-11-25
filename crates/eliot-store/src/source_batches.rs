@@ -7,6 +7,38 @@ use std::borrow::Cow;
 
 const NATIVE_FIELD_REFUSED: &str = "source.native_field_refused";
 
+/// Warning singleton batch identity: the deterministic per-warning batch,
+/// or one per-notice submission nonce minted by the producer. The nonce is
+/// bounded discriminator text so it stays out of secret bindings.
+fn warning_batch_id(native_id: &str, batch_id: &str) -> bool {
+    if batch_id == format!("{native_id}:batch") {
+        return true;
+    }
+    batch_id
+        .strip_prefix(format!("{native_id}:batch:").as_str())
+        .is_some_and(|nonce| {
+            !nonce.is_empty() && nonce.len() <= 64 && core::is_native_discriminator(nonce)
+        })
+}
+
+/// A merged warning is acknowledged by its original sequence without a
+/// second event.
+fn warning_replay(seq: i64, refused: Vec<usize>) -> BatchCommit {
+    BatchCommit {
+        ack: BatchAck {
+            first_seq: seq,
+            last_seq: seq,
+            cursor: None,
+            dropped_unclassified: 0,
+            refused_native_fields: refused,
+            permission_refusal: None,
+            native_wake_cancel: None,
+        },
+        events: Vec::new(),
+        replayed: true,
+    }
+}
+
 /// The only native event input accepted by the writer. Preparing before
 /// acquiring the writer keeps classification outside the transaction and
 /// gives every direct, observed, child and grouped batch the same digest input.
@@ -28,6 +60,8 @@ impl PreparedSourceBatch {
             return Err(secret_in_batch_binding());
         }
         let mut refused = Vec::new();
+        let warning_batch =
+            batch.events.len() == 1 && batch.source == "stream" && batch.cursor.is_none();
         for (index, event) in batch.events.iter_mut().enumerate() {
             let id = policy.contains_native_secret(&event.native_id);
             let kind = policy.contains_native_secret(&event.kind);
@@ -47,6 +81,19 @@ impl PreparedSourceBatch {
                 event.kind = NATIVE_FIELD_REFUSED.to_owned();
                 refused.push(index);
                 continue;
+            }
+            if event
+                .native_id
+                .starts_with(core::NATIVE_WARNING_CONTENT_PREFIX)
+                && !(warning_batch
+                    && event.kind == core::NATIVE_WARNING_EVENT
+                    && core::NativeWarning::has_stable_id_shape(&event.native_id)
+                    && warning_batch_id(&event.native_id, &batch.batch_id))
+            {
+                return Err(Error::new(
+                    "source_integrity",
+                    "native warning identity requires its exact singleton stream batch",
+                ));
             }
             if protected_data_has_secret(&event.data, &policy, false) {
                 return Err(secret_in_batch_binding());
@@ -978,6 +1025,19 @@ impl Store {
         }
         require_nonempty(&batch.batch_id, "batch_id")?;
         require_nonempty(&batch.source, "source")?;
+        // Stamp the committing batch identity into a warning singleton up
+        // front, so the ordinary insert path persists the merge record with
+        // the first row. The stamp travels with an exact resend, while every
+        // new notice mints a fresh nonce.
+        if batch.source == "stream"
+            && batch.events.len() == 1
+            && batch.events[0].kind == core::NATIVE_WARNING_EVENT
+            && core::NativeWarning::has_stable_id_shape(&batch.events[0].native_id)
+            && warning_batch_id(&batch.events[0].native_id, &batch.batch_id)
+            && let Some(object) = batch.events[0].data.as_object_mut()
+        {
+            object.insert("last_batch_id".to_owned(), json!(batch.batch_id.as_str()));
+        }
         if batch.events.is_empty() {
             return Err(Error::new("invalid", "native batch must contain an event"));
         }
@@ -1147,6 +1207,89 @@ impl Store {
         let source = load_source_state(tx, agent_num, batch.generation, &batch.source)?
             .ok_or_else(|| Error::new("source_integrity", "source has no committed state"))?;
 
+        if !observed
+            && batch.source == "stream"
+            && batch.events.len() == 1
+            && batch.events[0].kind == core::NATIVE_WARNING_EVENT
+            && core::NativeWarning::has_stable_id_shape(&batch.events[0].native_id)
+            && source.state == "open"
+            && !projection.is_terminal()
+        {
+            let event = &batch.events[0];
+            let owner: Option<String> = tx
+                .query_row(
+                    "SELECT source FROM source_owners
+                     WHERE agent=?1 AND generation=?2 AND family='session'",
+                    params![agent_num, batch.generation],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(sql_error)?;
+            if owner.as_deref() != Some(batch.source.as_str()) {
+                return Err(Error::new(
+                    "source_integrity",
+                    "warning source does not own its family",
+                ));
+            }
+            core::NativeWarning::validate_data(&event.data, projection.native_ref.as_deref())?;
+            let retained: Option<(i64, String)> = tx
+                .query_row(
+                    "SELECT seq, data FROM events
+                     WHERE agent=?1 AND generation<=?2 AND source='stream' AND kind=?3 AND native_id=?4
+                     ORDER BY seq DESC LIMIT 1",
+                    params![agent_num, batch.generation, core::NATIVE_WARNING_EVENT, event.native_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()
+                .map_err(sql_error)?;
+            // The increment is idempotent per submission: the producer mints
+            // one batch nonce per notice, so an exact resend carries the batch
+            // identity that already incremented the row while a later notice
+            // never does. The identity lives in the retained row itself, so
+            // event retention prunes the record with it.
+            if let Some((seq, data)) = retained {
+                let retained: core::NativeWarning = serde_json::from_value(decode_json(&data)?)
+                    .map_err(|_| Error::new("source_integrity", "retained warning is invalid"))?;
+                let incoming: core::NativeWarning = serde_json::from_value(event.data.clone())
+                    .map_err(|_| Error::new("source_integrity", "warning data is invalid"))?;
+                if retained
+                    .validate_for_thread(projection.native_ref.as_deref())
+                    .is_err()
+                    || !retained.matches_retained_diagnostic(&incoming)
+                {
+                    return Err(Error::new(
+                        "source_integrity",
+                        "warning identity collides with different retained content",
+                    ));
+                }
+                if retained.last_batch_id.as_deref() == Some(batch.batch_id.as_str()) {
+                    return Ok(warning_replay(seq, refused));
+                }
+                // Each new batch carries one occurrence, so identical warnings
+                // merge into this row by adding the incoming increment to the
+                // retained total. The total lives in the Store, never in
+                // process memory, so it survives producer restarts. The row
+                // is annotated in place, like other retained-row annotations,
+                // and records the incrementing batch identity with it.
+                let total = retained.count.saturating_add(incoming.count);
+                if total > retained.count {
+                    let mut stored: Value = decode_json(&data)?;
+                    if let Some(object) = stored.as_object_mut() {
+                        object.insert("count".to_owned(), json!(total));
+                        object.insert("last_batch_id".to_owned(), json!(batch.batch_id.as_str()));
+                    }
+                    tx.execute(
+                        "UPDATE events SET data=?1 WHERE seq=?2",
+                        params![encode_json(&stored)?, seq],
+                    )
+                    .map_err(sql_error)?;
+                }
+                return Ok(warning_replay(seq, refused));
+            }
+            // First occurrence takes the ordinary insert path below; it
+            // already carries the stamped batch identity, so a resend merges
+            // instead of inserting a second row.
+        }
         if source.last_batch_id.as_deref() == Some(batch.batch_id.as_str()) {
             if source.cursor == batch.cursor
                 && (source.last_batch_digest.as_deref() == Some(batch_digest.as_slice())

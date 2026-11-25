@@ -90,8 +90,8 @@ pub use native_child::{
     native_child_families_for_harness,
 };
 pub use native_data::{
-    MAX_NATIVE_WARNING_BYTES, NATIVE_WARNING_EVENT, NativeWarning, UNCLASSIFIED_NATIVE_EVENT,
-    is_native_discriminator, validate_unclassified_native_data,
+    MAX_NATIVE_WARNING_BYTES, NATIVE_WARNING_CONTENT_PREFIX, NATIVE_WARNING_EVENT, NativeWarning,
+    UNCLASSIFIED_NATIVE_EVENT, is_native_discriminator, validate_unclassified_native_data,
 };
 pub use native_store::{NativeStoreBinding, ProfileStoreResult};
 pub use observe::{
