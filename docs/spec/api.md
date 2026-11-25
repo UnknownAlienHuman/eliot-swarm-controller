@@ -1844,6 +1844,11 @@ that closes its send gate, including an unknown compaction's command ID and
 verb. The corresponding Owner inbox item identifies the queued inputs waiting
 on an unknown command.
 
+When the repository write gate queues a Git action or worktree removal,
+`swarm why COMMAND_ID` reports that another Git write or restore in the
+same repository must clear first. The queued outcome carries the cause
+at `store.dispatch.repository_write` until the command leaves the queue.
+
 For a failed or unknown `worktree.remove`, `swarm why COMMAND_ID` shows the
 retained nested code, cause and failure location when available. An unknown
 Git drain retains the failure from the drain check. `swarm why AGENT` includes
