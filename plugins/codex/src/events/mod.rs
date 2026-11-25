@@ -584,6 +584,22 @@ impl EventProcessor {
                     self.handle_child_notification(&method, params).await;
                     return;
                 }
+                // Turn notices still wait for association. The adapter can
+                // identify broken history from the owned thread even when
+                // the turn/start response never proves that association.
+                if method == "error"
+                    && self.status.ready
+                    && self.status.thread_id.as_deref().is_some_and(|thread| {
+                        params["threadId"].as_str() == Some(thread)
+                            && params["turnId"].as_str().is_some_and(|id| !id.is_empty())
+                            && params["willRetry"] == false
+                            && params["error"]["message"]
+                                .as_str()
+                                .is_some_and(crate::native::types::history_missing_tool_output)
+                    })
+                {
+                    self.status.history_missing_tool_output = true;
+                }
                 if self.should_buffer(&method, &params) {
                     self.buffer.push(
                         BufferedNativeFrame::Notification { method, params },
@@ -1454,13 +1470,6 @@ impl EventProcessor {
         ) else {
             return Ok(());
         };
-        if self.status.thread_id.as_deref() == Some(thread_id)
-            && !turn_id.is_empty()
-            && notification.will_retry == Some(false)
-            && crate::native::types::history_missing_tool_output(&error.message)
-        {
-            self.status.history_missing_tool_output = true;
-        }
         if self.status.active_turn_id.as_deref() != Some(turn_id)
             || self.status.active_command_id.is_none()
         {
