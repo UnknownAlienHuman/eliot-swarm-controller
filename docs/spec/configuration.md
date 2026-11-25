@@ -1691,7 +1691,7 @@ The daemon evaluates this every five seconds for root and child Agents outside c
 - an adapter-classified broken native session. The exact generation is fenced
   at settlement. The ordinary switch stops and drains it before a fresh launch
   in the same worktree. The brief identifies unknown input by its command ID
-  and effect status. That input is excluded from transfers.
+  and effect status and omits its text. That input is excluded from transfers.
 - a failed Resume with a bound native `agent.start` refusal that proves no native
   subject was created. The daemon persists the exact refusal reason and location, then
   selects it immediately through the same owed-work and automatic-handoff path. Boot
