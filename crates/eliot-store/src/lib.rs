@@ -6258,17 +6258,13 @@ fn turn_from_record(record: TurnRecord, harness: &str) -> Result<Turn> {
         .as_deref()
         .map(|value| parse_enum(value, "turn resolution source"))
         .transpose()?;
-    let outcome = match (resolution_source, record.outcome.as_deref()) {
-        (Some(TurnResolutionSource::Unknown), _) => Some(TurnOutcome::Unknown),
-        (_, Some(value)) => Some(
-            TurnOutcome::parse(value)
-                .ok_or_else(|| Error::new("internal", "invalid stored turn outcome"))?,
-        ),
-        (_, None) if state == TurnState::Completed => Some(
-            TurnOutcome::classify_legacy_status_for_harness(harness, record.status.as_deref()),
-        ),
-        (_, None) => None,
-    };
+    let outcome = decode_turn_outcome(
+        harness,
+        state,
+        record.status.as_deref(),
+        record.outcome.as_deref(),
+        resolution_source,
+    )?;
     let native_status = record.native_status.filter(|value| !value.is_empty());
     Ok(Turn {
         agent: format_agent_id(record.agent),
@@ -6289,6 +6285,26 @@ fn turn_from_record(record: TurnRecord, harness: &str) -> Result<Turn> {
         effective_model: record.effective_model,
         native_error_message: record.native_error_message,
         native_trigger: record.native_trigger,
+    })
+}
+
+fn decode_turn_outcome(
+    harness: &str,
+    state: TurnState,
+    status: Option<&str>,
+    stored_outcome: Option<&str>,
+    resolution_source: Option<TurnResolutionSource>,
+) -> Result<Option<TurnOutcome>> {
+    Ok(match (resolution_source, stored_outcome) {
+        (Some(TurnResolutionSource::Unknown), _) => Some(TurnOutcome::Unknown),
+        (_, Some(value)) => Some(
+            TurnOutcome::parse(value)
+                .ok_or_else(|| Error::new("internal", "invalid stored turn outcome"))?,
+        ),
+        (_, None) if state == TurnState::Completed => Some(
+            TurnOutcome::classify_legacy_status_for_harness(harness, status),
+        ),
+        (_, None) => None,
     })
 }
 

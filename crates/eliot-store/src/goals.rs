@@ -1678,24 +1678,16 @@ impl Store {
         };
         let resolution_source = resolution_source
             .as_deref()
-            .map(|value| match value {
-                "owner" => Ok(core::TurnResolutionSource::Owner),
-                "unknown" => Ok(core::TurnResolutionSource::Unknown),
-                _ => Err(Error::new(
-                    "internal",
-                    "invalid stored turn resolution source",
-                )),
-            })
+            .map(|value| parse_enum(value, "turn resolution source"))
             .transpose()?;
-        let outcome = match (resolution_source, stored_outcome.as_deref(), state.as_str()) {
-            (Some(core::TurnResolutionSource::Unknown), _, _) => core::TurnOutcome::Unknown,
-            (_, Some(value), _) => core::TurnOutcome::parse(value)
-                .ok_or_else(|| Error::new("internal", "invalid stored turn outcome"))?,
-            (_, None, "completed") => {
-                core::TurnOutcome::classify_legacy_status_for_harness(&harness, status.as_deref())
-            }
-            (_, None, _) => core::TurnOutcome::Unknown,
-        };
+        let outcome = decode_turn_outcome(
+            &harness,
+            parse_enum(&state, "turn state")?,
+            status.as_deref(),
+            stored_outcome.as_deref(),
+            resolution_source,
+        )?
+        .unwrap_or(TurnOutcome::Unknown);
         let reported = resolution_source.map_or(outcome, |source| source.reported_outcome(outcome));
         Ok(reported != core::TurnOutcome::Success)
     }
