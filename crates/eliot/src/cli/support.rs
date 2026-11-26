@@ -211,6 +211,24 @@ macro_rules! read_and_print {
 }
 pub(crate) use read_and_print;
 
+macro_rules! mutate_and_print {
+    ($data_dir:expr, $json_output:expr, $method:literal, $params:expr, $response:ty) => {{
+        let params = $params;
+        params.validate().map_err(Failure::for_mutation)?;
+        let response: $response = eliot_daemon::client_call_typed($data_dir, $method, &params)
+            .await
+            .map_err(Failure::for_mutation)?;
+        params
+            .validate_response(&response)
+            .map_err(Failure::invalid_response)?;
+        let result = serde_json::to_value(response)
+            .map_err(|_| Failure::new(4, concat!($method, " response is invalid")))?;
+        print_value(&result, $json_output);
+        Ok(0)
+    }};
+}
+pub(crate) use mutate_and_print;
+
 pub(crate) fn mutation_id(supplied_id: Option<String>) -> Result<String, Failure> {
     let id = match supplied_id {
         Some(id) => {

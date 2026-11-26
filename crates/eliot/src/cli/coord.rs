@@ -7,10 +7,9 @@ use super::args::{
     VarGetArgs, VarListArgs, VarSetArgs, WhoArgs,
 };
 use super::reads::resolve_agent_target;
-use super::support::read_and_print;
 use super::support::{
-    Failure, command_value, mutation_id, print_value, print_value_or_human, sleep_before_deadline,
-    validate_limit, wait_deadline,
+    Failure, command_value, mutate_and_print, mutation_id, print_value, print_value_or_human,
+    read_and_print, sleep_before_deadline, validate_limit, wait_deadline,
 };
 use eliot_core::Command as CoreCommand;
 use eliot_core::api::discovery::{IdentityRequest, IdentityResponse};
@@ -262,18 +261,13 @@ pub(crate) async fn run_cmd(
                 resolution,
                 reason,
             };
-            request.validate().map_err(Failure::for_mutation)?;
-            let response: CommandResolveResponse =
-                eliot_daemon::client_call_typed(&data_dir, "command.resolve", &request)
-                    .await
-                    .map_err(Failure::for_mutation)?;
-            request
-                .validate_response(&response)
-                .map_err(Failure::invalid_response)?;
-            let value = serde_json::to_value(response)
-                .map_err(|_| Failure::new(4, "command.resolve response is invalid"))?;
-            print_value(&value, json_output);
-            Ok(0)
+            mutate_and_print!(
+                &data_dir,
+                json_output,
+                "command.resolve",
+                request,
+                CommandResolveResponse
+            )
         }
     }
 }
@@ -303,18 +297,13 @@ pub(crate) async fn run_turn(
                 status,
                 reason,
             };
-            request.validate().map_err(Failure::for_mutation)?;
-            let response: TurnResolveResponse =
-                eliot_daemon::client_call_typed(&data_dir, "turn.resolve", &request)
-                    .await
-                    .map_err(Failure::for_mutation)?;
-            request
-                .validate_response(&response)
-                .map_err(Failure::invalid_response)?;
-            let value = serde_json::to_value(response)
-                .map_err(|_| Failure::new(4, "turn.resolve response is invalid"))?;
-            print_value(&value, json_output);
-            Ok(0)
+            mutate_and_print!(
+                &data_dir,
+                json_output,
+                "turn.resolve",
+                request,
+                TurnResolveResponse
+            )
         }
     }
 }
@@ -346,18 +335,13 @@ pub(crate) async fn run_msg(
                 thread,
                 reply_to_delivery: reply_to,
             };
-            request.validate().map_err(Failure::for_mutation)?;
-            let response: MailSendResponse =
-                eliot_daemon::client_call_typed(&data_dir, "mail.send", &request)
-                    .await
-                    .map_err(Failure::for_mutation)?;
-            request
-                .validate_response(&response)
-                .map_err(Failure::invalid_response)?;
-            let value = serde_json::to_value(response)
-                .map_err(|_| Failure::new(4, "mail.send response is invalid"))?;
-            print_value(&value, json_output);
-            Ok(0)
+            mutate_and_print!(
+                &data_dir,
+                json_output,
+                "mail.send",
+                request,
+                MailSendResponse
+            )
         }
         MsgCommand::Show(MsgShowArgs {
             delivery,
@@ -398,18 +382,7 @@ pub(crate) async fn run_msg(
                 agent,
                 deliveries: delivery,
             };
-            request.validate().map_err(Failure::for_mutation)?;
-            let response: MailAckResponse =
-                eliot_daemon::client_call_typed(&data_dir, "mail.ack", &request)
-                    .await
-                    .map_err(Failure::for_mutation)?;
-            request
-                .validate_response(&response)
-                .map_err(Failure::invalid_response)?;
-            let value = serde_json::to_value(response)
-                .map_err(|_| Failure::new(4, "mail.ack response is invalid"))?;
-            print_value(&value, json_output);
-            Ok(0)
+            mutate_and_print!(&data_dir, json_output, "mail.ack", request, MailAckResponse)
         }
     }
 }
@@ -981,18 +954,7 @@ pub(crate) async fn run_var(
                 expect_version,
                 note,
             };
-            request.validate().map_err(Failure::for_mutation)?;
-            let response: VarSetResponse =
-                eliot_daemon::client_call_typed(&data_dir, "var.set", &request)
-                    .await
-                    .map_err(Failure::for_mutation)?;
-            request
-                .validate_response(&response)
-                .map_err(Failure::invalid_response)?;
-            let value = serde_json::to_value(response)
-                .map_err(|_| Failure::new(4, "var.set response is invalid"))?;
-            print_value(&value, json_output);
-            Ok(0)
+            mutate_and_print!(&data_dir, json_output, "var.set", request, VarSetResponse)
         }
         VarCommand::List(VarListArgs {
             scope,
@@ -1183,18 +1145,13 @@ pub(crate) async fn run_claim_command(
                 note,
                 ttl_secs,
             };
-            request.validate().map_err(Failure::for_mutation)?;
-            let response: ClaimSetResponse =
-                eliot_daemon::client_call_typed(data_dir, "claim.set", &request)
-                    .await
-                    .map_err(Failure::for_mutation)?;
-            request
-                .validate_response(&response)
-                .map_err(Failure::invalid_response)?;
-            let value = serde_json::to_value(response)
-                .map_err(|_| Failure::new(4, "claim.set response is invalid"))?;
-            print_value(&value, json_output);
-            Ok(0)
+            mutate_and_print!(
+                data_dir,
+                json_output,
+                "claim.set",
+                request,
+                ClaimSetResponse
+            )
         }
         ClaimCommand::List(ClaimListArgs {
             project,
@@ -1228,18 +1185,13 @@ pub(crate) async fn run_claim_command(
                 agent,
                 glob,
             };
-            request.validate().map_err(Failure::for_mutation)?;
-            let response: ClaimReleaseResponse =
-                eliot_daemon::client_call_typed(data_dir, "claim.release", &request)
-                    .await
-                    .map_err(Failure::for_mutation)?;
-            request
-                .validate_response(&response)
-                .map_err(Failure::invalid_response)?;
-            let value = serde_json::to_value(response)
-                .map_err(|_| Failure::new(4, "claim.release response is invalid"))?;
-            print_value(&value, json_output);
-            Ok(0)
+            mutate_and_print!(
+                data_dir,
+                json_output,
+                "claim.release",
+                request,
+                ClaimReleaseResponse
+            )
         }
     }
 }
