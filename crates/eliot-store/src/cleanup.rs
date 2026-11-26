@@ -426,6 +426,35 @@ impl Store {
         self.record_artifact_custody(artifact, false)
     }
 
+    /// Retain the native identity reported by the exact dispatched start.
+    /// This records possible custody without admitting a native archive.
+    pub fn record_startup_native_session(
+        &mut self,
+        command_id: &str,
+        mut artifact: ArtifactView,
+    ) -> Result<()> {
+        let command = self
+            .get_command(command_id)?
+            .ok_or_else(|| Error::new("not_found", "artifact start command absent"))?;
+        if !core::is_start_verb(&command.verb)
+            || !matches!(
+                command.state,
+                CommandState::Dispatched | CommandState::Unknown
+            )
+            || command.target.as_deref() != Some(artifact.agent.as_str())
+            || command.generation != Some(artifact.generation)
+            || artifact.kind != ArtifactKind::NativeSession
+        {
+            return Err(Error::new(
+                "stale_generation",
+                "artifact start binding changed",
+            ));
+        }
+        artifact.purpose = STARTUP_NATIVE_SESSION_PURPOSE.to_owned();
+        artifact.state = "unknown".to_owned();
+        self.record_known_artifact(artifact)
+    }
+
     /// Only use after this daemon exclusively created the directory. A read
     /// or rediscovery of an existing path cannot establish this binding.
     pub fn record_created_artifact(&mut self, artifact: ArtifactView) -> Result<()> {
@@ -524,8 +553,13 @@ impl Store {
             && let Some(previous) = known_native_session_artifact(&tx, agent_num, &artifact.path)?
         {
             // Resuming the same native subject retains its old attempt fence.
-            if previous.state == "registered" && previous.generation < artifact.generation {
-                require_daemon_custody_room(&tx, agent_num, artifact.generation)?;
+            if previous.state == "registered"
+                && (previous.generation < artifact.generation
+                    || (previous.generation == artifact.generation && artifact.state == "unknown"))
+            {
+                if previous.generation != artifact.generation {
+                    require_daemon_custody_room(&tx, agent_num, artifact.generation)?;
+                }
                 artifact.id = previous.id;
                 tx.execute(
                     "UPDATE artifacts SET generation=?1,body=?2 WHERE id=?3",
@@ -1325,6 +1359,29 @@ impl Store {
         Ok(artifact)
     }
 
+    pub fn artifact_reconciliation_quiescent(
+        &self,
+        artifact: &ArtifactView,
+        release_custody: bool,
+    ) -> Result<bool> {
+        if release_custody
+            && artifact.kind == ArtifactKind::NativeSession
+            && artifact.purpose == STARTUP_NATIVE_SESSION_PURPOSE
+        {
+            let Some(agent) = self.get_agent(&artifact.agent)? else {
+                return Ok(false);
+            };
+            return Ok(agent.generation == artifact.generation
+                && (cleanup_terminal(agent.state) || agent.state == AgentState::Lost)
+                && capacity::has_owned_exit_and_reader_drain_tx(
+                    &self.connection,
+                    parse_agent_id(&agent.id)?,
+                    artifact.generation,
+                )?);
+        }
+        self.cleanup_agent_quiescent(artifact)
+    }
+
     pub fn reconcile_cleanup_artifact(
         &mut self,
         observed: &ArtifactView,
@@ -1349,7 +1406,7 @@ impl Store {
                 "artifact custody changed during readback",
             ));
         }
-        if !self.cleanup_agent_quiescent(&artifact)? {
+        if !self.artifact_reconciliation_quiescent(&artifact, request.release_custody.is_some())? {
             return Err(Error::new(
                 "agent_not_quiescent",
                 "artifact Agent custody is still active",
@@ -2205,6 +2262,8 @@ fn cleanup_path(path: &str) -> std::path::PathBuf {
 fn cleanup_terminal(state: AgentState) -> bool {
     matches!(state, AgentState::Stopped | AgentState::Failed)
 }
+
+const STARTUP_NATIVE_SESSION_PURPOSE: &str = "failed native start";
 
 /// Fence resume at admission and dispatch while cleanup is unknown, or after
 /// the current native session has been removed but before its Agent is deleted.

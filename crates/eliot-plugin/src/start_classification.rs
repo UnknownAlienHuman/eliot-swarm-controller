@@ -1,12 +1,7 @@
-//! Shared pre-effect start classification (k86, Refs #384).
-//! Failures before spawn or native session creation, and native refusals
-//! before a turn is dispatched, are definite failed. Anything after dispatch,
-//! or with an uncertain transport or cleanup, stays unknown.
-//! Per-plugin phase enums stay local; each plugin maps its phases into
-//! StartPoint and calls is_proven_no_effect. Reason formatting goes through
-//! format_start_reason so persisted reasons stay short non-secret literals.
+//! Native start evidence carried by the bound agent.start response.
 
 use eliot_core::{Error, FailureOrigin};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::{
@@ -14,14 +9,41 @@ use crate::{
     session::{classify_start_failure, failed_start_value},
 };
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum StartPoint {
     BeforeSpawn,
     SpawnRefused,
+    BeforeSession,
     NativeRefusalBeforeDispatch,
-    NativeSessionRemoved,
     AfterDispatch,
     TransportLost,
+}
+
+impl StartPoint {
+    pub fn with_transport(self, error: &Error) -> Self {
+        if error.code == "unknown" {
+            Self::TransportLost
+        } else {
+            self
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct StartFailureFact {
+    pub phase: String,
+    pub point: StartPoint,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_subject: Option<StartNativeSubject>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_pid: Option<u32>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct StartNativeSubject {
+    pub native_scope: String,
+    pub native_ref: String,
 }
 
 pub fn is_proven_no_effect(point: StartPoint) -> bool {
@@ -29,32 +51,35 @@ pub fn is_proven_no_effect(point: StartPoint) -> bool {
         point,
         StartPoint::BeforeSpawn
             | StartPoint::SpawnRefused
+            | StartPoint::BeforeSession
             | StartPoint::NativeRefusalBeforeDispatch
-            | StartPoint::NativeSessionRemoved
     )
 }
 
-/// Form the reply from native effect evidence. A known subject on an
-/// unresolved start is diagnostic evidence, not a readiness acknowledgement.
+/// Bind the native facts to the dispatched start. The host decides settlement.
 pub fn start_failure(
     params: &AgentStartParams,
     harness: &str,
     phase: &str,
     point: StartPoint,
     error: Error,
-    native_ref: Option<&str>,
+    native_subject: Option<(&str, &str)>,
+    native_pid: Option<u32>,
 ) -> eliot_core::Result<Value> {
     let error = classify_start_failure(error, harness, phase);
-    if is_proven_no_effect(point) {
-        return Ok(failed_start_value(params, error));
-    }
-    let error = if let Some(native_ref) = native_ref {
-        let message = format!("Native session {native_ref}: {}", error.message);
-        error.with_message(message)
-    } else {
-        error
-    };
-    Err(error.with_code("unknown"))
+    let mut value = failed_start_value(params, error);
+    value["state"] = Value::String("start_failure".to_owned());
+    value["start_failure"] = serde_json::to_value(StartFailureFact {
+        phase: phase.to_owned(),
+        point,
+        native_subject: native_subject.map(|(scope, reference)| StartNativeSubject {
+            native_scope: scope.to_owned(),
+            native_ref: reference.to_owned(),
+        }),
+        native_pid,
+    })
+    .map_err(|_| Error::new("internal", "native start evidence could not be encoded"))?;
+    Ok(value)
 }
 
 pub fn format_start_reason(what: &str, code: &str, suffix: &str) -> String {

@@ -515,7 +515,12 @@ impl Router {
             .await;
         match start {
             Ok(mut value) => {
-                if classify_start_result(&value) == CommandState::Failed {
+                if value["state"] == "unknown" {
+                    self.note_harness_auth_required(&harness, value["code"].as_str())
+                        .await;
+                    self.redact_native_value(&mut value);
+                    let _ = self.settle(id, CommandState::Unknown, Some(value)).await;
+                } else if classify_start_result(&value) == CommandState::Failed {
                     self.note_harness_auth_required(&harness, value["code"].as_str())
                         .await;
                     let native_start_refused = value.get("native_ref").is_none();

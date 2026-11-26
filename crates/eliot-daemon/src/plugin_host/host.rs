@@ -2593,7 +2593,7 @@ async fn cleanup_startup(
     pending_failure: &mut Option<PendingFailure>,
     proven_no_dispatch: bool,
     origin: Option<eliot_core::FailureOrigin>,
-) {
+) -> bool {
     let (exited, exit) = terminate_child_with_exit(child, &actor.monitoring, &actor.agent).await;
     // `settle_owned_source_exit` returns Ok only after positive custody exit,
     // completed reader drain, and the committed exit gap (see
@@ -2611,7 +2611,8 @@ async fn cleanup_startup(
         "plugin_startup_exit",
     )
     .await;
-    if settled.is_ok() && !proven_no_dispatch {
+    let exit_proved = settled.is_ok();
+    if exit_proved && !proven_no_dispatch {
         // The stderr reader is independent of the source reader. Join it
         // before inspecting the final bytes of a plugin that panicked.
         let capture = stderr_capture
@@ -2650,6 +2651,7 @@ async fn cleanup_startup(
         });
     }
     cleanup_actor(&actor.state, &actor.key, &actor.plugin_credential);
+    exit_proved
 }
 
 /// Retire one validated failed-start plugin without entering the live actor
@@ -3416,7 +3418,7 @@ fn validate_start_result(value: &Value, agent: &Agent, command: &Command) -> Res
             }
             _ => false,
         };
-    if matches!(state, Some("ready") | Some("failed"))
+    if matches!(state, Some("ready" | "failed" | "start_failure"))
         && failed_subject_valid
         && value.get("agent_id").and_then(Value::as_str) == Some(agent.id.as_str())
         && value.get("generation").and_then(Value::as_i64) == Some(agent.generation)
