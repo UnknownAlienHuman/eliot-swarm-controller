@@ -1,6 +1,6 @@
 use super::*;
 
-pub(super) const CURRENT_SCHEMA_VERSION: i64 = HANDOFF_READ_INDEX_VERSION;
+pub(super) const CURRENT_SCHEMA_VERSION: i64 = DIAGNOSE_READ_INDEX_VERSION;
 const HARNESS_CHECK_SCHEMA_VERSION: i64 = 112;
 const WORK_TRUTH_VERSION: i64 = 113;
 const WORK_TRUTH_INTENT_VERSION: i64 = 114;
@@ -47,6 +47,7 @@ const AUTONOMY_OUTCOMES_VERSION: i64 = 154;
 const CLEANUP_PATH_CUSTODY_VERSION: i64 = 155;
 const ORGANIZATION_CONTENT_SOURCE_VERSION: i64 = 156;
 const HANDOFF_READ_INDEX_VERSION: i64 = 157;
+const DIAGNOSE_READ_INDEX_VERSION: i64 = 158;
 
 fn has_restart_continuation_brief_column(connection: &Connection) -> Result<bool> {
     connection
@@ -2849,6 +2850,17 @@ impl Store {
                 "CREATE INDEX events_handoff_generation ON events(agent, generation, seq)
                  WHERE kind IN ('handoff.queued', 'handoff.settled', 'handoff.waiting');",
                 Some(HANDOFF_READ_INDEX_VERSION),
+            )?;
+        }
+        if current < DIAGNOSE_READ_INDEX_VERSION {
+            self.migrate_sql(
+                "CREATE INDEX events_diagnose_stopped ON events(agent, generation, seq)
+                 WHERE kind = 'agent.stopped';
+                 CREATE INDEX events_diagnose_resume_blocked ON events(agent, generation, seq)
+                 WHERE kind = 'agent.restart_resume_blocked';
+                 CREATE INDEX events_diagnose_failover ON events(agent, generation, seq)
+                 WHERE kind IN ('provider.failover_queued', 'provider.failover_settled');",
+                Some(DIAGNOSE_READ_INDEX_VERSION),
             )?;
         }
         Ok(())

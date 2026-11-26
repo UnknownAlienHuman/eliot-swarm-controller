@@ -2743,7 +2743,10 @@ impl Store {
     /// idle `agent.stopped` recorded before restart) for one generation,
     /// newest first. Powers `diagnose` process/exit steps: the exit code,
     /// NTSTATUS and redacted stderr tail ride on these events.
-    /// Bounded like every other page; at most `limit` rows.
+    /// Bounded like every other page; at most `limit` rows. The stopped
+    /// branch seeks the partial index so an absent terminal proves nothing
+    /// over the Agent's wider journal; the failed/lost branch keeps its
+    /// existing covering seek.
     pub fn latest_agent_terminal_events(
         &self,
         agent: &str,
@@ -2760,7 +2763,7 @@ impl Store {
                  WHERE agent = ?1 AND generation = ?2 AND kind IN ('agent.failed', 'agent.lost')
                  UNION ALL
                  SELECT seq, ts, kind, agent, generation, source, native_id, data, subject, cause
-                 FROM events INDEXED BY events_agent
+                 FROM events INDEXED BY events_diagnose_stopped
                  WHERE agent = ?1 AND generation = ?2 AND kind = 'agent.stopped'
                    AND json_extract(data, '$.reason') = 'owned_exit_before_restart'
                  ORDER BY seq DESC LIMIT ?3",

@@ -378,13 +378,15 @@ impl Store {
         Ok(eligible && has_owned_exit_and_reader_drain_tx(&self.connection, agent, generation)?)
     }
 
-    /// Read the last automatic-resume refusal for the exact generation.
+    /// Read the last automatic-resume refusal for the exact generation,
+    /// seeking the partial index so an absent refusal proves nothing over
+    /// the Agent's wider journal.
     pub fn restart_resume_blocked(&self, agent: &str, generation: i64) -> Result<Option<Value>> {
         let agent = parse_agent_id(agent)?;
         let data = self
             .connection
             .query_row(
-                "SELECT data FROM events
+                "SELECT data FROM events INDEXED BY events_diagnose_resume_blocked
              WHERE agent = ?1 AND generation = ?2 AND kind = 'agent.restart_resume_blocked'
              ORDER BY seq DESC LIMIT 1",
                 params![agent, generation],
