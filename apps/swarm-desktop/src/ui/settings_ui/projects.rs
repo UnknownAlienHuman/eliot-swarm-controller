@@ -42,8 +42,6 @@ fn policy_list(
                 Some(
                     controls::icon_button()
                         .grid_column(1)
-                        .width(tokens::height::CONTROL)
-                        .height(tokens::height::CONTROL)
                         .automation_name(format!("{name}: remove {entry} {}", index + 1))
                         .on_click(context.message(edit(PolicyEdit::Remove(list, index))))
                         .content(controls::icon(controls::glyph::CLOSE))

@@ -1148,22 +1148,14 @@ impl DesktopApp {
                     .is_enabled(primary_enabled)
                     .on_click(context.message(Message::Handoff(message)))
                     .automation_name(primary_label.clone())
-                    .content(
-                        controls::text(primary_label, tokens::text::EMPHASIZED).margin(
-                            Thickness::xy(tokens::spacing::MD - tokens::spacing::ROW, 0.0),
-                        ),
-                    )
+                    .content(controls::label(&primary_label))
                     .into(),
             ),
             None => Some(
                 controls::filled()
                     .is_enabled(false)
                     .automation_name(primary_label.clone())
-                    .content(
-                        controls::text(primary_label, tokens::text::EMPHASIZED).margin(
-                            Thickness::xy(tokens::spacing::MD - tokens::spacing::ROW, 0.0),
-                        ),
-                    )
+                    .content(controls::label(&primary_label))
                     .into(),
             ),
         };
@@ -1196,14 +1188,7 @@ impl DesktopApp {
         let footer = StackPanel::new()
             .grid_row(1)
             .spacing(tokens::spacing::MD)
-            .children((
-                summary,
-                StackPanel::new()
-                    .orientation(Orientation::Horizontal)
-                    .horizontal_alignment(HorizontalAlignment::Right)
-                    .spacing(tokens::spacing::SM)
-                    .keyed_children(crate::views::slots([Some(close.into()), primary])),
-            ));
+            .children((summary, super::dialog_ui::actions(close.into(), primary)));
         Some(super::dialog_ui::surface(
             context,
             self.dialog.epoch,

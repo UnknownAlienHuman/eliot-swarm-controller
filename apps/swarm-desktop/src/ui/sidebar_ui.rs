@@ -1080,15 +1080,11 @@ fn rename_row(renaming: &Renaming, indent: f64, context: &mut ViewContext<Sideba
                 )),
             controls::icon_button()
                 .grid_column(1)
-                .width(tokens::height::CONTROL)
-                .height(tokens::height::CONTROL)
                 .automation_name(save)
                 .on_click(context.message(Message::Menu(MenuMsg::RenameCommitted)))
                 .content(controls::icon(controls::glyph::CHECK)),
             controls::icon_button()
                 .grid_column(2)
-                .width(tokens::height::CONTROL)
-                .height(tokens::height::CONTROL)
                 .automation_name(cancel)
                 .on_click(context.message(Message::Menu(MenuMsg::RenameCancelled)))
                 .content(controls::icon(controls::glyph::CLOSE)),
@@ -1129,8 +1125,6 @@ fn tags_row(renaming: &Renaming, indent: f64, context: &mut ViewContext<Sidebar>
                 Some(
                     controls::icon_button()
                         .grid_column(1)
-                        .width(tokens::height::CONTROL)
-                        .height(tokens::height::CONTROL)
                         .automation_name(format!("Remove tag {}", index + 1))
                         .on_click(context.message(Message::Menu(MenuMsg::TagRemoved(index))))
                         .content(controls::icon(controls::glyph::CLOSE))
@@ -1154,14 +1148,10 @@ fn tags_row(renaming: &Renaming, indent: f64, context: &mut ViewContext<Sidebar>
             .spacing(tokens::spacing::XS)
             .children((
                 controls::icon_button()
-                    .width(tokens::height::CONTROL)
-                    .height(tokens::height::CONTROL)
                     .automation_name("Save tags")
                     .on_click(context.message(Message::Menu(MenuMsg::RenameCommitted)))
                     .content(controls::icon(controls::glyph::CHECK)),
                 controls::icon_button()
-                    .width(tokens::height::CONTROL)
-                    .height(tokens::height::CONTROL)
                     .automation_name("Cancel tags")
                     .on_click(context.message(Message::Menu(MenuMsg::RenameCancelled)))
                     .content(controls::icon(controls::glyph::CLOSE)),

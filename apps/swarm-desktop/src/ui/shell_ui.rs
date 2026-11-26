@@ -2791,7 +2791,6 @@ impl DesktopApp {
         });
         let button = |glyph: &str, name: String, message: Message| {
             controls::icon_button()
-                .height(tokens::height::CONTROL)
                 .automation_name(name)
                 .on_click(context.message(message))
                 .content(controls::icon(glyph))

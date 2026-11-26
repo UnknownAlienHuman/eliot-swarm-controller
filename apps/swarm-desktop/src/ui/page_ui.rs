@@ -229,8 +229,26 @@ pub(super) fn filter_chip(
     }
 }
 
-/// A wrapping row of chips 6 DIPs apart (`.filters`). Reactor 0.100.0 has
-/// no wrap panel, so the chips sit in rows of at most `per_row`.
+/// A page's filter chips (`.filters`) in one row 6 DIPs apart, the way the
+/// reference apps set a status filter (Codex: All · Active · Paused ·
+/// Completed): it never wraps, and where the page is narrower than the
+/// row, the row scrolls sideways inside the page instead of running past
+/// its edge.
+pub(super) fn chip_strip(chips: Vec<KeyedView>) -> View {
+    ScrollViewer::new()
+        .horizontal_scroll_bar_visibility(ScrollBarVisibility::Auto)
+        .vertical_scroll_bar_visibility(ScrollBarVisibility::Disabled)
+        .content(
+            StackPanel::new()
+                .orientation(Orientation::Horizontal)
+                .spacing(tokens::spacing::CHIP_GAP)
+                .keyed_children(chips),
+        )
+        .into()
+}
+
+/// A wrapping row of chips 6 DIPs apart. Reactor 0.101 has no wrap panel,
+/// so the chips sit in rows of at most `per_row`.
 pub(super) fn chip_rows(chips: Vec<KeyedView>, per_row: usize) -> View {
     let mut rows: Vec<KeyedView> = Vec::new();
     let mut current: Vec<KeyedView> = Vec::new();

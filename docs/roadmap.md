@@ -763,9 +763,9 @@ of the explicitly selected release scope.
       harness, through WinUI's AutoSuggestBox), Automations and Usage,
       collapsible projects with their Agents nested (manager, then workers,
       collapsed), a fleet line that opens the monitor and says what
-      is live in at most two counts, one per line, so it is never cut off
-      ("2 working" over "1 needs attention", "12 idle", "All quiet" when
-      nothing is; every count is its accessible name), a separate "N need attention" row that lists Agents waiting
+      is live in at most two counts, one count per line ("2 working" over
+      "1 needs attention", "12 idle", "All quiet" when nothing is), with the
+      full summary as its accessible name and tooltip, a separate "N need attention" row that lists Agents waiting
       on a request, failed or lost ones, and controlled Agents in `unknown`
       (observe-only native children never count), and Settings. A project is a repository
       and nests one level (k142): Project → Subprojects (its linked worktrees) →
