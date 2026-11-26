@@ -690,11 +690,26 @@ impl WorkspaceGit {
                         // Pin the root before building: a swap during the
                         // build must read as changed on the next tick.
                         let root_identity = project_root_identity(&watch_common);
-                        let (watcher, roots) = project_watcher(&watch_common, &paths, wake)
-                            .map(|(watcher, roots)| (Arc::new(watcher), roots))?;
+                        let (watcher, roots) =
+                            project_watcher(&watch_common, &paths, Arc::clone(&wake))
+                                .map(|(watcher, roots)| (Arc::new(watcher), roots))?;
                         (watcher, roots, root_identity)
                     }
                 };
+            // The watcher is live while its paths are still being
+            // registered: a rescan notice (fetch/gc ref bursts overflowing
+            // the backend) or a binding event landing mid-build latches
+            // `degraded` before the first revision is read. Rescan and
+            // re-arm once; only a repeated loss reports.
+            let (watcher, checkout_roots, root_identity) = if watcher.revision().is_some() {
+                (watcher, checkout_roots, root_identity)
+            } else {
+                // Pin the root before rebuilding for the same reason.
+                let root_identity = project_root_identity(&watch_common);
+                let (watcher, roots) = project_watcher(&watch_common, &paths, wake)
+                    .map(|(watcher, roots)| (Arc::new(watcher), roots))?;
+                (watcher, roots, root_identity)
+            };
             let revision = watcher.revision().ok_or_else(|| {
                 problem("unavailable", "project Git watcher lost checkout coverage")
             })?;
