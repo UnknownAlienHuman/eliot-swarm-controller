@@ -1198,7 +1198,8 @@ for the approved command.
 `policy.budget.max_rounds` supplies the Goal default (3 when omitted; accepted range
 1–16). `policy.budget.max_audits` bounds the
 [audit and continuation](automation.md#goal-audit-and-continuation) cycles of a blocked
-Goal (2 when omitted; accepted range 0–8; 0 leaves every block for the Owner). `policy.budget.max_cost` is a `GoalCostLimit` pair `{ unit, amount_micros }`
+Goal (2 when omitted; accepted range 0–8; 0 leaves every block for the Owner).
+`policy.budget.max_cost` is a `GoalCostLimit` pair `{ unit, amount_micros }`
 using the Agent's verbatim native session-cost unit; it is never converted. The
 policy's `scope` and `check_inputs` supply the corresponding Goal defaults. A policy
 that sets a budget, scope, or check inputs requires a check. The Owner can override

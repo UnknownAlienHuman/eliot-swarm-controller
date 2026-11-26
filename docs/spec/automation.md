@@ -2099,8 +2099,10 @@ with the changed inputs listed, or as `scope_unverified` with the reason, so the
 reviews it separately. The observation lists at most 20 paths. A
 failing check continues as before. Its continuation repeats the `scope` line, so the
 limit survives every round. Swarm never reverts, resets or deletes anything for a
-scope finding. Pause and resume keep the starting point. A blocked Goal continues only
-through a new `set` after the Owner reviews the finding; that `set` records a new one.
+scope finding. Pause and resume keep the starting point. A Goal blocked by a scope
+finding, or by `check_unrunnable`, continues only through a new `set` after the Owner
+reviews it; that `set` records a new starting point. Other blocks follow
+[Goal audit and continuation](#goal-audit-and-continuation).
 `goal show` reports the starting HEAD, the number of pre-existing changes and the
 argv-named check files.
 
