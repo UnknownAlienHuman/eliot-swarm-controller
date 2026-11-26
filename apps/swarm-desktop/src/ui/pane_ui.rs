@@ -663,6 +663,7 @@ impl DesktopApp {
         let widen: Option<View> = (self.layout.wide_docks && !full).then(|| {
             controls::bar_toggle(wide)
                 .grid_column(1)
+                .vertical_alignment(VerticalAlignment::Center)
                 .automation_name("Wide pane")
                 .on_is_checked_changed(crate::views::check_changes(
                     context.callback(|on: bool| Message::Pane(PaneMsg::Wide(on))),
@@ -677,6 +678,7 @@ impl DesktopApp {
         let expand: Option<View> = self.layout.docks.then(|| {
             controls::bar_toggle(full)
                 .grid_column(2)
+                .vertical_alignment(VerticalAlignment::Center)
                 .automation_name("Full view")
                 .on_is_checked_changed(crate::views::check_changes(
                     context.callback(|on: bool| Message::Pane(PaneMsg::Full(on))),
@@ -694,6 +696,7 @@ impl DesktopApp {
         });
         let close: View = controls::bar_button(false)
             .grid_column(3)
+            .vertical_alignment(VerticalAlignment::Center)
             .automation_name(format!("Close {title}"))
             .on_click(context.message(Message::Shell(ShellMsg::PanelToggled(Panel::Closed))))
             .content(controls::icon(controls::glyph::CLOSE))
