@@ -616,6 +616,7 @@ impl MusePlugin {
                 &session.native_client,
                 &subject.native_ref,
                 subject.retained_turn.as_deref(),
+                subject.retained_turn_unknown,
             )
             .await
             {
@@ -2678,6 +2679,7 @@ async fn verify_resume_preflight(
     client: &NativeClient,
     session_id: &str,
     retained_turn: Option<&str>,
+    retained_unknown: bool,
 ) -> Result<()> {
     let readback = read_owned_session(client, session_id).await?;
     if let Some(reason) = readback.history.unavailable_reason() {
@@ -2699,12 +2701,10 @@ async fn verify_resume_preflight(
         subject: "session",
         runtime_resumable: matches!(session.status.as_str(), "idle" | "notLoaded"),
         retained_turn,
-        newest_turn: newest_turn.as_ref().map(|(id, status)| {
-            (
-                id.as_str(),
-                matches!(status.as_str(), "completed" | "failed" | "cancelled"),
-            )
-        }),
+        retained_unknown,
+        newest_turn: newest_turn
+            .as_ref()
+            .map(|(id, status)| (id.as_str(), status.as_str())),
         active_turn: session
             .active_turn_id
             .is_some_and(|turn| !turn.trim().is_empty()),

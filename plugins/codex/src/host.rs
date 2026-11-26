@@ -1415,6 +1415,7 @@ impl CodexPlugin {
                 &session.native_client,
                 &subject.native_ref,
                 subject.retained_turn.as_deref(),
+                subject.retained_turn_unknown,
             )
             .await
         {
@@ -3588,6 +3589,7 @@ async fn verify_resume_preflight(
     client: &NativeClient,
     thread_id: &str,
     retained_turn: Option<&str>,
+    retained_unknown: bool,
 ) -> Result<()> {
     let thread = read_owned_thread(client, thread_id).await?;
     let newest_turn = read_latest_native_turn_status(client, thread_id).await?;
@@ -3599,12 +3601,10 @@ async fn verify_resume_preflight(
             Some("idle" | "notLoaded")
         ),
         retained_turn,
-        newest_turn: newest_turn.as_ref().map(|(id, status)| {
-            (
-                id.as_str(),
-                matches!(status.as_str(), "completed" | "interrupted" | "failed"),
-            )
-        }),
+        retained_unknown,
+        newest_turn: newest_turn
+            .as_ref()
+            .map(|(id, status)| (id.as_str(), status.as_str())),
         active_turn: false,
         proves_no_turn: newest_turn.is_none(),
     }
