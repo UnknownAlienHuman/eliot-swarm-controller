@@ -20,7 +20,7 @@ pub struct ProjectOverviewRequest {
 impl ProjectOverviewRequest {
     pub fn validate(&self) -> Result<()> {
         if let Some(project) = &self.project {
-            validate_project_name(project, "params.project")?;
+            super::organization::validate_project_name(project, "params.project")?;
         }
         if let Some(after) = &self.after
             && (after.is_empty() || after.len() > 4096 || after.contains(char::is_control))
@@ -325,7 +325,7 @@ pub struct ProjectOverviewEntry {
 
 impl ProjectOverviewEntry {
     pub fn validate(&self) -> Result<()> {
-        validate_project_name(&self.project, "project.overview response")?;
+        super::organization::validate_project_name(&self.project, "project.overview response")?;
         if let Some(manager) = &self.manager {
             manager.validate()?;
         }
@@ -518,14 +518,4 @@ impl ProjectOverviewResponse {
         }
         Ok(())
     }
-}
-
-fn validate_project_name(value: &str, field: &str) -> Result<()> {
-    if value.is_empty() || value.len() > 1024 || value.contains(char::is_control) {
-        return Err(Error::invalid_field(
-            field,
-            "nonempty name of at most 1024 bytes",
-        ));
-    }
-    Ok(())
 }

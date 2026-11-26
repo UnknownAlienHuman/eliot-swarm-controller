@@ -5,7 +5,7 @@
 //! explicit `mail.ack` over exact delivery ids does. Variable writes carry an
 //! optional compare-and-swap version; an absent row reads as version 0.
 
-use super::mutations::nullable;
+use super::{mutations::nullable, reads::validate_identifier};
 use crate::{AgentState, Error, GitCommit, Result, parse_agent_id};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -151,7 +151,7 @@ const fn default_mail_wake() -> bool {
 
 impl MailSendRequest {
     pub fn validate(&self) -> Result<()> {
-        validate_write_id(&self.id)
+        validate_identifier(&self.id, "mail write id must not be empty")
             .map_err(|e| e.with_field("params.id", "nonblank mutation id"))?;
         if self.to.is_empty() || self.to.len() > MAX_MAIL_RECIPIENTS {
             return Err(Error::invalid_field(
@@ -528,7 +528,7 @@ pub struct MailAckRequest {
 
 impl MailAckRequest {
     pub fn validate(&self) -> Result<()> {
-        validate_write_id(&self.id)?;
+        validate_identifier(&self.id, "mail write id must not be empty")?;
         if self
             .agent
             .as_deref()
@@ -641,7 +641,7 @@ pub struct VarSetRequest {
 
 impl VarSetRequest {
     pub fn validate(&self) -> Result<()> {
-        validate_write_id(&self.id)
+        validate_identifier(&self.id, "mail write id must not be empty")
             .map_err(|e| e.with_field("params.id", "nonblank mutation id"))?;
         validate_var_scope_and_key(self.scope.as_deref(), &self.key)?;
         validate_var_value(&self.value).map_err(|e| {
@@ -911,13 +911,6 @@ pub struct VarListResponse {
     pub revision: i64,
     pub entries: Vec<VarListEntry>,
     pub next: Option<VarListCursor>,
-}
-
-fn validate_write_id(id: &str) -> Result<()> {
-    if id.trim().is_empty() {
-        return Err(Error::new("invalid", "mail write id must not be empty"));
-    }
-    Ok(())
 }
 
 fn validate_mail_text(text: &str) -> Result<()> {
@@ -1247,7 +1240,7 @@ impl ClaimSetRequest {
     }
 
     pub fn validate(&self) -> Result<()> {
-        validate_write_id(&self.id)?;
+        validate_identifier(&self.id, "mail write id must not be empty")?;
         if self
             .agent
             .as_deref()
@@ -1439,7 +1432,7 @@ pub struct ClaimReleaseRequest {
 
 impl ClaimReleaseRequest {
     pub fn validate(&self) -> Result<()> {
-        validate_write_id(&self.id)?;
+        validate_identifier(&self.id, "mail write id must not be empty")?;
         if self
             .agent
             .as_deref()

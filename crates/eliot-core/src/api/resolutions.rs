@@ -2,6 +2,7 @@
 //! owner assertion about an already-uncertain outcome; they never invent a
 //! native receipt, replay an effect, or override capacity.
 
+use super::reads::validate_identifier;
 use crate::{CommandState, Error, Result};
 use serde::{Deserialize, Serialize};
 
@@ -83,9 +84,9 @@ pub struct CommandResolveRequest {
 
 impl CommandResolveRequest {
     pub fn validate(&self) -> Result<()> {
-        validate_write_id(&self.id)?;
+        validate_identifier(&self.id, "resolution write id must be nonempty")?;
         crate::command::validate_command_id(&self.command_id)?;
-        validate_reason(&self.reason)
+        validate_identifier(&self.reason, "resolution reason must be nonempty")
     }
 
     pub fn validate_response(&self, response: &CommandResolveResponse) -> Result<()> {
@@ -145,7 +146,7 @@ pub struct SettleStoppedRequest {
 
 impl SettleStoppedRequest {
     pub fn validate(&self) -> Result<()> {
-        validate_write_id(&self.id)?;
+        validate_identifier(&self.id, "resolution write id must be nonempty")?;
         if let Some(after) = &self.after {
             crate::validate_command_id(after)?;
         }
@@ -253,7 +254,7 @@ pub struct TurnResolveRequest {
 
 impl TurnResolveRequest {
     pub fn validate(&self) -> Result<()> {
-        validate_write_id(&self.id)?;
+        validate_identifier(&self.id, "resolution write id must be nonempty")?;
         if self.agent.trim().is_empty() {
             return Err(Error::new("invalid", "turn.resolve agent must be nonempty"));
         }
@@ -269,7 +270,7 @@ impl TurnResolveRequest {
                 "turn.resolve turn_id must be nonempty",
             ));
         }
-        validate_reason(&self.reason)
+        validate_identifier(&self.reason, "resolution reason must be nonempty")
     }
 
     pub fn validate_response(&self, response: &TurnResolveResponse) -> Result<()> {
@@ -294,23 +295,6 @@ pub struct TurnResolveResponse {
     pub generation: i64,
     pub turn_id: String,
     pub status: TurnResolveStatus,
-}
-
-fn validate_write_id(id: &str) -> Result<()> {
-    if id.trim().is_empty() {
-        return Err(Error::new(
-            "invalid",
-            "resolution write id must be nonempty",
-        ));
-    }
-    Ok(())
-}
-
-fn validate_reason(reason: &str) -> Result<()> {
-    if reason.trim().is_empty() {
-        return Err(Error::new("invalid", "resolution reason must be nonempty"));
-    }
-    Ok(())
 }
 
 fn unproven() -> Error {

@@ -1,6 +1,6 @@
 //! Owner provider-hold reads and corrective writes.
 
-use super::{DEFAULT_LIMIT, MAX_LIMIT, mutations::nullable};
+use super::{DEFAULT_LIMIT, MAX_LIMIT, mutations::nullable, reads::validate_identifier};
 use crate::limits::MAX_COMMAND_ID_BYTES;
 use crate::routing::validate_provider_scope;
 use crate::{Error, ProviderHold, Result};
@@ -94,7 +94,7 @@ pub struct ProviderClearHoldRequest {
 
 impl ProviderClearHoldRequest {
     pub fn validate(&self) -> Result<()> {
-        validate_write_id(&self.id)?;
+        validate_identifier(&self.id, "invalid provider hold write id")?;
         validate_provider_scope(&self.scope)?;
         if self
             .expected_probe_command
@@ -125,15 +125,8 @@ pub struct ProviderClearHoldResponse {
     pub cleared: bool,
 }
 
-fn validate_write_id(id: &str) -> Result<()> {
-    if id.trim().is_empty() {
-        return Err(Error::new("invalid", "invalid provider hold write id"));
-    }
-    Ok(())
-}
-
 fn validate_probe_command(command: &str) -> Result<()> {
-    validate_write_id(command)?;
+    validate_identifier(command, "invalid provider hold write id")?;
     if command.len() > MAX_COMMAND_ID_BYTES {
         return Err(Error::new(
             "invalid",

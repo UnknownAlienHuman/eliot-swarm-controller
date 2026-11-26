@@ -3,7 +3,7 @@
 
 use super::{
     DiscoverPage, MAX_DISCOVER_PAGE_BYTES, MAX_OBSERVATION_CURSOR_BYTES, ObservationPage,
-    ObservationQuery,
+    ObservationQuery, agent_views::text,
 };
 use crate::{Error, Result};
 use serde::{Deserialize, Serialize};
@@ -59,12 +59,12 @@ impl AgentDiscoverRequest {
     }
 
     pub fn validate(&self) -> Result<()> {
-        validate_text(&self.profile)?;
+        text(&self.profile)?;
         for value in [&self.harness, &self.native_scope, &self.cursor]
             .into_iter()
             .flatten()
         {
-            validate_text(value)?;
+            text(value)?;
         }
         if self
             .native_scope
@@ -171,9 +171,9 @@ impl AgentHistoryRequest {
     }
 
     pub fn validate(&self) -> Result<()> {
-        validate_text(&self.id)?;
-        validate_text(&self.source)?;
-        validate_text(&self.view)?;
+        text(&self.id)?;
+        text(&self.source)?;
+        text(&self.view)?;
         if !matches!(self.source.as_str(), "native" | "rollout")
             || self.generation.is_some_and(|value| value < 0)
             || (self.view == "items") != self.turn_id.is_some()
@@ -184,13 +184,13 @@ impl AgentHistoryRequest {
             ));
         }
         if let Some(turn) = &self.turn_id {
-            validate_text(turn)?;
+            text(turn)?;
             if !bounded_text(turn, MAX_OBSERVATION_CURSOR_BYTES) {
                 return Err(Error::new("invalid", "invalid history turn_id"));
             }
         }
         if let Some(cursor) = &self.cursor {
-            validate_text(cursor)?;
+            text(cursor)?;
         }
         // Reuse the existing private query bounds; notably history cursors do
         // not gain a control-character restriction or any new fingerprint rule.
@@ -231,13 +231,6 @@ impl AgentHistoryRequest {
     }
 }
 
-fn validate_text(value: &str) -> Result<()> {
-    if value.trim().is_empty() {
-        return Err(Error::new("invalid", "text must be non-empty"));
-    }
-    Ok(())
-}
-
 fn bounded_text(value: &str, max: usize) -> bool {
     !value.is_empty() && value.len() <= max && !value.chars().any(char::is_control)
 }
@@ -253,7 +246,7 @@ fn required_text<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
 ) -> std::result::Result<String, D::Error> {
     let value = String::deserialize(deserializer)?;
-    validate_text(&value).map_err(serde::de::Error::custom)?;
+    text(&value).map_err(serde::de::Error::custom)?;
     Ok(value)
 }
 
@@ -262,7 +255,7 @@ fn optional_text<'de, D: serde::Deserializer<'de>>(
 ) -> std::result::Result<Option<String>, D::Error> {
     let value = Option::<String>::deserialize(deserializer)?;
     if let Some(value) = &value {
-        validate_text(value).map_err(serde::de::Error::custom)?;
+        text(value).map_err(serde::de::Error::custom)?;
     }
     Ok(value)
 }
