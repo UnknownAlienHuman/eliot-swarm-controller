@@ -53,7 +53,7 @@ impl DesktopApp {
     }
 
     /// The one composer ([`Composer`]): the window binds what the card
-    /// shows (its trailing button, chips, usage ring and attachments);
+    /// shows (its trailing button, chips, usage indicator and attachments);
     /// the composer draws it and owns its text, so a keystroke redraws
     /// the card alone.
     pub(super) fn composer_view(&self, context: &mut ViewContext<Self>) -> View {
@@ -74,7 +74,10 @@ impl DesktopApp {
         };
         let chips: Vec<View> = match (agent.as_deref(), detail) {
             (None, _) => self.composer_chips(context),
-            (Some(_), Some(detail)) => vec![controls::chip_row(
+            // The model and access chips keep one line with the action while
+            // the card has its full reading width, beside a docked pane or
+            // not; narrower, they wrap as Home's do.
+            (Some(_), Some(detail)) => controls::chip_lines(
                 [
                     Some(self.model_chip(detail, running, context)),
                     access_chip(detail),
@@ -82,7 +85,12 @@ impl DesktopApp {
                 .into_iter()
                 .flatten()
                 .collect(),
-            )],
+                if self.pane_docked() {
+                    self.layout.full_reading_docked
+                } else {
+                    self.layout.full_reading
+                },
+            ),
             (Some(_), None) => Vec::new(),
         };
         let retry = agent
@@ -145,8 +153,8 @@ impl DesktopApp {
             chips,
             // Home's bar is the design's (+, the chips, Start task): the
             // limits are the sidebar's Usage row there.
-            // The task's quota ring (its harness's tightest window, with
-            // its popover) and the context ring.
+            // The task's usage indicator (its harness's tightest window,
+            // with its popover) and the context label.
             usage: if home {
                 None
             } else {
@@ -157,7 +165,7 @@ impl DesktopApp {
                         .vertical_alignment(VerticalAlignment::Center)
                         .keyed_children(crate::views::slots([
                             self.usage_indicator(context),
-                            self.context_ring(context),
+                            self.context_label(context),
                         ]))
                         .into(),
                 )
@@ -169,11 +177,6 @@ impl DesktopApp {
             primary,
             enabled: !self.submitting() && !(home && self.launch_folder_missing()),
             pending,
-            stacked: if home {
-                !self.layout.full_home
-            } else {
-                self.narrow_main()
-            },
             agent,
             send: context.forward(),
         })
@@ -187,18 +190,15 @@ impl DesktopApp {
         running: bool,
         context: &mut ViewContext<Self>,
     ) -> View {
-        let full = detail.settings.next_model().unwrap_or("Default model");
-        // The chip names the model as the header does ("qwen4-max · high");
-        // its accessible name keeps the full id.
-        let model = full;
+        let model = detail.settings.next_model();
         let effort = detail.settings.next_effort();
-        let label = format!(
-            "{} · {}",
-            crate::picker::model_short(full),
-            effort.map_or("default effort", effort_label)
-        );
+        // Home's short words ("qwen4-max · high", the model alone at its
+        // default effort), so a narrow main area never cuts the chip; its
+        // accessible name and tooltip keep the full id and effort.
+        let label = crate::picker::model_effort_label(model, effort);
         let name = format!(
-            "{model} · {}",
+            "{} · {}",
+            model.unwrap_or("Default model"),
             effort.map_or_else(|| "default effort".to_owned(), effort_name)
         );
         // The model and effort change between turns only: while one runs
@@ -219,10 +219,10 @@ impl DesktopApp {
                             false,
                         )),
                 )
-                .tooltip("Change the model between turns");
+                .tooltip(format!("{name}. Change the model between turns"));
         }
         let open = self.launch.open == Some(Pop::Effort);
-        self.popover_chip(
+        let chip = self.popover_chip(
             controls::chip()
                 .automation_name(format!(
                     "Model and effort: {name} ({})",
@@ -233,7 +233,16 @@ impl DesktopApp {
             &[Pop::Effort, Pop::Model],
             FlyoutPlacement::TopEdgeAlignedLeft,
             context,
-        )
+        );
+        // The full words in the tooltip, as Home's chip (a chip carrying
+        // its open flyout takes none).
+        let carries_flyout = self.launch.preset.is_none()
+            && matches!(self.launch.open, Some(Pop::Effort | Pop::Model));
+        if carries_flyout {
+            chip
+        } else {
+            chip.tooltip(name)
+        }
     }
 
     /// The open Agent and its detail when the popovers act on it (not a
@@ -542,10 +551,10 @@ impl DesktopApp {
     /// Codex's usage indicator beside Send: the tightest quota window of
     /// the composer's harness, the share left in words; it opens
     /// the usage popover as its flyout (without its tooltip meanwhile: a
-    /// flyout's chip takes none). The attention color only for a
-    /// real reading under the threshold on the account the task runs on; a
-    /// neutral outline ring when that is not known or another provider's
-    /// limits apply. Nothing when the harness reports no quota.
+    /// flyout's chip takes none). The words only for a real reading on the
+    /// account the task runs on; the icon alone, its tooltip saying why,
+    /// when that is not known or another provider's limits apply. Nothing
+    /// when the harness reports no quota.
     fn usage_indicator(&self, context: &mut ViewContext<Self>) -> Option<View> {
         let harness = self.composer_harness()?;
         let Some(Ok(reply)) = self.settings.quotas.get(&harness) else {
@@ -572,10 +581,9 @@ impl DesktopApp {
                 format!("Not known whether {label} limits apply here"),
             ),
         };
-        // The share left in words beside the Usage icon (a static mark, no
-        // ring); the icon alone when no reading applies, its tooltip says
-        // why.
-        let ring: View = if applies {
+        // The share left in words beside the Usage icon; the icon alone
+        // when no reading applies, its tooltip says why.
+        let content: View = if applies {
             controls::command_content(
                 controls::glyph::USAGE,
                 &format!("{}% left", window.remaining),
@@ -595,13 +603,13 @@ impl DesktopApp {
         let button = if open {
             self.anchored_popover(
                 button,
-                ring,
+                content,
                 Some(Pop::Usage),
                 FlyoutPlacement::TopEdgeAlignedRight,
                 context,
             )
         } else {
-            button.content(ring).tooltip(note)
+            button.content(content).tooltip(note)
         };
         // Keyed by whether the reading applies and by whether its flyout is
         // open (a tooltip and a flyout do not share a button).
@@ -623,8 +631,8 @@ impl DesktopApp {
     /// the tokens used ("Context 54k tokens"), never 0%; just "Context"
     /// while the harness reports no tokens, so the way to Details stays.
     /// Its tooltip says how fresh; a click opens Details. Provider quota is the
-    /// usage ring's, not this.
-    fn context_ring(&self, context: &mut ViewContext<Self>) -> Option<View> {
+    /// usage indicator's, not this.
+    fn context_label(&self, context: &mut ViewContext<Self>) -> Option<View> {
         let detail = self.bound_detail().ok()?;
         let fill = detail.context.as_ref();
         let age = fill
@@ -770,8 +778,8 @@ pub(in crate::ui) struct ComposerInput {
     /// projects.
     folder: Option<View>,
     attached: Vec<String>,
-    /// The chip lines: a conversation's one, or Home's one or two
-    /// (`composer_chips`).
+    /// The chip lines, Home's (`composer_chips`) or a conversation's: one
+    /// at the card's full width, else two ([`controls::chip_lines`]).
     chips: Vec<View>,
     usage: Option<View>,
     /// Add as a note is offered: the Agent's generation.
@@ -782,10 +790,6 @@ pub(in crate::ui) struct ComposerInput {
     /// This composer's own command is being confirmed: its action carries
     /// the pending ring.
     pending: bool,
-    /// A conversation: the main area is narrow, the parameters take their
-    /// own line and the action its own, at the right. Home: its column is
-    /// below its full width and its chips wrap two to a line.
-    stacked: bool,
     send: Callback<Message>,
 }
 
@@ -891,15 +895,13 @@ impl Component for Composer {
             .content(controls::icon(controls::glyph::NEW_TASK))
             .tooltip("Attach files");
         let home = input.agent.is_none();
-        let stacked = input.stacked;
-        // The hint before the ring and the action, while Enter steers: the
+        // The hint before the action, while Enter steers: the
         // lowest-priority cell, it trims away first.
         let hint: Option<View> = match &input.primary {
             Primary::Turn {
                 running: Some(_), ..
             } if !blank => Some(
                 controls::secondary("Enter to steer")
-                    .grid_column(if stacked { 0 } else { 1 })
                     .horizontal_alignment(HorizontalAlignment::Right)
                     .vertical_alignment(VerticalAlignment::Center)
                     .text_trimming(TextTrimming::CharacterEllipsis)
@@ -914,90 +916,60 @@ impl Component for Composer {
             GridLength::Auto
         };
         let actions = composer_actions(input, blank, context);
-        // A conversation's one line of chips beside +.
-        let chips = Grid::new()
-            .columns([GridLength::Auto, GridLength::STAR])
-            .column_spacing(tokens::spacing::CHIP_GAP)
-            .keyed_children(crate::views::slots([
-                Some(attach.clone()),
-                input
-                    .chips
-                    .first()
-                    .map(|chips| Border::new().grid_column(1).content(chips.clone()).into()),
-            ]));
-        // One line of parameters and the action (§8.1). Home: +, the chip
-        // lines (one, or two to a line below the full Home width) and Start
-        // task at the end of the last line, so no line holds the action
-        // alone. A conversation stacked: the parameters keep their line and
-        // the action takes the next, at the right, so neither trims away.
-        let bottom: View = if home {
-            let last = input.chips.len().saturating_sub(1);
-            let mut cells = vec![KeyedView::new("attach", attach)];
-            cells.extend(input.chips.iter().enumerate().map(|(index, line)| {
-                KeyedView::new(
-                    format!("chips:{index}"),
-                    Border::new()
-                        .grid_row(index as i32)
-                        .grid_column(1)
-                        // A line above the last also takes the action's
-                        // column.
-                        .grid_column_span(if index == last { 1 } else { 2 })
-                        .vertical_alignment(VerticalAlignment::Center)
-                        .content(line.clone()),
-                )
-            }));
+        // One layout for Home and a conversation (§8.1, §9.4): +, the chip
+        // lines (one, or two below the card's full width) and the action at
+        // the end of the last line, right-aligned, so no line holds the
+        // action alone; the steer hint before it trims away first.
+        let last = input.chips.len().saturating_sub(1);
+        let mut cells = vec![KeyedView::new("attach", attach)];
+        cells.extend(input.chips.iter().enumerate().map(|(index, line)| {
+            KeyedView::new(
+                format!("chips:{index}"),
+                Border::new()
+                    .grid_row(index as i32)
+                    .grid_column(1)
+                    // A line above the last also takes the hint's and the
+                    // action's columns.
+                    .grid_column_span(if index == last { 1 } else { 3 })
+                    .vertical_alignment(VerticalAlignment::Center)
+                    .content(line.clone()),
+            )
+        }));
+        if let Some(hint) = hint {
             cells.push(KeyedView::new(
-                "actions",
+                "hint",
                 Border::new()
                     .grid_row(last as i32)
                     .grid_column(2)
-                    .margin(Thickness::new(
-                        tokens::spacing::SM - tokens::spacing::CHIP_GAP,
-                        0.0,
-                        0.0,
-                        0.0,
-                    ))
-                    .vertical_alignment(VerticalAlignment::Center)
-                    .content(actions),
+                    .content(hint),
             ));
-            Grid::new()
-                .columns([GridLength::Auto, GridLength::STAR, GridLength::Auto])
-                .rows(vec![GridLength::Auto; last + 1])
-                .column_spacing(tokens::spacing::CHIP_GAP)
-                .row_spacing(tokens::spacing::CHIP_GAP)
-                .keyed_children(cells)
-                .into()
-        } else if stacked {
-            StackPanel::new()
-                .spacing(tokens::spacing::SM)
-                .children((
-                    chips,
-                    Grid::new()
-                        .columns([hint_cell, GridLength::Auto])
-                        .column_spacing(tokens::spacing::SM)
-                        .horizontal_alignment(HorizontalAlignment::Right)
-                        .keyed_children(crate::views::slots([
-                            hint.map(|hint| Border::new().content(hint).into()),
-                            Some(Border::new().grid_column(1).content(actions).into()),
-                        ])),
+        }
+        cells.push(KeyedView::new(
+            "actions",
+            Border::new()
+                .grid_row(last as i32)
+                .grid_column(3)
+                .margin(Thickness::new(
+                    tokens::spacing::SM - tokens::spacing::CHIP_GAP,
+                    0.0,
+                    0.0,
+                    0.0,
                 ))
-                .into()
-        } else {
-            Grid::new()
-                .columns([GridLength::Star(3.0), hint_cell, GridLength::Auto])
-                .column_spacing(tokens::spacing::SM)
-                .keyed_children(crate::views::slots([
-                    Some(
-                        Border::new()
-                            .vertical_alignment(VerticalAlignment::Center)
-                            .content(chips)
-                            .into(),
-                    ),
-                    hint,
-                    Some(Border::new().grid_column(2).content(actions).into()),
-                ]))
-                .into()
-        };
+                .vertical_alignment(VerticalAlignment::Center)
+                .content(actions),
+        ));
+        let bottom: View = Grid::new()
+            .columns([
+                GridLength::Auto,
+                GridLength::Star(3.0),
+                hint_cell,
+                GridLength::Auto,
+            ])
+            .rows(vec![GridLength::Auto; last + 1])
+            .column_spacing(tokens::spacing::CHIP_GAP)
+            .row_spacing(tokens::spacing::CHIP_GAP)
+            .keyed_children(cells)
+            .into();
         // Home (`Main.dc.html`): the field first, then + and the project,
         // place, model and access chips, then Start task; a folder outside
         // the projects takes its field above. Attached files as chips over
@@ -1014,11 +986,7 @@ impl Component for Composer {
         }
         rows.push(KeyedView::new("field", field));
         rows.push(KeyedView::new(
-            match (home, stacked) {
-                (true, _) => "bottom:home",
-                (false, true) => "bottom:stacked",
-                (false, false) => "bottom",
-            },
+            if home { "bottom:home" } else { "bottom" },
             bottom,
         ));
         // Home's composer stretches across the home column; a

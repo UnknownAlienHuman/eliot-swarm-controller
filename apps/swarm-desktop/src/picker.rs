@@ -166,6 +166,18 @@ pub fn effort_label(effort: &str) -> &str {
     }
 }
 
+/// A model chip's short words, Home's and the conversation's alike: the
+/// short model ([`model_short`]) and a chosen effort (`qwen4-max · high`),
+/// the model alone at its default effort; the full id and the effort in
+/// words are the chip's accessible name and tooltip.
+pub fn model_effort_label(model: Option<&str>, effort: Option<&str>) -> String {
+    let model = model.map_or("default model", model_short);
+    match effort {
+        Some(effort) => format!("{model} · {}", effort_label(effort)),
+        None => model.to_owned(),
+    }
+}
+
 /// An effort in full words for screen readers: `xhigh` → "extra high",
 /// `medium` → "medium".
 pub fn effort_name(effort: &str) -> String {
@@ -217,13 +229,7 @@ impl Choice {
             Self::Auto | Self::Preset(_) => {
                 self.chip_text(auto_profile, |effort| effort_label(effort).to_owned())
             }
-            Self::Model(pick) => {
-                let model = pick.model.as_deref().map_or("default model", model_short);
-                match pick.effort.as_deref() {
-                    Some(effort) => format!("{model} · {}", effort_label(effort)),
-                    None => model.to_owned(),
-                }
-            }
+            Self::Model(pick) => model_effort_label(pick.model.as_deref(), pick.effort.as_deref()),
         }
     }
 

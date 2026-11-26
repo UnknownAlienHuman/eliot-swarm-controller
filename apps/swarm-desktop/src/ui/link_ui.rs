@@ -464,7 +464,8 @@ impl DesktopApp {
         }
     }
 
-    /// The restart in progress, above the composer: calm, not an alert.
+    /// The restart in progress, above the composer: calm, not an alert; the
+    /// in-flight spinner while the restart runs.
     pub(super) fn reconnect_notice(&self) -> Option<View> {
         let (attempt, reason) = self.link.restarting.as_ref()?;
         let text = format!("Swarm stopped. Reconnecting… attempt {attempt} of {RESTART_ATTEMPTS}");
@@ -486,10 +487,7 @@ impl DesktopApp {
                         .columns([GridLength::Auto, GridLength::Auto, GridLength::STAR])
                         .column_spacing(tokens::spacing::SM)
                         .children((
-                            controls::status_mark(
-                                crate::controls::StatusTone::Pending,
-                                tokens::layout::DOT,
-                            ),
+                            controls::spinner(),
                             controls::body(text)
                                 .grid_column(1)
                                 .vertical_alignment(VerticalAlignment::Center),

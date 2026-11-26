@@ -91,8 +91,9 @@ pub mod glyph {
     pub const WARNING: &str = "\u{E7BA}";
     /// LightningBolt.
     pub const AUTOMATION: &str = "\u{E945}";
-    /// SpeedHigh.
-    pub const USAGE: &str = "\u{EC4A}";
+    /// AreaChart (not SpeedHigh, whose dashed gauge arc reads as a ring
+    /// fragment at icon size).
+    pub const USAGE: &str = "\u{E9D2}";
     /// OpenInNewWindow.
     pub const EXTERNAL: &str = "\u{E8A7}";
     /// OpenFolderHorizontal.
@@ -147,6 +148,8 @@ pub mod glyph {
     pub const FULL_VIEW: &str = "\u{E740}";
     /// BackToWindow.
     pub const EXIT_FULL_VIEW: &str = "\u{E73F}";
+    /// DockLeft: a frame whose right part is wide (the Wide pane).
+    pub const WIDE_PANE: &str = "\u{E90C}";
     /// PageAdd.
     pub const NEW_FILE: &str = "\u{EA1A}";
     /// Library.
@@ -167,8 +170,9 @@ pub mod glyph {
     pub const ATTENTION: &str = "\u{E8C9}";
     /// Permissions.
     pub const KEY: &str = "\u{E8D7}";
-    /// Process.
-    pub const DAEMON: &str = "\u{E9F3}";
+    /// Component, a chip (not Process, whose dashed broken circle reads as
+    /// a ring fragment).
+    pub const DAEMON: &str = "\u{E950}";
     /// People.
     pub const GROUP: &str = "\u{E716}";
 }
@@ -249,11 +253,12 @@ pub fn card() -> Border {
         .padding(Thickness::uniform(spacing::MD))
 }
 
-/// A status mark of `size` DIPs whose shape tells states apart: a filled
-/// circle for working (accent) and needs you (critical); a ring for
-/// starting (accent) and ended (text); a rounded square for failed
-/// or lost (critical), so a failure never reads as a question.
-pub fn status_mark(tone: StatusTone, size: f64) -> View {
+/// A static status mark of `size` DIPs whose shape tells states apart: a
+/// filled circle for working (accent) and needs you (critical); a rounded
+/// square for failed or lost (critical), so a failure never reads as a
+/// question. Starting and ended have no mark: the words beside it say
+/// them (§4.2), and no hollow ring stands in for a state.
+pub fn status_mark(tone: StatusTone, size: f64) -> Option<View> {
     let circle = |fill: ThemeBrush| -> View {
         Ellipse::new()
             .fill(fill)
@@ -262,27 +267,19 @@ pub fn status_mark(tone: StatusTone, size: f64) -> View {
             .vertical_alignment(VerticalAlignment::Center)
             .into()
     };
-    let ring = |stroke: ThemeBrush| -> View {
-        Ellipse::new()
-            .stroke(stroke)
-            .stroke_thickness(layout::STATUS_STROKE)
-            .width(size)
-            .height(size)
-            .vertical_alignment(VerticalAlignment::Center)
-            .into()
-    };
     match tone {
-        StatusTone::Active => circle(ThemeBrush::Accent),
-        StatusTone::Attention => circle(ThemeBrush::SystemCritical),
-        StatusTone::Pending => ring(ThemeBrush::Accent),
-        StatusTone::Neutral => ring(ThemeBrush::PrimaryText),
-        StatusTone::Failed => Border::new()
-            .background(ThemeBrush::SystemCritical)
-            .corner_radius(radius::STATUS_MARK)
-            .width(size)
-            .height(size)
-            .vertical_alignment(VerticalAlignment::Center)
-            .into(),
+        StatusTone::Active => Some(circle(ThemeBrush::Accent)),
+        StatusTone::Attention => Some(circle(ThemeBrush::SystemCritical)),
+        StatusTone::Pending | StatusTone::Neutral => None,
+        StatusTone::Failed => Some(
+            Border::new()
+                .background(ThemeBrush::SystemCritical)
+                .corner_radius(radius::STATUS_MARK)
+                .width(size)
+                .height(size)
+                .vertical_alignment(VerticalAlignment::Center)
+                .into(),
+        ),
     }
 }
 
@@ -465,23 +462,28 @@ pub fn bar_toggle(checked: bool) -> ToggleButton {
         .vertical_alignment(VerticalAlignment::Stretch)
 }
 
+/// The in-flight indicator (§4.2): WinUI's indeterminate `ProgressRing`
+/// at one size for every role, the row icon's, its minimum the same so the
+/// whole ring always fits. Only an action in flight shows it (a command
+/// being confirmed, a read or a run that is going); a persistent state is a
+/// static mark or words.
+pub fn spinner() -> View {
+    ProgressRing::new()
+        .is_indeterminate(true)
+        .width(icon_size::ROW)
+        .height(icon_size::ROW)
+        .min_width(icon_size::ROW)
+        .min_height(icon_size::ROW)
+        .vertical_alignment(VerticalAlignment::Center)
+        .into()
+}
+
 /// A command's content: its icon, then its label (Body) on the same line,
-/// both centred on it; `pending` puts WinUI's small indeterminate ring in
-/// the icon's place while the command is confirmed (§9.4), so the busy
-/// state stays on the action itself.
+/// both centred on it; `pending` puts the [`spinner`] in the icon's place
+/// while the command is confirmed (§9.4), so the busy state stays on the
+/// action itself.
 pub fn command_content(glyph: &str, label: &str, pending: bool) -> View {
-    let lead: View = if pending {
-        ProgressRing::new()
-            .is_indeterminate(true)
-            .width(icon_size::ROW)
-            .height(icon_size::ROW)
-            .min_width(icon_size::ROW)
-            .min_height(icon_size::ROW)
-            .vertical_alignment(VerticalAlignment::Center)
-            .into()
-    } else {
-        icon(glyph)
-    };
+    let lead: View = if pending { spinner() } else { icon(glyph) };
     StackPanel::new()
         .orientation(Orientation::Horizontal)
         .spacing(spacing::SM)
@@ -677,6 +679,20 @@ pub fn chip_row(chips: Vec<View>) -> View {
         .into()
 }
 
+/// A composer's chip lines (Home's and a conversation's alike): one
+/// [`chip_row`] while the card has its full width, else two, the first
+/// with the larger half (Reactor 0.101 has no wrap panel), so no chip is
+/// cut and the action stays at the end of the last line.
+pub fn chip_lines(chips: Vec<View>, one_line: bool) -> Vec<View> {
+    if one_line || chips.len() < 2 {
+        return vec![chip_row(chips)];
+    }
+    let first = chips.len().div_ceil(2);
+    let mut chips = chips;
+    let second = chips.split_off(first);
+    vec![chip_row(chips), chip_row(second)]
+}
+
 /// One segment of a segmented choice (see [`segmented`]): the selected
 /// segment is the accent button, the others default buttons.
 pub fn segment(selected: bool) -> Button {
@@ -857,7 +873,7 @@ pub fn status_pill(tone: StatusTone, label: &str) -> View {
         .vertical_alignment(VerticalAlignment::Center)
         .automation_name(label)
         .content(row_grid(
-            Some(status_mark(tone, layout::BADGE_DOT)),
+            status_mark(tone, layout::BADGE_DOT),
             trimmed(label, style::CAPTION).into(),
             None,
             spacing::CHIP_GAP,
@@ -1083,18 +1099,6 @@ pub fn badge(text: &str) -> View {
         .into()
 }
 
-/// A colored outline marks the quota band, including at zero remaining.
-pub fn status_ring(status: ThemeBrush) -> View {
-    Border::new()
-        .width(layout::RING)
-        .height(layout::RING)
-        .corner_radius(layout::RING / 2.0)
-        .border_thickness(Thickness::uniform(layout::USAGE_RING_STROKE))
-        .border_brush(status)
-        .vertical_alignment(VerticalAlignment::Center)
-        .into()
-}
-
 /// A counter (the Inbox count): WinUI's `InfoBadge`.
 pub fn count_badge(count: usize) -> View {
     InfoBadge::new()
@@ -1146,7 +1150,9 @@ pub enum RowMark {
     Working,
     /// Waiting for you: the attention icon in the accent text color.
     Waiting,
-    /// Idle or ready: a small ring.
+    /// Idle or ready: no mark, its slot left empty so the title stays in
+    /// line with the others (§4.2: a resting task is the normal case, not
+    /// a ring).
     Idle,
     /// Queued: the clock icon.
     Queued,
@@ -1172,38 +1178,33 @@ impl RowMark {
 /// screen reader; the row's text or tooltip says it on screen. A stopped
 /// row has no mark (`None` where a mark is optional).
 pub fn row_mark(mark: RowMark, word: &str) -> View {
-    let slot = |content: View| -> Border {
-        Border::new()
-            .width(layout::MARK_SLOT)
-            .height(layout::MARK_SLOT)
-            .vertical_alignment(VerticalAlignment::Center)
-            .content(content)
-    };
-    let dot = |size: f64| -> Ellipse {
-        Ellipse::new()
-            .width(size)
-            .height(size)
-            .horizontal_alignment(HorizontalAlignment::Center)
-            .vertical_alignment(VerticalAlignment::Center)
-    };
-    let slot = match mark {
-        RowMark::Working => slot(dot(layout::DOT_WAIT).fill(ThemeBrush::Accent).into()),
-        RowMark::Waiting => slot(
+    let content: Option<View> = match mark {
+        RowMark::Working => Some(
+            Ellipse::new()
+                .width(layout::DOT_WAIT)
+                .height(layout::DOT_WAIT)
+                .fill(ThemeBrush::Accent)
+                .horizontal_alignment(HorizontalAlignment::Center)
+                .vertical_alignment(VerticalAlignment::Center)
+                .into(),
+        ),
+        RowMark::Waiting => Some(
             glyph_icon(glyph::ATTENTION, icon_size::ROW)
                 .foreground(ThemeBrush::AccentText)
                 .vertical_alignment(VerticalAlignment::Center)
                 .into(),
         ),
-        RowMark::Idle => slot(
-            dot(layout::DOT_IDLE)
-                .stroke(ThemeBrush::PrimaryText)
-                .stroke_thickness(layout::HAIRLINE)
-                .into(),
-        ),
-        RowMark::Queued => slot(icon(glyph::SCHEDULE)),
-        RowMark::Failed => slot(critical_icon(glyph::ERROR, icon_size::ROW)),
+        RowMark::Idle => None,
+        RowMark::Queued => Some(icon(glyph::SCHEDULE)),
+        RowMark::Failed => Some(critical_icon(glyph::ERROR, icon_size::ROW)),
     };
-    slot.automation_name(word).into()
+    Border::new()
+        .width(layout::MARK_SLOT)
+        .height(layout::MARK_SLOT)
+        .vertical_alignment(VerticalAlignment::Center)
+        .maybe_content(content)
+        .automation_name(word)
+        .into()
 }
 
 /// A sidebar row's content: the leading mark or icon, the label (Body;

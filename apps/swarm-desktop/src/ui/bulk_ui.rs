@@ -925,10 +925,7 @@ impl DesktopApp {
                     .orientation(Orientation::Horizontal)
                     .spacing(tokens::spacing::SM)
                     .children((
-                        ProgressRing::new()
-                            .is_indeterminate(true)
-                            .width(tokens::layout::RING)
-                            .height(tokens::layout::RING),
+                        controls::spinner(),
                         controls::secondary("Reading every task and project…"),
                     ))
                     .into(),
@@ -973,10 +970,7 @@ impl DesktopApp {
                     .orientation(Orientation::Horizontal)
                     .spacing(tokens::spacing::SM)
                     .children((
-                        ProgressRing::new()
-                            .is_indeterminate(true)
-                            .width(tokens::layout::RING)
-                            .height(tokens::layout::RING),
+                        controls::spinner(),
                         controls::secondary(if stopping {
                             "Stopping after this one…"
                         } else {
