@@ -763,9 +763,9 @@ of the explicitly selected release scope.
       harness, through WinUI's AutoSuggestBox), Automations and Usage,
       collapsible projects with their Agents nested (manager, then workers,
       collapsed), a fleet line that opens the monitor and says what
-      is live in at most two counts, so it is never cut off ("2 working · 1
-      needs attention", "12 idle", "All quiet" when nothing is; every count
-      is its accessible name), a separate "N need attention" row that lists Agents waiting
+      is live in at most two counts, one per line, so it is never cut off
+      ("2 working" over "1 needs attention", "12 idle", "All quiet" when
+      nothing is; every count is its accessible name), a separate "N need attention" row that lists Agents waiting
       on a request, failed or lost ones, and controlled Agents in `unknown`
       (observe-only native children never count), and Settings. A project is a repository
       and nests one level (k142): Project → Subprojects (its linked worktrees) →
@@ -1285,8 +1285,9 @@ of the explicitly selected release scope.
       picker within the flyout's content width (no sideways scroll), rows
       with name, provider, effort and their own Ready/Quota unknown/On hold
       label, the current model's ID and effort ComboBox, Manage models in
-      Settings › Models. §9.5 "Context 54%", the token count or "Context
-      unavailable", with scope and freshness in the tooltip.
+      Settings › Models. §9.5 "Context 54%", the token count ("Context 54k
+      tokens") or just "Context" while the harness reports none, with the
+      tokens and freshness in the tooltip.
   - [ ] **M3 Context and projects.** Real diff, Agents, Details and Terminal,
     project assignment and transfer, fleet and Inbox.
   - [ ] **M4 Management.** Settings, model, routing and auth, Automations and

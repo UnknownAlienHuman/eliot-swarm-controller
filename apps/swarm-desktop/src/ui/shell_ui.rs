@@ -2697,7 +2697,7 @@ impl DesktopApp {
                 .then(|| (format!("Show more ({loaded} of {total})"), !reading)),
             show_archived: self.nav.show_archived,
             agents: AgentsEntry {
-                line: fleet.map_or_else(String::new, |fleet| {
+                parts: fleet.map_or_else(Vec::new, |fleet| {
                     fleet.compact(self.nav.agents_total, self.nav.archived)
                 }),
                 summary: fleet.map_or_else(
@@ -2869,7 +2869,7 @@ impl DesktopApp {
                     .content(controls::nav_content(
                         controls::glyph::BACK,
                         "Back to tasks",
-                        "",
+                        &[],
                     )),
                 controls::search_field(
                     TextBox::new()

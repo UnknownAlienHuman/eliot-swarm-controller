@@ -166,7 +166,8 @@ impl DesktopApp {
                                         } else {
                                             None
                                         },
-                                    )),
+                                    ))
+                                    .tooltip(note.clone()),
                                 Border::new()
                                     .grid_column(2)
                                     .vertical_alignment(VerticalAlignment::Center)

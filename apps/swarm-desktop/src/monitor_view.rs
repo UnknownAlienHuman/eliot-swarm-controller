@@ -603,12 +603,15 @@ impl Component for MonitorList {
 }
 
 /// The tree's columns inside a row's button: Task, Model, Activity, CPU,
-/// Memory.
+/// Memory. Each row is its own Grid and WinUI has no shared size groups,
+/// so the text columns share the row's width by star (the task the most)
+/// to stay aligned under the header at any width; CPU and Memory hold
+/// fixed-size numbers.
 fn row_columns() -> [GridLength; 5] {
     [
-        GridLength::STAR,
-        GridLength::Pixel(tokens::page::FLEET_MODEL),
-        GridLength::Pixel(tokens::page::FLEET_ACTIVITY),
+        GridLength::Star(tokens::page::FLEET_TASK_SHARE),
+        GridLength::Star(tokens::page::FLEET_TEXT_SHARE),
+        GridLength::Star(tokens::page::FLEET_TEXT_SHARE),
         GridLength::Pixel(tokens::page::FLEET_NUMBER),
         GridLength::Pixel(tokens::page::FLEET_NUMBER),
     ]
@@ -681,40 +684,44 @@ fn head_row() -> View {
 /// opens its conversation, then Resume or Stop.
 fn fleet_row(entry: &RowEntry, input: &MonitorListInput) -> View {
     let row = &entry.row;
-    let mut task: Vec<KeyedView> = vec![
-        KeyedView::new(
-            "mark",
-            Border::new()
-                .vertical_alignment(VerticalAlignment::Center)
-                .maybe_content(crate::ui::page_ui::agent_mark(
-                    row.state,
-                    row.status_line.as_deref(),
-                )),
-        ),
-        KeyedView::new(
-            "title",
-            crate::controls::text(entry.title.clone(), tokens::page::HEADING)
-                .grid_column(1)
-                .vertical_alignment(VerticalAlignment::Center)
+    let mut task: Vec<KeyedView> = vec![KeyedView::new(
+        "mark",
+        Border::new()
+            .vertical_alignment(VerticalAlignment::Center)
+            .maybe_content(crate::ui::page_ui::agent_mark(
+                row.state,
+                row.status_line.as_deref(),
+            )),
+    )];
+    // The title takes the task column's whole width and its project stands
+    // under it (as the chat header puts the project under the title), so a
+    // short project name no longer holds a share the title needs.
+    let mut names: Vec<KeyedView> = vec![KeyedView::new(
+        "title",
+        crate::controls::text(entry.title.clone(), tokens::page::HEADING)
+            .text_trimming(TextTrimming::CharacterEllipsis),
+    )];
+    if !entry.observed && !entry.project.is_empty() {
+        names.push(KeyedView::new(
+            "project",
+            crate::controls::secondary(entry.project.clone())
                 .text_trimming(TextTrimming::CharacterEllipsis),
-        ),
-    ];
+        ));
+    }
+    task.push(KeyedView::new(
+        "names",
+        StackPanel::new()
+            .grid_column(1)
+            .vertical_alignment(VerticalAlignment::Center)
+            .keyed_children(names),
+    ));
     if entry.observed {
         task.push(KeyedView::new(
             "observed",
             Border::new()
                 .grid_column(2)
-                .horizontal_alignment(HorizontalAlignment::Left)
                 .vertical_alignment(VerticalAlignment::Center)
                 .content(crate::controls::badge("observed")),
-        ));
-    } else if !entry.project.is_empty() {
-        task.push(KeyedView::new(
-            "project",
-            crate::controls::secondary(entry.project.clone())
-                .grid_column(2)
-                .vertical_alignment(VerticalAlignment::Center)
-                .text_trimming(TextTrimming::CharacterEllipsis),
         ));
     }
     let activity = crate::controls::text(entry.activity.clone(), tokens::text::BODY)
@@ -741,7 +748,7 @@ fn fleet_row(entry: &RowEntry, input: &MonitorListInput) -> View {
                     0.0,
                     0.0,
                 ))
-                .columns([GridLength::Auto, GridLength::Star(2.0), GridLength::STAR])
+                .columns([GridLength::Auto, GridLength::STAR, GridLength::Auto])
                 .column_spacing(tokens::spacing::SM)
                 .keyed_children(task),
             crate::controls::secondary(entry.model.clone())

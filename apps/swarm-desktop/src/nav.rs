@@ -1334,14 +1334,14 @@ impl Fleet {
         crate::monitor::live_words(working, self.attention, idle)
     }
 
-    /// The sidebar's fleet line, short enough never to be cut off: at most
-    /// two counts, the most urgent first ("2 working · 1 needs attention",
-    /// "12 idle"); the full [`Self::summary`] is its accessible name and
-    /// the Monitor's line.
-    pub fn compact(&self, total: usize, archived: Archived) -> String {
+    /// The sidebar's fleet status, one count per line (the Codex sidebar
+    /// shows one status per row, not a sentence): at most two counts, the
+    /// most urgent first ("2 working", "1 needs attention"; "12 idle"); the
+    /// full [`Self::summary`] is its accessible name and the Monitor's line.
+    pub fn compact(&self, total: usize, archived: Archived) -> Vec<String> {
         let (working, idle) = self.live(archived);
         if total == 0 && archived.total == 0 {
-            return "No Agents yet".to_owned();
+            return vec!["No Agents yet".to_owned()];
         }
         // Idle is the least urgent: it gives way when both others show.
         let idle = if working > 0 && self.attention > 0 {
@@ -1349,8 +1349,7 @@ impl Fleet {
         } else {
             idle
         };
-        let attention = self.attention;
-        crate::monitor::live_words(working, attention, idle)
+        crate::monitor::live_parts(working, self.attention, idle)
     }
 
     /// Working and idle, with the live archived Agents (an archived live

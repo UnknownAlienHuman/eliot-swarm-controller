@@ -2083,7 +2083,7 @@ impl DesktopApp {
                         .on_click(
                             context.message(Message::Settings(SettingsMsg::PageSelected(*page))),
                         )
-                        .content(controls::nav_content(page.glyph(), page.label(), "")),
+                        .content(controls::nav_content(page.glyph(), page.label(), &[])),
                 ));
             }
         }

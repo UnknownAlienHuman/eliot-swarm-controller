@@ -296,9 +296,11 @@ pub mod page {
     /// The rule editor's word column and its Repeat count.
     pub const SENTENCE_WORD: f64 = 72.0;
     pub const REPEAT_FIELD: f64 = 96.0;
-    /// The Agents tree's Model, Activity, CPU and Memory columns.
-    pub const FLEET_MODEL: f64 = 190.0;
-    pub const FLEET_ACTIVITY: f64 = 290.0;
+    /// The Agents tree's star shares of a row's width: the task (its
+    /// title is the text that matters) and each of Model and Activity.
+    pub const FLEET_TASK_SHARE: f64 = 3.0;
+    pub const FLEET_TEXT_SHARE: f64 = 2.0;
+    /// The Agents tree's CPU and Memory columns (fixed content).
     pub const FLEET_NUMBER: f64 = 60.0;
     /// A branch's preparation state on the project page.
     pub const BRANCH_STATE: f64 = 96.0;

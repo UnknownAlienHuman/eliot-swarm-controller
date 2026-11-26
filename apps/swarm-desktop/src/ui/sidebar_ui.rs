@@ -93,12 +93,12 @@ pub(super) struct TaskEntry {
     pub(super) age: String,
 }
 
-/// The Agents row: the fleet's line (at most two counts, the most urgent
-/// first: "2 working · 1 needs attention"), its counts in full and whether
-/// the fleet view (the Monitor pane) is open.
+/// The Agents row: the fleet's status (at most two counts, the most urgent
+/// first, one per line: "2 working", "1 needs attention"), its counts in
+/// full and whether the fleet view (the Monitor pane) is open.
 #[derive(Clone, PartialEq)]
 pub(super) struct AgentsEntry {
-    pub(super) line: String,
+    pub(super) parts: Vec<String>,
     pub(super) summary: String,
     pub(super) open: bool,
 }
@@ -1026,8 +1026,8 @@ fn inbox_row(inbox: &InboxEntry, context: &mut ViewContext<Sidebar>) -> KeyedVie
     )
 }
 
-/// The Agents row: the `hub` icon, "Agents" and the fleet's line ("3
-/// working", as on main: the most urgent two counts); it opens the fleet
+/// The Agents row: the `hub` icon, "Agents" and the fleet's status ("3
+/// working", the most urgent two counts, one per line); it opens the fleet
 /// view (the Monitor pane). Its name carries every count.
 fn agents_row(agents: &AgentsEntry, context: &mut ViewContext<Sidebar>) -> KeyedView {
     let open = agents.open;
@@ -1043,11 +1043,11 @@ fn agents_row(agents: &AgentsEntry, context: &mut ViewContext<Sidebar>) -> Keyed
                 super::page_ui::Place::Agents,
             ))))
             // The nav row rule: "Agents" keeps its width and the fleet's
-            // line trims at the right.
+            // counts stand one per line at the right.
             .content(controls::nav_content(
                 controls::glyph::HUB,
                 "Agents",
-                &agents.line,
+                &agents.parts,
             ))
             .tooltip(agents.summary.clone()),
     )

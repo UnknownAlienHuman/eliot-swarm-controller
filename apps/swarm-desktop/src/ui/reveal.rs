@@ -222,7 +222,7 @@ pub(super) fn path_row(title: &str, note: &str, path: &str, open: Callback<()>) 
                         .content(controls::icon(controls::glyph::OPEN_FOLDER)),
                 )),
         )
-        .tooltip(TOOLTIP)
+        .tooltip(format!("{TOOLTIP}: {note}"))
 }
 
 /// A list item about a path whose lines wrap (a cleanup item): the whole
@@ -259,19 +259,23 @@ pub(super) fn path_link(path: &str, open: Callback<()>) -> View {
         .margin(Thickness::new(-tokens::spacing::XS, 0.0, 0.0, 0.0))
         .automation_name(format!("Open in Explorer: {shown}"))
         .on_click(open)
+        // A star cell gives the path the room left beside its icon, so it
+        // trims with an ellipsis; a horizontal stack let it run past the
+        // button's edge and cut it off.
         .content(
-            StackPanel::new()
-                .orientation(Orientation::Horizontal)
-                .spacing(tokens::spacing::XS)
+            Grid::new()
+                .columns([GridLength::Auto, GridLength::STAR])
+                .column_spacing(tokens::spacing::XS)
                 .margin(Thickness::xy(tokens::spacing::XS, 0.0))
                 .children((
                     controls::icon(controls::glyph::OPEN_FOLDER),
                     controls::text(shown.to_owned(), tokens::text::BODY)
+                        .grid_column(1)
                         .vertical_alignment(VerticalAlignment::Center)
                         .text_trimming(TextTrimming::CharacterEllipsis),
                 )),
         )
-        .tooltip(TOOLTIP)
+        .tooltip(format!("{TOOLTIP}: {shown}"))
 }
 
 /// A square open-in-Explorer button beside a path field (Settings ›

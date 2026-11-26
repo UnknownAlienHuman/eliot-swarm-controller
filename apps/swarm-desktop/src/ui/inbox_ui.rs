@@ -1192,11 +1192,14 @@ impl DesktopApp {
             0
         };
         let title: View = match agent {
+            // As tall as its line: no vertical padding instead of a fixed
+            // height the button's padding left no room in, which cut the
+            // title's glyphs.
             Some(agent) => controls::text_button()
                 .horizontal_alignment(HorizontalAlignment::Left)
                 .margin(Thickness::new(-tokens::spacing::ROW, 0.0, 0.0, 0.0))
+                .padding(Thickness::xy(tokens::spacing::ROW, 0.0))
                 .min_height(0.0)
-                .height(tokens::spacing::LG - tokens::spacing::XS)
                 .automation_name(format!("Open {subject}"))
                 .on_click(context.message(Message::Inbox(InboxMsg::OpenAgent(agent.to_owned()))))
                 .content(
