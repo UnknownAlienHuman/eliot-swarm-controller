@@ -87,6 +87,9 @@ async fn run() {
     let mut previous_data_dir = None;
     // Failed polls in a row (no daemon answering): the next waits longer.
     let mut pace = crate::live::Pace::default();
+    // The data directory whose daemon refused this desktop (`not_allowed`):
+    // a definite answer, so it is asked no more until the directory changes.
+    let mut refused: Option<PathBuf> = None;
     loop {
         interval.tick().await;
         let mut index = 0;
@@ -105,13 +108,26 @@ async fn run() {
         };
         if previous_data_dir.as_ref() != Some(&data_dir) {
             next_probe.clear();
+            refused = None;
             previous_data_dir = Some(data_dir.clone());
         }
-        let pending = crate::client::auth_desktop_poll(&data_dir).await;
-        let Ok(pending) = pending else {
-            let poll_ms = u64::try_from(POLL_INTERVAL.as_millis()).unwrap_or(u64::MAX);
-            interval.reset_after(Duration::from_millis(pace.fail(poll_ms)));
+        if refused.as_ref() == Some(&data_dir) {
             continue;
+        }
+        let pending = match crate::client::auth_desktop_poll(&data_dir).await {
+            Ok(pending) => pending,
+            // This daemon does not let this desktop run native sign-ins: a
+            // definite refusal, never retried; quietly.
+            Err(error) if error.code == "not_allowed" => {
+                refused = Some(data_dir);
+                continue;
+            }
+            // A daemon that is down or unavailable is asked again, later.
+            Err(_) => {
+                let poll_ms = u64::try_from(POLL_INTERVAL.as_millis()).unwrap_or(u64::MAX);
+                interval.reset_after(Duration::from_millis(pace.fail(poll_ms)));
+                continue;
+            }
         };
         pace.reset();
         next_probe.retain(|(harness, revision), _| {
