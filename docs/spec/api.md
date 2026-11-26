@@ -1298,7 +1298,13 @@ archives or unarchives the selected Agent and all current descendants. Every
 member must be idle, ended (stopped, failed or lost), an external observer in
 `unknown` state, or an ended native observation (a stopped observed
 child keeping its `unknown` turn as retained ended-observation evidence), with no
-active turn, no other uncertain turn, no pending request and no open command.
+active turn, no other uncertain turn, no pending request and no blocking command.
+An accepted or queued `swarm_note:*` context injection has no native claim.
+Archive cancels it in the same transaction as the flag change and records
+`delivery: "withdrawn"` and `reason: "agent_archived"` on the command.
+Ordinary accepted or queued Owner and Agent input still blocks archive.
+Dispatched input blocks archive while it is unsettled. Archive can preserve
+an ended Agent's unknown outcomes once the affected generations have drained.
 Archiving an ended member also needs its custody resolved: no unexited owned process,
 `unknown` artifact or open native source (Eliot's `os`/`git`/`workspace_process`
 observers may stay open). Archiving an external observer in `unknown` state
@@ -1311,9 +1317,10 @@ before retrying Archive or Delete.
 The desktop offers Archive and Unarchive in the task row and header menus.
 Show archived in the sidebar includes archived tasks in the list.
 Unarchive applies the same state, turn, request and command guards and skips
-the custody check. The flag is durable. Admission of send, resume, steer or inject
-atomically unarchives its target, including selector members, so new activity appears in
-the default list. Reattaching an archived observer opens a new `observe` source and
+the custody check. The flag is durable. An explicit Owner Resume, or admission of
+steer or inject, atomically unarchives its target, including selector members,
+so new activity appears in the default list. Send and other Resume paths require
+an unarchived target. Reattaching an archived observer opens a new `observe` source and
 clears the flag, so a live reader is never hidden.
 `agent.list` accepts `archived:"exclude"` (default), `"only"` or `"include"`;
 totals and cursors use the same filter. The default also lists an archived ended
@@ -1337,13 +1344,13 @@ Unread completion digests and unread latest results anywhere below an Agent
 keep it visible. A working child or attached observer
 keeps its custody and stays visible. Retirement starts and stops no sessions.
 
-Open custody, live descendants, unknown outcomes, open commands or requests,
-retained Goals needing attention, project manager assignments and Owner pins
+Open custody, live descendants, unknown outcomes, blocking commands, open
+requests, retained Goals needing attention, project manager assignments and Owner pins
 all block the pass. A managed worktree still binds its Agent until the guarded
 cleanup lane has resolved it and its branch, including proof that unpublished
 work was preserved. Missing-path reconciliation alone does not prove this.
-The pass changes only the archive flag and records `agent.archived`. The
-Agent remains readable by ID and in history.
+The pass withdraws undispatched Swarm notes as above, changes the archive flag
+and records `agent.archived`. The Agent remains readable by ID and in history.
 
 `agent.delete {id, agent:"aN"}` is Owner-only and removes a tree whose Agents are ended
 (stopped or failed), a detached external observer, or an ended native observation with
@@ -1363,8 +1370,12 @@ treating stopped lifecycle as proof of drained history. An ordinary retained `un
 turn still blocks deletion after stop; the ended-observation evidence retires with its
 tree instead. Delete removes the tree's turns and events without resolving them: no
 resolution is recorded and no `turn.resolved` event is emitted. Live custody, open
-commands, uncertain turns, active or uncertain cleanup attempts, or a pinned history
-floor return `busy`; oversized operations return `unavailable` before cleanup.
+commands other than undispatched Swarm notes, uncertain turns, active or uncertain
+cleanup attempts, or a pinned history floor return `busy`. Oversized operations
+return `unavailable` before cleanup.
+The final delete transaction cancels undispatched Swarm note injections with
+`delivery: "withdrawn"` and `reason: "agent_deleted"` before pruning the tree's
+command history.
 After cleanup, Delete gives rules a bounded interval to consume the new events
 before rechecking the cursor guard. A refusal names the blocking rule. Retry with
 a fresh mutation ID after it catches up. If the rule is obsolete, the Owner can remove it with
@@ -3419,8 +3430,9 @@ empty typed blocker list when no blockers were observed, otherwise
 `state:"dispatched"` with the captured `StatusBlocker` list. Drain also returns a
 bounded `drain` report reusing the existing blocker sources instead of
 a new registry: running turns (Agents with a recorded `active_turn`), unsettled
-commands, unknown commands and live owned processes. Live owned processes come from
-the Store custody snapshot (process records not yet `exited`), never from routing
+commands, unknown commands and live owned processes. Undispatched Swarm note
+injections are omitted from unsettled-work counts and drain blockers. Live owned
+processes come from the Store custody snapshot (process records not yet `exited`), never from routing
 eligibility or workspace operation locks: a held workspace operation lock alone is
 not a live child and never appears. Every category carries a count, a bounded list
 and a truncation flag; the bound is 64 entries per list, and the flag is true
@@ -3641,7 +3653,9 @@ outcomes leave the release running.
 
 The CLI records the startup evidence and decision in the private data directory
 under the update preparation ID, including a candidate health failure before
-boot evidence exists. A record write failure appears in the update report.
+boot evidence exists. Recording a new decision prunes older
+`update-health-<ULID>.json` files, retaining the newest three. A record write
+failure appears in the update report.
 Rollback reports a candidate with proven surviving process custody as held
 and names its observed admission when available. Read the retained decision
 without a daemon using `swarm daemon update --health-decision PREPARE_ID`.

@@ -17,12 +17,15 @@ contract is not a requirement to implement every feature in the first layer.
 | [automation](spec/automation.md) | Rules, timers, scripts and Goals using normal commands |
 | [coordination](spec/coordination.md) | Mail, variables, hierarchy, who and advisory claims |
 | [configuration](spec/configuration.md) | Profiles, environment, routes and services |
+| [Fluent desktop](design/fluent-design-system.md) | Current native Windows UI, interaction and accessibility contract; implementation stages stay in D12 |
 | [cloud MCP](spec/cloud-mcp.md) | Local HTTP MCP child and dedicated Cloudflare Tunnel lifecycle |
 | [harnesses](harnesses/README.md) | Native capability notes; Codex first |
 | [donors](reference/donors.md) | Dependency/extract/pattern map with source and target paths |
 
-The first usable milestone is direct Codex/Luna after core/bus. Automation, communication
-and other harnesses follow. Update the page that owns a changed contract; do not create
+Core/bus, direct Codex/Luna and the subsequent automation/adapter layers are implemented;
+the roadmap owns remaining implementation and qualification. Material is frozen until
+Reactor/WinUI fully support it and the Owner reopens that direction. A dependency update
+does not change the current Fluent contract. Update the page that owns a changed contract; do not create
 reports, addenda, proof packets or another status registry.
 
 v1 code and its original notices are preserved on branch `archive/v1-final`, at commit

@@ -1,12 +1,12 @@
 # Eliot Swarm Desktop — брендбук и проект интерфейса Fluent
 
-**Версия:** 1.0 · **Дата:** 25 ноября 2026 · **Платформа:** Windows, Rust, настоящий WinUI 3.
+**Версия:** 1.1 · **Дата:** 26 ноября 2026 · **Платформа:** Windows, Rust, настоящий WinUI 3.
 
 **Назначение:** единая спецификация внешнего вида, экранов, состояний и реализации desktop-клиента Swarm Controller. Документ рассчитан на непосредственную работу агентов с существующим кодом, а не на создание нового UI-фреймворка.
 
 **Принятое направление:** штатный Fluent WinUI 3. Material 3 Expressive заморожен и исключён из текущего задания. Его возвращение — отдельное будущее решение после развития WinUI/Reactor, а не скрытая цель этой реализации.
 
-**База исследования:** приложенный «Eliot Swarm Desktop · Каркас интерфейса» от 24.11.2026 [U1]; актуальный репозиторий на `4f411a71c295434f8e61b17b13bc95e29a49eda1`; официальные материалы Microsoft и исходники WinUI/Reactor. Наблюдения о сторонних приложениях из каркаса принадлежат исходному исследованию: здесь они не выдаются за повторно проведённые live-проверки.
+**База исследования:** приложенный «Eliot Swarm Desktop · Каркас интерфейса» от 24.11.2026 [U1]; первоначальная версия сверялась с `4f411a71c295434f8e61b17b13bc95e29a49eda1`. Реализационные факты этой редакции узко перепроверены по исходнику `e2a7b96f1f81713db3fceb3f66634191fc7bc638` (26.11.2026; новые ссылки [C26]–[C41]). Остальные ссылки R/C на прежней базе остаются историческими материалами исследования и не утверждают, что указанные там кодовые пути существуют сейчас. Наблюдения о сторонних приложениях принадлежат исходному исследованию, а не live-проверкам.
 
 Числа размеров и задержек, помеченные **решение Swarm** или **цель**, — требования этого проекта. Они не являются утверждением, что Microsoft предписывает именно такие значения или что текущая сборка их уже достигает.
 
@@ -34,7 +34,7 @@
 20. [Данные, скорость и устойчивость](#20-данные-скорость-и-устойчивость)
 21. [Матрица функций и готовности API](#21-матрица-функций-и-готовности-api)
 22. [Rust, Reactor и миграция Material](#22-rust-reactor-и-миграция-material)
-23. [Порядок реализации и приёмка](#23-порядок-реализации-и-приёмка)
+23. [Приёмка](#23-приёмка)
 24. [Официальные материалы и исходники](#24-официальные-материалы-и-исходники)
 
 ## 1. Задание исполнителю
@@ -55,7 +55,7 @@
 
 ### 1.2. Короткий порядок чтения для агента
 
-Сначала прочитать разделы 1–7, 20–23 и owning spec изменяемого сценария. Затем читать только нужные экраны и соответствующие источники из раздела 24. Не перечитывать весь репозиторий на каждую правку. Статус реализации вести в существующей `docs/roadmap.md`, доказательства проверок — в PR; этот документ задаёт дизайн, а не создаёт второй реестр готовности. [R1], [R2], [R3], [R10]
+Сначала прочитать текущий пункт D12, разделы 1–2 и owning spec изменяемого сценария. Затем — соответствующий экран, компонент и связанные требования к данным/вводу. Раздел 22 нужен при изменении Reactor/WinUI integration, раздел 23 — для приёмки этапа; источники из раздела 24 открывать по конкретному вопросу. Статус вести в `docs/roadmap.md`, результаты проверок — в PR. [R1], [R2], [R3], [R10]
 
 ### 1.3. Что изменено относительно каркаса
 
@@ -433,6 +433,8 @@ Tool step показывает понятное имя, затем аргуме�
 
 Streaming меняет существующий блок по стабильному ключу. Появление нового token не пересоздаёт всё дерево ответа, не сбрасывает выделение и не закрывает раскрытые шаги. При копировании результатом является текст выбранного блока, а не обрезанная визуальная строка.
 
+Live turn preview — временный best-effort draft, не committed message и не durable history. Он привязан к видимому running turn, исчезает при его завершении или смене turn/chat и заменяется committed message при readback; отсутствие или задержка preview не означает потерю результата. [C27]
+
 ### 9.3. История и прокрутка
 
 Текущая модель истории уже имеет страницы и ограничения памяти. Сохранить её при миграции темы: 20 turns в странице, до 200 resident turns и 8 MiB resident payload; отдельные сообщения и tool rows также ограничены кодом. Это факты текущей реализации, не основание загрузить все 200 turns в один тяжёлый frame. [C3], [C4]
@@ -447,7 +449,7 @@ Streaming меняет существующий блок по стабильно
 | Искомое событие вне загруженного окна | Загрузить доступную страницу либо явно сообщить границу. Не обещать переход ко всей истории без API поиска/позиционирования. |
 | Данные обрезаны backend или cache | Показать причину и доступный способ продолжить чтение; не выдавать частичную историю за полную. |
 
-Определять нахождение у конца по реальным ScrollView metrics, когда они доступны в принятой версии Reactor. Не угадывать его по отсутствию wheel event, числу сообщений или таймеру. Уже используемый native `VerticalAnchorRatio=1` — функциональная часть приложения; его нельзя удалить вместе с Material resources. [C4], [C5], [Q2]
+Определять нахождение у конца по реальным ScrollView metrics, когда они доступны в принятой версии Reactor. Не угадывать его по отсутствию wheel event, числу сообщений или таймеру. Уже используемый native `VerticalAnchorRatio=1` — функциональная часть приложения; его нельзя удалить вместе с Material resources. [C4], [C29], [Q2]
 
 ### 9.4. Composer: точная таблица действий
 
@@ -545,9 +547,9 @@ Scoped tree показывает manager, children и наблюдаемые nat
 | Раздел | Содержание и границы |
 |---|---|
 | Summary | Project, workspace, branch, profile/model, state, started/last activity; Copy paths/IDs отдельно. |
-| Task | Доступный prompt/brief preview и связанные данные. Полный Task record не подменять восстановленным из transcript текстом: отдельного read/list API для него сейчас не подтверждено. |
-| Goal | Формулировка, check command, round/budget, status, последнее подтверждённое check result; edit/pause/continue по контракту. |
-| Work | Git base/head, current checkpoint, worktree ownership, claims и интеграция. История checkpoints требует отдельного list/read API; текущий единичный snapshot не изображается историей. |
+| Task | Доступный prompt/brief preview и связанные данные. Backend `task.list/get` существует, desktop caller/browser пока не найден; не подменять Task record реконструкцией из transcript. [C31], [C32], [C41] |
+| Goal | Текущие Goal get/set/status UI; Owner-approved Goal audit/continuation, first-input default objective и task card after compaction остаются требованиями roadmap, не заявлением о реализованном поведении. [C36], [C37] |
+| Work | Git base/head, worktree ownership, claims и интеграция. Backend/CLI предоставляет `checkpoint.list/get/restore`; desktop caller/browser пока не найден. [C33], [C34] |
 | Mail | Read-only просмотр адресованной агенту координации и доставки; явная Send note/Broadcast action. Просмотр владельцем не подтверждает чтение от имени агента. |
 | What went wrong | Последние релевантные failure/refusal/unknown facts, recovery action и Copy details. Один и тот же сбой не размножается в три красных карточки. |
 | Activity & resources | Native process/CPU/RAM/counters с timestamp и coverage; раскрываются и обновляются только когда нужны. |
@@ -555,7 +557,7 @@ Scoped tree показывает manager, children и наблюдаемые nat
 | Heavy work / coordination | Только существующие применимые grants/limits/claims. Инфраструктурная переменная не превращается в editable настройку без owning API. |
 | Technical | Agent ID, generation, session/profile/correlation identifiers, источники и timestamps; Copy diagnostic details без секретов. |
 
-`checkpoint.restore` существует, но готовый checkpoint browser отсутствует. В первой поставке можно показывать только реально полученный current checkpoint и supported restore flow с необходимыми предварительными условиями. Если для выбора/проверки restore не хватает данных, отдельный backend reader закрывается до появления команды; кнопку, обещающую несуществующий сценарий, не показывать. `var.get/set` не означает наличие `var.list`: общий браузер всех shared variables в текущем API не подтверждён. [R5], [R6], [C11]
+Backend и CLI поддерживают `checkpoint.list`, `checkpoint.get` и guarded `checkpoint.restore`; desktop пока не вызывает эти методы и не предоставляет browser или restore flow. Если добавляется desktop UI, он должен использовать exact Agent/generation и pinned checkpoint reference/OID из этих API. `var.get/set` не означает наличие `var.list`: общий браузер всех shared variables в текущем API не подтверждён. [R5], [R6], [C11], [C33], [C34]
 
 ### 11.4. Terminal
 
@@ -710,7 +712,7 @@ Usage отвечает на вопросы: какой provider доступен
 | Routing impact | Какие роли/candidates сейчас ограничены; ссылка в Routing. |
 | Capacity | Отдельный краткий блок slots/reservations при необходимости; не складывается с tokens/cost. |
 
-В sidebar показывается одна компактная строка, а не пять gauges для всех providers: остаток или hold того harness, чей limit действует там, где находится владелец (открытый чат — harness его Agent; страница проекта — harness с наибольшим числом running Agents проекта, иначе последнего активного; прочие страницы — harness с наибольшим числом running Agents, иначе тот, который запустит composer). До первого чтения строки нет; если чтение не дало окна этого harness, строка говорит "quota unknown" и не берёт число другого harness. Открытый чат, чей harness ещё неизвестен, не показывает числа. Popover раскрывает каждый harness один раз, Settings › Usage — подробности и управление. Таймер до reset рассчитывается из полученного timestamp; после наступления времени неизвестное состояние не превращается автоматически в unlimited quota.
+В sidebar строка Usage следует за текущей работой: открытый чат использует harness своего Agent; проект — harness с наибольшим числом работающих там Agents, а при равенстве или отсутствии работающих — harness самого недавно активного Agent; на остальных страницах — самый загруженный harness в fleet, затем harness следующего запуска composer. До первого полного чтения квоты строка не показывает значение. После чтения она показывает только квоту или hold выбранного harness, либо `quota unknown`, если его окно недоступно; квота другого harness не подставляется. Для открытого чата с неизвестным harness число не показывается. Flyout перечисляет каждый harness один раз; подробности и управление находятся в Settings › Usage. Время сброса берётся из полученного timestamp, а истечение времени само по себе не превращает unknown в unlimited. [C26]
 
 USD показывать только при достоверной денежной единице/методике backend. Native cost units или tokens нельзя подписывать `$`. По model context без capacity denominator показывать абсолютное значение или unavailable. Unknown, unsupported, stale и zero отличаются. Read/Refresh не инициирует платный inference. [R4], [R5], [R8]
 
@@ -720,7 +722,7 @@ USD показывать только при достоверной денежн
 
 Archive — организация истории. Страница содержит search, project filter, name/state/last activity и Restore. Архивирование не является Stop Agent и не удаляет worktree. Если состояние не допускает archive, UI объясняет отказ и показывает подходящее действие.
 
-После успешного archive — короткое inline сообщение с Undo, пока обратная операция допустима. Удаление относится к другой команде и не находится на месте Undo. Restore возвращает задачу в прежнюю допустимую группу; дальнейшее Send/Resume зависит от её настоящего lifecycle.
+После успешного archive — короткое inline сообщение с Undo, пока обратная операция допустима. Удаление относится к другой команде и не находится на месте Undo. Restore возвращает задачу в прежнюю допустимую группу. Явная Owner-команда Resume может продолжить archived Agent без предварительного unarchive; Send и остальные Resume требуют неархивированного target. [Контракт archive после #1215](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/a9c47ddf4e1d99ea87ea90ce92e81a91c72a1433/docs/spec/api.md#L1311)
 
 ### 17.2. Managed worktrees и cleanup
 
@@ -878,7 +880,7 @@ Native auth flow — уже предусмотренное узкое исклю
 - Loading indicator локален к занятой области. Ошибка одной строки не убирает весь экран под глобальный spinner.
 - Minimized/hidden окно не крутит декоративные animation loops. Background subscriptions не теряют работу, но визуальные ticks, expensive projections и анимации сокращаются.
 
-Нужны обе границы: количество данных в cache и количество UI elements в viewport. Наличие ItemsRepeater само по себе не доказывает virtualization: конечный viewport, layout и data source должны быть совместимы. У Reactor 0.100 уже есть `VirtualSource`; в текущем Swarm rich transcript вернулся к bounded keyed StackPanel после проблемы realization/anchoring. При миграции Fluent не повторять этот переход без конкретного доказательства исправленного сценария. Для fleet/history выбирать работающую bounded реализацию по профилю. [C3], [C4], [Q1], [W18], [W19]
+Нужны обе границы: количество данных в cache и количество UI elements в viewport. Наличие ItemsRepeater само по себе не доказывает virtualization: конечный viewport, layout и data source должны быть совместимы. Текущий rich transcript использует bounded keyed StackPanel после проблемы realization/anchoring. Для fleet/history выбирать работающую bounded реализацию по профилю. [C3], [C4], [Q1], [W18], [W19]
 
 ### 20.3. Бюджеты — цели Swarm, ещё не измеренные результаты
 
@@ -928,16 +930,16 @@ Display names, favorites/recent и имеющиеся preferences использ
 | Continue chat in project | Текущий main содержит workflow под активным manager | Не смешивать с placement-only Attach. |
 | Send/Steer/interrupt/resume/stop | Backend и UI | Сохранить точные bindings, показать fallback interruption → Agent stopped. |
 | Owner requests и Inbox | Backend/UI; текущий bulk UI выполняет последовательные решения | Новый общий bulk flow может подключить `owner.decide.bulk`: 1–100 refs, до 16 KiB; per-item result. |
-| Native menus/flyouts | Уже настоящие WinUI controls + bridge | Удалить Material styling, сохранить lifecycle/placement/focus. |
+| Native menus/flyouts | Настоящие WinUI controls + bridge | Сохранить native lifecycle, placement, focus и action identity; проверять их на Windows. |
 | Transcript/work log/Markdown | Реальные bounded model/render/cache | Визуальная миграция без потери selection/anchor и без whole-history rewrite. |
 | Real diff | `agent.diff` зарегистрирован и реализован; desktop caller отсутствует | Подключить существующий DTO/handler, не создавать второй diff API. |
 | Git digest/check/integration | Реальные backend paths и metadata UI | Показать actual commands/results и policy; не создавать IDE staging. |
 | Project manager/transfer | Backend и UI | Assignment conflict, progress, successor и recovery. |
 | Fleet/resources/diagnostics | Backend и monitor UI | Сохранить freshness/coverage, bounded reads и понятные колонки. |
 | Native subagents | Observe-only evidence для поддерживаемых harness | Отдельный тип строки, без недоступных Agent controls. |
-| Goals | Backend set/get/pause/clear/resume/round; текущая status/config UI | Полный current-goal editor/status, без выдуманной истории. |
-| Task record browser | Полного desktop read/list API не найдено | Показывать известный brief; полноценный browser требует отдельного reader, не эмуляции из ленты. |
-| Checkpoints | Current snapshot и `checkpoint.restore` есть; list/history reader не подтверждён | Current view/guarded restore только при достаточных данных. History — отдельная зависимость. |
+| Goals | Backend и базовый текущий Goal dialog/status; дополнительные Owner-approved defaults/audit/continuation/task-card behavior — roadmap work | Не считать A10–A12 реализованными по наличию базового Goal UI; сохранять актуальные actions/status без выдуманной истории. [C36], [C37] |
+| Task record browser | Backend `task.list`/`task.get` есть; desktop caller/browser пока не найден | Подключать только pinned, bounded reader с manifest/source coverage; не восстанавливать записи из ленты. [C31], [C32], [C41] |
+| Checkpoints | Backend/CLI `checkpoint.list/get/restore` реализованы; desktop caller/browser не найден | Подключить точные pinned reads и guarded restore в desktop; до этого не обещать checkpoint history/restore в UI. [C33], [C34], [C41] |
 | Mail | Backend queue/read/delivery/ack и client helpers | Details/team communication; owner просмотр не agent ack. Отдельный mail client не требуется. |
 | Claims | `claim.set/list/release` есть; dedicated UI не подтверждён | Read-only coordination view по API при необходимости; Git attribution и claims подписывать отдельно. |
 | Shared variables | `var.get/set`, без `var.list` | По известному key в technical/automation context; общий browser не обещать. |
@@ -961,55 +963,39 @@ Display names, favorites/recent и имеющиеся preferences использ
 
 **Остаёмся на Rust + WinUI 3 + Microsoft windows-reactor.** WinUI уже предоставляет Fluent controls. Смена визуального языка не требует переносить daemon, переписывать приложение на C# или внедрять иной renderer.
 
-Desktop: track upstream windows-rs; `Cargo.lock` records the resolved commit. Прежний `windows-reactor = "=0.100.0"` остался только в истории Git. У официального Microsoft source snapshot `5a875c078eb975e2d424ab3ab7eba323a8cfe0af` manifest уже `0.101.0`, а public API содержит нужные локальные font/scroll/input дополнения. README по-прежнему называет Reactor preview. Не путать source version с опубликованным crates.io release. [C1], [Q1], [Q2], [Q3]
+Desktop использует upstream windows-rs через git source; `Cargo.lock` фиксирует разрешённый commit. Ветка приложения уже использует API из актуального source graph для scoped monospace в `TextBlock` и нативных ScrollView metrics/requests. Это подтверждение реализации по исходникам, не Windows runtime-приёмка. Reactor остаётся preview; его опубликованная версия и upstream source version — разные сведения. [C1], [Q2], [Q3], [Q6]
 
-**Решение проекта для полного набора требований:** первым отдельным этапом перевести desktop и его dependency graph на один git source: track upstream windows-rs; `Cargo.lock` records the resolved commit. Snapshot `5a875c07` — известная точка сравнения. Причина узкая: scoped `TextBlock::font_family` и реальные ScrollView metrics/scroll requests позволяют убрать необходимость новых ручных обходов для кода и прокрутки. Это не смена framework. Совместимость snapshot со Swarm здесь **не проверена запуском**; этап M0 ниже является обязательной технической приёмкой до массовой переделки экранов.
-
-Не начинать десятки экранов параллельно на предполагаемом API. Если M0 выявит конкретный blocker, зафиксировать его и устранить ограниченной правкой/проверенным upstream change до продолжения. Нельзя молча заменить отсутствующий native API новой глобальной подменой шрифта, собственным ScrollView или широким форком. Desktop track upstream windows-rs; `Cargo.lock` records the resolved commit; прежний 0.100 не является поддерживаемой базой и не возвращается.
+Версии `0.100.0` и связанная с ней release guidance ниже сохранены как исторические ссылки для прежнего crates.io snapshot и runtime-контракта. Они не описывают текущую dependency base. Текущие несовершенные места определяются кодом и проверяются на Windows; не возвращать ограничения старого API как незавершённые задачи.
 
 ### 22.2. Матрица совместимости
 
-| Область | 0.100 в репозитории | Проверенный исходный API 0.101 | Решение |
+| Область | Исторический crates.io snapshot 0.100 | Текущее приложение / API | Решение |
 |---|---|---|---|
-| Stock Fluent controls | Есть | Есть | Не переписывать templates. |
-| `ItemsRepeater` / `VirtualSource` | Есть | Есть | API не гарантирует удачную virtualization конкретного rich transcript. |
-| Code-only `font_family` | У TextBlock builder отсутствует | Есть `TextBlock::font_family` | Локально для code/diff, без глобального `SymbolThemeFontFamily`. |
-| Editable code font | У TextBox builder отсутствует | У TextBox по-прежнему отсутствует | Сохранить native font в небольших editable полях; monospace preview/Open in editor. Не выдумывать `TextBox::font_family`. |
-| ScrollView anchor property | Текущий app ставит через XAML style | Есть builder property | Удалять старый setter только после рабочего replacement. |
-| Scroll metrics / programmatic scroll | Публичного нужного readback нет; app использует native glue | `observe_view`, `ScrollViewMetrics`, `request_scroll_to` | Реальное follow/jump с сохранением чтения. |
-| Key/focus callbacks | Ограничены; app содержит hooks | Есть дополнительные callbacks Border | Они не являются доказательством поддержки всех IME-состояний TextBox. |
-| Menu callback | Старый app сопоставляет labels | Source API использует `Key` | Stable action IDs, не dispatch по локализованному тексту. |
-| Flyout imperative lifecycle | App bridge | Не весь ShowAt/Hide/Closed lifecycle представлен | Сохранить необходимый bridge; не объявлять его ненативным только из-за interop. |
-| Theme brush inventory | Небольшой enum | По-прежнему ограниченный набор | Native controls для штатных visual states; не самодельный palette engine. |
+| Stock Fluent controls | Доступны | Текущий UI использует штатные controls | Не переписывать templates. |
+| `ItemsRepeater` / `VirtualSource` | Доступны | Rich transcript использует bounded keyed `StackPanel` после проблем realization/anchoring | Не объявлять virtualization готовой по факту наличия API; выбирать по профилю. |
+| Code-only `font_family` | В crates.io 0.100 отсутствовал | `TextBlock::font_family` уже применяется в code preview | Scoped monospace; не менять глобальный font key. |
+| Editable code font | В crates.io 0.100 отсутствовал | У `TextBox` builder по-прежнему нет этого свойства | Небольшие editable поля оставлять со штатным шрифтом; code preview/Open in editor — отдельная граница. |
+| Scroll metrics / programmatic scroll | В crates.io 0.100 отсутствовал | Используются `observe_view`, `ScrollViewMetrics`, `request_scroll_to` | Сохранять follow/jump и позицию чтения; проверить на Windows. |
+| Key/focus callbacks | Ограниченная поверхность | Hooks остаются для конкретных случаев | Проверять keyboard/IME/focus на Windows; наличие callback не доказывает все сценарии. |
+| Native menu callbacks | Старая реализация сопоставляла labels | Текущий WinUI flyout bridge сохраняет item/action mapping | Не dispatch-ить по локализованному отображаемому тексту; проверить lifecycle/focus. |
+| Flyout imperative lifecycle | Не вся поверхность доступна через Reactor | Swarm сохраняет необходимый WinUI bridge | Это native interop, не повод заменять меню самодельными controls. |
+| Theme brush inventory | Небольшой enum | По-прежнему ограниченный набор | Использовать native control states; не вводить palette engine. |
 
 Direct dependencies на `windows-core`, `windows-reference`, `windows-collections` и transitive crates должны соответствовать upstream workspace graph: `collections/core/future/reference/time/window` — 0.101.0, `windows-threading` — 0.100.1; optional `windows-reactor-setup` — 0.100.1. Не смешивать несовместимые WinRT types из двух версий и не назначать всем пакетам номер 0.101 по догадке. Track upstream windows-rs; `Cargo.lock` records the resolved commit; resolution/fetch проверяются и на Linux CI, поскольку target-specific dependencies участвуют в графе Cargo. [Q2], [Q3], [Q9]
 
 ### 22.3. Runtime и поставка
 
-Upstream release guidance для Reactor 0.100 указывает Windows App SDK 2.4.0; число WinUI component metadata в комментарии `generic.xaml` не является версией umbrella SDK. Swarm не подключает `windows-reactor-setup` и использует установленный Windows App Runtime. Track upstream windows-rs; `Cargo.lock` records the resolved commit; the installed Windows App Runtime is recorded, not pinned: каждое live-доказательство записывает фактически установленную версию runtime (setup source выбранного commit называет `Microsoft.WindowsAppSDK.Runtime` 2.6.4 — это справочная точка, а не требование). Bootstrap подтверждается на Windows; self-contained поставку не включать попутно. [C1], [Q4], [Q5], [Q6]
+Release guidance для Reactor 0.100 и упомянутая там Windows App SDK 2.4.0 относятся к историческому опубликованному snapshot. Swarm не подключает `windows-reactor-setup` и использует установленный Windows App Runtime. Runtime фактически установленной Windows следует фиксировать в runtime evidence; source setup package version сама по себе не задаёт deployment contract. Bootstrap и поддерживаемую deployment model подтверждать на Windows; self-contained поставка не следует из перехода на Fluent. [C1], [Q4], [Q5], [Q6]
 
 WinUI Gallery snapshot использует `2.6.6-experimental` в `standalone.props`. Gallery — образец поведения и композиции, его dependency file нельзя копировать в Rust production app. Переход на Fluent сам по себе не требует менять packaging на self-contained. Проверить установленный runtime и запуск на чистой поддерживаемой Windows в принятой deployment model. [G3], [W21]
 
-### 22.4. Карта изменений кода
+### 22.4. Текущая база и оставшиеся UI gaps
 
-| Файл / область desktop | Изменение | Что сохранить |
-|---|---|---|
-| `src/app_resources.rs`, `src/app_resources/templates.rs` | Удалить глобальные M3 colors, shapes, padding, templates и implicit overrides | ScrollView anchoring до replacement; `own_window`, `window_minimized` и используемые window helpers. |
-| `src/theme.rs`, `src/tokens.rs`, `src/m3.rs` | Оставить System/Light/Dark и минимальные layout constants; убрать Material palette/role engine | Реакцию на system theme и High Contrast, typed preferences. |
-| `src/fonts.rs` и font assets | Удалить Material font loading/global substitutions после замены callers | System UI font, scoped monospace и native Fluent icons. |
-| `src/motion.rs`, `src/shadow.rs` | Убрать Material interaction animation и Composition shadows, дублирующие controls | Только действительно нужное product behavior и reduced-motion semantics. |
-| `src/flyout.rs`, `src/winrt.rs` | Убрать только Material tint/decoration и доказанно заменённые вызовы | Native placement/lifecycle, Automation names, glyphs, display text, action identity и корректное освобождение handlers/resources. |
-| `src/shortcuts.rs`, `src/scroll_end.rs` | Постепенно заменить конкретные hooks публичным API там, где доказана эквивалентность | IME, Esc, focus, system changes, scroll anchors; не удалять одним sweep. |
-| `src/chat.rs`, `src/views.rs`, feed/cache | Сохранить bounded model, стабильные keys и progressive render; изменить визуальные slots | State identity, lazy parsing, selection, history limits. |
-| `src/ui/*` | Перекомпоновать существующие screens по документу | Existing actions, constraints, errors и typed command bindings. |
-| `src/client.rs`, DTO users | Подключить уже существующие `agent.diff`, `cleanup.apply_all`, при необходимости bulk API | Один typed protocol; никакой второй router. |
-| Cargo/build/assets | Удалить осиротевшие Material deps/assets, зафиксировать согласованный Reactor graph | App icon, WinUI runtime/bootstrap и необходимую упаковку. |
-
-Глобальные implicit M3 styles снимаются **до** того, как экраны объявляются Fluent. При миграции экранов не держать поверх новых native controls старую глобальную тему: иначе названия компонентов изменятся, а их visual states останутся переопределены.
+Текущий Fluent desktop уже использует `TextBlock::font_family`, ScrollView metrics/requests и native Flyout/MenuFlyout bridge в `views.rs`, `flyout.rs` и `menu_ui.rs`; предмет оставшейся проверки — реальные Windows focus, scroll, accessibility и deployment scenarios. §21 остаётся единственной картой продуктовых UI gaps: различать готовый backend contract и отсутствующий desktop caller, например для task/checkpoint reads и `agent.diff`. Не создавать задачи на миграцию отсутствующих Material modules/resources и не объявлять roadmap Goal increments A10–A12 реализованными по наличию базового Goal UI. [C29], [C35], [C39]
 
 ### 22.5. Legacy theme values
 
-Старые значения configuration должны читаться без поломки запуска. Принятое отображение: System→System, Light→Light, Dark→Dark; Purple→Light, Amoled/Neon/Matrix→Dark по прежнему light/dark характеру. Legacy значения не показывать как действующие дополнительные темы. Нормализация выполняется контролируемо через existing configuration flow, без записи при каждом render и без потери concurrent revision. [C18], [R4]
+Старые значения configuration должны читаться без поломки запуска. Принятое отображение: System→System, Light→Light, Dark→Dark; Purple→Light, Amoled/Neon/Matrix→Dark по прежнему light/dark характеру. Legacy значения не показывать как действующие дополнительные темы. Нормализация выполняется контролируемо через existing configuration flow, без записи при каждом render и без потери concurrent revision. [C40], [R4]
 
 ### 22.6. Заморозка Material
 
@@ -1017,24 +1003,11 @@ WinUI Gallery snapshot использует `2.6.6-experimental` в `standalone.
 
 Возврат возможен отдельным будущим решением, когда выбранные native APIs позволяют полноценно оформить необходимые controls, states, typography, scrolling, accessibility и motion без глобальных опасных подмен. До этого любые улучшения делают Fluent-клиент лучше; они не обязаны готовить скрытую Material-совместимость.
 
-## 23. Порядок реализации и приёмка
+## 23. Приёмка
 
-### 23.1. Конечные этапы
+Порядок реализации и статус принадлежат [roadmap](../roadmap.md). Этот документ задаёт требования к дизайну и приёмке, а не параллельный этапный план. Windows review должна охватить Home, длинную беседу, blocking decision, Changes, Project и Settings; фиксировать только реально наблюдённые результаты. Gallery служит источником поведения controls, не заменой проверки приложения.
 
-Один manager ведёт один worktree и связывает изменения. Узкие задачи можно делегировать по owning modules; конкурирующие агенты не меняют одновременно общие resources/theme/dependency graph.
-
-| Этап | Содержание | Выходной результат |
-|---|---|---|
-| M0. Совместимость | Track upstream windows-rs (`Cargo.lock` records the resolved commit), необходимые API adaptations, runtime bootstrap, scoped monospace для кода, scroll/focus/IME sanity на Windows | Зафиксированная рабочая база; exact versions и ограничения записаны в PR. |
-| M1. Основа Fluent | Убрать global M3 overrides; native themes, shell/sidebar, titlebar, один общий набор app layout constants | Все controls действительно используют штатные states; System/Light/Dark/Contrast работают. |
-| M2. Главный рабочий путь | Home, conversation, composer, decisions, native menus, long history | Полный launch/read/send/steer/stop/decision путь, сохранность draft/focus/scroll. |
-| M3. Контекст и проекты | Real diff, Agents/Details/Terminal, project assignment/transfer, fleet/Inbox | Действия привязаны к объектам; нет несуществующих read/history обещаний. |
-| M4. Управление | Settings, model/routing/auth, Automations/Scripts, Usage, Archive/cleanup/recovery | Полное покрытие поддерживаемого функционала и existing API gaps UI из §21. |
-| M5. Приёмка и удаление остатков | Actual Windows review, точечный profiling, dead Material assets/deps cleanup, документация | Принятый build с фактами проверки; unresolved blocker явно указан, а не спрятан. |
-
-После M1–M2 зафиксировать эталонные native screenshots для дальнейшей визуальной сверки: Home, длинная беседа, blocking decision, Changes, Project, Settings. Не тратить inference на генерацию эффектного mockup вместо рабочей WinUI поверхности. Эталон создаётся из приложения; изображения из Gallery нужны для поведения controls, не как подмена собственного результата.
-
-### 23.2. Чек-лист сдачи
+### 23.1. Чек-лист сдачи
 
 | Область | Доказательство готовности |
 |---|---|
@@ -1051,7 +1024,7 @@ WinUI Gallery snapshot использует `2.6.6-experimental` в `standalone.
 
 Build gates брать из актуального `AGENTS.md`: scoped `cargo fmt --check`, locked build и применимый clippy с предупреждениями как ошибками. Не возвращать удалённый test suite, не строить fake harness и не добавлять новый общий verification framework. Успешная сборка подтверждает типы/линковку, а не scrolling, focus, glyphs или удобство. [R3]
 
-### 23.3. Когда остановить неправильную реализацию
+### 23.2. Когда остановить неправильную реализацию
 
 Вернуть изменение на исправление, если оно:
 
@@ -1122,7 +1095,7 @@ Build gates брать из актуального `AGENTS.md`: scoped `cargo fm
 
 | Источник | Что проверять |
 |---|---|
-| [Опубликованный 0.100.0], [Q1] | Реальную исходную поверхность API приложения. |
+| [Опубликованный 0.100.0], [Q1] | Историческую поверхность API прежнего crates.io snapshot; не текущую dependency base. |
 | [public-api.txt], [Q2] | Наличие конкретного control/method/callback в целевом snapshot, до написания кода. |
 | [Cargo.toml], [Q3] | Версию `0.101.0`, MSRV, workspace dependency graph. |
 | [Microsoft release guidance], [Q4] | Исторический runtime contract 0.100; не путать версию WinUI component с SDK. |
@@ -1196,6 +1169,19 @@ Build gates брать из актуального `AGENTS.md`: scoped `cargo fm
 [C23]: https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/4f411a71c295434f8e61b17b13bc95e29a49eda1/apps/swarm-desktop/src/ui/chat_ui/composer.rs
 [C24]: https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/4f411a71c295434f8e61b17b13bc95e29a49eda1/apps/swarm-desktop/src/ui/scripts_ui.rs
 [C25]: https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/4f411a71c295434f8e61b17b13bc95e29a49eda1/apps/swarm-desktop/src/vendor_sign_in.rs
+[C26]: https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/e2a7b96f1f81713db3fceb3f66634191fc7bc638/apps/swarm-desktop/src/ui/usage_ui.rs
+[C27]: https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/e2a7b96f1f81713db3fceb3f66634191fc7bc638/apps/swarm-desktop/src/ui/chat_ui/live_feed.rs
+[C29]: https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/e2a7b96f1f81713db3fceb3f66634191fc7bc638/apps/swarm-desktop/src/views.rs
+[C31]: https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/e2a7b96f1f81713db3fceb3f66634191fc7bc638/crates/eliot-core/src/api/task_record.rs
+[C32]: https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/e2a7b96f1f81713db3fceb3f66634191fc7bc638/crates/eliot-daemon/src/router/task_records.rs
+[C33]: https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/e2a7b96f1f81713db3fceb3f66634191fc7bc638/crates/eliot-core/src/api/checkpoint.rs
+[C34]: https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/e2a7b96f1f81713db3fceb3f66634191fc7bc638/crates/eliot/src/cli/checkpoint.rs
+[C35]: https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/e2a7b96f1f81713db3fceb3f66634191fc7bc638/apps/swarm-desktop/src/flyout.rs
+[C36]: https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/e2a7b96f1f81713db3fceb3f66634191fc7bc638/apps/swarm-desktop/src/ui/goal_ui.rs
+[C37]: https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/e2a7b96f1f81713db3fceb3f66634191fc7bc638/apps/swarm-desktop/src/ui/chat_ui/header.rs
+[C39]: https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/e2a7b96f1f81713db3fceb3f66634191fc7bc638/apps/swarm-desktop/src/ui/menu_ui.rs
+[C40]: https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/e2a7b96f1f81713db3fceb3f66634191fc7bc638/apps/swarm-desktop/src/settings.rs
+[C41]: https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/e2a7b96f1f81713db3fceb3f66634191fc7bc638/apps/swarm-desktop/src/client.rs
 [W1]: https://learn.microsoft.com/en-us/windows/apps/design/signature-experiences/color
 [W2]: https://learn.microsoft.com/en-us/windows/apps/design/signature-experiences/typography
 [W3]: https://learn.microsoft.com/en-us/windows/apps/develop/platform/xaml/xaml-theme-resources

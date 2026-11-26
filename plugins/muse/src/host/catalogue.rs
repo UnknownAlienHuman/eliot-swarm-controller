@@ -1,4 +1,4 @@
-use super::{contextual_error, native_initialize_params};
+use super::{Initialized, contextual_error, native_initialize_params};
 use crate::native::{
     NativeClient, NativeLaunch, NativeProcess,
     types::{
@@ -8,22 +8,26 @@ use crate::native::{
     },
 };
 use eliot_core::{Error, Result, SecretPolicy};
-use eliot_plugin::native_cli::{BoundedReadLabels, run_bounded_with_stderr, valid_model_id};
+use eliot_plugin::{
+    AgentStartParams, PeerClient,
+    native_cli::{BoundedReadLabels, run_bounded_with_stderr, valid_model_id},
+    session::register_native_process,
+};
 use serde::Deserialize;
-use std::{fs::File, io::Read, path::Path, time::Duration};
+use std::{fs::File, io::Read, path::Path, process::Stdio, time::Duration};
 #[expect(
     clippy::disallowed_types,
     reason = "Muse catalogue refresh uses an owned native CLI command."
 )]
 use tokio::process::Command;
-use tokio::time::Instant;
+use tokio::time::{Instant, timeout_at};
 
 const QUERY_BUDGET: Duration = Duration::from_secs(15);
 const REFRESH_BUDGET: Duration = Duration::from_secs(12);
 const CLOSE_BUDGET: Duration = Duration::from_secs(3);
 
 #[derive(Deserialize)]
-struct ContributorCache {
+struct ProviderCache {
     schema_version: u32,
     provider_id: String,
     profile_id: String,
@@ -52,7 +56,7 @@ pub(super) fn include_cached_contributors(catalogue: &mut NativeModelListResult,
     if catalogue.provider_id != "meta" || catalogue.profile_id.as_deref() != Some("tbh") {
         return;
     }
-    let Some(cache) = read_contributor_cache(home) else {
+    let Some(cache) = read_provider_cache(home, "meta", "tbh") else {
         return;
     };
     for row in cache.rows {
@@ -83,13 +87,25 @@ pub(super) fn include_cached_contributors(catalogue: &mut NativeModelListResult,
     }
 }
 
-fn read_contributor_cache(home: &Path) -> Option<ContributorCache> {
+fn read_provider_cache(home: &Path, provider: &str, profile: &str) -> Option<ProviderCache> {
     const MAX_CACHE_BYTES: u64 = 1024 * 1024;
-    if !home.is_absolute() {
+    if !home.is_absolute() || provider.len() > 64 || profile.len() > 64 {
         return None;
     }
-    // The cache encodes provider "meta" and profile "tbh" as hex.
-    let path = home.join("model-catalog").join("6d657461__p746268.json");
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let hex = |id: &str| -> String {
+        id.bytes()
+            .flat_map(|byte| {
+                [
+                    char::from(HEX[usize::from(byte >> 4)]),
+                    char::from(HEX[usize::from(byte & 15)]),
+                ]
+            })
+            .collect()
+    };
+    let path =
+        home.join("model-catalog")
+            .join(format!("{}__p{}.json", hex(provider), hex(profile)));
     let info = path.metadata().ok()?;
     if !info.is_file() || info.len() > MAX_CACHE_BYTES {
         return None;
@@ -103,10 +119,10 @@ fn read_contributor_cache(home: &Path) -> Option<ContributorCache> {
     if bytes.len() as u64 > MAX_CACHE_BYTES {
         return None;
     }
-    let cache: ContributorCache = serde_json::from_slice(&bytes).ok()?;
+    let cache: ProviderCache = serde_json::from_slice(&bytes).ok()?;
     (cache.schema_version == 3
-        && cache.provider_id == "meta"
-        && cache.profile_id == "tbh"
+        && cache.provider_id == provider
+        && cache.profile_id == profile
         && cache.source == "provider_catalog")
         .then_some(cache)
 }
@@ -115,6 +131,7 @@ pub(super) struct CatalogueHost {
     pub(super) native: NativeProcess,
     pub(super) identity: NativeInitializeResult,
     pub(super) catalogue: NativeModelListResult,
+    refreshed_start_catalogue: bool,
     refresh_error: Option<Error>,
 }
 
@@ -142,6 +159,99 @@ impl CatalogueHost {
         Ok(host)
     }
 
+    /// The serve host snapshots its catalogue at birth. Refresh the same
+    /// provider cache without replacing that host or selecting its model.
+    pub(super) async fn refresh_start_default(
+        &mut self,
+        launch: &NativeLaunch,
+        initialized: &Initialized,
+        params: &AgentStartParams,
+        peer: &PeerClient,
+        refresh_pid: &mut Option<u32>,
+    ) -> Result<()> {
+        let deadline = Instant::now() + REFRESH_BUDGET;
+        // The daemon owns the generation Job, including this catalogue child.
+        let mut child = refresh_command(launch, Path::new(&initialized.instance_dir))
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(false)
+            .spawn()
+            .map_err(|_| Error::new("native_spawn", "Muse catalogue refresh could not start"))?;
+        *refresh_pid = child.id();
+        register_native_process(
+            peer,
+            &initialized.credential,
+            &params.agent_id,
+            params.generation,
+            *refresh_pid,
+            "Muse",
+            "catalogue refresh",
+            "session",
+            REFRESH_BUDGET,
+        )
+        .await?;
+        let status = timeout_at(deadline, child.wait())
+            .await
+            .map_err(|_| {
+                Error::new(
+                    "unknown",
+                    "Muse catalogue refresh did not exit by its deadline",
+                )
+            })?
+            .map_err(|_| Error::new("unknown", "Muse catalogue refresh exit could not be read"))?;
+        if !status.success() {
+            return Err(Error::new(
+                "native_readback",
+                "Muse catalogue refresh failed",
+            ));
+        }
+        let provider = &self.catalogue.provider_id;
+        let profile = self.catalogue.profile_id.as_deref().ok_or_else(|| {
+            Error::new(
+                "native_readback",
+                "Muse catalogue omitted its provider profile",
+            )
+        })?;
+        let cache = read_provider_cache(Path::new(&self.identity.muse_home), provider, profile)
+            .ok_or_else(|| {
+                Error::new(
+                    "native_readback",
+                    "Muse refreshed catalogue scope was not proved",
+                )
+            })?;
+        self.refreshed_start_catalogue = cache.rows.iter().any(|row| {
+            row.provider_id == *provider
+                && row.profile_id == profile
+                && row.visibility == "visible"
+                && valid_model_id(&row.model_id)
+        });
+        Ok(())
+    }
+
+    pub(super) fn has_default_catalogue(&self) -> bool {
+        !self.catalogue.models.is_empty() || self.refreshed_start_catalogue
+    }
+
+    pub(super) async fn from_started_native(
+        native: NativeProcess,
+        observe_models: bool,
+    ) -> Result<Self> {
+        let (identity, catalogue) = read_snapshot(
+            &native.client(),
+            Instant::now() + QUERY_BUDGET,
+            observe_models,
+        )
+        .await?;
+        Ok(Self {
+            native,
+            identity,
+            catalogue,
+            refreshed_start_catalogue: false,
+            refresh_error: None,
+        })
+    }
+
     async fn read(
         launch: &NativeLaunch,
         policy: &SecretPolicy,
@@ -159,6 +269,7 @@ impl CatalogueHost {
                 native,
                 identity,
                 catalogue,
+                refreshed_start_catalogue: false,
                 refresh_error: None,
             }),
             Err(error) => {
@@ -264,22 +375,26 @@ async fn read_snapshot(
     Ok((identity, models))
 }
 
-async fn refresh(launch: &NativeLaunch, instance_dir: &Path, policy: &SecretPolicy) -> Result<()> {
+#[expect(
+    clippy::disallowed_types,
+    reason = "This builds the fixed read-only Muse catalogue command."
+)]
+fn refresh_command(launch: &NativeLaunch, instance_dir: &Path) -> Command {
     #[expect(
         clippy::disallowed_methods,
         reason = "This statement constructs an owned Muse catalogue process."
-    )]
-    #[expect(
-        clippy::disallowed_types,
-        reason = "This command runs Muse's read-only model listing."
     )]
     let mut command = Command::new(&launch.program);
     command
         .args(["exec", "--list-models"])
         .current_dir(instance_dir)
         .envs(launch.environment.iter().map(|(name, value)| (name, value)));
+    command
+}
+
+async fn refresh(launch: &NativeLaunch, instance_dir: &Path, policy: &SecretPolicy) -> Result<()> {
     run_bounded_with_stderr(
-        command,
+        refresh_command(launch, instance_dir),
         64 * 1024,
         Instant::now() + REFRESH_BUDGET,
         &BoundedReadLabels {

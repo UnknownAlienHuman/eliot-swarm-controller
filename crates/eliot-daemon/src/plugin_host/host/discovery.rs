@@ -1312,11 +1312,16 @@ fn require_reader_cleanup<T>(
 /// a current provider route. The adapter rechecks the retained scope against
 /// the resolved directories before it opens any history file.
 fn history_environment(profile: &Value) -> Value {
-    let native = HarnessCapabilities::of(profile["harness"].as_str().unwrap_or_default())
-        .profile
-        .environment;
+    let capabilities = HarnessCapabilities::of(profile["harness"].as_str().unwrap_or_default());
+    let native = capabilities.profile.environment;
     let names = ["HOME", "USERPROFILE"]
         .into_iter()
+        .chain(
+            capabilities
+                .frozen_store_environment
+                .into_iter()
+                .flat_map(|store| store.selectors.iter().copied()),
+        )
         .chain(native.store_paths.iter().copied())
         .chain(native.legacy_captured_paths.iter().copied())
         .chain(native.credential_directory);

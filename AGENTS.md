@@ -4,7 +4,9 @@ Build the next useful path in [roadmap](docs/roadmap.md), not the entire final d
 Read [vision](docs/vision.md) and [architecture](docs/architecture.md) once, then only
 that task's owning spec, touched code and donor entry. Later-layer sections are not
 prerequisites. v1 is archived at `dc6f70aa` on `archive/v1-final`; do not restore its
-runtime or tooling. Select the next unchecked increment in the roadmap.
+runtime or tooling. Select the next unchecked increment in the roadmap. Desktop work
+follows the [native Fluent contract](docs/design/fluent-design-system.md) and roadmap D12;
+the frozen Material direction is outside current work.
 
 ## Work loop
 
@@ -83,8 +85,8 @@ Codex works. Completed history: L1 bootstrapped the command path with a
 temporary fake harness; L2 replaced it with direct Codex/Luna. The current
 product uses the five native adapters (Codex, Claude, OpenCode, Muse,
 Antigravity) with explicit profiles and frozen captured selectors. Do not
-restore the fake path or any synthetic runtime. Automation, mail and
-additional harnesses follow in the order defined by the roadmap.
+restore the fake path or any synthetic runtime. The roadmap owns the remaining work
+and qualification; do not restart completed layers from this historical sequence.
 
 ## Private QA, desktop and live proof
 

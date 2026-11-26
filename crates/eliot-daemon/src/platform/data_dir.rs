@@ -117,6 +117,25 @@ pub(crate) fn repair_managed_dir_acl(path: &Path) -> Result<Vec<ForeignDataDirAc
     }
 }
 
+/// Claim a directory the daemon just created with the protected
+/// managed-directory DACL, without an Owner notice: a normal creation must
+/// log nothing. Only inherited entries can exist on a directory created
+/// seconds ago by our own effect (git passes no security descriptor), and
+/// the daemon-owned parents it inherits from carry no other inheritable
+/// entries, so there is nothing to report. The downstream lifecycle repair
+/// stays as the safety net for anything that changes afterwards.
+pub(crate) fn protect_new_managed_dir(path: &Path) -> Result<()> {
+    #[cfg(windows)]
+    {
+        super::windows::repair_managed_dir_acl(path).map(|_| ())
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = path;
+        Ok(())
+    }
+}
+
 /// Missing managed directories are initialized by their existing creation
 /// path. Existing directories are checked before daemon state is opened.
 pub(crate) fn repair_existing_managed_dir_acl(path: &Path) -> Result<Vec<ForeignDataDirAce>> {

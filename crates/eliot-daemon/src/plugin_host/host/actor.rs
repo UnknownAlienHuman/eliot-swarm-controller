@@ -23,6 +23,7 @@ use crate::monitor::Monitoring;
 use crate::platform::OwnedChild;
 use eliot_core::{Agent, AgentStartParams, AgentState, CommandState, Error, FailureOrigin, Result};
 use eliot_plugin::protocol::{AgentStartBlocker, ArchivedResumeBinding};
+use eliot_plugin::start_classification::{StartFailureFact, is_proven_no_effect};
 use eliot_plugin::{StderrCapture, StderrView};
 use eliot_store::AgentLossEvidence;
 use futures_util::{StreamExt, stream::FuturesUnordered};
@@ -428,7 +429,52 @@ async fn run_agent_startup(
         ],
     );
     match start {
-        Ok(value) if validate_start_result(&value, &actor.agent, &actor.start_command).is_ok() => {
+        Ok(mut value)
+            if validate_start_result(&value, &actor.agent, &actor.start_command).is_ok() =>
+        {
+            if value["state"] == "start_failure" {
+                let evidence = decode_start_failure(actor, &value);
+                let custody_error = match &evidence {
+                    Ok(fact) => record_start_failure_custody(actor, fact).await.err(),
+                    Err(_) => None,
+                };
+                let no_effect = evidence
+                    .as_ref()
+                    .is_ok_and(|fact| is_proven_no_effect(fact.point));
+                if let Some(state) = actor.state.upgrade() {
+                    fence_command_routing(&state, &actor.key);
+                }
+                let exit_proved = cleanup_startup(
+                    actor,
+                    child
+                        .take()
+                        .expect("actor owns the starting child until cleanup"),
+                    event_task,
+                    stderr_capture,
+                    pending_failure,
+                    no_effect,
+                    None,
+                )
+                .await;
+                let response = evidence.map(|_| {
+                    value["state"] = json!(if no_effect && exit_proved {
+                        "failed"
+                    } else {
+                        "unknown"
+                    });
+                    if let Some(error) = custody_error {
+                        value["cause"] = json!("startup_native_custody_unrecorded");
+                        value["custody_error"] = json!(error.code);
+                    } else if !exit_proved {
+                        value["cause"] = json!("startup_custody_exit_unconfirmed");
+                    } else if !no_effect {
+                        value["cause"] = json!("native_start_effect_unknown");
+                    }
+                    value
+                });
+                let _ = started.send(response);
+                return false;
+            }
             if is_failed_start_result(&value) {
                 // The plugin proved the generation did not become ready.
                 // Retire and drain this exact
@@ -488,6 +534,83 @@ async fn run_agent_startup(
         }
     }
     true
+}
+
+fn decode_start_failure(actor: &AgentActorConfig, value: &Value) -> Result<StartFailureFact> {
+    let invalid = || Error::new("unknown", "invalid native start failure evidence");
+    let fact: StartFailureFact =
+        serde_json::from_value(value["start_failure"].clone()).map_err(|_| invalid())?;
+    if fact.phase.is_empty()
+        || fact.phase.len() > 64
+        || !fact
+            .phase
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte == b'_')
+        || fact.native_pid == Some(0)
+    {
+        return Err(invalid());
+    }
+    if let Some(subject) = &fact.native_subject {
+        let policy = eliot_core::SecretPolicy::new(actor.source_credentials.iter());
+        let valid_identity = |value: &str| {
+            !value.is_empty()
+                && value.len() <= 1024
+                && value.trim() == value
+                && !value.chars().any(char::is_control)
+                && !policy.contains_native_secret(value)
+        };
+        if is_proven_no_effect(fact.point)
+            || !valid_identity(&subject.native_scope)
+            || !valid_identity(&subject.native_ref)
+        {
+            return Err(invalid());
+        }
+    }
+    Ok(fact)
+}
+
+async fn record_start_failure_custody(
+    actor: &AgentActorConfig,
+    fact: &StartFailureFact,
+) -> Result<()> {
+    let Some(subject) = &fact.native_subject else {
+        return Ok(());
+    };
+    let state = actor.state.upgrade().ok_or_else(|| {
+        Error::new(
+            "unavailable",
+            "daemon stopped before retaining startup custody",
+        )
+    })?;
+    let artifact = crate::router::cleanup::native_session_custody(
+        &actor.agent,
+        &subject.native_scope,
+        &subject.native_ref,
+    );
+    let result = state
+        .store
+        .lock()
+        .await
+        .record_startup_native_session(&actor.start_command.id, artifact);
+    if let Err(error) = &result {
+        // The command outcome remains the primary readback. Keep the exact
+        // binding in the existing daemon log if the Store writer also fails.
+        let generation = actor.agent.generation.to_string();
+        crate::logging::record(
+            &eliot_core::SecretPolicy::new(actor.source_credentials.iter()),
+            "agent.start_custody_failed",
+            &[
+                ("agent_id", &actor.agent.id),
+                ("generation", &generation),
+                ("command_id", &actor.start_command.id),
+                ("native_scope", &subject.native_scope),
+                ("native_ref", &subject.native_ref),
+                ("error_code", &error.code),
+            ],
+            None,
+        );
+    }
+    result
 }
 
 /// The actor owns one recovery decision for this dispatched Resume. Neither

@@ -1,5 +1,6 @@
 //! Archive quiet, unbound Agents without changing their generation or history.
 use super::*;
+use context::{UNDISPATCHED_SWARM_NOTE_SQL, withdraw_swarm_notes_tx};
 
 const PAGE: i64 = 64;
 
@@ -163,7 +164,8 @@ impl Store {
                        OR (a.parent IS NOT NULL AND a.state IN ('idle','stopped')
                            AND a.origin='eliot' AND {RESULT_READ}))))
                    AND NOT EXISTS (SELECT 1 FROM commands c WHERE c.target=a.id
-                                    AND c.state IN ('accepted','queued','dispatched','unknown'))
+                                    AND c.state IN ('accepted','queued','dispatched','unknown')
+                                    AND NOT {UNDISPATCHED_SWARM_NOTE_SQL})
                    AND NOT EXISTS (SELECT 1 FROM turns t WHERE t.agent=a.id AND t.state IN ('running','unknown'))
                    AND NOT EXISTS (SELECT 1 FROM pending_requests p WHERE p.agent=a.id AND p.state='pending')
                    AND NOT EXISTS (SELECT 1 FROM goals g WHERE g.agent=a.id
@@ -226,6 +228,7 @@ impl Store {
             };
             let mut events = Vec::with_capacity(rows.len());
             for (id, generation, reason) in rows {
+                withdraw_swarm_notes_tx(&tx, id, "agent_archived", now, Some(&mut events))?;
                 db!(tx.execute("UPDATE agents SET archived=1 WHERE id=?1", [id]));
                 events.push(insert_daemon_event(
                     &tx,

@@ -444,6 +444,8 @@ fn encode_record(
                 | "command_id"
                 | "context_id"
                 | "turn_id"
+                | "native_scope"
+                | "native_ref"
                 | "request_id"
                 | "restore_id"
                 | "source"
@@ -470,9 +472,14 @@ fn encode_record(
                 | "attempt"
                 | "retry_after_ms"
         ) {
+            let limit = if matches!(key, "native_scope" | "native_ref") {
+                1024
+            } else {
+                256
+            };
             context.insert(
                 key.to_owned(),
-                Value::String(bounded_text(policy, text, 256)),
+                Value::String(bounded_text(policy, text, limit)),
             );
         }
     }

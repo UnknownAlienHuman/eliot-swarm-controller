@@ -1949,12 +1949,28 @@ impl PluginHost {
         }
         #[cfg(not(unix))]
         {
-            std::fs::create_dir_all(&parent).map_err(|error| {
-                Error::new(
-                    "platform_io",
-                    format!("create plugin instance root: {error}"),
-                )
-            })?;
+            // A new daemon-owned parent starts protected so children inherit
+            // only safe entries. An existing parent stays the timer's repair
+            // job; the canonical checks below still own admission.
+            match std::fs::symlink_metadata(&parent) {
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    crate::platform::windows::create_private_directory(&parent).map_err(
+                        |error| {
+                            Error::new(
+                                "platform_io",
+                                format!("create plugin instance root: {error}"),
+                            )
+                        },
+                    )?;
+                }
+                Err(error) => {
+                    return Err(Error::new(
+                        "platform_io",
+                        format!("inspect plugin instance root: {error}"),
+                    ));
+                }
+            }
             self.plugin_instance_root()?;
         }
         let instance_dir = parent.join(format!("{}-g{}-{}", key.id, key.generation, Ulid::new()));
@@ -1973,12 +1989,22 @@ impl PluginHost {
         }
         #[cfg(not(unix))]
         {
-            std::fs::create_dir(&instance_dir).map_err(|error| {
-                Error::new(
+            // Create with the explicit protected DACL so the lifecycle repair
+            // below finds nothing to remove and logs nothing. A raced
+            // existing directory is never adopted.
+            if !crate::platform::windows::create_private_directory(&instance_dir).map_err(
+                |error| {
+                    Error::new(
+                        "platform_io",
+                        format!("create plugin instance directory: {error}"),
+                    )
+                },
+            )? {
+                return Err(Error::new(
                     "platform_io",
-                    format!("create plugin instance directory: {error}"),
-                )
-            })?;
+                    "plugin instance directory already exists",
+                ));
+            }
         }
         if let Err(error) = restrict(&instance_dir) {
             remove_empty_instance_dir(&instance_dir);
@@ -2593,7 +2619,7 @@ async fn cleanup_startup(
     pending_failure: &mut Option<PendingFailure>,
     proven_no_dispatch: bool,
     origin: Option<eliot_core::FailureOrigin>,
-) {
+) -> bool {
     let (exited, exit) = terminate_child_with_exit(child, &actor.monitoring, &actor.agent).await;
     // `settle_owned_source_exit` returns Ok only after positive custody exit,
     // completed reader drain, and the committed exit gap (see
@@ -2611,7 +2637,8 @@ async fn cleanup_startup(
         "plugin_startup_exit",
     )
     .await;
-    if settled.is_ok() && !proven_no_dispatch {
+    let exit_proved = settled.is_ok();
+    if exit_proved && !proven_no_dispatch {
         // The stderr reader is independent of the source reader. Join it
         // before inspecting the final bytes of a plugin that panicked.
         let capture = stderr_capture
@@ -2650,6 +2677,7 @@ async fn cleanup_startup(
         });
     }
     cleanup_actor(&actor.state, &actor.key, &actor.plugin_credential);
+    exit_proved
 }
 
 /// Retire one validated failed-start plugin without entering the live actor
@@ -3416,7 +3444,7 @@ fn validate_start_result(value: &Value, agent: &Agent, command: &Command) -> Res
             }
             _ => false,
         };
-    if matches!(state, Some("ready") | Some("failed"))
+    if matches!(state, Some("ready" | "failed" | "start_failure"))
         && failed_subject_valid
         && value.get("agent_id").and_then(Value::as_str) == Some(agent.id.as_str())
         && value.get("generation").and_then(Value::as_i64) == Some(agent.generation)

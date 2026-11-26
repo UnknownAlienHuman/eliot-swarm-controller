@@ -1003,6 +1003,12 @@ fn update_health_decision_name(restart_id: &str) -> Result<String> {
     Ok(format!("update-health-{id}.json"))
 }
 
+/// One health decision file per `daemon update`; only the newest few are
+/// retained so repeated updates cannot pile evidence on the data root.
+const UPDATE_HEALTH_RETAINED: usize = 3;
+const UPDATE_HEALTH_PREFIX: &str = "update-health-";
+const UPDATE_HEALTH_SUFFIX: &str = ".json";
+
 /// Persist one update decision independently of the replaceable Store.
 pub fn record_update_health_decision(
     path: &Path,
@@ -1020,7 +1026,41 @@ pub fn record_update_health_decision(
             "update health decision exceeds its read limit",
         ));
     }
-    crate::platform::data_dir::replace_file_atomically(dir.path(), &name, &bytes, true)
+    crate::platform::data_dir::replace_file_atomically(dir.path(), &name, &bytes, true)?;
+    prune_update_health_decisions(&dir);
+    Ok(())
+}
+
+/// Drop older health decisions beyond the retained newest few. Canonical ULID
+/// names sort in creation order. Best effort: the new decision is already
+/// recorded, so a stale file that cannot be removed must not fail the update.
+fn prune_update_health_decisions(dir: &DataDir) {
+    let Ok(entries) = fs::read_dir(dir.path()) else {
+        return;
+    };
+    let mut decisions: Vec<String> = Vec::new();
+    for entry in entries.flatten() {
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        let Some(rest) = name
+            .strip_prefix(UPDATE_HEALTH_PREFIX)
+            .and_then(|rest| rest.strip_suffix(UPDATE_HEALTH_SUFFIX))
+        else {
+            continue;
+        };
+        if rest
+            .parse::<ulid::Ulid>()
+            .is_ok_and(|id| id.to_string() == rest)
+        {
+            decisions.push(name);
+        }
+    }
+    decisions.sort();
+    while decisions.len() > UPDATE_HEALTH_RETAINED {
+        let oldest = decisions.remove(0);
+        let _ = fs::remove_file(dir.path().join(&oldest));
+    }
 }
 
 pub fn read_update_health_decision(path: &Path, restart_id: &str) -> Result<serde_json::Value> {
