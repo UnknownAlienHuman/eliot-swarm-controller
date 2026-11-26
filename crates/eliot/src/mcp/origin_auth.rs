@@ -380,12 +380,14 @@ impl OriginAuth {
         // One config snapshot per verification: a newly added grant is
         // accepted and a revoked grant is rejected before the next request
         // without a restart, with no values paired across separate reads.
-        // Any load failure fails closed, as does a team or owner-audience
-        // change, which still needs a restart. No token or secret is logged
-        // or persisted here.
+        // A snapshot load failure still fails closed but reports 503: the
+        // local config is unavailable (retryable), not an expired grant.
+        // Token, issuer, and audience mismatches stay 401, as does a team
+        // or owner-audience change, which still needs a restart. No token
+        // or secret is logged or persisted here.
         let (issuer, owner_audience, audiences) =
             eliot_daemon::load_cloud_access_snapshot(&self.data_dir)
-                .map_err(|_| StatusCode::UNAUTHORIZED)?;
+                .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
         if issuer != self.issuer || owner_audience != self.owner_audience {
             return Err(StatusCode::UNAUTHORIZED);
         }
