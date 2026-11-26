@@ -1,4 +1,5 @@
 use super::*;
+use eliot_core::api::harness::{HarnessCapabilities, LegacyPreWriteRefusal};
 use eliot_core::{AgentState, Event, WorkspaceRemovalOutcome};
 use serde::Serialize;
 
@@ -19,6 +20,10 @@ enum CommandEvidence<'a> {
     ResumeSessionReady { seq: i64 },
     SendTurnStarted { seq: i64 },
     NativeControlRefusedBeforeWrite,
+    AntigravitySendStreamRefusal,
+    CodexSendSourceRefusal,
+    ClaudeSteerContextRefusal,
+    ForceStopMissingCustody,
     OwnedExitAndReaderDrain,
     RemovalNeverDispatched,
     RemovalAbsenceVerified,
@@ -44,6 +49,18 @@ impl CommandEvidence<'_> {
             }
             Self::NativeControlRefusedBeforeWrite => {
                 "The adapter refused the exact turn control before a native write."
+            }
+            Self::AntigravitySendStreamRefusal => {
+                "The Antigravity stream gate refused this Send before writing the native prompt."
+            }
+            Self::CodexSendSourceRefusal => {
+                "The Codex event-source gate refused this Send before starting a native turn."
+            }
+            Self::ClaudeSteerContextRefusal => {
+                "The daemon failed to render this Claude Steer before handing it to the adapter."
+            }
+            Self::ForceStopMissingCustody => {
+                "The force-stop custody guard refused this Stop before opening a Windows Job."
             }
             Self::OwnedExitAndReaderDrain => {
                 "Owned processes exited and the native reader drained for the exact Stop generation."
@@ -77,6 +94,7 @@ impl Store {
                     let mut stmt = tx.prepare(
                     "SELECT id FROM commands WHERE state='unknown' AND method='command.submit'
                         AND (verb IN ('resume','stop','attention.emit','inject','send')
+                            OR (verb='steer' AND json_extract(outcome,'$.code')='source_integrity')
                             OR (verb IN ('interrupt','steer')
                                 AND json_extract(outcome,'$.code')='stale_turn'))
                         AND id > COALESCE(?1,'') ORDER BY id LIMIT ?2",
@@ -192,27 +210,24 @@ fn reconcile_command_tx(
     if generation > agent.generation {
         return Ok(());
     }
-    if command
-        .turn_id
-        .as_ref()
-        .is_some_and(|turn| !turn.is_empty())
-        && outcome["code"] == "stale_turn"
-        && outcome["where"] == "plugin.command.unknown"
-        && outcome["cause"] == "plugin_outcome_unknown"
-        && outcome["message"].as_str().is_some_and(|message| {
-            eliot_core::api::HarnessCapabilities::of(&agent.harness)
-                .legacy_stale_turn_refusals
-                .contains(&(command.kind(), message))
-        })
-    {
+    if let Some(evidence) = retained_pre_write_refusal(record, &agent.harness, outcome) {
         events.push(settle_evidence_tx(
             tx,
             record,
             CommandState::Rejected,
             outcome.clone(),
-            &CommandEvidence::NativeControlRefusedBeforeWrite,
+            &evidence,
             now,
         )?);
+        if command.verb == "send" {
+            super::super::context::settle_send_claims_tx(
+                tx,
+                record,
+                CommandState::Rejected,
+                now,
+                events,
+            )?;
+        }
         return Ok(());
     }
     if command.verb == "resume"
@@ -284,6 +299,70 @@ fn reconcile_command_tx(
         )?);
     }
     Ok(())
+}
+
+fn retained_pre_write_refusal(
+    record: &CommandRecord,
+    harness: &str,
+    outcome: &Value,
+) -> Option<CommandEvidence<'static>> {
+    if outcome["cause"] != "plugin_outcome_unknown" {
+        return None;
+    }
+    let location = outcome["where"].as_str()?;
+    let code = outcome["code"].as_str()?;
+    let message = outcome["message"].as_str()?;
+    let command = &record.command;
+    let diagnostic = (command.verb.as_str(), location, code);
+    let bound_turn = command
+        .turn_id
+        .as_ref()
+        .is_some_and(|turn| !turn.is_empty());
+    if diagnostic == ("stop", "plugin.command", "unknown")
+        && command.args["force"] == true
+        && message == "generation custody namespace was not recorded"
+    {
+        return Some(CommandEvidence::ForceStopMissingCustody);
+    }
+    HarnessCapabilities::of(harness)
+        .legacy_pre_write_refusals
+        .iter()
+        .find_map(|refusal| match refusal {
+            LegacyPreWriteRefusal::StaleTurn(verb, refusal_message)
+                if diagnostic == (verb.as_str(), "plugin.command.unknown", "stale_turn")
+                    && bound_turn
+                    && message == *refusal_message =>
+            {
+                Some(CommandEvidence::NativeControlRefusedBeforeWrite)
+            }
+            LegacyPreWriteRefusal::SendStreamUnresolved(refusal_message)
+                if diagnostic == ("send", "plugin.command.unknown", "unknown")
+                    && command.turn_id.is_none()
+                    && message == *refusal_message =>
+            {
+                Some(CommandEvidence::AntigravitySendStreamRefusal)
+            }
+            LegacyPreWriteRefusal::SendSourceGate {
+                location: gate,
+                origin_evidence,
+            } if diagnostic == ("send", *gate, "unknown")
+                && command.turn_id.is_none()
+                && outcome["origin"] == "swarm"
+                && outcome["origin_evidence"] == *origin_evidence =>
+            {
+                Some(CommandEvidence::CodexSendSourceRefusal)
+            }
+            LegacyPreWriteRefusal::SteerContextRendering
+                if diagnostic == ("steer", "plugin.command", "source_integrity")
+                    && bound_turn
+                    && record.expected_turn_id == command.turn_id
+                    && message == "persisted inject args are malformed"
+                    && super::super::context::decode_inject_args(&command.args).is_err() =>
+            {
+                Some(CommandEvidence::ClaudeSteerContextRefusal)
+            }
+            _ => None,
+        })
 }
 
 fn archived_resume_refusal(outcome: &Value, native_ref: &str) -> bool {

@@ -3,9 +3,10 @@
 use crate::CLAUDE_EFFORT_LEVELS;
 use eliot_core::McpPolicy;
 use eliot_core::api::harness::{
-    AdhocEffort, AdhocLaunchDefaults, DocumentedModelCatalog, ModelReaderOptions,
-    NativeAccessBounds, NativeAuthCapability, NativeAuthCheck, NativeAuthCommand,
-    NativeAuthInvocation, NativeAuthState, NativeQuotaReadback, NativeRoute, ProfileCapabilities,
+    AdhocEffort, AdhocLaunchDefaults, DocumentedModelCatalog, LegacyPreWriteRefusal,
+    ModelReaderOptions, NativeAccessBounds, NativeAuthCapability, NativeAuthCheck,
+    NativeAuthCommand, NativeAuthInvocation, NativeAuthState, NativeQuotaReadback, NativeRoute,
+    ProfileCapabilities,
 };
 use eliot_core::api::native_profile::NativeSubagentsPolicy;
 use eliot_core::api::{ConfigureSessionMode, HarnessCapabilities, InputTokenAccounting};
@@ -14,6 +15,7 @@ use serde_json::Value;
 
 pub fn declaration() -> HarnessCapabilities {
     HarnessCapabilities {
+        legacy_pre_write_refusals: &[LegacyPreWriteRefusal::SteerContextRendering],
         skill_wrapper: Some(eliot_core::api::harness::NativeSkillWrapper {
             directory: ".claude-plugin",
             filename: "plugin.json",

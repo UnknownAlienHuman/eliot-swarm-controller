@@ -1,8 +1,8 @@
 //! Antigravity native adapter capability declaration.
 
 use eliot_core::api::harness::{
-    AdhocLaunchDefaults, AdhocModel, AdhocPermissions, NativeAccessBounds, NativeQuotaReadback,
-    NativeRoute, ProfileCapabilities,
+    AdhocLaunchDefaults, AdhocModel, AdhocPermissions, LegacyPreWriteRefusal, NativeAccessBounds,
+    NativeQuotaReadback, NativeRoute, ProfileCapabilities,
 };
 use eliot_core::api::native_profile::NativeSubagentsPolicy;
 use eliot_core::api::{ConfigureSessionMode, HarnessCapabilities, OwnerRulesDeliveryMethod};
@@ -16,9 +16,10 @@ pub(crate) const STEER_TURN_REFUSAL: &str =
 
 pub fn declaration() -> HarnessCapabilities {
     HarnessCapabilities {
-        legacy_stale_turn_refusals: &[
-            (CommandVerb::Interrupt, CANCEL_TURN_REFUSAL),
-            (CommandVerb::Steer, STEER_TURN_REFUSAL),
+        legacy_pre_write_refusals: &[
+            LegacyPreWriteRefusal::StaleTurn(CommandVerb::Interrupt, CANCEL_TURN_REFUSAL),
+            LegacyPreWriteRefusal::StaleTurn(CommandVerb::Steer, STEER_TURN_REFUSAL),
+            LegacyPreWriteRefusal::SendStreamUnresolved("Antigravity stream is unresolved"),
         ],
         oversized_frame_prefixes: &[
             "Antigravity stream ended on an oversized frame (frame_oversized ",

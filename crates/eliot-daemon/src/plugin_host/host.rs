@@ -2201,7 +2201,10 @@ impl PluginHost {
             let namespace = store
                 .generation_custody_namespace(&agent.id, agent.generation)?
                 .ok_or_else(|| {
-                    Error::new("unknown", "generation custody namespace was not recorded")
+                    Error::new(
+                        "native_not_dispatched",
+                        "generation custody namespace was not recorded",
+                    )
                 })?;
             if namespace != store.custody_namespace()? {
                 return Err(Error::new(

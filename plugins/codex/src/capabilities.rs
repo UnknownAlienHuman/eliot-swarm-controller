@@ -1,9 +1,10 @@
 //! Codex native adapter capability declaration.
 
 use eliot_core::api::harness::{
-    AdhocEffort, LaunchDefaultPolicy, NativeAccessBounds, NativeAuthCapability, NativeAuthCheck,
-    NativeAuthCommand, NativeAuthInvocation, NativeAuthState, NativeQuotaReadback, NativeRoute,
-    ProfileCapabilities, QuotaResetUnit, QuotaWindowProjection, QuotaWindowSlot,
+    AdhocEffort, LaunchDefaultPolicy, LegacyPreWriteRefusal, NativeAccessBounds,
+    NativeAuthCapability, NativeAuthCheck, NativeAuthCommand, NativeAuthInvocation,
+    NativeAuthState, NativeQuotaReadback, NativeRoute, ProfileCapabilities, QuotaResetUnit,
+    QuotaWindowProjection, QuotaWindowSlot,
 };
 use eliot_core::api::native_profile::NativeSubagentsPolicy;
 use eliot_core::api::{HarnessCapabilities, InputTokenAccounting};
@@ -14,6 +15,8 @@ use serde_json::Value;
 const ROUTE_ACCOUNT_KEY: &str = "account";
 const ROUTE_BINDING_KEY: &str = "route_binding";
 const CODEX_LOGIN_ENV: &str = "CODEX_HOME";
+pub(crate) const SEND_SOURCE_GATE_LOCATION: &str = "plugin.codex.command.send";
+pub(crate) const SEND_SOURCE_GATE_EVIDENCE: &str = "send gate refused on event-source failure";
 const ROUTE_KIND_RESPONSES: &str = "codex_responses";
 const ROUTE_KIND_CHATGPT: &str = "codex_chatgpt";
 const CODEX_PROXY_SELECTOR_ENV_NAMES: &[&str] = &["CODEX_HOME", "CODEX_SQLITE_HOME"];
@@ -83,6 +86,10 @@ pub(super) fn is_route_selector_env_name(name: &str) -> bool {
 
 pub fn declaration() -> HarnessCapabilities {
     HarnessCapabilities {
+        legacy_pre_write_refusals: &[LegacyPreWriteRefusal::SendSourceGate {
+            location: SEND_SOURCE_GATE_LOCATION,
+            origin_evidence: SEND_SOURCE_GATE_EVIDENCE,
+        }],
         catalogue_provider: eliot_core::api::harness::CatalogueProvider::Fixed("openai"),
         instruction_inventory: crate::instructions::INSTRUCTION_INVENTORY,
         model_login_source: Some(eliot_core::api::harness::ModelLoginSource::Files {

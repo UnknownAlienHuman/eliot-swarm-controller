@@ -761,7 +761,11 @@ fn project_unknown_commands(
                     true,
                 )),
                 "send" => Some((
-                    "Check the original native session for an input or turn receipt tied to this command ID.",
+                    "Check the original generation's native session for an input receipt bound to this command. Use failed only with proof of refusal before the input was written. Plugin exit and a terminal for an earlier input leave this Send unknown.",
+                    true,
+                )),
+                "steer" => Some((
+                    "Check the exact turn for a native delivery or hook receipt bound to this Steer. Use failed only with proof the steer was refused before delivery or the hook closed without claiming it. A timeout and the turn's terminal leave delivery unknown.",
                     true,
                 )),
                 _ => None,
