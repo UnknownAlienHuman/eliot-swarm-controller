@@ -23,7 +23,7 @@ Skip Swarm when your task needs no child, mail, shared state or shared-file coor
 
 ## Delegate when needed
 
-`child.run` inherits your workspace and profile. Provide `text`. Set `wait_ms` if you need the result before continuing. When `completion_wake` is `pending`, continue your work or end the turn and receive the result by mail. For an explicit readback, use the same operation id. Retry a lost launch reply with the same id and payload. If the result is truncated, use `agent.result` with the exact Agent, generation and turn. Never replay an uncertain effect.
+`child.run` inherits your workspace and profile. Provide `text`. Set `wait_ms` if you need the result before continuing. When `completion_wake` is `pending`, continue your work or end the turn and receive the result by mail. For an explicit readback, use the same operation id. Retry a lost launch reply with the same id and payload. If the result is truncated, use `agent.result` with the exact `id`, `generation` and `turn_id`. Never replay an uncertain effect.
 
 ## Keep work in Git
 
