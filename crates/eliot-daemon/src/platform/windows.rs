@@ -49,6 +49,9 @@ use windows_sys::Win32::Storage::FileSystem::{
     GetDiskFreeSpaceExW, GetFileInformationByHandle, GetFileType, MOVEFILE_REPLACE_EXISTING,
     MOVEFILE_WRITE_THROUGH, MoveFileExW, OPEN_EXISTING, READ_CONTROL, WRITE_DAC,
 };
+use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+    CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
+};
 use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, IsProcessInJob, JOB_OBJECT_LIMIT_ACTIVE_PROCESS,
     JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK,
@@ -949,11 +952,51 @@ fn interactive_session(pid: u32) -> bool {
     }
 }
 
+/// Basename of one pid from a Toolhelp snapshot: no process handle is opened,
+/// so a daemon that cannot open the peer (a WMI-started daemon in session 0
+/// versus a desktop from another process tree) still names it. The guard only
+/// compares the basename, so this carries the same strength. Unknown or
+/// exited pids read as None.
+fn toolhelp_image_file_name(pid: u32) -> Option<String> {
+    // SAFETY: the snapshot handle is closed on every path below; the entry is
+    // caller-owned and sized before the first enumeration call.
+    unsafe {
+        let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if snapshot == INVALID_HANDLE_VALUE {
+            return None;
+        }
+        let mut entry: PROCESSENTRY32W = std::mem::zeroed();
+        entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+        let mut found = None;
+        if Process32FirstW(snapshot, &mut entry) != 0 {
+            loop {
+                if entry.th32ProcessID == pid {
+                    let len = entry
+                        .szExeFile
+                        .iter()
+                        .position(|&unit| unit == 0)
+                        .unwrap_or(entry.szExeFile.len());
+                    found = String::from_utf16(&entry.szExeFile[..len]).ok();
+                    break;
+                }
+                if Process32NextW(snapshot, &mut entry) == 0 {
+                    break;
+                }
+            }
+        }
+        CloseHandle(snapshot);
+        found.filter(|name| !name.is_empty())
+    }
+}
+
 impl LocalPeer {
     pub(crate) fn is_interactive_desktop(&self) -> bool {
         self.image_path()
             .as_deref()
             .and_then(|image| Path::new(image).file_name())
+            .and_then(|name| name.to_str())
+            .map(str::to_owned)
+            .or_else(|| toolhelp_image_file_name(self.pid))
             .is_some_and(|name| name.eq_ignore_ascii_case("swarm-desktop.exe"))
             && interactive_session(self.pid)
     }

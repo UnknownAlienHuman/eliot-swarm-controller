@@ -469,6 +469,8 @@ fn encode_record(
                 | "restart_count"
                 | "attempt"
                 | "retry_after_ms"
+                | "peer_pid"
+                | "suppressed_refusals"
         ) {
             context.insert(
                 key.to_owned(),
