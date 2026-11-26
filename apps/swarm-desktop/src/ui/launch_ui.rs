@@ -231,6 +231,9 @@ pub(super) struct LaunchState {
     /// The folder is one the native picker chose outside the registered
     /// projects ("Other folder…").
     pub(super) custom_workspace: bool,
+    /// A project just registered from "Add project…" (its id) that no
+    /// project list read has listed yet: the new task keeps it meanwhile.
+    pub(super) added_project: Option<String>,
     /// The Owner's Goal fields for the next task, set in the Goal dialog
     /// over the project policy's Goal: sent as the launch's `args.goal`
     /// (only the fields the Owner changed); none takes the policy as it
@@ -791,9 +794,11 @@ impl DesktopApp {
                 } else if checkout == ADD_PROJECT {
                     // Settings › Projects' Browse: the picker, then the
                     // folder registered as a project (Cancel adds nothing).
-                    // The project list read after the save picks it.
+                    // The new task takes that project at once, not the
+                    // folder as an outside one; the project list read
+                    // after the save fills in its profiles.
                     match self.add_project_from_picker(context) {
-                        Ok(Some(folder)) => self.pick_other_folder(folder),
+                        Ok(Some((id, folder))) => self.pick_added_project(id, folder),
                         Ok(None) => {}
                         Err(error) => self.alert(error),
                     }
@@ -2131,9 +2136,23 @@ impl DesktopApp {
         }
         self.launch.workspace = folder;
         self.launch.custom_workspace = true;
+        self.launch.added_project = None;
         self.launch.chat = false;
         self.launch.profiles.clear();
         self.nav.selection.project = None;
+        self.launch.reconcile_choice();
+    }
+
+    /// The project just registered from the picker: the new task's
+    /// project by its id, before the project list read after the save
+    /// lists it (that read then picks it by its checkout).
+    fn pick_added_project(&mut self, id: String, folder: String) {
+        self.launch.workspace = folder;
+        self.launch.custom_workspace = false;
+        self.launch.chat = false;
+        self.launch.profiles.clear();
+        self.launch.added_project = Some(id.clone());
+        self.nav.selection.project = Some(id);
         self.launch.reconcile_choice();
     }
 

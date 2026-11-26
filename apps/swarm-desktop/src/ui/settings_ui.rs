@@ -1936,7 +1936,7 @@ impl DesktopApp {
     pub(super) fn add_project_from_picker(
         &mut self,
         context: &ComponentContext<Self>,
-    ) -> Result<Option<String>, String> {
+    ) -> Result<Option<(String, String)>, String> {
         // The section saves whole: never from a draft that was not read.
         if !self.settings.is_read() {
             return Err(
@@ -1952,9 +1952,9 @@ impl DesktopApp {
         let s = &mut self.settings;
         let id = model::project_id_for_folder(&s.projects, &path);
         model::add_project(&mut s.projects, &id, &path, &profiles)?;
-        s.project_open = Some(id);
+        s.project_open = Some(id.clone());
         self.autosave(Page::Projects, context);
-        Ok(Some(path))
+        Ok(Some((id, path)))
     }
 
     /// Settings › Projects with `id`'s editor open: the one place a
