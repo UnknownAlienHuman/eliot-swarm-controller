@@ -86,7 +86,7 @@ use crate::{
     bus::Bus,
     common::{now_ms, valid_environment_name},
     config::OnRestart,
-    monitor::{Monitoring, ObserveThresholds},
+    monitor::{Monitoring, ObservationFacts, ObserveThresholds},
     scripts::auth::{RunCredentialGuard, RunCredentialRegistry, SavedRunPrincipal},
     workspaces::WorkspaceManager,
 };
@@ -215,6 +215,27 @@ pub(crate) struct Router {
     inner: Arc<RouterInner>,
 }
 
+type FleetObservationFacts = HashMap<String, Arc<ObservationFacts>>;
+
+struct FleetObservationCache {
+    revision: (i64, u64),
+    facts: Arc<FleetObservationFacts>,
+}
+
+struct ObservedFleetPage {
+    rows: Vec<Value>,
+    next: Option<String>,
+    truncated: bool,
+    facts: FleetObservationFacts,
+}
+
+struct EncodedFleetRow {
+    value: Value,
+    bytes: usize,
+    cursor: String,
+    facts: Option<Arc<ObservationFacts>>,
+}
+
 struct RouterInner {
     rpc_latencies: crate::rpc_latency::RpcLatencies,
     update_boot: Mutex<update_health::BootHealth>,
@@ -225,6 +246,7 @@ struct RouterInner {
     autonomy_reader: Arc<tokio::sync::Semaphore>,
     agent_list_readers: Arc<tokio::sync::Semaphore>,
     projection_readers: Arc<eliot_store::ProjectionReaders>,
+    fleet_observations: Mutex<Option<FleetObservationCache>>,
     confirmed_stuck: Mutex<Arc<eliot_store::StuckStates>>,
     integration_cleanup: AsyncMutex<()>,
     bus: Bus,
@@ -634,6 +656,7 @@ impl Router {
                 projection_readers: Arc::new(eliot_store::ProjectionReaders::new(
                     data_root.join("eliot.db"),
                 )),
+                fleet_observations: Mutex::default(),
                 rpc_latencies: Default::default(),
                 update_boot: Default::default(),
                 acl_notices,
@@ -5878,21 +5901,6 @@ impl Router {
         }
     }
 
-    /// Join one observation to its captured summary generation. A resume
-    /// between the summary read and the observation fetch must not attach the
-    /// new generation's observations to the old summary.
-    fn join_observation_for_summary(
-        summary_generation: i64,
-        agent: &Agent,
-        observation: ObservationView,
-    ) -> ObservationView {
-        if agent.generation != summary_generation {
-            ObservationView::unavailable("stale_generation")
-        } else {
-            observation
-        }
-    }
-
     async fn agent_processes(&self, params: &Value, principal: &Principal) -> Result<Value> {
         let request: AgentProcessesRequest =
             eliot_core::api::discovery::decode_params(params.clone())?;
@@ -6288,67 +6296,220 @@ impl Router {
             })
             .map_err(|_| Error::new("internal", "Agent list could not be encoded"));
         }
-        // Observations join one full row per summary for the captured
-        // Agent/generation; a resume between the summary read and this fetch
-        // must not attach the new generation's observations to the old
-        // summary. The byte bound trims the page the same way it trims the
-        // compact rows, and truncation stays explicit so polling managers can
-        // tell a quiet page from a cut one.
-        let mut rows = Vec::new();
-        let mut encoded_bytes = 0_usize;
-        let mut truncated = page.truncated;
-        for summary in page.summaries {
-            let summary_generation = summary.generation;
-            let agent = {
-                let store = self.inner.store.lock().await;
-                store.get_agent(&summary.id)?.ok_or_else(|| {
-                    Error::new("not_found", format!("Agent {} was not found", summary.id))
-                })?
-            };
-            let observation = if agent.generation != summary_generation {
-                // Drop the new generation's observations; the old summary
-                // keeps its generation without inheriting them.
-                ObservationView::unavailable("stale_generation")
-            } else {
-                let fetched = self.observation_view(&agent).await;
-                Self::join_observation_for_summary(summary_generation, &agent, fetched)
-            };
-            let mut observation = observation;
-            display_observation(&mut observation);
-            let row = AgentListRow {
-                summary: display_agent_summary(summary),
-                observation: Some(observation),
-            };
-            let row_bytes = serde_json::to_vec(&row)
-                .map_err(|_| Error::new("internal", "cannot encode Agent observation"))?
-                .len();
-            if encoded_bytes.saturating_add(row_bytes + 1) > EVENT_RESPONSE_ENTRIES_MAX_BYTES {
-                if rows.is_empty() {
-                    return Err(Error::new(
-                        "frame_too_large",
-                        "Agent observation exceeds the page byte limit",
-                    ));
-                }
-                truncated = true;
-                break;
+        let revision = if request.states.is_some() && matches!(principal, Principal::Owner) {
+            self.inner.store.lock().await.projection_revision().ok()
+        } else {
+            None
+        };
+        let cached = self
+            .inner
+            .fleet_observations
+            .lock_recover()
+            .as_ref()
+            .filter(|cache| Some(cache.revision) == revision)
+            .map(|cache| Arc::clone(&cache.facts))
+            .unwrap_or_default();
+        let reused = !cached.is_empty();
+        let mut observed = self
+            .agent_list_observations(
+                page.summaries.clone(),
+                request.order,
+                page.truncated,
+                cached,
+            )
+            .await?;
+        if let Some(revision) = revision {
+            let current = self.inner.store.lock().await.projection_revision().ok();
+            if current == Some(revision) {
+                *self.inner.fleet_observations.lock_recover() = Some(FleetObservationCache {
+                    revision,
+                    facts: Arc::new(std::mem::take(&mut observed.facts)),
+                });
+            } else if reused {
+                // A write raced a cached page. Fall through to snapshots so
+                // the normal generation checks run against current rows.
+                observed = self
+                    .agent_list_observations(
+                        page.summaries,
+                        request.order,
+                        page.truncated,
+                        Arc::default(),
+                    )
+                    .await?;
             }
-            encoded_bytes += row_bytes + 1;
-            rows.push(row);
         }
-        let next = rows.last().map(|row| match request.order {
+        let mut response = serde_json::to_value(AgentListResponse {
+            state_totals: page.state_totals,
+            agents: Vec::new(),
+            next: observed.next,
+            total: page.total,
+            truncated: observed.truncated,
+        })
+        .map_err(|_| Error::new("internal", "Agent list could not be encoded"))?;
+        response["agents"] = Value::Array(observed.rows);
+        Ok(response)
+    }
+
+    /// Read observations in small ordered batches on the existing bounded
+    /// reader pool. Each batch rechecks the Agent and generation captured by
+    /// the summary page, and the wire byte limit still selects the same prefix.
+    async fn agent_list_observations(
+        &self,
+        summaries: Vec<AgentSummary>,
+        order: eliot_core::api::AgentListOrder,
+        truncated: bool,
+        cached: Arc<FleetObservationFacts>,
+    ) -> Result<ObservedFleetPage> {
+        use futures_util::{StreamExt, stream};
+
+        let mut summaries = summaries.into_iter();
+        let batches = std::iter::from_fn(move || {
+            let batch: Vec<_> = summaries.by_ref().take(8).collect();
+            (!batch.is_empty()).then_some(batch)
+        });
+        let reads = stream::iter(batches)
+            .map(|batch| {
+                let cached = Arc::clone(&cached);
+                async move {
+                    let permit = self
+                        .inner
+                        .agent_list_readers
+                        .clone()
+                        .acquire_owned()
+                        .await
+                        .map_err(|_| Error::new("unavailable", "agent list readers are closed"))?;
+                    let readers = Arc::clone(&self.inner.projection_readers);
+                    let monitoring = self.inner.monitoring.clone();
+                    let mut read = tokio::task::JoinSet::new();
+                    read.spawn_blocking(move || {
+                        let _permit = permit;
+                        let all_cached = batch
+                            .iter()
+                            .all(|summary| fleet_observation(&cached, summary).is_some());
+                        if all_cached {
+                            Ok(Self::render_fleet_batch(
+                                &monitoring,
+                                None,
+                                &cached,
+                                batch,
+                                order,
+                            ))
+                        } else {
+                            readers.read(|store| {
+                                Ok(Self::render_fleet_batch(
+                                    &monitoring,
+                                    Some(store),
+                                    &cached,
+                                    batch,
+                                    order,
+                                ))
+                            })
+                        }
+                    });
+                    read.join_next()
+                        .await
+                        .and_then(std::result::Result::ok)
+                        .ok_or_else(|| Error::new("internal", "agent list reader failed"))?
+                }
+            })
+            .buffered(4);
+        futures_util::pin_mut!(reads);
+        let mut page = ObservedFleetPage {
+            rows: Vec::new(),
+            next: None,
+            truncated,
+            facts: HashMap::new(),
+        };
+        let mut encoded_bytes = 0_usize;
+        'page: while let Some(batch) = reads.next().await {
+            for entry in batch? {
+                let entry = entry?;
+                // Keep at most one bounded page plus its first excluded row.
+                if entry.bytes <= EVENT_RESPONSE_ENTRIES_MAX_BYTES
+                    && let Some(facts) = entry.facts
+                {
+                    page.facts.insert(facts.id.clone(), facts);
+                }
+                if encoded_bytes.saturating_add(entry.bytes + 1) > EVENT_RESPONSE_ENTRIES_MAX_BYTES
+                {
+                    if page.rows.is_empty() {
+                        return Err(Error::new(
+                            "frame_too_large",
+                            "Agent observation exceeds the page byte limit",
+                        ));
+                    }
+                    page.truncated = true;
+                    break 'page;
+                }
+                encoded_bytes += entry.bytes + 1;
+                page.next = Some(entry.cursor);
+                page.rows.push(entry.value);
+            }
+        }
+        Ok(page)
+    }
+
+    fn render_fleet_batch(
+        monitoring: &Monitoring,
+        store: Option<&eliot_store::Store>,
+        cached: &FleetObservationFacts,
+        batch: Vec<AgentSummary>,
+        order: eliot_core::api::AgentListOrder,
+    ) -> Vec<Result<EncodedFleetRow>> {
+        batch
+            .into_iter()
+            .map(|summary| Self::observe_agent_list_row(monitoring, store, cached, summary, order))
+            .collect()
+    }
+
+    fn observe_agent_list_row(
+        monitoring: &Monitoring,
+        store: Option<&eliot_store::Store>,
+        cached: &FleetObservationFacts,
+        summary: AgentSummary,
+        order: eliot_core::api::AgentListOrder,
+    ) -> Result<EncodedFleetRow> {
+        let facts = if let Some(facts) = fleet_observation(cached, &summary) {
+            Ok(Arc::clone(facts))
+        } else {
+            let store =
+                store.ok_or_else(|| Error::new("internal", "missing Agent list snapshot"))?;
+            let agent = store.get_agent(&summary.id)?.ok_or_else(|| {
+                Error::new("not_found", format!("Agent {} was not found", summary.id))
+            })?;
+            if agent.generation != summary.generation {
+                Err(Error::new("stale_generation", "Agent generation changed"))
+            } else {
+                Monitoring::read_observation_facts(store, &agent).map(Arc::new)
+            }
+        };
+        let mut observation = match &facts {
+            Ok(facts) => monitoring.render_observation(facts),
+            Err(error) => ObservationView::unavailable(error.code.clone()),
+        };
+        let retained = facts.ok().filter(|facts| facts.cacheable(&observation));
+        display_observation(&mut observation);
+        let row = AgentListRow {
+            summary: display_agent_summary(summary),
+            observation: Some(observation),
+        };
+        let bytes = serde_json::to_vec(&row)
+            .map_err(|_| Error::new("internal", "cannot encode Agent observation"))?
+            .len();
+        let cursor = match order {
             eliot_core::api::AgentListOrder::Id => row.summary.id.clone(),
             eliot_core::api::AgentListOrder::Recent => {
                 eliot_core::api::encode_recent_cursor(&row.summary.id, row.summary.updated_at)
             }
-        });
-        serde_json::to_value(AgentListResponse {
-            state_totals: page.state_totals,
-            agents: rows,
-            next,
-            total: page.total,
-            truncated,
+        };
+        let value = serde_json::to_value(row)
+            .map_err(|_| Error::new("internal", "Agent list could not be encoded"))?;
+        Ok(EncodedFleetRow {
+            value,
+            bytes,
+            cursor,
+            facts: retained,
         })
-        .map_err(|_| Error::new("internal", "Agent list could not be encoded"))
     }
 
     async fn agent_result(&self, params: &Value, principal: &Principal) -> Result<Value> {
@@ -8699,6 +8860,15 @@ fn workspace_folder_name(workspace: &str) -> Option<String> {
         .file_name()
         .and_then(|name| name.to_str())
         .map(str::to_owned)
+}
+
+fn fleet_observation<'a>(
+    facts: &'a FleetObservationFacts,
+    summary: &AgentSummary,
+) -> Option<&'a Arc<ObservationFacts>> {
+    facts
+        .get(&summary.id)
+        .filter(|facts| facts.generation == summary.generation)
 }
 
 /// Format display paths in an `agent.list` row. Project and scope are exact

@@ -12,9 +12,9 @@ use crate::{
     workspace_git::DiffCheckout,
 };
 use eliot_core::{
-    Agent, Error, FileChangeHint, GitBaseline, GitHintPage, GitSnapshot, ProcessIdentity,
-    ProcessRecord, ProcessSample, ProcessSnapshot, ProcessState, Result, SessionUsage, SourceGap,
-    WorkspacePreparation,
+    Agent, AgentEdit, AgentState, Error, FileChangeHint, GitBaseline, GitHintPage, GitSnapshot,
+    ProcessIdentity, ProcessRecord, ProcessSample, ProcessSnapshot, ProcessState, Result,
+    SessionUsage, SourceGap, WorkspacePhase, WorkspacePreparation,
     api::{
         ChildRunLineCounts, FilesystemInvalidationState, FilesystemInvalidationView,
         GitObservation, GitView, LivenessBasis, LivenessView, MonitoringSourceState,
@@ -23,6 +23,7 @@ use eliot_core::{
     },
 };
 use eliot_plugin::sync::LockExt;
+use eliot_store::Store;
 use serde_json::Value;
 use std::{
     collections::{HashMap, HashSet},
@@ -48,6 +49,45 @@ const GIT_MAX_BACKOFF: Duration = Duration::from_secs(30);
 const WATCH_RETRY: Duration = Duration::from_secs(30);
 
 type Key = (String, i64);
+
+pub(crate) struct ObservationFacts {
+    pub(crate) id: String,
+    pub(crate) generation: i64,
+    state: AgentState,
+    processes: Vec<ProcessRecord>,
+    last_model_progress: Option<i64>,
+    source_healthy: Option<bool>,
+    workspace: Result<Option<WorkspaceFacts>>,
+    git: Result<GitFacts>,
+    cacheable: bool,
+}
+
+impl ObservationFacts {
+    pub(crate) fn cacheable(&self, view: &ObservationView) -> bool {
+        self.cacheable
+            && !matches!(
+                view,
+                ObservationView::Data(data)
+                    if self.git.is_ok() && !matches!(data.git, GitView::Data(_))
+            )
+    }
+}
+
+struct WorkspaceFacts {
+    generation: i64,
+    phase: WorkspacePhase,
+    setup_index: usize,
+    processes: Vec<ProcessRecord>,
+    source: Option<SourceState>,
+}
+
+struct GitFacts {
+    workspace: String,
+    baseline: Option<GitBaseline>,
+    edits: Vec<AgentEdit>,
+    source: Option<MonitoringSourceState>,
+    source_checked: bool,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct WorkspaceProcessContext {
@@ -993,84 +1033,113 @@ impl Monitoring {
     }
 
     pub(crate) async fn view(&self, agent: &Agent) -> Result<ObservationView> {
+        let store = self.inner.store.lock().await;
+        let facts = Self::read_observation_facts(&store, agent)?;
+        drop(store);
+        Ok(self.render_observation(&facts))
+    }
+
+    pub(crate) fn read_observation_facts(store: &Store, agent: &Agent) -> Result<ObservationFacts> {
+        let processes =
+            store.list_processes(&owner(&agent.id, agent.generation), None, PAGE_LIMIT)?;
+        let last_model_progress = store.last_model_progress(&agent.id, agent.generation)?;
+        let sources = store.list_source_states(&agent.id, agent.generation);
+        let workspace = Self::read_workspace_facts(store, agent);
+        let git = Self::read_git_facts(store, agent);
+        let cacheable = sources.is_ok()
+            && workspace.is_ok()
+            && (agent.workspace.is_none() || git.as_ref().is_ok_and(|facts| facts.source_checked));
+        Ok(ObservationFacts {
+            id: agent.id.clone(),
+            generation: agent.generation,
+            state: agent.state,
+            processes,
+            last_model_progress,
+            source_healthy: sources.ok().and_then(native_sources_healthy),
+            workspace,
+            git,
+            cacheable,
+        })
+    }
+
+    pub(crate) fn render_observation(&self, facts: &ObservationFacts) -> ObservationView {
         let cache = self
-            .target(&agent.id, agent.generation)
+            .target(&facts.id, facts.generation)
             .map(|target| target.cache.lock_recover().clone())
             .unwrap_or_default();
         let unavailable = self.inner.unavailable.lock_recover().clone();
-        let (mut processes, last_model_progress, source_healthy) = {
-            let store = self.inner.store.lock().await;
-            let processes =
-                store.list_processes(&owner(&agent.id, agent.generation), None, PAGE_LIMIT)?;
-            let progress = store.last_model_progress(&agent.id, agent.generation)?;
-            let healthy = store
-                .list_source_states(&agent.id, agent.generation)
-                .ok()
-                .and_then(native_sources_healthy);
-            (processes, progress, healthy)
-        };
+        let mut processes = facts.processes.clone();
         refresh_process_timestamps(&mut processes, &cache);
         let now = now_ms();
-        let model_clock_regressed = last_model_progress.is_some_and(|at| at > now);
-        let workspace = match self.workspace_view(agent).await {
-            Ok(workspace) => workspace,
-            Err(error) => Some(WorkspaceView::unavailable(error.code)),
+        let workspace = match &facts.workspace {
+            Ok(workspace) => workspace
+                .as_ref()
+                .map(|workspace| self.render_workspace(&facts.id, workspace)),
+            Err(error) => Some(WorkspaceView::unavailable(error.code.clone())),
         };
-        let git = match self.git_view(agent).await {
-            Ok(git) => git,
-            Err(error) => GitView::error(error.code),
-        };
-        Ok(ObservationView::Data(Box::new(ObservationData {
+        let git = facts
+            .git
+            .as_ref()
+            .map_err(Clone::clone)
+            .and_then(|git| self.render_git(git))
+            .unwrap_or_else(|error| GitView::error(error.code));
+        ObservationView::Data(Box::new(ObservationData {
             processes_truncated: processes.len() == PAGE_LIMIT,
             processes,
             stats: stats_view(&cache, unavailable, now),
             liveness: LivenessView {
-                state: agent.state,
-                last_model_progress,
-                age_ms: last_model_progress.and_then(|at| age_ms(now, at)),
-                clock_regressed: model_clock_regressed,
+                state: facts.state,
+                last_model_progress: facts.last_model_progress,
+                age_ms: facts.last_model_progress.and_then(|at| age_ms(now, at)),
+                clock_regressed: facts.last_model_progress.is_some_and(|at| at > now),
                 basis: LivenessBasis::CommittedNativeFacts,
-                source_healthy,
+                source_healthy: facts.source_healthy,
             },
             workspace,
             git,
-        })))
+        }))
     }
 
-    /// Agent.generation remains native/control state. Workspace observation is
-    /// explicitly named by its retained target, including target 1 while Agent is 0.
-    pub(crate) async fn workspace_view(&self, agent: &Agent) -> Result<Option<WorkspaceView>> {
-        let (preparation, mut processes, source) = {
-            let store = self.inner.store.lock().await;
-            let Some(preparation) = store.get_workspace(&agent.id)? else {
-                return Ok(None);
-            };
-            let process_owner = workspace_owner(&agent.id, preparation.target_generation);
-            let processes = store.list_processes(&process_owner, None, PAGE_LIMIT)?;
-            let source = store
-                .list_source_states(&agent.id, preparation.target_generation)?
-                .into_iter()
-                .find(|state| {
-                    state.get("source").and_then(Value::as_str) == Some("workspace_process")
-                })
-                .map(serde_json::from_value::<SourceState>)
-                .transpose()
-                .map_err(|_| Error::new("internal", "invalid workspace source-state projection"))?;
-            (preparation, processes, source)
+    /// Workspace observation names the retained preparation target even
+    /// when its generation is ahead of the Agent's native generation.
+    fn read_workspace_facts(store: &Store, agent: &Agent) -> Result<Option<WorkspaceFacts>> {
+        let Some(preparation) = store.get_workspace(&agent.id)? else {
+            return Ok(None);
         };
-        let cache = self.workspace_cache(&agent.id, preparation.target_generation);
-        refresh_process_timestamps(&mut processes, &cache);
-        let unavailable = self.inner.unavailable.lock_recover().clone();
-        Ok(Some(WorkspaceView::Data(Box::new(WorkspaceObservation {
-            owner: workspace_owner(&agent.id, preparation.target_generation),
-            target_generation: preparation.target_generation,
+        let generation = preparation.target_generation;
+        let processes =
+            store.list_processes(&workspace_owner(&agent.id, generation), None, PAGE_LIMIT)?;
+        let source = store
+            .list_source_states(&agent.id, generation)?
+            .into_iter()
+            .find(|state| state.get("source").and_then(Value::as_str) == Some("workspace_process"))
+            .map(serde_json::from_value::<SourceState>)
+            .transpose()
+            .map_err(|_| Error::new("internal", "invalid workspace source-state projection"))?;
+        Ok(Some(WorkspaceFacts {
+            generation,
             phase: preparation.phase,
             setup_index: preparation.setup_index,
+            processes,
+            source,
+        }))
+    }
+
+    fn render_workspace(&self, agent: &str, facts: &WorkspaceFacts) -> WorkspaceView {
+        let cache = self.workspace_cache(agent, facts.generation);
+        let mut processes = facts.processes.clone();
+        refresh_process_timestamps(&mut processes, &cache);
+        let unavailable = self.inner.unavailable.lock_recover().clone();
+        WorkspaceView::Data(Box::new(WorkspaceObservation {
+            owner: workspace_owner(agent, facts.generation),
+            target_generation: facts.generation,
+            phase: facts.phase,
+            setup_index: facts.setup_index,
             processes_truncated: processes.len() == PAGE_LIMIT,
             processes,
             stats: stats_view(&cache, unavailable, now_ms()),
-            source,
-        }))))
+            source: facts.source.clone(),
+        }))
     }
 
     fn workspace_cache(&self, agent: &str, generation: i64) -> Cache {
@@ -1166,9 +1235,40 @@ impl Monitoring {
     }
 
     pub(crate) async fn git_view(&self, agent: &Agent) -> Result<GitView> {
+        let store = self.inner.store.lock().await;
+        let facts = Self::read_git_facts(&store, agent)?;
+        drop(store);
+        self.render_git(&facts)
+    }
+
+    fn read_git_facts(store: &Store, agent: &Agent) -> Result<GitFacts> {
         let workspace = agent.workspace.as_deref().ok_or_else(|| {
             Error::new("invalid", "Git observation requires an admitted workspace")
         })?;
+        let baseline = store.git_baseline(workspace)?;
+        let edits = store.list_agent_edits(&agent.id, agent.generation, None, PAGE_LIMIT)?;
+        let source = store.read_source_state(&agent.id, agent.generation, "git");
+        let source_checked = source.is_ok()
+            || source.as_ref().err().is_some_and(|error| {
+                error.code == "source_integrity"
+                    && error.message.as_str() == "source has no committed state"
+            });
+        let source = source
+            .ok()
+            .map(serde_json::from_value::<MonitoringSourceState>)
+            .transpose()
+            .map_err(|_| Error::new("internal", "invalid Git source-state projection"))?;
+        Ok(GitFacts {
+            workspace: workspace.to_owned(),
+            baseline,
+            edits,
+            source,
+            source_checked,
+        })
+    }
+
+    fn render_git(&self, facts: &GitFacts) -> Result<GitView> {
+        let workspace = facts.workspace.as_str();
         let target = self
             .inner
             .git_workspaces
@@ -1192,19 +1292,6 @@ impl Monitoring {
             },
         );
         let unavailable = self.inner.git_unavailable.lock_recover().clone();
-        let (baseline, edits, source) = {
-            let store = self.inner.store.lock().await;
-            (
-                store.git_baseline(workspace)?,
-                store.list_agent_edits(&agent.id, agent.generation, None, PAGE_LIMIT)?,
-                store
-                    .read_source_state(&agent.id, agent.generation, "git")
-                    .ok()
-                    .map(serde_json::from_value::<MonitoringSourceState>)
-                    .transpose()
-                    .map_err(|_| Error::new("internal", "invalid Git source-state projection"))?,
-            )
-        };
         let snapshot = cache.snapshot.as_ref();
         let sampled_at = snapshot.map(|snapshot| snapshot.observed_at);
         let now = now_ms();
@@ -1252,10 +1339,10 @@ impl Monitoring {
                     deletions: work.deletions?,
                 })
             }),
-            baseline,
-            edits_truncated: edits.len() == PAGE_LIMIT,
-            edits,
-            source,
+            baseline: facts.baseline.clone(),
+            edits_truncated: facts.edits.len() == PAGE_LIMIT,
+            edits: facts.edits.clone(),
+            source: facts.source.clone(),
             error: unavailable.or(cache.error),
         }));
         self.check_git_value(

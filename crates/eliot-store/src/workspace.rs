@@ -322,11 +322,11 @@ pub(super) fn load_workspace(
     agent: i64,
 ) -> Result<Option<WorkspacePreparation>> {
     connection
-        .query_row(
-            &format!("SELECT {WORKSPACE_COLUMNS} FROM workspaces WHERE agent = ?1"),
-            [agent],
-            workspace_from_row,
-        )
+        .prepare_cached(&format!(
+            "SELECT {WORKSPACE_COLUMNS} FROM workspaces WHERE agent = ?1"
+        ))
+        .map_err(sql_error)?
+        .query_row([agent], workspace_from_row)
         .optional()
         .map_err(sql_error)
 }
@@ -336,11 +336,11 @@ pub(super) fn load_workspace_by_path(
     path: &str,
 ) -> Result<Option<WorkspacePreparation>> {
     connection
-        .query_row(
-            &format!("SELECT {WORKSPACE_COLUMNS} FROM workspaces WHERE worktree_path = ?1"),
-            [path],
-            workspace_from_row,
-        )
+        .prepare_cached(&format!(
+            "SELECT {WORKSPACE_COLUMNS} FROM workspaces WHERE worktree_path = ?1"
+        ))
+        .map_err(sql_error)?
+        .query_row([path], workspace_from_row)
         .optional()
         .map_err(sql_error)
 }

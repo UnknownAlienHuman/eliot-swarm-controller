@@ -191,9 +191,9 @@ pub(super) fn native_progress(
     generation: i64,
 ) -> Result<Option<i64>> {
     connection
-        .query_row(NATIVE_PROGRESS_SQL, params![agent, generation], |row| {
-            row.get(0)
-        })
+        .prepare_cached(NATIVE_PROGRESS_SQL)
+        .map_err(sql_error)?
+        .query_row(params![agent, generation], |row| row.get(0))
         .optional()
         .map_err(sql_error)
 }

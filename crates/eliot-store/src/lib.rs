@@ -506,12 +506,19 @@ struct StoredOwnerRulesDelivery {
     input_command_id: Option<String>,
 }
 
+#[derive(Default)]
+struct SnapshotAgentCache {
+    last: Option<(i64, Agent)>,
+}
+
 pub struct Store {
     connection: Connection,
     write_faulted: Cell<bool>,
     /// One exact autonomy response for this pooled connection. SQLite's
     /// connection-local data_version invalidates it; no TTL is involved.
     autonomy_cache: RefCell<Option<autonomy::AutonomyCache>>,
+    fleet_summaries: RefCell<Option<fleet::FleetSummaries>>,
+    snapshot_agent: RefCell<Option<SnapshotAgentCache>>,
     /// Persistent keyset cursor for retention command pruning: the last
     /// examined expired root `(created_at, id)`, or `None` at the oldest.
     /// Successive passes resume here instead of restarting at the oldest
@@ -588,6 +595,8 @@ impl Store {
             connection,
             write_faulted: Cell::new(false),
             autonomy_cache: RefCell::new(None),
+            fleet_summaries: RefCell::new(None),
+            snapshot_agent: RefCell::new(None),
             retention_commands_cursor: None,
             retention_processes_cursor: None,
             retention_attention_advisory_cursor: None,
@@ -674,6 +683,8 @@ impl Store {
             connection,
             write_faulted: Cell::new(false),
             autonomy_cache: RefCell::new(None),
+            fleet_summaries: RefCell::new(None),
+            snapshot_agent: RefCell::new(None),
             retention_commands_cursor: None,
             retention_processes_cursor: None,
             retention_attention_advisory_cursor: None,
@@ -720,6 +731,13 @@ impl Store {
     /// Whether a previous SQLite commit failure fenced this Store instance.
     pub fn is_write_faulted(&self) -> bool {
         self.write_faulted.get()
+    }
+
+    /// Connection-local revision for derived projections. Callers compare
+    /// stamps from the same writer before and after reading a snapshot.
+    pub fn projection_revision(&self) -> Result<(i64, u64)> {
+        self.ensure_committed_reads()?;
+        autonomy::revision(&self.connection)
     }
 
     /// Refuse retained-command reads if a failed transaction left the
@@ -1518,8 +1536,21 @@ impl Store {
     }
 
     pub fn get_agent(&self, id: &str) -> Result<Option<Agent>> {
-        let agent_num = parse_agent_id(id)?;
-        load_agent_by_num(&self.connection, agent_num)
+        self.load_snapshot_agent(parse_agent_id(id)?)
+    }
+
+    fn load_snapshot_agent(&self, agent_num: i64) -> Result<Option<Agent>> {
+        if let Some(cache) = self.snapshot_agent.borrow().as_ref()
+            && let Some((id, agent)) = cache.last.as_ref()
+            && *id == agent_num
+        {
+            return Ok(Some(agent.clone()));
+        }
+        let agent = load_agent_by_num(&self.connection, agent_num)?;
+        if let Some(cache) = self.snapshot_agent.borrow_mut().as_mut() {
+            cache.last = agent.as_ref().map(|agent| (agent_num, agent.clone()));
+        }
+        Ok(agent)
     }
 
     pub fn get_agent_instruction_delivery(
@@ -3677,7 +3708,7 @@ impl Store {
             .transpose()?;
         let mut statement = self
             .connection
-            .prepare(match cursor {
+            .prepare_cached(match cursor {
                 None => LIST_PROCESSES_FIRST_PAGE_SQL,
                 Some(_) => LIST_PROCESSES_CURSOR_PAGE_SQL,
             })
@@ -3713,11 +3744,9 @@ impl Store {
         let agent_num = parse_agent_id(agent)?;
         let exists: bool = self
             .connection
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM agents WHERE id = ?1)",
-                [agent_num],
-                |row| row.get(0),
-            )
+            .prepare_cached("SELECT EXISTS(SELECT 1 FROM agents WHERE id = ?1)")
+            .map_err(sql_error)?
+            .query_row([agent_num], |row| row.get(0))
             .map_err(sql_error)?;
         if !exists {
             return Ok(None);
@@ -3725,9 +3754,9 @@ impl Store {
         let native = native_children::native_progress(&self.connection, agent_num, generation)?;
         let git: Option<i64> = self
             .connection
-            .query_row(GIT_PROGRESS_SQL, params![agent_num, generation], |row| {
-                row.get(0)
-            })
+            .prepare_cached(GIT_PROGRESS_SQL)
+            .map_err(sql_error)?
+            .query_row(params![agent_num, generation], |row| row.get(0))
             .optional()
             .map_err(sql_error)?;
         Ok(native.into_iter().chain(git).max())
@@ -3888,7 +3917,7 @@ impl Store {
         }
         let mut statement = self
             .connection
-            .prepare(
+            .prepare_cached(
                 "SELECT workspace, path, updated_at FROM agent_edits
              WHERE agent = ?1 AND generation = ?2 AND (?3 IS NULL OR path > ?3)
              ORDER BY path LIMIT ?4",
@@ -4167,16 +4196,14 @@ fn git_source_cursor(source: &SourceStateRecord) -> Result<u64> {
 
 fn load_git_baseline(connection: &Connection, workspace: &str) -> Result<Option<GitBaseline>> {
     connection
-        .query_row(
-            "SELECT head, updated_at FROM git_workspaces WHERE workspace = ?1",
-            [workspace],
-            |row| {
-                Ok(GitBaseline {
-                    head: row.get(0)?,
-                    updated_at: row.get(1)?,
-                })
-            },
-        )
+        .prepare_cached("SELECT head, updated_at FROM git_workspaces WHERE workspace = ?1")
+        .map_err(sql_error)?
+        .query_row([workspace], |row| {
+            Ok(GitBaseline {
+                head: row.get(0)?,
+                updated_at: row.get(1)?,
+            })
+        })
         .optional()
         .map_err(sql_error)
 }
@@ -4938,16 +4965,14 @@ fn agent_from_record(connection: &Connection, record: AgentRecord) -> Result<Age
 
 fn load_agent_by_num(connection: &Connection, id: i64) -> Result<Option<Agent>> {
     let record = connection
-        .query_row(
-            concat!(
-                "SELECT ",
-                agent_record_columns!(),
-                "
+        .prepare_cached(concat!(
+            "SELECT ",
+            agent_record_columns!(),
+            "
              FROM agents WHERE id = ?1"
-            ),
-            [id],
-            agent_record_from_row,
-        )
+        ))
+        .map_err(sql_error)?
+        .query_row([id], agent_record_from_row)
         .optional()
         .map_err(sql_error)?;
     record
@@ -6810,13 +6835,11 @@ fn load_source_state(
     source: &str,
 ) -> Result<Option<SourceStateRecord>> {
     connection
-        .query_row(
-            "SELECT cursor, last_store_seq, last_batch_id, last_batch_digest,
+        .prepare_cached("SELECT cursor, last_store_seq, last_batch_id, last_batch_digest,
                     last_batch_first_seq, last_batch_last_seq, state, health,
                     gap_id, gap_digest, gap_from, gap_to, gap_seq, last_handoff_digest, last_handoff,
                     last_batch_dropped
-             FROM source_state WHERE agent = ?1 AND generation = ?2 AND source = ?3",
-            params![agent, generation, source],
+             FROM source_state WHERE agent = ?1 AND generation = ?2 AND source = ?3").map_err(sql_error)?.query_row(params![agent, generation, source],
             |row| {
                 Ok(SourceStateRecord {
                     cursor: row.get(0)?,
