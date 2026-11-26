@@ -596,6 +596,32 @@ as the call's target environment, and the adapter pins its short-lived reader to
 the frozen binding, verifies the archive scope and the initialized store, then
 calls `thread/archive` with no turn and no inference.
 
+### Task cards after compaction (A12)
+
+Verified on 2026-11-26 with Codex CLI 0.167.1 and the `codex-dev` profile
+on a private Windows stand. Commands used the stand Owner principal and the
+profile used the adopted OpenCodex route. Codex reported `gpt-6.2-sol` in the
+native turn context.
+
+- Manual (`a1#1`): `swarm compact` settled as applied at sequence 64.
+  The completed native `contextCompaction` item committed
+  `session.context.compacted` at 63. Swarm queued the task card at 65 and
+  delivered it with the next send at 90. The native user input contained
+  the original first-input objective, which Codex returned verbatim at 92.
+- Automatic (`a4#1`): the stand's private Codex config set
+  `model_auto_compact_token_limit = 15000` with scope `total`.
+  The first turn used 15,535 input tokens on its first call. Before answering
+  the follow-up, Codex compacted automatically and the completed item committed
+  at 234. Swarm queued the card at 235 and delivered it as the next native input
+  via `codex.turn/steer` at 237. The native user input contained the first-input
+  objective and the turn returned its opening sentence at 239.
+  [Installed version's config schema](https://github.com/openai/codex/blob/0a94398fa60c4fac0e7659e4213a0a36e613dd46/codex-rs/core/config.schema.json)
+
+The Swarm binary built from `4712d473f0f2c65d8299dfee5072c95005efeb4e`
+had SHA-256 `ecc3b3a180feb7371ffa62655d444c4cbb3aa266ee777e29902edf15d9e5d374`.
+The Codex executable had SHA-256
+`c12aca02de615a9fcb76f955bf005a33f4b10b577f8a1730161953f57a1155b3`.
+
 ### Broken native tool history
 
 For the owned thread, the specific native error `Custom tool call output is missing

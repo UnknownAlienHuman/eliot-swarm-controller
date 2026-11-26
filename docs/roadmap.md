@@ -139,8 +139,14 @@ engine, second scheduler or critic loop.
       The shared Claude manual completion check was exercised on the hardened
       proof binary. Its manual boundary committed at sequence 172 and the
       bound turn completed with no native terminal reason.
-      Live proof remains pending for Codex, Muse and Antigravity. Antigravity
-      also needs native compaction evidence bound to an exact prompt or turn.
+      Codex CLI 0.167.1 with `gpt-6.2-sol` confirmed the first-input objective
+      after manual compaction (delivery 90) and automatic compaction (237).
+      Live proof remains pending for Muse and Antigravity. Muse completed real
+      turns with lowered thresholds but produced no native compaction evidence.
+      Antigravity needs native compaction evidence bound to an exact prompt
+      or turn.
+      [Codex live proof](harnesses/codex.md#task-cards-after-compaction-a12)
+      · [Muse probe](harnesses/muse.md#task-cards-after-compaction-a12)
       [Compaction facts](spec/plugin-protocol.md#translation-and-normalization)
 
       A10–A12 passed formatting, locked all-target builds and warnings-denied
