@@ -118,6 +118,8 @@ impl DesktopApp {
             view_changes: context
                 .callback(|()| Message::Pane(crate::ui::pane_ui::PaneMsg::ViewChanges)),
         };
+        // The running turn's live draft, at the end of its turn.
+        let draft = self.shown_draft(&conversation);
         View::component::<views::Transcript>(views::TranscriptInput {
             conversation,
             items: if open {
@@ -129,6 +131,7 @@ impl DesktopApp {
             callbacks: Rc::new(callbacks),
             load_older,
             empty,
+            draft,
             boundary: self
                 .chat
                 .convo

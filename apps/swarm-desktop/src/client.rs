@@ -29,8 +29,8 @@ use eliot_core::api::{
     HandoffResponse, HarnessModelsRequest, HarnessModelsResponse, LaunchIntentGetRequest,
     LaunchIntentView, LaunchQueueListRequest, LaunchQueueRequest, LaunchQueueView,
     ORGANIZATION_CHANGED_KIND, OrgGroupView, OrgRowChange, OrganizationChangedEvent,
-    ReparentRequest, ReparentResponse, SwitchRequest, SwitchResponse, UsageSummaryRequest,
-    UsageSummaryResponse,
+    ReparentRequest, ReparentResponse, SwitchRequest, SwitchResponse, TurnPreviewWatchRequest,
+    TurnPreviewWatchResponse, UsageSummaryRequest, UsageSummaryResponse,
     auth_login::{
         AuthDesktopClaimRequest, AuthDesktopClaimResponse, AuthDesktopPollRequest,
         AuthDesktopPollResponse, AuthDesktopReportRequest, AuthDesktopReportResponse,
@@ -106,6 +106,7 @@ macro_rules! checked {
 checked! {
     AgentListRequest => AgentListResponse, "agent.list";
     AgentGetRequest => AgentGetResponse, "agent.get";
+    TurnPreviewWatchRequest => TurnPreviewWatchResponse, "turn.preview.watch";
     AgentResultRequest => AgentResultResponse, "agent.result";
     DiagnoseRequest => DiagnoseResponse, "diagnose";
     DaemonStatusRequest => DaemonStatusResponse, "daemon.status";
@@ -538,6 +539,26 @@ pub async fn get_agent(data_dir: &Path, id: &str) -> Result<AgentGetResponse> {
     let params = AgentGetRequest::new(id);
     let reply: AgentGetResponse = call(data_dir, &params).await?;
     Ok(reply)
+}
+
+/// One `turn.preview.watch` long poll for the live draft of exactly this
+/// turn: its current state without `revision`; with the last revision
+/// returned, a wait of up to 20 s for another one (a timeout echoes it with
+/// no preview).
+pub async fn turn_preview_watch(
+    data_dir: &Path,
+    agent: &str,
+    generation: i64,
+    turn_id: &str,
+    revision: Option<u64>,
+) -> Result<TurnPreviewWatchResponse> {
+    let params = TurnPreviewWatchRequest {
+        agent: agent.to_owned(),
+        generation,
+        turn_id: turn_id.to_owned(),
+        revision,
+    };
+    call(data_dir, &params).await
 }
 
 /// Owner-scoped failure diagnosis for one command, Agent or agent:turn.

@@ -339,6 +339,25 @@ fn render_part(part: &Part, docs: &HashMap<u64, Doc>) -> RenderedPart {
     }
 }
 
+/// The running turn's live message (`turn.preview.watch`), drawn at the end
+/// of its turn as the answer it becomes when the turn ends with it, so the
+/// answer takes its place without a jump. It is never one of the
+/// transcript's items.
+#[derive(Clone, PartialEq)]
+pub struct Draft {
+    /// The key of its turn's item (`turn:<generation>:<turn>`).
+    pub item: String,
+    pub part: Shared<RenderedPart>,
+    /// The daemon kept only the start of the message.
+    pub truncated: bool,
+}
+
+/// The draft's part, rendered with the Markdown `doc` a worker parsed from
+/// its text, as every committed message is.
+pub fn draft_part(part: &Part, doc: Doc) -> RenderedPart {
+    render_part(part, &HashMap::from([(text_hash(&part.text), doc)]))
+}
+
 impl RenderCache {
     /// Render the resident items, reusing every unchanged part.
     pub fn render(
@@ -1171,6 +1190,8 @@ pub struct TranscriptInput {
     pub load_older: Option<(bool, Callback<()>)>,
     /// The line shown without turns ("Loading…", "No messages yet.").
     pub empty: Option<&'static str>,
+    /// The running turn's live message, after its turn's parts.
+    pub draft: Option<Draft>,
     /// What the loaded history leaves out and why, over its oldest turn.
     pub boundary: Option<String>,
     pub automation_id: &'static str,
@@ -1772,6 +1793,27 @@ fn turn_views(input: &TranscriptInput, skip: usize) -> Vec<KeyedView> {
                             }),
                         ));
                     }
+                }
+            }
+            // The live draft where its committed message will be: after the
+            // turn's last part, keyed by its message, so each revision
+            // updates the same block (no live region: nothing is announced
+            // per revision).
+            if let Some(draft) = input.draft.as_ref().filter(|draft| draft.item == item.key) {
+                views.push(KeyedView::new(
+                    draft.part.0.key.clone(),
+                    View::component::<PartView>(PartInput {
+                        part: draft.part.clone(),
+                        expanded: false,
+                        callbacks: Rc::clone(&input.callbacks),
+                    }),
+                ));
+                if draft.truncated {
+                    views.push(KeyedView::new(
+                        "draft-truncated",
+                        label("The full message appears when the turn ends.")
+                            .text_wrapping(TextWrapping::Wrap),
+                    ));
                 }
             }
             // A turn stretches across the reading column: a short turn's

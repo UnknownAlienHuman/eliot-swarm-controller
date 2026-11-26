@@ -378,3 +378,229 @@ impl DesktopApp {
         self.start_snapshot(context);
     }
 }
+
+/// The exact live turn a draft belongs to: the open Agent's generation and
+/// active turn, as its readback has them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(in crate::ui) struct PreviewTurn {
+    agent: String,
+    generation: i64,
+    turn_id: String,
+}
+
+/// One `turn.preview.watch` reply, with its preview's Markdown.
+pub(in crate::ui) type PreviewReply =
+    eliot_core::Result<(eliot_core::api::TurnPreviewWatchResponse, Option<Doc>)>;
+
+/// The open running turn's live draft (`turn.preview.watch`: best effort,
+/// memory only) and its one watch. The draft is never in the conversation,
+/// its items or any store.
+#[derive(Default)]
+pub(in crate::ui) struct PreviewState {
+    /// The turn watched: the visible running turn.
+    turn: Option<PreviewTurn>,
+    /// The chat epoch the watch belongs to: a newer one drops it.
+    epoch: u64,
+    /// Counts the calls: only the reply of the latest one is taken.
+    call: u64,
+    /// The last non-null revision returned.
+    revision: Option<u64>,
+    /// The call in flight. Cancelling it drops its request, and with it
+    /// the request's slot among the daemon's watches.
+    task: Option<ComponentTask>,
+    /// Failed calls in a row (`busy` included): each waits longer.
+    pace: live::Pace,
+    /// The daemon said the turn ended: nothing more is asked for it.
+    ended: bool,
+    draft: Option<ShownDraft>,
+}
+
+/// The draft as drawn, with its message's id and text.
+struct ShownDraft {
+    message_id: String,
+    part: crate::chat::Part,
+    view: views::Draft,
+}
+
+impl DesktopApp {
+    /// The open Agent's running turn while its conversation is shown and
+    /// the transcript does not hold the turn's end yet.
+    fn visible_turn(&self) -> Option<(&str, i64, &str)> {
+        let convo = self.chat.convo.as_ref()?;
+        let detail = self.chat.detail.as_ref()?;
+        let turn_id = detail.active_turn.as_deref()?;
+        (self.main == Main::Conversation
+            && self.nav.selection.agent.as_deref() == Some(convo.agent())
+            && detail.agent == convo.agent()
+            && !convo.turn_ended(detail.generation, turn_id))
+        .then_some((detail.agent.as_str(), detail.generation, turn_id))
+    }
+
+    /// Keep exactly one watch, for the visible running turn (run after
+    /// every message). Another turn, a new chat epoch or a closed chat
+    /// cancels the call in flight, so its request is dropped, not just its
+    /// reply; the draft goes with its turn. The committed message with the
+    /// draft's id, or its turn's committed end, replaces the draft.
+    pub(in crate::ui) fn sync_preview(&mut self, context: &ComponentContext<Self>) {
+        let visible = self.visible_turn();
+        let same = match (&self.chat.preview.turn, visible) {
+            (Some(turn), Some((agent, generation, turn_id))) => {
+                turn.agent == agent && turn.generation == generation && turn.turn_id == turn_id
+            }
+            (None, None) => true,
+            _ => false,
+        };
+        let turn = (!same).then(|| {
+            visible.map(|(agent, generation, turn_id)| PreviewTurn {
+                agent: agent.to_owned(),
+                generation,
+                turn_id: turn_id.to_owned(),
+            })
+        });
+        let preview = &mut self.chat.preview;
+        if turn.is_some() || preview.epoch != self.chat.epoch {
+            if let Some(task) = preview.task.take() {
+                task.cancel();
+            }
+            if let Some(turn) = turn {
+                preview.turn = turn;
+                preview.draft = None;
+                preview.ended = false;
+                preview.pace.reset();
+            }
+            // A new epoch can follow a daemon restart: ask for the current
+            // state, keeping the draft until it answers.
+            preview.revision = None;
+            preview.epoch = self.chat.epoch;
+        }
+        if let (Some(turn), Some(draft), Some(convo)) =
+            (&preview.turn, &preview.draft, &self.chat.convo)
+            && convo.holds_message(turn.generation, &turn.turn_id, &draft.message_id)
+        {
+            preview.draft = None;
+        }
+        if preview.turn.is_some() && preview.task.is_none() && !preview.ended {
+            self.watch_preview(context);
+        }
+    }
+
+    /// One call for the watched turn: the current state first, then a long
+    /// poll from the last revision. A failed call waits out its backoff
+    /// before its reply returns; leaving the turn cancels it at once.
+    fn watch_preview(&mut self, context: &ComponentContext<Self>) {
+        let (Some(turn), Ok(data_dir)) = (self.chat.preview.turn.clone(), self.data_dir.clone())
+        else {
+            return;
+        };
+        let preview = &mut self.chat.preview;
+        preview.call += 1;
+        let (epoch, call, revision) = (self.chat.epoch, preview.call, preview.revision);
+        let failed_wait = {
+            let mut pace = preview.pace;
+            pace.fail(0)
+        };
+        preview.task = Some(context.spawn_background(move |cancel| {
+            let cancelled = || cancel.is_cancelled();
+            let reply = client::block_on(feed::cancellable(
+                client::turn_preview_watch(
+                    &data_dir,
+                    &turn.agent,
+                    turn.generation,
+                    &turn.turn_id,
+                    revision,
+                ),
+                &cancelled,
+            ))
+            .map(|reply| {
+                if reply.is_err() {
+                    let _ = feed::backoff(failed_wait, &cancelled);
+                }
+                Box::new(reply.map(|reply| {
+                    let doc = reply
+                        .preview
+                        .as_ref()
+                        .map(|preview| crate::markdown::parse(&preview.text));
+                    (reply, doc)
+                }))
+            });
+            Message::Chat(ChatMsg::PreviewLoaded(epoch, call, turn, reply))
+        }));
+    }
+
+    /// Apply the latest call's reply: a new revision replaces the draft (or
+    /// clears it), a timeout keeps it, an end clears it for good. A failure
+    /// (`busy` included) keeps the draft and says nothing: the preview is
+    /// best effort, and the next call waits longer.
+    pub(super) fn preview_loaded(
+        &mut self,
+        epoch: u64,
+        call: u64,
+        turn: PreviewTurn,
+        reply: Option<Box<PreviewReply>>,
+    ) {
+        let preview = &mut self.chat.preview;
+        if epoch != self.chat.epoch || call != preview.call || preview.turn.as_ref() != Some(&turn)
+        {
+            return;
+        }
+        let Some(reply) = reply else {
+            return;
+        };
+        preview.task = None;
+        match *reply {
+            Ok((reply, doc)) => {
+                preview.pace.reset();
+                if reply.ended {
+                    preview.ended = true;
+                    preview.draft = None;
+                } else if reply.revision != preview.revision {
+                    preview.revision = reply.revision;
+                    preview.draft = reply.preview.zip(doc).map(|(shown, doc)| {
+                        let part = crate::chat::Part::draft(&shown.message_id, shown.text);
+                        let view = views::Draft {
+                            item: crate::chat::turn_item_key(turn.generation, &turn.turn_id),
+                            part: views::Shared(Rc::new(views::draft_part(&part, doc))),
+                            truncated: shown.truncated,
+                        };
+                        ShownDraft {
+                            message_id: shown.message_id,
+                            part,
+                            view,
+                        }
+                    });
+                }
+            }
+            Err(_) => {
+                let _ = preview.pace.fail(0);
+            }
+        }
+    }
+
+    /// The open turn's draft as the transcript draws it, for the Agent
+    /// whose conversation is shown.
+    pub(super) fn shown_draft(&self, conversation: &str) -> Option<views::Draft> {
+        let preview = &self.chat.preview;
+        preview
+            .turn
+            .as_ref()
+            .filter(|turn| turn.agent == conversation)
+            .and(preview.draft.as_ref())
+            .map(|draft| draft.view.clone())
+    }
+
+    /// A shown part's text for Copy: a transcript part, or the draft.
+    pub(super) fn shown_part_text(&self, key: &str) -> Option<String> {
+        self.chat
+            .convo
+            .as_ref()
+            .and_then(|convo| convo.part_text(key))
+            .or_else(|| {
+                self.chat
+                    .preview
+                    .draft
+                    .as_ref()
+                    .filter(|draft| draft.part.key == key)
+                    .map(|draft| draft.part.text.clone())
+            })
+    }
+}

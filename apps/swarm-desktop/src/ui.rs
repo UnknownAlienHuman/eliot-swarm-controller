@@ -1078,6 +1078,7 @@ impl Component for DesktopApp {
                 hold_waited: None,
                 decision_at: 0,
                 decide_reason: String::new(),
+                preview: Default::default(),
             },
             monitor: monitor_ui::MonitorState::default(),
             inbox: inbox_ui::InboxState::default(),
@@ -1150,6 +1151,7 @@ impl Component for DesktopApp {
         self.sync_monitor();
         self.sync_pane(context);
         self.sync_dialog(context);
+        self.sync_preview(context);
     }
 
     fn view(&self, _input: &DesktopInput, context: &mut ViewContext<Self>) -> View {
