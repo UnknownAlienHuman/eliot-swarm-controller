@@ -1045,17 +1045,7 @@ fn project_handoffs(
                t.state = 'completed' OR (
                  json_type(source.profile_snapshot, '$._harness_check') IS NULL
                  AND (c.state = 'unknown' OR t.state = 'unknown')
-               ), 0)
-           AND NOT (
-               COALESCE(json_extract(e.data,'$.task_command'), '') = ''
-               AND COALESCE((SELECT prior.kind = 'turn.completed'
-                      AND json_extract(prior.data,'$.outcome') = 'success'
-                   FROM events prior INDEXED BY events_agent
-                   WHERE prior.agent=e.agent AND prior.generation=e.generation
-                     AND prior.seq < e.seq
-                     AND prior.kind IN ('turn.started','turn.completed','turn.unknown','turn.resolved')
-                   ORDER BY prior.seq DESC LIMIT 1), 0)
-           )",
+               ), 0)",
         "CAST(json_extract(e.data,'$.switch_command') AS TEXT) = ?1",
         bindings,
     )?;

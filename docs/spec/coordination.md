@@ -1650,9 +1650,8 @@ to repeat its steps before checking them, and the Owner inbox gets a `handoff` i
 Swarm never replays that turn.
 The inbox omits an applied handoff notice after the source is archived or
 the linked source turn settles. It shows the exact linked unknown command
-or turn once. For a handoff with no task binding, a last successful source
-turn recorded before the handoff establishes that the uncertainty came from
-the separate unknown-outcome gate. A failed or interrupted turn with
+or turn once. An uncertain handoff with no recorded task binding stays
+visible while the source is unarchived. A failed or interrupted turn with
 possible partial effects can still need review.
 
 A session-loss wait records its unfinished turn when known. It closes on

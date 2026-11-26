@@ -542,7 +542,7 @@ impl Session {
             .filter(|value| !value.trim().is_empty())
             .ok_or_else(|| {
                 Error::new(
-                    "stale_turn",
+                    "native_not_dispatched",
                     "Antigravity request reply needs its captured turn id",
                 )
             })?;
@@ -552,7 +552,7 @@ impl Session {
             .filter(|value| !value.trim().is_empty())
             .ok_or_else(|| {
                 Error::new(
-                    "not_found",
+                    "native_not_dispatched",
                     "Antigravity request reply needs its captured request id",
                 )
             })?;
@@ -849,7 +849,10 @@ impl Session {
             .as_deref()
             .filter(|turn| !turn.trim().is_empty())
             .ok_or_else(|| {
-                Error::new("stale_turn", "Antigravity steer requires a captured turn")
+                Error::new(
+                    "native_not_dispatched",
+                    "Antigravity steer requires a captured turn",
+                )
             })?;
         let text = params
             .input_text()
