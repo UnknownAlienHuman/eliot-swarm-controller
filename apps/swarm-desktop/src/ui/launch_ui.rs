@@ -1828,7 +1828,7 @@ impl DesktopApp {
 
     /// The harness a launch of the current choice starts: the chosen
     /// model's, or Swarm's pick for Auto and presets.
-    fn starting_harness(&self) -> Option<String> {
+    pub(super) fn starting_harness(&self) -> Option<String> {
         match &self.launch.choice {
             Choice::Model(pick) => Some(pick.harness.clone()),
             _ => self.launch.profile().map(|profile| profile.harness.clone()),

@@ -1537,7 +1537,7 @@ impl DesktopApp {
                 }
             }
             SettingsMsg::UsageRefresh => {
-                self.load_quotas(context);
+                self.read_usage(context);
                 self.load_fleet(context);
             }
             SettingsMsg::QuotaLoaded(harness, reply) => {
@@ -1996,7 +1996,7 @@ impl DesktopApp {
                 }
             }
             Page::Usage => {
-                self.load_quotas(context);
+                self.read_usage(context);
                 self.load_fleet(context);
             }
             Page::Worktrees => self.load_worktrees(context),

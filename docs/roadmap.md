@@ -1109,12 +1109,19 @@ of the explicitly selected release scope.
       (Queue it through `launch.enqueue`; Attach an existing session shown
       disabled with its reason), three suggestion cards; the refusal notice
       with Queue it stays above the composer.
-    - [x] **Usage popover.** The sidebar's Usage row (a ring and "Codex 62% ·
-      1 hold" once read) opens a WinUI flyout: each harness's tightest
-      window with its share left, reset time and meter (`error` under 20 %),
-      "Quota unknown" where none is reported, provider holds
-      (`provider.holds`) and Open usage settings. Opening it, and Refresh,
-      read the limits once.
+    - [x] **Usage popover.** The sidebar's Usage row speaks for the limit
+      active where the owner is (owner, 2026-11-26): an open chat's Agent's
+      harness; on a project page the harness with the most running Agents
+      there, else its most recently active Agent's; elsewhere the harness
+      with the most running Agents, else (a tie or none running) the one the
+      composer launches next. It reads "Claude Code 62% left" from that
+      harness's tightest window, "… on hold", or "… quota unknown", never
+      another harness's number. It opens a WinUI flyout that lists each
+      harness once with every window (share left, reset time, meter `error`
+      under 20 %), "Quota unknown" where none is reported, its provider hold
+      (`provider.holds`) and Manage usage; Settings › Usage holds the detail
+      (plan, version, exact resets, why a quota is unknown, hold reasons) and
+      Refresh. Opening either, and Refresh, read the limits once.
     - [x] **Daemon screen.** `Offline.dc.html`: the clover, the state's
       title, the daemon's own reason, Retry (and Start Swarm with Retry for a
       daemon its owner stopped), Repair settings, Open config.toml, Open
