@@ -856,6 +856,10 @@ pub struct AgentGetResponse {
     /// First Owner input pinned for this root or chat, when visible to the caller.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub first_owner_message: Option<String>,
+    /// Fallback objective from the retained first linked input, only when no
+    /// Eliot Goal is installed. The internal Goal auditor is excluded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_goal_objective: Option<String>,
 }
 
 /// A retained Owner stop or interrupt failure visible to this caller.

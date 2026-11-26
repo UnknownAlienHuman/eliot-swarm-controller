@@ -420,6 +420,16 @@ No cumulative input/output/cache counters exist on the `usage_update`
 surface (`cumulative_tokens` stays null), and occupancy/cost are never
 mapped to `TurnUsage`: the session stream alone cannot supply per-turn
 usage. Per-turn usage arrives only on the terminal prompt response above.
+The installed Antigravity CLI 1.5.16 changelog documents `/compact` as a manual
+command that summarizes the conversation and ends its prompt turn. A manual
+success maps to `session.context.compacted` only when the exact submitted prompt
+starts with `/compact`, its fenced `session/prompt` ends with `end_turn`, and that prompt
+produces a new transcript checkpoint or ACP compaction-summary chunk. Generic
+`SYSTEM/CHECKPOINT/DONE` rows on other prompts remain checkpoint facts. For
+automatic compaction, the adapter pairs an ACP `compaction_summary_chunk` with
+the exact successful prompt terminal; `compaction_update` alone is not treated
+as terminal evidence. `agy acp --help` exposes startup flags but no ACP update
+payload schema, so no stronger automatic event lifecycle is claimed.
 Live 2026-11-14 with installed `agy` 1.5.3
 (`gemini-3.8-flash-high`, served as base `gemini-3.8-flash` plus
 `thought_level high`): one Agent, one short task (read `task.txt`, reply

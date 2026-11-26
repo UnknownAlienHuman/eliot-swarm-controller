@@ -165,6 +165,7 @@ impl Store {
                 saved_context: None,
                 transferred: &[],
                 facts: Some(facts),
+                audit_text: None,
                 directive: Some(&directive),
                 input_principal: None,
                 restart: true,
@@ -988,6 +989,7 @@ pub(super) fn handoff_tx(
                 saved_context: None,
                 transferred: &originals,
                 facts: Some(facts),
+                audit_text: None,
                 directive: None,
                 input_principal,
                 restart: false,
@@ -1012,6 +1014,7 @@ pub(super) fn handoff_tx(
                 saved_context,
                 transferred: &originals,
                 facts: None,
+                audit_text: None,
                 directive: None,
                 input_principal,
                 restart: false,
@@ -1029,8 +1032,31 @@ pub(super) fn handoff_tx(
         } else {
             let (claims, claim_conflicts, conflicts_truncated) =
                 attribution::transfer_claims_tx(tx, &from, &to, policy, now, &mut events)?;
-            let goal_revision =
-                goals::transfer_goal_tx(tx, &from, &to, policy, continuation, now, &mut events)?;
+            let goal_revision = match input {
+                HandoffInput::Switch(plan) => match plan.audit_text.as_deref() {
+                    Some(audit_text) => goals::transfer_goal_audit_switch_tx(
+                        tx,
+                        &from,
+                        &to,
+                        policy,
+                        (&plan.switch_id, audit_text),
+                        now,
+                        &mut events,
+                    )?,
+                    None => goals::transfer_goal_tx(
+                        tx,
+                        &from,
+                        &to,
+                        policy,
+                        continuation,
+                        now,
+                        &mut events,
+                    )?,
+                },
+                _ => {
+                    goals::transfer_goal_tx(tx, &from, &to, policy, continuation, now, &mut events)?
+                }
+            };
             let moved = reparent::reparent_tx(
                 tx,
                 &ReparentRequest {

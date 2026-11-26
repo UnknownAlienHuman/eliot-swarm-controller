@@ -18,6 +18,7 @@ mod diagnose;
 mod digests;
 pub(crate) mod discovery;
 mod disk_usage;
+mod goal_audit;
 mod goal_scope;
 mod goals;
 mod handoff;
@@ -3966,6 +3967,12 @@ impl Router {
         let profile = LaunchCommandArgs::required_text(launch.profile.as_deref(), "profile")?;
         self.refresh_model_hold(profile, &request.args["profile_snapshot"])
             .await;
+        if let Some(source) = routing.audit_source {
+            // The auditor uses the already prepared checkout of this Goal.
+            // It gets a single linked input and no project Goal or setup.
+            request.args["registered_project"] = json!(source.project);
+            return Ok(None);
+        }
         // A switch that requests neither a workspace nor a branch keeps its
         // source checkout: reuse was selected before preparation, so no
         // worktree is minted even under the automatic policy.
@@ -5731,6 +5738,7 @@ impl Router {
             last_control_failure,
             last_resume_failure,
             first_owner_message,
+            default_goal_objective,
         ) = {
             let store = self.inner.store.lock().await;
             hierarchy::authorize_agent_read(&store, principal, id, None)?;
@@ -5773,6 +5781,7 @@ impl Router {
                 }
                 None => None,
             };
+            let (_, default_goal_objective) = task_card::goal_projection(&store, &agent)?;
             let (provider_hold, native_notice) = store.agent_status_projection(&agent)?;
             let instruction_delivery = store.get_agent_instruction_delivery(id)?;
             let owner_rules_delivery = store.get_agent_owner_rules_delivery(id)?;
@@ -5795,6 +5804,7 @@ impl Router {
                 last_control_failure,
                 last_resume_failure,
                 first_owner_message,
+                default_goal_objective,
             )
         };
         let live_presence = if agent.observe_only {
@@ -5888,6 +5898,7 @@ impl Router {
             last_resume_failure,
             work_truth,
             first_owner_message,
+            default_goal_objective,
         };
         display_agent_get_response(&mut response);
         let mut value = serde_json::to_value(response)
@@ -9834,6 +9845,7 @@ fn reject_launch_derived_keys(args: &Value) -> Result<()> {
         "project_assignment_launch",
         "project_transfer_launch",
         "profile_choice",
+        "goal_audit_source",
         "instruction_sources",
         sources::RETAINED_SOURCE_SNAPSHOT,
         sources::LAUNCH_OWNER_RULES,

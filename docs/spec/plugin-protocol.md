@@ -951,21 +951,41 @@ compaction start. The terminal must echo the provider's usage figures and bind
 to the current turn or an exact dispatched idle compaction command. This applies
 to both automatic and manual compaction. The source history stays incomplete
 at the recorded gap. Other unverified gaps fence the stream.
-Antigravity reports completed system checkpoints from the exact owned native
-conversation transcript. The isolated root supplies the path for private
+Antigravity transcript `SYSTEM/CHECKPOINT/DONE` rows are not compaction proof by
+themselves. Installed Antigravity CLI 1.5.16 changelog documents `/compact` as a
+manual command that summarizes the conversation and ends its prompt turn. The adapter maps it
+only when the exact submitted prompt starts with `/compact`, that fenced
+`session/prompt` ends with `end_turn`, and the prompt produces a new checkpoint
+or ACP `compaction_summary_chunk`. Generic checkpoints on other prompts remain
+checkpoint facts. An ACP summary chunk paired with the exact successful prompt
+terminal also maps automatic compaction; `compaction_update` alone is not
+terminal evidence. The isolated root supplies the transcript path for private
 profiles. Inherited profiles can bind it from an authenticated `PreInvocation`
 callback that names the exact conversation transcript under the profile root.
 ACP prompt settlement reads complete rows forward from the retained byte offset.
-Resume establishes a baseline before reporting new checkpoints. The fact carries
-the native checkpoint index, and the task card waits for the next input.
-When the transcript is replaced, Swarm resets the offset and step watermark
-and uses the completed record digest to avoid replaying retained checkpoints.
-The transcript summary stays in the native store.
-Every compaction fact, manual or automatic, active or idle, on every harness, queues
-one [task card](automation.md#inject-context-at-the-safe-point) carrying the Goal, or the first
-input when no Goal is set: in the active turn when the fact binds one, else for the
-next input. A harness that does not yet report its compaction (Claude Code and Muse
-automatic compaction) is a gap tracked by roadmap item A12, not an exception.
+Resume establishes a baseline before reporting new checkpoints. When the
+transcript is replaced, Swarm resets the offset and step watermark and uses the
+completed record digest to avoid replaying retained checkpoints. The transcript
+summary stays in the native store.
+Muse 1.4.25's generated MSP schema defines manual `session/compact` as
+admission-only and reports the terminal through `item/completed`, kind
+`compaction`, with stable `itemId`, `outcome`, `trigger` (`manual` or `auto`),
+and optional `turnId`. Muse maps only `outcome=compacted`; a noop, failure or
+cancellation does not queue a task card. Context-usage deltas are not
+compaction proof.
+Every confirmed compaction fact, manual or automatic, active or idle, queues one
+[task card](automation.md#inject-context-at-the-safe-point) carrying the Goal, or
+the first input when no Goal is set: in the active turn when the fact binds one,
+else for the next input. Codex `contextCompaction` item completion, Claude
+`compact_boundary`, OpenCode `session.compaction.ended`, Muse terminal compaction
+items, and Antigravity's correlated manual/automatic evidence produce this fact.
+Each uses exact native identity when available and the active turn only when
+bound. Claude's boundary does not distinguish manual from automatic compaction
+in its payload, and Claude's adapter does not advertise the compact capability;
+manual native compaction is observed from `compact_boundary`, then the card is
+queued at the active turn's soonest supported point or the next input when
+idle. Its CLI `--autocompact` option does not make Eliot's compact verb
+available.
 An exactly associated OpenCode SSE execution terminal proves its status even when
 HTTP transcript enrichment is unavailable, including after the native server exits.
 Commit that status without final text or usage; unavailable enrichment is not a

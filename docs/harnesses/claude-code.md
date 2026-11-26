@@ -213,6 +213,18 @@ and are never guessed as success, failure, or interruption. This uses the
 [vendor SDKAssistantMessage error field](https://code.claude.com/docs/en/agent-sdk/typescript#sdkassistantmessage),
 not error prose.
 
+The adapter maps a native `system` record with subtype `compact_boundary` to
+`session.context.compacted`, keyed by its exact session and native UUID. It
+includes `turn_id` only when that native boundary is observed during the exact
+active Swarm turn. The Claude harness declaration leaves Eliot's `compact`
+capability false, so Swarm does not issue a compact command; a native manual or
+automatic operation is observed only when Claude emits this boundary. A bound
+boundary queues the task card at the soonest supported context point, which
+moves to the next input if the turn ends first. An idle boundary queues it for
+the next input directly. The installed Claude Code 2.1.278 help advertises
+`--autocompact`; that launch option does not change Eliot's native compact
+capability.
+
 The stream decoder ignores additive fields. Unknown top-level record types,
 unconnected `control_request` subtypes, unknown `command_lifecycle.state`
 values, and unrecognized terminal reasons are recorded as neutral

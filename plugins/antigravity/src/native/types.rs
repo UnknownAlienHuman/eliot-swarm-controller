@@ -384,6 +384,10 @@ pub(crate) enum AcpUpdate {
         cost_amount: Option<f64>,
         cost_unit: Option<String>,
     },
+    /// Native compaction summary content. It carries no standalone terminal
+    /// receipt, so the event owner binds it to the exact pending prompt and
+    /// waits for that prompt's terminal response before publishing compaction.
+    CompactionSummaryChunk,
     /// Known metadata updates this adapter does not model (plan, mode,
     /// config, notices, …): handled without input association.
     Ignored,
@@ -572,14 +576,14 @@ pub(crate) fn classify_update(params: &Value) -> Option<(String, AcpUpdate)> {
                 cost_amount: usage_cost_amount(update.get("cost")),
                 cost_unit: usage_cost_unit(update.get("cost")),
             },
+            "compaction_summary_chunk" => AcpUpdate::CompactionSummaryChunk,
             "plan"
             | "available_commands_update"
             | "current_mode_update"
             | "config_option_update"
             | "session_info_update"
             | "notice"
-            | "compaction_update"
-            | "compaction_summary_chunk" => AcpUpdate::Ignored,
+            | "compaction_update" => AcpUpdate::Ignored,
             other => AcpUpdate::Other(other.to_owned()),
         },
     ))

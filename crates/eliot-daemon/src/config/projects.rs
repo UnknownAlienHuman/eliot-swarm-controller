@@ -73,13 +73,35 @@ impl ProjectPolicyCheck {
     }
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ProjectPolicyBudget {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_rounds: Option<i64>,
+    #[serde(default = "default_max_audits")]
+    pub max_audits: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_cost: Option<core::api::GoalCostLimit>,
+}
+
+fn default_max_audits() -> i64 {
+    2
+}
+
+impl Default for ProjectPolicyBudget {
+    fn default() -> Self {
+        Self {
+            max_rounds: None,
+            max_audits: default_max_audits(),
+            max_cost: None,
+        }
+    }
+}
+
+impl ProjectPolicyBudget {
+    pub(crate) const fn effective_max_audits(&self) -> i64 {
+        self.max_audits
+    }
 }
 
 /// The settings boundary also accepts the former top-level #879 fields so it
@@ -653,6 +675,17 @@ fn normalize_project_policy(
         ));
     }
 
+    let max_audits = policy.budget.effective_max_audits();
+    if !(0..=8).contains(&max_audits) {
+        return Err(config_error_at(
+            source,
+            offset,
+            &format!("projects.{id}.policy.budget.max_audits"),
+            "must be between 0 and 8",
+            "profile_error",
+        ));
+    }
+
     if let Some(limit) = &policy.budget.max_cost {
         limit.validate().map_err(|error| {
             config_error_at(
@@ -688,6 +721,7 @@ fn normalize_project_policy(
         check,
         budget: ProjectPolicyBudget {
             max_rounds,
+            max_audits,
             max_cost: policy.budget.max_cost,
         },
         scope: policy.scope,

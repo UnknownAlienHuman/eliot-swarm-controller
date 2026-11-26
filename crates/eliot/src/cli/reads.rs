@@ -257,6 +257,9 @@ pub(crate) async fn run_show(
             if let Some(message) = &response.first_owner_message {
                 println!("First Owner message:\n{message}");
             }
+            if let Some(objective) = &response.default_goal_objective {
+                println!("Default Goal objective:\n{objective}");
+            }
             if let Some(choice) = &agent.profile_choice
                 && choice
                     .skipped

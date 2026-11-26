@@ -332,6 +332,8 @@ struct AgentSession {
     resources_proved_closed: bool,
     stop_end_ack_proved: bool,
     local_provider: Option<LocalProvider>,
+    goal_audit_read_only: bool,
+    audit_turn_started: bool,
     secret_policy: SecretPolicy,
 }
 
@@ -341,6 +343,9 @@ struct AgentSession {
 /// redaction secrets. Exactly one of `auth_selector` and `local_provider`
 /// is set: local providers use environment-backed authentication.
 struct ParsedStart {
+    /// Frozen one-turn Goal audit mode. This is a per-launch restriction,
+    /// not a profile setting; invalid accompanying permissions fail closed.
+    goal_audit_read_only: bool,
     params: AgentStartParams,
     /// Frozen native-subagent switch (`allow` or `deny`): `deny` stores a
     /// per-session `subagent` deny ruleset on the session (verified by
@@ -1091,10 +1096,47 @@ impl OpenCodePlugin {
         }
         let (initialized, profile) = self.start_prereqs(params)?;
         let requested_mcp_policy = policy_from_snapshot(profile)?;
+        let goal_audit_read_only = match profile.get("goal_audit_read_only") {
+            None => false,
+            Some(Value::Bool(value)) => *value,
+            Some(_) => {
+                return Err(Error::new(
+                    "profile_error",
+                    "OpenCode goal_audit_read_only must be a boolean",
+                ));
+            }
+        };
         let native_subagents = profile
             .get("native_subagents")
             .and_then(Value::as_str)
             .map(str::to_owned);
+        if goal_audit_read_only
+            && (profile.get("mcp") != Some(&Value::String("minimal".to_owned()))
+                || profile.get("mcp_allow") != Some(&Value::Array(Vec::new()))
+                || requested_mcp_policy.as_str() != "minimal"
+                || native_subagents.as_deref() != Some("deny"))
+        {
+            return Err(Error::new(
+                "profile_error",
+                "OpenCode Goal audit requires mcp=minimal, an empty mcp_allow, and native_subagents=deny",
+            ));
+        }
+        if goal_audit_read_only
+            && profile
+                .get("setup")
+                .is_some_and(|setup| !setup.as_array().is_some_and(Vec::is_empty))
+        {
+            return Err(Error::new(
+                "profile_error",
+                "OpenCode Goal audit does not permit launch setup",
+            ));
+        }
+        if goal_audit_read_only && params.resume_from.is_some() {
+            return Err(Error::new(
+                "profile_error",
+                "OpenCode Goal audit must start a fresh native session",
+            ));
+        }
         let mcp_cloud_hostname = eliot_core::parse_snapshot_cloud_hostname(profile);
         // The retained subject validates through the shared Muse/Claude
         // helper: same continuity rules and codes, no local copy.
@@ -1176,6 +1218,7 @@ impl OpenCodePlugin {
         });
         Ok(Box::new(ParsedStart {
             params: params.clone(),
+            goal_audit_read_only,
             native_subagents,
             requested_model,
             model_ref,
@@ -1263,7 +1306,11 @@ impl OpenCodePlugin {
                     reuse_existing: parsed.resume.is_some(),
                 }),
                 local_provider: parsed.local_provider.clone(),
-                owner_rules: parsed.params.owner_rules.clone(),
+                owner_rules: if parsed.goal_audit_read_only {
+                    None
+                } else {
+                    parsed.params.owner_rules.clone()
+                },
                 frozen_pass_env: parsed
                     .params
                     .profile
@@ -1275,6 +1322,7 @@ impl OpenCodePlugin {
                 swarm_environment: parsed.swarm_mcp_environment.clone(),
                 remote_mcp: parsed.remote_mcp.clone(),
                 native_subagents: parsed.native_subagents.clone(),
+                goal_audit_read_only: parsed.goal_audit_read_only,
             },
             &parsed.secrets,
             envelope,
@@ -1348,6 +1396,8 @@ impl OpenCodePlugin {
             resources_proved_closed: false,
             stop_end_ack_proved: false,
             local_provider: parsed.local_provider.clone(),
+            goal_audit_read_only: parsed.goal_audit_read_only,
+            audit_turn_started: false,
             secret_policy: SecretPolicy::new(&parsed.secrets),
         };
 
@@ -1468,7 +1518,13 @@ impl OpenCodePlugin {
         // ruleset, where it outranks every agent/project rule; `allow`
         // profiles create the session unchanged.
         let deny_native_subagents = parsed.native_subagents.as_deref() != Some("allow");
-        let deny_permissions = deny_native_subagents.then(Self::subagent_deny_permissions);
+        let deny_permissions = if parsed.goal_audit_read_only {
+            Some(Self::audit_read_only_permissions())
+        } else if deny_native_subagents {
+            Some(Self::subagent_deny_permissions())
+        } else {
+            None
+        };
         let cutoff = create_cutoff(envelope);
         // The location default is only a preview. Look it up before create,
         // and only when there is spare time ahead of the create request's
@@ -1636,6 +1692,25 @@ impl OpenCodePlugin {
                 )
                 .await;
         }
+        if parsed.goal_audit_read_only
+            && mcp_inventory.as_deref().is_none_or(|servers| {
+                servers
+                    .iter()
+                    .any(|server| matches!(server.status.status.as_str(), "connected" | "pending"))
+            })
+        {
+            return self
+                .fail_created_start(
+                    &parsed.params,
+                    session,
+                    Error::new(
+                        "profile_error",
+                        "OpenCode Goal audit requires an empty serving MCP inventory",
+                    ),
+                    envelope,
+                )
+                .await;
+        }
         // Effective-configuration proofs: the inventory gate above only sees
         // entry names and statuses. Managed, system and global layers merge
         // natively above the project files the pre-create scan sees
@@ -1663,6 +1738,20 @@ impl OpenCodePlugin {
                     parsed.mcp_cloud_hostname.as_deref(),
                 )
                 .and_then(|()| {
+                    if parsed.goal_audit_read_only
+                        && documents.iter().any(|document| {
+                            document
+                                .info
+                                .as_ref()
+                                .and_then(|info| info.mcp.as_ref())
+                                .is_some_and(|mcp| !mcp.servers.is_empty())
+                        })
+                    {
+                        return Err(Error::new(
+                            "profile_error",
+                            "OpenCode Goal audit found an effective MCP server definition",
+                        ));
+                    }
                     if mcp_inventory.as_deref().is_some_and(|servers| {
                         servers
                             .iter()
@@ -1708,7 +1797,40 @@ impl OpenCodePlugin {
         // never serve a `deny` profile), while an unproved removal keeps the
         // exact native identity in memory as unknown with the live server.
         // The same readback sets the verification flag.
-        let subagents_verified = if deny_native_subagents {
+        let policy_verified = if parsed.goal_audit_read_only {
+            match Self::readback_audit_read_only(
+                &session.http,
+                &created.id,
+                phase_deadline(cutoff, RPC_TIMEOUT),
+            )
+            .await
+            {
+                Ok(true) => true,
+                Ok(false) => {
+                    return self
+                        .fail_created_start(
+                            &parsed.params,
+                            session,
+                            Error::new(
+                                "profile_error",
+                                "OpenCode audit permission ruleset is missing or widened",
+                            ),
+                            envelope,
+                        )
+                        .await;
+                }
+                Err(error) => {
+                    return self
+                        .fail_created_start(
+                            &parsed.params,
+                            session,
+                            Error::new("native_readback", *error.message),
+                            envelope,
+                        )
+                        .await;
+                }
+            }
+        } else if deny_native_subagents {
             match Self::readback_subagent_deny(
                 &session.http,
                 &created.id,
@@ -1746,16 +1868,26 @@ impl OpenCodePlugin {
         } else {
             "allow"
         });
-        effective["native_subagents_verified"] = json!(subagents_verified);
-        let hook_timing = crate::native::startup::Step::new("context_bind");
-        let context_bound = bind_context_hooks(
-            &session.http,
-            &created.id,
-            phase_deadline(cutoff, RPC_TIMEOUT),
-        )
-        .await;
-        drop(hook_timing);
-        let effective = if context_bound {
+        effective["native_subagents_verified"] = json!(policy_verified);
+        effective["goal_audit_read_only"] = json!(parsed.goal_audit_read_only);
+        effective["goal_audit_read_only_verified"] =
+            json!(!parsed.goal_audit_read_only || policy_verified);
+        let context_bound = if parsed.goal_audit_read_only {
+            false
+        } else {
+            let hook_timing = crate::native::startup::Step::new("context_bind");
+            let bound = bind_context_hooks(
+                &session.http,
+                &created.id,
+                phase_deadline(cutoff, RPC_TIMEOUT),
+            )
+            .await;
+            drop(hook_timing);
+            bound
+        };
+        let effective = if parsed.goal_audit_read_only {
+            with_context_points(effective, &[])
+        } else if context_bound {
             with_context_points(
                 effective,
                 &[InjectPoint::NextInput, InjectPoint::TurnSafePoint],
@@ -2586,6 +2718,50 @@ impl OpenCodePlugin {
         }]
     }
 
+    /// Deny every native action, then allow only the four non-mutating file
+    /// discovery/read actions. Keep the subagent deny last as a safety pin.
+    fn audit_read_only_permissions() -> Vec<PermissionRule> {
+        let mut rules = vec![PermissionRule {
+            action: "*".to_owned(),
+            resource: "*".to_owned(),
+            effect: "deny".to_owned(),
+        }];
+        for action in ["read", "list", "glob", "grep"] {
+            rules.push(PermissionRule {
+                action: action.to_owned(),
+                resource: "*".to_owned(),
+                effect: "allow".to_owned(),
+            });
+        }
+        rules.push(PermissionRule {
+            action: "subagent".to_owned(),
+            resource: "*".to_owned(),
+            effect: "deny".to_owned(),
+        });
+        rules
+    }
+
+    async fn readback_audit_read_only(
+        http: &OpenCodeHttp,
+        session_id: &str,
+        deadline: Instant,
+    ) -> Result<bool> {
+        let info = http
+            .get_session(session_id, deadline)
+            .await
+            .map_err(|error| {
+                Error::new(
+                    "native_readback",
+                    format!(
+                        "OpenCode audit permission readback failed ({})",
+                        error.message
+                    ),
+                )
+            })?;
+        let expected = Self::audit_read_only_permissions();
+        Ok(info.permissions.as_deref() == Some(expected.as_slice()))
+    }
+
     /// Prove the stored session carries the deny ruleset with a fresh
     /// `session.get`. A lost readback is `native_readback`, never unknown:
     /// the read itself proves nothing was written.
@@ -3129,6 +3305,12 @@ impl OpenCodePlugin {
 
     async fn send_command(&mut self, params: AgentCommandParams) -> Result<Value> {
         let session = ready_session(&mut self.session, &params)?;
+        if session.goal_audit_read_only && session.audit_turn_started {
+            return Err(Error::new(
+                "unsupported",
+                "OpenCode Goal audit permits exactly one model turn",
+            ));
+        }
         let text = Self::admit_send_command(session, &params).await?;
         let command_id = params.command_id;
         // One deadline for admission plus association: the HTTP 200 only
@@ -3141,7 +3323,12 @@ impl OpenCodePlugin {
             .ok_or_else(|| Error::new("unknown", "OpenCode session identity is unresolved"))?;
         let inbox = match Self::prompt_session(session, &session_id, &text, deadline).await? {
             PromptAdmission::Rejected(value) => return Ok(value),
-            PromptAdmission::Admitted(inbox) => inbox,
+            PromptAdmission::Admitted(inbox) => {
+                if session.goal_audit_read_only {
+                    session.audit_turn_started = true;
+                }
+                inbox
+            }
         };
         Self::associate_prompt_turn(
             session,

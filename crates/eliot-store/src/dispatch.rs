@@ -56,7 +56,49 @@ fn dispatch_target_tx(tx: &Transaction<'_>, command: &CommandRecord) -> Result<(
             &command.command.id,
             agent_num,
             agent.workspace.as_deref(),
+            goals::audit_launch_checkout_owner_tx(
+                tx,
+                &command.command.args,
+                &command.command.id,
+                agent.workspace.as_deref(),
+            )?,
         )?;
+    }
+    if agent.is_goal_auditor()
+        && matches!(
+            command.command.verb.as_str(),
+            "send" | "steer" | "inject" | "resume" | "configure"
+        )
+    {
+        let launch_id = tx.query_row(
+            "SELECT parent_command FROM commands WHERE id=?1 AND verb='send' AND link_kind='send' AND ordinal=0",
+            [&command.command.id],
+            |row| row.get::<_, String>(0),
+        ).optional().map_err(sql_error)?;
+        let Some(launch) = launch_id
+            .as_deref()
+            .map(|id| load_command(tx, id))
+            .transpose()?
+            .flatten()
+        else {
+            return Err(Error::new(
+                "not_allowed",
+                "Goal auditor accepts only its linked audit input",
+            ));
+        };
+        if goals::audit_launch_checkout_owner_tx(
+            tx,
+            &launch.args,
+            &launch.id,
+            agent.workspace.as_deref(),
+        )?
+        .is_none()
+        {
+            return Err(Error::new(
+                "not_allowed",
+                "Goal auditor has no bound audit launch",
+            ));
+        }
     }
     if matches!(command.command.verb.as_str(), "launch" | "send" | "steer") {
         provider_holds::require_dispatch_tx(tx, &agent, &command.command)?;

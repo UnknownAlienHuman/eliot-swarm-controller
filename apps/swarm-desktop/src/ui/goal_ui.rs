@@ -68,7 +68,7 @@ struct Draft {
 
 impl Draft {
     /// The fields as the goal fills them (empty with no goal).
-    fn of(goal: Option<&GoalView>) -> Self {
+    fn of(goal: Option<&GoalView>, default_objective: Option<&str>) -> Self {
         match goal {
             Some(goal) => Self {
                 text: goal.definition.text.clone(),
@@ -81,7 +81,7 @@ impl Draft {
                     .map(|limit| limit as f64),
             },
             None => Self {
-                text: String::new(),
+                text: default_objective.unwrap_or_default().to_owned(),
                 check: String::new(),
                 rounds: None,
                 turns: None,
@@ -268,6 +268,25 @@ fn parse_argv(line: &str) -> Result<Vec<String>, String> {
 }
 
 impl DesktopApp {
+    /// The projected default objective seeds the existing Goal editor until
+    /// a Goal has been set or cleared in this generation.
+    fn default_goal_objective(&self, agent: &str) -> Option<&str> {
+        let goal = self
+            .chat
+            .goal
+            .as_ref()
+            .filter(|(id, _)| id == agent)
+            .and_then(|(_, goal)| goal.as_ref());
+        if goal.is_some_and(|goal| goal.status == GoalStatus::Cleared) {
+            return None;
+        }
+        self.chat
+            .detail
+            .as_ref()
+            .filter(|detail| detail.agent == agent)
+            .and_then(|detail| detail.default_goal_objective.as_deref())
+    }
+
     /// The open dialog's goal: none while it is read, `Some(None)` with no
     /// goal (a cleared one included).
     fn dialog_goal(&self, agent: &str) -> Option<Option<&GoalView>> {
@@ -314,7 +333,10 @@ impl DesktopApp {
                 let Some(agent) = self.goal.open.as_ref().map(|open| open.agent.clone()) else {
                     return;
                 };
-                let current = Draft::of(self.dialog_goal(&agent).flatten());
+                let current = Draft::of(
+                    self.dialog_goal(&agent).flatten(),
+                    self.default_goal_objective(&agent),
+                );
                 let Some(open) = self.goal.open.as_mut() else {
                     return;
                 };
@@ -355,7 +377,11 @@ impl DesktopApp {
             return;
         };
         let goal = self.dialog_goal(&open.agent).flatten();
-        let draft = open.draft.clone().unwrap_or_else(|| Draft::of(goal));
+        let default_objective = self.default_goal_objective(&open.agent);
+        let draft = open
+            .draft
+            .clone()
+            .unwrap_or_else(|| Draft::of(goal, default_objective));
         let checked = draft.definition(goal).and_then(|definition| {
             let id = open
                 .retry
@@ -488,7 +514,11 @@ impl DesktopApp {
         let open = self.goal.open.as_ref()?;
         let goal = self.dialog_goal(&open.agent);
         let current = goal.flatten();
-        let draft = open.draft.clone().unwrap_or_else(|| Draft::of(current));
+        let default_objective = self.default_goal_objective(&open.agent);
+        let draft = open
+            .draft
+            .clone()
+            .unwrap_or_else(|| Draft::of(current, default_objective));
         let busy = open.busy.is_some();
         // While no daemon answers, no read runs: the goal shown is not
         // confirmed, as after a failed read.
@@ -505,6 +535,10 @@ impl DesktopApp {
         let context_line = match (goal, read_error) {
             (None, Some(error)) => Some(format!("The goal could not be read: {error}")),
             (None, None) => Some("Reading the goal…".to_owned()),
+            (Some(None), None) if self.default_goal_objective(&open.agent).is_some() => Some(
+                "Default objective · no checks or automatic rounds run until you set a Goal."
+                    .to_owned(),
+            ),
             (Some(None), None) => None,
             (Some(None), Some(error)) => {
                 Some(format!("No goal when last read. Not read again: {error}"))
@@ -600,6 +634,9 @@ impl DesktopApp {
         }]);
         let heading = match current {
             Some(_) => format!("Goal for “{}”", open.title),
+            None if self.default_goal_objective(&open.agent).is_some() => {
+                format!("Default objective for “{}”", open.title)
+            }
             None => format!("Set a goal for “{}”", open.title),
         };
         Some(super::dialog_ui::surface(

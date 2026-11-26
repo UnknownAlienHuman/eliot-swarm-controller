@@ -16,6 +16,7 @@ pub(super) struct LaunchRouting<'a> {
     pub(super) growth_switch: bool,
     pub(super) preview: bool,
     pub(super) harness_check_candidate: Option<&'a eliot_core::api::HarnessCandidate>,
+    pub(super) audit_source: Option<&'a Agent>,
 }
 
 impl LaunchRouting<'_> {
@@ -164,6 +165,7 @@ struct RoutePreflight {
     provider_authority: Option<[u8; 32]>,
     provider_source: Option<Value>,
     handoff_source: Option<Value>,
+    audit_source: Option<Agent>,
     withheld_provider_routes: HashSet<String>,
     withheld_fresh_session: bool,
     handoff_allowed: Option<Vec<String>>,
@@ -320,7 +322,8 @@ impl Router {
             reason: "no available candidate".into(),
             skipped: Vec::new(),
             quota_status: RouteQuotaStatus::Unknown,
-            provider_failover: (provider_reactions
+            provider_failover: (mode.audit_source.is_none()
+                && provider_reactions
                 && routing.auto_handoff()
                 && routing.provider_failover()
                 && matches!(principal, Principal::Owner)
@@ -332,6 +335,7 @@ impl Router {
         // A held account is never replaced with another account of the same
         // harness. Policy may still select a different native harness.
         let mut preflight = RoutePreflight {
+            audit_source: mode.audit_source.cloned(),
             preview: mode.preview,
             arbitrated: mode.arbitrated,
             automatic: mode.automatic(principal),
@@ -833,6 +837,11 @@ impl Router {
             }
         };
         let harness = required_text(&snapshot, "harness")?.to_owned();
+        if let Some(source) = &preflight.audit_source
+            && !super::goal_audit::prepare_audit_profile(source, &harness, &mut snapshot)
+        {
+            return Ok(Err(RouteSkipReason::InvalidProfile));
+        }
         // A failed self-check removes the harness from automatic routing until
         // a later check passes (#932 item 3). Explicit Owner launches bypass
         // routing, so they still work.

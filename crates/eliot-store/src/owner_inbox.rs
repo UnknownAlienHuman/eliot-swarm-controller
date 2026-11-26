@@ -87,6 +87,7 @@ fn artifact_capacity_item(connection: &Connection) -> eliot_core::Result<Option<
         group: None,
         blocks_work: false,
         outcome_unknown: false,
+        audit_history: None,
     }))
 }
 
@@ -2043,7 +2044,9 @@ fn project_goals(
            * (COALESCE(json_extract(g.state,'$.last_committed_slot'),0) + 1),
        COALESCE(json_extract(g.state,'$.paused_reason') = '{deferral_limit_reason}',0),
        EXISTS(SELECT 1 FROM goal_markers m WHERE m.agent=g.agent AND m.mode=g.mode
-            AND m.generation=g.generation AND m.revision=g.revision AND m.state='unknown')
+            AND m.generation=g.generation AND m.revision=g.revision AND m.state='unknown'),
+       json_extract(g.state,'$.audit_history'),
+       json_extract(g.state,'$.audit_cycle.blocked_reason')
        FROM goals g JOIN agents a ON a.id=g.agent WHERE (json_extract(g.state,'$.status') IN ('active','blocked')
          OR (json_extract(g.state,'$.status') = 'paused'
              AND json_extract(g.state,'$.paused_reason') = '{deferral_limit_reason}'))
@@ -2070,6 +2073,8 @@ fn project_goals(
                 r.get::<_, Option<i64>>(10)?,
                 r.get::<_, bool>(11)?,
                 r.get::<_, bool>(12)?,
+                r.get::<_, Option<String>>(13)?,
+                r.get::<_, Option<String>>(14)?,
             ))
         })
         .map_err(sql_error)?;
@@ -2088,7 +2093,21 @@ fn project_goals(
             timer_due,
             deferral_paused,
             unknown,
+            raw_audit_history,
+            audit_reason,
         ) = row.map_err(sql_error)?;
+        let audit_history = raw_audit_history
+            .as_deref()
+            .map(serde_json::from_str::<Vec<eliot_core::api::GoalAuditHistoryEntry>>)
+            .transpose()
+            .map_err(|_| crate::Error::new("corrupt", "invalid Goal audit history"))?
+            .unwrap_or_default();
+        if audit_history.len() > 8 {
+            return Err(crate::Error::new(
+                "corrupt",
+                "Goal audit history exceeds its retained bound",
+            ));
+        }
         let state = match raw_state.as_str() {
             "active" => GoalStatus::Active,
             "blocked" => GoalStatus::Blocked,
@@ -2126,7 +2145,7 @@ fn project_goals(
             } else if deferral_paused {
                 deferral_limit_reason
             } else {
-                "goal_blocked"
+                audit_reason.as_deref().unwrap_or("goal_blocked")
             };
             let clear = action(
                 "clear",
@@ -2136,7 +2155,17 @@ fn project_goals(
             let mut projected = item(
                 OwnerInboxKind::BlockedGoal,
                 subject,
-                format!("g{generation}:goal:{revision}:event:{event_seq}"),
+                format!(
+                    "g{generation}:goal:{revision}:event:{event_seq}:audit:{}",
+                    eliot_core::api::inference::sha256_hex(
+                        serde_json::to_string(&audit_history)
+                            .map_err(|_| crate::Error::new(
+                                "internal",
+                                "serialize Goal audit history"
+                            ))?
+                            .as_bytes()
+                    )
+                ),
                 now,
                 since,
                 reason,
@@ -2144,6 +2173,7 @@ fn project_goals(
                 vec![clear],
             );
             projected.outcome_unknown = unknown;
+            projected.audit_history = (!audit_history.is_empty()).then_some(audit_history);
             items.push(projected);
         } else if let Mover::Stuck { reason } = result {
             let inspect = action(
@@ -2485,5 +2515,6 @@ fn item(
         group: None,
         blocks_work: false,
         outcome_unknown: false,
+        audit_history: None,
     }
 }

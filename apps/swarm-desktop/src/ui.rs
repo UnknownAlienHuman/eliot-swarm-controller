@@ -178,6 +178,8 @@ struct UiDetail {
     /// Actual task checkout, which can differ from its project on a worktree.
     workspace: Option<String>,
     project_instructions: Option<Vec<String>>,
+    /// Fallback Goal objective projected from the retained first linked input.
+    default_goal_objective: Option<String>,
     /// The routing decision recorded at admission (None: an explicit
     /// profile or harness).
     routing: Option<eliot_core::RoutingDecision>,
@@ -779,6 +781,7 @@ fn detail_from(reply: &AgentGetResponse) -> UiDetail {
         parent: reply.agent.parent.clone(),
         workspace: reply.agent.workspace.clone(),
         project_instructions: crate::monitor_view::project_instruction_lines(reply),
+        default_goal_objective: reply.default_goal_objective.clone(),
         routing: reply.agent.profile_choice.clone(),
         control_failure: reply.last_control_failure.clone(),
         branch: reply.agent.branch.clone(),

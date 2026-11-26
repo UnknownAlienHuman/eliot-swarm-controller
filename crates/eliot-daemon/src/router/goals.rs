@@ -1350,6 +1350,7 @@ pub(crate) async fn run_goal_driver(
     let mut followup_tick = tokio::time::interval(std::time::Duration::from_secs(30));
     followup_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut rounds: JoinSet<(String, i64)> = JoinSet::new();
+    let mut audits = JoinSet::new();
     let mut in_flight: HashMap<String, InFlightAutoRound> = HashMap::new();
     // Newest event per Goal with a round in flight, driven as a follow-up
     // when that round resolves. Never filled past shutdown: the drain
@@ -1377,6 +1378,15 @@ pub(crate) async fn run_goal_driver(
                 if expired {
                     router.notify_goal_reconcile();
                 }
+                if audits.is_empty() {
+                    let router = router.clone();
+                    audits.spawn(async move { router.drive_goal_audits().await });
+                }
+            }
+            Some(joined) = audits.join_next(), if !audits.is_empty() => {
+                if let Ok(Err(error)) = joined {
+                    crate::logging::record(&router.secret_policy_snapshot(), "daemon.goal_audit_read_failed", &[], Some(&error));
+                }
             }
             changed = shutdown.changed() => {
                 if changed.is_err() || *shutdown.borrow() {
@@ -1388,7 +1398,12 @@ pub(crate) async fn run_goal_driver(
                 }
             }
             received = events.recv() => match received {
-                Ok(event) if event.kind == "goal.round" => {}
+                Ok(event) if event.kind == "goal.round" => {
+                    if event.data["outcome"] == "blocked" && audits.is_empty() {
+                        let router = router.clone();
+                        audits.spawn(async move { router.drive_goal_audits().await });
+                    }
+                }
                 Ok(event) => {
                     spawn_auto_round(
                         &router,

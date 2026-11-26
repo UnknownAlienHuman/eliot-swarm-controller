@@ -1036,7 +1036,13 @@ fn admit_launch_tx(
     workspace::require_managed_path_ready(tx, &workspace)?;
     work_truth::require_no_checkpoint_restore(tx, &workspace)?;
     if !linked_switch_launch {
-        switch::require_checkout_owner_tx(tx, Some(&workspace), None)?;
+        let audit_owner = goals::audit_launch_checkout_owner_tx(
+            tx,
+            &request.args,
+            &request.id,
+            Some(&workspace),
+        )?;
+        switch::require_checkout_owner_tx(tx, Some(&workspace), audit_owner)?;
     }
     if request.args.get("prompt").is_some() {
         return Err(Error::new(

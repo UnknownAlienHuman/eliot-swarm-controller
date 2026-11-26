@@ -107,6 +107,17 @@ native refusal alone does not prove a contract mismatch or an upstream failure.
 | goal | native set/edit/pause/resume/clear where installed schema supports them |
 | compact/fork/background | native-only, advertised after implementation |
 
+Muse 1.4.25's offline `muse schema generate-json-schema` export defines
+`session/compact` as manual compaction with an admission-only acknowledgment;
+the durable result is an `item/completed` notification for kind `compaction`.
+Its stable `itemId`, terminal `outcome`, `trigger` (`manual` or `auto`), and
+optional owning `turnId` provide the correlation. The adapter emits
+`session.context.compacted` only for `outcome=compacted`, using that exact item
+identity. A `noop`, failed or cancelled outcome emits no compaction fact. A
+manual result for the latest completed turn queues the task card for the next
+input; an exact active-turn result remains bound to that turn. Context usage
+changes alone are never treated as compaction.
+
 The Muse 1.4.25 MSP schema documents that an omitted `session/setModel`
 `profileId` means no profile. In #949, the retained Contributor selector
 lost its `tbh` route and the provider answered with the ordinary model.
