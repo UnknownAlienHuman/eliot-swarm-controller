@@ -182,6 +182,7 @@ impl OpenCodeHttp {
         directory: &str,
         permissions: Option<&[PermissionRule]>,
         deadline: Instant,
+        native_ref: &mut Option<String>,
     ) -> std::result::Result<SessionInfo, HttpOutcome> {
         let path = server_native_directory(Path::new(directory)).map_err(|_| {
             HttpOutcome::NotDispatched {
@@ -203,7 +204,9 @@ impl OpenCodeHttp {
             }),
             permissions: permissions.map(<[PermissionRule]>::to_vec),
         })
-        .map_err(|_| HttpOutcome::unknown("OpenCode session/create params could not be encoded"))?;
+        .map_err(|_| HttpOutcome::NotDispatched {
+            reason: "OpenCode session/create params could not be encoded".to_owned(),
+        })?;
         if Instant::now() >= deadline {
             return Err(HttpOutcome::NotDispatched {
                 reason: "OpenCode session/create deadline elapsed before dispatch".to_owned(),
@@ -221,8 +224,19 @@ impl OpenCodeHttp {
         if response.status == 200 {
             let envelope: DataEnvelope<SessionInfo> = serde_json::from_slice(&response.body)
                 .map_err(|_| {
+                    // The response is tied to this request even if a separate
+                    // field prevents decoding the complete session metadata.
+                    *native_ref =
+                        serde_json::from_slice::<DataEnvelope<serde_json::Value>>(&response.body)
+                            .ok()
+                            .and_then(|envelope| {
+                                envelope.data["id"]
+                                    .as_str()
+                                    .filter(|id| !id.trim().is_empty())
+                                    .map(str::to_owned)
+                            });
                     HttpOutcome::unknown(
-                        "OpenCode session/create returned no exact session identity",
+                        "OpenCode session/create returned incomplete session metadata",
                     )
                 })?;
             if envelope.data.id.trim().is_empty() {
@@ -230,8 +244,15 @@ impl OpenCodeHttp {
                     "OpenCode session/create returned no exact session identity",
                 ));
             }
+            *native_ref = Some(envelope.data.id.clone());
             return Ok(envelope.data);
         }
+        // OpenCode v2.4.1 performs schema decoding and authorization before
+        // the handler. Session.create checks the parent before publishing
+        // SessionEvent.Created and treats failed post-create readback as a defect.
+        // https://github.com/anomalyco/opencode/blob/v2.4.1/packages/protocol/src/groups/session.ts#L167-L184
+        // https://github.com/anomalyco/opencode/blob/v2.4.1/packages/server/src/middleware/authorization.ts#L102-L107
+        // https://github.com/anomalyco/opencode/blob/v2.4.1/packages/core/src/session.ts#L292-L342
         Err(map_write_error("session/create", &response))
     }
 
@@ -1147,8 +1168,9 @@ impl OpenCodeHttp {
             .header(OPENCODE_DIRECTORY_HEADER, self.directory_header.clone());
         if let Some(body) = body {
             // The workspace reqwest has no `json` feature; encode manually.
-            let encoded = serde_json::to_vec(&body)
-                .map_err(|_| HttpOutcome::unknown("OpenCode request body could not be encoded"))?;
+            let encoded = serde_json::to_vec(&body).map_err(|_| HttpOutcome::NotDispatched {
+                reason: "OpenCode request body could not be encoded".to_owned(),
+            })?;
             request = request
                 .header(reqwest::header::CONTENT_TYPE, "application/json")
                 .body(encoded);

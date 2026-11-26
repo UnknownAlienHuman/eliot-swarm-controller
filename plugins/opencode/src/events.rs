@@ -196,6 +196,8 @@ pub(crate) struct EventStatus {
     pub ready: bool,
     pub connected: bool,
     pub session_id: Option<String>,
+    pub created_session_id: Option<String>,
+    pub multiple_session_creations: bool,
     pub active_command_id: Option<String>,
     pub active_turn_id: Option<String>,
     pub last_turn: Option<TurnFacts>,
@@ -736,11 +738,23 @@ impl EventHandle {
         }
     }
 
-    /// The event task's CURRENT status, read synchronously through the
-    /// control queue: a snapshot racing the close publish must observe
-    /// post-commit state, not the last published watch value (which can
-    /// still show the active turn after the caller already observed
-    /// turn.completed).
+    pub async fn created_session_id(&self, deadline: Instant) -> Option<String> {
+        let mut status = self.actor.watch().clone();
+        let status = timeout_at(
+            deadline,
+            status.wait_for(|status| status.created_session_id.is_some() || status.native_drained),
+        )
+        .await
+        .ok()?
+        .ok()?;
+        if status.multiple_session_creations {
+            return None;
+        }
+        status.created_session_id.clone()
+    }
+
+    /// Read current status through the control queue after any in-flight
+    /// event commit, which might be newer than the published watch value.
     pub async fn current_status(&self) -> Result<EventStatus> {
         self.actor
             .call(|reply| Control::SnapshotStatus { reply })
@@ -975,6 +989,18 @@ impl EventProcessor {
         match frame {
             Some(SseFrame::Event(envelope)) => {
                 if envelope.event_type == "session.created" {
+                    if !self.status.ready
+                        && let Ok(created) =
+                            serde_json::from_value::<SessionLifecycleData>(envelope.data.clone())
+                        && !created.session_id.trim().is_empty()
+                    {
+                        if let Some(observed) = &self.status.created_session_id {
+                            self.status.multiple_session_creations |=
+                                observed != &created.session_id;
+                        } else {
+                            self.status.created_session_id = Some(created.session_id);
+                        }
+                    }
                     drop(crate::native::startup::Step::new("session_created_event"));
                 }
                 if self.should_buffer(&envelope.event_type) {

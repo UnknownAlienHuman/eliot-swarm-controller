@@ -39,6 +39,7 @@ use eliot_plugin::{
         unknown_control, unknown_snapshot, validate_binding, validate_identity,
         with_claimed_context, with_context_points, with_model_catalogue_diagnostic,
     },
+    start_classification::{StartPoint, is_proven_no_effect, start_failure},
 };
 use serde_json::{Value, json};
 use std::{
@@ -435,26 +436,56 @@ impl MusePlugin {
         Ok(serde_json::json!({"validated": true}))
     }
 
-    /// Settle a failed start: the settled marker refuses any second
-    /// agent.start, and the daemon retires this plugin process.
-    fn retain_failed_start(&mut self, error: Error) -> Error {
+    async fn fail_session_start(
+        &mut self,
+        params: &AgentStartParams,
+        mut session: AgentSession,
+        point: StartPoint,
+        phase: &str,
+        error: Error,
+    ) -> Result<Value> {
         self.failed_start = Some(FailedStart);
-        error
+        let (point, error) = if is_proven_no_effect(point) {
+            discard_unstarted(&mut session).await;
+            if session.phase != SessionPhase::Stopped {
+                let message = format!("{}; owned host exit is unconfirmed", error.message);
+                (StartPoint::TransportLost, error.with_message(message))
+            } else if error.code == "unknown" {
+                (StartPoint::TransportLost, error)
+            } else {
+                (point, error)
+            }
+        } else {
+            (point, error)
+        };
+        let error = session.native_client.diagnostic_error(error);
+        if !is_proven_no_effect(point) {
+            session.session_id = session
+                .session_id
+                .or_else(|| session.events.status().session_id);
+        }
+        let result = start_failure(
+            params,
+            "muse",
+            phase,
+            point,
+            error,
+            session.session_id.as_deref(),
+        );
+        if result.is_err() {
+            self.session = Some(session);
+        }
+        result
     }
 
-    /// Retain a proven-no-effect start failure and build its failed-state
-    /// result: no `session/start|resume` was dispatched and no input was
-    /// sent, so the launch is definitely failed, never unknown. The reason
-    /// names the failed check in short non-secret words; it is persisted in
-    /// the daemon outcome, so it must never carry paths, values, or secrets.
-    fn retain_proven_no_effect_start(&mut self, params: &AgentStartParams, error: Error) -> Value {
-        debug_assert!(eliot_plugin::start_classification::is_proven_no_effect(
-            eliot_plugin::start_classification::StartPoint::NativeRefusalBeforeDispatch
-        ));
-        let error = eliot_plugin::session::classify_start_failure(error, "muse", "prepare");
-        let value = eliot_plugin::session::failed_start_value(params, error);
+    fn fail_start_preparation(&mut self, params: &AgentStartParams, error: Error) -> Result<Value> {
         self.failed_start = Some(FailedStart);
-        value
+        let point = if error.code == "unknown" {
+            StartPoint::TransportLost
+        } else {
+            StartPoint::BeforeSpawn
+        };
+        start_failure(params, "muse", "prepare", point, error, None)
     }
 
     async fn start(&mut self, raw: &Value, peer: &PeerClient) -> Result<Value> {
@@ -492,12 +523,12 @@ impl MusePlugin {
         } = match start::prepare_profile(&params, initialized) {
             Ok(prepared) => prepared,
             Err(error) => {
-                return Ok(self.retain_proven_no_effect_start(&params, error));
+                return self.fail_start_preparation(&params, error);
             }
         };
         let skill_pointer = match start::skill_pointer(&params) {
             Ok(pointer) => pointer,
-            Err(error) => return Ok(self.retain_proven_no_effect_start(&params, error)),
+            Err(error) => return self.fail_start_preparation(&params, error),
         };
         let policy = SecretPolicy::new(secrets.iter());
         let mut host = match catalogue::CatalogueHost::open(
@@ -510,8 +541,7 @@ impl MusePlugin {
         .await
         {
             Ok(host) => host,
-            Err(error) if error.code == "unknown" => return Err(self.retain_failed_start(error)),
-            Err(error) => return Ok(self.retain_proven_no_effect_start(&params, error)),
+            Err(error) => return self.fail_start_preparation(&params, error),
         };
         let initialized_native = match Self::validate_catalogue(
             &host,
@@ -521,8 +551,10 @@ impl MusePlugin {
             Ok(validated) => validated,
             Err(error) => {
                 return match host.close().await {
-                    Ok(()) => Ok(self.retain_proven_no_effect_start(&params, error)),
-                    Err(cleanup) => Err(self.retain_failed_start(cleanup)),
+                    Ok(()) => self.fail_start_preparation(&params, error),
+                    Err(cleanup) => {
+                        self.fail_start_preparation(&params, cleanup.with_code("unknown"))
+                    }
                 };
             }
         };
@@ -538,9 +570,11 @@ impl MusePlugin {
             model_hold_settings_path,
             skill_pointer,
             peer,
-        ) {
+        )
+        .await
+        {
             Ok(session) => session,
-            Err(error) => return Ok(self.retain_proven_no_effect_start(&params, error)),
+            Err(error) => return self.fail_start_preparation(&params, error),
         };
         session.contributor_mode_forced =
             requested_model.as_deref().is_some_and(is_contributor_model);
@@ -558,24 +592,15 @@ impl MusePlugin {
         )
         .await
         {
-            session.events.close().await;
-            if session
-                .native
-                .terminate(true, Instant::now() + RPC_TIMEOUT)
-                .await
-                .is_err()
-            {
-                self.session = Some(session);
-                let message = format!(
-                    "{}; owned session host cleanup is unconfirmed; no session or input was sent",
-                    error.message
-                );
-                return Err(contextual_error(error, "unknown", message));
-            }
-            // Registration failed but the child is terminated: no session was
-            // dispatched, so this is proven-no-effect. Registration messages
-            // are canned words plus a code, safe to persist as the reason.
-            return Ok(self.retain_proven_no_effect_start(&params, error));
+            return self
+                .fail_session_start(
+                    &params,
+                    session,
+                    StartPoint::NativeRefusalBeforeDispatch,
+                    "register",
+                    error,
+                )
+                .await;
         }
 
         session.selected_effort = initialized_native.effort.clone();
@@ -583,24 +608,18 @@ impl MusePlugin {
 
         if let Some(subject) = &resume_subject {
             if subject.native_scope != session.native_scope {
-                let error = discard_failed_start(
-                    &mut session,
-                    Error::new(
-                        "profile_error",
-                        "Muse resume subject is outside the authenticated native scope",
-                    ),
-                )
-                .await;
-                if session.phase == SessionPhase::Unknown {
-                    let message = format!(
-                        "{}; owned session host cleanup is unconfirmed; no session/resume or input was sent",
-                        error.message
-                    );
-                    self.session = Some(session);
-                    return Err(error.with_code("unknown").with_message(message));
-                }
-                // No `session/resume` was dispatched: proven-no-effect.
-                return Ok(self.retain_proven_no_effect_start(&params, error));
+                return self
+                    .fail_session_start(
+                        &params,
+                        session,
+                        StartPoint::NativeRefusalBeforeDispatch,
+                        "resume_preflight",
+                        Error::new(
+                            "profile_error",
+                            "Muse resume subject is outside the authenticated native scope",
+                        ),
+                    )
+                    .await;
             }
             session.session_id = Some(subject.native_ref.clone());
             if let Err(error) = verify_resume_preflight(
@@ -621,17 +640,15 @@ impl MusePlugin {
                     error.with_code("native_readback")
                 }
                 .with_message(message);
-                let error = discard_failed_start(&mut session, error).await;
-                if session.phase == SessionPhase::Unknown {
-                    let message = format!(
-                        "{}; owned session host cleanup is unconfirmed; no session/resume or input was sent",
-                        error.message
-                    );
-                    self.session = Some(session);
-                    return Err(error.with_code("unknown").with_message(message));
-                }
-                // Only prerequisite reads ran: proven-no-effect.
-                return Ok(self.retain_proven_no_effect_start(&params, error));
+                return self
+                    .fail_session_start(
+                        &params,
+                        session,
+                        StartPoint::NativeRefusalBeforeDispatch,
+                        "resume_preflight",
+                        error,
+                    )
+                    .await;
             }
         }
 
@@ -653,7 +670,15 @@ impl MusePlugin {
             match encoded {
                 Ok(value) => ("session/resume", value),
                 Err(error) => {
-                    return Ok(self.retain_proven_no_effect_start(&params, error));
+                    return self
+                        .fail_session_start(
+                            &params,
+                            session,
+                            StartPoint::NativeRefusalBeforeDispatch,
+                            "encode",
+                            error,
+                        )
+                        .await;
                 }
             }
         } else {
@@ -668,20 +693,45 @@ impl MusePlugin {
             match encoded {
                 Ok(value) => ("session/start", value),
                 Err(error) => {
-                    return Ok(self.retain_proven_no_effect_start(&params, error));
+                    return self
+                        .fail_session_start(
+                            &params,
+                            session,
+                            StartPoint::NativeRefusalBeforeDispatch,
+                            "encode",
+                            error,
+                        )
+                        .await;
                 }
             }
         };
-        let dispatched = self
-            .dispatch_session_start(session, session_method, params_value)
-            .await?;
-        let start::DispatchedStart {
-            mut session,
-            response: response_value,
-        } = dispatched;
+        let response_value = match session
+            .native_client
+            .call(session_method, params_value, Instant::now() + RPC_TIMEOUT)
+            .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                let point = if error.code == "native_rejected" || native_no_write(&error.code) {
+                    StartPoint::NativeRefusalBeforeDispatch
+                } else {
+                    StartPoint::TransportLost
+                };
+                let message = format!("Muse {session_method}: {}", error.message);
+                return self
+                    .fail_session_start(
+                        &params,
+                        session,
+                        point,
+                        "session",
+                        error.with_message(message),
+                    )
+                    .await;
+            }
+        };
+        let configured = async {
         // A lost resume reply leaves the write unknown under the minted
         // command id; the resume is never dispatched a second time.
-        let mut snapshot_pull: Option<bool> = None;
         let mut resume_pointers = Vec::new();
         let (native_session, view_cursor) = if resume_subject.is_some() {
             let mut resumed = match serde_json::from_value::<NativeSessionResumeResult>(
@@ -702,7 +752,6 @@ impl MusePlugin {
                     // The retained session id stays: a mismatched host
                     // identity (or served history) fails the resume without
                     // adopting the foreign identity.
-                    self.session = Some(session);
                     return Err(Error::new(
                         "unknown",
                         format!(
@@ -715,17 +764,13 @@ impl MusePlugin {
             // response identity before readiness, including early health pushes
             // queued behind requests belonging to the retained generation.
             session.session_id = Some(resumed.session.session_id.clone());
-            if let Err(error) = session
+            session
                 .events
                 .view_readback(
                     resumed.session.session_id.clone(),
                     resumed.history.unavailable_reason(),
                 )
-                .await
-            {
-                self.session = Some(session);
-                return Err(error);
-            }
+                .await?;
             // Late-joiner pointers are pulled after readiness (below): the
             // full payloads arrive as re-issued server-to-client requests
             // right after this response, and the pull covers any re-issue the
@@ -735,7 +780,6 @@ impl MusePlugin {
                 resume_pointers = std::mem::take(&mut resumed.pending_requests);
             }
             if resumed.session.status != "idle" {
-                self.session = Some(session);
                 return Err(Error::new(
                     "unknown",
                     "Muse session/resume did not prove the resumed session idle; no input was sent",
@@ -752,10 +796,10 @@ impl MusePlugin {
                         .get("session")
                         .and_then(|session| session.get("sessionId"))
                         .and_then(Value::as_str)
+                        && !session_id.trim().is_empty()
                     {
                         session.session_id = Some(session_id.to_owned());
                     }
-                    self.session = Some(session);
                     return Err(Error::new(
                         "unknown",
                         format!(
@@ -766,7 +810,6 @@ impl MusePlugin {
             };
             if started.session.status != "idle" {
                 session.session_id = Some(started.session.session_id.clone());
-                self.session = Some(session);
                 return Err(Error::new(
                     "unknown",
                     "Muse session/start did not prove the new session idle; no input was sent",
@@ -775,9 +818,8 @@ impl MusePlugin {
             (started.session, started.view_cursor)
         };
         session.session_id = Some(native_session.session_id.clone());
-        let effective_effort = self
-            .apply_start_effort(
-                &mut session,
+        let effective_effort = Self::apply_start_effort(
+                &session,
                 &native_session,
                 &view_cursor,
                 initialized_native.effort.as_deref(),
@@ -796,12 +838,10 @@ impl MusePlugin {
                 && native_session.model_id.as_deref() == Some(route.model_id.as_str())
                 && native_session.provider_id.as_deref() == Some(route.provider_id.as_str())
         });
-        let model_set = self
-            .align_resume_model(&mut session, &native_session, resume_route)
+        let model_set = Self::align_resume_model(&session, &native_session, resume_route)
             .await?;
-        let approval_set = self
-            .align_resume_approval(
-                &mut session,
+        let approval_set = Self::align_resume_approval(
+                &session,
                 &native_session,
                 resume_subject.is_some(),
                 requested_approval.as_deref(),
@@ -823,7 +863,6 @@ impl MusePlugin {
                                     .events
                                     .view_readback(reread.session.session_id.clone(), Some(reason))
                                     .await;
-                                self.session = Some(session);
                                 loss?;
                                 return Err(Error::new(
                                     "unknown",
@@ -832,10 +871,7 @@ impl MusePlugin {
                             }
                             reread.session
                         }
-                        Err(error) => {
-                            let error = discard_failed_start(&mut session, error).await;
-                            return Err(self.retain_failed_start(error));
-                        }
+                        Err(error) => return Err(error),
                     };
                 (
                     reread.model_id.clone(),
@@ -882,7 +918,7 @@ impl MusePlugin {
             &[InjectPoint::NextInput, InjectPoint::ActiveTurn],
         );
         // The effective settings are checked BEFORE readiness: on any
-        // mismatch no `session.ready` is published and no session is kept.
+        // mismatch no `session.ready` is published.
         let workspace_text = workspace.to_string_lossy();
         let reported_root = native_session.workspace_root.as_deref();
         let checks = [
@@ -916,23 +952,39 @@ impl MusePlugin {
                 Some(value) => format!("{:?}", policy.redact_bounded(value, 512)),
                 None => "<absent>".to_owned(),
             };
-            let error = discard_failed_start(
-                &mut session,
-                Error::new(
+            return Err(Error::new(
                     "profile_error",
                     format!(
                         "Muse {field} did not match the frozen profile (expected {}, reported {})",
                         describe(requested),
                         describe(reported)
                     ),
-                ),
-            )
-            .await;
-            return Err(self.retain_failed_start(error));
+                ));
         }
-        session = self
-            .publish_start_ready(session, &native_session, &effective)
-            .await?;
+        Ok((native_session, effective, resume_pointers))
+        }.await;
+        let (native_session, effective, resume_pointers) = match configured {
+            Ok(configured) => configured,
+            Err(error) => {
+                return self
+                    .fail_session_start(
+                        &params,
+                        session,
+                        StartPoint::AfterDispatch,
+                        "settings",
+                        error,
+                    )
+                    .await;
+            }
+        };
+        if let Err(error) =
+            Self::publish_start_ready(&mut session, &native_session, &effective).await
+        {
+            return self
+                .fail_session_start(&params, session, StartPoint::AfterDispatch, "ready", error)
+                .await;
+        }
+        let mut snapshot_pull: Option<bool> = None;
         // Adoption is best-effort and never fails the resume: entries that
         // bind to a live turn open, the dead generation's orphans drop. It
         // runs after readiness so a corrupt snapshot entry gaps the source
@@ -2241,11 +2293,6 @@ async fn discard_unstarted(session: &mut AgentSession) {
         Ok(_) => SessionPhase::Stopped,
         Err(_) => SessionPhase::Unknown,
     };
-}
-
-async fn discard_failed_start(session: &mut AgentSession, error: Error) -> Error {
-    discard_unstarted(session).await;
-    session.native_client.diagnostic_error(error)
 }
 
 /// A `configure` model and/or effort request. Admission already gated the

@@ -978,7 +978,14 @@ pub async fn register_native_process(
                 "{harness} {process_noun} process registration failed ({})",
                 error.code
             );
-            contextual_error(error, "process_registration", message)
+            // These start paths retain the uncertain registration after
+            // attempting to terminate the owned process.
+            let code = if matches!(harness, "Muse" | "OpenCode") && error.code == "timeout" {
+                "unknown"
+            } else {
+                "process_registration"
+            };
+            contextual_error(error, code, message)
         })?;
     let record: ProcessRecord = serde_json::from_value(value).map_err(|_| {
         Error::new(

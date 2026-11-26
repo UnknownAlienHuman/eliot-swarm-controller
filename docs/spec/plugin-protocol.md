@@ -251,6 +251,16 @@ The native command envelope carries the stable verb spelling. Host and adapter
 dispatch use the shared typed verb. The frozen launch model and effort share one
 projection for adapters that apply retained effort overrides at turn time.
 
+The shared [start classification](../../crates/eliot-plugin/src/start_classification.rs)
+uses adapter-reported dispatch, refusal and cleanup facts. Proven
+non-dispatch or native pre-admission refusal permits local cleanup and a
+bound failed result. After possible session admission, a lost reply,
+unverified readiness or unproved cleanup settles `unknown`. Keep the exact
+native identity, process and generation files available for cleanup when
+observed. A native removal proved for the exact newly created session
+permits a failed result after verification failure. A missing reply or
+identity never authorizes another create or deletion by guesswork.
+
 An ordinary stop attempts `agent.command` with `interrupt` for the captured
 active or uncertain turn under the stop's authority, then sends `agent.stop` to
 close the controlled session. For an Owner interrupt, the daemon sets
