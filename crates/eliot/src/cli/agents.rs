@@ -8,11 +8,11 @@ use super::args::{
 use super::support::read_and_print;
 use super::support::{
     DEFAULT_WAIT_SECONDS, Failure, INTERRUPTED_EXIT_CODE, MAX_ANSWERS_FILE_BYTES, MAX_TEXT_BYTES,
-    command_value, mutation_id, parse_goal_json, print_value, response_exit_code,
-    sleep_before_deadline, submit_and_print, submit_command, submit_request, submit_value,
-    turn_exit_code, turn_value, validate_limit, validate_no_policy, wait_call, wait_deadline,
-    wait_for_command, wait_for_linked_turn, wait_for_turn,
+    command_value, mutation_id, parse_goal_json, print_value, response_exit_code, submit_and_print,
+    submit_command, submit_request, submit_value, turn_exit_code, turn_value, validate_limit,
+    validate_no_policy, wait_deadline, wait_for_command, wait_for_linked_turn, wait_for_turn,
 };
+use super::waits::{WaitClient, unsettled};
 use eliot_core::api::harness::{QuotaUsageOrigin, RECOMMENDED_QUOTA_RESERVE_PERCENT};
 use eliot_core::api::{
     AgentDiscoverRequest, AgentGetRequest, AgentGetResponse, CommandGetRequest, DiscoverPage,
@@ -502,6 +502,7 @@ pub(crate) async fn run_send(
         text,
         sources,
         wait,
+        wait_seconds,
         probe,
         generation: GenerationArgs { generation },
         timeout_seconds,
@@ -511,8 +512,8 @@ pub(crate) async fn run_send(
     id: Option<String>,
 ) -> Result<u8, Failure> {
     validate_text(Some(&text))?;
-    let deadline = if wait {
-        Some(wait_deadline(timeout_seconds)?)
+    let deadline = if wait || wait_seconds.is_some() {
+        Some(wait_deadline(wait_seconds.unwrap_or(timeout_seconds))?)
     } else {
         None
     };
@@ -529,11 +530,10 @@ pub(crate) async fn run_send(
         print_value(&submit_value(&submitted)?, json_output);
         return Ok(submit_exit);
     }
-    if !wait {
+    let Some(deadline) = deadline else {
         print_value(&submit_value(&submitted)?, json_output);
         return Ok(submit_exit);
-    }
-    let deadline = deadline.ok_or_else(|| Failure::new(2, "missing wait deadline"))?;
+    };
     let completed = match submitted.linked_command.as_deref() {
         Some(linked) => {
             wait_for_linked_turn(&data_dir, &submitted.command_id, linked, deadline).await?
@@ -658,15 +658,11 @@ pub(crate) async fn run_inject(
     if !wait {
         return submit_and_print(&data_dir, &params, json_output).await;
     }
+    let deadline = wait_deadline(DEFAULT_WAIT_SECONDS)?;
     let submitted = submit_command(&data_dir, &params).await?;
-    let request = eliot_core::ContextWaitRequest {
-        id: submitted.command_id,
-        wait_ms: 30_000,
-    };
-    let command: eliot_core::Command =
-        eliot_daemon::client_call_typed(&data_dir, "inject.wait", &request)
-            .await
-            .map_err(Failure::readback)?;
+    let command = WaitClient::Caller(&data_dir)
+        .inject(submitted.command_id, deadline)
+        .await?;
     let state = command.state;
     print_value(&command_value(command)?, json_output);
     Ok(response_exit_code(state))
@@ -952,13 +948,9 @@ pub(crate) async fn run_switch(
     if let Some(deadline) = deadline
         && coordination_pending(response.state)
     {
-        let query = CommandGetRequest::new(&request.id);
-        let command = wait_call(
-            eliot_daemon::wait_command(&data_dir, &query, deadline),
-            deadline,
-        )
-        .await?
-        .ok_or_else(Failure::timeout)?;
+        let command = WaitClient::Caller(&data_dir)
+            .command(&request.id, deadline)
+            .await?;
         let state = command.state;
         response = coordination_outcome(command, "swarm.switch")?;
         request
@@ -979,13 +971,9 @@ pub(crate) async fn run_switch(
         )
         && coordination_pending(state)
     {
-        let query = CommandGetRequest::new(disposal);
-        let stop = wait_call(
-            eliot_daemon::wait_command(&data_dir, &query, deadline),
-            deadline,
-        )
-        .await?
-        .ok_or_else(Failure::timeout)?;
+        let stop = WaitClient::Caller(&data_dir)
+            .command(disposal, deadline)
+            .await?;
         if stop.verb != "stop"
             || stop.target.as_deref() != Some(&created.agent)
             || stop.generation != Some(created.generation)
@@ -1034,23 +1022,24 @@ pub(crate) async fn run_handoff(
     request
         .validate_response(&response)
         .map_err(Failure::invalid_response)?;
-    if let Some(deadline) = deadline {
+    if let Some(deadline) = deadline
+        && coordination_pending(response.brief_state)
+    {
         let query = CommandGetRequest::new(&request.id);
-        while coordination_pending(response.brief_state) {
-            sleep_before_deadline(deadline).await?;
-            let command = wait_call(
-                eliot_daemon::client_call_typed(&data_dir, "command.get", &query),
-                deadline,
-            )
+        // The parent is already applied and retains the live delivery state.
+        response = WaitClient::Caller(&data_dir)
+            .command_readback(&query, deadline, |command| {
+                let next: eliot_core::api::HandoffResponse =
+                    coordination_outcome(command, "swarm.handoff")?;
+                request
+                    .validate_response(&next)
+                    .map_err(Failure::invalid_response)?;
+                if next.brief_command != response.brief_command {
+                    return Err(Failure::new(4, "handoff brief binding changed"));
+                }
+                Ok((!coordination_pending(next.brief_state)).then_some(next))
+            })
             .await?;
-            query
-                .validate_response(&command)
-                .map_err(Failure::invalid_response)?;
-            response = coordination_outcome(command, "swarm.handoff")?;
-            request
-                .validate_response(&response)
-                .map_err(Failure::invalid_response)?;
-        }
     }
     let exit = if args.no_wait {
         0
@@ -1283,12 +1272,13 @@ pub(crate) async fn swarm_wait(
             "swarm wait requires exactly one of --all or --any",
         ));
     }
-    if timeout_seconds == 0 || timeout_seconds > 30 {
+    if mail && timeout_seconds > 30 {
         return Err(Failure::new(
             2,
-            "--timeout-seconds must be between 1 and 30",
+            "--timeout-seconds cannot exceed 30 with --mail",
         ));
     }
+    let deadline = wait_deadline(timeout_seconds)?;
     if ids.len() > MAX_SWARM_WAIT_TARGETS {
         return Err(Failure::new(2, "swarm wait requires 1..=256 captured ids"));
     }
@@ -1311,19 +1301,17 @@ pub(crate) async fn swarm_wait(
     if commands.is_empty() && turns.is_empty() {
         return Err(Failure::new(2, "swarm wait requires 1..=256 captured ids"));
     }
-    let wait_ms = timeout_seconds.saturating_mul(1_000);
-    let params = SwarmWaitRequest::new(commands, turns, mode, wait_ms).with_mailbox(mail);
-    params.validate().map_err(Failure::for_read)?;
-    let response: SwarmWaitResponse =
-        eliot_daemon::client_call_typed(data_dir, "swarm.wait", &params)
-            .await
-            .map_err(Failure::for_read)?;
-    params
-        .validate_response(&response)
-        .map_err(Failure::invalid_response)?;
+    let params = SwarmWaitRequest::new(commands, turns, mode, 0).with_mailbox(mail);
+    let response = WaitClient::Caller(data_dir)
+        .wait_set(params, deadline)
+        .await?
+        .ok_or_else(|| unsettled("wait set", "no validated snapshot"))?;
     let value = serde_json::to_value(&response)
         .map_err(|_| Failure::new(4, "swarm.wait response is invalid"))?;
     print_value(&value, json_output);
+    if !response.completed && !response.mail_wake {
+        return Err(unsettled("wait set", "still_running"));
+    }
     Ok(swarm_wait_exit_code(&response))
 }
 

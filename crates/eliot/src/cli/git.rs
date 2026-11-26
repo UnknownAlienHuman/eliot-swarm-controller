@@ -2,14 +2,15 @@ use super::{
     args::{GitCommand, GitIntegrateArgs},
     support::{
         Failure, command_state_result, print_value_or_human, response_exit_code, submit_and_print,
-        submit_command, submit_request, wait_call, wait_deadline,
+        submit_command, submit_request, wait_deadline,
     },
+    waits::WaitClient,
 };
 use eliot_core::{
     CommandState,
     api::{
-        CommandGetRequest, GitIntegrateCheckClassification, GitIntegrateDefinitionArgs,
-        GitIntegrateOutcome, GitIntegrateStatus,
+        GitIntegrateCheckClassification, GitIntegrateDefinitionArgs, GitIntegrateOutcome,
+        GitIntegrateStatus,
     },
     fence_untrusted_text, reason_words,
 };
@@ -48,13 +49,9 @@ pub(crate) async fn run(
     }
     let deadline = wait_deadline(timeout_seconds)?;
     let submitted = submit_command(data_dir, &request).await?;
-    let query = CommandGetRequest::new(&submitted.command_id);
-    let command = wait_call(
-        eliot_daemon::wait_command(data_dir, &query, deadline),
-        deadline,
-    )
-    .await?
-    .ok_or_else(Failure::timeout)?;
+    let command = WaitClient::Caller(data_dir)
+        .command(&submitted.command_id, deadline)
+        .await?;
     let Some(outcome) = command
         .outcome
         .as_ref()
