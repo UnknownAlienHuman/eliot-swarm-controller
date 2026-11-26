@@ -270,7 +270,9 @@ pub fn status_mark(tone: StatusTone, size: f64) -> Option<View> {
     match tone {
         StatusTone::Active => Some(circle(ThemeBrush::Accent)),
         StatusTone::Attention => Some(circle(ThemeBrush::SystemCritical)),
-        StatusTone::Pending | StatusTone::Neutral => None,
+        // Work in flight (starting) shows the native progress indicator.
+        StatusTone::Pending => Some(spinner()),
+        StatusTone::Neutral => None,
         StatusTone::Failed => Some(
             Border::new()
                 .background(ThemeBrush::SystemCritical)
