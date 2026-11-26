@@ -18,6 +18,8 @@ pub(super) struct Focus {
 
 /// The Goal dialog's kind ([`DesktopApp::dialog_kind`]).
 const GOAL: u8 = 10;
+/// The project page's assignment, transfer or note dialog.
+const PROJECT: u8 = 11;
 
 pub(super) fn surface(
     context: &mut ViewContext<DesktopApp>,
@@ -83,6 +85,8 @@ impl DesktopApp {
             9
         } else if self.goal.open.is_some() {
             GOAL
+        } else if self.assignment.dialog.is_some() {
+            PROJECT
         } else {
             0
         }
@@ -189,6 +193,7 @@ impl DesktopApp {
                 };
                 self.goal_update(msg, context);
             }
+            PROJECT => self.assign_update(assignment_ui::AssignMsg::Closed, context),
             _ => {}
         }
     }

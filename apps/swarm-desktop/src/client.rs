@@ -159,6 +159,7 @@ checked! {
     eliot_core::api::GoalPauseRequest => eliot_core::api::GoalView, "goal.pause";
     eliot_core::api::GoalResumeRequest => eliot_core::api::GoalView, "goal.resume";
     eliot_core::api::GoalClearRequest => eliot_core::api::GoalView, "goal.clear";
+    eliot_core::api::ProjectBroadcastRequest => eliot_core::api::ProjectBroadcastResponse, "project.broadcast";
 }
 
 /// The event reads check their reply against the cursor they read after.
@@ -1028,6 +1029,110 @@ pub async fn owner_decide(
 ) -> Result<eliot_core::api::OwnerDecideResponse> {
     request.validate()?;
     eliot_daemon::client_call_typed(data_dir, "owner.decide", request).await
+}
+
+/// The project's current manager assignment (`project.assignment.get`):
+/// identity, epoch, revision, state, workspace and start command.
+pub async fn assignment_get(
+    data_dir: &Path,
+    project: &str,
+) -> Result<eliot_core::api::ProjectAssignment> {
+    let request = eliot_core::api::ProjectAssignmentGetRequest {
+        project: project.to_owned(),
+    };
+    request.validate()?;
+    let reply: eliot_core::api::ProjectAssignment =
+        eliot_daemon::client_call_typed(data_dir, "project.assignment.get", &request).await?;
+    if reply.project != request.project {
+        return Err(invalid_reply(
+            "project.assignment.get",
+            "it names another project",
+        ));
+    }
+    Ok(reply)
+}
+
+/// One Owner assignment mutation: `project.assignment.claim` (a named
+/// manager at the revision shown), `.launch` (a manager on an approved
+/// profile) or `.release` (at the epoch shown). The same request (id
+/// included) reads the retained outcome back.
+pub enum AssignmentChange {
+    Claim(eliot_core::api::ProjectAssignmentClaimRequest),
+    Launch(eliot_core::api::ProjectAssignmentLaunchRequest),
+    Release(eliot_core::api::ProjectAssignmentReleaseRequest),
+}
+
+pub async fn assignment_change(
+    data_dir: &Path,
+    change: &AssignmentChange,
+) -> Result<eliot_core::api::ProjectAssignmentResult> {
+    let (method, project, reply) = match change {
+        AssignmentChange::Claim(request) => {
+            request.validate()?;
+            (
+                "project.assignment.claim",
+                &request.project,
+                eliot_daemon::client_call_typed(data_dir, "project.assignment.claim", request)
+                    .await,
+            )
+        }
+        AssignmentChange::Launch(request) => {
+            request.validate()?;
+            (
+                "project.assignment.launch",
+                &request.project,
+                eliot_daemon::client_call_typed(data_dir, "project.assignment.launch", request)
+                    .await,
+            )
+        }
+        AssignmentChange::Release(request) => {
+            request.validate()?;
+            (
+                "project.assignment.release",
+                &request.project,
+                eliot_daemon::client_call_typed(data_dir, "project.assignment.release", request)
+                    .await,
+            )
+        }
+    };
+    let reply: eliot_core::api::ProjectAssignmentResult = reply?;
+    if &reply.assignment.project != project {
+        return Err(invalid_reply(method, "it names another project"));
+    }
+    Ok(reply)
+}
+
+/// One Owner `project.transfer` action (begin, launch, commit or cancel)
+/// at the assignment revision shown. The same request reads its retained
+/// result back; a fresh id checks a changed condition.
+pub async fn project_transfer(
+    data_dir: &Path,
+    request: &eliot_core::api::ProjectTransferRequest,
+) -> Result<eliot_core::api::ProjectTransferResult> {
+    request.validate()?;
+    let reply: eliot_core::api::ProjectTransferResult = eliot_daemon::client_call_typed(
+        data_dir,
+        eliot_core::api::PROJECT_TRANSFER_METHOD,
+        request,
+    )
+    .await?;
+    if reply.id != request.id || reply.assignment.project != request.project {
+        return Err(invalid_reply(
+            eliot_core::api::PROJECT_TRANSFER_METHOD,
+            "it does not match the request",
+        ));
+    }
+    Ok(reply)
+}
+
+/// Queue a note for the project's other working Agents
+/// (`project.broadcast`): each recipient with its captured generation,
+/// turn and insertion command.
+pub async fn project_broadcast(
+    data_dir: &Path,
+    request: &eliot_core::api::ProjectBroadcastRequest,
+) -> Result<eliot_core::api::ProjectBroadcastResponse> {
+    call(data_dir, request).await
 }
 
 /// Queue native sign-in for one harness, optionally bound to the inbox

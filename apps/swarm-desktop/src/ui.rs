@@ -39,6 +39,7 @@ use windows_reactor::*;
 
 use crate::views::{Column, MaybeContent};
 
+mod assignment_ui;
 mod automation_ui;
 mod bulk_ui;
 mod chat_ui;
@@ -421,6 +422,8 @@ struct DesktopApp {
     automation: automation_ui::AutomationState,
     /// The open project page and its reads.
     project: project_ui::ProjectState,
+    /// The project page's manager assignment, transfer and note (§12.2, §12.3).
+    assignment: assignment_ui::AssignState,
     /// The sidebar's right-click menu, rename and confirmation.
     menu: menu_ui::MenuState,
     /// The right pane's width, its tabs' reads and choices.
@@ -1099,6 +1102,7 @@ impl Component for DesktopApp {
             usage: usage_ui::UsageState::default(),
             automation: automation_ui::AutomationState::default(),
             project: project_ui::ProjectState::default(),
+            assignment: assignment_ui::AssignState::default(),
             menu: menu_ui::MenuState::default(),
             pane: pane_ui::PaneState::default(),
             bulk: None,

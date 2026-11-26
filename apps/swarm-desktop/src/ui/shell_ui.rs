@@ -2574,6 +2574,8 @@ impl DesktopApp {
             Some(self.daemon_confirmation(context))
         } else if let Some(dialog) = self.goal_dialog(context) {
             Some(dialog)
+        } else if self.assignment.dialog.is_some() {
+            self.assignment_dialog(context)
         } else {
             Some(self.task_dialog(context))
         };

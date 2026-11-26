@@ -1,13 +1,15 @@
-//! The project page (`Project.dc.html`): its header (path, Open folder,
-//! New task, the project's menu), then two columns. Left: the manager
-//! (`project.assignment` as the sidebar's `chat.organization` read carries
-//! it, with a hand-over in progress and competing top-level tasks), the
-//! tasks by state read from the daemon (`agent.list` with `project`,
-//! paged, so a project is never limited to the sidebar's loaded rows) with
-//! queued launches, and the project check. Right: who works where (`who`,
-//! by Git), branches and worktrees, capacity (read only) and the project's
-//! automations. A project's name opens it; Back returns.
+//! The project page (`Project.dc.html`, brand book §12.1): its header
+//! (path, Open folder, New task, the project's menu), then one summary
+//! group ([`super::assignment_ui`]: the manager or Choose a manager, the
+//! assignment and transfer state with their actions, the team and
+//! capacity), then two columns. Left: the tasks by state read from the
+//! daemon (`agent.list` with `project`, paged, so a project is never
+//! limited to the sidebar's loaded rows) with queued launches, and the
+//! project check. Right: who works where (`who`, by Git) with Note to
+//! project agents, branches and worktrees and the project's automations.
+//! A project's name opens it; Back returns.
 
+use super::assignment_ui::{self, AssignMsg};
 use super::menu_ui::{MenuMsg, Target as MenuTarget};
 use super::*;
 use eliot_core::AgentState;
@@ -78,8 +80,8 @@ pub(super) enum ProjectMsg {
     WhoLoaded(u64, Box<Fallible<eliot_core::api::WhoResponse>>),
     /// Show or hide the finished tasks.
     FinishedToggled,
-    /// Show or hide the tasks competing with the manager.
-    CompetingToggled,
+    /// The summary group's manager assignment, transfer and note.
+    Assign(AssignMsg),
     /// Read the page again after a failed read.
     Retry,
 }
@@ -100,8 +102,8 @@ struct GroupList {
 pub(super) struct ProjectState {
     /// The sidebar key (`org:<project>`): the place Back returns to.
     pub(super) key: String,
-    id: String,
-    checkout: String,
+    pub(super) id: String,
+    pub(super) checkout: String,
     /// Tags reads: a reply for an older project or refresh is dropped.
     epoch: u64,
     lists: [GroupList; 4],
@@ -109,7 +111,6 @@ pub(super) struct ProjectState {
     who: Option<Fallible<eliot_core::api::WhoResponse>>,
     who_reading: bool,
     finished_open: bool,
-    competing_open: bool,
 }
 
 impl DesktopApp {
@@ -156,9 +157,7 @@ impl DesktopApp {
             ProjectMsg::FinishedToggled => {
                 self.project.finished_open = !self.project.finished_open;
             }
-            ProjectMsg::CompetingToggled => {
-                self.project.competing_open = !self.project.competing_open;
-            }
+            ProjectMsg::Assign(msg) => self.assign_update(msg, context),
             ProjectMsg::Retry => self.read_project(context),
             ProjectMsg::EditCheck => {
                 let id = self.project.id.clone();
@@ -226,6 +225,12 @@ impl DesktopApp {
             }
         }
         self.read_who(context);
+        self.read_assignment(context);
+    }
+
+    /// Every task row the page has read, in every group.
+    pub(super) fn project_task_rows(&self) -> impl Iterator<Item = &UiAgent> {
+        self.project.lists.iter().flat_map(|list| list.rows.iter())
     }
 
     fn read_group(
@@ -367,48 +372,6 @@ impl DesktopApp {
                 }
             })
             .collect();
-        let org = self
-            .nav
-            .organization
-            .groups
-            .iter()
-            .find(|group| group.project.as_deref() == Some(state.id.as_str()));
-        // The manager card: the assignment the sidebar read carries.
-        let manager = org.map(|group| {
-            let agent = group.manager.as_ref().map(|manager| {
-                let row = self.find_agent(&manager.agent);
-                ManagerLine {
-                    agent: row.cloned(),
-                    title: self.agent_title(&manager.agent),
-                    state: manager.state,
-                    words: [
-                        row.map(|row| {
-                            crate::picker::harness_model_label(&row.harness, row.model.as_deref())
-                        }),
-                        manager.branch.clone(),
-                        Some(crate::monitor::state_words(manager.state).to_owned()),
-                    ]
-                    .into_iter()
-                    .flatten()
-                    .collect::<Vec<_>>()
-                    .join(" · "),
-                }
-            });
-            ManagerView {
-                agent,
-                assignment: group
-                    .assignment
-                    .as_ref()
-                    .map(|assignment| format!("{:?}", assignment.state).to_lowercase()),
-                needs: group.needs_assignment,
-                transfer: group.transfer.clone(),
-                competing: group
-                    .conflicting_roots
-                    .iter()
-                    .map(|id| self.agent_title(id))
-                    .collect(),
-            }
-        });
         // Queued launches and automation waits for this project.
         let queued: Vec<String> = self
             .nav
@@ -513,18 +476,14 @@ impl DesktopApp {
                 )
             }
         });
-        let capacity = org.and_then(|group| group.capacity.as_ref()).map(|scope| {
-            let live: Vec<String> = groups
-                .iter()
-                .filter(|group| group.group == Group::Working)
-                .flat_map(|group| group.rows.iter().map(|line| line.title.clone()))
-                .collect();
-            CapacityView {
-                usage: scope.usage,
-                limit: scope.limit,
-                live: live.join(", "),
-            }
-        });
+        // The summary group: the manager, assignment and transfer, team
+        // and capacity (with the working tasks holding its slots).
+        let live: Vec<String> = groups
+            .iter()
+            .filter(|group| group.group == Group::Working)
+            .flat_map(|group| group.rows.iter().map(|line| line.title.clone()))
+            .collect();
+        let manager = self.manager_view(live);
         // This project's automations: its rules and the brief queues that
         // start tasks in its checkout.
         let key = nav::path_key(&state.checkout);
@@ -579,12 +538,10 @@ impl DesktopApp {
             groups,
             queued,
             finished_open: state.finished_open,
-            competing_open: state.competing_open,
             manager,
             worktrees,
             check,
             usage,
-            capacity,
             automations: cards,
             who,
             send: context.forward(),
@@ -707,34 +664,10 @@ struct WorktreeLine {
 }
 
 #[derive(Clone, PartialEq)]
-struct ManagerLine {
-    agent: Option<UiAgent>,
-    title: String,
-    state: AgentState,
-    words: String,
-}
-
-#[derive(Clone, PartialEq)]
-struct ManagerView {
-    agent: Option<ManagerLine>,
-    assignment: Option<String>,
-    needs: bool,
-    transfer: Option<String>,
-    competing: Vec<String>,
-}
-
-#[derive(Clone, PartialEq)]
 struct CheckView {
     command: String,
     runs: String,
     scope: String,
-}
-
-#[derive(Clone, PartialEq)]
-struct CapacityView {
-    usage: usize,
-    limit: Option<u64>,
-    live: String,
 }
 
 #[derive(Clone, PartialEq)]
@@ -774,12 +707,10 @@ pub(super) struct ProjectInput {
     groups: Vec<GroupView>,
     queued: Vec<String>,
     finished_open: bool,
-    competing_open: bool,
-    manager: Option<ManagerView>,
+    manager: Option<assignment_ui::ManagerView>,
     worktrees: Vec<WorktreeLine>,
     check: Option<CheckView>,
     usage: Option<String>,
-    capacity: Option<CapacityView>,
     automations: Vec<(String, crate::controls::StatusTone)>,
     who: Option<Fallible<WhoView>>,
     send: Callback<Message>,
@@ -871,15 +802,17 @@ impl Component for ProjectView {
                 ),
             ));
         }
+        items.push(KeyedView::new(
+            "summary",
+            assignment_ui::summary_panel(input.manager.as_ref(), context),
+        ));
         let left = vec![
-            KeyedView::new("manager", manager_panel(input, context)),
             KeyedView::new("tasks", tasks_panel(input, context)),
             KeyedView::new("check", check_panel(input, context)),
         ];
         let right = vec![
-            KeyedView::new("who", who_panel(input)),
+            KeyedView::new("who", who_panel(input, context)),
             KeyedView::new("worktrees", worktrees_panel(input, context)),
-            KeyedView::new("capacity", capacity_panel(input, context)),
             KeyedView::new("automations", automations_panel(input, context)),
         ];
         items.push(KeyedView::new(
@@ -1039,146 +972,6 @@ fn tasks_panel(input: &ProjectInput, context: &mut ViewContext<ProjectView>) -> 
     page_ui::panel(tokens::spacing::ROW_GAP, rows)
 }
 
-fn manager_panel(input: &ProjectInput, context: &mut ViewContext<ProjectView>) -> View {
-    let mut rows: Vec<KeyedView> =
-        vec![KeyedView::new("head", page_ui::panel_head("Manager", None))];
-    match &input.manager {
-        None => rows.push(KeyedView::new("reading", page_ui::quiet("Reading…"))),
-        Some(manager) => {
-            match &manager.agent {
-                Some(line) => {
-                    let content = Grid::new()
-                        .columns([GridLength::Auto, GridLength::STAR])
-                        .column_spacing(tokens::spacing::INSET)
-                        .children((
-                            Border::new()
-                                .vertical_alignment(VerticalAlignment::Center)
-                                .maybe_content(page_ui::state_mark(line.state)),
-                            Border::new()
-                                .grid_column(1)
-                                .content(page_ui::two_lines(&line.title, &line.words)),
-                        ));
-                    let agent: View = match &line.agent {
-                        Some(agent) => controls::row(false)
-                            .min_height(tokens::height::TWO_LINE_ROW)
-                            .automation_name(format!("Open the manager {}", line.title))
-                            .on_click(
-                                context
-                                    .message(Message::Shell(ShellMsg::AgentOpened(agent.clone()))),
-                            )
-                            .content(content)
-                            .into(),
-                        None => content.into(),
-                    };
-                    rows.push(KeyedView::new("agent", agent));
-                }
-                None => rows.push(KeyedView::new(
-                    "none",
-                    page_ui::quiet(if manager.needs {
-                        "This project has no manager; its top-level tasks wait for one."
-                    } else {
-                        "This project has no manager."
-                    }),
-                )),
-            }
-            if let Some(assignment) = &manager.assignment
-                && assignment != "active"
-            {
-                rows.push(KeyedView::new(
-                    "assignment",
-                    page_ui::quiet(format!("Assignment: {assignment}")),
-                ));
-            }
-            if let Some(transfer) = &manager.transfer {
-                rows.push(KeyedView::new(
-                    "transfer",
-                    strip(
-                        controls::glyph::MOVE,
-                        &format!("Handing over the project (transfer {transfer})"),
-                        None,
-                    ),
-                ));
-            }
-            if !manager.competing.is_empty() {
-                let count = manager.competing.len();
-                let open = input.competing_open;
-                rows.push(KeyedView::new(
-                    format!("competing:{open}"),
-                    strip(
-                        controls::glyph::GROUP,
-                        &format!(
-                            "{} compete{} with the manager",
-                            eliot_core::count_words(
-                                count as u64,
-                                "other top-level task",
-                                "other top-level tasks"
-                            ),
-                            if count == 1 { "s" } else { "" }
-                        ),
-                        Some(
-                            controls::text_button()
-                                .automation_name(if open {
-                                    "Hide the competing tasks"
-                                } else {
-                                    "Show the competing tasks"
-                                })
-                                .on_click(
-                                    context.message(Message::Project(ProjectMsg::CompetingToggled)),
-                                )
-                                .content(controls::label(if open { "Hide" } else { "Show" }))
-                                .into(),
-                        ),
-                    ),
-                ));
-                if open {
-                    rows.push(KeyedView::new(
-                        "competing-list",
-                        controls::secondary(manager.competing.join(", "))
-                            .text_wrapping(TextWrapping::Wrap),
-                    ));
-                }
-            }
-        }
-    }
-    page_ui::panel(tokens::spacing::SM, rows)
-}
-
-/// An attention strip inside a panel: a card surface, an icon, one line
-/// and an optional action.
-fn strip(glyph: &str, text: &str, action: Option<View>) -> View {
-    Border::new()
-        .background(ThemeBrush::CardBackground)
-        .border_brush(ThemeBrush::CardStroke)
-        .border_thickness(Thickness::uniform(tokens::layout::HAIRLINE))
-        .corner_radius(tokens::radius::CONTAINER)
-        .min_height(tokens::height::CONTROL + tokens::spacing::SM)
-        .padding(Thickness::new(
-            tokens::spacing::INSET,
-            0.0,
-            tokens::spacing::XS,
-            0.0,
-        ))
-        .content(
-            Grid::new()
-                .columns([GridLength::Auto, GridLength::STAR, GridLength::Auto])
-                .column_spacing(tokens::spacing::SM)
-                .children((
-                    controls::small_icon(glyph),
-                    controls::text(text.to_owned(), tokens::text::BODY)
-                        .grid_column(1)
-                        .vertical_alignment(VerticalAlignment::Center)
-                        .text_wrapping(TextWrapping::Wrap),
-                    crate::views::MaybeContent::maybe_content(
-                        Border::new()
-                            .grid_column(2)
-                            .vertical_alignment(VerticalAlignment::Center),
-                        action,
-                    ),
-                )),
-        )
-        .into()
-}
-
 fn check_panel(input: &ProjectInput, context: &mut ViewContext<ProjectView>) -> View {
     let edit: View = controls::text_button()
         .automation_name("Edit project check")
@@ -1212,10 +1005,15 @@ fn check_panel(input: &ProjectInput, context: &mut ViewContext<ProjectView>) -> 
     page_ui::panel(tokens::spacing::SM, rows)
 }
 
-fn who_panel(input: &ProjectInput) -> View {
+fn who_panel(input: &ProjectInput, context: &mut ViewContext<ProjectView>) -> View {
+    let note: View = controls::text_button()
+        .automation_name("Note to project agents")
+        .on_click(context.message(Message::Project(ProjectMsg::Assign(AssignMsg::NoteOpened))))
+        .content(controls::label("Note to project agents"))
+        .into();
     let mut rows = vec![KeyedView::new(
         "head",
-        page_ui::panel_head("Who works where", None),
+        page_ui::panel_head("Who works where", Some(note)),
     )];
     match &input.who {
         None => rows.push(KeyedView::new("reading", page_ui::quiet("Reading…"))),
@@ -1363,45 +1161,6 @@ fn worktrees_panel(input: &ProjectInput, context: &mut ViewContext<ProjectView>)
         ));
     }
     page_ui::panel(tokens::spacing::ROW_GAP, rows)
-}
-
-fn capacity_panel(input: &ProjectInput, context: &mut ViewContext<ProjectView>) -> View {
-    let edit: View = controls::text_button()
-        .automation_name("Edit capacity in config.toml")
-        .on_click(context.message(Message::Settings(SettingsMsg::OpenConfig)))
-        .content(controls::link_content("Edit"))
-        .tooltip("Capacity is set in config.toml ([capacity])");
-    let mut rows = vec![KeyedView::new(
-        "head",
-        page_ui::panel_head("Capacity", Some(edit)),
-    )];
-    match &input.capacity {
-        None => rows.push(KeyedView::new("none", page_ui::quiet("Not read yet."))),
-        Some(capacity) => {
-            let at_once = match capacity.limit {
-                Some(0) => "Closed: new launches wait".to_owned(),
-                Some(limit) => format!("{} of {limit}", capacity.usage),
-                None => format!("{} · no limit", capacity.usage),
-            };
-            let at_once = if capacity.live.is_empty() {
-                at_once
-            } else {
-                format!("{at_once} · {}", capacity.live)
-            };
-            rows.push(KeyedView::new(
-                "at-once",
-                page_ui::kv_text("At once", at_once),
-            ));
-            if let Some(limit) = capacity.limit.filter(|limit| *limit > 0) {
-                let share = capacity.usage as f64 * 100.0 / limit as f64;
-                rows.push(KeyedView::new(
-                    format!("meter:{}", share.round()),
-                    controls::meter(share, false),
-                ));
-            }
-        }
-    }
-    page_ui::panel(tokens::spacing::SM, rows)
 }
 
 fn automations_panel(input: &ProjectInput, context: &mut ViewContext<ProjectView>) -> View {

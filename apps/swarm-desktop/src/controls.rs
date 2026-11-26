@@ -173,8 +173,6 @@ pub mod glyph {
     /// Component, a chip (not Process, whose dashed broken circle reads as
     /// a ring fragment).
     pub const DAEMON: &str = "\u{E950}";
-    /// People.
-    pub const GROUP: &str = "\u{E716}";
 }
 
 /// Semantic meaning of an Agent or command state, for status marks.
