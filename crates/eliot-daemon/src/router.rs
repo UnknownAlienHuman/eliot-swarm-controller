@@ -5703,6 +5703,7 @@ impl Router {
             owner_rules_delivery,
             last_control_failure,
             last_resume_failure,
+            first_owner_message,
         ) = {
             let store = self.inner.store.lock().await;
             hierarchy::authorize_agent_read(&store, principal, id, None)?;
@@ -5733,6 +5734,18 @@ impl Router {
                 }
                 None => None,
             };
+            let first_owner_message = match store.first_owner_message_command(id)? {
+                Some(command) => {
+                    match hierarchy::authorize_command_read(&store, principal, &command) {
+                        Ok(()) => {
+                            eliot_store::input_before_owner_rules(&command).map(str::to_owned)
+                        }
+                        Err(error) if error.code == "not_allowed" => None,
+                        Err(error) => return Err(error),
+                    }
+                }
+                None => None,
+            };
             let (provider_hold, native_notice) = store.agent_status_projection(&agent)?;
             let instruction_delivery = store.get_agent_instruction_delivery(id)?;
             let owner_rules_delivery = store.get_agent_owner_rules_delivery(id)?;
@@ -5754,6 +5767,7 @@ impl Router {
                 owner_rules_delivery,
                 last_control_failure,
                 last_resume_failure,
+                first_owner_message,
             )
         };
         let live_presence = if agent.observe_only {
@@ -5846,6 +5860,7 @@ impl Router {
             last_control_failure,
             last_resume_failure,
             work_truth,
+            first_owner_message,
         };
         display_agent_get_response(&mut response);
         serde_json::to_value(response)

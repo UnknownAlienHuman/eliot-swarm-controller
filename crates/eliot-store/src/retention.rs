@@ -139,6 +139,7 @@ struct SubtreeMember {
     probe_ref: bool,
     goal_ref: bool,
     config_ref: bool,
+    first_owner_message_ref: bool,
 }
 
 struct RetentionCutoffs {
@@ -808,6 +809,8 @@ fn command_set_protection(members: &[SubtreeMember], cutoff: i64) -> Option<&'st
         Some("unknown_outcome")
     } else if members.iter().any(|m| m.workspace_ref || m.probe_ref) {
         Some("custody")
+    } else if members.iter().any(|m| m.first_owner_message_ref) {
+        Some("first_owner_message")
     } else if members
         .iter()
         .any(|m| m.is_open() || m.turn_state.is_some() || m.goal_ref || m.config_ref)
@@ -1083,7 +1086,8 @@ fn subtree_members_tx(connection: &Connection, root: &str) -> Result<(Vec<Subtre
                       AND json_extract(g.state, '$.status') IN ('active', 'paused')
                       AND json_extract(g.state, '$.last_continuation_command_id') = c.id
                 ),
-                EXISTS(SELECT 1 FROM agent_config a WHERE a.command_id = c.id)
+                EXISTS(SELECT 1 FROM agent_config a WHERE a.command_id = c.id),
+                EXISTS(SELECT 1 FROM agents a WHERE a.first_owner_command = c.id)
          FROM commands c WHERE c.id IN ({placeholders})"
     );
     let mut statement = connection.prepare(&sql).map_err(sql_error)?;
@@ -1099,6 +1103,7 @@ fn subtree_members_tx(connection: &Connection, root: &str) -> Result<(Vec<Subtre
                 probe_ref: row.get(6)?,
                 goal_ref: row.get(7)?,
                 config_ref: row.get(8)?,
+                first_owner_message_ref: row.get(9)?,
             })
         })
         .map_err(sql_error)?;

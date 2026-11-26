@@ -1,6 +1,6 @@
 use super::*;
 
-pub(super) const CURRENT_SCHEMA_VERSION: i64 = DIAGNOSE_READ_INDEX_VERSION;
+pub(super) const CURRENT_SCHEMA_VERSION: i64 = FIRST_OWNER_MESSAGE_VERSION;
 const HARNESS_CHECK_SCHEMA_VERSION: i64 = 112;
 const WORK_TRUTH_VERSION: i64 = 113;
 const WORK_TRUTH_INTENT_VERSION: i64 = 114;
@@ -48,6 +48,7 @@ const CLEANUP_PATH_CUSTODY_VERSION: i64 = 155;
 const ORGANIZATION_CONTENT_SOURCE_VERSION: i64 = 156;
 const HANDOFF_READ_INDEX_VERSION: i64 = 157;
 const DIAGNOSE_READ_INDEX_VERSION: i64 = 158;
+const FIRST_OWNER_MESSAGE_VERSION: i64 = 159;
 
 fn has_restart_continuation_brief_column(connection: &Connection) -> Result<bool> {
     connection
@@ -2861,6 +2862,36 @@ impl Store {
                  CREATE INDEX events_diagnose_failover ON events(agent, generation, seq)
                  WHERE kind IN ('provider.failover_queued', 'provider.failover_settled');",
                 Some(DIAGNOSE_READ_INDEX_VERSION),
+            )?;
+        }
+        if current < FIRST_OWNER_MESSAGE_VERSION {
+            self.migrate_sql(
+                "ALTER TABLE agents ADD COLUMN first_owner_command TEXT
+                    REFERENCES commands(id) ON DELETE SET NULL;
+                 UPDATE agents AS a SET first_owner_command = (
+                     SELECT c.id FROM commands c INDEXED BY commands_target
+                     WHERE c.target = a.id AND c.principal = 'owner'
+                       AND c.state <> 'rejected'
+                       AND json_type(c.args, '$.text') = 'text'
+                       AND json_extract(c.cause, '$.rule') IS NULL
+                       AND (
+                           (c.verb = 'launch' AND json_type(c.args, '$._provider_probe') IS NULL)
+                           OR (c.verb = 'send' AND json_type(c.args, '$.notice_kind') IS NULL
+                               AND (c.parent_command IS NULL OR c.link_kind = 'selector'
+                                    OR (c.link_kind = 'send' AND EXISTS (
+                                        SELECT 1 FROM commands p WHERE p.id = c.parent_command
+                                          AND p.verb = 'resume'
+                                          AND json_type(p.args, '$.continue_from_stop') IS NULL
+                                          AND NOT EXISTS (
+                                              SELECT 1 FROM restart_resume_intents r
+                                              WHERE r.command_id = p.id))))
+                           )
+                       )
+                     ORDER BY c.created_at, c.rowid LIMIT 1
+                 ) WHERE a.parent IS NULL OR a.chat = 1;
+                 CREATE INDEX agents_first_owner_command ON agents(first_owner_command)
+                     WHERE first_owner_command IS NOT NULL;",
+                Some(FIRST_OWNER_MESSAGE_VERSION),
             )?;
         }
         Ok(())

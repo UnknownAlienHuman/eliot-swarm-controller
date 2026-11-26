@@ -2583,12 +2583,41 @@ fn submit_tx_mode(
             error
         }
     })?;
+    if principal == "owner" && !derived_rule && !restart_resume {
+        let first_message = match request.kind() {
+            Launch if request.args.get(core::PROVIDER_PROBE_LAUNCH_ARG).is_none() => Some(&command),
+            Send if request.args.get("notice_kind").is_none() => Some(&command),
+            Resume if continuation_text.is_none() => linked_command.as_ref(),
+            _ => None,
+        };
+        if let Some(input) = first_message
+            && input.state != CommandState::Rejected
+            && input_before_owner_rules(input).is_some_and(|text| !text.trim().is_empty())
+            && let Some(agent) = input.target.as_deref()
+        {
+            pin_first_owner_message_tx(tx, parse_agent_id(agent)?, &input.id)?;
+        }
+    }
     Ok(Admission {
         command,
         linked_command,
         events,
         is_new: true,
     })
+}
+
+/// Pin the first Owner input when its command is admitted, in the same transaction.
+pub(super) fn pin_first_owner_message_tx(
+    tx: &Transaction<'_>,
+    agent: i64,
+    command: &str,
+) -> Result<()> {
+    db!(tx.execute(
+        "UPDATE agents SET first_owner_command = ?2
+         WHERE id = ?1 AND first_owner_command IS NULL AND (parent IS NULL OR chat = 1)",
+        params![agent, command],
+    ));
+    Ok(())
 }
 
 /// Admit the derived removal once Store has verified the manager's exact

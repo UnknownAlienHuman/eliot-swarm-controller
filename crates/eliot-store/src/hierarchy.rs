@@ -549,15 +549,24 @@ pub(super) fn admit_selector_expansion(
             member_request.args.clone(),
         )?)?;
         match request.verb.as_str() {
-            "send" => admission::admit_send_member(
-                tx,
-                principal,
-                &member_request,
-                &member_digest,
-                member,
-                now,
-                &mut events,
-            )?,
+            "send" => {
+                admission::admit_send_member(
+                    tx,
+                    principal,
+                    &member_request,
+                    &member_digest,
+                    member,
+                    now,
+                    &mut events,
+                )?;
+                if principal == "owner" && request.args.get("notice_kind").is_none() {
+                    admission::pin_first_owner_message_tx(
+                        tx,
+                        parse_agent_id(&member.id)?,
+                        &child_id,
+                    )?;
+                }
+            }
             "stop" => admission::admit_stop_member(
                 tx,
                 principal,

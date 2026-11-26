@@ -104,6 +104,7 @@ impl Store {
             Some(probe),
             AgentListProjection::Rows,
             custody.as_deref(),
+            self.has_first_owner_message,
         )?;
         self.read_agent_list_page(
             filter,
@@ -111,7 +112,15 @@ impl Store {
             limit,
             (now_ms, growth_thresholds),
             |scoped, projection| {
-                agent_list_select(scoped, caller, None, None, projection, custody.as_deref())
+                agent_list_select(
+                    scoped,
+                    caller,
+                    None,
+                    None,
+                    projection,
+                    custody.as_deref(),
+                    self.has_first_owner_message,
+                )
             },
             |summary| summary.id.clone(),
         )
@@ -275,6 +284,7 @@ impl Store {
             Some(probe),
             AgentListProjection::Rows,
             custody.as_deref(),
+            self.has_first_owner_message,
         )?;
         self.read_agent_list_page(
             filter,
@@ -282,7 +292,15 @@ impl Store {
             limit,
             (now_ms, growth_thresholds),
             |scoped, projection| {
-                agent_list_select_recent(scoped, caller, None, None, projection, custody.as_deref())
+                agent_list_select_recent(
+                    scoped,
+                    caller,
+                    None,
+                    None,
+                    projection,
+                    custody.as_deref(),
+                    self.has_first_owner_message,
+                )
             },
             |summary| encode_recent_cursor(&summary.id, summary.updated_at),
         )
@@ -507,10 +525,7 @@ impl Store {
                 native_children::native_open_turn_select!("a.id", "a.generation"),
                 ") ELSE 0 END AS native_open_turn,
                     {} AS organization, o.tags, o.revision AS organization_revision,
-                    (SELECT substr(json_extract(args, '$.text'), 1, ?2)
-                     FROM commands INDEXED BY commands_target
-                     WHERE target = a.id AND verb = 'send' AND json_type(args, '$.text') = 'text'
-                     ORDER BY created_at, rowid LIMIT 1) AS preview,
+                    {} AS preview,
                     (SELECT COUNT(*) FROM events WHERE kind = 'activity.heavy'
                      AND agent = a.id AND generation = a.generation) AS heavy_count,
                     (SELECT json_group_array(json(data) ORDER BY seq DESC) FROM (
@@ -537,7 +552,8 @@ impl Store {
              LEFT JOIN git_work_state work ON work.workspace = a.workspace
                  AND source.health NOT IN ('error', 'stale') AND source.last_store_seq IS NOT NULL"
             ),
-            organization::organization_group()
+            organization::organization_group(),
+            agent_preview("a", "?2", self.has_first_owner_message)
         );
         let mut statement = self.connection.prepare_cached(&sql).map_err(sql_error)?;
         statement
@@ -705,9 +721,7 @@ impl AgentListFilter {
 /// The `query` predicate over one Agent row (`alias` names the `agents`
 /// table), shared by `agent.list` and the organization projection so both
 /// surfaces match the same fields: the `aN` id, the retained name, the
-/// first-input preview (the oldest retained `send` text, capped at
-/// `core::api::AGENT_PREVIEW_CHARS` characters, a launch's linked first
-/// input included), the project label, the execution directory and the
+/// first-input preview (see [`agent_preview`]), the project label, the execution directory and the
 /// harness. Every whitespace-separated word must be contained, ASCII
 /// case-insensitively (`instr`, so `%` and `_` stay literal). `params`
 /// yields one placeholder per word (`?` or a numbered `?N`); the words are
@@ -715,21 +729,48 @@ impl AgentListFilter {
 pub(super) fn agent_search_predicate(
     alias: &str,
     params: impl IntoIterator<Item = String>,
+    has_first_owner_message: bool,
 ) -> String {
+    let preview = agent_preview(
+        alias,
+        &core::api::AGENT_PREVIEW_CHARS.to_string(),
+        has_first_owner_message,
+    );
     let haystack = format!(
-        "lower('a' || {alias}.id || ' ' || COALESCE({alias}.name, '') || ' ' || COALESCE(( \
-         SELECT substr(json_extract(c.args, '$.text'), 1, {preview}) FROM commands c \
-         WHERE c.target = {alias}.id AND c.verb = 'send' \
-         AND json_type(c.args, '$.text') = 'text' \
-         ORDER BY c.created_at, c.rowid LIMIT 1), '') || ' ' || {alias}.project || ' ' \
+        "lower('a' || {alias}.id || ' ' || COALESCE({alias}.name, '') || ' ' \
+         || COALESCE({preview}, '') || ' ' || {alias}.project || ' ' \
          || COALESCE({alias}.workspace, '') || ' ' || {alias}.harness)",
-        preview = core::api::AGENT_PREVIEW_CHARS,
     );
     params
         .into_iter()
         .map(|param| format!("instr({haystack}, lower({param})) > 0"))
         .collect::<Vec<_>>()
         .join(" AND ")
+}
+
+/// A bounded title preview. Agents without a pin keep their existing SEND preview.
+fn agent_preview(alias: &str, limit: &str, has_first_owner_message: bool) -> String {
+    let oldest_send = format!(
+        "(SELECT substr(json_extract(c.args, '$.text'), 1, {limit})
+          FROM commands c INDEXED BY commands_target
+          WHERE c.target = {alias}.id AND c.verb = 'send' AND json_type(c.args, '$.text') = 'text'
+          ORDER BY c.created_at, c.rowid LIMIT 1)"
+    );
+    if !has_first_owner_message {
+        return oldest_send;
+    }
+    format!(
+        "COALESCE(
+            (SELECT substr(
+                CASE WHEN json_type(c.args, '$.{SEND_SOURCE_BASE_BYTES_ARG}') = 'integer'
+                     THEN CAST(substr(CAST(json_extract(c.args, '$.text') AS BLOB), 1,
+                                      json_extract(c.args, '$.{SEND_SOURCE_BASE_BYTES_ARG}')) AS TEXT)
+                     ELSE json_extract(c.args, '$.text')
+                END, 1, {limit})
+             FROM commands c WHERE c.id = {alias}.first_owner_command),
+            {oldest_send}
+         )"
+    )
 }
 
 /// The words of one search `query`, each bound to one placeholder of
@@ -746,11 +787,13 @@ fn push_search(
     predicates: &mut Vec<String>,
     params: &mut Vec<rusqlite::types::Value>,
     query: &str,
+    has_first_owner_message: bool,
 ) {
     let words = search_words(query);
     predicates.push(agent_search_predicate(
         "agents",
         words.iter().map(|_| "?".to_owned()),
+        has_first_owner_message,
     ));
     params.extend(words);
 }
@@ -822,6 +865,7 @@ fn agent_list_select_recent(
     limit: Option<i64>,
     projection: AgentListProjection,
     custody: Option<&[i64]>,
+    has_first_owner_message: bool,
 ) -> Result<AgentListSelect> {
     let count = !matches!(projection, AgentListProjection::Rows);
     let columns = if matches!(projection, AgentListProjection::StateTotals) {
@@ -861,7 +905,7 @@ fn agent_list_select_recent(
         params.push(rusqlite::types::Value::from(harness.clone()));
     }
     if let Some(query) = &filter.query {
-        push_search(&mut predicates, &mut params, query);
+        push_search(&mut predicates, &mut params, query, has_first_owner_message);
     }
     match filter.archived {
         core::api::ArchivedFilter::Exclude => {
@@ -980,6 +1024,7 @@ fn agent_list_select(
     limit: Option<i64>,
     projection: AgentListProjection,
     custody: Option<&[i64]>,
+    has_first_owner_message: bool,
 ) -> Result<AgentListSelect> {
     let count = !matches!(projection, AgentListProjection::Rows);
     let columns = if matches!(projection, AgentListProjection::StateTotals) {
@@ -1066,7 +1111,7 @@ fn agent_list_select(
         note_index("agents_list_harness", false);
     }
     if let Some(query) = &filter.query {
-        push_search(&mut predicates, &mut params, query);
+        push_search(&mut predicates, &mut params, query, has_first_owner_message);
     }
     // Archive never hides custody the owner must still resolve: an ended
     // Agent that lost control after it was archived stays listed while its

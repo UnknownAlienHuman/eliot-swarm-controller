@@ -294,9 +294,9 @@ fn elapsed_time(milliseconds: i64) -> String {
 /// without a read per row (the pattern of Codex app-server `thread/list`,
 /// whose threads carry `name` and a first-message `preview`): the Agent's
 /// name when one was set, its frozen profile name, and the first
-/// [`AGENT_PREVIEW_CHARS`] characters of its oldest retained `send` text (a
-/// launch's linked first input included). Each is absent when the Store has
-/// none; the same scope that lists the row may already read that command.
+/// [`AGENT_PREVIEW_CHARS`] characters of its pinned first Owner input or,
+/// when no first Owner input is pinned, its oldest retained `send` text.
+/// Each is absent when the Store has none.
 #[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct AgentSummary {
     #[serde(default)]
@@ -853,6 +853,9 @@ pub struct AgentGetResponse {
     /// Where this generation's work is recorded in Git, and its latest handoff.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub work_truth: Option<AgentWorkTruthView>,
+    /// First Owner input pinned for this root or chat, when visible to the caller.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_owner_message: Option<String>,
 }
 
 /// A retained Owner stop or interrupt failure visible to this caller.
