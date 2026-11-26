@@ -318,6 +318,12 @@ pub(crate) struct NativeThreadArchiveParams {
     pub thread_id: String,
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct NativeThreadUnarchiveParams<'a> {
+    pub thread_id: &'a str,
+}
+
 /// Deliberately excludes preview, name and turns, even when the native response has them.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]

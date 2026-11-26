@@ -1607,16 +1607,19 @@ fn project_resume_failures(
         })?;
         let failure = eliot_core::api::AgentResumeFailure::from_command(&command)?;
         let subject = format!("a{agent}");
-        let recommended =
-            (resume_safe && crate::unknown_start_command(db, agent)?.is_none()).then(|| {
-                action(
-                    "resume",
-                    "command.submit",
-                    json!({
-                        "verb":"resume","target":subject,"expected_generation":generation,"args":{}
-                    }),
-                )
-            });
+        let instructions = resume_failure_instructions(db, agent, &subject, generation, &command)?;
+        let recommended = (instructions.is_none()
+            && resume_safe
+            && crate::unknown_start_command(db, agent)?.is_none())
+        .then(|| {
+            action(
+                "resume",
+                "command.submit",
+                json!({
+                    "verb":"resume","target":subject,"expected_generation":generation,"args":{}
+                }),
+            )
+        });
         let choices = recommended
             .iter()
             .cloned()
@@ -1637,6 +1640,7 @@ fn project_resume_failures(
             choices,
         );
         projected.blocks_work = true;
+        projected.instructions = instructions;
         projected.detail = Some(match failure.detail {
             Some(detail) => format!(
                 "Resume generation {generation} failed: {} — {detail}",
@@ -1654,6 +1658,74 @@ fn project_resume_failures(
         items.push(projected);
     }
     Ok(())
+}
+
+fn resume_failure_instructions(
+    db: &Connection,
+    agent: i64,
+    subject: &str,
+    generation: i64,
+    command: &eliot_core::Command,
+) -> eliot_core::Result<Option<String>> {
+    let Some(outcome) = command.outcome.as_ref() else {
+        return Ok(None);
+    };
+    let code = outcome["code"].as_str().unwrap_or_default();
+    let message = outcome["message"].as_str().unwrap_or_default();
+    let location = outcome["where"].as_str().unwrap_or_default();
+    let retry = format!("swarm resume {subject}");
+    let instructions = match (code, location, message) {
+        ("model_catalogue_changed", _, _)
+        | (
+            _,
+            "plugin.codex.route.model_catalog_json",
+            "Codex model_catalog_json overrides the frozen route's catalogue source",
+        ) => {
+            // Historical refusals are still visible until the Owner retries.
+            return Ok(None);
+        }
+        (_, "plugin.codex.route.model_catalog_json", _) => format!(
+            "In the retained Codex store, set model_catalog_json to a readable absolute catalogue file or remove the setting to use the provider catalogue. Then run {retry}."
+        ),
+        (
+            _,
+            "store.dispatch.workspace_gate",
+            "registered workspace branch differs from the requested branch",
+        ) => {
+            let Some(workspace) = crate::workspace::load_workspace(db, agent)? else {
+                return Ok(None);
+            };
+            format!(
+                "Run {retry} to check current Git evidence. If the change is unattributed, run git switch --no-guess -- REGISTERED_BRANCH in the retained checkout, using '{}' as REGISTERED_BRANCH. If Git refuses, save your work before retrying the switch. Do not discard changes.",
+                workspace.requested_branch
+            )
+        }
+        (
+            _,
+            "store.dispatch.workspace_gate",
+            "workspace registration is duplicate, locked, prunable, or incomplete",
+        ) => format!(
+            "Run git worktree list --porcelain in the registered repository. For a locked checkout, use git worktree unlock PATH on the retained worktree. For broken registration after a move, use git worktree repair PATH. Verify one valid entry before running {retry}."
+        ),
+        (_, "router.dispatch.prepare_artifact_root", "artifact ledger is full") => format!(
+            "Run swarm cleanup plan --scope all and review the candidates. Once capacity is available, run {retry}."
+        ),
+        ("resume_model_unbound" | "resume_effort_unverified", _, _) => format!(
+            "Run swarm switch {subject} --generation {generation} --profile PROFILE with an eligible profile that names a supported model and effort."
+        ),
+        ("native_readback", _, message)
+            if message
+                .contains("newest native turn does not match the exact retained terminal turn")
+                || message.starts_with("Codex resume preflight failed before thread/resume dispatch: thread not loaded:")
+                || message.contains("cannot prove the retained session ran no native turns") =>
+        {
+            format!(
+                "Run swarm why {subject} and resolve any unknown work shown in swarm inbox. If {retry} still refuses on native history, run swarm switch {subject} --generation {generation} to continue from the retained worktree."
+            )
+        }
+        _ => return Ok(None),
+    };
+    Ok(Some(instructions))
 }
 
 fn project_agents(

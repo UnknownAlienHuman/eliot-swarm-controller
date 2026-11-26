@@ -192,12 +192,12 @@ pub(super) fn restart_ancestor_fences_resume_tx(
         .map_err(sql_error)
 }
 
-pub(super) fn restart_resume_candidate_tx(
+pub(super) fn require_restart_resume_candidate_tx(
     connection: &Connection,
     agent: &str,
     generation: i64,
     resume_text: Option<&str>,
-) -> Result<bool> {
+) -> Result<()> {
     let agent_num = parse_agent_id(agent)?;
     let eligibility = restart_resume_eligibility();
     let query = format!(
@@ -215,11 +215,29 @@ pub(super) fn restart_resume_candidate_tx(
             |row| row.get(0),
         )
         .map_err(sql_error)?;
-    if !candidate
-        || !has_owned_exit_and_reader_drain_tx(connection, agent_num, generation)?
-        || restart_ancestor_fences_resume_tx(connection, agent_num)?
-    {
-        return Ok(false);
+    if !candidate {
+        return Err(Error::new(
+            "bad_state",
+            format!(
+                "restart Resume eligibility changed before admission. Run swarm why {agent} and review swarm inbox for unsettled work"
+            ),
+        ));
+    }
+    if !has_owned_exit_and_reader_drain_tx(connection, agent_num, generation)? {
+        return Err(Error::new(
+            "bad_state",
+            format!(
+                "the prior process exit or reader drain is unproven. Run swarm why {agent} and swarm processes {agent} to inspect custody"
+            ),
+        ));
+    }
+    if restart_ancestor_fences_resume_tx(connection, agent_num)? {
+        return Err(Error::new(
+            "bad_state",
+            format!(
+                "a restart-affected ancestor must resume first. Run swarm show {agent} to identify its parent and resolve the ancestor's Resume"
+            ),
+        ));
     }
     let query = format!(
         "SELECT json_type(restart.data, '$.undelivered_send_id')
@@ -234,12 +252,19 @@ pub(super) fn restart_resume_candidate_tx(
         .map_err(sql_error)?
         .flatten();
     match captured_id_kind.as_deref() {
-        None => Ok(true),
-        Some("text") => Ok(
-            restart_initial_launch_input(connection, agent_num, generation)?
-                .is_some_and(|expected| resume_text == Some(expected.as_str())),
-        ),
-        Some(_) => Ok(false),
+        None => Ok(()),
+        Some("text")
+            if restart_initial_launch_input(connection, agent_num, generation)?
+                .is_some_and(|expected| resume_text == Some(expected.as_str())) =>
+        {
+            Ok(())
+        }
+        Some(_) => Err(Error::new(
+            "bad_state",
+            format!(
+                "the captured launch input could not be verified. Run swarm why {agent} to review the launch and SEND outcomes before giving fresh input"
+            ),
+        )),
     }
 }
 

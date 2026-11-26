@@ -232,6 +232,11 @@ settled work before admitting a promptless Resume with no linked SEND.
 A retained old process family keeps the generation lost until exact
 custody readback releases it. Startup reconciliation closes the old
 native publisher and retains any recorded source gap.
+When a harness verifies native history before Resume, the terminal turn
+must match the newest retained turn of the same native subject. An intervening
+native turn without matching Store evidence blocks Resume, including a turn
+started across the planned restart input cutoff. The Owner inbox names the
+diagnostic and the generation-bound Switch path after unknown work is settled.
 Unresolved commands, turns, requests, Goal rounds, Owner Stops, or restart-
 affected ancestors continue to fence admission. The exact turn interrupted by
 the restart may remain unknown. The new generation keeps the native subject
@@ -1265,6 +1270,12 @@ An idle member keeps its live custody. Unarchive skips the custody check.
 A refusal names the Agent and its first blocker. Reattaching an archived
 observer opens a new `observe` source and clears the flag, so a live reader is never hidden.
 Send, resume, steer and inject admission atomically clears the target's archive flag.
+When an adapter reports a correlated archive refusal for the retained native
+subject, the daemon may restore that exact session through the documented
+native operation. The refusal must prove that the earlier open had no effect.
+The daemon checks the current Resume binding and requires the exact restore
+acknowledgement before continuing the open once. An uncertain restore fences
+the attempt and linked input.
 
 Automatic [Agent retirement](configuration.md#agent-retirement) applies the archive flag
 to an individual Agent with closed custody and no unresolved work. The

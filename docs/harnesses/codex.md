@@ -475,6 +475,9 @@ Resume checks the newest native turn against the latest retained turn for the sa
 Agent. A promptless Resume can leave the latest turn in an earlier generation of
 the same thread. The source binding still comes from the immediately preceding
 generation, and the native readback must confirm the exact turn is terminal.
+If the native thread has a later turn outside the retained stream boundary,
+inspect `swarm why AGENT` and settle unknown work before using
+`swarm switch AGENT --generation N` to continue from the worktree.
 
 One app-server can host many threads, but per-Agent processes keep environment, Eliot
 token, Git identity and custody separate. Native child threads share the parent
@@ -527,7 +530,7 @@ write. A lost Eliot event acknowledgement follows the common last-batch rule.
 | inject | next_input via the next SEND prepend; active_turn via `turn/steer` on the exact captured turn, mechanism `codex.turn/steer`; other points unsupported, never a weaker SEND |
 | interrupt | `turn/interrupt` for the captured native turn. With no captured turn, read the owned thread to confirm idle. The [shared interrupt policy](../spec/plugin-protocol.md#host-requests) owns confirmation and escalation |
 | stop | for a captured busy turn, send exact-thread/turn `turn/interrupt` once and wait up to the core stop interrupt bound for native `turn/completed`; only the terminal status proves interruption. Then end this Agent's owned session/process; missing evidence retains an unknown turn. Force skips the cooperative window |
-| resume | new Eliot generation/app-server plus `thread/resume` of retained thread; no old input replay |
+| resume | new Eliot generation/app-server plus `thread/resume` of the retained thread. Codex maps an exact archive refusal to a typed native fact. The daemon decides whether to issue `native.unarchive` and continue the same Resume once. An uncertain unarchive fences linked input. |
 | approve/deny/answer | reply to the exact offered native request; public details are the shared ApprovalRequest/QuestionRequest, answers are the universal answers map |
 | configure | model and effort ride the per-turn `turn/start` fields (`TurnStartParams.model`/`effort`), resolved from the retained revision at send dispatch; the frozen snapshot never changes |
 | fork / native Goal / child control | later optional methods verified against installed schema, not advertised until implemented |
@@ -546,12 +549,26 @@ SHA-256 of byte `1` followed by the configured file's exact bytes, or
 SHA-256 of byte `0` when no file is set. Replacing a file with identical
 contents preserves its identity.
 
-Before opening or resuming a thread, the worker checks the effective
-provider route and compares the current catalogue digest with the frozen
-digest. A change returns `model_catalogue_changed` with both digests. Restore
-the previous catalogue bytes to resume the Agent, or start a new Agent to
-adopt the new catalogue. A read refusal names the cause without exposing the
+The worker verifies the effective provider route before both launch and
+Resume. A catalogue digest change during launch returns
+`model_catalogue_changed` with both digests. Resume reads the current catalogue
+and resolves the retained selector on the same route. The native reply must
+echo the exact model. On an unchanged catalogue, omission of an explicit
+profile selector is advisory. A daemon-selected default with frozen effort
+requires an exact row advertising that effort. After a catalogue change,
+a frozen effort requires the exact resolved row to advertise it. An absent
+selector, absent required row, or unsupported effort refuses before opening
+the thread. Use Switch with a profile that supplies a supported selector and
+effort. A catalogue file read refusal names the cause without exposing the
 configured path.
+
+The installed Codex 0.167.1 schemas, generated with
+`codex app-server generate-json-schema --out <dir>`, define `thread/unarchive`
+in `v2/ThreadUnarchiveParams.json` and `v2/ThreadUnarchiveResponse.json`.
+The adapter translates the request's `threadId` and verifies the reply's
+`thread.id`. [Upstream protocol definitions](https://github.com/openai/codex/blob/rust-v0.167.1/codex-rs/app-server-protocol/src/protocol/v2/thread.rs).
+If that operation is unavailable, run `codex unarchive THREAD_ID` using
+the retained Codex store and exit the TUI before retrying Swarm Resume.
 Legacy frozen profiles without a digest keep their existing launch and
 resume behavior. The adapter reads the Owner's configuration and catalogue
 without writing to them.
