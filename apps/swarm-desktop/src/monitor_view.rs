@@ -642,21 +642,72 @@ fn outer_columns() -> [GridLength; 3] {
 }
 
 /// A number cell (CPU, Memory): right-aligned, muted.
-fn number(text: &str, column: i32) -> View {
+fn number(text: &str) -> View {
     crate::controls::text(text.to_owned(), tokens::text::BODY)
-        .grid_column(column)
         .horizontal_alignment(HorizontalAlignment::Right)
         .vertical_alignment(VerticalAlignment::Center)
         .into()
 }
 
-/// The header row (`.trow.head`): the column names in `label-medium`, a
-/// hairline under them.
-fn head_row(narrow: bool) -> View {
+/// A row's text columns ([`row_columns`]) with their cells: the task
+/// cell, the model (a wide main area only), activity, CPU and memory. The
+/// header and every row lay out through this one grid, so each column
+/// name stands over its column.
+fn row_cells(
+    narrow: bool,
+    task: View,
+    model: View,
+    activity: View,
+    cpu: View,
+    memory: View,
+) -> Grid {
     let at = activity_column(narrow);
-    let label = |text: &str, column: i32, right: bool| -> View {
-        crate::controls::text(text.to_owned(), tokens::text::LABEL)
+    let cell = |column: i32, content: View| -> View {
+        Border::new()
             .grid_column(column)
+            .vertical_alignment(VerticalAlignment::Center)
+            .content(content)
+            .into()
+    };
+    Grid::new()
+        .columns(row_columns(narrow))
+        .column_spacing(tokens::spacing::SM)
+        .keyed_children(crate::views::slots([
+            Some(task),
+            (!narrow).then(|| cell(1, model)),
+            Some(cell(at, activity)),
+            Some(cell(at + 1, cpu)),
+            Some(cell(at + 2, memory)),
+        ]))
+}
+
+/// The task cell's own columns: the state mark's slot, the title (its
+/// project under it) and the observed badge; a worker indents one step.
+fn task_cell(kid: bool, cells: Vec<KeyedView>) -> View {
+    Grid::new()
+        .margin(Thickness::new(
+            if kid {
+                tokens::layout::TREE_INDENT
+            } else {
+                0.0
+            },
+            0.0,
+            0.0,
+            0.0,
+        ))
+        .columns([GridLength::Auto, GridLength::STAR, GridLength::Auto])
+        .column_spacing(tokens::spacing::SM)
+        .keyed_children(cells)
+        .into()
+}
+
+/// The header row (`.trow.head`): the column names in `label-medium`, a
+/// hairline under them, laid out through the rows' own columns
+/// ([`row_cells`], [`task_cell`]): "Task" past an empty mark slot, as a
+/// row's title is.
+fn head_row(narrow: bool) -> View {
+    let label = |text: &str, right: bool| -> View {
+        crate::controls::text(text.to_owned(), tokens::text::LABEL)
             .horizontal_alignment(if right {
                 HorizontalAlignment::Right
             } else {
@@ -665,6 +716,18 @@ fn head_row(narrow: bool) -> View {
             .vertical_alignment(VerticalAlignment::Center)
             .into()
     };
+    let task = task_cell(
+        false,
+        vec![
+            KeyedView::new("mark", Border::new().width(tokens::layout::MARK_SLOT)),
+            KeyedView::new(
+                "title",
+                crate::controls::text("Task".to_owned(), tokens::text::LABEL)
+                    .grid_column(1)
+                    .vertical_alignment(VerticalAlignment::Center),
+            ),
+        ],
+    );
     Border::new()
         .min_height(tokens::height::CONTROL)
         .border_brush(ThemeBrush::CardStroke)
@@ -675,40 +738,20 @@ fn head_row(narrow: bool) -> View {
             "Columns: Task, Model, Activity, CPU, Memory"
         })
         .content(
-            Grid::new()
-                .columns(outer_columns())
-                .keyed_children(crate::views::slots([
-                    None,
-                    Some(
-                        // Inset as a row's content is inside its stock button
-                        // (border 1 + padding 11), so each name stands over
-                        // its column.
-                        Grid::new()
-                            .grid_column(1)
-                            .margin(Thickness::xy(tokens::spacing::INSET, 0.0))
-                            .columns(row_columns(narrow))
-                            .column_spacing(tokens::spacing::SM)
-                            .keyed_children(crate::views::slots([
-                                // Past the rows' mark slot, over their titles.
-                                Some(
-                                    crate::controls::text("Task".to_owned(), tokens::text::LABEL)
-                                        .margin(Thickness::new(
-                                            tokens::layout::MARK_SLOT + tokens::spacing::SM,
-                                            0.0,
-                                            0.0,
-                                            0.0,
-                                        ))
-                                        .vertical_alignment(VerticalAlignment::Center)
-                                        .into(),
-                                ),
-                                (!narrow).then(|| label("Model", 1, false)),
-                                Some(label("Activity", at, false)),
-                                Some(label("CPU", at + 1, true)),
-                                Some(label("Memory", at + 2, true)),
-                            ]))
-                            .into(),
-                    ),
-                ])),
+            Grid::new().columns(outer_columns()).children((
+                // A row's cells sit inside its stock button (border 1 +
+                // padding 11): the header's take the same inset.
+                row_cells(
+                    narrow,
+                    task,
+                    label("Model", false),
+                    label("Activity", false),
+                    label("CPU", true),
+                    label("Memory", true),
+                )
+                .grid_column(1)
+                .margin(Thickness::xy(tokens::spacing::INSET, 0.0)),
+            )),
         )
         .into()
 }
@@ -777,9 +820,7 @@ fn fleet_row(entry: &RowEntry, input: &MonitorListInput) -> View {
                 .content(crate::controls::badge("observed")),
         ));
     }
-    let at = activity_column(input.narrow);
     let activity = crate::controls::text(entry.activity.clone(), tokens::text::BODY)
-        .grid_column(at)
         .vertical_alignment(VerticalAlignment::Center)
         .text_trimming(TextTrimming::CharacterEllipsis);
     let activity = if entry.attention {
@@ -787,38 +828,17 @@ fn fleet_row(entry: &RowEntry, input: &MonitorListInput) -> View {
     } else {
         activity
     };
-    let content = Grid::new()
-        .columns(row_columns(input.narrow))
-        .column_spacing(tokens::spacing::SM)
-        .keyed_children(crate::views::slots([
-            Some(
-                Grid::new()
-                    .margin(Thickness::new(
-                        if entry.kid {
-                            tokens::layout::TREE_INDENT
-                        } else {
-                            0.0
-                        },
-                        0.0,
-                        0.0,
-                        0.0,
-                    ))
-                    .columns([GridLength::Auto, GridLength::STAR, GridLength::Auto])
-                    .column_spacing(tokens::spacing::SM)
-                    .keyed_children(task)
-                    .into(),
-            ),
-            (!input.narrow).then(|| {
-                crate::controls::secondary(entry.model.clone())
-                    .grid_column(1)
-                    .vertical_alignment(VerticalAlignment::Center)
-                    .text_trimming(TextTrimming::CharacterEllipsis)
-                    .into()
-            }),
-            Some(activity.into()),
-            Some(number(&entry.cpu, at + 1)),
-            Some(number(&entry.memory, at + 2)),
-        ]));
+    let content = row_cells(
+        input.narrow,
+        task_cell(entry.kid, task),
+        crate::controls::secondary(entry.model.clone())
+            .vertical_alignment(VerticalAlignment::Center)
+            .text_trimming(TextTrimming::CharacterEllipsis)
+            .into(),
+        activity.into(),
+        number(&entry.cpu),
+        number(&entry.memory),
+    );
     let open = input.open.clone();
     let id = row.id.clone();
     let name = format!(

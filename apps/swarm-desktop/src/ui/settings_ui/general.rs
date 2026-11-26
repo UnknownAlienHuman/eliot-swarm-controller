@@ -72,7 +72,7 @@ impl DesktopApp {
                     context.callback(|index| Message::Settings(SettingsMsg::AccessChosen(index))),
                 ),
         )]);
-        let widths = split_ui::PanelWidths::of(self.prefs.panels);
+        let widths = self.panel_widths();
         StackPanel::new()
             .spacing(tokens::spacing::SM)
             .children((

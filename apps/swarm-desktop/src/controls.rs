@@ -126,6 +126,8 @@ pub mod glyph {
     pub const HUB: &str = "\u{E968}";
     /// Clock.
     pub const SCHEDULE: &str = "\u{E917}";
+    /// QuietHours: an idle Agent's resting mark.
+    pub const IDLE: &str = "\u{E708}";
     /// ErrorBadge.
     pub const ERROR: &str = "\u{EA39}";
     /// Send.
@@ -1165,9 +1167,9 @@ pub enum RowMark {
     Working,
     /// Waiting for you: the attention icon in the accent text color.
     Waiting,
-    /// Idle or ready: no mark, its slot left empty so the title stays in
-    /// line with the others (§4.2: a resting task is the normal case, not
-    /// a ring).
+    /// Idle or ready: the quiet-hours icon in the text color, a static
+    /// mark of its own shape (§4.2: a persistent state is a static mark or
+    /// words, never a ring, and color is not its only sign).
     Idle,
     /// Queued: the clock icon.
     Queued,
@@ -1209,7 +1211,7 @@ pub fn row_mark(mark: RowMark, word: &str) -> View {
                 .vertical_alignment(VerticalAlignment::Center)
                 .into(),
         ),
-        RowMark::Idle => None,
+        RowMark::Idle => Some(icon(glyph::IDLE)),
         RowMark::Queued => Some(icon(glyph::SCHEDULE)),
         RowMark::Failed => Some(critical_icon(glyph::ERROR, icon_size::ROW)),
     };

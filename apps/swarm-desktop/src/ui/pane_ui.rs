@@ -255,8 +255,10 @@ const CLOSED_AT_FIRST: [&str; 2] = ["task", "technical"];
 pub(super) struct PaneState {
     /// Full view: the open panel over the whole main card.
     pub(super) full: bool,
-    /// The pane's width before Wide, which unpressing Wide returns to.
-    before_wide: Option<f64>,
+    /// Wide: the pane shown at 720 while pressed. The saved width stays
+    /// the handle's, so unpressing returns to the width before Wide, after
+    /// a restart too.
+    pub(super) wide: bool,
     changes: ChangesState,
     terminal: TerminalState,
     /// Agents tab rows whose workers are folded away.
@@ -276,9 +278,8 @@ pub(super) enum PaneMsg {
     /// The Full view toggle: the panel over the whole main card, or back
     /// beside the conversation.
     Full(bool),
-    /// The Wide toggle: the pane at its wide width (720), or back to the
-    /// width it had before (its default after a restart). The width is
-    /// saved as a handle's is.
+    /// The Wide toggle: the pane shown at its wide width (720), or back to
+    /// its saved width, the one it had before. Wide itself saves nothing.
     Wide(bool),
     /// The open tab's Refresh (and Retry).
     Refresh,
@@ -324,23 +325,19 @@ impl DesktopApp {
         match msg {
             PaneMsg::Full(on) => self.pane.full = on,
             PaneMsg::Wide(on) => {
-                let widths = split_ui::PanelWidths::of(self.prefs.panels);
-                let wide = tokens::layout::PANEL_WIDE_WIDTH;
-                let pane = if on {
-                    if widths.pane < wide {
-                        self.pane.before_wide = Some(widths.pane);
-                    }
-                    wide
-                } else {
-                    self.pane
-                        .before_wide
-                        .take()
-                        .unwrap_or(tokens::layout::PANEL_WIDTH)
-                };
-                self.shell_update(
-                    ShellMsg::PanelsResized(widths.with(split_ui::Edge::Pane, pane)),
-                    context,
-                );
+                let saved = split_ui::PanelWidths::of(self.prefs.panels);
+                if on || self.pane.wide {
+                    self.pane.wide = on;
+                } else if saved.pane >= tokens::layout::PANEL_WIDE_WIDTH {
+                    // The handle or Settings saved 720 itself: there is no
+                    // earlier width, so the pane takes its default.
+                    self.shell_update(
+                        ShellMsg::PanelsResized(
+                            saved.with(split_ui::Edge::Pane, tokens::layout::PANEL_WIDTH),
+                        ),
+                        context,
+                    );
+                }
             }
             PaneMsg::Refresh => match self.panel {
                 Panel::Changes => self.read_changes(context),
@@ -907,11 +904,40 @@ impl DesktopApp {
             .into()
     }
 
+    /// The panel widths shown: `[desktop] panels`, the pane at 720 while
+    /// Wide is pressed.
+    pub(super) fn panel_widths(&self) -> split_ui::PanelWidths {
+        let saved = split_ui::PanelWidths::of(self.prefs.panels);
+        if self.pane.wide {
+            saved.with(split_ui::Edge::Pane, tokens::layout::PANEL_WIDE_WIDTH)
+        } else {
+            saved
+        }
+    }
+
+    /// Widths a handle or Settings reports, as `[desktop] panels` keeps
+    /// them: Wide's 720 is shown, never saved, so a report of it keeps the
+    /// saved pane width; any other pane width ends Wide.
+    pub(super) fn saved_widths(
+        &mut self,
+        reported: split_ui::PanelWidths,
+    ) -> split_ui::PanelWidths {
+        if !self.pane.wide {
+            return reported;
+        }
+        if reported.pane == tokens::layout::PANEL_WIDE_WIDTH {
+            let saved = split_ui::PanelWidths::of(self.prefs.panels);
+            reported.with(split_ui::Edge::Pane, saved.pane)
+        } else {
+            self.pane.wide = false;
+            reported
+        }
+    }
+
     /// The pane's content takes its wide layout: Full view, or the pane at
-    /// its widest (`[desktop] panels`).
+    /// its widest (Wide, or 720 in `[desktop] panels`).
     fn pane_wide(&self) -> bool {
-        self.pane.full
-            || split_ui::PanelWidths::of(self.prefs.panels).pane >= tokens::layout::PANEL_WIDE_WIDTH
+        self.pane.full || self.panel_widths().pane >= tokens::layout::PANEL_WIDE_WIDTH
     }
 
     /// The pane's bar, over a hairline: the open panel's title, then Wide
@@ -926,8 +952,7 @@ impl DesktopApp {
         let title = panel.label();
         let full = self.pane.full;
         // Wide and Full view are toggles: UIA reads their pressed state.
-        let wide =
-            split_ui::PanelWidths::of(self.prefs.panels).pane >= tokens::layout::PANEL_WIDE_WIDTH;
+        let wide = self.panel_widths().pane >= tokens::layout::PANEL_WIDE_WIDTH;
         let widen: Option<View> = (self.layout.wide_docks && !full).then(|| {
             controls::bar_toggle(wide)
                 .grid_column(1)
