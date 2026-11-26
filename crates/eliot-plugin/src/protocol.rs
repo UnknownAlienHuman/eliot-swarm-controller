@@ -251,6 +251,28 @@ pub struct NativeArchiveParams {
     pub workspace: Option<String>,
 }
 
+/// Bind an archived-session fact and the subsequent native operations to the
+/// still-owned start attempt. This binding is also the unarchive acknowledgement.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ArchivedResumeBinding {
+    pub agent_id: String,
+    pub generation: i64,
+    pub command_id: String,
+    pub native_ref: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(
+    tag = "state",
+    content = "binding",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
+pub enum AgentStartBlocker {
+    NativeSessionArchived(ArchivedResumeBinding),
+}
+
 /// Read the terminal outcome for one native turn, with no vendor write.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

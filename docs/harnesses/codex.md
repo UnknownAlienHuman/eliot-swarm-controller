@@ -530,7 +530,7 @@ write. A lost Eliot event acknowledgement follows the common last-batch rule.
 | inject | next_input via the next SEND prepend; active_turn via `turn/steer` on the exact captured turn, mechanism `codex.turn/steer`; other points unsupported, never a weaker SEND |
 | interrupt | `turn/interrupt` for the captured native turn. With no captured turn, read the owned thread to confirm idle. The [shared interrupt policy](../spec/plugin-protocol.md#host-requests) owns confirmation and escalation |
 | stop | for a captured busy turn, send exact-thread/turn `turn/interrupt` once and wait up to the core stop interrupt bound for native `turn/completed`; only the terminal status proves interruption. Then end this Agent's owned session/process; missing evidence retains an unknown turn. Force skips the cooperative window |
-| resume | new Eliot generation/app-server plus `thread/resume` of the retained thread. On an exact archive refusal, call `thread/unarchive` once, require the same thread ID in the reply, then open that thread once. An uncertain unarchive retains an unknown outcome and fences linked input. |
+| resume | new Eliot generation/app-server plus `thread/resume` of the retained thread. Codex maps an exact archive refusal to a typed native fact. The daemon decides whether to issue `native.unarchive` and continue the same Resume once. An uncertain unarchive fences linked input. |
 | approve/deny/answer | reply to the exact offered native request; public details are the shared ApprovalRequest/QuestionRequest, answers are the universal answers map |
 | configure | model and effort ride the per-turn `turn/start` fields (`TurnStartParams.model`/`effort`), resolved from the retained revision at send dispatch; the frozen snapshot never changes |
 | fork / native Goal / child control | later optional methods verified against installed schema, not advertised until implemented |
@@ -554,12 +554,18 @@ Resume. A catalogue digest change during launch returns
 `model_catalogue_changed` with both digests. Resume reads the current catalogue
 and resolves the retained selector on the same route. The native reply must
 echo the exact model. A catalogue omission is advisory where the native
-route accepts the explicit selector. If a changed catalogue has no retained
-selector, Switch the Agent to a profile with an explicit model. A catalogue
-file read refusal names the cause without exposing the configured path.
+route accepts the explicit selector and the retained profile leaves effort
+unspecified. With a frozen effort and a changed catalogue, the exact resolved
+row must advertise that effort. An absent selector, absent required row, or
+unsupported effort refuses before opening the thread. Use Switch with a
+profile that supplies a supported selector and effort. A catalogue file read
+refusal names the cause without exposing the configured path.
 
-The Codex 0.167.1 app-server schema defines `thread/unarchive` with
-`ThreadUnarchiveParams.threadId` and `ThreadUnarchiveResponse.thread.id`.
+The installed Codex 0.167.1 schemas, generated with
+`codex app-server generate-json-schema --out <dir>`, define `thread/unarchive`
+in `v2/ThreadUnarchiveParams.json` and `v2/ThreadUnarchiveResponse.json`.
+The adapter translates the request's `threadId` and verifies the reply's
+`thread.id`. [Upstream protocol definitions](https://github.com/openai/codex/blob/rust-v0.167.1/codex-rs/app-server-protocol/src/protocol/v2/thread.rs).
 If that operation is unavailable, run `codex unarchive THREAD_ID` using
 the retained Codex store and exit the TUI before retrying Swarm Resume.
 Legacy frozen profiles without a digest keep their existing launch and

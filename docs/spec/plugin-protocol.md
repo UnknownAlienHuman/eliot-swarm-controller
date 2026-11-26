@@ -235,6 +235,8 @@ quota decisions, routing, and hold settlement.
 | --- | --- | --- |
 | `initialize` | protocol, frozen plugin config, private instance directory, optional `store_root` (required by OpenCode) | return actual manifest |
 | `agent.start` | agent/generation, profile, workspace, target environment, note, source plan/state, optional resume subject/linked initial input | establish session; input/result settle separately; a proven startup refusal returns a bound `"state": "failed"` with a short non-secret `reason` |
+| `native.unarchive` | exact [`ArchivedResumeBinding`](../../crates/eliot-plugin/src/protocol.rs) from the typed `native_session_archived` start refusal | translate one native restore on the still-owned plugin, and acknowledge the exact binding only after native confirmation |
+| `agent.start.continue` | the acknowledged archived Resume binding | open the already-prepared subject and return the normal readiness or failure result |
 | `agent.command` | agent/generation, command id, verb/args, exact turn/request where required | applied/rejected/failed/unknown, native mechanism and application point |
 | `agent.stop` | agent/generation, command id | gracefully close the bound controlled native session and drain its events |
 | `agent.snapshot` | controlled command/turn binding, or exact subject plus `observation` page query | bounded readback; private history never acknowledges controlled effects |
@@ -336,6 +338,10 @@ reader errors and stderr with the broader diagnostic-secret set.
 `resume_from={native_scope,native_ref}` is an `agent.start` option, not replay of the
 old input. `initial={command_id,text}` is supplied only for a harness that requires
 input to create a session. Explicit new text remains a separate linked command.
+For a correlated archive refusal, the daemon verifies the current dispatched
+Resume, calls `native.unarchive` once, then checks acknowledgement and current
+binding before sending `agent.start.continue` once. An ambiguous result or a
+second archive refusal does not trigger a new write.
 
 Codex and Muse share the retained-turn preflight before adopting a resume. Each
 adapter translates its readback into a resumable runtime state, any active turn,

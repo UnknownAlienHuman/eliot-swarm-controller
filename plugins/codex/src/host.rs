@@ -31,7 +31,7 @@ use eliot_plugin::{
     AgentCommandParams, AgentCommandVerb, AgentSnapshotParams, AgentStartParams, AgentStopParams,
     DiscoverParams, InitializeParams, MAX_EVENT_BYTES, MAX_TEXT_BYTES, ObserverAttachParams,
     ObserverDetachParams, ObserverSnapshotParams, Peer, PeerClient, PluginManifest, RpcRequest,
-    protocol::{ProfileStoreParams, stream_sources},
+    protocol::{AgentStartBlocker, ArchivedResumeBinding, ProfileStoreParams, stream_sources},
     resume::ResumePreflight,
     session::{
         ModelSelection, attach_reply_diagnostics, begin_stop, decode, ensure_dedicated_reader,
@@ -69,6 +69,7 @@ const MAX_ITEM_PAGES: usize = 16;
 struct CodexPlugin {
     initialized: Option<Initialized>,
     session: Option<AgentSession>,
+    pending_resume: Option<Box<PreparedThread>>,
     failed_start: Option<FailedStart>,
     failed_attach: Option<FailedAttach>,
     observer: Option<ObserverSession>,
@@ -203,27 +204,31 @@ struct ValidatedStartPlan {
     profile: serde_json::Map<String, Value>,
 }
 
-/// Dispatched Codex thread with its owned session: the native effect has
-/// happened exactly once and its identity is proven; readiness settlement
-/// takes over from here.
-struct DispatchedThread {
-    session: AgentSession,
+/// Checked startup inputs kept alongside the owned session during a native
+/// archive refusal. The daemon can address that same start attempt again.
+struct PreparedThread {
+    params: AgentStartParams,
+    plan: ValidatedStartPlan,
     selected: SelectedModel,
-    readback: ThreadStartReadback,
+}
+
+impl PreparedThread {
+    fn matches(&self, binding: &ArchivedResumeBinding) -> bool {
+        self.params.agent_id == binding.agent_id
+            && self.params.generation == binding.generation
+            && self.params.command_id == binding.command_id
+            && self
+                .plan
+                .resume_subject
+                .as_ref()
+                .is_some_and(|subject| subject.native_ref == binding.native_ref)
+    }
 }
 
 struct SelectedModel {
     id: String,
     effort: Option<String>,
     catalogue_omits_model: bool,
-}
-
-/// Outcome of the dispatch phase: either a live dispatched thread ready for
-/// readiness settlement, or a settled pre-dispatch report when the worker
-/// never reached thread dispatch.
-enum DispatchOutcome {
-    Dispatched(Box<DispatchedThread>),
-    Settled(Value),
 }
 
 /// Validate the frozen Codex start plan before any native I/O: resume
@@ -600,11 +605,13 @@ impl CodexPlugin {
             "model.list" => self.model_list(&request.params).await,
             "quota.read" => self.quota_read(&request.params).await,
             "native.archive" => self.native_archive(&request.params).await,
+            "native.unarchive" => self.native_unarchive(&request.params).await,
             "native.turn_evidence" => crate::history::read(&request.params).await,
             "agent.attach" => self.attach(&request.params).await,
             "agent.detach" => self.detach(&request.params).await,
             "agent.validate_start" => self.validate_start(&request.params),
             "agent.start" => Box::pin(self.start(&request.params, client)).await,
+            "agent.start.continue" => Box::pin(self.continue_start(&request.params)).await,
             "agent.command" => self.command(&request.params).await,
             "agent.snapshot" => self.snapshot(&request.params).await,
             "agent.stop" => self.stop(&request.params).await,
@@ -1033,23 +1040,81 @@ impl CodexPlugin {
         let plan = validate_start_plan(&params, initialized)?;
         let session = self.spawn_owned_session(&plan, &params, peer).await?;
 
-        let dispatched = self.dispatch_thread_start(session, &params, &plan).await?;
-        // Readiness and input settlement live in settle_start_readiness, unless
-        // dispatch settled a pre-thread report: effective readback,
-        // frozen-profile match, ready commitment, result.
-        match dispatched {
-            DispatchOutcome::Dispatched(thread) => {
-                self.settle_start_readiness(
-                    thread.session,
-                    &params,
-                    &plan,
-                    thread.readback,
-                    thread.selected,
-                )
-                .await
-            }
-            DispatchOutcome::Settled(value) => Ok(value),
+        self.dispatch_thread_start(session, params, plan).await
+    }
+
+    fn pending_resume_binding(&self, raw: &Value) -> Result<ArchivedResumeBinding> {
+        let binding: ArchivedResumeBinding =
+            decode(raw, "Codex archived Resume binding is invalid")?;
+        if self
+            .pending_resume
+            .as_ref()
+            .is_none_or(|prepared| !prepared.matches(&binding))
+            || self
+                .session
+                .as_ref()
+                .is_none_or(|session| session.phase != SessionPhase::Unknown)
+        {
+            return Err(Error::new(
+                "native_not_dispatched",
+                "Codex has no matching pending Resume",
+            ));
         }
+        Ok(binding)
+    }
+
+    async fn native_unarchive(&self, raw: &Value) -> Result<Value> {
+        let binding = self.pending_resume_binding(raw)?;
+        let session = self
+            .session
+            .as_ref()
+            .expect("validated pending Resume owns a session");
+        let thread_id = &binding.native_ref;
+        let params =
+            serde_json::to_value(NativeThreadUnarchiveParams { thread_id }).map_err(|_| {
+                Error::new(
+                    "native_not_dispatched",
+                    "Codex unarchive params could not be encoded",
+                )
+            })?;
+        let reply = session
+            .native_client
+            .call("thread/unarchive", params, Instant::now() + RPC_TIMEOUT)
+            .await
+            .map_err(|error| {
+                if error.failure_where.as_deref()
+                    == Some("plugin.codex.native.response.method_not_found")
+                    || native_no_write(&error.code)
+                {
+                    error.with_code("native_not_dispatched")
+                } else {
+                    contextual_error(
+                        error,
+                        "unknown",
+                        "Codex thread/unarchive outcome is unproven",
+                    )
+                }
+            })?;
+        if reply.pointer("/thread/id").and_then(Value::as_str) != Some(thread_id) {
+            return Err(Error::new(
+                "unknown",
+                "Codex thread/unarchive did not acknowledge the exact thread",
+            ));
+        }
+        Ok(json!(binding))
+    }
+
+    async fn continue_start(&mut self, raw: &Value) -> Result<Value> {
+        self.pending_resume_binding(raw)?;
+        let prepared = *self
+            .pending_resume
+            .take()
+            .expect("validated pending Resume");
+        let session = self
+            .session
+            .take()
+            .expect("validated pending Resume owns a session");
+        self.open_prepared_thread(session, prepared).await
     }
     /// Spawn the owned Codex worker from the validated plan: enumerate the
     /// worker-visible MCP surface, compute transport-carrying disables,
@@ -1265,9 +1330,9 @@ impl CodexPlugin {
     async fn dispatch_thread_start(
         &mut self,
         mut session: AgentSession,
-        params: &AgentStartParams,
-        plan: &ValidatedStartPlan,
-    ) -> Result<DispatchOutcome> {
+        params: AgentStartParams,
+        plan: ValidatedStartPlan,
+    ) -> Result<Value> {
         let (selected, native_scope) = match Self::initialize_native(
             &session.native_client,
             &plan.workspace,
@@ -1288,14 +1353,12 @@ impl CodexPlugin {
             Ok(selected) => selected,
             Err(error) => {
                 let error = discard_failed_start(&mut session, error).await;
-                return self
-                    .settle_pre_dispatch_outcome(
-                        session,
-                        params,
-                        error,
-                        "owned app-server cleanup is unconfirmed; no thread or input was sent",
-                    )
-                    .map(DispatchOutcome::Settled);
+                return self.settle_pre_dispatch_outcome(
+                    session,
+                    &params,
+                    error,
+                    "owned app-server cleanup is unconfirmed; no thread or input was sent",
+                );
             }
         };
         session.selected_model = selected.id.clone();
@@ -1307,14 +1370,12 @@ impl CodexPlugin {
             && let Err(error) = verify_windows_sandbox_ready(&session.native_client).await
         {
             let error = discard_failed_start(&mut session, error).await;
-            return self
-                .settle_pre_dispatch_outcome(
-                    session,
-                    params,
-                    error,
-                    "owned app-server cleanup is unconfirmed; no thread or input was sent",
-                )
-                .map(DispatchOutcome::Settled);
+            return self.settle_pre_dispatch_outcome(
+                session,
+                &params,
+                error,
+                "owned app-server cleanup is unconfirmed; no thread or input was sent",
+            );
         }
 
         if let Some(subject) = &plan.resume_subject {
@@ -1327,41 +1388,59 @@ impl CodexPlugin {
                     ),
                 )
                 .await;
-                return self
-                    .settle_pre_dispatch_outcome(
-                        session,
-                        params,
-                        error,
+                return self.settle_pre_dispatch_outcome(
+                    session,
+                    &params,
+                    error,
                     "owned app-server cleanup is unconfirmed; no thread/resume or input was sent",
-                    )
-                    .map(DispatchOutcome::Settled);
+                );
             }
             session.thread_id = Some(subject.native_ref.clone());
-            if let Err(error) = verify_resume_preflight(
+        }
+
+        self.open_prepared_thread(
+            session,
+            PreparedThread {
+                params,
+                plan,
+                selected,
+            },
+        )
+        .await
+    }
+
+    async fn open_prepared_thread(
+        &mut self,
+        mut session: AgentSession,
+        prepared: PreparedThread,
+    ) -> Result<Value> {
+        let PreparedThread {
+            params,
+            plan,
+            selected,
+        } = prepared;
+        if let Some(subject) = &plan.resume_subject
+            && let Err(error) = verify_resume_preflight(
                 &session.native_client,
                 &subject.native_ref,
                 subject.retained_turn.as_deref(),
             )
             .await
-            {
-                let message = format!(
-                    "Codex resume preflight failed before thread/resume dispatch: {}",
-                    error.message
-                );
-                // Only prerequisite reads ran; native thread effects were not dispatched.
-                let error = pre_dispatch_read_error(error, "native_readback", &message);
-                let error = discard_failed_start(&mut session, error).await;
-                return self
-                    .settle_pre_dispatch_outcome(
-                        session,
-                        params,
-                        error,
-                    "owned app-server cleanup is unconfirmed; no thread/resume or input was sent",
-                    )
-                    .map(DispatchOutcome::Settled);
-            }
+        {
+            let message = format!(
+                "Codex resume preflight failed before thread/resume dispatch: {}",
+                error.message
+            );
+            // Only prerequisite reads ran; native thread effects were not dispatched.
+            let error = pre_dispatch_read_error(error, "native_readback", &message);
+            let error = discard_failed_start(&mut session, error).await;
+            return self.settle_pre_dispatch_outcome(
+                session,
+                &params,
+                error,
+                "owned app-server cleanup is unconfirmed; no thread/resume or input was sent",
+            );
         }
-
         // rust-v0.167.1 Config::multi_agent_version_override requires agents.enabled=false
         // and multi_agent_v2=false: model metadata can bypass multi_agent=false alone.
         // Apply the documented dotted config overrides to every start and resume,
@@ -1412,17 +1491,30 @@ impl CodexPlugin {
                 })?,
             )
         };
-        let response_value = match open_thread(
-            &session.native_client,
-            thread_method,
-            params_value,
-            plan.resume_subject
-                .as_ref()
-                .map(|subject| subject.native_ref.as_str()),
-        )
-        .await
+        let response_value = match session
+            .native_client
+            .call(thread_method, params_value, Instant::now() + RPC_TIMEOUT)
+            .await
         {
             Ok(value) => value,
+            Err(error)
+                if let Some(subject) = plan.resume_subject.as_ref()
+                    && is_archive_refusal(&error, &subject.native_ref) =>
+            {
+                let binding = ArchivedResumeBinding {
+                    agent_id: params.agent_id.clone(),
+                    generation: params.generation,
+                    command_id: params.command_id.clone(),
+                    native_ref: subject.native_ref.clone(),
+                };
+                self.session = Some(session);
+                self.pending_resume = Some(Box::new(PreparedThread {
+                    params,
+                    plan,
+                    selected,
+                }));
+                return Ok(json!(AgentStartBlocker::NativeSessionArchived(binding)));
+            }
             Err(error) if error.code == "native_rejected" => {
                 let error = discard_failed_start(&mut session, error).await;
                 self.failed_start = Some(FailedStart);
@@ -1492,11 +1584,8 @@ impl CodexPlugin {
                 "Codex thread/resume did not prove the resumed thread idle; no input was sent",
             ));
         }
-        Ok(DispatchOutcome::Dispatched(Box::new(DispatchedThread {
-            session,
-            selected,
-            readback,
-        })))
+        self.settle_start_readiness(session, &params, &plan, readback, selected)
+            .await
     }
 
     /// Settle start readiness for the dispatched thread: deliver the
@@ -1892,10 +1981,19 @@ impl CodexPlugin {
                     "Codex Responses route requires an explicit model id",
                 )
             })?;
-            let catalogue_omits_model = catalogue_changed
-                && discover_models(client)
-                    .await
-                    .is_ok_and(|entries| entries.iter().all(|entry| entry.id != requested));
+            let catalogue_omits_model = if catalogue_changed {
+                let entries = discover_models(client).await;
+                let entry = entries
+                    .as_deref()
+                    .ok()
+                    .and_then(|entries| entries.iter().find(|entry| entry.id == requested));
+                if let Some(effort) = requested_effort {
+                    verify_catalogue_effort(entry, effort, true)?;
+                }
+                entries.is_ok() && entry.is_none()
+            } else {
+                false
+            };
             return Ok((
                 SelectedModel {
                     id: requested.to_owned(),
@@ -1935,18 +2033,8 @@ impl CodexPlugin {
                 })?;
             ModelSelection::new(&default.id, Some(default))
         };
-        if let Some(effort) = requested_effort
-            && !selection.allows_effort(|entry| {
-                entry
-                    .supported_reasoning_efforts
-                    .iter()
-                    .any(|supported| supported.reasoning_effort == effort)
-            })
-        {
-            return Err(Error::new(
-                "profile_error",
-                "Codex profile effort is not supported by the exact selected model",
-            ));
+        if let Some(effort) = requested_effort {
+            verify_catalogue_effort(selection.catalogue_entry, effort, catalogue_changed)?;
         }
         Ok((
             SelectedModel {
@@ -3140,60 +3228,39 @@ async fn discard_failed_start(session: &mut AgentSession, error: Error) -> Error
     session.native_client.diagnostic_error(error)
 }
 
-async fn open_thread(
-    client: &NativeClient,
-    method: &str,
-    params: Value,
-    resume_thread: Option<&str>,
-) -> Result<Value> {
-    let Some(thread_id) = resume_thread else {
-        return client
-            .call(method, params, Instant::now() + RPC_TIMEOUT)
-            .await;
-    };
-    match client
-        .call(method, params.clone(), Instant::now() + RPC_TIMEOUT)
-        .await
-    {
-        Err(error)
-            if error.code == "native_rejected"
-                && error.failure_where.as_deref() == Some("plugin.codex.native.response")
-                && error.message.as_str()
-                    == format!(
-                        "session {thread_id} is archived. Run `codex unarchive {thread_id}` to unarchive it first."
-                    ) => {}
-        result => return result,
-    }
-    let unarchive =
-        serde_json::to_value(NativeThreadUnarchiveParams { thread_id }).map_err(|_| {
-            Error::new(
-                "native_not_dispatched",
-                "Codex unarchive params could not be encoded",
+fn is_archive_refusal(error: &Error, thread_id: &str) -> bool {
+    error.code == "native_rejected"
+        && error.failure_where.as_deref() == Some("plugin.codex.native.response")
+        && error.message.as_str()
+            == format!(
+                "session {thread_id} is archived. Run `codex unarchive {thread_id}` to unarchive it first."
             )
-        })?;
-    let reply = client.call("thread/unarchive", unarchive, Instant::now() + RPC_TIMEOUT).await
-        .map_err(|error| {
-            if error.failure_where.as_deref() == Some("plugin.codex.native.response.method_not_found")
-                || native_no_write(&error.code)
-            {
-                error.with_code("native_rejected").with_message(format!(
-                    "Codex could not unarchive session {thread_id}. Run `codex unarchive {thread_id}` in the retained Codex store, exit Codex, then retry Resume."
-                ))
-            } else {
-                Error::new("unknown", "Codex thread/unarchive may have changed native state; Resume was not repeated")
-                    .with_where("plugin.codex.thread.unarchive")
-            }
-        })?;
-    if reply.pointer("/thread/id").and_then(Value::as_str) != Some(thread_id) {
-        return Err(Error::new(
-            "unknown",
-            "Codex thread/unarchive did not acknowledge the exact thread; Resume was not repeated",
-        )
-        .with_where("plugin.codex.thread.unarchive"));
+}
+
+fn verify_catalogue_effort(
+    entry: Option<&NativeModelEntry>,
+    effort: &str,
+    changed: bool,
+) -> Result<()> {
+    if entry.is_some_and(|entry| {
+        entry
+            .supported_reasoning_efforts
+            .iter()
+            .any(|supported| supported.reasoning_effort == effort)
+    }) || (!changed && entry.is_none())
+    {
+        return Ok(());
     }
-    client
-        .call(method, params, Instant::now() + RPC_TIMEOUT)
-        .await
+    if changed {
+        return Err(Error::new(
+            "resume_effort_unverified",
+            "The changed Codex catalogue does not verify the frozen model and reasoning effort. Switch to a profile with a supported model and effort.",
+        ));
+    }
+    Err(Error::new(
+        "profile_error",
+        "Codex profile effort is not supported by the exact selected model",
+    ))
 }
 
 /// Bounded launch catalogue: per-page `RPC_TIMEOUT` capped by an overall

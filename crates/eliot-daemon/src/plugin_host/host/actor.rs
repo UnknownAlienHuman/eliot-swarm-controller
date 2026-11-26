@@ -21,7 +21,8 @@ use super::{
 };
 use crate::monitor::Monitoring;
 use crate::platform::OwnedChild;
-use eliot_core::{Agent, AgentStartParams, Error, FailureOrigin, Result};
+use eliot_core::{Agent, AgentStartParams, AgentState, CommandState, Error, FailureOrigin, Result};
+use eliot_plugin::protocol::{AgentStartBlocker, ArchivedResumeBinding};
 use eliot_plugin::{StderrCapture, StderrView};
 use eliot_store::AgentLossEvidence;
 use futures_util::{StreamExt, stream::FuturesUnordered};
@@ -391,7 +392,7 @@ async fn run_agent_startup(
     let start = match serde_json::to_value(start_params) {
         // PluginClient validates the exact completed RPC frame, including its
         // allocated request ID and newline, before any bytes reach the writer.
-        Ok(params) => client.call("agent.start", params, start_deadline()).await,
+        Ok(params) => start_with_archive_recovery(actor, client, params, start_deadline()).await,
         Err(_) => Err(Error::new(
             "internal",
             "agent.start params could not be encoded",
@@ -487,6 +488,118 @@ async fn run_agent_startup(
         }
     }
     true
+}
+
+/// The actor owns one recovery decision for this dispatched Resume. Neither
+/// an uncertain restore nor a second refusal can trigger another native write.
+async fn start_with_archive_recovery(
+    actor: &AgentActorConfig,
+    client: &PluginClient,
+    params: Value,
+    deadline: Instant,
+) -> Result<Value> {
+    let start = client.call("agent.start", params, deadline).await?;
+    if start["state"] != "native_session_archived" {
+        return Ok(start);
+    }
+    let Ok(AgentStartBlocker::NativeSessionArchived(binding)) = serde_json::from_value(start)
+    else {
+        return Err(Error::new(
+            "unknown",
+            "native archive refusal has no exact binding",
+        ));
+    };
+    if actor.start_command.verb != "resume"
+        || binding.agent_id != actor.agent.id
+        || binding.generation != actor.agent.generation
+        || binding.command_id != actor.start_command.id
+        || binding.native_ref.trim().is_empty()
+        || actor
+            .resume_from
+            .as_ref()
+            .and_then(|subject| subject["native_ref"].as_str())
+            != Some(binding.native_ref.as_str())
+    {
+        return Err(Error::new(
+            "unknown",
+            "native archive refusal does not match the dispatched Resume",
+        ));
+    }
+    let request = serde_json::to_value(&binding).map_err(|_| {
+        Error::new(
+            "native_not_dispatched",
+            "archive restore binding could not be encoded",
+        )
+    })?;
+    if !archive_resume_is_current(actor).await? {
+        return Err(Error::new(
+            "native_not_dispatched",
+            "archived Resume is no longer current",
+        ));
+    }
+    let restored = client.call("native.unarchive", request.clone(), deadline).await
+        .map_err(|error| {
+            if error.code == "native_not_dispatched" {
+                error.with_message(format!("Native restoration was refused for {}. Restore that session in its retained harness store before retrying Resume.", binding.native_ref))
+            } else {
+                error.with_code("unknown")
+            }
+        })?;
+    if serde_json::from_value::<ArchivedResumeBinding>(restored)
+        .ok()
+        .as_ref()
+        != Some(&binding)
+    {
+        return Err(Error::new(
+            "unknown",
+            "archive restore did not acknowledge the exact Resume binding",
+        ));
+    }
+    if !archive_resume_is_current(actor)
+        .await
+        .map_err(|error| error.with_code("unknown"))?
+    {
+        return Err(Error::new(
+            "unknown",
+            "native archive restored after the Resume binding changed",
+        ));
+    }
+    client
+        .call("agent.start.continue", request, deadline)
+        .await
+        .map_err(|error| {
+            if error.code == "native_not_dispatched" {
+                error.with_code("unknown").with_message(
+                    "native archive was restored but Resume continuation was not dispatched",
+                )
+            } else {
+                error
+            }
+        })
+}
+
+async fn archive_resume_is_current(actor: &AgentActorConfig) -> Result<bool> {
+    let state = actor
+        .state
+        .upgrade()
+        .ok_or_else(|| Error::new("unknown", "plugin host stopped during archived Resume"))?;
+    let mut store = state.store.lock().await;
+    let agent = &actor.agent;
+    let current = store.get_agent(&agent.id)?.is_some_and(|current| {
+        current.generation == agent.generation
+            && current.state == AgentState::Starting
+            && !current.archived
+            && current.native_ref == agent.native_ref
+            && current.native_scope == agent.native_scope
+    });
+    Ok(current
+        && store
+            .get_command(&actor.start_command.id)?
+            .is_some_and(|command| {
+                command.state == CommandState::Dispatched
+                    && command.generation == Some(agent.generation)
+            })
+        && !store.generation_has_open_stop(&agent.id, agent.generation)?)
 }
 
 fn startup_loss_origin(error: &Error) -> Option<FailureOrigin> {

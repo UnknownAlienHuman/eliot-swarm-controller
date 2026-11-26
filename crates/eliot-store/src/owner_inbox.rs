@@ -1696,7 +1696,7 @@ fn resume_failure_instructions(
                 return Ok(None);
             };
             format!(
-                "Run {retry} to check the retained checkout against current Git evidence. If the change is unattributed, restore the registered branch '{}' in the retained checkout after saving your work, then retry.",
+                "Run {retry} to check current Git evidence. If the change is unattributed, run git switch --no-guess -- REGISTERED_BRANCH in the retained checkout, using '{}' as REGISTERED_BRANCH. If Git refuses, save your work before retrying the switch. Do not discard changes.",
                 workspace.requested_branch
             )
         }
@@ -1708,10 +1708,10 @@ fn resume_failure_instructions(
             "Run git worktree list --porcelain in the registered repository. For a locked checkout, use git worktree unlock PATH on the retained worktree. For broken registration after a move, use git worktree repair PATH. Verify one valid entry before running {retry}."
         ),
         (_, "router.dispatch.prepare_artifact_root", "artifact ledger is full") => format!(
-            "Run swarm cleanup plan --scope all. Apply a reviewed safe candidate with swarm cleanup apply PLAN_ID --artifact ARTIFACT_ID, then run {retry}."
+            "Run swarm cleanup plan --scope all and review the candidates. Once capacity is available, run {retry}."
         ),
-        ("resume_model_unbound", _, _) => format!(
-            "Run swarm switch {subject} --generation {generation} --profile PROFILE with an eligible profile that names an explicit model."
+        ("resume_model_unbound" | "resume_effort_unverified", _, _) => format!(
+            "Run swarm switch {subject} --generation {generation} --profile PROFILE with an eligible profile that names a supported model and effort."
         ),
         ("native_readback", _, message)
             if message

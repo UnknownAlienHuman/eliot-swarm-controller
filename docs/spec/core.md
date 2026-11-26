@@ -1270,11 +1270,12 @@ An idle member keeps its live custody. Unarchive skips the custody check.
 A refusal names the Agent and its first blocker. Reattaching an archived
 observer opens a new `observe` source and clears the flag, so a live reader is never hidden.
 Send, resume, steer and inject admission atomically clears the target's archive flag.
-When the retained vendor session is separately archived, the harness may
-restore that exact session during a Resume through its documented operation.
-It can repeat a native open only after a correlated archive refusal proves
-that the earlier open had no effect and the restore is acknowledged. An
-uncertain restore fences the attempt and linked input.
+When an adapter reports a correlated archive refusal for the retained native
+subject, the daemon may restore that exact session through the documented
+native operation. The refusal must prove that the earlier open had no effect.
+The daemon checks the current Resume binding and requires the exact restore
+acknowledgement before continuing the open once. An uncertain restore fences
+the attempt and linked input.
 
 Automatic [Agent retirement](configuration.md#agent-retirement) applies the archive flag
 to an individual Agent with closed custody and no unresolved work. The
