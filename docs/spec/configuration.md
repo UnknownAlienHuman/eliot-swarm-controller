@@ -122,7 +122,9 @@ each path every second until a failure or a recurring grant raises that path's
 retry delay, starting at two seconds and doubling up to 30 seconds. Log rotation requires a validated
 `logs/` ACL. Managed plugin homes and worktrees are repaired only when exact daemon
 creation or retained provenance identifies the path and a safe lifecycle check permits
-repair. Adopted workspaces and active worktree fences are outside this scope. Existing
+repair. New daemon-owned managed directories are created with the protected DACL,
+so ordinary creation reports no repair; the lifecycle check stays the safety net
+for later changes. Adopted workspaces and active worktree fences are outside this scope. Existing
 descendants change only at their owned lifecycle checks or through normal NTFS
 inheritance; the daemon does not recursively rewrite them. Eliot private files are
 validated under the file rules above; ordinary worktree files are not treated as
