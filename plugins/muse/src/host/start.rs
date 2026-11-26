@@ -1,10 +1,9 @@
 //! Existing Muse profile, transport, settings and readiness phases.
-//! Start/resume uncertainty, registration and late endpoint retirement stay in the host.
 
 use super::{
     AgentSession, Initialized, InitializedNative, MusePlugin, RPC_TIMEOUT, SessionPhase,
-    catalogue::CatalogueHost, contextual_error, discard_failed_start, muse_scope, muse_serve_args,
-    new_command_id, read_effective_reasoning_effort,
+    catalogue::CatalogueHost, contextual_error, muse_scope, muse_serve_args, new_command_id,
+    read_effective_reasoning_effort,
 };
 use crate::{
     events::{self, EventConfig},
@@ -24,8 +23,8 @@ use eliot_plugin::session::ModelSelection;
 use eliot_plugin::{
     AgentStartParams, PeerClient,
     session::{
-        ResumeSubject, TargetEnvironment, native_no_write, optional_profile_text,
-        parse_resume_subject, target_environment, validate_source_plan,
+        ResumeSubject, TargetEnvironment, optional_profile_text, parse_resume_subject,
+        target_environment, validate_source_plan,
     },
     skill,
 };
@@ -233,7 +232,7 @@ pub(super) fn skill_pointer(params: &AgentStartParams) -> Result<String> {
     ))
 }
 
-pub(super) fn bind_owned_session(
+pub(super) async fn bind_owned_session(
     params: &AgentStartParams,
     initialized: &Initialized,
     mut native: NativeProcess,
@@ -242,7 +241,13 @@ pub(super) fn bind_owned_session(
     skill_pointer: String,
     peer: &PeerClient,
 ) -> Result<AgentSession> {
-    let frames = native.take_frames()?;
+    let frames = match native.take_frames() {
+        Ok(frames) => frames,
+        Err(error) => {
+            native.terminate(true, Instant::now() + RPC_TIMEOUT).await?;
+            return Err(error);
+        }
+    };
     let stream = native.stream_state();
     let native_client = native.client();
     let events = events::spawn(
@@ -277,64 +282,7 @@ pub(super) fn bind_owned_session(
         skill_pointer: Some(skill_pointer),
     })
 }
-/// Dispatched session start or resume with its owned session: the dispatch
-/// either proves a reply or settles the failure with the session retained
-/// exactly as the start path requires (dropped when proven-no-effect,
-/// kept unknown when a native effect may have happened).
-pub(super) struct DispatchedStart {
-    pub(super) session: AgentSession,
-    pub(super) response: Value,
-}
-
 impl MusePlugin {
-    /// Dispatch session start (or session resume) and classify the reply.
-    /// A rejection or a proven-undispatched write discards the child and
-    /// retains the failure; any other transport loss keeps the session
-    /// unknown instead of retrying the dispatch.
-    pub(super) async fn dispatch_session_start(
-        &mut self,
-        mut session: AgentSession,
-        session_method: &str,
-        params_value: Value,
-    ) -> Result<DispatchedStart> {
-        match session
-            .native_client
-            .call(session_method, params_value, Instant::now() + RPC_TIMEOUT)
-            .await
-        {
-            Ok(response) => Ok(DispatchedStart { session, response }),
-            Err(error) if error.code == "native_rejected" => {
-                let error = error
-                    .with_where(format!("plugin.muse.start.{session_method}"))
-                    .with_origin(
-                        eliot_core::FailureOrigin::Harness,
-                        "Muse returned a native session error",
-                    );
-                let error = discard_failed_start(&mut session, error).await;
-                Err(self.retain_failed_start(error))
-            }
-            Err(error) if native_no_write(&error.code) => {
-                let message = format!("Muse {session_method} was not dispatched");
-                let code = error.code.clone();
-                let error = contextual_error(error, code, message);
-                let error = discard_failed_start(&mut session, error).await;
-                Err(self.retain_failed_start(error))
-            }
-            Err(error) => {
-                let error = contextual_error(
-                    error,
-                    "unknown",
-                    format!(
-                        "Muse {session_method} may have changed native state; it will not be repeated"
-                    ),
-                );
-                let error = self.retain_failed_start(error);
-                self.session = Some(session);
-                Err(error)
-            }
-        }
-    }
-
     pub(super) fn validate_catalogue(
         host: &CatalogueHost,
         requested_model: Option<&str>,
@@ -395,8 +343,7 @@ impl MusePlugin {
     }
 
     pub(super) async fn apply_start_effort(
-        &mut self,
-        session: &mut AgentSession,
+        session: &AgentSession,
         native_session: &NativeSession,
         view_cursor: &str,
         requested_effort: Option<&str>,
@@ -416,7 +363,7 @@ impl MusePlugin {
                     "Muse session/setReasoningEffort params could not be encoded",
                 )
             })?;
-            let effort_response = match session
+            let effort_response = session
                 .native_client
                 .call(
                     "session/setReasoningEffort",
@@ -424,87 +371,43 @@ impl MusePlugin {
                     Instant::now() + RPC_TIMEOUT,
                 )
                 .await
-            {
-                Ok(value) => value,
-                Err(error) if error.code == "native_rejected" => {
-                    let error = discard_failed_start(
-                        session,
+                .map_err(|error| {
+                    if error.code == "native_rejected" {
                         contextual_error(
                             error,
                             "profile_error",
                             "Muse session/setReasoningEffort did not admit the profile effort",
-                        ),
-                    )
-                    .await;
-                    return Err(self.retain_failed_start(error));
-                }
-                Err(error) if native_no_write(&error.code) => {
-                    let message = "Muse session/setReasoningEffort was not dispatched".to_owned();
-                    let code = error.code.clone();
-                    let error =
-                        discard_failed_start(session, contextual_error(error, code, message)).await;
-                    return Err(self.retain_failed_start(error));
-                }
-                Err(error) => {
-                    let error = discard_failed_start(
-                        session,
-                        contextual_error(
-                            error,
-                            "unknown",
-                            "Muse session/setReasoningEffort may have changed native state; it will not be repeated",
-                        ),
-                    )
-                    .await;
-                    return Err(self.retain_failed_start(error));
-                }
-            };
-            let effort_ack: NativeSessionSetReasoningEffortResult =
-                match serde_json::from_value(effort_response) {
-                    Ok(ack) => ack,
-                    Err(_) => {
-                        let error = discard_failed_start(
-                            session,
-                            Error::new(
-                                "profile_error",
-                                "Muse session/setReasoningEffort ack did not match the 1.4 schema",
-                            ),
                         )
-                        .await;
-                        return Err(self.retain_failed_start(error));
+                    } else {
+                        error
                     }
-                };
-            if effort_ack.command_id != effort_command || effort_ack.status != "accepted" {
-                let error = discard_failed_start(
-                    session,
+                })?;
+            let effort_ack: NativeSessionSetReasoningEffortResult =
+                serde_json::from_value(effort_response).map_err(|_| {
                     Error::new(
                         "profile_error",
-                        "Muse session/setReasoningEffort did not acknowledge the exact submitted command",
-                    ),
-                )
-                .await;
-                return Err(self.retain_failed_start(error));
+                        "Muse session/setReasoningEffort ack did not match the 1.4 schema",
+                    )
+                })?;
+            if effort_ack.command_id != effort_command || effort_ack.status != "accepted" {
+                return Err(Error::new(
+                    "profile_error",
+                    "Muse session/setReasoningEffort did not acknowledge the exact submitted command",
+                ));
             }
-            return match read_effective_reasoning_effort(
+            return read_effective_reasoning_effort(
                 &session.native_client,
                 &native_session.session_id,
                 view_cursor,
             )
-            .await
-            {
-                Ok(effort) => Ok(effort),
-                Err(error) => {
-                    let error = discard_failed_start(session, error).await;
-                    Err(self.retain_failed_start(error))
-                }
-            };
+            .await;
         }
 
         Ok(None)
     }
 
     pub(super) async fn align_resume_model(
-        &mut self,
-        session: &mut AgentSession,
+        session: &AgentSession,
         native_session: &NativeSession,
         selection: Option<NativeModelSelection>,
     ) -> Result<bool> {
@@ -525,7 +428,7 @@ impl MusePlugin {
                     "Muse session/setModel params could not be encoded",
                 )
             })?;
-            let model_response = match session
+            let model_response = session
                 .native_client
                 .call(
                     "session/setModel",
@@ -533,64 +436,25 @@ impl MusePlugin {
                     Instant::now() + RPC_TIMEOUT,
                 )
                 .await
-            {
-                Ok(value) => value,
-                Err(error) if error.code == "native_rejected" => {
-                    let error = discard_failed_start(
-                        session,
-                        error.with_where("plugin.muse.start.set_model").with_origin(
-                            eliot_core::FailureOrigin::Harness,
-                            "Muse session/setModel returned a native error",
-                        ),
-                    )
-                    .await;
-                    return Err(self.retain_failed_start(error));
-                }
-                Err(error) if native_no_write(&error.code) => {
-                    let message = "Muse session/setModel was not dispatched".to_owned();
-                    let code = error.code.clone();
-                    let error =
-                        discard_failed_start(session, contextual_error(error, code, message)).await;
-                    return Err(self.retain_failed_start(error));
-                }
-                Err(error) => {
-                    let error = discard_failed_start(
-                        session,
-                        contextual_error(
-                            error,
-                            "unknown",
-                            "Muse session/setModel may have changed native state; it will not be repeated",
-                        ),
-                    )
-                    .await;
-                    return Err(self.retain_failed_start(error));
-                }
-            };
-            let model_ack: NativeSessionSetModelResult =
-                match serde_json::from_value(model_response) {
-                    Ok(ack) => ack,
-                    Err(_) => {
-                        let error = discard_failed_start(
-                            session,
-                            Error::new(
-                                "profile_error",
-                                "Muse session/setModel ack did not match the 1.4 schema",
-                            ),
-                        )
-                        .await;
-                        return Err(self.retain_failed_start(error));
+                .map_err(|error| {
+                    if error.code == "native_rejected" {
+                        error.with_where("plugin.muse.start.set_model")
+                    } else {
+                        error
                     }
-                };
-            if model_ack.command_id != model_command || model_ack.status != "accepted" {
-                let error = discard_failed_start(
-                    session,
+                })?;
+            let model_ack: NativeSessionSetModelResult = serde_json::from_value(model_response)
+                .map_err(|_| {
                     Error::new(
                         "profile_error",
-                        "Muse session/setModel did not acknowledge the exact submitted command",
-                    ),
-                )
-                .await;
-                return Err(self.retain_failed_start(error));
+                        "Muse session/setModel ack did not match the 1.4 schema",
+                    )
+                })?;
+            if model_ack.command_id != model_command || model_ack.status != "accepted" {
+                return Err(Error::new(
+                    "profile_error",
+                    "Muse session/setModel did not acknowledge the exact submitted command",
+                ));
             }
             return Ok(true);
         }
@@ -599,8 +463,7 @@ impl MusePlugin {
     }
 
     pub(super) async fn align_resume_approval(
-        &mut self,
-        session: &mut AgentSession,
+        session: &AgentSession,
         native_session: &NativeSession,
         resuming: bool,
         requested_approval: Option<&str>,
@@ -625,7 +488,7 @@ impl MusePlugin {
                     "Muse session/setApprovalMode params could not be encoded",
                 )
             })?;
-            let approval_response = match session
+            let approval_response = session
                 .native_client
                 .call(
                     "session/setApprovalMode",
@@ -633,68 +496,32 @@ impl MusePlugin {
                     Instant::now() + RPC_TIMEOUT,
                 )
                 .await
-            {
-                Ok(value) => value,
-                Err(error) if error.code == "native_rejected" => {
-                    let error = discard_failed_start(
-                        session,
+                .map_err(|error| {
+                    if error.code == "native_rejected" {
                         contextual_error(
                             error,
                             "profile_error",
                             "Muse session/setApprovalMode did not admit the profile approval mode",
-                        ),
-                    )
-                    .await;
-                    return Err(self.retain_failed_start(error));
-                }
-                Err(error) if native_no_write(&error.code) => {
-                    let message = "Muse session/setApprovalMode was not dispatched".to_owned();
-                    let code = error.code.clone();
-                    let error =
-                        discard_failed_start(session, contextual_error(error, code, message)).await;
-                    return Err(self.retain_failed_start(error));
-                }
-                Err(error) => {
-                    let error = discard_failed_start(
-                        session,
-                        contextual_error(
-                            error,
-                            "unknown",
-                            "Muse session/setApprovalMode may have changed native state; it will not be repeated",
-                        ),
-                    )
-                    .await;
-                    return Err(self.retain_failed_start(error));
-                }
-            };
-            let approval_ack: NativeSessionSetApprovalModeResult =
-                match serde_json::from_value(approval_response) {
-                    Ok(ack) => ack,
-                    Err(_) => {
-                        let error = discard_failed_start(
-                            session,
-                            Error::new(
-                                "profile_error",
-                                "Muse session/setApprovalMode ack did not match the 1.4 schema",
-                            ),
                         )
-                        .await;
-                        return Err(self.retain_failed_start(error));
+                    } else {
+                        error
                     }
-                };
+                })?;
+            let approval_ack: NativeSessionSetApprovalModeResult =
+                serde_json::from_value(approval_response).map_err(|_| {
+                    Error::new(
+                        "profile_error",
+                        "Muse session/setApprovalMode ack did not match the 1.4 schema",
+                    )
+                })?;
             if approval_ack.command_id != approval_command
                 || approval_ack.status != "accepted"
                 || approval_ack.effective_mode.mode != approval
             {
-                let error = discard_failed_start(
-                    session,
-                    Error::new(
-                        "profile_error",
-                        "Muse session/setApprovalMode did not acknowledge the requested mode",
-                    ),
-                )
-                .await;
-                return Err(self.retain_failed_start(error));
+                return Err(Error::new(
+                    "profile_error",
+                    "Muse session/setApprovalMode did not acknowledge the requested mode",
+                ));
             }
             setters_ran = true;
         }
@@ -703,12 +530,11 @@ impl MusePlugin {
     }
 
     pub(super) async fn publish_start_ready(
-        &mut self,
-        mut session: AgentSession,
+        session: &mut AgentSession,
         native_session: &NativeSession,
         effective: &Value,
-    ) -> Result<AgentSession> {
-        if let Err(error) = session
+    ) -> Result<()> {
+        session
             .events
             .ready(
                 session.native_scope.clone(),
@@ -716,20 +542,8 @@ impl MusePlugin {
                 effective.clone(),
                 session.expected_model.clone(),
             )
-            .await
-        {
-            session.phase = SessionPhase::Unknown;
-            self.session = Some(session);
-            return Err(Error::new(
-                "unknown",
-                format!(
-                    "Muse session is known but session.ready was not acknowledged: {}",
-                    error.message
-                ),
-            ));
-        }
+            .await?;
         session.phase = SessionPhase::Ready;
-
-        Ok(session)
+        Ok(())
     }
 }

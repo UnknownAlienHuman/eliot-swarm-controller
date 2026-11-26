@@ -305,10 +305,14 @@ A promptless resume can open another generation without creating a turn.
 Resume preflight compares the newest native turn with the newest retained
 turn on the same Agent, including earlier generations of that session.
 
-Pre-session-effect refusals (profile, catalogue refresh, spawn, initialize,
-`model/list`, resume preflight) return a failed-state start
-result carrying a short non-secret reason, and the launch settles failed,
-never unknown; any failure after a native session effect stays unknown.
+Profile, skill, catalogue, process-registration and resume-preflight refusals
+settle failed once the owned host is closed. The same applies when the stdio
+writer proves non-dispatch or Muse proves pre-admission refusal. A lost
+start/resume response, unconfirmed host cleanup, or a settings or readiness
+failure after session admission settles `unknown`. Swarm retains the owned
+host and the exact session ID when reported by the reply or the native
+session-start notification. Start, resume and settings writes are single
+dispatches.
 `projectionUnavailable` is the projection-failed-closed health reason on the
 command plane, independent of view subscription membership. It is distinct from
 `view/gap`, whose opaque `after`/`next` cursors are exclusive bounds on dropped

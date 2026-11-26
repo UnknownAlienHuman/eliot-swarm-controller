@@ -20,6 +20,7 @@ use crate::{
 use eliot_core::api::HarnessModelEntry;
 use eliot_core::local_provider::LocalProvider;
 use eliot_core::{ContextItem, Error, FailureOrigin, InjectPoint, McpPolicy, Result, SecretPolicy};
+use eliot_plugin::start_classification::{StartPoint, is_proven_no_effect, start_failure};
 use eliot_plugin::{
     AgentCommandParams, AgentCommandVerb, AgentSnapshotParams, AgentStartParams, AgentStopParams,
     InitializeParams, MAX_TEXT_BYTES, Peer, PeerClient, PluginManifest, RpcRequest,
@@ -163,6 +164,7 @@ fn delete_deadline(envelope: Instant) -> Instant {
 /// uncertain, so those failures keep the historical error settlement.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum StartPhase {
+    Admission,
     /// Credential transfer, serve spawn, or serve readiness: no HTTP write
     /// has run and no server is necessarily up. The transfer may already
     /// have touched the isolated credential store, so an uncertain transfer
@@ -198,11 +200,11 @@ fn start_point_for_phase(
     phase: StartPhase,
     code: &str,
 ) -> eliot_plugin::start_classification::StartPoint {
-    use eliot_plugin::start_classification::StartPoint;
     if phase == StartPhase::Spawn && code == "unknown" {
         return StartPoint::TransportLost;
     }
     match phase {
+        StartPhase::Admission => StartPoint::BeforeSpawn,
         StartPhase::Spawn => StartPoint::SpawnRefused,
         StartPhase::Subscribe | StartPhase::Register | StartPhase::Verify => {
             StartPoint::BeforeSpawn
@@ -236,6 +238,7 @@ impl StartPhase {
     /// `spawn` phase but reports its own `auth_transfer` step in the reason.
     fn as_str(self) -> &'static str {
         match self {
+            StartPhase::Admission => "admission",
             StartPhase::Spawn => "spawn",
             StartPhase::Subscribe => "subscribe",
             StartPhase::Register => "register",
@@ -248,6 +251,7 @@ impl StartPhase {
 
 fn presession_reason(phase: StartPhase, code: &str) -> String {
     let what = match phase {
+        StartPhase::Admission => "OpenCode frozen profile was refused",
         StartPhase::Spawn => "OpenCode serve failed to start",
         StartPhase::Verify => "OpenCode native catalogue verification failed",
         StartPhase::Subscribe => "OpenCode event subscription failed",
@@ -1021,7 +1025,24 @@ impl OpenCodePlugin {
 
     async fn start(&mut self, raw: &Value, peer: &PeerClient) -> Result<Value> {
         let _timing = crate::native::startup::Step::new("start_total");
-        let parsed = self.parse_start_request(raw)?;
+        let params: AgentStartParams = decode(raw, "OpenCode agent.start params are invalid")?;
+        validate_identity(
+            &params.agent_id,
+            params.generation,
+            &params.command_id,
+            "OpenCode",
+        )?;
+        let parsed = match self.parse_start_request(&params) {
+            Ok(parsed) => parsed,
+            Err(error) if error.code == "bad_state" => return Err(error),
+            Err(error) => {
+                return Ok(self.retain_proven_no_effect_start(
+                    &params,
+                    StartPhase::Admission,
+                    error,
+                ));
+            }
+        };
         // One envelope for the whole dispatch: every pre-session phase
         // shares it, so a loaded cold start gets room without outliving the
         // daemon agent.start budget (which would settle the launch unknown
@@ -1071,14 +1092,21 @@ impl OpenCodePlugin {
     }
 
     fn validate_start(&self, raw: &Value) -> Result<Value> {
-        self.parse_start_request(raw)?;
+        let params: AgentStartParams = decode(raw, "OpenCode agent.start params are invalid")?;
+        validate_identity(
+            &params.agent_id,
+            params.generation,
+            &params.command_id,
+            "OpenCode",
+        )?;
+        self.parse_start_request(&params)?;
         Ok(json!({"validated": true}))
     }
 
     /// Start phase 1, admission: the once-only guard, decode and
     /// frozen-profile validation. Failures here retain nothing: a corrected
     /// start may retry.
-    fn parse_start_request(&self, raw: &Value) -> Result<Box<ParsedStart>> {
+    fn parse_start_request(&self, params: &AgentStartParams) -> Result<Box<ParsedStart>> {
         let _timing = crate::native::startup::Step::new("frozen_admission");
         // The daemon sends agent.start exactly once per freshly spawned
         // plugin process: a bound or settled plugin never starts again.
@@ -1088,14 +1116,7 @@ impl OpenCodePlugin {
                 "OpenCode plugin already received agent.start",
             ));
         }
-        let params: AgentStartParams = decode(raw, "OpenCode agent.start params are invalid")?;
-        validate_identity(
-            &params.agent_id,
-            params.generation,
-            &params.command_id,
-            "OpenCode",
-        )?;
-        let (initialized, profile) = self.start_prereqs(&params)?;
+        let (initialized, profile) = self.start_prereqs(params)?;
         let requested_mcp_policy = policy_from_snapshot(profile)?;
         let native_subagents = profile
             .get("native_subagents")
@@ -1121,14 +1142,14 @@ impl OpenCodePlugin {
         // A resume that inherited a `configure` overlay carries its
         // effective model and effort as the native realignment target
         // (the effort selects the documented `Model.Ref.variant`).
-        let (override_model, override_model_ref, override_effort) = start_config_override(&params)?;
+        let (override_model, override_model_ref, override_effort) = start_config_override(params)?;
         let requested_agent = optional_profile_text(profile, "agent", "OpenCode")?;
         // A fragment profile always carries an explicit model: a fragment
         // without a model fails closed instead of falling back to the native
         // default.
         let local_provider = start_local_provider(profile)?;
         let auth_selector = start_auth_selector(profile, local_provider.is_some())?;
-        let (workspace, program) = start_paths(profile, &params)?;
+        let (workspace, program) = start_paths(profile, params)?;
         let TargetEnvironment {
             variables: environment,
             mut secrets,
@@ -1181,7 +1202,7 @@ impl OpenCodePlugin {
             generation: params.generation,
         });
         Ok(Box::new(ParsedStart {
-            params,
+            params: params.clone(),
             native_subagents,
             requested_model,
             model_ref,
@@ -1497,7 +1518,7 @@ impl OpenCodePlugin {
             }
         }
         let create_timing = crate::native::startup::Step::new("session_create");
-        let created = match session
+        let created = session
             .http
             .create_session(
                 &title,
@@ -1505,54 +1526,59 @@ impl OpenCodePlugin {
                 &directory,
                 deny_permissions.as_deref(),
                 create_deadline(cutoff),
+                &mut session.session_id,
             )
-            .await
-        {
+            .await;
+        drop(create_timing);
+        let created = match created {
             Ok(created) => created,
-            Err(HttpOutcome::Rejected { reason, .. }) => {
-                // Authoritative refusal: the server proves no session was
-                // admitted, so this settles as a definite failed start.
-                discard_unstarted(&mut session, envelope).await;
-                return Ok(CreateOutcome::ProvenFailed(self.proven_no_effect_start(
-                    &parsed.params,
-                    PhaseFailure {
-                        phase: StartPhase::CreateRefused,
-                        error: Box::new(Error::new("rejected", reason).with_origin(
+            Err(failure) => {
+                let (point, error) = match failure {
+                    HttpOutcome::Rejected { reason, .. } => (
+                        StartPoint::NativeRefusalBeforeDispatch,
+                        Error::new("rejected", reason).with_origin(
                             FailureOrigin::Harness,
                             "native session/create refused without upstream evidence",
-                        )),
-                    },
-                )));
-            }
-            Err(HttpOutcome::NotDispatched { reason }) => {
-                // Provably never dispatched: no byte left the socket, so no
-                // native session exists and this is a definite failed start.
-                discard_unstarted(&mut session, envelope).await;
-                return Ok(CreateOutcome::ProvenFailed(self.proven_no_effect_start(
-                    &parsed.params,
-                    PhaseFailure {
-                        phase: StartPhase::CreateRefused,
-                        error: Box::new(Error::new("native_not_dispatched", reason)),
-                    },
-                )));
-            }
-            Err(HttpOutcome::Unknown { reason }) => {
-                self.session = Some(session);
-                return Err(Error::new(
-                    "unknown",
-                    format!(
-                        "OpenCode session/create may have changed native state; it will not be repeated ({reason})"
+                        ),
                     ),
-                )
-                .with_where("plugin.opencode.start.create")
-                .with_origin(
-                    FailureOrigin::Harness,
-                    "native session/create outcome uncertain; native state may exist",
-                ));
+                    HttpOutcome::NotDispatched { reason } => (
+                        StartPoint::NativeRefusalBeforeDispatch,
+                        Error::new("native_not_dispatched", reason),
+                    ),
+                    HttpOutcome::Unknown { reason } => (
+                        StartPoint::TransportLost,
+                        Error::new("native_create", reason),
+                    ),
+                };
+                if is_proven_no_effect(point) {
+                    discard_unstarted(&mut session, envelope).await;
+                } else if session.session_id.is_none() {
+                    // This fresh, authenticated server was subscribed before
+                    // its sole create dispatch. Its early lifecycle event can
+                    // identify the session even when the HTTP reply was lost.
+                    session.session_id = session
+                        .events
+                        .created_session_id(phase_deadline(
+                            envelope,
+                            std::time::Duration::from_secs(1),
+                        ))
+                        .await;
+                }
+                let result = start_failure(
+                    &parsed.params,
+                    "opencode",
+                    "create",
+                    point,
+                    session.server.diagnostic_error(error),
+                    session.session_id.as_deref(),
+                );
+                self.failed_start = Some(FailedStart);
+                if result.is_err() {
+                    self.session = Some(session);
+                }
+                return result.map(CreateOutcome::ProvenFailed);
             }
         };
-        drop(create_timing);
-        session.session_id = Some(created.id.clone());
         // Effective readback before readiness: the create response states the
         // exact model and location; a mismatch prevents `session.ready`.
         let effective_model = created
@@ -1617,14 +1643,14 @@ impl OpenCodePlugin {
         if let Err(error) =
             gate_mcp_inventory(mcp_inventory.as_deref(), parsed.requested_mcp_policy)
         {
-            return Err(self
+            return self
                 .fail_created_start(
+                    &parsed.params,
                     session,
-                    &created.id,
                     Error::new("profile_error", *error.message),
                     envelope,
                 )
-                .await);
+                .await;
         }
         // Effective-configuration proofs: the inventory gate above only sees
         // entry names and statuses. Managed, system and global layers merge
@@ -1672,14 +1698,14 @@ impl OpenCodePlugin {
                 )),
             };
             if let Err(error) = proof {
-                return Err(self
+                return self
                     .fail_created_start(
+                        &parsed.params,
                         session,
-                        &created.id,
                         Error::new("profile_error", *error.message),
                         envelope,
                     )
-                    .await);
+                    .await;
             }
         }
         effective["mcp_servers"] = mcp_servers;
@@ -1708,24 +1734,24 @@ impl OpenCodePlugin {
             {
                 Ok(true) => true,
                 Ok(false) => {
-                    return Err(self
+                    return self
                         .fail_created_start(
+                            &parsed.params,
                             session,
-                            &created.id,
                             Error::new("profile_error", "OpenCode session deny ruleset is missing"),
                             envelope,
                         )
-                        .await);
+                        .await;
                 }
                 Err(error) => {
-                    return Err(self
+                    return self
                         .fail_created_start(
+                            &parsed.params,
                             session,
-                            &created.id,
                             Error::new("native_readback", *error.message),
                             envelope,
                         )
-                        .await);
+                        .await;
                 }
             }
         } else {
@@ -1755,17 +1781,13 @@ impl OpenCodePlugin {
         };
         if (parsed.requested_model.is_some() && !model_verified) || !effort_verified || !location_ok
         {
-            return Err(self
-                .fail_created_start(
-                    session,
-                    &created.id,
+            return self.fail_created_start(&parsed.params, session,
                     Error::new(
                         "profile_error",
                         "OpenCode effective model, effort or session directory did not match the frozen profile",
                     ),
                     envelope,
-                )
-                .await);
+                ).await;
         }
         Ok(CreateOutcome::Created(
             Box::new(session),
@@ -1815,8 +1837,13 @@ impl OpenCodePlugin {
                 parsed.mcp_cloud_hostname.as_deref(),
             )
         {
-            return Err(self.fail_resume(session, error, envelope).await);
+            return self
+                .fail_resume(&parsed.params, session, error, envelope)
+                .await;
         }
+        // The scope matched. Keep the previously bound ID even when the
+        // native read loses its reply.
+        session.session_id = Some(resume.native_ref.clone());
         let deadline = phase_deadline(envelope, RPC_TIMEOUT);
         let retained =
             match Self::resume_read_retained(&session, &resume.native_ref, deadline).await {
@@ -1835,9 +1862,8 @@ impl OpenCodePlugin {
                         },
                     ));
                 }
-                Err(error) => return Err(self.fail_resume(session, error, envelope).await),
+                Err(error) => return self.stash_resume_unknown(&parsed.params, session, error),
             };
-        session.session_id = Some(retained.id.clone());
         // Read model metadata before any retained-session configuration write.
         let model_catalogue =
             match Self::resume_validate_catalogue(&parsed, &session, &retained, deadline).await {
@@ -1870,7 +1896,7 @@ impl OpenCodePlugin {
                 }
             };
         if let Err(error) = Self::resume_verify_idle(&session, &retained.id, deadline).await {
-            return Err(self.stash_resume_unknown(session, error).await);
+            return self.stash_resume_unknown(&parsed.params, session, error);
         }
         let effective = match Self::resume_configure(
             &parsed,
@@ -1893,9 +1919,13 @@ impl OpenCodePlugin {
                 ));
             }
             Err(error) if error.code == "unknown" => {
-                return Err(self.stash_resume_unknown(session, error).await);
+                return self.stash_resume_unknown(&parsed.params, session, error);
             }
-            Err(error) => return Err(self.fail_resume(session, error, envelope).await),
+            Err(error) => {
+                return self
+                    .fail_resume(&parsed.params, session, error, envelope)
+                    .await;
+            }
         };
         let context_bound = bind_context_hooks(&session.http, &retained.id, deadline).await;
         let effective = if context_bound {
@@ -1915,7 +1945,7 @@ impl OpenCodePlugin {
             )
             .await
         {
-            return Err(self.stash_resume_unknown(session, error).await);
+            return self.stash_resume_unknown(&parsed.params, session, error);
         }
         session.phase = SessionPhase::Ready;
         let result = json!({
@@ -2347,7 +2377,8 @@ impl OpenCodePlugin {
                     .switch_agent(session_id, &wanted, deadline)
                     .await,
                 "agent",
-            )?;
+            )
+            .map_err(|error| Self::resume_configure_error(error, repair_needed))?;
         }
         // Reaching this point proves each requested earlier setter returned success.
         let earlier_write = repair_needed || agent_needed;
@@ -2644,72 +2675,70 @@ impl OpenCodePlugin {
         }
     }
 
-    /// Discard the server after a resume failure that wrote nothing and
-    /// settle the start failed.
     async fn fail_resume(
         &mut self,
+        params: &AgentStartParams,
         mut session: AgentSession,
         error: Error,
         envelope: Instant,
-    ) -> Error {
+    ) -> Result<Value> {
         let error = discard_failed_start(&mut session, error, envelope).await;
-        // Resume-phase native failures keep their harness origin: the
-        // readback or configuration the native side refused or left
-        // unresolved. Only the location is filled when missing.
-        let mut error = error.with_where("plugin.opencode.start.resume");
-        if error.origin.is_none() {
-            error = error.with_origin(
-                FailureOrigin::Harness,
-                "resume-phase native readback or configuration failed or stayed unresolved",
-            );
-        }
-        self.retain_failed_start(error)
+        Ok(self.retain_proven_no_effect_start(params, StartPhase::ResumeRefused, error))
     }
 
-    /// Stash a resume-ambiguous session as unknown: the server and stream
-    /// stay for the snapshot, and the resume is never repeated.
-    async fn stash_resume_unknown(&mut self, session: AgentSession, error: Error) -> Error {
+    fn stash_resume_unknown(
+        &mut self,
+        params: &AgentStartParams,
+        session: AgentSession,
+        error: Error,
+    ) -> Result<Value> {
+        let result = start_failure(
+            params,
+            "opencode",
+            "resume",
+            StartPoint::AfterDispatch,
+            session.server.diagnostic_error(error),
+            session.session_id.as_deref(),
+        );
         self.session = Some(session);
-        if error.origin.is_some() {
-            return error;
-        }
-        let message = error.message;
-        Error::new(
-            "unknown",
-            format!("OpenCode resume is unresolved ({message})"),
-        )
-        .with_where("plugin.opencode.start.resume")
-        .with_origin(
-            FailureOrigin::Harness,
-            "retained native session state unresolved after resume readback",
-        )
+        result
     }
 
-    /// Every post-create failure funnels through here: the created session
-    /// may have been admitted, so the delete is proved first. A proved
-    /// removal stops the server inside the shutdown share and settles failed;
-    /// an unproved removal retains the exact session in memory as unknown,
-    /// with the server still live. The create is never repeated.
+    /// Ask the native server once to remove the exact created session.
+    /// Only a proved removal permits the shared failed-start outcome.
     async fn fail_created_start(
         &mut self,
+        params: &AgentStartParams,
         mut session: AgentSession,
-        native_ref: &str,
         error: Error,
         envelope: Instant,
-    ) -> Error {
-        let (proved, kill_note) =
-            delete_created_session_proved(&mut session, native_ref, envelope).await;
-        if proved {
-            let message = format!("{}; {kill_note}", error.message);
-            let error = session.server.diagnostic_error(error.with_message(message));
+    ) -> Result<CreateOutcome> {
+        let native_ref = session
+            .session_id
+            .as_deref()
+            .expect("successful create bound the ID");
+        let (proved, removal) = delete_created_session_proved(&session, native_ref, envelope).await;
+        let point = if proved {
             discard_created_start(&mut session, envelope).await;
-            return self.retain_failed_start(error);
+            StartPoint::NativeSessionRemoved
+        } else {
+            StartPoint::AfterDispatch
+        };
+        let message = format!("{}; {removal}", error.message);
+        let error = session.server.diagnostic_error(error.with_message(message));
+        let result = start_failure(
+            params,
+            "opencode",
+            "create",
+            point,
+            error,
+            session.session_id.as_deref(),
+        );
+        self.failed_start = Some(FailedStart);
+        if result.is_err() {
+            self.session = Some(session);
         }
-        // The known id was bound at create. Keep it with the live server
-        // and stream for readback, without committing session.ready.
-        session.phase = SessionPhase::Unknown;
-        self.session = Some(session);
-        created_start_unknown(native_ref, &error.message, &kill_note)
+        result.map(CreateOutcome::ProvenFailed)
     }
 
     /// Start phase 5, readiness: publish `session.ready` and return the
@@ -2731,20 +2760,20 @@ impl OpenCodePlugin {
             )
             .await
         {
-            session.phase = SessionPhase::Unknown;
+            let message = format!(
+                "OpenCode session.ready was not acknowledged: {}",
+                error.message
+            );
+            let result = start_failure(
+                &parsed.params,
+                "opencode",
+                "ready",
+                StartPoint::AfterDispatch,
+                error.with_message(message),
+                session.session_id.as_deref(),
+            );
             self.session = Some(session);
-            return Err(Error::new(
-                "unknown",
-                format!(
-                    "OpenCode session is known but session.ready was not acknowledged: {}",
-                    error.message
-                ),
-            )
-            .with_where("plugin.opencode.start.ready")
-            .with_origin(
-                FailureOrigin::Harness,
-                "native session.ready acknowledgement unobserved; native session is known",
-            ));
+            return result;
         }
         session.phase = SessionPhase::Ready;
         let result = json!({
@@ -4769,7 +4798,7 @@ async fn discard_created_start(session: &mut AgentSession, envelope: Instant) {
 /// the server live. The delete runs on its own deadline ending a full
 /// shutdown share before the envelope, never the shutdown's deadline.
 async fn delete_created_session_proved(
-    session: &mut AgentSession,
+    session: &AgentSession,
     session_id: &str,
     envelope: Instant,
 ) -> (bool, String) {
@@ -4792,18 +4821,6 @@ async fn delete_created_session_proved(
             format!("the created native session kill is unconfirmed ({reason})"),
         ),
     }
-}
-
-fn created_start_unknown(native_ref: &str, reason: &str, removal: &str) -> Error {
-    Error::new(
-        "unknown",
-        format!("OpenCode session {native_ref} is unresolved ({reason}; {removal})"),
-    )
-    .with_where("plugin.opencode.start.create")
-    .with_origin(
-        FailureOrigin::Harness,
-        "created native session state unresolved after start readback",
-    )
 }
 
 /// Prove the v1 context-hook binding for one exact session. Only a
