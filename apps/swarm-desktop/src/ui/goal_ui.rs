@@ -1,6 +1,7 @@
 //! The Goal dialog (brand book §18.1 Goal row, §11.3): one native
-//! ContentDialog, opened by the conversation header's Goal, a task menu's
-//! "Goal…" and Details › Goal's "Goal…". It holds the goal text, the
+//! ContentDialog, opened by the conversation header's Goal, the open
+//! chat's composer (+ → Goal…), a task menu's "Goal…", Details › Goal's
+//! "Goal…" and Home's Goal chip for the new task. It holds the goal text, the
 //! check command (an explicit argv that runs in the task's worktree) and
 //! the limits in their source units (rounds, turns, same-result rounds),
 //! and offers Save, Pause, Resume and Clear as the daemon allows them for
@@ -15,17 +16,39 @@
 //! never the default for Enter: the dialog opens with the keyboard in the
 //! goal text, Enter there starts a new line, and Esc and Cancel close it.
 //! Clear asks first, in the same dialog.
+//!
+//! With no goal set, the first message is the objective (brand book §9.1,
+//! `docs/spec/automation.md` "Default Goal objective"): the dialog shows
+//! it as the current goal text, for the owner to replace.
+//!
+//! For the new task, the dialog starts from the Goal the launch will
+//! install: the project's launch policy (`[projects.ID.policy]`), whose
+//! settings stay edited in Settings › Projects alone (the dialog links
+//! there). Save keeps only the fields the owner changed, which the launch
+//! sends as `args.goal`, each overriding its policy default (Command
+//! admission in `docs/spec/api.md`); with no policy check the goal needs
+//! its own text and check, as `goal.set` does.
 
+use super::launch_ui::NEW_TASK_COMPOSER;
 use super::*;
+use crate::settings_model::PolicyFields;
 use eliot_core::api::{GoalDefinition, GoalSetRequest, GoalStatus, GoalView};
+use serde_json::{Value, json};
 
 /// The most a round, turn or same-result limit may be (`MAX_GOAL_LIMIT`).
 const MAX_LIMIT: f64 = eliot_core::api::MAX_GOAL_LIMIT as f64;
 
 #[derive(Clone, Debug)]
 pub(super) enum GoalMsg {
-    /// Open the dialog for this Agent (its conversation opens first).
+    /// Open the dialog for this Agent (its conversation opens first), or
+    /// for the new task ([`NEW_TASK_COMPOSER`]).
     Open(String),
+    /// The composer's Goal (Home's chip, the open chat's + → Goal…): the
+    /// dialog for the composer's task.
+    Composer,
+    /// The new task's dialog's link: Settings › Projects with the
+    /// project's launch policy.
+    Policy,
     Text(String),
     Check(String),
     Rounds(Option<f64>),
@@ -66,7 +89,124 @@ struct Draft {
     same: Option<f64>,
 }
 
+/// A round, turn or same-result limit as the daemon takes it.
+fn limit(value: Option<f64>, name: &str) -> Result<Option<i64>, String> {
+    match value {
+        None => Ok(None),
+        Some(value) if value.fract() == 0.0 && (1.0..=MAX_LIMIT).contains(&value) => {
+            Ok(Some(value as i64))
+        }
+        Some(_) => Err(format!("{name} takes a whole number from 1 to 1,000,000.")),
+    }
+}
+
+/// The check command's requirement, in the owner's words.
+const CHECK_REQUIRED: &str =
+    "Give the check command: the program that proves the goal is met, such as cargo test.";
+/// The bound an idle-driven goal needs, in the owner's words.
+const LIMIT_REQUIRED: &str =
+    "Set a round or turn limit: Swarm runs the goal on every idle turn until one is reached.";
+
+/// The `args.goal` fields the dialog edits, with the limit each names.
+const LIMIT_FIELDS: [(&str, &str); 3] = [
+    ("max_rounds", "Rounds"),
+    ("max_turns", "Turns"),
+    ("max_without_progress", "Same result"),
+];
+
 impl Draft {
+    fn empty() -> Self {
+        Self {
+            text: String::new(),
+            check: String::new(),
+            rounds: None,
+            turns: None,
+            same: None,
+        }
+    }
+
+    /// The project policy's Goal as the dialog shows it: its check and
+    /// rounds (the policy has no goal text: the daemon names the work).
+    fn of_policy(policy: &PolicyFields) -> Self {
+        Self {
+            check: argv_text(&policy.check_argv()),
+            rounds: Some(policy.rounds() as f64),
+            ..Self::empty()
+        }
+    }
+
+    /// These fields with the owner's `args.goal` fields over them.
+    fn with(mut self, goal: &client::LaunchGoal) -> Self {
+        if let Some(text) = goal.get("text").and_then(Value::as_str) {
+            self.text = text.to_owned();
+        }
+        if let Some(Value::Array(check)) = goal.get("check") {
+            let check: Vec<String> = check
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect();
+            self.check = argv_text(&check);
+        }
+        for (field, _) in LIMIT_FIELDS {
+            if let Some(value) = goal.get(field) {
+                let value = value.as_i64().map(|limit| limit as f64);
+                match field {
+                    "max_rounds" => self.rounds = value,
+                    "max_turns" => self.turns = value,
+                    _ => self.same = value,
+                }
+            }
+        }
+        self
+    }
+
+    fn limits(&self) -> [Option<f64>; 3] {
+        [self.rounds, self.turns, self.same]
+    }
+
+    /// The new task's `args.goal`: the fields that differ from `base`
+    /// (the policy's Goal, or empty without one), checked as the Goal the
+    /// launch will install; none when nothing differs.
+    fn launch_goal(
+        &self,
+        base: &Draft,
+        policy: bool,
+    ) -> Result<Option<client::LaunchGoal>, String> {
+        let mut goal = client::LaunchGoal::new();
+        let text = self.text.trim();
+        if !text.is_empty() && text != base.text.trim() {
+            goal.insert("text".to_owned(), json!(text));
+        }
+        let check = parse_argv(&self.check)?;
+        if check != parse_argv(&base.check)? {
+            goal.insert("check".to_owned(), json!(check));
+        }
+        for ((field, name), (mine, theirs)) in LIMIT_FIELDS
+            .into_iter()
+            .zip(self.limits().into_iter().zip(base.limits()))
+        {
+            let mine = limit(mine, name)?;
+            if mine != limit(theirs, name)? {
+                // `null` clears the policy's limit (an Owner override).
+                goal.insert(field.to_owned(), json!(mine));
+            }
+        }
+        if goal.is_empty() {
+            return Ok(None);
+        }
+        if !policy && text.is_empty() {
+            return Err("Write what the goal is.".to_owned());
+        }
+        if check.is_empty() {
+            return Err(CHECK_REQUIRED.to_owned());
+        }
+        if self.rounds.is_none() && self.turns.is_none() {
+            return Err(LIMIT_REQUIRED.to_owned());
+        }
+        Ok(Some(goal))
+    }
+
     /// The fields as the goal fills them (empty with no goal).
     fn of(goal: Option<&GoalView>) -> Self {
         match goal {
@@ -80,13 +220,7 @@ impl Draft {
                     .max_without_progress
                     .map(|limit| limit as f64),
             },
-            None => Self {
-                text: String::new(),
-                check: String::new(),
-                rounds: None,
-                turns: None,
-                same: None,
-            },
+            None => Self::empty(),
         }
     }
 
@@ -100,20 +234,8 @@ impl Draft {
         }
         let check = parse_argv(&self.check)?;
         if check.is_empty() {
-            return Err(
-                "Give the check command: the program that proves the goal is met, such as cargo test."
-                    .to_owned(),
-            );
+            return Err(CHECK_REQUIRED.to_owned());
         }
-        let limit = |value: Option<f64>, name: &str| -> Result<Option<i64>, String> {
-            match value {
-                None => Ok(None),
-                Some(value) if value.fract() == 0.0 && (1.0..=MAX_LIMIT).contains(&value) => {
-                    Ok(Some(value as i64))
-                }
-                Some(_) => Err(format!("{name} takes a whole number from 1 to 1,000,000.")),
-            }
-        };
         let mut definition = goal.map_or_else(
             || GoalDefinition {
                 text: String::new(),
@@ -142,10 +264,7 @@ impl Draft {
             && definition.max_rounds.is_none()
             && definition.max_turns.is_none()
         {
-            return Err(
-                "Set a round or turn limit: Swarm runs the goal on every idle turn until one is reached."
-                    .to_owned(),
-            );
+            return Err(LIMIT_REQUIRED.to_owned());
         }
         Ok(definition)
     }
@@ -153,6 +272,7 @@ impl Draft {
 
 /// The open dialog: the Agent it acts on and what the owner did in it.
 pub(super) struct GoalDialog {
+    /// The Agent, or [`NEW_TASK_COMPOSER`] for the new task's goal.
     agent: String,
     title: String,
     /// The edits; none shows the current goal's values.
@@ -171,6 +291,11 @@ impl GoalDialog {
     /// Clear's question is showing.
     pub(super) fn confirm_clear(&self) -> bool {
         self.confirm_clear
+    }
+
+    /// The dialog sets the new task's goal (no daemon call until Start).
+    fn new_task(&self) -> bool {
+        self.agent == NEW_TASK_COMPOSER
     }
 }
 
@@ -268,6 +393,83 @@ fn parse_argv(line: &str) -> Result<Vec<String>, String> {
 }
 
 impl DesktopApp {
+    /// The launch policy of the new task's project when it installs a Goal
+    /// (a registered project whose policy has a check; never a chat).
+    fn launch_policy(&self) -> Option<PolicyFields> {
+        let project = self.launch_project_id();
+        if project.is_empty() {
+            return None;
+        }
+        Some(self.settings.policy_of(&project)).filter(PolicyFields::installs_goal)
+    }
+
+    /// The Goal the new task starts with, as the dialog's fields: the
+    /// policy's (or none) and the owner's fields over it.
+    fn launch_goal_drafts(&self) -> (Draft, Draft, bool) {
+        let policy = self.launch_policy();
+        let base = policy.as_ref().map_or_else(Draft::empty, Draft::of_policy);
+        let shown = match &self.launch.goal {
+            Some(goal) => base.clone().with(goal),
+            None => base.clone(),
+        };
+        (base, shown, policy.is_some())
+    }
+
+    /// The new task's `args.goal`, checked against the Goal it overrides
+    /// now (the project may have changed since it was set).
+    pub(super) fn launch_goal_checked(&self) -> Result<Option<client::LaunchGoal>, String> {
+        if self.launch.goal.is_none() {
+            return Ok(None);
+        }
+        let (base, shown, policy) = self.launch_goal_drafts();
+        shown
+            .launch_goal(&base, policy)
+            .map_err(|error| format!("Goal: {error}"))
+    }
+
+    /// Home's Goal chip words: the Goal the new task will start with
+    /// ("Goal · 3 rounds"), or "Goal" with none.
+    pub(super) fn launch_goal_label(&self) -> String {
+        let (_, shown, policy) = self.launch_goal_drafts();
+        if !policy && self.launch.goal.is_none() {
+            return "Goal".to_owned();
+        }
+        let count = |value: f64, one: &str, many: &str| {
+            let value = value as i64;
+            format!(
+                "Goal \u{b7} {value} {}",
+                if value == 1 { one } else { many }
+            )
+        };
+        match (shown.rounds, shown.turns) {
+            (Some(rounds), _) => count(rounds, "round", "rounds"),
+            (None, Some(turns)) => count(turns, "turn", "turns"),
+            (None, None) => "Goal".to_owned(),
+        }
+    }
+
+    /// The fields the open dialog starts from: the Agent's goal, or with
+    /// none the first message as the objective (brand book §9.1); the new
+    /// task's Goal for the new task.
+    fn goal_base(&self, open: &GoalDialog) -> Draft {
+        if open.new_task() {
+            return self.launch_goal_drafts().1;
+        }
+        match self.dialog_goal(&open.agent) {
+            Some(None) => Draft {
+                text: self
+                    .bound_detail()
+                    .ok()
+                    .filter(|detail| detail.agent == open.agent)
+                    // Save checks the goal text limit like any edit.
+                    .and_then(|detail| detail.first_owner_message.clone())
+                    .unwrap_or_default(),
+                ..Draft::empty()
+            },
+            goal => Draft::of(goal.flatten()),
+        }
+    }
+
     /// The open dialog's goal: none while it is read, `Some(None)` with no
     /// goal (a cleared one included).
     fn dialog_goal(&self, agent: &str) -> Option<Option<&GoalView>> {
@@ -283,6 +485,29 @@ impl DesktopApp {
 
     pub(super) fn goal_update(&mut self, msg: GoalMsg, context: &ComponentContext<Self>) {
         match msg {
+            GoalMsg::Composer => {
+                let target = self.composer_target();
+                self.goal_update(GoalMsg::Open(target), context);
+            }
+            GoalMsg::Policy => {
+                let project = self.launch_project_id();
+                if !project.is_empty() {
+                    self.goal.open = None;
+                    self.open_policy_editor(project, context);
+                }
+            }
+            GoalMsg::Open(agent) if agent == NEW_TASK_COMPOSER => {
+                self.close_popover();
+                self.goal.open = Some(GoalDialog {
+                    agent,
+                    title: String::new(),
+                    draft: None,
+                    busy: None,
+                    error: None,
+                    confirm_clear: false,
+                    retry: None,
+                });
+            }
             GoalMsg::Open(agent) => {
                 // The goal it shows is the open conversation's.
                 if self.selected_agent_id().as_deref() != Some(agent.as_str()) {
@@ -311,10 +536,9 @@ impl DesktopApp {
             | GoalMsg::Rounds(_)
             | GoalMsg::Turns(_)
             | GoalMsg::Same(_) => {
-                let Some(agent) = self.goal.open.as_ref().map(|open| open.agent.clone()) else {
+                let Some(current) = self.goal.open.as_ref().map(|open| self.goal_base(open)) else {
                     return;
                 };
-                let current = Draft::of(self.dialog_goal(&agent).flatten());
                 let Some(open) = self.goal.open.as_mut() else {
                     return;
                 };
@@ -349,13 +573,29 @@ impl DesktopApp {
         }
     }
 
-    /// Save: the edited goal, checked here, then `goal.set`.
+    /// Save: the edited goal, checked here, then `goal.set`; for the new
+    /// task, the changed fields kept for its launch.
     fn save_goal(&mut self, context: &ComponentContext<Self>) {
         let Some(open) = self.goal.open.as_ref() else {
             return;
         };
+        let draft = open.draft.clone().unwrap_or_else(|| self.goal_base(open));
+        if open.new_task() {
+            let (base, _, policy) = self.launch_goal_drafts();
+            match draft.launch_goal(&base, policy) {
+                Ok(goal) => {
+                    self.launch.goal = goal;
+                    self.goal.open = None;
+                }
+                Err(error) => {
+                    if let Some(open) = self.goal.open.as_mut() {
+                        open.error = Some(error);
+                    }
+                }
+            }
+            return;
+        }
         let goal = self.dialog_goal(&open.agent).flatten();
-        let draft = open.draft.clone().unwrap_or_else(|| Draft::of(goal));
         let checked = draft.definition(goal).and_then(|definition| {
             let id = open
                 .retry
@@ -486,9 +726,12 @@ impl DesktopApp {
     /// footer of the controls the goal's status allows.
     pub(super) fn goal_dialog(&self, context: &mut ViewContext<Self>) -> Option<ContentDialog> {
         let open = self.goal.open.as_ref()?;
+        if open.new_task() {
+            return Some(self.launch_goal_dialog(open, context));
+        }
         let goal = self.dialog_goal(&open.agent);
         let current = goal.flatten();
-        let draft = open.draft.clone().unwrap_or_else(|| Draft::of(current));
+        let draft = open.draft.clone().unwrap_or_else(|| self.goal_base(open));
         let busy = open.busy.is_some();
         // While no daemon answers, no read runs: the goal shown is not
         // confirmed, as after a failed read.
@@ -505,6 +748,11 @@ impl DesktopApp {
         let context_line = match (goal, read_error) {
             (None, Some(error)) => Some(format!("The goal could not be read: {error}")),
             (None, None) => Some("Reading the goal…".to_owned()),
+            // Brand book §9.1: the first message serves as the goal.
+            (Some(None), None) if !self.goal_base(open).text.is_empty() => Some(
+                "No goal set: the first message is the objective. Replace it with your goal."
+                    .to_owned(),
+            ),
             (Some(None), None) => None,
             (Some(None), Some(error)) => {
                 Some(format!("No goal when last read. Not read again: {error}"))
@@ -519,6 +767,106 @@ impl DesktopApp {
         // them until a read succeeds.
         let stale = read_error.is_some();
         let confirmed = goal.filter(|_| !stale);
+        let body = self.goal_fields(
+            &draft,
+            context_line,
+            open.error.clone(),
+            stale,
+            None,
+            context,
+        );
+        // Keyed by the question, so no button of one footer is reused as
+        // another's (a second click on Clear goal never lands on Save).
+        let footer = Grid::new().keyed_children(vec![if open.confirm_clear {
+            KeyedView::new("ask", self.goal_clear_footer(context))
+        } else {
+            KeyedView::new("controls", self.goal_footer(open, confirmed, busy, context))
+        }]);
+        let heading = match current {
+            Some(_) => format!("Goal for “{}”", open.title),
+            None => format!("Set a goal for “{}”", open.title),
+        };
+        Some(super::dialog_ui::surface(
+            context,
+            self.dialog.epoch,
+            heading,
+            body,
+            footer.into(),
+            tokens::layout::GOAL_DIALOG_WIDTH,
+        ))
+    }
+
+    /// The new task's Goal dialog: the Goal its launch will install (the
+    /// project's launch policy with the owner's fields over it), a link to
+    /// that policy in Settings › Projects, and Cancel and Save goal.
+    fn launch_goal_dialog(
+        &self,
+        open: &GoalDialog,
+        context: &mut ViewContext<Self>,
+    ) -> ContentDialog {
+        let (_, shown, policy) = self.launch_goal_drafts();
+        let draft = open.draft.clone().unwrap_or(shown);
+        let project = self.launch_project_id();
+        let line = if policy {
+            "This project's launch policy gives each new task this goal. A field you change applies to this task only."
+        } else if project.is_empty() {
+            "Without a goal, the first message is the objective."
+        } else {
+            "This project's launch policy sets no goal. Without one, the first message is the objective."
+        };
+        let link: Option<View> = (!project.is_empty()).then(|| {
+            controls::text_button()
+                .horizontal_alignment(HorizontalAlignment::Left)
+                .automation_name("Edit the launch policy in Settings › Projects")
+                .on_click(context.message(Message::Goal(GoalMsg::Policy)))
+                .content(controls::label("Edit the launch policy"))
+                .into()
+        });
+        let body = self.goal_fields(
+            &draft,
+            Some(line.to_owned()),
+            open.error.clone(),
+            false,
+            link,
+            context,
+        );
+        // Cancel and Save goal at the right, as on a task's dialog.
+        let footer = super::dialog_ui::actions(
+            controls::text_button()
+                .element_ref(&self.dialog.close)
+                .automation_name("Cancel goal")
+                .on_click(context.message(Message::Goal(GoalMsg::Closed)))
+                .content(controls::label("Cancel"))
+                .into(),
+            Some(
+                controls::filled()
+                    .automation_name("Save goal")
+                    .on_click(context.message(Message::Goal(GoalMsg::Save)))
+                    .content(controls::label("Save goal"))
+                    .into(),
+            ),
+        );
+        super::dialog_ui::surface(
+            context,
+            self.dialog.epoch,
+            "Goal for the new task".to_owned(),
+            body,
+            footer,
+            tokens::layout::GOAL_DIALOG_WIDTH,
+        )
+    }
+
+    /// The dialog's body: its context line, an optional link, the goal
+    /// text, the check command, the limits and the error.
+    fn goal_fields(
+        &self,
+        draft: &Draft,
+        context_line: Option<String>,
+        error: Option<String>,
+        stale: bool,
+        link: Option<View>,
+        context: &mut ViewContext<Self>,
+    ) -> View {
         let number = |header: &str, value: Option<f64>, message: fn(Option<f64>) -> GoalMsg| {
             NumberBox::new()
                 .header(controls::secondary(header))
@@ -538,14 +886,14 @@ impl DesktopApp {
                 number("Turns", draft.turns, GoalMsg::Turns).grid_column(1),
                 number("Same result", draft.same, GoalMsg::Same).grid_column(2),
             ));
-        let error: Option<View> = open.error.clone().map(|error| {
+        let error: Option<View> = error.map(|error| {
             controls::body(error)
                 .foreground(ThemeBrush::SystemCritical)
                 .text_wrapping(TextWrapping::Wrap)
                 .is_text_selection_enabled(true)
                 .into()
         });
-        let body = StackPanel::new()
+        StackPanel::new()
             .spacing(tokens::spacing::MD)
             .keyed_children(crate::views::slots([
                 context_line.map(|line| {
@@ -553,6 +901,7 @@ impl DesktopApp {
                         .text_wrapping(TextWrapping::Wrap)
                         .into()
                 }),
+                link,
                 Some(
                     controls::field()
                         .element_ref(&self.dialog.field)
@@ -590,26 +939,7 @@ impl DesktopApp {
                 ),
                 error,
             ]))
-            .into();
-        // Keyed by the question, so no button of one footer is reused as
-        // another's (a second click on Clear goal never lands on Save).
-        let footer = Grid::new().keyed_children(vec![if open.confirm_clear {
-            KeyedView::new("ask", self.goal_clear_footer(context))
-        } else {
-            KeyedView::new("controls", self.goal_footer(open, confirmed, busy, context))
-        }]);
-        let heading = match current {
-            Some(_) => format!("Goal for “{}”", open.title),
-            None => format!("Set a goal for “{}”", open.title),
-        };
-        Some(super::dialog_ui::surface(
-            context,
-            self.dialog.epoch,
-            heading,
-            body,
-            footer.into(),
-            tokens::layout::GOAL_DIALOG_WIDTH,
-        ))
+            .into()
     }
 
     /// Clear's question in the footer: Keep goal (the keyboard's) or Clear

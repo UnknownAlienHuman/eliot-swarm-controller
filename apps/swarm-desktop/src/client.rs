@@ -1118,6 +1118,11 @@ pub enum LaunchPlace {
     Chat,
 }
 
+/// A launch's Owner Goal fields (`args.goal`): a partial Goal object whose
+/// fields override the project policy's Goal one by one (`docs/spec/api.md`,
+/// Command admission).
+pub type LaunchGoal = serde_json::Map<String, Value>;
+
 /// First prompt as one submission: nonblank text rides the launch admission
 /// and the linked `<id>/send` command must appear in the reply. Overrides
 /// exist only on the ad-hoc path, which the daemon validates; a profile
@@ -1128,8 +1133,9 @@ pub async fn submit_launch(
     target: LaunchTarget,
     place: &LaunchPlace,
     text: Option<String>,
+    goal: Option<LaunchGoal>,
 ) -> Result<CommandSubmitResponse> {
-    let args = launch_args(target, place, text)?;
+    let args = launch_args(target, place, text, goal)?;
     submit(
         data_dir,
         &submit_request(mutation_id, None, "launch", args)?,
@@ -1147,10 +1153,11 @@ pub async fn enqueue_launch(
     target: LaunchTarget,
     place: &LaunchPlace,
     text: Option<String>,
+    goal: Option<LaunchGoal>,
 ) -> Result<LaunchIntentView> {
     let request = LaunchQueueRequest {
         id: mutation_id,
-        args: launch_args(target, place, text)?,
+        args: launch_args(target, place, text, goal)?,
     };
     request.validate()?;
     let reply: LaunchIntentView =
@@ -1348,22 +1355,37 @@ pub async fn organize(
     }
 }
 
-/// The ordinary launch arguments of one launch or queued intent.
-fn launch_args(target: LaunchTarget, place: &LaunchPlace, text: Option<String>) -> Result<Value> {
+/// The ordinary launch arguments of one launch or queued intent, as Core's
+/// [`LaunchCommandArgs`](eliot_core::api::LaunchCommandArgs): the place, the
+/// frozen choice, the first prompt and the Owner's Goal fields.
+fn launch_args(
+    target: LaunchTarget,
+    place: &LaunchPlace,
+    text: Option<String>,
+    goal: Option<LaunchGoal>,
+) -> Result<Value> {
     if let Some(text) = text.as_deref() {
         check_text(text)?;
     }
-    let mut args = match place {
-        LaunchPlace::Workspace(workspace) => serde_json::json!({ "workspace": workspace }),
-        LaunchPlace::Worktree(workspace) => {
-            serde_json::json!({ "workspace": workspace, "worktree": "" })
-        }
-        LaunchPlace::Chat => serde_json::json!({ "chat": true }),
+    let nonblank = |value: Option<String>| value.filter(|value| !value.trim().is_empty());
+    let mut args = eliot_core::api::LaunchCommandArgs {
+        text,
+        goal,
+        ..Default::default()
     };
+    match place {
+        LaunchPlace::Workspace(workspace) => args.workspace = Some(workspace.clone()),
+        LaunchPlace::Worktree(workspace) => {
+            args.workspace = Some(workspace.clone());
+            // Empty: the daemon names the standard branch.
+            args.worktree = Some(String::new());
+        }
+        LaunchPlace::Chat => args.chat = Some(true),
+    }
     match target {
         LaunchTarget::Routed => {}
         LaunchTarget::Profile(profile) if !profile.trim().is_empty() => {
-            args["profile"] = Value::String(profile);
+            args.profile = Some(profile);
         }
         LaunchTarget::Profile(_) => {
             return Err(Error::new(
@@ -1377,22 +1399,14 @@ fn launch_args(target: LaunchTarget, place: &LaunchPlace, text: Option<String>) 
             effort,
             access,
         } => {
-            args["harness"] = Value::String(harness);
-            if let Some(model) = model.filter(|model| !model.trim().is_empty()) {
-                args["model"] = Value::String(model);
-            }
-            if let Some(effort) = effort.filter(|effort| !effort.trim().is_empty()) {
-                args["effort"] = Value::String(effort);
-            }
-            if let Some(access) = access.filter(|access| !access.trim().is_empty()) {
-                args["access"] = Value::String(access);
-            }
+            args.harness = Some(harness);
+            args.model = nonblank(model);
+            args.effort = nonblank(effort);
+            args.access = nonblank(access);
         }
     }
-    if let Some(text) = text {
-        args["text"] = Value::String(text);
-    }
-    Ok(args)
+    serde_json::to_value(args)
+        .map_err(|error| Error::new("internal", format!("launch arguments: {error}")))
 }
 
 /// Mid-run model/effort overlay for the next turn of exactly the generation

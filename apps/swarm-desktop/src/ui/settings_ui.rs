@@ -1426,27 +1426,10 @@ impl DesktopApp {
                 };
             }
             SettingsMsg::ProjectBrowse => {
-                match crate::file_dialog::pick_folder("Add a project: choose its checkout folder") {
-                    Ok(Some(path)) => {
-                        let profiles = self.known_profiles();
-                        let s = &mut self.settings;
-                        let id = model::project_id_for_folder(&s.projects, &path);
-                        match model::add_project(&mut s.projects, &id, &path, &profiles) {
-                            Ok(()) => {
-                                s.project_open = Some(id);
-                                self.autosave(Page::Projects, context);
-                            }
-                            Err(error) => {
-                                s.notes.insert(Page::Projects, Note::error(error));
-                            }
-                        }
-                    }
-                    Ok(None) => {}
-                    Err(error) => {
-                        self.settings
-                            .notes
-                            .insert(Page::Projects, Note::error(error));
-                    }
+                if let Err(error) = self.add_project_from_picker(context) {
+                    self.settings
+                        .notes
+                        .insert(Page::Projects, Note::error(error));
                 }
             }
             SettingsMsg::CloudField(index, text) => {
@@ -1937,6 +1920,39 @@ impl DesktopApp {
         self.load_profile_list(context);
         self.load_routing_preview(context);
         self.load_projects(context);
+    }
+
+    /// Add a project (Settings › Projects' Browse, Home's "Add project…"):
+    /// the native folder picker, then the folder added to the projects
+    /// section allowing the known profiles and saved on the read revision;
+    /// the store validates it and a refusal shows on Settings › Projects.
+    /// The chosen folder, or none when the picker was cancelled (nothing
+    /// changes).
+    pub(super) fn add_project_from_picker(
+        &mut self,
+        context: &ComponentContext<Self>,
+    ) -> Result<Option<String>, String> {
+        let Some(path) =
+            crate::file_dialog::pick_folder("Add a project: choose its checkout folder")?
+        else {
+            return Ok(None);
+        };
+        let profiles = self.known_profiles();
+        let s = &mut self.settings;
+        let id = model::project_id_for_folder(&s.projects, &path);
+        model::add_project(&mut s.projects, &id, &path, &profiles)?;
+        s.project_open = Some(id);
+        self.autosave(Page::Projects, context);
+        Ok(Some(path))
+    }
+
+    /// Settings › Projects with `id`'s editor open: the one place a
+    /// project's launch policy is edited.
+    pub(super) fn open_policy_editor(&mut self, id: String, context: &ComponentContext<Self>) {
+        self.shell_update(ShellMsg::SettingsPage(Page::Projects), context);
+        if self.settings.project_open.as_deref() != Some(id.as_str()) {
+            self.settings_update(SettingsMsg::ProjectOpened(id), context);
+        }
     }
 
     pub(super) fn load_settings(&mut self, context: &ComponentContext<Self>) {
