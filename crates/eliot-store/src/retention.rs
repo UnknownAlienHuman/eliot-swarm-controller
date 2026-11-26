@@ -443,6 +443,11 @@ impl Store {
             commit_transaction(tx, &self.write_faulted)?;
             return Ok((0, pruned_through));
         };
+        db!(crate::event_coverage::record_event_pruning_tx(
+            &tx,
+            "seq > ?1 AND seq <= ?2",
+            params![pruned_through, last_deleted],
+        ));
         let deleted = db!(tx.execute(
             "DELETE FROM events WHERE seq > ?1 AND seq <= ?2",
             params![pruned_through, last_deleted],

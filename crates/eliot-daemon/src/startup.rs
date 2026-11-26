@@ -41,7 +41,7 @@ pub async fn ensure_running(data_dir: &Path, swarm_executable: &Path) -> Result<
     } else {
         None
     };
-    match reachable(data_dir).await {
+    match probe(data_dir).await {
         Ok(true) => return Ok(acl_problem.is_some()),
         Ok(false) => {}
         Err(error) if repairable_data_dir_acl(&error) => acl_problem = Some(error),
@@ -140,6 +140,37 @@ pub(crate) async fn open_client_data_dir(data_dir: &Path) -> Result<DataDir> {
             }
             result => return result,
         }
+    }
+}
+
+/// Warm-path liveness probe: confirm the recorded endpoint accepts a
+/// connection without issuing an RPC. The dispatch that follows still
+/// performs full authentication and peer verification, so skipping the
+/// `daemon.status` preflight RPC here cannot weaken any security check;
+/// this only decides whether a (re)start is needed.
+async fn probe(data_dir: &Path) -> Result<bool> {
+    let data_dir = open_client_data_dir(data_dir).await?;
+    let info = data_dir
+        .read_daemon_info()?
+        .ok_or_else(|| Error::new("unavailable", "daemon is not running"))?;
+    let until = tokio::time::Instant::now() + Duration::from_secs(2);
+    match tokio::time::timeout_at(
+        until,
+        crate::platform::IpcStream::connect(&info.endpoint, until),
+    )
+    .await
+    {
+        Ok(Ok(_)) => Ok(true),
+        Ok(Err(error))
+            if matches!(
+                error.code.as_str(),
+                "unavailable" | "platform_io" | "data_dir_unavailable"
+            ) =>
+        {
+            Ok(false)
+        }
+        Ok(Err(error)) => Err(error),
+        Err(_) => Ok(false),
     }
 }
 

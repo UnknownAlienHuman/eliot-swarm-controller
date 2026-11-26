@@ -7,7 +7,7 @@
 use eliot_core::{self as core, Error};
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
 };
 
 #[cfg(any(windows, target_os = "linux"))]
@@ -30,9 +30,19 @@ impl PartialEq for FilesystemRevision {
 }
 impl Eq for FilesystemRevision {}
 
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum WatchChange {
+    #[cfg(any(windows, target_os = "linux"))]
+    Ignore = 0,
+    #[cfg(any(windows, target_os = "linux"))]
+    Content = 1,
+    Rebind = 2,
+    Lost = 3,
+}
+
 pub(crate) struct WorkspaceInvalidation {
     dirty: Arc<AtomicBool>,
-    degraded: Arc<AtomicBool>,
+    coverage: Arc<AtomicU8>,
     revision: Arc<AtomicU64>,
     #[cfg(any(windows, target_os = "linux"))]
     _watcher: RecommendedWatcher,
@@ -83,7 +93,13 @@ impl WorkspaceInvalidation {
             scope.linked = Some((admin, common));
         }
         Self::watch_paths(paths, None, move |path, _kind| {
-            (scope.includes(path), scope.binding_changed(path))
+            if scope.binding_changed(path) {
+                WatchChange::Lost
+            } else if scope.includes(path) {
+                WatchChange::Content
+            } else {
+                WatchChange::Ignore
+            }
         })
     }
 
@@ -93,35 +109,32 @@ impl WorkspaceInvalidation {
     pub(crate) fn watch_paths(
         paths: Vec<(PathBuf, RecursiveMode)>,
         wake: Option<Arc<tokio::sync::Notify>>,
-        classify: impl Fn(&Path, &EventKind) -> (bool, bool) + Send + 'static,
+        classify: impl Fn(&Path, &EventKind) -> WatchChange + Send + 'static,
     ) -> core::Result<Self> {
         use crate::git_monitor::reject_links;
         let dirty = Arc::new(AtomicBool::new(true));
-        let degraded = Arc::new(AtomicBool::new(false));
+        let coverage = Arc::new(AtomicU8::new(0));
         let revision = Arc::new(AtomicU64::new(0));
         let callback_dirty = Arc::clone(&dirty);
-        let callback_degraded = Arc::clone(&degraded);
+        let callback_coverage = Arc::clone(&coverage);
         let callback_revision = Arc::clone(&revision);
         let mut watcher = RecommendedWatcher::new(
             move |result: notify::Result<notify::Event>| {
-                let (changed, binding) = match result {
-                    Ok(event) if event.need_rescan() => (true, true),
-                    Ok(event) if !matches!(event.kind, EventKind::Access(_)) => {
-                        event.paths.iter().fold(
-                            (event.paths.is_empty(), false),
-                            |(changed, binding), path| {
-                                let (relevant, rebound) = classify(path, &event.kind);
-                                (changed || relevant, binding || rebound)
-                            },
-                        )
-                    }
-                    Ok(_) => (false, false),
-                    Err(_) => (true, true),
+                let change = match result {
+                    Ok(event) if event.need_rescan() => WatchChange::Lost,
+                    Ok(event) if !matches!(event.kind, EventKind::Access(_)) => event
+                        .paths
+                        .iter()
+                        .map(|path| classify(path, &event.kind))
+                        .max()
+                        .unwrap_or(WatchChange::Content),
+                    Ok(_) => WatchChange::Ignore,
+                    Err(_) => WatchChange::Lost,
                 };
-                if binding {
-                    callback_degraded.store(true, Ordering::Release);
+                if change >= WatchChange::Rebind {
+                    callback_coverage.fetch_max(change as u8, Ordering::Release);
                 }
-                if binding || changed {
+                if change != WatchChange::Ignore {
                     callback_revision.fetch_add(1, Ordering::AcqRel);
                     callback_dirty.store(true, Ordering::Release);
                     if let Some(wake) = &wake {
@@ -140,7 +153,7 @@ impl WorkspaceInvalidation {
         }
         Ok(Self {
             dirty,
-            degraded,
+            coverage,
             revision,
             _watcher: watcher,
         })
@@ -156,9 +169,11 @@ impl WorkspaceInvalidation {
 
     pub(crate) fn revision(&self) -> Option<FilesystemRevision> {
         let observed = self.revision.load(Ordering::Acquire);
-        (!self.is_degraded()).then(|| FilesystemRevision {
-            source: Arc::clone(&self.revision),
-            observed,
+        (self.coverage.load(Ordering::Acquire) < WatchChange::Rebind as u8).then(|| {
+            FilesystemRevision {
+                source: Arc::clone(&self.revision),
+                observed,
+            }
         })
     }
 
@@ -174,7 +189,7 @@ impl WorkspaceInvalidation {
 
     /// Latched after a backend error, rescan notice or watched binding change.
     pub(crate) fn is_degraded(&self) -> bool {
-        self.degraded.load(Ordering::Acquire)
+        self.coverage.load(Ordering::Acquire) == WatchChange::Lost as u8
     }
 }
 

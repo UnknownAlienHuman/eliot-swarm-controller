@@ -142,6 +142,11 @@ pub(crate) struct EventStatus {
     pub session_id: Option<String>,
     pub active_command_id: Option<String>,
     pub active_turn_id: Option<String>,
+    /// The retained generation's `unknown` turn id, when a resume continues
+    /// it. Its late native facts name expected history: they are gapped,
+    /// never replayed or associated, and never fail readiness. The turn
+    /// itself stays unknown for Owner resolution.
+    pub retained_unknown_turn: Option<String>,
     pub last_turn: Option<TurnFacts>,
     pub provider_model_turn: Option<String>,
     pub model_mismatch: Option<(String, String)>,
@@ -291,6 +296,10 @@ pub(crate) struct EventHandle {
 }
 
 enum Control {
+    RetainUnknownTurn {
+        turn_id: String,
+        reply: oneshot::Sender<()>,
+    },
     ViewReadback {
         session_id: String,
         reason: Option<NativeHistoryNoneReason>,
@@ -476,6 +485,16 @@ fn native_notification_turn_id(params: &Value) -> Option<&str> {
         .and_then(Value::as_str)
         .or_else(|| params.pointer("/item/turnId").and_then(Value::as_str))
         .or_else(|| provider::signal(params).map(|signal| signal.turn_id))
+}
+
+/// The retained generation's `unknown` turn, when a resume continues it:
+/// the daemon died mid-turn, so the resumed native session replays this
+/// turn's late facts. They name expected history for a turn that stays
+/// unknown for Owner resolution — never a replay, association, or
+/// readiness failure.
+fn retained_unknown_exempt(status: &EventStatus, params: &Value) -> bool {
+    native_notification_turn_id(params)
+        .is_some_and(|turn_id| status.retained_unknown_turn.as_deref() == Some(turn_id))
 }
 
 /// Store identities acknowledged during the active turn, independently of
@@ -805,6 +824,17 @@ impl EventHandle {
         let _ = self.actor.call(|reply| Control::Close { reply }).await;
     }
 
+    /// Record the retained generation's `unknown` turn before readiness:
+    /// its late native facts name expected history for a turn that stays
+    /// unknown for Owner resolution. Best effort: a closing queue has no
+    /// frames left to protect.
+    pub async fn retain_unknown_turn(&self, turn_id: String) {
+        let _ = self
+            .actor
+            .call(|reply| Control::RetainUnknownTurn { turn_id, reply })
+            .await;
+    }
+
     pub async fn drain_native(&self) -> Result<()> {
         eliot_plugin::native_lifecycle::wait_for_native_tail(self.actor.watch(), |s| {
             s.native_drained
@@ -909,6 +939,11 @@ impl EventProcessor {
         control: Control,
     ) -> bool {
         match control {
+            Control::RetainUnknownTurn { turn_id, reply } => {
+                self.status.retained_unknown_turn = Some(turn_id);
+                let _ = reply.send(());
+                true
+            }
             Control::ViewReadback {
                 session_id,
                 reason,
@@ -1201,15 +1236,21 @@ impl EventProcessor {
                         BufferedNativeFrame::Notification { method, params },
                         &mut self.loss_reason,
                     );
-                } else if let Err(error) = self.process_notification(method, params).await {
+                } else if let Err(error) = self.process_notification(method.clone(), params).await {
                     self.status.source_unknown = true;
                     if !self.gap_reported
                         && !self.writes_blocked
                         && error.failure_where.as_deref() != Some("plugin.events.put")
                     {
-                        let _ = self
-                            .record_gap("Muse notification could not be normalized")
-                            .await;
+                        // Method and error code only: no native payload text.
+                        // The rejection diagnostics name the method so the
+                        // next send names the failing frame instead of an
+                        // empty snapshot.
+                        let reason = format!(
+                            "Muse {method} notification could not be normalized ({})",
+                            error.code
+                        );
+                        let _ = self.record_gap(reason.as_str()).await;
                     }
                     if self.status.failure.is_none() {
                         self.status.failure = Some(*error.message);
@@ -1695,6 +1736,15 @@ impl EventProcessor {
     }
 
     async fn process_buffered_frame(&mut self, frame: BufferedNativeFrame) -> Result<()> {
+        // Method and error code only: no native payload text.
+        let label = match &frame {
+            BufferedNativeFrame::Notification { method, .. } => {
+                format!("Buffered Muse {method} notification could not be normalized")
+            }
+            BufferedNativeFrame::Request { method, .. } => {
+                format!("Buffered Muse {method} request could not be normalized")
+            }
+        };
         let result = match frame {
             BufferedNativeFrame::Notification { method, params } => {
                 self.process_notification(method, params).await
@@ -1704,10 +1754,8 @@ impl EventProcessor {
             }
         };
         if let Err(error) = result {
-            return Err(self
-                .stream_source()
-                .buffered_failure(error, "Buffered Muse native frame could not be normalized")
-                .await);
+            let reason = format!("{label} ({})", error.code);
+            return Err(self.stream_source().buffered_failure(error, &reason).await);
         }
         Ok(())
     }
@@ -1725,6 +1773,19 @@ impl EventProcessor {
             .session_id
             .as_deref()
             .ok_or_else(|| Error::new("unknown", "Muse request has no owned session"))?;
+        if retained_unknown_exempt(&self.status, &params) {
+            // Re-issued request for the retained unknown turn: receipt it
+            // and drop it as an orphan. Never answered; the turn stays
+            // unknown for Owner resolution.
+            if let Some(native_id) = orphan_request_id(&method, &params) {
+                self.expected_requests.remove(native_id.as_str());
+            }
+            let _ = self
+                .native
+                .reply_server_request(id, json!({}), Instant::now() + EVENT_DEADLINE)
+                .await;
+            return Ok(());
+        }
         let turn_id = self
             .status
             .active_turn_id
@@ -2688,6 +2749,21 @@ impl EventProcessor {
         {
             return Ok(());
         }
+        if retained_unknown_exempt(&self.status, &params) {
+            // Expected history for the retained unknown turn: name its
+            // coverage once without declaring a new uncertain outcome. The
+            // turn itself stays unknown for Owner resolution. Never replay
+            // it as a native trigger, never associate or commit it, and
+            // never fail on it — readiness included.
+            if !self.gap_reported {
+                self.record_coverage_gap(
+                    "Muse frame names the retained unknown turn; it stays unknown for Owner resolution",
+                    &["session", "turn", "message", "tool", "request"],
+                )
+                .await?;
+            }
+            return Ok(());
+        }
         if is_workflow_item_frame(&method, &params) {
             return self.observe_workflow_item(params).await;
         }
@@ -2695,6 +2771,10 @@ impl EventProcessor {
             method.as_str(),
             "item/started" | "item/updated" | "item/completed"
         ) && params.pointer("/item/kind").and_then(Value::as_str) != Some("compaction")
+            && (method != "item/updated"
+                || self.status.session_id.as_deref().is_none_or(|session_id| {
+                    params.get("sessionId").and_then(Value::as_str) == Some(session_id)
+                }))
             && (params.pointer("/item/kind").and_then(Value::as_str)
                 == Some("backgroundTerminalCompletion")
                 || self.status.active_turn_id.is_none()
@@ -2703,7 +2783,8 @@ impl EventProcessor {
                 }))
         {
             // Background receipts and idle view items can outlive their
-            // foreground turn. They carry no new active-turn binding.
+            // foreground turn. An update for another bound session goes
+            // through the session validation below even when idle.
             return Ok(());
         }
         match method.as_str() {
@@ -2891,16 +2972,23 @@ impl EventProcessor {
                             "Muse item/updated did not match the 1.4 schema",
                         )
                     })?;
-                if notification.item.kind == "compaction" {
-                    self.validate_compaction_binding(
-                        &notification.session_id,
-                        notification.item.turn_id.as_deref(),
-                    )?;
-                } else {
-                    self.validate_item_turn(
-                        &notification.session_id,
-                        notification.item.turn_id.as_ref(),
-                    )?;
+                // A session mismatch still gaps: the frame names another
+                // stream. A non-active turn binding (stale replay, batch
+                // race on the self-updating host) carries no committable
+                // state, so it is ignored instead of gapping the source;
+                // the terminal `item/completed` keeps strict validation
+                // and still commits every tool fact.
+                if self.status.session_id.as_deref() != Some(notification.session_id.as_str()) {
+                    return Err(Error::new(
+                        "source_integrity",
+                        "Muse notification did not belong to the owned native session",
+                    ));
+                }
+                if let Some(turn_id) = notification.item.turn_id.as_deref()
+                    && !turn_id.trim().is_empty()
+                    && self.status.active_turn_id.as_deref() != Some(turn_id)
+                {
+                    return Ok(());
                 }
             }
             "item/completed" => {
@@ -2944,8 +3032,21 @@ impl EventProcessor {
                     }
                 }
             }
+            "item/delta" => {
+                // Streaming deltas for delta-streamed kinds (installed
+                // 1.4.25 stable surface, SS4.4.1): deltas never bump the
+                // item revision, and the authoritative terminal
+                // `item/completed` carries every committed tool fact, so a
+                // delta folds no bus fact and is explicitly ignored.
+            }
             "turn/completed" => {
                 self.complete_turn(params).await?;
+            }
+            "turn/toolBatchSubmitted" => {
+                // Batch-submission scheduling signal (installed 1.4.25
+                // experimental surface): the submitted calls arrive as
+                // `item/started`, so the batch notice itself carries no
+                // committable lifecycle fact and is explicitly ignored.
             }
             "usage/changed" => {
                 // Optional quota sample: a malformed sample is dropped
@@ -4790,6 +4891,12 @@ impl EventProcessor {
 
     async fn record_gap(&mut self, reason: &str) -> Result<()> {
         self.stream_source().record_gap(reason).await
+    }
+
+    async fn record_coverage_gap(&mut self, reason: &str, families: &[&str]) -> Result<()> {
+        self.stream_source()
+            .record_coverage_gap(reason, families)
+            .await
     }
 
     /// The shared stream-commit half of this processor.

@@ -1162,8 +1162,11 @@ The OS sets no fixed delivery deadline for the notification itself.
 Before publication, monitoring
 checks the registered checkout HEAD and index stamps on both sides of the
 Git read. Git configuration and checkout inventory changes depend on watcher
-coverage. A newly built watcher that reports degraded before its first revision
-is read is rebuilt once; only a repeated loss reports unavailable. Legacy callers
+coverage. Worktree membership and pointer changes invalidate the read and
+refresh the watch set. Ordinary directory modifications are content changes
+where they affect the inventory. Backend errors, rescan notices, replacement
+of a required watch root and failures to arm checkout bindings trigger one
+rebuild. Repeated loss reports unavailable. Legacy callers
 get a bounded live Git read on a cache miss. Callers
 that send `include_git_state: true` receive `git_refreshing: true` without
 origin or checkout details while a watched observation is pending. They can
@@ -1171,7 +1174,11 @@ poll again on their normal refresh cadence. When monitoring cannot cover or
 verify a repository, the daemon uses the bounded live Git read and includes
 `git_watch_unsupported: true` for opted-in callers. This fallback also
 starts after three consecutive attempts invalidated by a moving revision.
-A new verified observation restores the cached path.
+It reports one warning per repository per burst with the invalidated attempt
+count at entry. The fallback remains visible until the same watcher revision,
+registered checkout stamps and bindings verify for ten seconds. Recovery
+restores the cached path and records the total invalidated attempts at debug
+log level.
 Malformed and pathless remotes produce no name, and the origin URL itself
 never leaves the daemon.
 
@@ -2079,7 +2086,13 @@ NTSTATUS and the redacted stderr tail (a loss to a daemon restart is `swarm` at
 `agent.lost.stderr_tail` keeps the bounded, redacted capture verbatim, including
 any raw panic marker lines. The process step can carry the startup panic marker
 summary in `origin_evidence`. Diagnosis also includes the previous-run crash
-marker when the terminal failure is unclassified.
+marker when the terminal failure is unclassified. For an Agent, the chain also
+carries the current provider hold as a `provider_hold` step (origin `provider`)
+when the Store marks it as the wait reason for the active turn, and any
+automatic-restart fence as a `restart` step (origin `swarm`) with the exact
+`swarm resume` retry; neither step shadows a classified command, turn or loss
+origin. A blocked goal outranks the generic command and turn fallbacks as the
+reason.
 For a queued SEND, `swarm why COMMAND_ID` reports the retained command or turn
 that closes its send gate, including an unknown compaction's command ID and
 verb. The corresponding Owner inbox item identifies the queued inputs waiting
@@ -2106,8 +2119,11 @@ When a failure exists, the one-line `summary` starts with its origin
 waiting or stopped Agent with no failure in the bounded recent generation read
 says that nothing has failed in that recent history; it carries no unrelated
 previous-crash marker. Unknown origin remains for unexplained failures or
-unknown outcomes. A terminal's typed `native_error.code` (for example
-`quota_exhausted`) and native quota reset hint are included in its turn step.
+unknown outcomes. A stored command or turn outcome with a native adapter code
+(`native_*`) but no recorded origin reports the harness origin instead, per the
+core rule that unmapped native errors stay harness. A terminal's typed
+`native_error.code` (for example `quota_exhausted`) and native quota reset hint
+are included in its turn step.
 For an Agent in any lifecycle state, diagnosis also lists retained unknown commands
 and turns from any generation, appending `; retained ...` to the usual summary
 within its length bound. The summary keeps its origin-first explanation. The
@@ -3157,10 +3173,19 @@ Event requests, responses and `EventsFilter` are defined in the canonical Core A
 
 `events.bounds` accepts `EventsBoundsRequest` and returns `EventsBoundsResponse`
 ([Core DTOs](../../crates/eliot-core/src/api.rs)). Its optional `filter` has the same
-grammar and caller-scope checks as replay. The numeric bounds describe the journal,
-as does replay's `high_water`: `pruned_through` is the exclusive pruning floor and
-`hi` is the allocated sequence high-water mark, including when every event row has
-been pruned. This bounded metadata query reads no event page and requires no cursor.
+grammar and caller-scope checks as replay. `hi` is the journal's allocated sequence
+high-water mark, including when every event row has been pruned. Unfiltered reads
+use the journal's exclusive pruning floor. For a filter, `pruned_through` is the
+highest removed sequence matching the effective authorized filter, or zero when
+no matching events were removed. `events.read` and `events.subscribe` use that
+same floor to check their exclusive cursor.
+
+Stores upgraded from journal-wide coverage have no filter keys for prior deletions.
+A surviving Agent with its creation event has no legacy gap. For a surviving Agent
+whose creation is missing, the legacy floor is capped at the cursor immediately
+before its first surviving event, if one exists. The legacy journal watermark
+also covers kind/source-only filters, Agents already deleted before upgrade, and
+variable events included by an Agent's authorization scope.
 
 CLI `watch [AGENT]` reads these bounds once and starts at `hi`, delivering new events.
 `watch [AGENT] --after SEQ` instead uses that exact exclusive replay cursor. A lost

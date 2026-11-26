@@ -2845,7 +2845,7 @@ impl DesktopApp {
                     tokens::spacing::ROW_GAP,
                     0.0,
                 ))
-                .content(controls::status_mark(tone, tokens::layout::DOT))
+                .maybe_content(controls::status_mark(tone, tokens::layout::DOT))
                 .into()
         });
         let button = |glyph: &str, name: String, message: Message| {

@@ -680,13 +680,27 @@ fn head_row(narrow: bool) -> View {
                 .keyed_children(crate::views::slots([
                     None,
                     Some(
+                        // Inset as a row's content is inside its stock button
+                        // (border 1 + padding 11), so each name stands over
+                        // its column.
                         Grid::new()
                             .grid_column(1)
-                            .margin(Thickness::xy(tokens::spacing::ROW, 0.0))
+                            .margin(Thickness::xy(tokens::spacing::INSET, 0.0))
                             .columns(row_columns(narrow))
                             .column_spacing(tokens::spacing::SM)
                             .keyed_children(crate::views::slots([
-                                Some(label("Task", 0, false)),
+                                // Past the rows' mark slot, over their titles.
+                                Some(
+                                    crate::controls::text("Task".to_owned(), tokens::text::LABEL)
+                                        .margin(Thickness::new(
+                                            tokens::layout::MARK_SLOT + tokens::spacing::SM,
+                                            0.0,
+                                            0.0,
+                                            0.0,
+                                        ))
+                                        .vertical_alignment(VerticalAlignment::Center)
+                                        .into(),
+                                ),
                                 (!narrow).then(|| label("Model", 1, false)),
                                 Some(label("Activity", at, false)),
                                 Some(label("CPU", at + 1, true)),
@@ -705,9 +719,12 @@ fn head_row(narrow: bool) -> View {
 /// conversation, then Resume or Stop.
 fn fleet_row(entry: &RowEntry, input: &MonitorListInput) -> View {
     let row = &entry.row;
+    // Every row keeps the mark's slot, a stopped one too, so each title
+    // starts where the header's Task does.
     let mut task: Vec<KeyedView> = vec![KeyedView::new(
         "mark",
         Border::new()
+            .width(tokens::layout::MARK_SLOT)
             .vertical_alignment(VerticalAlignment::Center)
             .maybe_content(crate::ui::page_ui::agent_mark(
                 row.state,
@@ -722,8 +739,8 @@ fn fleet_row(entry: &RowEntry, input: &MonitorListInput) -> View {
         crate::controls::text(entry.title.clone(), tokens::page::HEADING)
             .text_trimming(TextTrimming::CharacterEllipsis),
     )];
-    // The project and the model in one line ("repo · Claude Code ·
-    // claude-haiku-5-5"): a narrow row, which has no Model column, shows it
+    // The project and the model in one line ("repo · Claude Code · haiku
+    // 5.5"): a narrow row, which has no Model column, shows it
     // under the title (trimmed at its end); the row's name and tooltip always
     // carry it whole.
     let project = (!entry.observed && !entry.project.is_empty()).then_some(entry.project.as_str());
