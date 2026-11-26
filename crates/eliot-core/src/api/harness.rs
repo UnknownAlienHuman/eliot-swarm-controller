@@ -765,13 +765,6 @@ impl HarnessCapabilities {
             .any(|(_, caps)| caps.native_child_families.contains(&family))
     }
 
-    /// Whether the name would collide with a built-in provider on an adopted route.
-    pub fn is_reserved_proxy_provider(name: &str) -> bool {
-        Self::registered()
-            .iter()
-            .any(|(_, caps)| caps.native_route.reserves_proxy_provider(name))
-    }
-
     /// Exact registered provider label for a reserved route name.
     pub fn reserved_proxy_provider(name: &str) -> Option<&'static str> {
         Self::registered().iter().find_map(|(harness, caps)| {

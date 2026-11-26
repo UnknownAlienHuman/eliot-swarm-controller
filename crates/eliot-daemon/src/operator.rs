@@ -829,15 +829,6 @@ if (!$process.CloseMainWindow() -or !$process.WaitForExit(5000)) { exit 1 }
     Ok(())
 }
 
-/// Start the release companion after the daemon is ready.
-#[cfg(windows)]
-pub fn start_desktop(path: &Path, executable: &Path, sha256: String) -> Result<u32> {
-    let directory = executable
-        .parent()
-        .ok_or_else(|| Error::new("invalid", "desktop release must have a parent directory"))?;
-    start_desktop_in_directory(path, executable, directory, sha256)
-}
-
 #[cfg(windows)]
 pub fn start_desktop_in_directory(
     path: &Path,
@@ -886,21 +877,6 @@ fn write_desktop_record(path: &Path, record: &DesktopRecord) -> Result<()> {
         )
     })?;
     crate::platform::data_dir::replace_file_atomically(path, DESKTOP_RECORD, &bytes, true)
-}
-
-/// Start outside the caller's Windows Job through local WMI. Send argv and
-/// environment over stdin, keeping their values out of the helper command line.
-#[cfg(windows)]
-pub fn start_detached(
-    executable: &Path,
-    args: &[&std::ffi::OsStr],
-    hidden: bool,
-    home: Option<&Path>,
-) -> Result<u32> {
-    let directory = executable
-        .parent()
-        .ok_or_else(|| Error::new("invalid", "release binary must have a parent directory"))?;
-    start_detached_in_directory(executable, directory, args, hidden, home)
 }
 
 #[cfg(windows)]
