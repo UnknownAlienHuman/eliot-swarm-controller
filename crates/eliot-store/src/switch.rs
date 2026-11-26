@@ -2765,7 +2765,9 @@ impl Store {
         result
     }
 
-    /// Latest exact provider switch fact for this attempt, including queueing.
+    /// Latest exact provider switch fact for this attempt, including
+    /// queueing. The literals ride the partial index so an absent switch
+    /// proves nothing over the Agent's wider journal.
     pub fn provider_switch_event(
         &self,
         agent: &str,
@@ -2777,16 +2779,12 @@ impl Store {
             .connection
             .query_row(
                 "SELECT seq, ts, kind, agent, generation, source, native_id, data, subject, cause
-             FROM events WHERE agent=?1 AND generation=?2 AND kind IN (?3,?4)
-             AND (?5 IS NULL OR json_extract(data,'$.task_command')=?5)
+             FROM events INDEXED BY events_diagnose_failover
+             WHERE agent=?1 AND generation=?2
+               AND kind IN ('provider.failover_queued', 'provider.failover_settled')
+               AND (?3 IS NULL OR json_extract(data,'$.task_command')=?3)
              ORDER BY seq DESC LIMIT 1",
-                params![
-                    parse_agent_id(agent)?,
-                    generation,
-                    PROVIDER_SWITCH_QUEUED,
-                    PROVIDER_SWITCH_SETTLED,
-                    task
-                ],
+                params![parse_agent_id(agent)?, generation, task],
                 event_record_from_row,
             )
             .optional()
