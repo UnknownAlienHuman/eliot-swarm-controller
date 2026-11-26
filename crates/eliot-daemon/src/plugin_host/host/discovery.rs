@@ -748,6 +748,7 @@ impl PluginHost {
             // server's directory context. Codex pins its store through the
             // frozen binding inside the profile.
             let request = NativeArchiveParams {
+                target_environment: (!workspace_bound).then(|| history_environment(&profile)),
                 profile,
                 native_ref,
                 agent_id: workspace_bound.then(|| agent.id.clone()),

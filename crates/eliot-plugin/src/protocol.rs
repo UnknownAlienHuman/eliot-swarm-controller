@@ -236,6 +236,9 @@ pub struct ProfileStoreParams {
 pub struct NativeArchiveParams {
     pub profile: Value,
     pub native_ref: String,
+    /// Retained store selectors for a store-bound metadata reader.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_environment: Option<Value>,
     /// The Agent whose frozen store the reader must prove it serves before
     /// the delete. Required by harnesses whose sessions live in a per-Agent
     /// store (OpenCode); Codex pins its store through the frozen binding.
