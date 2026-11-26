@@ -2679,6 +2679,7 @@ pub struct DiagnoseStep {
 
 /// The same most-informative reason for every diagnosis presentation. Failure
 /// origin, terminal turn and process evidence take precedence over fallbacks.
+/// A blocked goal outranks the generic command and turn fallbacks.
 pub fn diagnosis_reason(steps: &[DiagnoseStep]) -> Option<&DiagnoseStep> {
     steps
         .iter()
@@ -2697,13 +2698,13 @@ pub fn diagnosis_reason(steps: &[DiagnoseStep]) -> Option<&DiagnoseStep> {
             })
         })
         .or_else(|| steps.iter().find(|step| step.exit_code.is_some()))
-        .or_else(|| steps.iter().find(|step| step.kind == "command"))
-        .or_else(|| steps.iter().find(|step| step.kind == "turn"))
         .or_else(|| {
             steps
                 .iter()
                 .find(|step| step.kind == "goal" && step.code.as_deref() == Some("blocked"))
         })
+        .or_else(|| steps.iter().find(|step| step.kind == "command"))
+        .or_else(|| steps.iter().find(|step| step.kind == "turn"))
         .or(steps.first())
 }
 

@@ -2079,7 +2079,13 @@ NTSTATUS and the redacted stderr tail (a loss to a daemon restart is `swarm` at
 `agent.lost.stderr_tail` keeps the bounded, redacted capture verbatim, including
 any raw panic marker lines. The process step can carry the startup panic marker
 summary in `origin_evidence`. Diagnosis also includes the previous-run crash
-marker when the terminal failure is unclassified.
+marker when the terminal failure is unclassified. For an Agent, the chain also
+carries the current provider hold as a `provider_hold` step (origin `provider`)
+when the Store marks it as the wait reason for the active turn, and any
+automatic-restart fence as a `restart` step (origin `swarm`) with the exact
+`swarm resume` retry; neither step shadows a classified command, turn or loss
+origin. A blocked goal outranks the generic command and turn fallbacks as the
+reason.
 For a queued SEND, `swarm why COMMAND_ID` reports the retained command or turn
 that closes its send gate, including an unknown compaction's command ID and
 verb. The corresponding Owner inbox item identifies the queued inputs waiting
@@ -2106,8 +2112,11 @@ When a failure exists, the one-line `summary` starts with its origin
 waiting or stopped Agent with no failure in the bounded recent generation read
 says that nothing has failed in that recent history; it carries no unrelated
 previous-crash marker. Unknown origin remains for unexplained failures or
-unknown outcomes. A terminal's typed `native_error.code` (for example
-`quota_exhausted`) and native quota reset hint are included in its turn step.
+unknown outcomes. A stored command or turn outcome with a native adapter code
+(`native_*`) but no recorded origin reports the harness origin instead, per the
+core rule that unmapped native errors stay harness. A terminal's typed
+`native_error.code` (for example `quota_exhausted`) and native quota reset hint
+are included in its turn step.
 For an Agent in any lifecycle state, diagnosis also lists retained unknown commands
 and turns from any generation, appending `; retained ...` to the usual summary
 within its length bound. The summary keeps its origin-first explanation. The
