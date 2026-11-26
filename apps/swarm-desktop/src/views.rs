@@ -340,8 +340,8 @@ fn render_part(part: &Part, docs: &HashMap<u64, Doc>) -> RenderedPart {
 }
 
 /// The running turn's live message (`turn.preview.watch`), drawn at the end
-/// of its turn as the progress message it becomes once committed, so the
-/// committed one takes its place without a jump. It is never one of the
+/// of its turn as the answer it becomes when the turn ends with it, so the
+/// answer takes its place without a jump. It is never one of the
 /// transcript's items.
 #[derive(Clone, PartialEq)]
 pub struct Draft {
@@ -1812,7 +1812,6 @@ fn turn_views(input: &TranscriptInput, skip: usize) -> Vec<KeyedView> {
                     views.push(KeyedView::new(
                         "draft-truncated",
                         label("The full message appears when the turn ends.")
-                            .margin(Thickness::xy(tokens::spacing::ROW, 0.0))
                             .text_wrapping(TextWrapping::Wrap),
                     ));
                 }

@@ -947,14 +947,14 @@ impl Part {
         }
     }
 
-    /// The running turn's live message (`turn.preview.watch`) as the
-    /// progress message it becomes once committed. It is drawn after its
-    /// turn's parts and is never one of them.
+    /// The running turn's live message (`turn.preview.watch`), shaped as
+    /// the answer it becomes when it is the turn's last message. It is
+    /// drawn after its turn's parts and is never one of them.
     pub fn draft(message_id: &str, text: String) -> Self {
         Self::new(
             format!("draft:{message_id}"),
-            PartKind::Progress,
-            "Assistant · progress".to_owned(),
+            PartKind::Final,
+            "Assistant · working".to_owned(),
             text,
             Vec::new(),
         )
