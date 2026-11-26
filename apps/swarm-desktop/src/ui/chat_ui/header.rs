@@ -134,9 +134,11 @@ impl DesktopApp {
 
     /// The header's "…" entries: the task menu of the open Agent
     /// ([`DesktopApp::task_entries`], brand book §7.4), bound to the
-    /// generation the header shows. Without a sidebar row only what the
-    /// readback proves is offered: no placement, tags, archive or delete.
-    fn header_menu(&self, agent: &str, detail: &UiDetail) -> Vec<MenuItem> {
+    /// generation the header shows, without Goal… (the header's own Goal
+    /// button), and whether that menu offers Goal. Without a sidebar row
+    /// only what the readback proves is offered: no placement, tags,
+    /// archive or delete.
+    fn header_menu(&self, agent: &str, detail: &UiDetail) -> (Vec<MenuItem>, bool) {
         let binding = MenuBinding {
             agent: agent.to_owned(),
             generation: detail.generation,
@@ -170,7 +172,20 @@ impl DesktopApp {
                 })
                 .unwrap_or_default(),
         };
-        menu_ui::menu_items(&entries)
+        let goal = menu_ui::offers(&entries, Action::Goal);
+        let entries: Vec<menu_ui::Entry> = entries
+            .into_iter()
+            .filter(|entry| {
+                !matches!(
+                    entry,
+                    menu_ui::Entry::Item {
+                        action: Action::Goal,
+                        ..
+                    }
+                )
+            })
+            .collect();
+        (menu_ui::menu_items(&entries), goal)
     }
 
     /// The conversation's header ([`Header`]): the window reads what it
@@ -247,7 +262,10 @@ impl DesktopApp {
             .iter()
             .filter(|kid| kid.parent.as_deref() == Some(agent) && !kid.archived)
             .count();
-        let menu = detail.map(|detail| self.header_menu(agent, detail));
+        let (menu, goal_offered) = match detail.map(|detail| self.header_menu(agent, detail)) {
+            Some((menu, offered)) => (Some(menu), offered),
+            None => (None, false),
+        };
         let running = detail
             .is_some_and(|detail| detail.active_turn.is_some() && !detail.observe_only)
             || (detail.is_none() && state == eliot_core::AgentState::Busy);
@@ -256,6 +274,7 @@ impl DesktopApp {
             subtitle,
             state: shown,
             goal,
+            goal_offered,
             changes,
             workers,
             open: if self.panel_shown() {
@@ -341,8 +360,8 @@ impl DesktopApp {
     }
 }
 
-/// The goal mark's words ("Goal · round 2 of 3", "Goal blocked"); none for
-/// a cleared goal.
+/// The Goal button's words for a set goal ("Goal · round 2 of 3", "Goal
+/// blocked"); none for a cleared goal (the button then says "Goal").
 fn goal_words(goal: &eliot_core::api::GoalView) -> Option<String> {
     use eliot_core::api::GoalStatus;
     let rounds = goal.counters.rounds;
@@ -407,6 +426,9 @@ pub(super) struct HeaderInput {
     state: State,
     /// The goal's words, when the Agent has a goal.
     goal: Option<String>,
+    /// The task menu offers Goal: the Goal button shows (it also shows
+    /// while a goal exists).
+    goal_offered: bool,
     /// The worktree's `+N −M`, when read.
     changes: Option<(u64, u64)>,
     /// The task's workers.
@@ -425,21 +447,26 @@ pub(super) struct HeaderInput {
 
 /// The header (`ConversationHeader`, §9.1), as its own component. Left, in
 /// the star cell: the title (trimmed with "…") over one line of project ·
-/// branch, the state and the goal. Right: Changes, Agents, Details and
-/// More, stock buttons of one height (the pane commands are toggle buttons,
-/// checked while their tab is open); when the main area is at its
-/// narrowest, Agents and Details are More's first entries unless their tab
-/// is open, and Terminal is in More unless its tab is open. Under it the
+/// branch and the state (in a narrow main area the title spans the header
+/// and the commands sit beside that line). Right: Goal, Changes, Agents,
+/// Details and More,
+/// stock buttons of one height. Goal opens the Goal dialog and says the
+/// goal's state when there is one ("Goal · round 1 of 4", "Goal met"). The
+/// pane commands are toggle buttons, pressed while their panel is open
+/// (pressing the pressed one closes it); when the main area is at its
+/// narrowest, Agents and Details are More's first entries unless their
+/// panel is open, and Terminal is in More unless its panel is open. Each
+/// command's tooltip says what it does, with its shortcut. Under it the
 /// progress bar while a turn runs: the header's one activity indicator.
 pub(super) struct Header {
     send: Callback<Message>,
 }
 
-/// More's entries that open a pane tab not in the bar, before the task's
-/// own actions.
-const OPEN_AGENTS: &str = "Agents";
-const OPEN_DETAILS: &str = "Details";
-const OPEN_TERMINAL: &str = "Terminal (Ctrl+J)";
+/// More's entries that open a panel not in the bar, before the task's own
+/// actions.
+const OPEN_AGENTS: &str = "pane:agents";
+const OPEN_DETAILS: &str = "pane:details";
+const OPEN_TERMINAL: &str = "pane:terminal";
 
 impl Component for Header {
     type Input = HeaderInput;
@@ -460,8 +487,8 @@ impl Component for Header {
     }
 
     fn view(&self, input: &HeaderInput, context: &mut ViewContext<Self>) -> View {
-        // A pane command: checked while its tab is open; unchecking it
-        // closes the pane, checking it opens that tab.
+        // A pane command: pressed while its panel is open; unpressing it
+        // closes the pane, pressing it opens that panel.
         let toggle = |panel: Panel, words: String, context: &mut ViewContext<Self>| -> View {
             let checked = input.open == panel;
             controls::bar_toggle(checked)
@@ -480,8 +507,26 @@ impl Component for Header {
                     },
                 )))
                 .content(controls::label(&words))
-                .into()
+                .tooltip(panel.tooltip(checked))
         };
+        // Goal: always where the owner looks first; its words are the
+        // goal's state once one is set.
+        let goal: Option<View> = (input.goal_offered || input.goal.is_some()).then(|| {
+            let words = input.goal.clone().unwrap_or_else(|| "Goal".to_owned());
+            controls::bar_button(false)
+                .automation_name(words.clone())
+                .on_click(context.message(Message::Chat(ChatMsg::AgentMenu(Action::Goal))))
+                .content(controls::command_content(
+                    controls::glyph::GOAL,
+                    &words,
+                    false,
+                ))
+                .tooltip(if input.goal.is_some() {
+                    "Edit, pause or clear this task's goal"
+                } else {
+                    "Set a goal this task keeps working toward"
+                })
+        });
         let changes = toggle(
             Panel::Changes,
             match input.changes {
@@ -495,21 +540,30 @@ impl Component for Header {
         } else {
             "Agents".to_owned()
         };
-        // A secondary pane command sits in the bar while its tab is open
-        // (checked, so unchecking it closes the pane) and in More otherwise:
+        // A secondary pane command sits in the bar while its panel is open
+        // (pressed, so unpressing it closes the pane) and in More otherwise:
         // Agents and Details when the bar is compact, Terminal always.
         let in_bar = |panel: Panel| -> bool {
             input.open == panel || (!input.compact && panel != Panel::Terminal)
         };
         let mut items: Vec<MenuItem> = Vec::new();
         if !in_bar(Panel::Agents) {
-            items.push(MenuItem::item(OPEN_AGENTS, agents_words.clone()));
+            items.push(MenuItem::item(
+                OPEN_AGENTS,
+                Panel::Agents.with_shortcut(&agents_words),
+            ));
         }
         if !in_bar(Panel::Details) {
-            items.push(MenuItem::item(OPEN_DETAILS, OPEN_DETAILS));
+            items.push(MenuItem::item(
+                OPEN_DETAILS,
+                Panel::Details.with_shortcut(Panel::Details.label()),
+            ));
         }
         if !in_bar(Panel::Terminal) {
-            items.push(MenuItem::item(OPEN_TERMINAL, OPEN_TERMINAL));
+            items.push(MenuItem::item(
+                OPEN_TERMINAL,
+                Panel::Terminal.with_shortcut(Panel::Terminal.label()),
+            ));
         }
         if let Some(menu) = &input.menu {
             items.push(MenuItem::separator("actions"));
@@ -535,8 +589,13 @@ impl Component for Header {
                             }),
                     }
                 })),
-            ));
-        let mut commands = vec![KeyedView::new("changes", changes)];
+            ))
+            .tooltip("More task actions");
+        let mut commands: Vec<KeyedView> = goal
+            .map(|goal| KeyedView::new("goal", goal))
+            .into_iter()
+            .collect();
+        commands.push(KeyedView::new("changes", changes));
         if in_bar(Panel::Agents) {
             commands.push(KeyedView::new(
                 "agents",
@@ -546,18 +605,18 @@ impl Component for Header {
         if in_bar(Panel::Details) {
             commands.push(KeyedView::new(
                 "details",
-                toggle(Panel::Details, OPEN_DETAILS.to_owned(), context),
+                toggle(Panel::Details, Panel::Details.label().to_owned(), context),
             ));
         }
         if in_bar(Panel::Terminal) {
             commands.push(KeyedView::new(
                 "terminal",
-                toggle(Panel::Terminal, "Terminal".to_owned(), context),
+                toggle(Panel::Terminal, Panel::Terminal.label().to_owned(), context),
             ));
         }
         commands.push(KeyedView::new("more", more));
-        // The line under the title: project · branch (it trims first), the
-        // state and the goal, in one type size on one baseline.
+        // The line under the title: project · branch (it trims first) and
+        // the state, in one type size on one baseline.
         let state: View = StackPanel::new()
             .orientation(Orientation::Horizontal)
             .spacing(tokens::spacing::XS)
@@ -572,62 +631,48 @@ impl Component for Header {
                 ),
             ]))
             .into();
-        let goal: Option<View> = input.goal.as_ref().map(|words| {
-            StackPanel::new()
-                .orientation(Orientation::Horizontal)
-                .spacing(tokens::spacing::XS)
-                .vertical_alignment(VerticalAlignment::Center)
-                .automation_name(words.clone())
-                .children((
-                    controls::xs_icon(controls::glyph::GOAL),
-                    controls::secondary(words.clone())
-                        .vertical_alignment(VerticalAlignment::Center),
-                ))
-                .into()
-        });
-        let mut columns = vec![GridLength::STAR, GridLength::Auto];
-        let mut cells = vec![
-            KeyedView::new(
-                "place",
+        let line = Grid::new()
+            .columns([GridLength::STAR, GridLength::Auto])
+            .column_spacing(tokens::spacing::MD)
+            .horizontal_alignment(HorizontalAlignment::Left)
+            .children((
                 controls::secondary(input.subtitle.clone())
                     .vertical_alignment(VerticalAlignment::Center)
                     .text_trimming(TextTrimming::CharacterEllipsis),
-            ),
-            KeyedView::new("state", Border::new().grid_column(1).content(state)),
-        ];
-        if let Some(goal) = goal {
-            columns.push(GridLength::Auto);
-            cells.push(KeyedView::new(
-                "goal",
-                Border::new().grid_column(2).content(goal),
+                Border::new().grid_column(1).content(state),
             ));
-        }
-        let line = Grid::new()
-            .columns(columns)
-            .column_spacing(tokens::spacing::MD)
-            .horizontal_alignment(HorizontalAlignment::Left)
-            .keyed_children(cells);
         let bar = Border::new()
             .min_height(tokens::height::HEADER)
             .border_brush(ThemeBrush::CardStroke)
             .border_thickness(Thickness::new(0.0, 0.0, 0.0, tokens::layout::HAIRLINE))
             .padding(Thickness::xy(tokens::spacing::MD, tokens::spacing::XS))
             .content(
+                // The title over its line, the commands beside both; in a
+                // narrow main area the title takes the whole width and the
+                // commands sit beside the line, so the title is not cut to
+                // a word.
                 Grid::new()
+                    .rows([GridLength::Auto, GridLength::Auto])
                     .columns([GridLength::STAR, GridLength::Auto])
                     .column_spacing(tokens::spacing::MD)
+                    .row_spacing(if input.compact {
+                        tokens::spacing::XS
+                    } else {
+                        0.0
+                    })
+                    .vertical_alignment(VerticalAlignment::Center)
                     .children((
-                        StackPanel::new()
-                            .vertical_alignment(VerticalAlignment::Center)
-                            .children((
-                                controls::text(input.title.clone(), tokens::text::HEADER)
-                                    .automation_heading_level(AutomationHeadingLevel::Level2)
-                                    .text_trimming(TextTrimming::CharacterEllipsis)
-                                    .is_text_selection_enabled(true),
-                                line,
-                            )),
+                        controls::text(input.title.clone(), tokens::text::HEADER)
+                            .grid_column_span(if input.compact { 2 } else { 1 })
+                            .automation_heading_level(AutomationHeadingLevel::Level2)
+                            .text_trimming(TextTrimming::CharacterEllipsis)
+                            .is_text_selection_enabled(true),
+                        line.grid_row(1)
+                            .vertical_alignment(VerticalAlignment::Center),
                         StackPanel::new()
                             .grid_column(1)
+                            .grid_row(if input.compact { 1 } else { 0 })
+                            .grid_row_span(if input.compact { 1 } else { 2 })
                             .orientation(Orientation::Horizontal)
                             .spacing(tokens::spacing::XS)
                             .vertical_alignment(VerticalAlignment::Center)

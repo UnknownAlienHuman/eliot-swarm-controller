@@ -77,7 +77,10 @@ pub struct Closed {
 
 /// The frame styles of WinUI's desktop window (`WS_OVERLAPPEDWINDOW` with
 /// `WS_EX_WINDOWEDGE`, read from the live window), for its outer size
-/// before it exists.
+/// before it exists. Reactor neither sets nor exposes them: it creates the
+/// stock `Microsoft.UI.Xaml.Window` (windows-rs 5a875c0,
+/// `crates/libs/reactor/src/native/winui/window/mod.rs:521`), which owns
+/// its HWND's styles.
 const WINUI_FRAME: (u32, u32) = (WS_OVERLAPPEDWINDOW, WS_EX_WINDOWEDGE);
 
 /// The outer bounds the window opens at: the saved top-left and client size
