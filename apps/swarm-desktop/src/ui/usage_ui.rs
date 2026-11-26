@@ -203,8 +203,6 @@ impl DesktopApp {
             Some(_) => "Usage".to_owned(),
         };
         let row = controls::row(open)
-            .height(tokens::height::CONTROL)
-            .min_height(tokens::height::CONTROL)
             .horizontal_alignment(HorizontalAlignment::Stretch)
             .horizontal_content_alignment(HorizontalAlignment::Stretch)
             .automation_name(format!(

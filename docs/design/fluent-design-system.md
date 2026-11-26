@@ -296,7 +296,7 @@
 
 ### 6.2. Правила адаптации — решение Swarm
 
-Расчёт выполняется по client width в DIP. Не использовать физическую ширину монитора.
+Расчёт выполняется по client width в DIP. Не использовать физическую ширину монитора. Ширину окна наблюдает один observer: он сообщает раскладку только при смене класса, результата docking или того, помещается ли колонка Home (§8.1) и колонка чтения (§9.4) во всю ширину. Ширины из окна не выводятся: колонки — Grid star/Auto, колонка чтения 720 центрируется своим MaxWidth.
 
 | Доступная ширина | Раскладка |
 |---|---|
@@ -978,6 +978,7 @@ Desktop использует upstream windows-rs через git source; `Cargo.l
 | Editable code font | В crates.io 0.100 отсутствовал | У `TextBox` builder по-прежнему нет этого свойства | Небольшие editable поля оставлять со штатным шрифтом; code preview/Open in editor — отдельная граница. |
 | Scroll metrics / programmatic scroll | В crates.io 0.100 отсутствовал | Используются `observe_view`, `ScrollViewMetrics`, `request_scroll_to` | Сохранять follow/jump и позицию чтения; проверить на Windows. |
 | Key/focus callbacks | Ограниченная поверхность | Hooks остаются для конкретных случаев | Проверять keyboard/IME/focus на Windows; наличие callback не доказывает все сценарии. |
+| Перекрытое содержимое вне focus/UIA | Отсутствовало | Reactor 0.101 (и upstream `056c965c02`) не даёт `UIElement.Visibility`, `AutomationProperties.AccessibilityView` и `UIElement.TabFocusNavigation`; `IsTabStop` есть только у `Border` и касается его самого, `IsHitTestVisible` — только указателя | Беседа под pane, лежащей поверх Main, остаётся в UIA и порядке Tab. Это API gap Reactor (§19.2): не удалять поддерево беседы ради него, иначе теряются scroll и selection. |
 | Native menu callbacks | Старая реализация сопоставляла labels | Текущий WinUI flyout bridge сохраняет item/action mapping | Не dispatch-ить по локализованному отображаемому тексту; проверить lifecycle/focus. |
 | Flyout imperative lifecycle | Не вся поверхность доступна через Reactor | Swarm сохраняет необходимый WinUI bridge | Это native interop, не повод заменять меню самодельными controls. |
 | Theme brush inventory | Небольшой enum | По-прежнему ограниченный набор | Использовать native control states; не вводить palette engine. |

@@ -527,6 +527,13 @@ pub fn sub_row(selected: bool) -> Button {
     row(selected)
 }
 
+/// A two-line row (a title over its note): a [`row`] whose minimum is the
+/// two-line height (§4.5); like every row it grows with the text scale,
+/// never clipped to a fixed height.
+pub fn two_line_row(selected: bool) -> Button {
+    row(selected).min_height(height::TWO_LINE_ROW)
+}
+
 /// A row's content: an optional icon, the title (trimmed), an optional
 /// caption note and a trailing mark. Absent parts take no column, so no
 /// gap shifts the title.

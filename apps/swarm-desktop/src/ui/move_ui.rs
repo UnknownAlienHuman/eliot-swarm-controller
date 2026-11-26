@@ -270,9 +270,7 @@ impl DesktopApp {
                 }
                 KeyedView::new(
                     format!("{}:{selected}", agent.id),
-                    controls::row(selected)
-                        .height(tokens::height::TWO_LINE_ROW)
-                        .min_height(tokens::height::TWO_LINE_ROW)
+                    controls::two_line_row(selected)
                         .automation_name(format!("{label}, {note}"))
                         .on_click(context.message(Message::Move(MoveMsg::Picked(agent.id.clone()))))
                         .content(

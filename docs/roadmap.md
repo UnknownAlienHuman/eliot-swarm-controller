@@ -727,8 +727,8 @@ templates and compatibility layers are outside current work.
       palettes read as Light or Dark, and Reactor theme brushes for the few
       accent or critical marks. The shell layout is M1b.
     - [ ] **M1b Window layout.** The §6.2 size classes and docking formula
-      from one window-size observer that posts only on a class or docking
-      change; no widths derived from the window (Grid star/Auto columns,
+      from one window-size observer that posts only on a class, docking or
+      full-column change; no widths derived from the window (Grid star/Auto columns,
       the 720 reading column centred by MaxWidth); resizable sidebar and
       context pane (pointer, arrow keys, persisted in `[desktop] panels`,
       Reset panel widths in Settings); the compact sidebar in the native

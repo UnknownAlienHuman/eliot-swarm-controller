@@ -571,8 +571,7 @@ impl DesktopApp {
             ])
             .column_spacing(tokens::spacing::SM)
             .children((
-                controls::row(false)
-                    .height(tokens::height::CONTROL + tokens::spacing::LG)
+                controls::two_line_row(false)
                     .automation_name(format!("Edit {}: {line}", card.title))
                     .on_click(context.message(Message::Automation(AutomationMsg::Rule(
                         RuleMsg::Opened(card.key.clone()),
