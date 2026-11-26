@@ -82,7 +82,7 @@ impl WorkspaceInvalidation {
             }
             scope.linked = Some((admin, common));
         }
-        Self::watch_paths(paths, None, move |path| {
+        Self::watch_paths(paths, None, move |path, _kind| {
             (scope.includes(path), scope.binding_changed(path))
         })
     }
@@ -93,7 +93,7 @@ impl WorkspaceInvalidation {
     pub(crate) fn watch_paths(
         paths: Vec<(PathBuf, RecursiveMode)>,
         wake: Option<Arc<tokio::sync::Notify>>,
-        classify: impl Fn(&Path) -> (bool, bool) + Send + 'static,
+        classify: impl Fn(&Path, &EventKind) -> (bool, bool) + Send + 'static,
     ) -> core::Result<Self> {
         use crate::git_monitor::reject_links;
         let dirty = Arc::new(AtomicBool::new(true));
@@ -110,7 +110,7 @@ impl WorkspaceInvalidation {
                         event.paths.iter().fold(
                             (event.paths.is_empty(), false),
                             |(changed, binding), path| {
-                                let (relevant, rebound) = classify(path);
+                                let (relevant, rebound) = classify(path, &event.kind);
                                 (changed || relevant, binding || rebound)
                             },
                         )
