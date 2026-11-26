@@ -418,7 +418,7 @@ pub(crate) async fn list_models(
     let probe_result: Result<Vec<NativeModelEntry>> = async {
         let client = probe.client();
         route
-            .verify_effective_config(&client, &cwd, metadata_secrets, None, deadline)
+            .verify_effective_config(&client, &cwd, metadata_secrets, None, false, deadline)
             .await?;
         let (entries, _) = collect_model_pages(
             &client,

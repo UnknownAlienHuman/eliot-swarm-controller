@@ -14,9 +14,9 @@ use crate::{
             NativeInitializeResponse, NativeModelEntry, NativeSandboxMode, NativeTextUserInput,
             NativeThreadCompactStartParams, NativeThreadCompactStartResponse,
             NativeThreadConfigOverrides, NativeThreadResumeParams, NativeThreadStartParams,
-            NativeTurnInterruptParams, NativeTurnStartParams, NativeTurnStartResponse,
-            NativeTurnSteerParams, NativeTurnSteerResponse, NativeUserInput, ThreadReadback,
-            ThreadStartReadback,
+            NativeThreadUnarchiveParams, NativeTurnInterruptParams, NativeTurnStartParams,
+            NativeTurnStartResponse, NativeTurnSteerParams, NativeTurnSteerResponse,
+            NativeUserInput, ThreadReadback, ThreadStartReadback,
         },
     },
     observe::{self, ObserverSession},
@@ -166,6 +166,7 @@ struct NativeStartContext<'a> {
     store: &'a NativeStoreBinding,
     catalogue_digest: Option<&'a str>,
     metadata_secrets: &'a [String],
+    resuming: bool,
 }
 
 /// Validated Codex start plan: every frozen-profile, workspace and launch
@@ -1279,6 +1280,7 @@ impl CodexPlugin {
                 store: &plan.frozen_store,
                 catalogue_digest: plan.catalogue_digest.as_deref(),
                 metadata_secrets: &plan.metadata_secrets,
+                resuming: plan.resume_subject.is_some(),
             },
         )
         .await
@@ -1410,10 +1412,15 @@ impl CodexPlugin {
                 })?,
             )
         };
-        let response_value = match session
-            .native_client
-            .call(thread_method, params_value, Instant::now() + RPC_TIMEOUT)
-            .await
+        let response_value = match open_thread(
+            &session.native_client,
+            thread_method,
+            params_value,
+            plan.resume_subject
+                .as_ref()
+                .map(|subject| subject.native_ref.as_str()),
+        )
+        .await
         {
             Ok(value) => value,
             Err(error) if error.code == "native_rejected" => {
@@ -1859,13 +1866,14 @@ impl CodexPlugin {
             }
         }
 
-        context
+        let catalogue_changed = context
             .route
             .verify_effective_config(
                 client,
                 workspace,
                 context.metadata_secrets,
                 context.catalogue_digest,
+                context.resuming,
                 Instant::now() + RPC_TIMEOUT,
             )
             .await?;
@@ -1884,11 +1892,15 @@ impl CodexPlugin {
                     "Codex Responses route requires an explicit model id",
                 )
             })?;
+            let catalogue_omits_model = catalogue_changed
+                && discover_models(client)
+                    .await
+                    .is_ok_and(|entries| entries.iter().all(|entry| entry.id != requested));
             return Ok((
                 SelectedModel {
                     id: requested.to_owned(),
                     effort: context.route.optional_effort(requested_effort)?,
-                    catalogue_omits_model: false,
+                    catalogue_omits_model,
                 },
                 native_scope,
             ));
@@ -1896,6 +1908,12 @@ impl CodexPlugin {
 
         let entries = discover_models(client).await?;
         let frozen = daemon_model.filter(|id| !id.trim().is_empty());
+        if catalogue_changed && requested_model.or(frozen).is_none() {
+            return Err(Error::new(
+                "resume_model_unbound",
+                "Codex catalogue changed and the retained Agent has no exact model selector. Switch the Agent to an explicit model to continue from its worktree.",
+            ));
+        }
         let selection = if let Some(id) = requested_model.or(frozen) {
             ModelSelection::new(
                 id,
@@ -3120,6 +3138,62 @@ async fn deliver_swarm_skill(native_client: &NativeClient, data_dir: &Path) -> R
 async fn discard_failed_start(session: &mut AgentSession, error: Error) -> Error {
     discard_unstarted(session).await;
     session.native_client.diagnostic_error(error)
+}
+
+async fn open_thread(
+    client: &NativeClient,
+    method: &str,
+    params: Value,
+    resume_thread: Option<&str>,
+) -> Result<Value> {
+    let Some(thread_id) = resume_thread else {
+        return client
+            .call(method, params, Instant::now() + RPC_TIMEOUT)
+            .await;
+    };
+    match client
+        .call(method, params.clone(), Instant::now() + RPC_TIMEOUT)
+        .await
+    {
+        Err(error)
+            if error.code == "native_rejected"
+                && error.failure_where.as_deref() == Some("plugin.codex.native.response")
+                && error.message.as_str()
+                    == format!(
+                        "session {thread_id} is archived. Run `codex unarchive {thread_id}` to unarchive it first."
+                    ) => {}
+        result => return result,
+    }
+    let unarchive =
+        serde_json::to_value(NativeThreadUnarchiveParams { thread_id }).map_err(|_| {
+            Error::new(
+                "native_not_dispatched",
+                "Codex unarchive params could not be encoded",
+            )
+        })?;
+    let reply = client.call("thread/unarchive", unarchive, Instant::now() + RPC_TIMEOUT).await
+        .map_err(|error| {
+            if error.failure_where.as_deref() == Some("plugin.codex.native.response.method_not_found")
+                || native_no_write(&error.code)
+            {
+                error.with_code("native_rejected").with_message(format!(
+                    "Codex could not unarchive session {thread_id}. Run `codex unarchive {thread_id}` in the retained Codex store, exit Codex, then retry Resume."
+                ))
+            } else {
+                Error::new("unknown", "Codex thread/unarchive may have changed native state; Resume was not repeated")
+                    .with_where("plugin.codex.thread.unarchive")
+            }
+        })?;
+    if reply.pointer("/thread/id").and_then(Value::as_str) != Some(thread_id) {
+        return Err(Error::new(
+            "unknown",
+            "Codex thread/unarchive did not acknowledge the exact thread; Resume was not repeated",
+        )
+        .with_where("plugin.codex.thread.unarchive"));
+    }
+    client
+        .call(method, params, Instant::now() + RPC_TIMEOUT)
+        .await
 }
 
 /// Bounded launch catalogue: per-page `RPC_TIMEOUT` capped by an overall

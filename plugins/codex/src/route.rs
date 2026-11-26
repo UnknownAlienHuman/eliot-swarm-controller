@@ -295,8 +295,9 @@ impl CodexRoute {
         cwd: &Path,
         metadata_secrets: &[String],
         expected_catalogue: Option<&str>,
+        resuming: bool,
         deadline: Instant,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let response = client
             .call(
                 "config/read",
@@ -316,16 +317,19 @@ impl CodexRoute {
         if let Some(old) = expected_catalogue {
             let new = model_catalogue_digest(config, deadline).await?;
             if old != new {
+                if resuming {
+                    return Ok(true);
+                }
                 return Err(Error::new(
                     "model_catalogue_changed",
                     format!(
-                        "Codex model catalogue digest changed (old {old}, new {new}). Restore the previous catalogue bytes to resume this Agent, or start a new Agent to adopt the new catalogue."
+                        "Codex model catalogue digest changed during launch (old {old}, new {new}). Submit a new launch against the current catalogue."
                     ),
                 )
                 .with_where("plugin.codex.route.model_catalog_json"));
             }
         }
-        Ok(())
+        Ok(false)
     }
 
     fn verify_config(&self, config: &Value, metadata_secrets: &[String]) -> Result<()> {

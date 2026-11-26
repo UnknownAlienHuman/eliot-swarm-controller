@@ -2348,12 +2348,7 @@ fn submit_tx_mode(
             Error::new("invalid", "restart Resume has no captured Agent generation")
         })?;
         let resume_text = request.args.get("text").and_then(Value::as_str);
-        if !capacity::restart_resume_candidate_tx(tx, target, generation, resume_text)? {
-            return Err(Error::new(
-                "bad_state",
-                "restart Resume eligibility changed before admission",
-            ));
-        }
+        capacity::require_restart_resume_candidate_tx(tx, target, generation, resume_text)?;
     }
     if request.selector.is_some() {
         return submit_selector_tx(

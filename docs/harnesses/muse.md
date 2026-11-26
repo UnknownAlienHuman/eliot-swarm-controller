@@ -304,6 +304,9 @@ values with redaction.
 A promptless resume can open another generation without creating a turn.
 Resume preflight compares the newest native turn with the newest retained
 turn on the same Agent, including earlier generations of that session.
+When the Store has no turn, the native readback must prove the session ran
+none. The Owner can inspect the refusal with `swarm why AGENT` and use
+`swarm switch AGENT --generation N` once any unknown work is settled.
 
 Profile, skill, catalogue, process-registration and resume-preflight refusals
 settle failed once the owned host is closed. The same applies when the stdio
