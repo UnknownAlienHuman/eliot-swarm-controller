@@ -882,7 +882,13 @@ pub fn status_pill(tone: StatusTone, label: &str) -> View {
         .vertical_alignment(VerticalAlignment::Center)
         .automation_name(label)
         .content(row_grid(
-            status_mark(tone, layout::BADGE_DOT),
+            // A pill is its own block: work starting there shows the
+            // native progress indicator beside its words (§4.2); rows keep
+            // the static marks, with no ring.
+            match tone {
+                StatusTone::Pending => Some(spinner()),
+                _ => status_mark(tone, layout::BADGE_DOT),
+            },
             trimmed(label, style::CAPTION).into(),
             None,
             spacing::CHIP_GAP,
