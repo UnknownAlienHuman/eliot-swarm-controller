@@ -689,6 +689,16 @@ as a competing writer. Rename and archive reuse their existing paths;
 presentation preferences stay in settings. The wire contract is
 [Chat organization](api.md#chat-organization).
 
+## Context notes
+
+A [Swarm context note](automation.md#inject-context-at-the-safe-point) for the
+next input is passive. The task card can wait while an Agent is idle and is
+claimed when real input dispatches. Pending notes do not count as work in the
+sidebar or Owner attention. Background fact-note admission skips archived Agents.
+[Archive and Delete](api.md#agent-and-daemon-read-views) withdraw undispatched
+Swarm notes atomically.
+After unarchive, Resume can queue a fresh task card for its new generation.
+
 ## Mailbox
 
 A stable Agent owns its mailbox. One row is one concrete recipient delivery:

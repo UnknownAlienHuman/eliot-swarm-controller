@@ -11,6 +11,13 @@ macro_rules! command_record_select {
     };
 }
 
+// A consumer claim commits the transition to dispatched before native I/O.
+macro_rules! undispatched_swarm_note_sql {
+    () => {
+        "(verb='inject' AND principal GLOB 'swarm_note:*' AND state IN ('accepted','queued'))"
+    };
+}
+
 mod assignment;
 mod attention_steps;
 mod autonomy;
@@ -137,11 +144,14 @@ const INITIAL_SOURCE: &str = "stream";
 const PROCESS_SOURCE: &str = "os";
 const WORKSPACE_PROCESS_SOURCE: &str = "workspace_process";
 const GIT_SOURCE: &str = "git";
-/// Rows that still block drain: neither settled nor pruned observer
-/// attach/detach noise. Shared by the bounded list and its total so the
+/// Rows that still block drain, excluding passive Swarm notes and pruned
+/// observer attach/detach noise. Shared by the bounded list and its total so the
 /// drain report can mark truncation honestly for any omission (the list
 /// bound or the page byte bound trimming full command rows).
-const UNSETTLED_COMMANDS_WHERE: &str = "state IN ('accepted', 'queued', 'dispatched', 'unknown')
+const UNSETTLED_COMMANDS_WHERE: &str = concat!(
+    "state IN ('accepted', 'queued', 'dispatched', 'unknown') AND NOT ",
+    undispatched_swarm_note_sql!(),
+    "
                   AND NOT (state = 'unknown' AND verb IN ('attach','detach')
                     AND EXISTS(SELECT 1 FROM agents a WHERE a.id = commands.target AND a.observe_only = 1)
                     AND NOT EXISTS(SELECT 1 FROM source_state s WHERE s.agent = commands.target
@@ -152,7 +162,8 @@ const UNSETTLED_COMMANDS_WHERE: &str = "state IN ('accepted', 'queued', 'dispatc
                         commands.generation = a.generation AND (
                           a.state IN ('stopped','failed','lost')
                           OR EXISTS(SELECT 1 FROM agent_successors h WHERE h.agent = a.id
-                              AND h.generation = commands.generation))))))";
+                              AND h.generation = commands.generation))))))"
+);
 // Deferred Swarm notes can wait for a post-restart safe point. A claimed
 // note is dispatched and remains subject to the ordinary settlement gate.
 // Older-generation queued rows cannot dispatch. Future-generation inputs
