@@ -76,6 +76,18 @@ pub(crate) struct EventStatus {
     pub batch_unknown: bool,
     pub source_unknown: bool,
     pub stopped: bool,
+    /// Latest natively evidenced compaction boundary: the exact committed
+    /// `session.context.compacted` identity. The compact verb waits on
+    /// this instead of inferring compaction.
+    pub last_compaction: Option<CompactionEvidence>,
+}
+
+/// Exact native identity of one committed compaction boundary: the native
+/// `compact_boundary` event id that keyed the fact. The committed fact
+/// itself carries the bound turn, if any.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct CompactionEvidence {
+    pub native_event_id: String,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -140,6 +152,23 @@ enum Control {
     },
     CancelTurn {
         command_id: String,
+        reply: oneshot::Sender<()>,
+    },
+    /// Track one compact-verb input identity. Its lifecycle echo and
+    /// terminal are matched in memory like Codex compaction progress:
+    /// they start no turn, so the committed boundary stays the only
+    /// compaction evidence. At most one compact runs at a time.
+    BeginCompact {
+        uuid: String,
+        reply: oneshot::Sender<Result<()>>,
+    },
+    /// Release the single-flight compact gate. The identity stays tracked
+    /// so a late echo or terminal still matches instead of gapping.
+    /// `dispatched` false withdraws a proven never-written input.
+    /// The reply fires after the gate clears, so a retry never races it.
+    EndCompact {
+        uuid: String,
+        dispatched: bool,
         reply: oneshot::Sender<()>,
     },
     CheckTurn {
@@ -415,6 +444,13 @@ struct EventProcessor {
     last_input: Option<String>,
     /// Exact turn carrying the native manual-compaction boundary.
     manual_compaction_turn: Option<String>,
+    /// Compact-verb input identities tracked in memory: their lifecycle
+    /// echo and terminal match here instead of starting a turn, so only
+    /// the committed boundary evidences compaction. Entries are never
+    /// removed after dispatch, so a late echo still matches.
+    compact_inputs: HashSet<String>,
+    /// A compact verb run currently owns the single-flight gate.
+    compact_in_flight: bool,
     /// A native result ended while the bound input was still queued.
     native_prefix_ended: bool,
     /// Main-loop usage of those earlier native results in this turn.
@@ -589,6 +625,30 @@ impl EventHandle {
             .await;
     }
 
+    /// Track one compact-verb input before its stdin write, so its native
+    /// lifecycle echo matches instead of gapping. Single-flight: a second
+    /// compact while one owns the gate is refused before any native write.
+    pub async fn begin_compact(&self, uuid: String) -> Result<()> {
+        self.actor
+            .call(|reply| Control::BeginCompact { uuid, reply })
+            .await?
+    }
+
+    /// Release the single-flight compact gate after the run settles.
+    /// `dispatched` false withdraws a proven never-written identity;
+    /// a dispatched identity stays tracked for its late echo or terminal.
+    /// Awaited so a retry never races the cleared gate.
+    pub async fn end_compact(&self, uuid: String, dispatched: bool) {
+        let _ = self
+            .actor
+            .call(|reply| Control::EndCompact {
+                uuid,
+                dispatched,
+                reply,
+            })
+            .await;
+    }
+
     /// The exact live turn's interrupt status, or None if the turn ended.
     /// An actor timeout or loss remains an error, never proof of a finished turn.
     pub async fn turn_interrupt_status(&self, turn_id: &str) -> Result<Option<bool>> {
@@ -606,6 +666,45 @@ impl EventHandle {
                 turn_id: turn_id.to_owned(),
             })
             .await;
+    }
+
+    /// Wait for a fresh native compaction boundary after the compact verb
+    /// sent its input: the exact committed `session.context.compacted`
+    /// evidence newer than the caller's snapshot. The boundary itself is the
+    /// native result; no turn terminal is consulted and nothing is inferred.
+    /// Gaps from the unassociated compact input are expected and never end
+    /// the wait early: only the boundary or the deadline decides.
+    pub async fn wait_compaction(
+        &self,
+        previous: Option<String>,
+        deadline: Instant,
+    ) -> Result<String> {
+        let mut status = self.actor.watch().clone();
+        loop {
+            {
+                let current = status.borrow();
+                if let Some(evidence) = current.last_compaction.as_ref().filter(|evidence| {
+                    !evidence.native_event_id.trim().is_empty()
+                        && previous.as_deref() != Some(evidence.native_event_id.as_str())
+                }) {
+                    return Ok(evidence.native_event_id.clone());
+                }
+            }
+            timeout_at(deadline, status.changed())
+                .await
+                .map_err(|_| {
+                    Error::new(
+                        "unknown",
+                        "Claude compaction boundary was not observed before the deadline",
+                    )
+                })?
+                .map_err(|_| {
+                    Error::new(
+                        "unknown",
+                        "Claude event status stream closed during compaction",
+                    )
+                })?;
+        }
     }
 
     /// Decide one open `can_use_tool` permission. Runs on the event task,
@@ -796,6 +895,20 @@ async fn dispatch_control(
             publish(processor, status);
             let _ = reply.send(());
         }
+        Control::BeginCompact { uuid, reply } => {
+            let result = processor.begin_compact(uuid);
+            publish(processor, status);
+            let _ = reply.send(result);
+        }
+        Control::EndCompact {
+            uuid,
+            dispatched,
+            reply,
+        } => {
+            processor.end_compact(&uuid, dispatched);
+            publish(processor, status);
+            let _ = reply.send(());
+        }
         Control::CheckTurn { turn_id, reply } => {
             let live = processor.status.active_turn_id.as_deref() == Some(turn_id.as_str())
                 && processor.status.failure.is_none()
@@ -924,6 +1037,8 @@ impl EventProcessor {
             active_input: None,
             last_input: None,
             manual_compaction_turn: None,
+            compact_inputs: HashSet::new(),
+            compact_in_flight: false,
             native_prefix_ended: false,
             prefix_usage: None,
             deny_uncertain: HashSet::new(),
@@ -1091,6 +1206,35 @@ impl EventProcessor {
             self.pending_turn = None;
             self.cancelled_hook_requests.clear();
         }
+    }
+
+    /// Track one compact-verb input identity before its stdin write.
+    /// Single-flight: while a compact owns the gate no second compact
+    /// may register, so every tracked identity belongs to a settled or
+    /// running compact and late echoes still match.
+    fn begin_compact(&mut self, uuid: String) -> Result<()> {
+        if uuid.trim().is_empty() {
+            return Err(Error::new(
+                "invalid",
+                "Claude compact requires an exact native input id",
+            ));
+        }
+        if self.compact_in_flight {
+            return Err(Error::new("busy", "Claude compact is already in flight"));
+        }
+        self.compact_inputs.insert(uuid);
+        self.compact_in_flight = true;
+        Ok(())
+    }
+
+    /// Release the single-flight compact gate. A proven never-written
+    /// identity (`dispatched` false) is withdrawn since no echo for it
+    /// can ever arrive; a dispatched identity stays tracked.
+    fn end_compact(&mut self, uuid: &str, dispatched: bool) {
+        if !dispatched {
+            self.compact_inputs.remove(uuid);
+        }
+        self.compact_in_flight = false;
     }
 
     fn buffer_record(&mut self, record: Value) {
@@ -1390,6 +1534,10 @@ impl EventProcessor {
         }
         self.commit_event("session.context.compacted", native_id, data)
             .await?;
+        self.status.last_compaction = Some(CompactionEvidence {
+            native_event_id: native_event_id.to_owned(),
+        });
+        self.publish_now();
         if let Some(turn_id) = manual_turn {
             self.manual_compaction_turn = Some(turn_id);
         }
@@ -1523,6 +1671,12 @@ impl EventProcessor {
                 "native_protocol",
                 "Claude command_lifecycle omitted its turn association",
             ));
+        }
+        if self.compact_inputs.contains(parsed.command_uuid.as_str()) {
+            // The compact verb's own input echoes here: tracked in memory
+            // like Codex compaction progress, never a turn. The committed
+            // boundary is the compaction evidence; this echo starts nothing.
+            return Ok(());
         }
         let matches_observed_turn = self
             .pending_turn
@@ -3396,6 +3550,26 @@ impl EventProcessor {
         }
         self.task_notification_pending = false;
         self.status.background_continuation = false;
+        let mut named_inputs: Vec<&str> = Vec::new();
+        if let Some(uuid) = parsed.user_message_uuid.as_deref() {
+            named_inputs.push(uuid);
+        }
+        named_inputs.extend(parsed.user_message_uuids.iter().map(String::as_str));
+        if self.status.active_turn_id.is_none()
+            && self.pending_turn.is_none()
+            && record.get("subtype").and_then(Value::as_str) == Some("success")
+            && record.get("is_error").and_then(Value::as_bool) == Some(false)
+            && !named_inputs.is_empty()
+            && named_inputs
+                .iter()
+                .all(|uuid| self.compact_inputs.contains(*uuid))
+        {
+            // The compact verb's own terminal: the committed boundary
+            // already carries the compaction fact, so this names no turn
+            // and commits nothing further. The identity stays tracked so
+            // any later duplicate still matches instead of gapping.
+            return Ok(());
+        }
         let manual_compaction_completed = parsed.terminal_reason.trim().is_empty()
             && self.manual_compaction_turn.as_ref().is_some_and(|turn| {
                 self.status.active_turn_id.as_ref() == Some(turn)

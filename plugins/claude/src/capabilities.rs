@@ -144,6 +144,7 @@ pub fn declaration() -> HarnessCapabilities {
         user_instruction_files: crate::instructions::USER_FILES,
         resume_config: true,
         restart_requires_idle: true,
+        compact: true,
         accepts_send_during_native_turn: true,
         configure_reports_accepted_model: true,
         configure_session_mode: ConfigureSessionMode::WhenModelPresent,

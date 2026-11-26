@@ -216,14 +216,21 @@ not error prose.
 The adapter maps a native `system` record with subtype `compact_boundary` to
 `session.context.compacted`, keyed by its exact session and native UUID. It
 includes `turn_id` only when that native boundary is observed during the exact
-active Swarm turn. The Claude harness declaration leaves Eliot's `compact`
-capability false, so Swarm does not issue a compact command; a native manual or
-automatic operation is observed only when Claude emits this boundary. A bound
+active Swarm turn. The Claude harness declaration sets Eliot's `compact`
+capability true: `swarm compact` on an idle Agent writes the native
+`/compact` input and reports only the exact observed `compact_boundary` as
+receipt. The input identity is tracked in memory like Codex compaction
+progress: its lifecycle echo and terminal match there and start no turn, so
+only the boundary evidences compaction. No boundary before the deadline
+stays `unknown`; nothing is inferred. A mid-turn attempt is refused with
+the existing send-readiness error, as is a second compact while one owns
+the single-flight gate. A native manual or automatic operation outside the verb is still
+observed when Claude emits this boundary. A bound
 boundary queues the task card at the soonest supported context point, which
 moves to the next input if the turn ends first. An idle boundary queues it for
 the next input directly. The installed Claude Code 2.1.278 help advertises
-`--autocompact`; that launch option does not change Eliot's native compact
-capability.
+`--autocompact`; that launch option only changes native automatic compaction
+behavior.
 
 Claude Code 2.1.330 supplies `manual` or `auto` in the compact boundary
 metadata. A manual boundary bound to the active turn can be followed by a
@@ -261,6 +268,7 @@ retained, and an exact native result can resolve the outcome.
 | resume | new plugin/CLI with `--resume` and the exact retained session id; never resend prior prompt; the frozen model (or the inherited `configure` overlay's accepted selector on a resume under an overlay) is re-applied via `set_model` on the idle preflight, and a drifted permission mode via `set_permission_mode` (drift path unverified live: no live resume has drifted yet) |
 | approve/deny | exact `can_use_tool` native request id; the public `request.opened` is a common approval with kind `approval`: summary `"<tool> tool permission request; <key>: <value>; ..."` composed from the ask's semantic string arguments (command, description, cwd, file/path targets, flattened in sorted key order as plain text — no native JSON/input/ids in the public details), redacted before the existing event-size decision, and exactly two choices `approve` (decision `approve`) / `deny` (decision `deny`), `feedback_allowed` false; the native tool/input/transport binding stays in private pending state. Before `request.opened`, the adapter preflights the complete allow `control_response` through the shared native encoder, including its terminating newline. If the original input cannot fit, it is preserved and the request receives the supported explicit deny diagnostic instead of an approval. Approval replies validate against that binary offer: an explicit canonical `choice_id` (from the shared `{choice_id, feedback}` args shape) is accepted only when it names the offered id matching the verb; no autochoice beyond the verb itself, no default choice is read from an out-of-offer id, and feedback is rejected. Allow echoes the asked `input` as `updatedInput`, deny sends the fixed message (verified live, 2.1.278) |
 | answer | unsupported: the AskUserQuestion shape on the installed CLI is unverified |
+| compact | idle session writes native `/compact`, tracks its echo/terminal in memory without starting a turn, and waits for a fresh exact `compact_boundary`; applied only with the boundary receipt, no boundary before the deadline stays unknown, mid-turn or concurrent compact refuses with the existing error |
 | configure | Live model selector through the streaming `set_model` control request ([Agent SDK configuration](https://code.claude.com/docs/en/agent-sdk/configuration#change-configuration-mid-session)). Active turns, pending input and native background continuation refuse before the setter. The plugin checks live permission mode before and after the setter. In `auto`, a matching catalogue entry must advertise auto support. If the list omits the selector, the native setter decides and the result carries the catalogue diagnostic. A successful configure commits the accepted selector for subsequent turns and resume. The serving model and its verification come from the next bound, main-thread assistant record (`message.completed` or `turn.model_observed`). A correlated validation refusal includes its reason. Lost or ambiguous replies stay unknown. Effort is launch-only (`--effort`). |
 | goal | no native goal mechanism; goal selection stays in Eliot |
 

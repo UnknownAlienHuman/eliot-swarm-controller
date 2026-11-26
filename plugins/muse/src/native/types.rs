@@ -369,6 +369,21 @@ pub struct NativeSessionReadResult {
     pub view_cursor: String,
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct NativeSessionCompactParams<'a> {
+    pub command_id: &'a str,
+    pub session_id: &'a str,
+    pub turn_id: &'a str,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct NativeSessionCompactResult {
+    pub command_id: String,
+    pub status: String,
+}
+
 /// `session/resume` params (SS2.5.2). `commandId` is the caller-minted SS2.5
 /// idempotency handle (UUIDv7): a resume that loads a session writes a
 /// durable `SessionResumed` record, so a lost reply is unknown and the write
