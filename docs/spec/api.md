@@ -3966,7 +3966,8 @@ swarm result A [--generation N] [--before CURSOR_JSON | --turn-id TURN] [--limit
 swarm turn resolve A --generation N --turn-id TURN --status completed|failed|interrupted --reason TEXT
 swarm approve|deny A [--generation N] [--request R] [--choice ID] [--feedback TEXT] | answer A --answers-file PATH [--generation N] [--request R]
 swarm configure A [--model MODEL] [--effort EFFORT] [--generation N]
-swarm compact|fork|background ...
+swarm compact A [--generation N] [--wait-seconds N]
+swarm fork|background ...
 swarm cmd show|children|cancel|resolve|settle-stopped ...
 swarm cmd resolve ID --status completed|failed|rejected --reason TEXT
 swarm cmd resolve-custody A --generation N --reason TEXT
@@ -4015,7 +4016,7 @@ swarm switch FROM --generation N [--task-command CMD] [COMMANDS]... [--profile P
 swarm rule install-review --project PROJECT --author PROFILE --workspace PATH [--expected-revision SHA256] [--reviewer R]
 ```
 
-The CLI does not expose `compact`, `fork`, `background`, `plugin-test` or `hook` yet; the compact verb is reachable through `command.submit`.
+The CLI does not expose `fork`, `background`, `plugin-test` or `hook` yet.
 
 `cmd cancel` implements only undispatched handoff-input withdrawal. `cmd show`,
 `cmd children`, `cmd resolve`, and `turn resolve` are available; `turn show`

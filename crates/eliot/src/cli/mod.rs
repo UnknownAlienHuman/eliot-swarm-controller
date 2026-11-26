@@ -162,6 +162,7 @@ pub(crate) async fn dispatch(
         CliCommand::Steer(args) => agents::run_steer(args, data_dir, json_output, id).await,
         CliCommand::Inject(args) => agents::run_inject(args, data_dir, json_output, id).await,
         CliCommand::Interrupt(args) => agents::run_interrupt(args, data_dir, json_output, id).await,
+        CliCommand::Compact(args) => agents::run_compact(args, data_dir, json_output, id).await,
         CliCommand::Approve(args) => agents::run_approve(args, data_dir, json_output, id).await,
         CliCommand::Deny(args) => agents::run_deny(args, data_dir, json_output, id).await,
         CliCommand::Answer(args) => agents::run_answer(args, data_dir, json_output, id).await,
