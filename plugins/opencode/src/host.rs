@@ -3683,18 +3683,13 @@ impl OpenCodePlugin {
                     .as_ref()
                     .is_none_or(|active| active == &input.turn_id)
         }) {
-            events::read_turn_messages(
-                &session.http,
-                &request.session_id,
-                &input.inbox_id,
-                deadline,
-            )
-            .await
-            .ok()
-            .filter(|readback| {
-                !matches!(readback, events::TurnReadback::Running)
-                    || event_status.active_turn_id.as_deref() == Some(input.turn_id.as_str())
-            })
+            events::read_turn_messages(&session.http, &request.session_id, input, deadline)
+                .await
+                .ok()
+                .filter(|readback| {
+                    !matches!(readback, events::TurnReadback::Running)
+                        || event_status.active_turn_id.as_deref() == Some(input.turn_id.as_str())
+                })
         } else {
             None
         };

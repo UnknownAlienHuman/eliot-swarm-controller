@@ -233,6 +233,9 @@ writes them to that step's assistant message. The terminal reports their
 sum at `main_loop_turn` scope, with each counter available when every
 included message supplies it. The Store folds cache creation into
 uncached input and reasoning into output when projecting these counters.
+An inbox input delivered into the exact active turn stays within that turn's
+history slice even when OpenCode stores it as another user message. Other user
+messages still divide executions.
 The newest assistant message in that exact input-to-idle slice also supplies a
 per-call context count when `input`, `cache.read`, `cache.write`, `output`
 and `reasoning` are all present. Their checked sum is committed as
