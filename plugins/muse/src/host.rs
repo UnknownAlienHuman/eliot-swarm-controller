@@ -2,7 +2,10 @@ mod catalogue;
 mod start;
 
 use crate::{
-    events::{EventHandle, EventStatus, SendAssociation, TurnFacts, turn_native_error},
+    events::{
+        EventHandle, EventStatus, ManualCompactionOutcome, SendAssociation, TurnFacts,
+        turn_native_error,
+    },
     native::{
         NativeClient, NativeLaunch, NativeProcess,
         requests::describe_request,
@@ -10,7 +13,8 @@ use crate::{
             NativeApprovalListPendingParams, NativeApprovalListPendingResult,
             NativeClientCapabilities, NativeClientInfo, NativeInitializeParams,
             NativeItemCompletedNotification, NativeModelEffortVariants, NativeModelListParams,
-            NativeModelListResult, NativeSession, NativeSessionReadParams, NativeSessionReadResult,
+            NativeModelListResult, NativeSession, NativeSessionCompactParams,
+            NativeSessionCompactResult, NativeSessionReadParams, NativeSessionReadResult,
             NativeSessionReasoningEffortChangedNotification, NativeSessionResumeParams,
             NativeSessionResumeResult, NativeSessionSetModelParams, NativeSessionSetModelResult,
             NativeSessionStartParams, NativeSessionStartResult, NativeSettingsReadResult,
@@ -50,6 +54,8 @@ use std::{
 use tokio::{sync::mpsc, time::Instant};
 
 const RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+// Leave time to return the terminal result within the daemon's 180 s compact RPC.
+const COMPACTION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(175);
 
 fn request_deadline(received_at: Instant) -> Instant {
     received_at + RPC_TIMEOUT
@@ -1043,6 +1049,7 @@ impl MusePlugin {
         match &params.verb {
             AgentCommandVerb::Send => self.send_command(params, deadline).await,
             AgentCommandVerb::Configure => self.configure_command(params).await,
+            AgentCommandVerb::Compact => self.compact_command(params, deadline).await,
             AgentCommandVerb::Steer => self.steer_command(params).await,
             AgentCommandVerb::Inject => self.inject_active_turn(params).await,
             AgentCommandVerb::Interrupt => self.interrupt_command(params).await,
@@ -1053,6 +1060,114 @@ impl MusePlugin {
                 "unsupported",
                 "Muse plugin command verb is not implemented",
             )),
+        }
+    }
+
+    async fn compact_command(
+        &self,
+        params: AgentCommandParams,
+        deadline: Instant,
+    ) -> Result<Value> {
+        if params.turn_id.is_some() || params.request_id.is_some() {
+            return Err(Error::new(
+                "invalid",
+                "compact requires an idle session binding",
+            ));
+        }
+        let session = self
+            .session
+            .as_ref()
+            .ok_or_else(|| Error::new("bad_state", "Muse Agent session has not started"))?;
+        validate_binding(
+            &session.agent_id,
+            session.generation,
+            &params.agent_id,
+            params.generation,
+            "Muse",
+        )?;
+        let status = session.events.status();
+        if session.phase != SessionPhase::Ready
+            || !status.ready
+            || status.active_command_id.is_some()
+            || status.active_turn_id.is_some()
+            || status.source_unknown
+            || status.needs_idle_proof
+        {
+            return Ok(rejected_control(
+                "Muse compact requires a confirmed idle session",
+            ));
+        }
+        let (Some(session_id), Some(turn)) =
+            (session.session_id.as_deref(), status.last_turn.as_ref())
+        else {
+            return Ok(rejected_control(
+                "Muse compact requires a completed native turn",
+            ));
+        };
+        let native_command_id = new_command_id();
+        let encoded = serde_json::to_value(NativeSessionCompactParams {
+            command_id: &native_command_id,
+            session_id,
+            turn_id: &turn.turn_id,
+        })
+        .map_err(|_| {
+            Error::new(
+                "internal",
+                "Muse session/compact params could not be encoded",
+            )
+        })?;
+        let terminal_deadline = Instant::now() + COMPACTION_TIMEOUT;
+        let value = match session
+            .native_client
+            .call("session/compact", encoded, deadline)
+            .await
+        {
+            Ok(value) => value,
+            Err(error) if native_no_write(&error.code) || error.code == "native_rejected" => {
+                return Ok(rejected_control(&error.message));
+            }
+            Err(error) => return Err(error),
+        };
+        let ack: NativeSessionCompactResult = serde_json::from_value(value)
+            .map_err(|_| Error::new("unknown", "Muse session/compact response was invalid"))?;
+        match (ack.command_id == native_command_id, ack.status.as_str()) {
+            (true, "accepted") => {}
+            (true, "noop") => return Ok(rejected_control("Muse reported no compactable history")),
+            _ => {
+                return Ok(unknown_control(
+                    "Muse session/compact admission was not confirmed",
+                ));
+            }
+        }
+        // The idle command lane admits one compact. MSP binds its terminal item
+        // to the owning turn and manual trigger, with an item ID independent of the ACK.
+        let Some(fact) = session
+            .events
+            .wait_manual_compaction(
+                &turn.turn_id,
+                status.last_manual_compaction.as_ref(),
+                terminal_deadline,
+            )
+            .await
+        else {
+            return Ok(unknown_control(
+                "Muse did not report the exact compaction outcome",
+            ));
+        };
+        match fact.outcome {
+            ManualCompactionOutcome::Compacted => Ok(json!({
+                "state": "applied",
+                "command_id": params.command_id,
+                "compaction": {"completed": true, "receipt_id": fact.receipt_id},
+            })),
+            ManualCompactionOutcome::Noop => Ok(rejected_control("Muse reported no compaction")),
+            outcome => Ok(json!({
+                "state": "failed",
+                "reason": match outcome {
+                    ManualCompactionOutcome::Cancelled => "Muse cancelled compaction",
+                    _ => "Muse reported compaction failure",
+                },
+            })),
         }
     }
 
@@ -3047,6 +3162,7 @@ fn muse_manifest() -> PluginManifest {
             "resume",
             "send",
             "configure",
+            "compact",
             "steer",
             "interrupt",
             "approve",
