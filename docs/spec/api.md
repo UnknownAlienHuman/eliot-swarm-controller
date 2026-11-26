@@ -1162,8 +1162,11 @@ The OS sets no fixed delivery deadline for the notification itself.
 Before publication, monitoring
 checks the registered checkout HEAD and index stamps on both sides of the
 Git read. Git configuration and checkout inventory changes depend on watcher
-coverage. A newly built watcher that reports degraded before its first revision
-is read is rebuilt once; only a repeated loss reports unavailable. Legacy callers
+coverage. Worktree membership and pointer changes invalidate the read and
+refresh the watch set. Ordinary directory modifications are content changes
+where they affect the inventory. Backend errors, rescan notices, replacement
+of a required watch root and failures to arm checkout bindings trigger one
+rebuild. Repeated loss reports unavailable. Legacy callers
 get a bounded live Git read on a cache miss. Callers
 that send `include_git_state: true` receive `git_refreshing: true` without
 origin or checkout details while a watched observation is pending. They can
@@ -1171,7 +1174,11 @@ poll again on their normal refresh cadence. When monitoring cannot cover or
 verify a repository, the daemon uses the bounded live Git read and includes
 `git_watch_unsupported: true` for opted-in callers. This fallback also
 starts after three consecutive attempts invalidated by a moving revision.
-A new verified observation restores the cached path.
+It reports one warning per repository per burst with the invalidated attempt
+count at entry. The fallback remains visible until the same watcher revision,
+registered checkout stamps and bindings verify for ten seconds. Recovery
+restores the cached path and records the total invalidated attempts at debug
+log level.
 Malformed and pathless remotes produce no name, and the origin URL itself
 never leaves the daemon.
 

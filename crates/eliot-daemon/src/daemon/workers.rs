@@ -66,6 +66,15 @@ impl WorkerReporter {
         );
     }
 
+    pub(crate) fn project_revision_settled(&self, repository: &str, count: u64) {
+        logging::record_debug(
+            &self.router.secret_policy_snapshot(),
+            "daemon.project_git_revision_settled",
+            &[("worker", "git_sampler"), ("path", repository)],
+            &[("invalidated_observations", count)],
+        );
+    }
+
     pub(crate) fn failed(
         &self,
         name: &str,
