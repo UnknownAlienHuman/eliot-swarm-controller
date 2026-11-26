@@ -299,7 +299,7 @@ impl MusePlugin {
                 "Muse session host did not identify its data scope",
             ));
         }
-        if requested_model.is_none() && host.catalogue.models.is_empty() {
+        if requested_model.is_none() && !host.has_default_catalogue() {
             return Err(host.catalogue_error(Error::new(
                 "native_model_unavailable",
                 "Muse model/list reported no usable default; use an explicit model",

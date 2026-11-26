@@ -20,7 +20,7 @@ use crate::{
 use eliot_core::api::HarnessModelEntry;
 use eliot_core::local_provider::LocalProvider;
 use eliot_core::{ContextItem, Error, FailureOrigin, InjectPoint, McpPolicy, Result, SecretPolicy};
-use eliot_plugin::start_classification::{StartPoint, start_failure};
+use eliot_plugin::start_classification::{StartPoint, is_proven_no_effect, start_failure};
 use eliot_plugin::{
     AgentCommandParams, AgentCommandVerb, AgentSnapshotParams, AgentStartParams, AgentStopParams,
     InitializeParams, MAX_TEXT_BYTES, Peer, PeerClient, PluginManifest, RpcRequest,
@@ -145,13 +145,13 @@ enum StartPhase {
     ResumeRefused,
 }
 
-/// Classify a refusal after any owned server exit has been confirmed.
+/// Describe where the failure occurred before any session effect.
 fn start_point_for_phase(phase: StartPhase) -> StartPoint {
     match phase {
         StartPhase::Admission => StartPoint::BeforeSpawn,
         StartPhase::Spawn => StartPoint::SpawnRefused,
         StartPhase::Subscribe | StartPhase::Register | StartPhase::Verify => {
-            StartPoint::BeforeSpawn
+            StartPoint::BeforeSession
         }
         StartPhase::CreateRefused | StartPhase::ResumeRefused => {
             StartPoint::NativeRefusalBeforeDispatch
@@ -1200,11 +1200,7 @@ impl OpenCodePlugin {
             Ok(server) => server,
             Err(error) => {
                 // Only spawn can have an uncertain credential import.
-                let point = if error.code == "unknown" {
-                    StartPoint::TransportLost
-                } else {
-                    StartPoint::SpawnRefused
-                };
+                let point = StartPoint::SpawnRefused.with_transport(&error);
                 return Err(PhaseFailure {
                     phase: StartPhase::Spawn,
                     point,
@@ -1222,7 +1218,7 @@ impl OpenCodePlugin {
             Err(error) => {
                 return Err(PhaseFailure {
                     phase: StartPhase::Subscribe,
-                    point: StartPoint::NativeRefusalBeforeDispatch,
+                    point: start_point_for_phase(StartPhase::Subscribe).with_transport(&error),
                     error: Box::new(server.diagnostic_error(error)),
                     native_pid,
                 });
@@ -2524,7 +2520,7 @@ impl OpenCodePlugin {
             params,
             &session,
             phase.as_str(),
-            start_point_for_phase(phase),
+            start_point_for_phase(phase).with_transport(&error),
             error,
         )
     }
@@ -2547,7 +2543,7 @@ impl OpenCodePlugin {
             session
                 .session_id
                 .as_deref()
-                .filter(|_| point != StartPoint::NativeRefusalBeforeDispatch)
+                .filter(|_| !is_proven_no_effect(point))
                 .map(|reference| (session.native_scope.as_str(), reference)),
             session.server.pid(),
         )

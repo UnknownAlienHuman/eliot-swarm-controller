@@ -474,15 +474,13 @@ impl MusePlugin {
         native_pid: Option<u32>,
     ) -> Result<Value> {
         self.failed_start = Some(FailedStart);
-        start_failure(
-            params,
-            "muse",
-            phase,
-            StartPoint::BeforeSpawn,
-            error,
-            None,
-            native_pid,
-        )
+        let point = if native_pid.is_some() {
+            StartPoint::BeforeSession
+        } else {
+            StartPoint::BeforeSpawn
+        }
+        .with_transport(&error);
+        start_failure(params, "muse", phase, point, error, None, native_pid)
     }
 
     async fn start(&mut self, raw: &Value, peer: &PeerClient) -> Result<Value> {
@@ -528,17 +526,46 @@ impl MusePlugin {
             Err(error) => return self.fail_start_preparation(&params, "prepare", error, None),
         };
         let policy = SecretPolicy::new(secrets.iter());
-        let native = match NativeProcess::spawn(launch, policy.clone()).await {
+        let native = match NativeProcess::spawn(launch.clone(), policy.clone()).await {
             Ok(native) => native,
             Err(error) => return self.fail_start_preparation(&params, "spawn", error, None),
         };
         let native_pid = native.pid();
-        let host = match catalogue::CatalogueHost::from_started_native(native, true).await {
+        if let Err(error) = register_native_process(
+            peer,
+            &initialized.credential,
+            &params.agent_id,
+            params.generation,
+            native_pid,
+            "Muse",
+            "session host",
+            "session",
+            RPC_TIMEOUT,
+        )
+        .await
+        {
+            return self.fail_start_preparation(&params, "register", error, native_pid);
+        }
+        let mut host = match catalogue::CatalogueHost::from_started_native(native, true).await {
             Ok(host) => host,
             Err(error) => {
                 return self.fail_start_preparation(&params, "catalogue", error, native_pid);
             }
         };
+        let mut refresh_pid = None;
+        if requested_model.is_none()
+            && host.catalogue.models.is_empty()
+            && let Err(error) = host
+                .refresh_start_default(&launch, initialized, &params, peer, &mut refresh_pid)
+                .await
+        {
+            return self.fail_start_preparation(
+                &params,
+                "catalogue_refresh",
+                error,
+                refresh_pid.or(native_pid),
+            );
+        }
         let initialized_native = match Self::validate_catalogue(
             &host,
             requested_model.as_deref(),
@@ -567,28 +594,6 @@ impl MusePlugin {
         };
         session.contributor_mode_forced =
             requested_model.as_deref().is_some_and(is_contributor_model);
-
-        if let Err(error) = register_native_process(
-            peer,
-            &initialized.credential,
-            &session.agent_id,
-            session.generation,
-            session.native.pid(),
-            "Muse",
-            "session host",
-            "session",
-            RPC_TIMEOUT,
-        )
-        .await
-        {
-            return self.fail_session_start(
-                &params,
-                session,
-                StartPoint::NativeRefusalBeforeDispatch,
-                "register",
-                error,
-            );
-        }
 
         session.selected_effort = initialized_native.effort.clone();
         session.native_scope = initialized_native.scope;

@@ -262,7 +262,10 @@ owned exit and releases capacity. A possible native write or unproved exit
 settles `unknown`.
 
 When the native session may exist and its identity is known, Swarm records an
-`unknown` native-session artifact before retiring the process tree. The Owner
+`unknown` native-session artifact before retiring the process tree. If that
+artifact write is refused, the unknown command outcome keeps the exact
+scope and session ID with the custody error for Owner readback. The daemon
+log retains the identity if command persistence also fails. The Owner
 can release that custody with `swarm artifact reconcile ID --release-custody REASON`
 after verified generation exit and source drain. This releases the artifact
 binding and leaves the vendor session and command outcome intact. An

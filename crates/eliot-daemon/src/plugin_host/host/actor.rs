@@ -433,7 +433,11 @@ async fn run_agent_startup(
             if validate_start_result(&value, &actor.agent, &actor.start_command).is_ok() =>
         {
             if value["state"] == "start_failure" {
-                let evidence = record_start_failure(actor, &value).await;
+                let evidence = decode_start_failure(actor, &value);
+                let custody_error = match &evidence {
+                    Ok(fact) => record_start_failure_custody(actor, fact).await.err(),
+                    Err(_) => None,
+                };
                 let no_effect = evidence
                     .as_ref()
                     .is_ok_and(|fact| is_proven_no_effect(fact.point));
@@ -458,7 +462,10 @@ async fn run_agent_startup(
                     } else {
                         "unknown"
                     });
-                    if !exit_proved {
+                    if let Some(error) = custody_error {
+                        value["cause"] = json!("startup_native_custody_unrecorded");
+                        value["custody_error"] = json!(error.code);
+                    } else if !exit_proved {
                         value["cause"] = json!("startup_custody_exit_unconfirmed");
                     } else if !no_effect {
                         value["cause"] = json!("native_start_effect_unknown");
@@ -529,7 +536,7 @@ async fn run_agent_startup(
     true
 }
 
-async fn record_start_failure(actor: &AgentActorConfig, value: &Value) -> Result<StartFailureFact> {
+fn decode_start_failure(actor: &AgentActorConfig, value: &Value) -> Result<StartFailureFact> {
     let invalid = || Error::new("unknown", "invalid native start failure evidence");
     let fact: StartFailureFact =
         serde_json::from_value(value["start_failure"].clone()).map_err(|_| invalid())?;
@@ -558,22 +565,52 @@ async fn record_start_failure(actor: &AgentActorConfig, value: &Value) -> Result
         {
             return Err(invalid());
         }
-        let state = actor.state.upgrade().ok_or_else(|| {
-            Error::new("unknown", "daemon stopped before retaining startup custody")
-        })?;
-        let artifact = crate::router::cleanup::native_session_custody(
-            &actor.agent,
-            &subject.native_scope,
-            &subject.native_ref,
-        );
-        state
-            .store
-            .lock()
-            .await
-            .record_startup_native_session(&actor.start_command.id, artifact)
-            .map_err(|_| Error::new("unknown", "native start custody could not be committed"))?;
     }
     Ok(fact)
+}
+
+async fn record_start_failure_custody(
+    actor: &AgentActorConfig,
+    fact: &StartFailureFact,
+) -> Result<()> {
+    let Some(subject) = &fact.native_subject else {
+        return Ok(());
+    };
+    let state = actor.state.upgrade().ok_or_else(|| {
+        Error::new(
+            "unavailable",
+            "daemon stopped before retaining startup custody",
+        )
+    })?;
+    let artifact = crate::router::cleanup::native_session_custody(
+        &actor.agent,
+        &subject.native_scope,
+        &subject.native_ref,
+    );
+    let result = state
+        .store
+        .lock()
+        .await
+        .record_startup_native_session(&actor.start_command.id, artifact);
+    if let Err(error) = &result {
+        // The command outcome remains the primary readback. Keep the exact
+        // binding in the existing daemon log if the Store writer also fails.
+        let generation = actor.agent.generation.to_string();
+        crate::logging::record(
+            &eliot_core::SecretPolicy::new(actor.source_credentials.iter()),
+            "agent.start_custody_failed",
+            &[
+                ("agent_id", &actor.agent.id),
+                ("generation", &generation),
+                ("command_id", &actor.start_command.id),
+                ("native_scope", &subject.native_scope),
+                ("native_ref", &subject.native_ref),
+                ("error_code", &error.code),
+            ],
+            None,
+        );
+    }
+    result
 }
 
 /// The actor owns one recovery decision for this dispatched Resume. Neither

@@ -14,9 +14,20 @@ use crate::{
 pub enum StartPoint {
     BeforeSpawn,
     SpawnRefused,
+    BeforeSession,
     NativeRefusalBeforeDispatch,
     AfterDispatch,
     TransportLost,
+}
+
+impl StartPoint {
+    pub fn with_transport(self, error: &Error) -> Self {
+        if error.code == "unknown" {
+            Self::TransportLost
+        } else {
+            self
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -40,6 +51,7 @@ pub fn is_proven_no_effect(point: StartPoint) -> bool {
         point,
         StartPoint::BeforeSpawn
             | StartPoint::SpawnRefused
+            | StartPoint::BeforeSession
             | StartPoint::NativeRefusalBeforeDispatch
     )
 }

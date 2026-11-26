@@ -280,9 +280,13 @@ after `session/start`. The installed `muse exec --help` documents
 The dedicated catalogue reader first reads the host's `model/list` snapshot.
 An empty snapshot triggers one refresh with the resolved executable and
 environment from the private plugin directory. The refresh and each host
-query have separate deadlines. A fresh `serve` reads the resulting cache even
-if the refresh fails. Controlled startup performs one catalogue read before
-session admission. For the picker, Swarm augments the
+query have separate deadlines. A fresh reader `serve` reads the resulting
+cache even if the refresh fails. When controlled startup requests the native
+default and its catalogue is empty, it starts one `exec --list-models` child
+in the same generation custody, reports the PID and validates visible rows
+from the exact provider/profile cache in that host's data root. The original
+`serve` process then admits the session and reports the selected default.
+For the picker, Swarm augments the
 Meta/TBH `model/list` snapshot with hidden Contributor rows from the provider's
 version 3 `model-catalog/6d657461__p746268.json` under the host-reported `museHome`.
 Muse 1.4.25 writes those rows during `exec --list-models` while omitting them
