@@ -12,12 +12,11 @@
 //! alone (`agent.diff` with its path), once. The Terminal tab reads
 //! `agent.processes` and `agent.stats` on open, task change and Refresh.
 //! Agents and Details ride the Monitor's refresh chain, which follows
-//! `events.wait` on their Agents' fleet events as the Agents page does;
-//! Details › Task reads the run's Git task record (`task.list`, `task.get`)
-//! and Details › Work its checkpoints and claims (`checkpoint.list`,
-//! `checkpoint.get`, `claim.list`) while their section is open, once per
-//! Agent run and on Refresh. Every read waits while the window is
-//! minimized.
+//! `events.wait` on their Agents' fleet events as the Agents page does and
+//! waits while the window is minimized; Details › Task reads the run's Git
+//! task record (`task.list`, `task.get`) and Details › Work its checkpoints
+//! and claims (`checkpoint.list`, `checkpoint.get`, `claim.list`) while
+//! their section is open, once per Agent run and on Refresh.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -422,6 +421,9 @@ pub(super) enum PaneMsg {
     OpenFile(String),
     /// Show a changed file in File Explorer (its folder when it is gone).
     OpenFolder(String),
+    /// Opening a changed file or its folder settled off the UI thread:
+    /// why it failed, if it did.
+    Opened(Option<String>),
     CopyPath(String),
     /// Copy a changed file's whole patch as shown.
     CopyDiff(String),
@@ -535,29 +537,46 @@ impl DesktopApp {
                 };
             }
             PaneMsg::OpenFile(path) => match self.changes_file(&path) {
-                Some(full) => {
-                    if let Err(error) = super::reveal::open_with_default_app(&full) {
-                        self.alert(error);
-                    }
+                // The file system checks and the open run off the UI thread.
+                Ok((worktree, relative)) => {
+                    let _task = context.spawn_background(move |_| {
+                        match super::reveal::inside_worktree(&worktree, &relative)
+                            .and_then(|full| super::reveal::open_for_editing(&full))
+                        {
+                            Ok(()) => Message::Pane(PaneMsg::Opened(None)),
+                            Err(error) => Message::Pane(PaneMsg::Opened(Some(error))),
+                        }
+                    });
                 }
-                None => self.alert("This task has no worktree to open the file from."),
+                Err(error) => self.alert(error),
             },
             PaneMsg::OpenFolder(path) => match self.changes_file(&path) {
-                Some(full) => {
-                    // A deleted file's folder still shows where it was.
-                    let shown = if full.exists() {
-                        Some(full)
-                    } else {
-                        full.parent().map(Path::to_path_buf)
-                    };
-                    if let Some(Err(error)) =
-                        shown.map(|path| super::reveal::reveal(&path.to_string_lossy()))
-                    {
-                        self.alert(error);
-                    }
+                Ok((worktree, relative)) => {
+                    let _task = context.spawn_background(move |_| {
+                        // A deleted file's folder still shows where it was.
+                        let shown =
+                            super::reveal::inside_worktree(&worktree, &relative).or_else(|_| {
+                                match relative.parent() {
+                                    Some(parent) if !parent.as_os_str().is_empty() => {
+                                        super::reveal::inside_worktree(&worktree, parent)
+                                    }
+                                    _ => super::reveal::inside_worktree(&worktree, Path::new("")),
+                                }
+                            });
+                        match shown.and_then(|path| super::reveal::reveal(&path.to_string_lossy()))
+                        {
+                            Ok(()) => Message::Pane(PaneMsg::Opened(None)),
+                            Err(error) => Message::Pane(PaneMsg::Opened(Some(error))),
+                        }
+                    });
                 }
-                None => self.alert("This task has no worktree to open the folder from."),
+                Err(error) => self.alert(error),
             },
+            PaneMsg::Opened(failed) => {
+                if let Some(error) = failed {
+                    self.alert(error);
+                }
+            }
             PaneMsg::CopyDiff(path) => match self.whole_patch(&path) {
                 Some(text) => match crate::clipboard::set_text(&text) {
                     Ok(()) => self.set_status(format!("Copied the diff of {path}.")),
@@ -785,8 +804,7 @@ impl DesktopApp {
             let data_dir = data_dir.clone();
             let run = run.clone();
             self.pane.task_record.task = Some(context.spawn_background(move |cancel| {
-                let cancelled = || cancel.is_cancelled();
-                if !wait_shown(&cancelled) {
+                if cancel.is_cancelled() {
                     return Message::Pane(PaneMsg::TaskRecordLoaded(epoch, None));
                 }
                 let read = client::block_on(task_record(&data_dir, &run.0, run.1));
@@ -796,8 +814,7 @@ impl DesktopApp {
         if self.pane.section_open("work") && (again || self.pane.work_record.wants(&run)) {
             let epoch = self.pane.work_record.begin(&run);
             self.pane.work_record.task = Some(context.spawn_background(move |cancel| {
-                let cancelled = || cancel.is_cancelled();
-                if !wait_shown(&cancelled) {
+                if cancel.is_cancelled() {
                     return Message::Pane(PaneMsg::WorkRecordLoaded(epoch, None));
                 }
                 let read = client::block_on(work_record(&data_dir, &run.0, run.1));
@@ -831,9 +848,11 @@ impl DesktopApp {
             .filter(|workspace| !workspace.is_empty())
     }
 
-    /// A changed file's path on disk: the read's worktree joined with the
-    /// repository-relative path.
-    fn changes_file(&self, path: &str) -> Option<PathBuf> {
+    /// A changed file as the read's worktree and its repository-relative
+    /// path. The daemon's path is data: one with a root, a drive, `..` or
+    /// `.` is refused here, and [`super::reveal::inside_worktree`] checks
+    /// the canonical result stays inside the worktree before any open.
+    fn changes_file(&self, path: &str) -> Result<(PathBuf, PathBuf), String> {
         let root = self
             .pane
             .changes
@@ -846,8 +865,17 @@ impl DesktopApp {
                 },
                 Err(_) => None,
             })
-            .or_else(|| self.open_workspace())?;
-        Some(Path::new(&root).join(path.replace('/', "\\")))
+            .or_else(|| self.open_workspace())
+            .ok_or_else(|| "This task has no worktree to open the file from.".to_owned())?;
+        let relative = PathBuf::from(path.replace('/', "\\"));
+        let plain = !relative.as_os_str().is_empty()
+            && relative
+                .components()
+                .all(|part| matches!(part, std::path::Component::Normal(_)));
+        if !plain {
+            return Err(format!("{path} is not a path inside the worktree."));
+        }
+        Ok((PathBuf::from(root), relative))
     }
 
     /// The row of `id` as the menus and dialogs take it: the sidebar's, else
@@ -937,8 +965,7 @@ impl DesktopApp {
         changes.reading = true;
         let (epoch, source) = (changes.epoch, changes.source);
         changes.task = Some(context.spawn_background(move |cancel| {
-            let cancelled = || cancel.is_cancelled();
-            if !wait_shown(&cancelled) {
+            if cancel.is_cancelled() {
                 return Message::Pane(PaneMsg::ChangesLoaded(epoch, None));
             }
             let request = Diff::request(&agent, None, source, None);
@@ -991,8 +1018,7 @@ impl DesktopApp {
         changes.file.path = Some(path.clone());
         let epoch = changes.file.epoch;
         changes.file.task = Some(context.spawn_background(move |cancel| {
-            let cancelled = || cancel.is_cancelled();
-            if !wait_shown(&cancelled) {
+            if cancel.is_cancelled() {
                 return Message::Pane(PaneMsg::FileLoaded(epoch, None));
             }
             let request = Diff::request(&agent, Some(generation), source, Some(path));
@@ -1023,8 +1049,7 @@ impl DesktopApp {
         terminal.reading = true;
         let epoch = terminal.epoch;
         terminal.task = Some(context.spawn_background(move |cancel| {
-            let cancelled = || cancel.is_cancelled();
-            if !wait_shown(&cancelled) {
+            if cancel.is_cancelled() {
                 return Message::Pane(PaneMsg::ProcessesLoaded(epoch, None));
             }
             let (processes, stats) = client::block_on(futures_util::future::join(
@@ -2527,17 +2552,6 @@ async fn work_record(data_dir: &Path, agent: &str, generation: i64) -> Result<Wo
         newest,
         claims: claims.map_err(|error| error.user_message()),
     })
-}
-
-/// Wait while the window is minimized or hidden (locally, no daemon
-/// request); false when cancelled meanwhile.
-fn wait_shown(cancelled: &dyn Fn() -> bool) -> bool {
-    while crate::window_place::hidden() {
-        if !feed::backoff(monitor::HIDDEN_CHECK_MS, cancelled) {
-            return false;
-        }
-    }
-    !cancelled()
 }
 
 /// A row of controls (`.toolbar-row`), 8 DIPs apart: `lead` at the start,
