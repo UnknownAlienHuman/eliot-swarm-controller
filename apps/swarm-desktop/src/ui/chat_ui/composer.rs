@@ -636,21 +636,23 @@ impl DesktopApp {
 
     /// The context beside the main action (brand book §9.5), small text as
     /// the harness reports it: "Context 34%" against a known window, else
-    /// the tokens used ("Context 54k tokens"), never 0%; nothing while the
-    /// harness reports no tokens (Codex shows only a known usage). Its
-    /// tooltip says how fresh; a click opens Details. Provider quota is the
+    /// the tokens used ("Context 54k tokens"), never 0%; just "Context"
+    /// while the harness reports no tokens, so the way to Details stays.
+    /// Its tooltip says how fresh; a click opens Details. Provider quota is the
     /// usage ring's, not this.
     fn context_ring(&self, context: &mut ViewContext<Self>) -> Option<View> {
         let detail = self.bound_detail().ok()?;
-        let fill = detail.context.as_ref()?;
-        let age = fill.observed_at.map_or_else(String::new, |at| {
-            format!(
-                ", {} ago",
-                monitor::elapsed_label(crate::handoff::now_ms().saturating_sub(at))
-            )
-        });
-        let (label, words) = match (fill.used, fill.window, fill.percent()) {
-            (Some(used), Some(window), Some(share)) => (
+        let fill = detail.context.as_ref();
+        let age = fill
+            .and_then(|fill| fill.observed_at)
+            .map_or_else(String::new, |at| {
+                format!(
+                    ", {} ago",
+                    monitor::elapsed_label(crate::handoff::now_ms().saturating_sub(at))
+                )
+            });
+        let (label, words) = match fill.map(|fill| (fill.used, fill.window, fill.percent())) {
+            Some((Some(used), Some(window), Some(share))) => (
                 format!("Context {}%", share.round()),
                 format!(
                     "{} of {} tokens{age}",
@@ -658,11 +660,11 @@ impl DesktopApp {
                     monitor::group(window)
                 ),
             ),
-            (Some(used), _, _) => (
+            Some((Some(used), _, _)) => (
                 format!("Context {}k tokens", used / 1_000),
                 format!("{} tokens{age}", monitor::group(used)),
             ),
-            (None, _, _) => return None,
+            _ => ("Context".to_owned(), format!("Not reported{age}")),
         };
         Some(
             controls::bar_button(false)

@@ -191,6 +191,11 @@ fn allowed(status: GoalStatus) -> &'static [client::GoalControl] {
     }
 }
 
+/// The check command's help: its tooltip and UI Automation help text.
+const CHECK_HELP: &str = "Runs in the task's worktree without a shell; exit 0 means met";
+/// The limits' help: their tooltip and UI Automation help text.
+const LIMITS_HELP: &str = "Rounds of checks, the task's turns, and rounds in a row with the same result; empty means no limit";
+
 /// The goal's state in a few words, for the dialog's context line.
 fn status_words(goal: &GoalView) -> String {
     let (state, reason) = match goal.status {
@@ -574,11 +579,14 @@ impl DesktopApp {
                         .on_text_changed(crate::views::text_edits(
                             context.callback(|text| Message::Goal(GoalMsg::Check(text))),
                         ))
-                        .tooltip("Runs in the task's worktree without a shell; exit 0 means met"),
+                        .automation_help_text(CHECK_HELP)
+                        .tooltip(CHECK_HELP),
                 ),
-                Some(limits.tooltip(
-                    "Rounds of checks, the task's turns, and rounds in a row with the same result; empty means no limit",
-                )),
+                Some(
+                    limits
+                        .automation_help_text(LIMITS_HELP)
+                        .tooltip(LIMITS_HELP),
+                ),
                 error,
             ]))
             .into();

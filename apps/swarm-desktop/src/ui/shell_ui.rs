@@ -1482,6 +1482,7 @@ impl DesktopApp {
             }
             page_ui::Place::Agents => {
                 self.start_monitor(context);
+                self.read_liveness(context);
                 if self.monitor.autonomy.report.is_none() {
                     self.read_autonomy(0, context);
                 }

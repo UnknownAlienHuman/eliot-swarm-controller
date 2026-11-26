@@ -758,6 +758,7 @@ impl DesktopApp {
                 "All",
                 Some(inbox.total()),
                 inbox.filter.is_none(),
+                None,
                 context.message(Message::Inbox(InboxMsg::Filter(None))),
             ),
         )];
@@ -773,6 +774,7 @@ impl DesktopApp {
                     kind_title(kind),
                     Some(count),
                     selected,
+                    None,
                     context.message(Message::Inbox(InboxMsg::Filter(Some(kind)))),
                 ),
             ));

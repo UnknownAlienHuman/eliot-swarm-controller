@@ -298,7 +298,10 @@ impl DesktopApp {
                                     .foreground(ThemeBrush::SystemCritical)
                                     .text_trimming(TextTrimming::CharacterEllipsis),
                                 controls::text(
-                                    "Ends it at once; a running turn is cut off.",
+                                    format!(
+                                        "Ends Agent {} run {} at once; a running turn is cut off.",
+                                        bound.agent, bound.generation
+                                    ),
                                     tokens::text::CAPTION,
                                 )
                                 .foreground(ThemeBrush::SystemCritical)

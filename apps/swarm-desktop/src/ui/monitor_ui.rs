@@ -35,6 +35,9 @@ pub(super) enum MonitorMsg {
     FleetChosen(FleetFilter),
     /// Group the tree by project (true) or by state.
     GroupBy(bool),
+    /// The swarm's wait classes (`daemon.status` `liveness`): the read's
+    /// sequence and what it found.
+    LivenessLoaded(u64, Box<Fallible<eliot_core::api::SwarmLiveness>>),
     /// Show or hide Autonomy's lines by source.
     AutonomyToggled,
     /// Swarm autonomy's window: the last 7 days (true) or 24 hours.
@@ -82,6 +85,10 @@ pub(super) struct MonitorState {
     /// The Agents page's filter chip and grouping.
     pub(super) fleet: FleetFilter,
     pub(super) by_project: bool,
+    /// The wait classes as last read (`None` until read).
+    pub(super) liveness: Option<Fallible<eliot_core::api::SwarmLiveness>>,
+    /// Tags wait-class reads; an older reply is dropped.
+    pub(super) liveness_seq: u64,
     /// The sidebar's read of attention reports is running (only while the
     /// panel, and so its refresh, is closed).
     pub(super) sidebar_reading: bool,
@@ -324,6 +331,11 @@ impl DesktopApp {
             }
             MonitorMsg::FleetChosen(filter) => self.monitor.fleet = filter,
             MonitorMsg::GroupBy(by_project) => self.monitor.by_project = by_project,
+            MonitorMsg::LivenessLoaded(seq, read) => {
+                if seq == self.monitor.liveness_seq {
+                    self.monitor.liveness = Some(*read);
+                }
+            }
             MonitorMsg::AutonomyToggled => {
                 let autonomy = &mut self.monitor.autonomy;
                 autonomy.open = !autonomy.open;
@@ -337,6 +349,7 @@ impl DesktopApp {
             }
             MonitorMsg::AutonomyRefresh => {
                 self.read_autonomy(0, context);
+                self.read_liveness(context);
             }
             MonitorMsg::AutonomyLoaded(seq, read) => {
                 if seq != self.monitor.autonomy.seq {
@@ -790,6 +803,22 @@ impl DesktopApp {
         }
     }
 
+    /// Read the swarm's wait classes (`daemon.status` `liveness`) once:
+    /// when the Agents page opens and on its Refresh, never on a timer.
+    pub(super) fn read_liveness(&mut self, context: &ComponentContext<Self>) {
+        let Ok(data_dir) = self.data_dir.clone() else {
+            return;
+        };
+        self.monitor.liveness_seq += 1;
+        let seq = self.monitor.liveness_seq;
+        let _task = context.spawn_background(move |_| {
+            let read = client::block_on(client::daemon_status(&data_dir))
+                .map(|status| status.liveness)
+                .map_err(|error| error.user_message());
+            Message::Monitor(MonitorMsg::LivenessLoaded(seq, Box::new(read)))
+        });
+    }
+
     /// The Agents page (`Agents.dc.html`): search and grouping, the
     /// summary, the filter chips with counts, the tree
     /// (managers and their workers; state mark, task, project, model,
@@ -803,6 +832,7 @@ impl DesktopApp {
         let read_at = data.read_at_ms.unwrap_or_default();
         let checkouts = self.checkouts();
         let project_of = |row: &MonitorRow| self.monitor_project(row, &checkouts);
+        let partial = data.partial();
         let tree = data.tree(read_at);
         let fleet = self.monitor.fleet;
         let search = &self.monitor.filter;
@@ -827,12 +857,11 @@ impl DesktopApp {
                 .filter(|row| filter.keeps(row, incident(row)))
                 .count()
         };
-        // The daemon's total, else the loaded rows.
-        let count = |filter: FleetFilter| {
-            filter
-                .states()
-                .and_then(total_of)
-                .unwrap_or_else(|| loaded(filter))
+        // The daemon's total, else the loaded rows, marked "+" when the read
+        // is partial: one guard for the value and its mark.
+        let counted = |filter: FleetFilter| match filter.states().and_then(total_of) {
+            Some(total) => (total, false),
+            None => (loaded(filter), partial),
         };
         let mut items: Vec<KeyedView> = Vec::new();
 
@@ -883,10 +912,14 @@ impl DesktopApp {
             .count();
         let (tokens_today, reporting) = self.tokens_today();
         items.push(KeyedView::new(
-            format!("stats:{holds}:{tokens_today}:{reporting}"),
+            format!("stats:{holds}:{partial}:{tokens_today}:{reporting}"),
             page_ui::grid(vec![
                 page_ui::stat_panel(page_ui::stat(
-                    holds.to_string(),
+                    if partial {
+                        format!("{holds}+")
+                    } else {
+                        holds.to_string()
+                    },
                     "On provider hold",
                     Some("Quota, rate limit or sign-in".to_owned()),
                 )),
@@ -899,18 +932,38 @@ impl DesktopApp {
         ));
 
         // The filter chips.
+        // The wait classes, on the Waiting chip's tooltip and help text.
+        let waits = match &self.monitor.liveness {
+            Some(Ok(liveness)) => Some(format!(
+                "Moving {} · Asked {} · Parked {} · Stuck {} · Long {}",
+                liveness.moving, liveness.asked, liveness.parked, liveness.stuck, liveness.long
+            )),
+            _ => None,
+        };
         let chips: Vec<KeyedView> = FleetFilter::ALL
             .into_iter()
             .map(|filter| {
                 let selected = fleet == filter;
-                let n = count(filter);
-                let label = filter.label();
+                let (n, loaded_only) = counted(filter);
+                // A partial read counts only its loaded rows: "3+".
+                let (text, count) = if loaded_only {
+                    (format!("{} {n}+", filter.label()), None)
+                } else {
+                    (filter.label().to_owned(), Some(n))
+                };
+                let tip = (filter == FleetFilter::Waiting)
+                    .then(|| waits.clone())
+                    .flatten();
                 KeyedView::new(
-                    format!("{label}:{selected}:{n}"),
+                    format!(
+                        "{text}:{selected}:{n}:{}",
+                        tip.as_deref().unwrap_or_default()
+                    ),
                     page_ui::filter_chip(
-                        label,
-                        Some(n),
+                        &text,
+                        count,
                         selected,
+                        tip,
                         context.message(Message::Monitor(MonitorMsg::FleetChosen(filter))),
                     ),
                 )
@@ -1020,7 +1073,12 @@ impl DesktopApp {
                 } else {
                     total_of(group.states())
                 };
-                let label = format!("{} · {}", group.title(), total.unwrap_or(loaded_rows));
+                // The read's total; else its loaded rows, "+" when partial.
+                let label = match total {
+                    Some(total) => format!("{} · {total}", group.title()),
+                    None if partial => format!("{} · {loaded_rows}+", group.title()),
+                    None => format!("{} · {loaded_rows}", group.title()),
+                };
                 if group == FleetGroup::Stopped {
                     let open = self.monitor.stopped_open || searching;
                     entries.push(monitor_view::MonitorEntry::Stopped(label, open));
@@ -1657,13 +1715,7 @@ impl DesktopApp {
         ));
 
         // Heavy work: only when heavy episodes were recorded.
-        let heavy: Vec<String> = read
-            .map(monitor_view::observe_lines)
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|line| line.starts_with("Heavy work"))
-            .collect();
-        if !heavy.is_empty() {
+        if let Some(heavy) = read.and_then(monitor_view::heavy_work) {
             items.push(KeyedView::new(
                 "heavy",
                 self.details_section(
@@ -1671,7 +1723,7 @@ impl DesktopApp {
                     "Heavy work",
                     vec![KeyedView::new(
                         "lines",
-                        controls::body(heavy.join("\n"))
+                        controls::body(heavy)
                             .text_wrapping(TextWrapping::Wrap)
                             .is_text_selection_enabled(true),
                     )],

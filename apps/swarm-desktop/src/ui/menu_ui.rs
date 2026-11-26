@@ -1442,10 +1442,12 @@ impl DesktopApp {
         context: &mut ViewContext<Self>,
     ) -> ContentDialog {
         let (title, body, button) = match target {
-            Target::Agent(_) if action == Action::Stop => (
+            Target::Agent(agent) if action == Action::Stop => (
                 format!("Stop “{}”?", target.title()),
-                "A running turn is cut off. The worktree and branch stay; Resume starts it again."
-                    .to_owned(),
+                format!(
+                    "Agent {} · run {}. A running turn is cut off; the worktree and branch stay.",
+                    agent.id, agent.generation
+                ),
                 "Stop Agent",
             ),
             Target::Agent(agent) if action == Action::Delete => {

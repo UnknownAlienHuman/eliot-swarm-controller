@@ -1047,6 +1047,7 @@ impl DesktopApp {
                         .on_text_changed(crate::views::text_edits(context.callback(move |text| {
                             Message::Automation(AutomationMsg::FormText(field, text))
                         })))
+                        .automation_help_text(help)
                         .tooltip(help),
                     None,
                 ),
@@ -1098,6 +1099,7 @@ impl DesktopApp {
                                 Message::Automation(AutomationMsg::FormWorkspace(index))
                             })),
                     )])
+                    .automation_help_text("The project the tasks start in")
                     .tooltip("The project the tasks start in"),
                 None,
             ),
@@ -1120,6 +1122,7 @@ impl DesktopApp {
                                 Message::Automation(AutomationMsg::FormRole(index))
                             })),
                     )])
+                    .automation_help_text("The task's role: Settings › Routing picks its model")
                     .tooltip("The task's role: Settings › Routing picks its model"),
                 None,
             ),
@@ -1140,6 +1143,7 @@ impl DesktopApp {
                         context
                             .callback(|value| Message::Automation(AutomationMsg::FormBusy(value))),
                     )
+                    .automation_help_text("How many of its tasks may run at the same time")
                     .tooltip("How many of its tasks may run at the same time"),
                 None,
             ),

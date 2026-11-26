@@ -16,8 +16,6 @@ use super::*;
 use crate::picker::{self, Choice, Item, ItemKind, ManageGroup, Row};
 use crate::settings::Access;
 
-/// What a model row with no explicit effort launches: the harness's own
-/// default (its accessible name; the chip reads "Default").
 /// Models a Manage models group lists before it asks for a search.
 const MANAGE_GROUP_ROWS: usize = 150;
 

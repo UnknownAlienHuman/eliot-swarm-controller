@@ -17,7 +17,7 @@ impl DesktopApp {
             "enabled",
             controls::setting_row(
                 "Cloud MCP",
-                "Swarm's MCP endpoint through a Cloudflare tunnel",
+                "Swarm's MCP endpoint through a Cloudflare tunnel behind Cloudflare Access",
                 View::from(switch),
             ),
         )];

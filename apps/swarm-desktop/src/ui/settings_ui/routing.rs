@@ -38,7 +38,7 @@ impl DesktopApp {
             let supporting = match (role.as_str(), list.is_empty()) {
                 ("default", true) => "No profiles: Auto cannot start tasks.",
                 ("default", false) => "New tasks on Auto.",
-                (_, true) => "Not set",
+                (_, true) => "Not set: its launches are refused",
                 (_, false) => "Launches that ask for this role.",
             };
             let mut rows: Vec<KeyedView> = Vec::new();

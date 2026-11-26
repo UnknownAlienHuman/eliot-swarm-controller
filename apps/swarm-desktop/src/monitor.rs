@@ -1532,6 +1532,16 @@ impl Monitor {
         tree
     }
 
+    /// Whether a live state holds more Agents than the bounded read
+    /// returned (its `state_totals` count exceeds its rows), including one
+    /// with no rows in the page at all: every count is then partial.
+    pub fn partial(&self) -> bool {
+        self.counts.iter().any(|count| {
+            count.state != AgentState::Stopped
+                && count.total.is_some_and(|total| total > count.shown)
+        })
+    }
+
     pub fn apply(&mut self, snapshot: MonitorSnapshot) {
         if let Some((root, tree)) = snapshot.tree.as_ref() {
             if self.tree.root.as_ref() != Some(root) {
