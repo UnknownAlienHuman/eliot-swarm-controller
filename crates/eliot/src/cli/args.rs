@@ -500,9 +500,11 @@ pub(crate) struct LaunchArgs {
     #[arg(long, value_name = "HARNESS")]
     pub(crate) harness: Option<String>,
     /// Ad-hoc model ID, or an exact model from the named Owner profile's launch_models.
+    /// Model selection is rejected for role and default-role launches.
     #[arg(long, value_name = "MODEL")]
     pub(crate) model: Option<String>,
-    /// Ad-hoc reasoning effort; omitted uses the harness native default.
+    /// Ad-hoc reasoning effort, or an Owner override for a named profile;
+    /// omitted uses the harness native default. Role/default launches reject it.
     /// Codex, Muse and Claude (closed low|medium|high|xhigh|max) map effort,
     /// as does OpenCode (installed per-model variant ids); other harnesses
     /// reject it.

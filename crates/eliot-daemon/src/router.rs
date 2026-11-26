@@ -4230,7 +4230,7 @@ impl Router {
         }
 
         let launch = LaunchCommandArgs::read(&request.args)?;
-        check_profile_model_request(&request.args, &launch, principal)?;
+        check_named_launch_selectors(&request.args, &launch, principal)?;
 
         // Ad-hoc Owner launch: freeze a profile-equivalent snapshot from
         // built-in per-harness defaults plus flags. Agent principals keep
@@ -4314,6 +4314,9 @@ impl Router {
                 )
             })
             .await??;
+            if snapshot.get("model").is_some() {
+                snapshot["model_source"] = json!("launch");
+            }
             crate::config::stamp_cloud_mcp_hostname(&mut snapshot, &self.inner.data_root);
             crate::config::capture_native_store_inputs(
                 &mut snapshot,
@@ -4433,30 +4436,23 @@ impl Router {
                         &harness,
                     )?;
                 }
-                Some((name.to_owned(), harness, snapshot, command_bound))
+                Some((name.to_owned(), snapshot, harness, command_bound, false))
             } else {
-                Some((
-                    parent.profile.clone(),
-                    parent.harness.clone(),
-                    parent.profile_snapshot.clone(),
-                    true,
-                ))
+                let mut snapshot = parent.profile_snapshot.clone();
+                LaunchCommandArgs::restore_saved_selectors(&mut snapshot);
+                Some((parent.profile, snapshot, parent.harness, true, true))
             }
         } else {
             None
         };
-        let (profile_name, mut snapshot, harness, command_bound) = match agent_child_snapshot {
-            Some((name, harness, snapshot, bound)) => (name, snapshot, harness, bound),
+        let (name, mut snapshot, harness, command_bound, reused) = match agent_child_snapshot {
+            Some(selected) => selected,
             None => {
                 let profile_name = launch
                     .profile
+                    .as_deref()
                     .ok_or_else(|| Error::new("invalid", "profile must be a non-empty string"))?;
-                let mut snapshot = crate::config::resolve_profile_for_launch(
-                    &self.inner.profile_cache,
-                    &self.inner.data_root,
-                    &profile_name,
-                    launch.profile_model.as_deref(),
-                )?;
+                let mut snapshot = self.resolve_profile_cached(profile_name)?;
                 crate::config::capture_native_store_inputs(
                     &mut snapshot,
                     self.inner.stand_store_root.as_deref(),
@@ -4486,15 +4482,22 @@ impl Router {
                 } else {
                     false
                 };
-                (profile_name, snapshot, harness, command_bound)
+                (
+                    profile_name.to_owned(),
+                    snapshot,
+                    harness,
+                    command_bound,
+                    false,
+                )
             }
         };
         // The retained wire shape keeps the named profile so Store admission
         // can bind the child row to the parent's profile without guessing.
         if let Some(args) = request.args.as_object_mut() {
-            args.insert("profile".to_owned(), Value::String(profile_name.clone()));
+            args.insert("profile".to_owned(), Value::String(name.clone()));
         }
         if matches!(principal, Principal::Agent { .. }) {
+            launch.check_delegated_selectors(&snapshot)?;
             install_frozen_profile(request, &harness, snapshot.clone(), true)?;
             let store = self.inner.store.lock().await;
             hierarchy::check_agent_launch_authority(&store, principal, request)?;
@@ -4511,10 +4514,7 @@ impl Router {
                 && !crate::adhoc::profile_command_exists(cmd)
             {
                 return Err(crate::adhoc::missing_profile_command_refusal(
-                    &profile_name,
-                    &harness,
-                    cmd,
-                    None,
+                    &name, &harness, cmd, None,
                 ));
             }
         } else {
@@ -4533,22 +4533,21 @@ impl Router {
                 candidate.clone()
             } else {
                 let selector = snapshot.get("cmd").and_then(Value::as_str);
-                crate::adhoc::resolve_profile_command(&profile_name, &harness, selector).await?
+                crate::adhoc::resolve_profile_command(&name, &harness, selector).await?
             };
             crate::adhoc::write_profile_command_snapshot(&mut snapshot, candidate)?;
         }
         // Reused parent snapshots already carry their frozen default; only
         // freshly resolved child snapshots need a freeze. The label matches
         // the catalogue's named-profile key.
-        if snapshot
-            .get("daemon_model")
-            .and_then(Value::as_str)
-            .is_none_or(|model| model.trim().is_empty())
-        {
-            let deadline = std::time::Instant::now() + crate::adhoc::DISCOVERY_BUDGET;
-            self.resolve_launch_default(&harness, &profile_name, &mut snapshot, deadline)
+        let deadline = std::time::Instant::now() + crate::adhoc::DISCOVERY_BUDGET;
+        if !reused {
+            self.resolve_launch_default(&harness, &name, &mut snapshot, deadline)
                 .await?;
         }
+        self.validate_named_launch_selection(&harness, &name, &snapshot, &launch, deadline)
+            .await?;
+        launch.freeze_saved_selectors(&mut snapshot);
         install_frozen_profile(request, &harness, snapshot, true)?;
         {
             let store = self.inner.store.lock().await;
@@ -4557,7 +4556,7 @@ impl Router {
         self.check_explicit_launch_quota(
             principal,
             routing,
-            &profile_name,
+            &name,
             &harness,
             &request.args["profile_snapshot"],
         )
@@ -9097,7 +9096,7 @@ fn normalize_launch(request: &mut SubmitCommand, principal: &Principal) -> Resul
     reject_launch_derived_keys(&request.args)?;
     project_checks::validate_launch_inputs(&request.args, matches!(principal, Principal::Owner))?;
     let launch = LaunchCommandArgs::read(&request.args)?;
-    check_profile_model_request(&request.args, &launch, principal)?;
+    check_named_launch_selectors(&request.args, &launch, principal)?;
     if request.args.get("role").is_some() {
         let role = launch
             .role
@@ -9194,7 +9193,7 @@ fn normalize_launch(request: &mut SubmitCommand, principal: &Principal) -> Resul
             eliot_core::api::harness::AdhocAccess::parse(access)?;
         }
     } else {
-        for field in ["model", "effort", "auth", "access"] {
+        for field in ["auth", "access"] {
             if args.get(field).is_some() {
                 return Err(Error::new(
                     "invalid",
@@ -9236,37 +9235,71 @@ fn normalize_launch(request: &mut SubmitCommand, principal: &Principal) -> Resul
     Ok(())
 }
 
-fn check_profile_model_request(
+fn check_named_launch_selectors(
     args: &Value,
     launch: &LaunchCommandArgs,
     principal: &Principal,
 ) -> Result<()> {
-    let Some(model) = launch.profile_model.as_deref() else {
+    if args.get("harness").is_some() && args.get("profile_model").is_none() {
         return Ok(());
-    };
-    require_owner(principal)?;
-    if args.get("parent").is_some()
-        || args.get("harness").is_some()
+    }
+    if ["model", "profile_model", "effort"]
+        .into_iter()
+        .all(|field| args.get(field).is_none())
+    {
+        return Ok(());
+    }
+    if !(matches!(principal, Principal::Agent { .. })
+        || matches!(principal, Principal::Owner) && args.get("parent").is_none())
+    {
+        return Err(Error::new(
+            "not_allowed",
+            "model and effort selection requires a parentless Owner or an authorized Agent",
+        ));
+    }
+    if args.get("harness").is_some()
         || args.get("role").is_some()
         || launch
             .profile
             .as_deref()
             .is_none_or(|profile| profile.trim().is_empty())
     {
-        return Err(Error::invalid_field(
-            "args.profile_model",
-            "an exact model ID for an explicitly named, parentless Owner profile launch",
+        return Err(Error::new(
+            "invalid",
+            "named launch model and effort selection requires an explicit profile",
         ));
     }
-    if !crate::config::valid_model_selector(model) {
+    if args.get("model").is_some() && launch.profile_model.is_some() {
+        return Err(Error::new(
+            "invalid",
+            "model and profile_model are mutually exclusive",
+        ));
+    }
+    for (field, model) in [
+        ("model", launch.model.as_deref()),
+        ("profile_model", launch.profile_model.as_deref()),
+    ] {
+        if args.get(field).is_some() && !model.is_some_and(crate::config::valid_model_selector) {
+            return Err(Error::invalid_field(
+                format!("args.{field}"),
+                "an exact model ID",
+            ));
+        }
+    }
+    if args.get("effort").is_some()
+        && !launch.effort.as_deref().is_some_and(|effort| {
+            !effort.is_empty() && effort == effort.trim() && !effort.chars().any(char::is_control)
+        })
+    {
         return Err(Error::invalid_field(
-            "args.profile_model",
-            "a nonempty single model ID",
+            "args.effort",
+            "an exact reasoning effort",
         ));
     }
     if let Some(field) = eliot_core::PROVIDER_LAUNCH_OVERRIDE_FIELDS
         .iter()
         .copied()
+        .filter(|field| !matches!(*field, "model" | "effort"))
         .chain(["local_provider"])
         .find(|field| args.get(*field).is_some())
     {

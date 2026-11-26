@@ -101,6 +101,9 @@ fn ignored_child_snapshot_key(key: &str) -> bool {
         key,
         "model"
             | "effort"
+            | "model_source"
+            | "launch_models"
+            | "launch_selection"
             | "context_ceiling_tokens"
             | "daemon_model"
             | "child_profiles"

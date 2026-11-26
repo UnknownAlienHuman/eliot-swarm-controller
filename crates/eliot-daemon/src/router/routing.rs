@@ -813,7 +813,9 @@ impl Router {
         }
         let inherited_snapshot = parent.is_some_and(|parent| parent.profile == name);
         let mut snapshot = if let Some(parent) = parent.filter(|parent| parent.profile == name) {
-            parent.profile_snapshot.clone()
+            let mut snapshot = parent.profile_snapshot.clone();
+            LaunchCommandArgs::restore_saved_selectors(&mut snapshot);
+            snapshot
         } else {
             match self.resolve_profile_cached(name) {
                 Ok(mut snapshot) => {

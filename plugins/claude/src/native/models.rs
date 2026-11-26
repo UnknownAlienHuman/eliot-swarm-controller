@@ -1,6 +1,6 @@
 //! No-prompt metadata read over the Claude Code initialize control request.
 
-use std::{ffi::OsString, path::Path, time::Duration};
+use std::{collections::HashSet, ffi::OsString, path::Path, time::Duration};
 
 use crate::CLAUDE_EFFORT_LEVELS;
 use eliot_core::{Error, Result, SecretPolicy};
@@ -124,19 +124,35 @@ fn project_inventory(reply: Value) -> Result<Value> {
             "Claude model.list received no native inventory",
         ));
     }
-    let models: Vec<_> = readback
+    // A native alias and its resolved pin are both selectable. An explicit
+    // inventory row for the pin takes precedence over an alias's metadata.
+    let mut ids: HashSet<_> = readback
         .models
-        .into_iter()
-        .filter_map(|model| {
-            let id = model.value.filter(|id| !id.trim().is_empty())?;
-            Some(json!({
-                "id": id,
-                "resolved_model": model.resolved_model,
-                "display_name": model.display_name,
-                "efforts": model.supported_effort_levels,
-            }))
-        })
+        .iter()
+        .filter_map(|model| model.value.as_deref())
         .collect();
+    let mut models = Vec::new();
+    for model in &readback.models {
+        let Some(id) = model.value.as_deref().filter(|id| !id.trim().is_empty()) else {
+            continue;
+        };
+        models.push(json!({
+            "id": id,
+            "display_name": model.display_name,
+            "efforts": model.supported_effort_levels,
+        }));
+        if let Some(pin) = model
+            .resolved_model
+            .as_deref()
+            .filter(|id| !id.trim().is_empty())
+            && ids.insert(pin)
+        {
+            models.push(json!({
+                "id": pin,
+                "efforts": model.supported_effort_levels,
+            }));
+        }
+    }
     if models.is_empty() {
         return Err(Error::new(
             "source_integrity",

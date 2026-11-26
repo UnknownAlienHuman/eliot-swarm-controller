@@ -347,11 +347,14 @@ pub(crate) async fn run_launch(
         return Err(Failure::new(2, "ad-hoc launch cannot have a parent"));
     }
     if harness.is_none()
-        && (effort.is_some() || auth.is_some() || access.is_some() || cmd.is_some())
+        && ((profile.is_none() && effort.is_some())
+            || auth.is_some()
+            || access.is_some()
+            || cmd.is_some())
     {
         return Err(Failure::new(
             2,
-            "--effort/--auth/--access/--cmd require --harness",
+            "--effort requires --harness or --profile; --auth/--access/--cmd require --harness",
         ));
     }
     if model.is_some() && harness.is_none() && profile.is_none() {
@@ -382,11 +385,6 @@ pub(crate) async fn run_launch(
     let no_policy = validate_no_policy(no_policy)?;
     let goal = parse_goal_json(goal_json)?;
     let deadline = wait_deadline(timeout_seconds)?;
-    let (model, profile_model) = if profile.is_some() {
-        (None, model)
-    } else {
-        (model, None)
-    };
     let args = json!(eliot_core::api::LaunchCommandArgs {
         workspace: workspace.map(|path| path.to_string_lossy().into_owned()),
         chat: chat.then_some(true),
@@ -394,7 +392,6 @@ pub(crate) async fn run_launch(
         role,
         harness,
         model,
-        profile_model,
         effort,
         auth,
         access,

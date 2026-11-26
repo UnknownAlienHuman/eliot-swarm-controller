@@ -3575,6 +3575,9 @@ impl EventProcessor {
         let roots = transcript_config_roots();
         let latest_message = self.latest_context_message.take();
         let latest_model = latest_message.as_ref().map(|(model, _)| model.clone());
+        if let Some(model) = &latest_model {
+            data["effective_model"] = json!(model);
+        }
         let transcript = tokio::task::spawn_blocking(move || {
             transcript_usage_in(&roots, &session_id, latest_message)
         })

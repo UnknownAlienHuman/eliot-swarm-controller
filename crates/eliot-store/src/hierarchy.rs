@@ -444,9 +444,10 @@ pub(super) fn admission_allows_carried_parent_binding(
         .get("profile")
         .and_then(Value::as_str)
         .is_some_and(|name| name == parent.profile)
-        && args.get("profile_snapshot") == Some(&parent.profile_snapshot)
     {
-        return Ok(true);
+        let launch = core::api::LaunchCommandArgs::read(args)?;
+        let expected = inherited_launch_snapshot(&parent.profile_snapshot, &launch)?;
+        return Ok(args.get("profile_snapshot") == Some(&expected));
     }
     let Some(child_snapshot) = args.get("profile_snapshot") else {
         return Ok(false);
@@ -469,6 +470,17 @@ pub(super) fn admission_allows_carried_parent_binding(
                     .and_then(Value::as_array)
                     .is_some_and(|allowed| allowed.iter().any(|entry| entry.as_str() == Some(name)))
         }))
+}
+
+pub(super) fn inherited_launch_snapshot(
+    parent: &Value,
+    launch: &core::api::LaunchCommandArgs,
+) -> Result<Value> {
+    let mut snapshot = parent.clone();
+    core::api::LaunchCommandArgs::restore_saved_selectors(&mut snapshot);
+    launch.check_delegated_selectors(&snapshot)?;
+    launch.freeze_saved_selectors(&mut snapshot);
+    Ok(snapshot)
 }
 
 /// Snapshot one tree selector to its member rows, in member order. Unknown

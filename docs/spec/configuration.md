@@ -433,20 +433,27 @@ non-regular files, read failures and files beyond its fixed read bound report
 CRLF expansion, an optional BOM and trailing newlines, so line-ending normalization
 does not truncate equivalent text. The comparison makes zero configuration writes.
 
-## Owner model selection on a saved route
+## Launch model selection on a saved route
 
-Set `launch_models = ["<exact model ID>", ...]` on a named Claude, Codex,
-or OpenCode profile to allow model selection at launch. Omit the list or
-leave it empty to disable the feature. A non-empty list requires a saved
-`model` and at most 32 distinct IDs. OpenCode selections must use the
-saved model's provider prefix, and local-provider selections must name a
-model declared by that provider.
+`swarm launch --profile P --model M --effort E` selects a model, an effort,
+or both for one launch on a saved Claude, Codex or OpenCode route. An omitted
+selector uses the saved value. The daemon reads the profile's catalogue using the
+captured executable and route. OpenCode selections must use the saved model's
+provider prefix and a local-provider selection must name one of its declared models.
+Codex catalogue reads use the verified route cache identity and the shared metadata
+reader strips the route key. Admission requires catalogue membership on that read.
+Claude's catalogue includes native resolved IDs alongside its reported aliases.
 
-`swarm launch --profile P --model M` selects the saved route and an exact
-listed model for one parentless Owner launch. The choice leaves the saved
-profile and the route's credentials, native settings and delegation intact.
-The daemon validates the list and the route against one settings revision.
-See [the launch contract](api.md#command-admission) for admission and readback.
+Set `launch_models = ["<exact model ID>", ...]` to delegate explicit model selection
+for that profile. A non-empty list requires a saved `model` and accepts up to 32
+distinct, same-route IDs. An empty or omitted list grants no model selections to
+Agents. A child reusing its parent's profile uses the parent's captured list and
+saved model and effort. An Agent must still be allowed to launch on that profile
+and can specify only the saved effort. The Owner's `--model` selection is bounded
+by the route and catalogue.
+
+The generation freezes the selected values and model provenance for readback
+and resume. See [the launch contract](api.md#command-admission).
 
 ## Ad-hoc Owner launch (no stored profile)
 
