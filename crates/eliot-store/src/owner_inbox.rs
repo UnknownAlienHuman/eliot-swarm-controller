@@ -21,6 +21,10 @@ impl OwnerInboxItemSink for Vec<OwnerInboxItem> {
 
 pub(crate) const SWITCH_FENCE_NEEDS_OWNER: &str = "switch_checkout_release_needs_owner";
 pub(crate) const REPEATED_FAILURE_REASON: &str = "repeated_failure";
+/// An unknown artifact fences an ended provider probe's deletion. The
+/// startup recovery attempt already establishes the wait, so the inbox
+/// reports it without a second liveness sample.
+pub(crate) const PROBE_RECOVERY_NEEDS_OWNER: &str = "provider_probe_artifact_unknown";
 const ARTIFACT_LEDGER_SUBJECT: &str = "artifact-ledger";
 
 fn queued_sends_blocked_by(
@@ -128,6 +132,7 @@ pub(super) fn project_into(
     project_handoffs(connection, now, items, &mut liveness, &[])?;
     project_switch_fences(connection, now, items, &mut liveness, &[])?;
     project_work_not_in_git(connection, now, items, &mut liveness, &[])?;
+    project_probe_recovery_artifacts(connection, now, items, &mut liveness, &[])?;
     project_repeated_failures(connection, now, items, None)?;
     if let Some(item) = artifact_capacity_item(connection)? {
         items.push(item);
@@ -189,6 +194,9 @@ pub(crate) fn project_item(
             Some(("hold", scope)) if kind == OwnerInboxKind::Stuck => (project_holds, scope),
             Some(("goal", goal)) if kind == OwnerInboxKind::Stuck => (project_goals, goal),
             Some(("timer", timer)) if kind == OwnerInboxKind::Stuck => (project_timers, timer),
+            Some(("artifact", id)) if kind == OwnerInboxKind::Stuck => {
+                (project_probe_recovery_artifacts, id)
+            }
             Some(("launch", id)) => (project_launch_intents, id),
             Some(("assignment", timer)) => (project_assignment_waits, timer),
             Some((agent, generation))
@@ -1562,6 +1570,102 @@ fn project_holds(
                 vec![inspect],
             ));
         }
+    }
+    Ok(())
+}
+
+/// An unknown artifact fences deletion of its ended maintenance probe.
+/// Surface each blocker with the exact Owner reconcile command; recovery
+/// never settles the uncertain effect itself.
+fn project_probe_recovery_artifacts(
+    db: &Connection,
+    now: i64,
+    items: &mut dyn OwnerInboxItemSink,
+    stats: &mut SwarmLiveness,
+    bindings: &[&dyn ToSql],
+) -> eliot_core::Result<()> {
+    let mut stmt = projection_query(
+        db,
+        "SELECT art.id, art.agent, art.generation,
+                json_extract(art.body, '$.kind'),
+                json_extract(art.body, '$.created_at'),
+                a.updated_at
+         FROM artifacts art INDEXED BY artifacts_unknown_agent
+         JOIN agents a ON a.id = art.agent
+         WHERE json_extract(art.body, '$.state') = 'unknown'
+           AND a.chat = 1 AND a.parent IS NULL AND a.observe_only = 0 AND a.project = ''
+           AND a.state IN ('stopped', 'failed', 'lost')
+           AND json_extract(a.profile_snapshot, '$._provider_probe') = 1",
+        "art.id = ?1",
+        bindings,
+    )?;
+    let rows = stmt
+        .query_map(bindings, |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, Option<i64>>(4)?,
+                row.get::<_, i64>(5)?,
+            ))
+        })
+        .map_err(crate::sql_error)?;
+    for row in rows {
+        let (artifact_id, agent, generation, kind, created_at, since) =
+            row.map_err(crate::sql_error)?;
+        let native_session = kind.as_deref() == Some("native_session");
+        let reconcile = if native_session {
+            action(
+                "reconcile",
+                "artifact.reconcile",
+                json!({"artifact": artifact_id.clone(), "release_custody": Value::Null}),
+            )
+        } else {
+            action(
+                "reconcile",
+                "artifact.reconcile",
+                json!({"artifact": artifact_id.clone()}),
+            )
+        };
+        let inspect_agent = action(
+            "inspect_agent",
+            "agent.get",
+            json!({"id": format!("a{agent}")}),
+        );
+        let choices = vec![reconcile.clone(), inspect_agent];
+        let mut projected = item(
+            OwnerInboxKind::Stuck,
+            format!("artifact:{artifact_id}"),
+            format!("a{agent}:g{generation}:unknown"),
+            now,
+            created_at.unwrap_or(since),
+            PROBE_RECOVERY_NEEDS_OWNER,
+            Some(reconcile),
+            choices,
+        );
+        projected.outcome_unknown = true;
+        let agent_id = format!("a{agent}");
+        projected.detail = Some(format!(
+            "Ended provider probe {agent_id} keeps unknown artifact {artifact_id}; deletion stays fenced until the Owner reconciles it."
+        ));
+        projected.instructions = Some(if native_session {
+            format!(
+                "The probe session cannot be re-read. Take responsibility with `swarm artifact reconcile {artifact_id} --release-custody \"<reason>\"`, then restart the daemon so probe recovery deletes {agent_id}."
+            )
+        } else {
+            format!(
+                "Re-read the retained path with `swarm artifact reconcile {artifact_id}`, then restart the daemon so probe recovery deletes {agent_id}."
+            )
+        });
+        tally(
+            stats,
+            &Mover::Asked {
+                reason: PROBE_RECOVERY_NEEDS_OWNER,
+                item: OwnerInboxKind::Stuck,
+            },
+        );
+        items.push(projected);
     }
     Ok(())
 }

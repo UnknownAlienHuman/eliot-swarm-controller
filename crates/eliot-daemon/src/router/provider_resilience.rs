@@ -407,6 +407,7 @@ impl Router {
         shutdown: &watch::Receiver<bool>,
     ) -> Result<()> {
         let mut after = 0;
+        let mut attempted: std::collections::HashSet<String> = std::collections::HashSet::new();
         while !*shutdown.borrow() {
             let page = self.inner.store.lock().await.ended_provider_probes(after)?;
             if page.is_empty() {
@@ -415,6 +416,13 @@ impl Router {
             for (id, agent_id) in page {
                 if *shutdown.borrow() {
                     return Ok(());
+                }
+                // One attempt per blocked artifact per start: a fenced
+                // unknown artifact stays for the Owner inbox item, and the
+                // next start retries it after `artifact reconcile`.
+                if !attempted.insert(agent_id.clone()) {
+                    after = id;
+                    continue;
                 }
                 if let Err(error) = self
                     .finish_provider_probe(
@@ -581,6 +589,12 @@ impl Router {
             };
             match inspected {
                 Ok(_) => break,
+                // An unknown artifact is an uncertain effect: never settle
+                // it automatically. Return at once so the Owner inbox item
+                // carries the exact `swarm artifact reconcile` command.
+                Err(error) if error.code == "provider_probe_artifact_unknown" => {
+                    return Err(error);
+                }
                 Err(error) if error.code == "busy" && tokio::time::Instant::now() < deadline => {
                     #[expect(
                         clippy::disallowed_methods,

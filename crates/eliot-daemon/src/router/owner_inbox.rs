@@ -232,6 +232,9 @@ impl Router {
                         "provider.clear_hold" => {
                             self.provider_clear_hold(&action.args, principal).await
                         }
+                        "artifact.reconcile" => {
+                            self.artifact_reconcile(&action.args, principal).await
+                        }
                         "goal.resume" => self.goal_resume(&action.args, principal).await,
                         "goal.clear" => self.goal_clear(&action.args, principal).await,
                         "goal.round" => self.goal_round(&action.args, principal).await,
