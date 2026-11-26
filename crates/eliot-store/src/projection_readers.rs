@@ -37,7 +37,11 @@ impl ProjectionReaders {
             .connection
             .unchecked_transaction()
             .map_err(sql_error)?;
+        // Source and workspace views repeatedly resolve the same Agent.
+        // Reuse that row only inside this read transaction.
+        *store.snapshot_agent.borrow_mut() = Some(SnapshotAgentCache::default());
         let result = project(&store);
+        *store.snapshot_agent.borrow_mut() = None;
         // End the snapshot before returning the connection to the pool.
         // A failed rollback drops the connection rather than reusing it.
         snapshot.rollback().map_err(sql_error)?;

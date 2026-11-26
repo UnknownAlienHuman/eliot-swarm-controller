@@ -6,6 +6,18 @@ use eliot_core::api::{
 };
 use std::collections::HashMap;
 
+pub(super) struct FleetSummaries {
+    revision: (i64, u64),
+    select: AgentListSelect,
+    growth: core::SessionGrowthThresholds,
+    summaries: Vec<AgentSummary>,
+}
+
+fn progress_age(now: i64, at: Option<i64>) -> Option<i64> {
+    at.and_then(|at| now.checked_sub(at))
+        .filter(|age| *age >= 0)
+}
+
 impl Store {
     /// Compact fleet projection for `agent.list`: scope-checked, filtered,
     /// ordered by Agent ID (`order: id`) or newest activity first
@@ -97,7 +109,7 @@ impl Store {
             filter,
             page,
             limit,
-            |records| self.summaries_from_records(records, now_ms, growth_thresholds),
+            (now_ms, growth_thresholds),
             |scoped, projection| {
                 agent_list_select(scoped, caller, None, None, projection, custody.as_deref())
             },
@@ -114,28 +126,57 @@ impl Store {
         filter: &AgentListFilter,
         page: AgentListSelect,
         limit: usize,
-        summarize: impl Fn(Vec<AgentRecord>) -> Result<Vec<AgentSummary>>,
+        (now_ms, growth_thresholds): (i64, &core::SessionGrowthThresholds),
         select_page: impl Fn(&AgentListFilter, AgentListProjection) -> Result<AgentListSelect>,
         next_cursor: impl Fn(&AgentSummary) -> String,
     ) -> Result<AgentListPage> {
-        let records = {
-            let mut statement = self
-                .connection
-                .prepare_cached(&page.sql)
-                .map_err(sql_error)?;
-            let rows = statement
-                .query_map(
-                    rusqlite::params_from_iter(page.params.iter()),
-                    agent_record_from_row,
-                )
-                .map_err(sql_error)?;
-            let mut records = Vec::new();
-            for row in rows {
-                records.push(row.map_err(sql_error)?);
-            }
-            records
+        // The same bound selection and committed revision imply the same
+        // roster. Recompute clock-dependent ages and the byte bound below.
+        let revision = if filter.states.is_some() && self.connection.is_autocommit() {
+            super::autonomy::revision(&self.connection).ok()
+        } else {
+            None
         };
-        let mut summaries = summarize(records)?;
+        let cached = self.fleet_summaries.borrow();
+        let mut summaries = if let Some(cached) = cached.as_ref()
+            && Some(cached.revision) == revision
+            && cached.select == page
+            && &cached.growth == growth_thresholds
+        {
+            let mut summaries = cached.summaries.clone();
+            for summary in &mut summaries {
+                summary.progress_age_ms = progress_age(now_ms, summary.last_progress_at);
+            }
+            summaries
+        } else {
+            drop(cached);
+            let records = {
+                let mut statement = self
+                    .connection
+                    .prepare_cached(&page.sql)
+                    .map_err(sql_error)?;
+                let rows = statement
+                    .query_map(
+                        rusqlite::params_from_iter(page.params.iter()),
+                        agent_record_from_row,
+                    )
+                    .map_err(sql_error)?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()
+                    .map_err(sql_error)?
+            };
+            let summaries = self.summaries_from_records(records, now_ms, growth_thresholds)?;
+            if let Some(revision) = revision
+                && super::autonomy::revision(&self.connection).ok() == Some(revision)
+            {
+                *self.fleet_summaries.borrow_mut() = Some(FleetSummaries {
+                    revision,
+                    select: page,
+                    growth: *growth_thresholds,
+                    summaries: summaries.clone(),
+                });
+            }
+            summaries
+        };
         let total_page = select_page(filter, AgentListProjection::Count)?;
         let total: i64 = self
             .connection
@@ -239,7 +280,7 @@ impl Store {
             filter,
             page,
             limit,
-            |records| self.summaries_from_records(records, now_ms, growth_thresholds),
+            (now_ms, growth_thresholds),
             |scoped, projection| {
                 agent_list_select_recent(scoped, caller, None, None, projection, custody.as_deref())
             },
@@ -420,9 +461,7 @@ impl Store {
             root: format_agent_id(record.root.unwrap_or(record.id)),
             active_turn: record.active_turn,
             last_progress_at,
-            progress_age_ms: last_progress_at
-                .and_then(|at| now_ms.checked_sub(at))
-                .filter(|age| *age >= 0),
+            progress_age_ms: progress_age(now_ms, last_progress_at),
             last_turn_id,
             last_outcome,
             last_resolution_source,
@@ -751,6 +790,7 @@ enum AgentListProjection {
     StateTotals,
 }
 
+#[derive(PartialEq)]
 struct AgentListSelect {
     sql: String,
     params: Vec<rusqlite::types::Value>,

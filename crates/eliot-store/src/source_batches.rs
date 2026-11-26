@@ -405,7 +405,8 @@ impl Store {
     /// their separate current-generation authorization in read_source_state.
     pub fn list_source_states(&self, agent: &str, generation: i64) -> Result<Vec<Value>> {
         let agent_num = parse_agent_id(agent)?;
-        let current = load_agent_by_num(&self.connection, agent_num)?
+        let current = self
+            .load_snapshot_agent(agent_num)?
             .ok_or_else(|| Error::new("not_found", "source-state Agent was not found"))?;
         let pending = generation > current.generation;
         if generation < 0
@@ -420,7 +421,7 @@ impl Store {
         }
         let mut statement = self
             .connection
-            .prepare(
+            .prepare_cached(
                 "SELECT source FROM source_state WHERE agent = ?1 AND generation = ?2
              AND (?3 = 0 OR source = 'workspace_process') ORDER BY source LIMIT ?4",
             )
@@ -451,7 +452,7 @@ impl Store {
                 .ok_or_else(|| Error::new("source_integrity", "source state disappeared"))?;
             let mut owners = self
                 .connection
-                .prepare(
+                .prepare_cached(
                     "SELECT family, mechanism FROM source_owners
                  WHERE agent = ?1 AND generation = ?2 AND source = ?3 ORDER BY family LIMIT ?4",
                 )
@@ -506,11 +507,9 @@ impl Store {
         let agent_num = parse_agent_id(agent)?;
         let current_generation: i64 = self
             .connection
-            .query_row(
-                "SELECT generation FROM agents WHERE id = ?1",
-                [agent_num],
-                |row| row.get(0),
-            )
+            .prepare_cached("SELECT generation FROM agents WHERE id = ?1")
+            .map_err(sql_error)?
+            .query_row([agent_num], |row| row.get(0))
             .optional()
             .map_err(sql_error)?
             .ok_or_else(|| Error::new("not_found", format!("Agent {agent} was not found")))?;
@@ -522,17 +521,16 @@ impl Store {
         }
         let state = load_source_state(&self.connection, agent_num, generation, source)?
             .ok_or_else(|| Error::new("source_integrity", "source has no committed state"))?;
-        let (observer_ready, diagnostic_counts) =
-            match load_agent_by_num(&self.connection, agent_num)? {
-                Some(agent) => (
-                    observer::live_ready(&self.connection, &agent, generation)?,
-                    load_native_diagnostic_counts(&self.connection, &agent)?,
-                ),
-                None => (false, None),
-            };
+        let (observer_ready, diagnostic_counts) = match self.load_snapshot_agent(agent_num)? {
+            Some(agent) => (
+                observer::live_ready(&self.connection, &agent, generation)?,
+                load_native_diagnostic_counts(&self.connection, &agent)?,
+            ),
+            None => (false, None),
+        };
         let mut statement = self
             .connection
-            .prepare(
+            .prepare_cached(
                 "SELECT family FROM source_owners
                  WHERE agent = ?1 AND generation = ?2 AND source = ?3
                  ORDER BY family LIMIT ?4",
@@ -1854,17 +1852,17 @@ fn load_native_diagnostic_counts(
         return Ok(None);
     };
     connection
-        .query_row(
+        .prepare_cached(
             "SELECT admitted, dropped FROM native_session_unclassified
          WHERE harness = ?1 AND native_scope = ?2 AND native_ref = ?3",
-            params![agent.harness, scope, native_ref],
-            |row| {
-                Ok(core::api::NativeDiagnosticCounts {
-                    unclassified_admitted: row.get(0)?,
-                    unclassified_dropped: row.get(1)?,
-                })
-            },
         )
+        .map_err(sql_error)?
+        .query_row(params![agent.harness, scope, native_ref], |row| {
+            Ok(core::api::NativeDiagnosticCounts {
+                unclassified_admitted: row.get(0)?,
+                unclassified_dropped: row.get(1)?,
+            })
+        })
         .optional()
         .map_err(sql_error)
 }

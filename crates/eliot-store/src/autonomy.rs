@@ -41,7 +41,7 @@ fn window_changes(
     Ok(false)
 }
 
-fn revision(connection: &Connection) -> Result<(i64, u64)> {
+pub(super) fn revision(connection: &Connection) -> Result<(i64, u64)> {
     let version = connection
         .query_row("PRAGMA data_version", [], |row| row.get(0))
         .map_err(sql_error)?;
