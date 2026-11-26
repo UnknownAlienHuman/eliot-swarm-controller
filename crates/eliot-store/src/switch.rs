@@ -5,6 +5,7 @@ use eliot_core::api::{
     ProjectAssignmentState, ProjectManagerIdentity, ReparentRequest, SwitchAgent, SwitchLaunch,
     SwitchRequest, SwitchResponse,
 };
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 mod automatic;
@@ -337,76 +338,36 @@ fn require_assignment_launch_profile(
     Ok(())
 }
 
+fn malformed_switch() -> Error {
+    Error::new("source_integrity", "switch request malformed")
+}
+
+fn take_switch_field<T: DeserializeOwned>(
+    args: &mut serde_json::Map<String, Value>,
+    field: &str,
+) -> Result<Option<T>> {
+    args.remove(field)
+        .map(serde_json::from_value)
+        .transpose()
+        .map_err(|_| malformed_switch())
+}
+
 fn decode_switch(mut args: Value) -> Result<RetainedSwitch> {
-    let malformed = || Error::new("source_integrity", "switch request malformed");
-    let args_map = args.as_object_mut().ok_or_else(malformed)?;
-    let failure = args_map
-        .remove(PROVIDER_FAILURE)
-        .map(serde_json::from_value)
-        .transpose()
-        .map_err(|_| malformed())?;
-    let authority = args_map
-        .remove(PROVIDER_AUTHORITY)
-        .map(serde_json::from_value)
-        .transpose()
-        .map_err(|_| malformed())?;
-    let profile_authority = args_map
-        .remove(SESSION_GROWTH_AUTHORITY)
-        .map(serde_json::from_value)
-        .transpose()
-        .map_err(|_| malformed())?;
-    let owner_automation = args_map
-        .remove(OWNER_AUTOMATION)
-        .map(serde_json::from_value)
-        .transpose()
-        .map_err(|_| malformed())?
-        .unwrap_or(false);
-    let continuation = args_map
-        .remove(CONTINUATION)
-        .map(serde_json::from_value)
-        .transpose()
-        .map_err(|_| malformed())?;
-    let requested_by = args_map
-        .remove(REQUESTED_BY)
-        .map(serde_json::from_value)
-        .transpose()
-        .map_err(|_| malformed())?;
-    let source_stop_command = args_map
-        .remove(SOURCE_STOP_COMMAND)
-        .map(serde_json::from_value)
-        .transpose()
-        .map_err(|_| malformed())?;
-    let source_checkout = args_map
-        .remove(SOURCE_CHECKOUT)
-        .map(serde_json::from_value)
-        .transpose()
-        .map_err(|_| malformed())?;
-    let source_checkout_root = args_map
-        .remove(SOURCE_CHECKOUT_ROOT)
-        .map(serde_json::from_value)
-        .transpose()
-        .map_err(|_| malformed())?;
-    let source_checkout_key = args_map
-        .remove(SOURCE_CHECKOUT_KEY)
-        .map(serde_json::from_value)
-        .transpose()
-        .map_err(|_| malformed())?;
-    let target_checkout_root = args_map
-        .remove(TARGET_CHECKOUT_ROOT)
-        .map(serde_json::from_value)
-        .transpose()
-        .map_err(|_| malformed())?;
-    let target_checkout_key = args_map
-        .remove(TARGET_CHECKOUT_KEY)
-        .map(serde_json::from_value)
-        .transpose()
-        .map_err(|_| malformed())?;
-    let target_project = args_map
-        .remove(TARGET_PROJECT)
-        .map(serde_json::from_value)
-        .transpose()
-        .map_err(|_| malformed())?;
-    let request = serde_json::from_value(args).map_err(|_| malformed())?;
+    let args_map = args.as_object_mut().ok_or_else(malformed_switch)?;
+    let failure = take_switch_field(args_map, PROVIDER_FAILURE)?;
+    let authority = take_switch_field(args_map, PROVIDER_AUTHORITY)?;
+    let profile_authority = take_switch_field(args_map, SESSION_GROWTH_AUTHORITY)?;
+    let owner_automation = take_switch_field(args_map, OWNER_AUTOMATION)?.unwrap_or(false);
+    let continuation = take_switch_field(args_map, CONTINUATION)?;
+    let requested_by = take_switch_field(args_map, REQUESTED_BY)?;
+    let source_stop_command = take_switch_field(args_map, SOURCE_STOP_COMMAND)?;
+    let source_checkout = take_switch_field(args_map, SOURCE_CHECKOUT)?;
+    let source_checkout_root = take_switch_field(args_map, SOURCE_CHECKOUT_ROOT)?;
+    let source_checkout_key = take_switch_field(args_map, SOURCE_CHECKOUT_KEY)?;
+    let target_checkout_root = take_switch_field(args_map, TARGET_CHECKOUT_ROOT)?;
+    let target_checkout_key = take_switch_field(args_map, TARGET_CHECKOUT_KEY)?;
+    let target_project = take_switch_field(args_map, TARGET_PROJECT)?;
+    let request = serde_json::from_value(args).map_err(|_| malformed_switch())?;
     Ok(RetainedSwitch {
         request,
         source_stop_command,

@@ -1658,7 +1658,9 @@ pub(super) fn settle_ended_turn_context_tx(
     let agent = load_agent_by_num(tx, agent_num)?;
     let can_move = allow_fallback && agent.as_ref().is_some_and(next_input_available);
     let safe_point_steers = agent.as_ref().is_some_and(Agent::steers_at_turn_safe_point);
-    for command_id in pending_turn_context_command_ids(tx, agent_num, generation, turn_id)? {
+    for command_id in
+        pending_turn_command_ids(tx, PENDING_TURN_CONTEXT, agent_num, generation, turn_id)?
+    {
         let record = load_command_record(tx, &command_id)?
             .ok_or_else(|| Error::new("source_integrity", "turn context disappeared"))?;
         let args = decode_inject_args(&record.command.args)?;
@@ -1697,7 +1699,7 @@ pub(super) fn settle_ended_turn_context_tx(
         });
     }
     let pending_steers = if safe_point_steers {
-        pending_turn_steer_command_ids(tx, agent_num, generation, turn_id)?
+        pending_turn_command_ids(tx, PENDING_TURN_STEERS, agent_num, generation, turn_id)?
     } else {
         Vec::new()
     };
@@ -2016,59 +2018,31 @@ fn read_pending_context_candidate(
     )))
 }
 
-fn pending_turn_context_command_ids(
-    tx: &Transaction<'_>,
-    agent_num: i64,
-    generation: i64,
-    turn_id: &str,
-) -> Result<Vec<String>> {
-    let mut statement = tx
-        .prepare(
-            "SELECT id FROM commands INDEXED BY commands_context_pending
+const PENDING_TURN_CONTEXT: &str = "SELECT id FROM commands INDEXED BY commands_context_pending
              WHERE target = ?1 AND generation = ?2 AND verb = 'inject'
                AND state IN ('accepted', 'queued')
                AND json_extract(args, '$.point') IN ('turn_safe_point', 'active_turn')
                AND turn_id = ?3
-             ORDER BY created_at, rowid",
-        )
-        .map_err(sql_error)?;
-    let rows = statement
-        .query_map(params![agent_num, generation, turn_id], |row| {
-            row.get::<_, String>(0)
-        })
-        .map_err(sql_error)?;
-    let mut command_ids = Vec::new();
-    for row in rows {
-        command_ids.push(row.map_err(sql_error)?);
-    }
-    Ok(command_ids)
-}
+             ORDER BY created_at, rowid";
 
-fn pending_turn_steer_command_ids(
+const PENDING_TURN_STEERS: &str = "SELECT id FROM commands INDEXED BY commands_turn_steer_pending
+             WHERE target = ?1 AND generation = ?2 AND verb = 'steer'
+               AND state IN ('accepted', 'queued')
+               AND turn_id = ?3
+             ORDER BY created_at, rowid";
+
+fn pending_turn_command_ids(
     tx: &Transaction<'_>,
+    sql: &str,
     agent_num: i64,
     generation: i64,
     turn_id: &str,
 ) -> Result<Vec<String>> {
-    let mut statement = tx
-        .prepare(
-            "SELECT id FROM commands INDEXED BY commands_turn_steer_pending
-             WHERE target = ?1 AND generation = ?2 AND verb = 'steer'
-               AND state IN ('accepted', 'queued')
-               AND turn_id = ?3
-             ORDER BY created_at, rowid",
-        )
-        .map_err(sql_error)?;
+    let mut statement = tx.prepare(sql).map_err(sql_error)?;
     let rows = statement
-        .query_map(params![agent_num, generation, turn_id], |row| {
-            row.get::<_, String>(0)
-        })
+        .query_map(params![agent_num, generation, turn_id], |row| row.get(0))
         .map_err(sql_error)?;
-    let mut command_ids = Vec::new();
-    for row in rows {
-        command_ids.push(row.map_err(sql_error)?);
-    }
-    Ok(command_ids)
+    rows.collect::<rusqlite::Result<_>>().map_err(sql_error)
 }
 
 fn claimed_context_commands(
