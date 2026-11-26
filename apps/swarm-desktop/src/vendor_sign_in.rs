@@ -88,7 +88,8 @@ async fn run() {
     // Failed polls in a row (no daemon answering): the next waits longer.
     let mut pace = crate::live::Pace::default();
     // The data directory whose daemon refused this desktop (`not_allowed`):
-    // a definite answer, so it is asked no more until the directory changes.
+    // a definite answer, so that daemon is asked no more; a new data
+    // directory or a daemon that went down and came back is asked again.
     let mut refused: Option<PathBuf> = None;
     loop {
         interval.tick().await;
@@ -101,6 +102,9 @@ async fn run() {
             }
         }
         if DAEMON_DOWN.load(std::sync::atomic::Ordering::Relaxed) {
+            // The daemon that refused may come back as another release
+            // with other rules: ask it again once it answers.
+            refused = None;
             continue;
         }
         let Ok(data_dir) = crate::client::data_dir() else {
