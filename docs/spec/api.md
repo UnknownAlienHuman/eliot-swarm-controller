@@ -872,6 +872,13 @@ the daemon keeps the work queued. The desktop claims the exact harness and revis
 runs the vendor's native interactive flow in the Owner's desktop session, and reports
 the result through the bounded desktop sign-in DTOs. The CLI request itself never
 opens a headless vendor process or asserts that the desktop action completed.
+On Windows, `auth.desktop.poll`, `auth.desktop.claim` and `auth.desktop.report`
+require the interactive Swarm desktop: the peer basename must be
+`swarm-desktop.exe` in the active session. When the peer handle cannot be
+opened, the basename comes from a handle-free Toolhelp snapshot. A refusal
+keeps the wire-stable `not_allowed` message and logs once per peer pid with a
+15-minute re-log cap (`peer_pid`, plus `suppressed_refusals` when nonzero);
+the per-call `rpc.error` line is suppressed for these refusals.
 
 The daemon dispatches one automatic console per harness outage. The grant expires
 after 15 seconds. Store retains the claim across daemon restarts. An explicit request
