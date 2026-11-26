@@ -662,6 +662,10 @@ pub struct Agent {
 }
 
 impl Agent {
+    pub fn is_goal_auditor(&self) -> bool {
+        self.profile_snapshot["goal_audit_read_only"] == Value::Bool(true)
+    }
+
     pub fn receives_git_base_notices(&self) -> bool {
         !self.chat
             && !self.observe_only

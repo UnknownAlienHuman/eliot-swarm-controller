@@ -31,6 +31,7 @@ pub type SwitchLiveCheckout = (String, i64, String, String);
 pub struct SwitchReservation<'a> {
     pub owner_process: Option<&'a OwnerProcess>,
     pub profile_authority: Option<[u8; 32]>,
+    pub audit_revision: Option<i64>,
     pub source_checkout: Option<(&'a str, &'a str)>,
     pub live_checkouts: &'a [SwitchLiveCheckout],
 }
@@ -124,6 +125,7 @@ pub(super) fn require_checkout_launch_tx(
     id: &str,
     agent: i64,
     workspace: Option<&str>,
+    audit_owner: Option<i64>,
 ) -> Result<()> {
     let switch_parent: Option<(Option<String>, Option<String>)> = tx
         .query_row(
@@ -169,8 +171,12 @@ pub(super) fn require_checkout_launch_tx(
             ));
         }
     }
-    if parent.is_none() {
-        require_checkout_owner_tx(tx, Some(workspace), Some(agent))?;
+    // An audited continuation may launch into the exact checkout still
+    // permanently owned by the Goal's original Agent. The Goal helper binds
+    // this ID; every other permanent owner remains a conflict. This exception
+    // never crosses an unsettled switch fence above.
+    if parent.is_none() || audit_owner.is_some() {
+        require_checkout_owner_tx(tx, Some(workspace), audit_owner.or(Some(agent)))?;
     }
     Ok(())
 }
@@ -233,9 +239,10 @@ pub struct SwitchWork {
 
 /// Switch input prepared against the source generation and reserved payload.
 pub struct PreparedSwitchBrief {
-    switch_id: String,
+    pub(super) switch_id: String,
     provider_boundary: Option<i64>,
     pub(super) binding: Option<(String, String)>,
+    pub(super) audit_text: Option<String>,
     pub(super) brief: handoff::brief::BuiltBrief,
     pub(super) resume_goal: bool,
     pub(super) enters_assignment: bool,
@@ -1339,6 +1346,7 @@ impl Store {
         let handoff = request.handoff(&plan.handoff_command, "a9223372036854775807", i64::MAX);
         let provider = retained.provider_failure.is_some();
         let resume_goal = !provider && request.launch.project.is_none();
+        let audit_text = goals::goal_audit_switch_text(&tx, &source, id)?;
         let binding = facts.task_command.clone().zip(facts.task_ref.clone());
         let brief = if provider && binding.is_none() && !facts.original_task_missing {
             let task = handoff::source_task(&tx, &source, &request.task_command, None)?
@@ -1388,6 +1396,7 @@ impl Store {
                     saved_context: None,
                     transferred: &originals,
                     facts: Some(facts),
+                    audit_text: audit_text.as_deref(),
                     directive: directive.as_deref(),
                     input_principal: None,
                     restart: false,
@@ -1413,6 +1422,7 @@ impl Store {
             switch_id: id.to_owned(),
             provider_boundary,
             binding,
+            audit_text,
             brief,
             resume_goal,
             enters_assignment,
@@ -1467,6 +1477,7 @@ impl Store {
         let SwitchReservation {
             owner_process,
             profile_authority,
+            audit_revision,
             source_checkout,
             live_checkouts,
         } = reservation;
@@ -1512,6 +1523,11 @@ impl Store {
                 ));
             }
             require_switch_caller(&tx, principal, request)?;
+            if let Some(revision) = audit_revision {
+                let source = load_agent_by_num(&tx, parse_agent_id(&request.from)?)?
+                    .ok_or_else(|| Error::new("not_found", "source Agent missing"))?;
+                goals::bind_goal_audit_switch_tx(&tx, &source, revision, &request.id, now)?;
+            }
             source_tx(&tx, request, self.hierarchy_limits, policy, false)?;
             let mut change = reserve_switch_tx(
                 &tx,
@@ -2325,6 +2341,13 @@ impl Store {
                     uncertain =
                         handoff::last_turn_uncertain(&tx, source_num, request.from_generation)?
                             || has_unknown_gate(&tx, source_num)?;
+                    let current_audit_text = goals::goal_audit_switch_text(&tx, &source, id)?;
+                    if current_audit_text != brief.audit_text {
+                        return Err(Error::new(
+                            "bad_state",
+                            "Goal audit was paused, cleared, or changed before transfer",
+                        ));
+                    }
                     consume_switch_child_id(&tx, id, &plan.handoff_command, "handoff")?;
                     let change = handoff::handoff_tx(
                         &tx,
@@ -2560,6 +2583,11 @@ impl Store {
             let outcome = serde_json::to_value(&value)
                 .map_err(|_| Error::new("internal", "cannot encode switch result"))?;
             update_command_state(&tx, id, state, Some(&outcome), None, now)?;
+            if state != CommandState::Applied
+                && let Some(source) = load_agent_by_num(&tx, parse_agent_id(&request.from)?)?
+            {
+                goals::settle_goal_audit_switch_tx(&tx, &source, id, now)?;
+            }
             Store::settle_automatic_handoff_attempt_tx(&tx, id, state, now)?;
             events.push(insert_daemon_command_event(
                 &tx, now, &format!("command.{}",command_state_name(state)), None, None, id,
@@ -2716,6 +2744,9 @@ impl Store {
                 now,
                 false,
             )?;
+            if let Some(source) = load_agent_by_num(&tx, parse_agent_id(&retained.request.from)?)? {
+                goals::settle_goal_audit_switch_tx(&tx, &source, id, now)?;
+            }
             events.extend(change.events);
             Self::settle_automatic_handoff_attempt_tx(&tx, id, CommandState::Rejected, now)?;
             commit_transaction(tx, &self.write_faulted)?;
@@ -3117,7 +3148,9 @@ fn source_tx(
             "switch gained a transferable SEND after its reservation",
         ));
     }
-    goals::require_handoff_source_goal(tx, &source, policy)?;
+    if goals::goal_audit_switch_text(tx, &source, &request.id)?.is_none() {
+        goals::require_handoff_source_goal(tx, &source, policy)?;
+    }
     require_switch_children(tx, &source, limits)?;
     // Continue-in-project binds the target registration at reserve time, so
     // preparation resolves the target checkout and never the source repo.

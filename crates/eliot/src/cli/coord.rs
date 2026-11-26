@@ -852,6 +852,17 @@ fn print_owner_inbox(response: &OwnerInboxResponse, json_output: bool) -> Result
             if let Some(detail) = &item.detail {
                 println!("  {detail}");
             }
+            if let Some(history) = &item.audit_history {
+                for entry in history {
+                    println!("  Audit cycle {} · auditor {}", entry.cycle, entry.auditor);
+                    if let Some(successor) = &entry.successor {
+                        println!("    Successor: {successor}");
+                    }
+                    for line in entry.text.lines() {
+                        println!("    {line}");
+                    }
+                }
+            }
             if let Some(instructions) = &item.instructions {
                 println!("  Run:");
                 for line in instructions.lines() {

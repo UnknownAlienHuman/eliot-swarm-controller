@@ -58,6 +58,7 @@ pub use failed_custody::FailedGenerationExitSnapshot;
 pub use fleet::{AgentListFilter, AgentListPage};
 pub use git::CodeProgressState;
 pub use goals::{
+    GOAL_AUDIT_HISTORY_LIMIT, GoalAuditEvidence, GoalAuditHistoryEntry, GoalAuditStep,
     GoalCheckCustody, GoalCheckDeadlineTarget, GoalCheckHistoryEntry, GoalCheckResult,
     GoalCommitOutcome, GoalContinuation, GoalRoundClaim, GoalRoundCommit, GoalRoundCommitResult,
     GoalRoundDecision, GoalRoundKey, GoalRoundProbe,

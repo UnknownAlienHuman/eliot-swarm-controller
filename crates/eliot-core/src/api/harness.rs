@@ -521,6 +521,8 @@ pub struct HarnessCapabilities {
     pub compact: bool,
     /// Native compaction exposes a recoverable boundary after a stream gap.
     pub compaction_gap_recovery: bool,
+    /// Enforces one fresh read-only audit turn via native controls.
+    pub goal_audit_read_only: bool,
     /// `harness.models` accepts a `workspace` launch-preview argument.
     pub models_workspace_preview: bool,
     /// Published native aliases used when a verified live catalogue is unavailable.

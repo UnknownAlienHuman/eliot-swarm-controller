@@ -184,15 +184,28 @@ impl RemoteAgentMcp {
     }
 }
 
-fn agent_config_json(
-    model: Option<&str>,
-    fragment: Option<&LocalProvider>,
-    swarm_executable: &str,
-    swarm_data_dir: &str,
-    swarm_environment: &[(OsString, OsString)],
-    native_subagents: Option<&str>,
-    remote_mcp: Option<&RemoteAgentMcp>,
-) -> String {
+struct AgentConfigInput<'a> {
+    model: Option<&'a str>,
+    fragment: Option<&'a LocalProvider>,
+    swarm_executable: &'a str,
+    swarm_data_dir: &'a str,
+    swarm_environment: &'a [(OsString, OsString)],
+    native_subagents: Option<&'a str>,
+    remote_mcp: Option<&'a RemoteAgentMcp>,
+    goal_audit_read_only: bool,
+}
+
+fn agent_config_json(input: AgentConfigInput<'_>) -> String {
+    let AgentConfigInput {
+        model,
+        fragment,
+        swarm_executable,
+        swarm_data_dir,
+        swarm_environment,
+        native_subagents,
+        remote_mcp,
+        goal_audit_read_only,
+    } = input;
     let mut servers = serde_json::Map::new();
     let managed = if let Some(remote) = remote_mcp {
         serde_json::json!({
@@ -219,14 +232,16 @@ fn agent_config_json(
             "environment": environment,
         })
     };
-    servers.insert(SWARM_MCP_SERVER_NAME.to_owned(), managed);
-    let mcp = serde_json::Value::Object({
-        let mut mcp = serde_json::Map::new();
-        mcp.insert("servers".to_owned(), serde_json::Value::Object(servers));
-        mcp
-    });
     let mut document = provider_config(model, fragment);
-    document["mcp"] = mcp;
+    if !goal_audit_read_only {
+        servers.insert(SWARM_MCP_SERVER_NAME.to_owned(), managed);
+        let mcp = serde_json::Value::Object({
+            let mut mcp = serde_json::Map::new();
+            mcp.insert("servers".to_owned(), serde_json::Value::Object(servers));
+            mcp
+        });
+        document["mcp"] = mcp;
+    }
     if let Some(permission) = native_subagents_permission(native_subagents) {
         document["permission"] = permission;
     }
@@ -317,6 +332,8 @@ pub struct ServerLaunch {
     /// `task` deny in the isolated per-Agent config as a second layer next
     /// to the authoritative per-session `subagent` deny ruleset.
     pub native_subagents: Option<String>,
+    /// One-off frozen Goal audit mode: do not configure the internal Agent MCP.
+    pub goal_audit_read_only: bool,
 }
 
 /// Launch of a short-lived archive reader server: the same owned `serve`
@@ -398,7 +415,9 @@ impl OwnedServer {
             )
         })?;
         let config_path = config_dir.join("opencode.jsonc");
-        if let Some(rules) = &launch.owner_rules {
+        if !launch.goal_audit_read_only
+            && let Some(rules) = &launch.owner_rules
+        {
             // OpenCode v2 loads AGENTS.md from its effective global config
             // directory. XDG_CONFIG_HOME below binds it to this instance.
             std::fs::write(config_dir.join("AGENTS.md"), rules).map_err(|_| {
@@ -441,15 +460,16 @@ impl OwnedServer {
         })?;
         std::fs::write(
             &config_path,
-            agent_config_json(
-                launch.model.as_deref(),
-                launch.local_provider.as_ref(),
+            agent_config_json(AgentConfigInput {
+                model: launch.model.as_deref(),
+                fragment: launch.local_provider.as_ref(),
                 swarm_executable,
                 swarm_data_dir,
-                &launch.swarm_environment,
-                launch.native_subagents.as_deref(),
-                launch.remote_mcp.as_ref(),
-            ),
+                swarm_environment: &launch.swarm_environment,
+                native_subagents: launch.native_subagents.as_deref(),
+                remote_mcp: launch.remote_mcp.as_ref(),
+                goal_audit_read_only: launch.goal_audit_read_only,
+            }),
         )
         .map_err(|error| {
             Error::new(
@@ -457,61 +477,65 @@ impl OwnedServer {
                 format!("OpenCode per-Agent config could not be written: {error}"),
             )
         })?;
-        // Vendor-native context-hook producer: one auto-discovered plugin
-        // file under the isolated root, written before `serve` starts. This
-        // adds nothing to `opencode.jsonc` (model/mcp/auth behavior
-        // unchanged) and touches no global user file: only this directory
-        // gains one file, rewritten verbatim on every start.
-        let plugins_dir = config_dir.join("plugins");
-        std::fs::create_dir_all(&plugins_dir).map_err(|error| {
-            Error::new(
-                "native_spawn",
-                format!("OpenCode per-Agent plugins directory could not be created: {error}"),
+        if !launch.goal_audit_read_only {
+            // Vendor-native context-hook producer: one auto-discovered plugin
+            // file under the isolated root, written before `serve` starts. This
+            // adds nothing to `opencode.jsonc` (model/mcp/auth behavior
+            // unchanged) and touches no global user file: only this directory
+            // gains one file, rewritten verbatim on every start.
+            let plugins_dir = config_dir.join("plugins");
+            std::fs::create_dir_all(&plugins_dir).map_err(|error| {
+                Error::new(
+                    "native_spawn",
+                    format!("OpenCode per-Agent plugins directory could not be created: {error}"),
+                )
+            })?;
+            std::fs::write(
+                plugins_dir.join(ELIOT_CONTEXT_PLUGIN_FILE),
+                ELIOT_CONTEXT_PLUGIN,
             )
-        })?;
-        std::fs::write(
-            plugins_dir.join(ELIOT_CONTEXT_PLUGIN_FILE),
-            ELIOT_CONTEXT_PLUGIN,
-        )
-        .map_err(|error| {
-            Error::new(
-                "native_spawn",
-                format!("OpenCode per-Agent plugin could not be written: {error}"),
-            )
-        })?;
-        // Bundled coordination skill: copy the daemon-materialized
-        // canonical files into this isolated root's global skills
-        // directory, so the per-Agent server loads `eliot-swarm` natively
-        // with no project or user file touched. Rewritten verbatim on
-        // every start, like the context-hook plugin above. A missing
-        // canonical copy fails the start: the Agent must not start
-        // believing it has no skill.
-        let skill_dir = config_dir.join("skills").join(skill::SKILL_NAME);
-        std::fs::create_dir_all(&skill_dir).map_err(|error| {
-            Error::new(
-                "native_spawn",
-                format!("OpenCode per-Agent skills directory could not be created: {error}"),
-            )
-        })?;
-        for file in [skill::SKILL_FILE, skill::SKILL_REFERENCE_FILE] {
-            let text = skill::read_skill_file(&skill::skill_dir(&launch.swarm_data_dir).join(file))
+            .map_err(|error| {
+                Error::new(
+                    "native_spawn",
+                    format!("OpenCode per-Agent plugin could not be written: {error}"),
+                )
+            })?;
+            // Bundled coordination skill: copy the daemon-materialized
+            // canonical files into this isolated root's global skills
+            // directory, so the per-Agent server loads `eliot-swarm` natively
+            // with no project or user file touched. Rewritten verbatim on
+            // every start, like the context-hook plugin above. A missing
+            // canonical copy fails the start: the Agent must not start
+            // believing it has no skill.
+            let skill_dir = config_dir.join("skills").join(skill::SKILL_NAME);
+            std::fs::create_dir_all(&skill_dir).map_err(|error| {
+                Error::new(
+                    "native_spawn",
+                    format!("OpenCode per-Agent skills directory could not be created: {error}"),
+                )
+            })?;
+            for file in [skill::SKILL_FILE, skill::SKILL_REFERENCE_FILE] {
+                let text = skill::read_skill_file(
+                    &skill::skill_dir(&launch.swarm_data_dir).join(file),
+                )
                 .map_err(|_| {
                     Error::new(
                         "native_spawn",
                         "OpenCode skill source is unavailable; the daemon did not materialize it",
                     )
                 })?;
-            std::fs::write(skill_dir.join(file), text).map_err(|error| {
-                Error::new(
-                    "native_spawn",
-                    format!("OpenCode per-Agent skill could not be written: {error}"),
-                )
-                .with_where("plugin.opencode.start.spawn")
-                .with_origin(
-                    FailureOrigin::Environment,
-                    "isolated instance directory write failed",
-                )
-            })?;
+                std::fs::write(skill_dir.join(file), text).map_err(|error| {
+                    Error::new(
+                        "native_spawn",
+                        format!("OpenCode per-Agent skill could not be written: {error}"),
+                    )
+                    .with_where("plugin.opencode.start.spawn")
+                    .with_origin(
+                        FailureOrigin::Environment,
+                        "isolated instance directory write failed",
+                    )
+                })?;
+            }
         }
         // Credential preparation before `serve` starts, under the exact XDG
         // roots the server will use. Cloud path: the isolated store sees no

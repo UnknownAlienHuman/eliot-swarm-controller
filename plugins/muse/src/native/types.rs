@@ -925,8 +925,10 @@ pub(crate) fn turn_usage_from_native(usage: &NativeTurnUsage) -> Option<TurnUsag
 /// target feeds native file-change hints, and `patch_ref` carries only the
 /// durable stored-output id (plus its servability flag) behind which a
 /// multi-file edit diff waits. Every other per-kind field (`visibleOutput`,
-/// `outputRef`, `patchSummary`, `commandText`, ...) stays unparsed: unknown
-/// fields are ignored, so additive schema evolution never rejects a frame.
+/// `outputRef`, `patchSummary`, `commandText`, ...) stays unparsed, apart from
+/// the compaction `trigger` and terminal `outcome` needed to map its durable
+/// lifecycle. Unknown fields are ignored, so additive schema evolution never
+/// rejects a frame.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NativeItem {
@@ -934,6 +936,10 @@ pub struct NativeItem {
     pub kind: String,
     pub revision: i64,
     pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trigger: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

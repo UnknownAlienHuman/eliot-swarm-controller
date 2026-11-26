@@ -384,6 +384,9 @@ pub(crate) enum AcpUpdate {
         cost_amount: Option<f64>,
         cost_unit: Option<String>,
     },
+    /// Session-scoped compaction summary content. ACP supplies no prompt or
+    /// turn identity, so this update is never attributed to a pending turn.
+    CompactionSummaryChunk,
     /// Known metadata updates this adapter does not model (plan, mode,
     /// config, notices, …): handled without input association.
     Ignored,
@@ -572,14 +575,14 @@ pub(crate) fn classify_update(params: &Value) -> Option<(String, AcpUpdate)> {
                 cost_amount: usage_cost_amount(update.get("cost")),
                 cost_unit: usage_cost_unit(update.get("cost")),
             },
+            "compaction_summary_chunk" => AcpUpdate::CompactionSummaryChunk,
             "plan"
             | "available_commands_update"
             | "current_mode_update"
             | "config_option_update"
             | "session_info_update"
             | "notice"
-            | "compaction_update"
-            | "compaction_summary_chunk" => AcpUpdate::Ignored,
+            | "compaction_update" => AcpUpdate::Ignored,
             other => AcpUpdate::Other(other.to_owned()),
         },
     ))

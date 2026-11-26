@@ -595,6 +595,7 @@ pub(super) fn project_harness_auth(
             group: None,
             blocks_work: false,
             outcome_unknown: phase == "unknown",
+            audit_history: None,
         });
     }
     Ok(())

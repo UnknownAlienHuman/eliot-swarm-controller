@@ -413,6 +413,8 @@ struct EventProcessor {
     active_input: Option<String>,
     /// Input merged into the last finished turn, for its late lifecycle.
     last_input: Option<String>,
+    /// Exact turn carrying the native manual-compaction boundary.
+    manual_compaction_turn: Option<String>,
     /// A native result ended while the bound input was still queued.
     native_prefix_ended: bool,
     /// Main-loop usage of those earlier native results in this turn.
@@ -921,6 +923,7 @@ impl EventProcessor {
             task_notification_pending: false,
             active_input: None,
             last_input: None,
+            manual_compaction_turn: None,
             native_prefix_ended: false,
             prefix_usage: None,
             deny_uncertain: HashSet::new(),
@@ -1368,14 +1371,29 @@ impl EventProcessor {
             return Ok(());
         }
         let mut data = json!({});
+        let trigger = record
+            .pointer("/compact_metadata/trigger")
+            .or_else(|| record.pointer("/compactMetadata/trigger"))
+            .and_then(Value::as_str);
+        if let Some(trigger @ ("manual" | "auto")) = trigger {
+            data["trigger"] = json!(trigger);
+        }
+        let mut manual_turn = None;
         if !self.status.source_unknown
             && !self.writes_blocked
             && let Some(turn_id) = self.status.active_turn_id.as_deref()
         {
             data["turn_id"] = Value::String(turn_id.to_owned());
+            if trigger == Some("manual") {
+                manual_turn = Some(turn_id.to_owned());
+            }
         }
         self.commit_event("session.context.compacted", native_id, data)
-            .await
+            .await?;
+        if let Some(turn_id) = manual_turn {
+            self.manual_compaction_turn = Some(turn_id);
+        }
+        Ok(())
     }
 
     /// Claude announces a background task notification before its init.
@@ -3378,7 +3396,16 @@ impl EventProcessor {
         }
         self.task_notification_pending = false;
         self.status.background_continuation = false;
-        if parsed.terminal_reason.trim().is_empty() {
+        let manual_compaction_completed = parsed.terminal_reason.trim().is_empty()
+            && self.manual_compaction_turn.as_ref().is_some_and(|turn| {
+                self.status.active_turn_id.as_ref() == Some(turn)
+                    && !parsed.names_only_other_inputs(turn)
+            })
+            && self.status.session_id.is_some()
+            && parsed.session_id == self.status.session_id
+            && record.get("subtype").and_then(Value::as_str) == Some("success")
+            && record.get("is_error").and_then(Value::as_bool) == Some(false);
+        if parsed.terminal_reason.trim().is_empty() && !manual_compaction_completed {
             return self
                 .record_gap("Claude result omitted its terminal reason")
                 .await;
@@ -3452,30 +3479,39 @@ impl EventProcessor {
         {
             return Ok(());
         }
+        // The native /compact control result has a success subtype and no
+        // terminal reason. Its already committed boundary ties it to this turn.
         let reported = native_terminal_reason(&parsed.terminal_reason);
-        if reported == TerminalOutcome::Unknown {
+        if reported == TerminalOutcome::Unknown && !manual_compaction_completed {
             self.record_unclassified("claude.result.terminal_reason", &parsed.terminal_reason)
                 .await?;
         }
         let secrets = SecretPolicy::new(self.secrets.iter().cloned());
-        let terminal_reason = if reported == TerminalOutcome::Unknown {
+        let terminal_reason = if manual_compaction_completed {
+            String::new()
+        } else if reported == TerminalOutcome::Unknown {
             "other".to_owned()
         } else {
             secrets.redact_text(&parsed.terminal_reason)
         };
-        let outcome = eliot_plugin::settle::terminal_outcome(
+        let outcome = eliot_plugin::settle::terminal_outcome_with_manual_compaction(
             reported,
             self.native_provider_restriction
                 .as_ref()
                 .map(|restriction| restriction.kind),
+            record.get("subtype").and_then(Value::as_str) == Some("success")
+                && record.get("is_error").and_then(Value::as_bool) == Some(false),
+            manual_compaction_completed,
         );
         let mut data = json!({
             "command_id": command_id.clone(),
             "turn_id": turn_id.clone(),
-            "status": if outcome == TerminalOutcome::Failure { "failed" } else { &terminal_reason },
+            "status": if outcome == TerminalOutcome::Failure { "failed" } else if manual_compaction_completed { "completed" } else { &terminal_reason },
             "outcome": outcome,
-            "native_status": terminal_reason.clone(),
         });
+        if !manual_compaction_completed {
+            data["native_status"] = json!(terminal_reason);
+        }
         self.scope_turn_command(&mut data);
         let mut provider_restriction = self.native_provider_restriction.take();
         let rate_limit_event = self.native_rate_limit_event.take();
@@ -3615,7 +3651,7 @@ impl EventProcessor {
             command_id,
             turn_id,
             status: outcome.terminal_status().map(str::to_owned),
-            native_status: Some(terminal_reason),
+            native_status: (!manual_compaction_completed).then_some(terminal_reason),
             final_text: data
                 .get("final_text")
                 .and_then(Value::as_str)
@@ -3624,6 +3660,7 @@ impl EventProcessor {
             write_pending: true,
         });
         self.status.active_turn_id = None;
+        self.manual_compaction_turn = None;
         self.status.active_command_id = None;
         self.status.native_unbound = false;
         self.status.wake_cancel_pending = false;

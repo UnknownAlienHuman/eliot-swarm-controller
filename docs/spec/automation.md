@@ -2203,12 +2203,16 @@ audit cycle instead of waiting for the Owner:
    `max_audits = 0`, the Goal stays blocked for the Owner as before. The Owner
    inbox then lists the audit history with each auditor's text.
 
-The audit only reads: it never writes, reverts or deletes. Scope findings
+Audits use read-only worktree evidence. OpenCode permits reading the worktree's
+root directory listing and denies other native tools, including arbitrary file
+reads and searches. Its session readback must match that exact policy before
+the adapter reports readiness. Scope findings
 (`scope_violation`, `check_input_changed`, `scope_unverified`) are safety stops and
 still wait for the Owner. `check_unrunnable` waits for a corrected check. An unknown
-audit or handoff outcome holds the cycle and is never replayed. A missing `audit`
-role, or a successor that routing cannot admit, leaves the Goal blocked with that
-reason. An Owner pause or clear ends the cycle.
+audit or handoff outcome holds the cycle and is never replayed. The 30-second
+Goal driver tick retries a proven pre-admission refusal and retains its reason
+for the Owner. An admitted failure ends that cycle. An Owner pause or clear
+fences the cycle and requests STOP for an already-starting or running auditor.
 
 ### Default Goal objective
 

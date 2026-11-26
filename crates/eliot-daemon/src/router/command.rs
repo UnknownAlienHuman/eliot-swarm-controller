@@ -765,7 +765,7 @@ impl Router {
         {
             return false;
         }
-        if agent.chat || existing.is_some() {
+        if agent.chat || agent.is_goal_auditor() || existing.is_some() {
             return true;
         }
 

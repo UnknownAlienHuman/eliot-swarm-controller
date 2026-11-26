@@ -2770,15 +2770,21 @@ impl EventProcessor {
         if matches!(
             method.as_str(),
             "item/started" | "item/updated" | "item/completed"
-        ) && (params.pointer("/item/kind").and_then(Value::as_str)
-            == Some("backgroundTerminalCompletion")
-            || self.status.active_turn_id.is_none()
-            || self.status.last_turn.as_ref().is_some_and(|last| {
-                native_notification_turn_id(&params) == Some(last.turn_id.as_str())
-            }))
+        ) && params.pointer("/item/kind").and_then(Value::as_str) != Some("compaction")
+            && (method != "item/updated"
+                || self.status.session_id.as_deref().is_none_or(|session_id| {
+                    params.get("sessionId").and_then(Value::as_str) == Some(session_id)
+                }))
+            && (params.pointer("/item/kind").and_then(Value::as_str)
+                == Some("backgroundTerminalCompletion")
+                || self.status.active_turn_id.is_none()
+                || self.status.last_turn.as_ref().is_some_and(|last| {
+                    native_notification_turn_id(&params) == Some(last.turn_id.as_str())
+                }))
         {
             // Background receipts and idle view items can outlive their
-            // foreground turn. They carry no new active-turn binding.
+            // foreground turn. An update for another bound session goes
+            // through the session validation below even when idle.
             return Ok(());
         }
         match method.as_str() {
@@ -2941,10 +2947,17 @@ impl EventProcessor {
                             "Muse item/started did not match the 1.4 schema",
                         )
                     })?;
-                self.validate_item_turn(
-                    &notification.session_id,
-                    notification.item.turn_id.as_ref(),
-                )?;
+                if notification.item.kind == "compaction" {
+                    self.validate_compaction_binding(
+                        &notification.session_id,
+                        notification.item.turn_id.as_deref(),
+                    )?;
+                } else {
+                    self.validate_item_turn(
+                        &notification.session_id,
+                        notification.item.turn_id.as_ref(),
+                    )?;
+                }
                 self.start_tool(&notification.item).await?;
             }
             "item/updated" => {
@@ -2986,32 +2999,37 @@ impl EventProcessor {
                             "Muse item/completed did not match the 1.4 schema",
                         )
                     })?;
-                self.validate_item_turn(
-                    &notification.session_id,
-                    notification.item.turn_id.as_ref(),
-                )?;
-                if notification.item.kind == "agentMessage" {
-                    let text = notification.item.text.as_deref().ok_or_else(|| {
-                        Error::new("native_protocol", "Muse agentMessage omitted its text")
-                    })?;
-                    if self.status.model_mismatch.is_none() {
-                        let bytes = self.messages.awaiting_bytes.saturating_add(text.len());
-                        if bytes > MAX_TEXT_BYTES
-                            || self.messages.awaiting_model.len() >= MAX_MESSAGES_AWAITING_MODEL
-                        {
-                            return self
-                                .record_gap(
-                                    "Muse messages awaiting provider evidence exceeded their bound",
-                                )
-                                .await;
-                        }
-                        self.messages.awaiting_bytes = bytes;
-                        self.messages
-                            .awaiting_model
-                            .push((notification.item.item_id, text.to_owned()));
-                    }
+                if notification.item.kind == "compaction" {
+                    self.complete_compaction(&notification.session_id, &notification.item)
+                        .await?;
                 } else {
-                    self.complete_tool(&notification.item).await?;
+                    self.validate_item_turn(
+                        &notification.session_id,
+                        notification.item.turn_id.as_ref(),
+                    )?;
+                    if notification.item.kind == "agentMessage" {
+                        let text = notification.item.text.as_deref().ok_or_else(|| {
+                            Error::new("native_protocol", "Muse agentMessage omitted its text")
+                        })?;
+                        if self.status.model_mismatch.is_none() {
+                            let bytes = self.messages.awaiting_bytes.saturating_add(text.len());
+                            if bytes > MAX_TEXT_BYTES
+                                || self.messages.awaiting_model.len() >= MAX_MESSAGES_AWAITING_MODEL
+                            {
+                                return self
+                                    .record_gap(
+                                        "Muse messages awaiting provider evidence exceeded their bound",
+                                    )
+                                    .await;
+                            }
+                            self.messages.awaiting_bytes = bytes;
+                            self.messages
+                                .awaiting_model
+                                .push((notification.item.item_id, text.to_owned()));
+                        }
+                    } else {
+                        self.complete_tool(&notification.item).await?;
+                    }
                 }
             }
             "item/delta" => {
@@ -3169,6 +3187,98 @@ impl EventProcessor {
                 Ok(())
             }
         }
+    }
+
+    /// A compaction item can finish after the run it summarizes has settled.
+    /// Accept only the exact active or most recently completed native turn;
+    /// a mismatched native turn must not be attached to the current input.
+    fn validate_compaction_binding(
+        &self,
+        session_id: &str,
+        native_turn_id: Option<&str>,
+    ) -> Result<bool> {
+        if self.status.session_id.as_deref() != Some(session_id) {
+            return Err(Error::new(
+                "source_integrity",
+                "Muse compaction item did not belong to the owned native session",
+            ));
+        }
+        let Some(native_turn_id) = native_turn_id else {
+            return Ok(false);
+        };
+        if native_turn_id.trim().is_empty() {
+            return Err(Error::new(
+                "source_integrity",
+                "Muse compaction item carried an empty native turn id",
+            ));
+        }
+        if self.status.active_turn_id.as_deref() == Some(native_turn_id) {
+            return Ok(true);
+        }
+        if self
+            .status
+            .last_turn
+            .as_ref()
+            .is_some_and(|turn| turn.turn_id == native_turn_id)
+        {
+            return Ok(false);
+        }
+        Err(Error::new(
+            "source_integrity",
+            "Muse compaction item did not match the active or latest completed native turn",
+        ))
+    }
+
+    /// Only the authoritative terminal compaction item with outcome
+    /// `compacted` proves that context changed. The session/compact reply is
+    /// admission only; its exact item UUID and trigger arrive here through the
+    /// durable view lifecycle for both manual and automatic compactions.
+    async fn complete_compaction(&mut self, session_id: &str, item: &NativeItem) -> Result<()> {
+        let active_turn = self.validate_compaction_binding(session_id, item.turn_id.as_deref())?;
+        if item.outcome.as_deref() != Some("compacted") {
+            match item.outcome.as_deref() {
+                Some("noop" | "failed" | "cancelled") => return Ok(()),
+                Some(outcome) => {
+                    self.record_unclassified_native("muse.compaction.outcome", outcome)
+                        .await?;
+                    return Ok(());
+                }
+                None => {
+                    return self
+                        .record_gap("Muse terminal compaction item omitted its outcome")
+                        .await;
+                }
+            }
+        }
+        if item.item_id.trim().is_empty() {
+            return self
+                .record_gap("Muse compaction item omitted its exact item id")
+                .await;
+        }
+        let native_turn_id = item.turn_id.as_deref();
+        let identity_turn = native_turn_id.unwrap_or("session");
+        let mut data = json!({});
+        if let Some(native_turn_id) = native_turn_id {
+            data["native_turn_id"] = json!(native_turn_id);
+        }
+        if active_turn && let Some(turn_id) = native_turn_id {
+            data["turn_id"] = json!(turn_id);
+        }
+        if let Some(trigger) = item.trigger.as_deref() {
+            if !matches!(trigger, "manual" | "auto") {
+                self.record_unclassified_native("muse.compaction.trigger", trigger)
+                    .await?;
+            }
+            data["trigger"] = json!(trigger);
+        }
+        let native_id = event_id(
+            session_id,
+            identity_turn,
+            &item.item_id,
+            "session.context.compacted",
+        )?;
+        self.commit_event("session.context.compacted", native_id, data)
+            .await
     }
 
     async fn complete_message(&mut self, turn_id: &str, item_id: &str, text: &str) -> Result<()> {

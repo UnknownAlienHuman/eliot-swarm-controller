@@ -100,6 +100,19 @@ pub struct OwnerInboxItem {
     pub blocks_work: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub outcome_unknown: bool,
+    /// Retained A10 audit and continuation history for a blocked Goal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audit_history: Option<Vec<GoalAuditHistoryEntry>>,
+}
+
+/// One bounded audit cycle as shown to the Owner with the blocked Goal.
+#[derive(JsonSchema, Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+pub struct GoalAuditHistoryEntry {
+    pub cycle: u8,
+    pub auditor: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub successor: Option<String>,
+    pub text: String,
 }
 
 #[derive(JsonSchema, Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]

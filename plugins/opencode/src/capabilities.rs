@@ -118,6 +118,7 @@ pub fn declaration() -> HarnessCapabilities {
         manifest_extra_verbs: &["models"],
         compact: true,
         compaction_gap_recovery: true,
+        goal_audit_read_only: true,
         models_workspace_preview: true,
         models_preview_auth_integrations: true,
         initial_model_refusal_cleanup: true,
