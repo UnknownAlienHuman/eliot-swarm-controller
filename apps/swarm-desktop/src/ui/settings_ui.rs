@@ -1932,6 +1932,12 @@ impl DesktopApp {
         &mut self,
         context: &ComponentContext<Self>,
     ) -> Result<Option<String>, String> {
+        // The section saves whole: never from a draft that was not read.
+        if !self.settings.is_read() {
+            return Err(
+                "Settings are not read yet: add the project once Swarm answers.".to_owned(),
+            );
+        }
         let Some(path) =
             crate::file_dialog::pick_folder("Add a project: choose its checkout folder")?
         else {
