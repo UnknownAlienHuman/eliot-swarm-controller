@@ -48,6 +48,16 @@ stronger model, a failure, or the Owner's choice. Moving work between models is 
 ordinary path, not a special recovery feature. See
 [Work truth lives in Git and the file system](architecture.md#work-truth-lives-in-git-and-the-file-system).
 
+On 2026-11-26 the owner set how a Goal must behave:
+
+> «Если Goal падает, он должен уходить на аудит и передаваться дальше в работу!!! […] В интерфейсе должна быть возможность ставить Goal вручную прямо в чате. Первое сообщение и/или Goal должны передаваться агенту постоянно, например после сжатия контекста. Если Goal не задан, им может стать первое сообщение.»
+
+A Goal that fails is audited and handed back to work, not abandoned. The Owner sets
+a Goal by hand in the chat. The Goal, or the first message when no Goal is set,
+reaches the Agent again after every context compaction. See
+[Goal audit and continuation](spec/automation.md#goal-audit-and-continuation) and
+[Default Goal objective](spec/automation.md#default-goal-objective).
+
 ## What Eliot is
 
 ### Owner clarification, 2026-11-15

@@ -99,6 +99,19 @@ engine, second scheduler or critic loop.
       scope until `--resume`; `agent.patch_digest` (files, packages, new
       dependencies, public interface, checker/lint changes, new suppressions)
       focuses the independent review.
+- [ ] **A10 Goal audit and continuation (Owner decision 2026-11-26).** A blocked
+      Goal (`round_budget`, `turn_limit`, `no_progress`, `escalation_refused`)
+      gets a read-only audit turn on the `[routing]` role `audit`, then a handoff
+      in the same worktree with the audit text and a fresh budget, up to
+      `policy.budget.max_audits` cycles; scope findings stay Owner stops.
+- [ ] **A11 Default Goal objective (Owner decision 2026-11-26).** With no
+      policy or explicit Goal, the first linked input becomes the Goal
+      objective, carried in the task card and shown in the chat.
+- [ ] **A12 Task card after every compaction.** Extends the checked
+      "Worktree notes and task cards" item (manual compaction on OpenCode and
+      Antigravity): the task card (brief, branch, Goal or first input) reaches
+      the Agent after manual and automatic compaction on Codex, Claude Code,
+      OpenCode, Muse and Antigravity.
 - [x] **Project formatting and checks (#833, #811).** Swarm applies the project
       formatter in the managed worktree and delivers a failed fast check in the
       same OpenCode turn. The routing role installs the bounded project Goal.
@@ -1289,7 +1302,10 @@ of the explicitly selected release scope.
       disabled with its reason and no unsupported feature shown; the
       header's "…" is the same task menu (Goal is the header's own
       button). §18.1 one Goal ContentDialog from the header's Goal, the
-      task menu's Goal… and Details › Goal…: text, the check argv and
+      open chat's composer (Owner decision 2026-11-26: a Goal by hand in the
+      chat; with none set, the first message shows as the objective; the
+      header shows audit cycles), the task menu's Goal… and Details › Goal…:
+      text, the check argv and
       round/turn limits in their source units, Save/Pause/Resume/Clear by
       the goal's status over the existing `goal.*` calls, errors in the
       dialog, Save named and never the Enter default. §8.3 the model
