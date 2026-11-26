@@ -309,6 +309,7 @@ mod coordination;
 pub use coordination::MAX_VAR_WRITE_GROUP;
 mod digests;
 mod dispatch;
+mod event_coverage;
 mod fleet;
 mod git;
 mod goals;
@@ -530,6 +531,7 @@ struct SnapshotAgentCache {
 pub struct Store {
     connection: Connection,
     has_first_owner_message: bool,
+    has_event_prune_coverage: bool,
     write_faulted: Cell<bool>,
     // Each admitted apply holds a clone until its effects and settlement end.
     // Reconciliation can only replace a fence with no live apply holder.
@@ -620,9 +622,17 @@ impl Store {
                 |row| row.get(0),
             )
             .map_err(sql_error)?;
+        let has_event_prune_coverage = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name = 'event_prune_coverage')",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(sql_error)?;
         Ok(Self {
             connection,
             has_first_owner_message,
+            has_event_prune_coverage,
             write_faulted: Cell::new(false),
             cleanup_attempts: Arc::new(()),
             autonomy_cache: RefCell::new(None),
@@ -713,6 +723,7 @@ impl Store {
         let mut store = Self {
             connection,
             has_first_owner_message: true,
+            has_event_prune_coverage: true,
             write_faulted: Cell::new(false),
             cleanup_attempts: Arc::new(()),
             autonomy_cache: RefCell::new(None),
@@ -2843,11 +2854,21 @@ impl Store {
         limit: usize,
         through: Option<i64>,
     ) -> Result<Vec<Event>> {
+        self.require_retained(after)?;
+        self.read_retained_events(after, limit, through)
+    }
+
+    /// Read physical rows after the caller has checked its replay floor.
+    pub fn read_retained_events(
+        &self,
+        after: i64,
+        limit: usize,
+        through: Option<i64>,
+    ) -> Result<Vec<Event>> {
         validate_limit(limit)?;
         if after < 0 || through.is_some_and(|bound| bound < after) {
             return Err(Error::new("invalid", "invalid event sequence bounds"));
         }
-        self.require_retained(after)?;
         let mut statement = self
             .connection
             .prepare(
@@ -2872,8 +2893,8 @@ impl Store {
     /// rows of the named Agents in `(after, through]`, restricted to `kinds`
     /// and `sources` when those are nonempty, in sequence order, at most
     /// `limit` rows within the page byte bound. The work is bounded by the
-    /// named Agents' own rows, never by the rest of the journal. No Agent
-    /// matches no row (after the same retention check). Agent-less
+    /// named Agents' own rows, never by the rest of the journal. The caller
+    /// checks the replay floor for the filter before reading. Agent-less
     /// `var.changed` facts whose encoded scope is in `var_scopes` ride
     /// along through the `events_kind` index, so an Agent waiting on a
     /// variable it can read sees the version bump; the fact never carries
@@ -2905,8 +2926,7 @@ impl Store {
                 "agent event reads take at most 1,000 Agents, kinds or sources",
             ));
         }
-        self.require_retained(after)?;
-        if agents.is_empty() {
+        if agents.is_empty() && var_scopes.is_empty() {
             return Ok(Vec::new());
         }
         let placeholders = |count: usize| vec!["?"; count].join(",");

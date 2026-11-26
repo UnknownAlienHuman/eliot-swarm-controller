@@ -104,21 +104,21 @@ use eliot_core::{
         AgentSummary, CommandChildrenRequest, CommandChildrenResponse, CommandGetRequest,
         CommandSubmitRequest, CommandSubmitResponse, CrashMarker, DaemonShutdownRequest,
         DaemonShutdownResponse, DaemonStatusRequest, DiscoverPage, DoctorHarnessEntry,
-        EventsBoundsRequest, EventsFilter, EventsReadRequest, EventsReadResponse,
-        EventsSubscribeRequest, EventsSubscribeResponse, FrozenGitPublish, GitFetchDefinitionArgs,
-        GitPublishTrigger, GitView, HarnessCheckOutcome, HarnessDoctorRequest,
-        HarnessDoctorResponse, HeavyAgentTotals, HeavyEpisodeView, HeavySummaryView,
-        LaunchCommandArgs, MAX_OBSERVATION_PAGE_BYTES, MAX_SWARM_WAIT_MS, MAX_SWARM_WAIT_TARGETS,
-        MAX_WAIT_FINAL_TEXT_BYTES, MAX_WAIT_FRAME_BYTES, MaintenancePurgeLegacyAttentionRequest,
-        MaintenancePurgeLegacyAttentionResponse, MaintenanceRunRequest, MaintenanceRunResponse,
-        ObservationPage, ObservationQuery, ObservationView, ObserveHeavyRequest,
-        ObserveHeavyResponse, ProcessPageCursor, ProjectCheckConfiguration, ProjectCheckPassed,
-        ProjectDiscoverRequest, ProjectRegistrationView, ProviderClearHoldRequest,
-        ProviderHoldsRequest, RuleGetRequest, RuleStateView, SWITCH_BLANK_SCOPE_ARG,
-        SWITCH_PROJECT_REVISION_ARG, SessionGrowthView, ShutdownMode, SourceState,
-        SwarmWaitRequest, SwarmWaitResponse, TimerGetRequest, TimerStateView, TurnGetRequest,
-        UsageScopeView, UsageSummaryRequest, UsageSummaryResponse, WaitEntryResult,
-        WorkSummaryView, WorkerTaskHealth, WorkerTaskStatus, fair_excerpt_cap,
+        EventsBoundsRequest, EventsBoundsResponse, EventsFilter, EventsReadRequest,
+        EventsReadResponse, EventsSubscribeRequest, EventsSubscribeResponse, FrozenGitPublish,
+        GitFetchDefinitionArgs, GitPublishTrigger, GitView, HarnessCheckOutcome,
+        HarnessDoctorRequest, HarnessDoctorResponse, HeavyAgentTotals, HeavyEpisodeView,
+        HeavySummaryView, LaunchCommandArgs, MAX_OBSERVATION_PAGE_BYTES, MAX_SWARM_WAIT_MS,
+        MAX_SWARM_WAIT_TARGETS, MAX_WAIT_FINAL_TEXT_BYTES, MAX_WAIT_FRAME_BYTES,
+        MaintenancePurgeLegacyAttentionRequest, MaintenancePurgeLegacyAttentionResponse,
+        MaintenanceRunRequest, MaintenanceRunResponse, ObservationPage, ObservationQuery,
+        ObservationView, ObserveHeavyRequest, ObserveHeavyResponse, ProcessPageCursor,
+        ProjectCheckConfiguration, ProjectCheckPassed, ProjectDiscoverRequest,
+        ProjectRegistrationView, ProviderClearHoldRequest, ProviderHoldsRequest, RuleGetRequest,
+        RuleStateView, SWITCH_BLANK_SCOPE_ARG, SWITCH_PROJECT_REVISION_ARG, SessionGrowthView,
+        ShutdownMode, SourceState, SwarmWaitRequest, SwarmWaitResponse, TimerGetRequest,
+        TimerStateView, TurnGetRequest, UsageScopeView, UsageSummaryRequest, UsageSummaryResponse,
+        WaitEntryResult, WorkSummaryView, WorkerTaskHealth, WorkerTaskStatus, fair_excerpt_cap,
         is_supported_harness,
     },
 };
@@ -6651,8 +6651,13 @@ impl Router {
         let request: EventsBoundsRequest =
             eliot_core::api::discovery::decode_params(params.clone())?;
         request.validate()?;
-        authorize_event_filter(request.filter, principal)?;
-        let bounds = self.inner.store.lock().await.event_bounds()?;
+        let mut filter = authorize_event_filter(request.filter, principal)?;
+        filter.var_scopes = self.readable_var_scopes(principal).await?;
+        let store = self.inner.store.lock().await;
+        let bounds = EventsBoundsResponse {
+            pruned_through: filter.replay_floor(&store)?,
+            hi: store.high_water()?,
+        };
         bounds.validate()?;
         serde_json::to_value(bounds)
             .map_err(|_| Error::new("internal", "event bounds could not be encoded"))
@@ -7267,6 +7272,7 @@ impl Router {
                     "event cursor is above the high-water mark",
                 ));
             }
+            filter.require_replay_cursor(&store, after)?;
             let mut cursor = after;
             let mut scanned = 0;
             let mut events = Vec::new();
@@ -7319,7 +7325,7 @@ impl Router {
                 && scanned < EVENT_SCAN_MAX
             {
                 let page_limit = (EVENT_SCAN_MAX - scanned).clamp(1, 256);
-                let page = store.read_events(cursor, page_limit, Some(high_water))?;
+                let page = store.read_retained_events(cursor, page_limit, Some(high_water))?;
                 if page.is_empty() {
                     cursor = high_water;
                     break;
@@ -8232,6 +8238,36 @@ impl Router {
 }
 
 impl EventFilter {
+    fn replay_floor(&self, store: &eliot_store::Store) -> Result<i64> {
+        let agents: Vec<i64> = self
+            .agents
+            .iter()
+            .filter_map(|agent| eliot_core::parse_agent_id(agent).ok())
+            .collect();
+        let kinds: Vec<&str> = self.kinds.iter().map(String::as_str).collect();
+        let sources: Vec<&str> = self.sources.iter().map(String::as_str).collect();
+        let var_scopes: Vec<&str> = self.var_scopes.iter().map(String::as_str).collect();
+        store.event_replay_floor(
+            (!self.agents.is_empty()).then_some(agents.as_slice()),
+            &kinds,
+            &sources,
+            &var_scopes,
+        )
+    }
+
+    fn require_replay_cursor(&self, store: &eliot_store::Store, after: i64) -> Result<()> {
+        let floor = self.replay_floor(store)?;
+        if after < floor {
+            return Err(Error::new(
+                "history_gap",
+                format!(
+                    "requested event history is no longer fully retained. Earliest resume cursor is {floor}."
+                ),
+            ));
+        }
+        Ok(())
+    }
+
     fn matches(&self, event: &Event) -> bool {
         (self.agents.is_empty()
             || event

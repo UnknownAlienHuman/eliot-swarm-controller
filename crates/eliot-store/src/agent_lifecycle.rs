@@ -1103,6 +1103,11 @@ fn delete_tree_tx(tx: &Transaction<'_>, members: &[i64], now: i64) -> Result<()>
     delete_db!(tx.execute("DELETE FROM messages WHERE recipient IN (SELECT id FROM deleted_agents) OR sender IN (SELECT 'a'||id FROM deleted_agents)",[]));
     // Mark a conservative history floor before removing individual retained events.
     delete_db!(tx.execute("UPDATE rule_history_coverage SET pruned_through=MAX(pruned_through,COALESCE((SELECT MAX(seq) FROM events WHERE agent IN (SELECT id FROM deleted_agents)),0)) WHERE singleton=1",[]));
+    delete_db!(crate::event_coverage::record_event_pruning_tx(
+        tx,
+        "agent IN (SELECT id FROM deleted_agents)",
+        [],
+    ));
     delete_db!(tx.execute(
         "DELETE FROM events WHERE agent IN (SELECT id FROM deleted_agents)",
         []
