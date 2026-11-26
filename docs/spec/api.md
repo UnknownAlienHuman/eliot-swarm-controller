@@ -878,7 +878,7 @@ require the interactive Swarm desktop: the peer basename must be
 opened, the basename comes from a handle-free Toolhelp snapshot. A refusal
 keeps the wire-stable `not_allowed` message and logs once per peer pid with a
 15-minute re-log cap (`peer_pid`, plus `suppressed_refusals` when nonzero);
-the per-call `rpc.error` line is suppressed for these refusals.
+the per-call `rpc.error` line is suppressed for these refusals. The desktop stops `auth.desktop.poll` for that data directory after a `not_allowed` refusal and asks again after the daemon restarts or the data directory changes.
 
 The daemon dispatches one automatic console per harness outage. The grant expires
 after 15 seconds. Store retains the claim across daemon restarts. An explicit request
@@ -4081,7 +4081,7 @@ the client error preserves the current path/SID/rights diagnosis and names the
 Owner-only retry command `swarm --data-dir '<path>' daemon`. The path is escaped for
 PowerShell by doubling embedded single quotes. The local Owner startup path performs
 that repair; Agent and Run callers keep their inherited identity and do not use their
-credentials to probe Owner-only status or start the daemon.
+credentials to probe Owner-only status or start the daemon. Warm CLI commands check daemon liveness with a connect-only endpoint probe instead of a `daemon.status` RPC; the dispatched call still performs full owner-token authentication and peer verification.
 
 `swarm status` and the start output include the resolved data directory, so
 `--data-dir`, `ELIOT_HOME` and default-location differences are visible. Local
