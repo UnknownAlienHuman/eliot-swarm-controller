@@ -139,8 +139,12 @@ async fn run_inner(cli: Cli) -> ExitCode {
         None
     };
 
+    // Keep command futures out of the runtime entry frame. In debug builds
+    // those nested frames can exhaust the default Windows main-thread stack.
     let result = match command {
-        CliCommand::Plugin(PluginArgs { command, .. }) => run_plugin_command(command).await,
+        CliCommand::Plugin(PluginArgs { command, .. }) => {
+            Box::pin(run_plugin_command(command)).await
+        }
         command => {
             if !matches!(command, CliCommand::Stand(_)) {
                 match eliot_daemon::operator::read_only_stand_exists(&data_dir) {
@@ -194,15 +198,19 @@ async fn run_inner(cli: Cli) -> ExitCode {
                     *report = eliot_daemon::data_dir_acl_report(&data_dir);
                 }
             }
-            // The general dispatcher reserves stack for its other command
-            // branches even when polling daemon startup. Keep that frame off
-            // the main thread's Store initialization path.
             match command {
                 CliCommand::Daemon(args) => {
                     Box::pin(cli::run_daemon(args, data_dir, json_output, id)).await
                 }
                 command => {
-                    cli::dispatch(command, data_dir, json_output, id, doctor_acl_report).await
+                    Box::pin(cli::dispatch(
+                        command,
+                        data_dir,
+                        json_output,
+                        id,
+                        doctor_acl_report,
+                    ))
+                    .await
                 }
             }
         }
