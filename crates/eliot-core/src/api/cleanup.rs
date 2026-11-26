@@ -84,6 +84,38 @@ impl ArtifactRegisterRequest {
 }
 
 #[derive(schemars::JsonSchema, Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ArtifactReconcileRequest {
+    pub id: String,
+    pub artifact: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub release_custody: Option<String>,
+}
+
+impl ArtifactReconcileRequest {
+    pub fn validate(&self) -> Result<()> {
+        cleanup_id(&self.id)?;
+        cleanup_id(&self.artifact)?;
+        if self.release_custody.as_ref().is_some_and(|reason| {
+            reason.trim().is_empty() || reason.len() > 512 || reason.chars().any(char::is_control)
+        }) {
+            return Err(Error::new(
+                "invalid",
+                "invalid Owner custody release reason",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(schemars::JsonSchema, Clone, Debug, Serialize, Deserialize)]
+pub struct ArtifactReconciliation {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_reason: Option<String>,
+}
+
+#[derive(schemars::JsonSchema, Clone, Debug, Serialize, Deserialize)]
 pub struct ArtifactView {
     pub id: String,
     pub agent: String,
@@ -98,6 +130,8 @@ pub struct ArtifactView {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<i64>,
     pub state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reconciliation: Option<ArtifactReconciliation>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub git: Option<CleanupGitBinding>,
 }

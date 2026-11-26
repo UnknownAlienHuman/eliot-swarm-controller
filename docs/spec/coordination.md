@@ -57,10 +57,11 @@ roots retain their place in the plan. Discovery retains candidates found before
 a scan error. Terminal cache release puts an incomplete or failed root in the plan's inventory
 issues and records it in `cleanup.automatic`, including when the slice found no
 candidates. Periodic inventory scans that root independently across pages.
-Manual plans select `registered` rows. Settled rows (`removed`, `unknown`,
-`skipped(...)`) are attempt history read back from retained plans, and filtering
-them before the page cap keeps a settled prefix from starving later eligible
-rows. The Store pages the final candidate order once (ordinary rows, then
+Manual plans select `registered` rows. Manual Owner plans also show `unknown`
+rows as `keep(unknown)`. Settled rows are attempt history read back from retained
+plans and are filtered before the page cap. Backfill can return a truncated
+page with no items. Continue with its token until the inventory is exhausted.
+The Store pages the final candidate order once (ordinary rows, then
 worktrees, then branches and native sessions, each oldest insertion first), and a
 truncated plan returns an opaque `continuation` token: the last shown artifact, the
 consumed project-row offsets, the settings revision those offsets were read at, the
@@ -194,6 +195,27 @@ plans keep it with `prior_cleanup_attempt` until exact readback or Owner
 reconciliation settles the removal. The original receipt remains readable.
 A removal failure after possible Git or filesystem effects is `unknown`.
 Legacy `failed` rows with unresolved effect evidence retain the same fence.
+The Owner can run `swarm artifact reconcile ARTIFACT_ID` to re-read an unknown
+directory using its retained path, ownership and filesystem identity. If the
+same directory survives and passes cleanup preflight, reconciliation restores
+`registered` custody and cleanup can plan its removal under the ordinary gates.
+Two absence checks across the ordinary grace interval settle it as `removed`
+with the reconciliation write as evidence and zero bytes claimed. A changed
+identity or unreadable path leaves the fence in place. Cleanup apply rechecks
+the identity and rejects plans from before the reconciliation.
+
+When exact readback is unavailable, the Owner can run
+`swarm artifact reconcile ARTIFACT_ID --release-custody "reason"` to take
+responsibility for the retained object. This records `released`, the mutation
+ID and the Owner's reason. It performs no vendor, Git or filesystem mutation
+and records no claim of removal. In particular, a Codex archive with an unknown
+acknowledgement can be released while preserving whatever session the vendor
+retains. Both forms require quiescent Agent custody, rechecked at commit.
+Reconciliation returns `busy` while an existing cleanup attempt is running.
+Retry after the attempt settles or its daemon exits. The original cleanup
+receipt remains readable within retention. Worktrees, branches and internal
+generation roots have separate custody checks and are outside this Owner operation.
+
 Uncertain attempts fence
 resume at admission and dispatch. Windows
 pins ancestors, opens the entire bounded tree through relative handles without
@@ -338,9 +360,10 @@ apply retries check the retained receipt before loading the plan row, so a
 reclaimed settled plan still replays its retained response instead of `not_found`.
 Write retention pins every consumed apply receipt while its plan row exists, so a
 settled receipt can never prune before the ledger reclaims the plan and wedge it
-permanently ineligible. Removed identities remain tombstones; unknown identities are never
-automatically retried. The CLI exposes `artifact register`, `cleanup plan` and
-`cleanup apply`. Desktop Settings › Worktrees & cleanup (Clean up finished work)
+permanently ineligible. An explicit reconciliation can make an old unknown
+receipt eligible for ordinary retention without changing its outcome.
+Removed identities remain tombstones. Unknown identities require Owner
+reconciliation. Desktop Settings › Worktrees & cleanup (Clean up finished work)
 reviews an Owner `all` plan grouped by kind with each item's size and reason,
 applies the safe items of the checked groups through the same Router after one
 confirmation (local deletions only, one mutation id per plan and selection until a

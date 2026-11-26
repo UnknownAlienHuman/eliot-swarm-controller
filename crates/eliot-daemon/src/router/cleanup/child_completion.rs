@@ -236,12 +236,12 @@ impl Router {
             }
             Err(error) => return Err(error),
         }
-        let (plan, mut response, is_new) = {
+        let (plan, mut response, attempt) = {
             let mut store = self.inner.store.lock().await;
             store.verify_child_cleanup_manager(job)?;
             store.begin_cleanup_apply("owner", &apply, now_ms(), false)?
         };
-        if is_new {
+        if let Some(_attempt) = attempt {
             self.apply_cleanup_artifacts(
                 "owner",
                 &apply,

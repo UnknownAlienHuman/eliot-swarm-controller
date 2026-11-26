@@ -1810,6 +1810,7 @@ impl PluginHost {
             ));
         }
         let artifact = ArtifactView {
+            reconciliation: None,
             id: Ulid::new().to_string(),
             agent: agent.id.clone(),
             generation: agent.generation,

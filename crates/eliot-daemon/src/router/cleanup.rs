@@ -16,6 +16,7 @@ mod discovery;
 mod jobs;
 mod ownership;
 mod projects;
+mod reconciliation;
 
 const CLEANUP_BACKFILL_BATCH: usize = 8;
 const CLEANUP_BACKFILL_LIMIT: usize = 1_024;
@@ -645,6 +646,7 @@ impl Router {
             .lock()
             .await
             .record_created_artifact(ArtifactView {
+                reconciliation: None,
                 id: ulid::Ulid::new().to_string(),
                 agent: agent.id,
                 generation: agent.generation,
@@ -687,6 +689,7 @@ impl Router {
         let parent = crate::platform::script_file::Directory::open(&parent)?;
         let directory = parent.create_directory(&format!("{}-{}", agent.id, agent.generation))?;
         let root = ArtifactView {
+            reconciliation: None,
             id: ulid::Ulid::new().to_string(),
             agent: agent.id.clone(),
             generation: agent.generation,
@@ -763,6 +766,7 @@ impl Router {
                         .await
                 {
                     known.push(ArtifactView {
+                        reconciliation: None,
                         id: ulid::Ulid::new().to_string(),
                         agent: agent.id.clone(),
                         generation: agent.generation,
@@ -809,6 +813,7 @@ impl Router {
                     .await
             {
                 known.push(ArtifactView {
+                    reconciliation: None,
                     id: ulid::Ulid::new().to_string(),
                     agent: agent.id.clone(),
                     generation: agent.generation,
@@ -938,6 +943,7 @@ impl Router {
             planned_tip: None,
         };
         known.push(ArtifactView {
+            reconciliation: None,
             id: ulid::Ulid::new().to_string(),
             agent: agent.id.clone(),
             generation: agent.generation,
@@ -962,6 +968,7 @@ impl Router {
             .await?;
         if oid.code == 0 {
             known.push(ArtifactView {
+                reconciliation: None,
                 id: ulid::Ulid::new().to_string(),
                 agent: agent.id.clone(),
                 generation: agent.generation,
@@ -1289,6 +1296,9 @@ impl Router {
         now: i64,
         allow_fenced_root: bool,
     ) -> Result<Option<String>> {
+        if artifact.state == "unknown" {
+            return Ok(Some("owner_review_required".to_owned()));
+        }
         let cargo_cache = is_cargo_target_artifact(artifact);
         let (agent, ended_at) = {
             let store = self.inner.store.lock().await;
@@ -2622,17 +2632,17 @@ impl Router {
         let name = principal_name(principal);
         // Both automatic callers reserve and hold the same apply slot as
         // explicit jobs. The restart seal checks it under the Store lock.
-        let (_worker, plan, mut response) = {
+        let (_worker, _attempt, plan, mut response) = {
             let mut store = self.inner.store.lock().await;
             self.check_cleanup_admission()?;
-            let (plan, mut response, is_new) =
+            let (plan, mut response, attempt) =
                 store.begin_cleanup_apply(&name, &request, now_ms(), false)?;
-            if !is_new {
+            let Some(attempt) = attempt else {
                 return encoded(response);
-            }
+            };
             let worker = self.claim_cleanup_worker(&request.id);
             self.apply_project_registrations(&mut store, &request, &plan, &mut response)?;
-            (worker, plan, response)
+            (worker, attempt, plan, response)
         };
         self.apply_cleanup_artifacts(
             &name,
@@ -2747,8 +2757,10 @@ impl Router {
                 Ok(removal) => removal.outcome(&item.artifact.id),
                 Err(error) => CleanupItemOutcome {
                     artifact_id: item.artifact.id.clone(),
-                    detail: (item.artifact.kind == ArtifactKind::Branch
-                        || matches!(mode, CleanupApplyMode::ChildCompletion(_)))
+                    detail: (matches!(
+                        item.artifact.kind,
+                        ArtifactKind::Branch | ArtifactKind::NativeSession
+                    ) || matches!(mode, CleanupApplyMode::ChildCompletion(_)))
                     .then(|| {
                         let secrets: Vec<_> =
                             self.inner.secrets.lock_recover().iter().cloned().collect();
@@ -3939,6 +3951,7 @@ fn native_session_artifact(agent: &Agent) -> Option<ArtifactView> {
     let scope = agent.native_scope.as_ref()?;
     let reference = agent.native_ref.as_ref()?;
     Some(ArtifactView {
+        reconciliation: None,
         id: ulid::Ulid::new().to_string(),
         agent: agent.id.clone(),
         generation: agent.generation,
@@ -4127,7 +4140,7 @@ impl Router {
             delete_remote: false,
             artifacts: None,
         };
-        let (_, mut response, is_new) = match self.inner.store.lock().await.begin_cleanup_apply(
+        let (_, mut response, attempt) = match self.inner.store.lock().await.begin_cleanup_apply(
             "owner",
             &apply,
             now_ms(),
@@ -4136,9 +4149,9 @@ impl Router {
             Ok(applied) => applied,
             Err(_) => return,
         };
-        if !is_new {
+        let Some(_attempt) = attempt else {
             return;
-        }
+        };
         for (index, item) in plan.items.iter().enumerate() {
             if item.verdict != "safe" || response.items[index].outcome != "unknown" {
                 continue;

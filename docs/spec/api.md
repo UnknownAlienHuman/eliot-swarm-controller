@@ -1294,7 +1294,9 @@ observers may stay open). Archiving an external observer in `unknown` state
 also requires resolved custody, so an open `observe` source blocks it.
 A failed guard returns typed `busy` and names the blocking Agent and its state,
 request, command, turn, process, source or artifact. Archive stops nothing and
-preserves retained unknown evidence.
+preserves retained unknown evidence. An unknown artifact names its exact ledger
+ID. The Owner can use [artifact reconciliation](coordination.md#registered-artifacts-and-cleanup-k69)
+before retrying Archive or Delete.
 The desktop offers Archive and Unarchive in the task row and header menus.
 Show archived in the sidebar includes archived tasks in the list.
 Unarchive applies the same state, turn, request and command guards and skips
@@ -1336,10 +1338,13 @@ Agent remains readable by ID and in history.
 (stopped or failed), a detached external observer, or an ended native observation with
 its `unknown` turn retained as ended-observation evidence, using retention's leaf-first
 command cleanup. A failed launch can be removed after its sources and custody drain; an
-already-terminal `stop` does not need to rewrite its failure state. Delete removes a
-retained tree-selector, rule, or timer admission parent with its full member command
-set in the same transaction. Each member must pass the ordinary deletion checks. A set
-with commands outside the requested Agent tree returns `busy`. A `busy` refusal names
+already-terminal `stop` does not need to rewrite its failure state. Delete removes
+applied targetless selector, rule, timer, switch and handoff ancestors with their
+full member command set in the same transaction. Each member must pass the ordinary
+deletion checks. A set with commands outside the requested Agent tree returns
+`busy`. The Owner can select a common Agent ancestor that covers the full set, or
+archive the affected Agent trees separately when the set spans independent roots.
+A `busy` refusal names
 the blocking Agent and its actual state, pending requests, command, turn (including
 generation and retained state) or undrained process, source or artifact, rather than
 treating stopped lifecycle as proof of drained history. An ordinary retained `unknown`
@@ -1347,8 +1352,12 @@ turn still blocks deletion after stop; the ended-observation evidence retires wi
 tree instead. Delete removes the tree's turns and events without resolving them: no
 resolution is recorded and no `turn.resolved` event is emitted. Live custody, open
 commands, uncertain turns, active or uncertain cleanup attempts, or a pinned history
-floor return `busy`; oversized operations return `unavailable` before cleanup. Before
-removing the records, Delete uses the [cleanup ledger](coordination.md#registered-artifacts-and-cleanup-k69)
+floor return `busy`; oversized operations return `unavailable` before cleanup.
+For a live rule cursor, retry with a fresh mutation ID after the rule has consumed
+the retained events. If the rule is obsolete, the Owner can remove it with
+`swarm rule delete` using its current revision or remove the assignment that
+generates it in Settings.
+Before removing the records, Delete uses the [cleanup ledger](coordination.md#registered-artifacts-and-cleanup-k69)
 to archive eligible Codex chats, delete eligible OpenCode chats and remove the tree's
 eligible Swarm-created worktrees. It uses the same worktree ownership and cleanliness
 checks as `cleanup.apply`. Ordinary checkouts, Git branches, external sessions and
@@ -1359,8 +1368,14 @@ removal. Open or uncertain processes still block preflight, and the source must
 close before the task records are removed.
 If cleanup is refused or uncertain, Delete keeps the task records. An unsuccessful
 native session cleanup also keeps the tree's worktrees. Earlier confirmed cleanup
-in the same request still stands. Uncertain effects are fenced, and an exact
-retry reads the retained outcome. A successful Delete supersedes unapplied cleanup
+in the same request still stands. Uncertain effects are fenced. The refusal
+identifies the artifact for readback or explicit Owner release. An exact retry
+reads the retained outcome. After reconciliation, use a fresh delete ID. For
+tracked changes, preserve the work and clean the checkout. For branch drift,
+preserve the current branch and restore the originally recorded checkout branch.
+For a dependent retained worktree, use guarded `swarm worktree remove` on the
+dependent Agent before retrying removal of its source.
+A successful Delete supersedes unapplied cleanup
 reviews for the deleted tree's items. Process records for every generation are removed;
 consumed cleanup plans and their exact apply replay remain retained. A deleted command
 keeps any existing write receipt verbatim, including the receipt for a managed
@@ -3852,6 +3867,7 @@ swarm cleanup apply <PLAN_ID> [--artifact ID]... [--delete-remote]
 swarm cleanup apply-all [--scope all|project] [--project PROJECT] [--older-than TIMESTAMP]
 swarm cleanup status <ID>
 swarm artifact register <PATH> --kind build|data_dir|temp|other --purpose TEXT [--ttl DURATION]
+swarm artifact reconcile <ARTIFACT_ID> [--release-custody REASON]
 swarm launch [--profile P | --role R | --harness H] --workspace PATH [--worktree BRANCH [--base REF]] [--parent AGENT] [--source PATH]... [--no-policy REASON] [--goal-json JSON_OBJECT] [PROMPT] [--queue] [--wait] [--timeout-seconds N]
 swarm launch [--workspace PATH | --chat] [--parent AGENT] [--no-policy REASON] [--goal-json JSON_OBJECT] [PROMPT] [--queue] [--wait] [--timeout-seconds N]
 swarm settings read

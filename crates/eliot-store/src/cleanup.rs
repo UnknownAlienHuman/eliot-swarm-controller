@@ -48,6 +48,20 @@ pub(super) fn settled_cleanup_plan_select() -> String {
                AND NOT EXISTS (
                    SELECT 1 FROM json_each(w.result, '$.items') r
                    WHERE json_extract(r.value, '$.outcome') = 'unknown'
+                     AND NOT EXISTS (
+                         SELECT 1 FROM json_each(p.body, '$.items') i
+                         LEFT JOIN artifacts a ON a.id = json_extract(i.value, '$.artifact.id')
+                         WHERE json_extract(i.value, '$.artifact.id') = json_extract(r.value, '$.artifact_id')
+                           AND json_extract(i.value, '$.artifact.kind') <> 'project_registration'
+                           AND (
+                               (json_type(a.body, '$.reconciliation') = 'object'
+                                AND json_extract(a.body, '$.state') IN ('registered','removed','released'))
+                               OR (a.id IS NULL AND NOT EXISTS (
+                                   SELECT 1 FROM agents g WHERE g.id =
+                                       CAST(substr(json_extract(i.value, '$.artifact.agent'), 2) AS INTEGER)
+                               ))
+                           )
+                     )
                )
              ORDER BY p.id LIMIT :plan_limit"
     )
@@ -843,8 +857,12 @@ impl Store {
                 let owned_root = include_ownership_roots
                     && matches!(caller, Sender::Owner)
                     && artifact.state == "ownership_root";
+                let owner_review = !include_ownership_roots
+                    && !bulk
+                    && matches!(caller, Sender::Owner)
+                    && artifact.state == "unknown";
                 if rank_of(artifact.kind, &artifact.purpose) != rank
-                    || (artifact.state != "registered" && !owned_root)
+                    || (artifact.state != "registered" && !owned_root && !owner_review)
                 {
                     continue;
                 }
@@ -1213,6 +1231,7 @@ impl Store {
                 .flatten();
         }
         let artifact = ArtifactView {
+            reconciliation: None,
             id: request.id.clone(),
             agent: agent.id,
             generation,
@@ -1270,6 +1289,103 @@ impl Store {
             &request.id,
             principal,
             "artifact.register",
+            &canonical::digest(&payload)?,
+            &serde_json::to_value(&artifact)
+                .map_err(|_| Error::new("invalid", "artifact cannot encode"))?,
+            now,
+        )?;
+        commit_transaction(tx, &self.write_faulted)?;
+        Ok(artifact)
+    }
+
+    pub fn unknown_cleanup_artifact(&self, id: &str) -> Result<ArtifactView> {
+        self.ensure_committed_reads()?;
+        let body: String = self
+            .connection
+            .query_row("SELECT body FROM artifacts WHERE id=?1", [id], |row| {
+                row.get(0)
+            })
+            .optional()
+            .map_err(sql_error)?
+            .ok_or_else(|| Error::new("not_found", "artifact absent"))?;
+        let artifact: ArtifactView = serde_json::from_str(&body)
+            .map_err(|_| Error::new("source_integrity", "invalid artifact row"))?;
+        if artifact.state != "unknown" {
+            return Err(Error::new(
+                "bad_state",
+                "artifact custody is no longer unknown",
+            ));
+        }
+        if Arc::strong_count(&self.cleanup_attempts) > 1 {
+            return Err(Error::new(
+                "busy",
+                "an artifact cleanup attempt is still running",
+            ));
+        }
+        Ok(artifact)
+    }
+
+    pub fn reconcile_cleanup_artifact(
+        &mut self,
+        observed: &ArtifactView,
+        request: &ArtifactReconcileRequest,
+        absent: bool,
+        now: i64,
+    ) -> Result<ArtifactView> {
+        self.ensure_writer_healthy()?;
+        request.validate()?;
+        let payload = serde_json::to_value(request)
+            .map_err(|_| Error::new("invalid", "artifact reconciliation cannot encode"))?;
+        if let Some(replay) =
+            self.cleanup_replay("owner", &request.id, "artifact.reconcile", &payload)?
+        {
+            return Ok(replay);
+        }
+        validate_id_age(&request.id, now)?;
+        let mut artifact = self.unknown_cleanup_artifact(&request.artifact)?;
+        if encode_json(&artifact)? != encode_json(observed)? {
+            return Err(Error::new(
+                "identity_changed",
+                "artifact custody changed during readback",
+            ));
+        }
+        if !self.cleanup_agent_quiescent(&artifact)? {
+            return Err(Error::new(
+                "agent_not_quiescent",
+                "artifact Agent custody is still active",
+            ));
+        }
+        artifact.state = if request.release_custody.is_some() {
+            "released"
+        } else if absent {
+            "removed"
+        } else {
+            "registered"
+        }
+        .to_owned();
+        artifact.reconciliation = Some(ArtifactReconciliation {
+            id: request.id.clone(),
+            owner_reason: request.release_custody.clone(),
+        });
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sql_error)?;
+        let path = if absent {
+            format!("retired:{}", artifact.id)
+        } else {
+            artifact.path.clone()
+        };
+        tx.execute(
+            "UPDATE artifacts SET body=?1,path=?2 WHERE id=?3",
+            params![encode_json(&artifact)?, path, artifact.id],
+        )
+        .map_err(sql_error)?;
+        retain_write_tx(
+            &tx,
+            &request.id,
+            "owner",
+            "artifact.reconcile",
             &canonical::digest(&payload)?,
             &serde_json::to_value(&artifact)
                 .map_err(|_| Error::new("invalid", "artifact cannot encode"))?,
@@ -1365,7 +1481,7 @@ impl Store {
         request: &CleanupApplyRequest,
         now: i64,
         job: bool,
-    ) -> Result<(CleanupPlan, CleanupApplyResponse, bool)> {
+    ) -> Result<(CleanupPlan, CleanupApplyResponse, Option<Arc<()>>)> {
         self.ensure_writer_healthy()?;
         request.validate()?;
         let payload = serde_json::to_value(request)
@@ -1421,7 +1537,7 @@ impl Store {
                 response.items[index] = settled.clone();
                 self.settle_cleanup_item(principal, request, &response, artifact, &settled)?;
             }
-            return Ok((plan, response, false));
+            return Ok((plan, response, None));
         }
         let plan = self.cleanup_plan(principal, &request.plan_id)?;
         validate_id_age(&request.id, now)?;
@@ -1566,6 +1682,8 @@ impl Store {
                         && a.identity == item.artifact.identity
                         && a.generation == item.artifact.generation
                         && a.path == item.artifact.path
+                        && a.reconciliation.as_ref().map(|r| &r.id)
+                            == item.artifact.reconciliation.as_ref().map(|r| &r.id)
                 }) {
                     response.items[index].outcome = "skipped".to_owned();
                     response.items[index].reason = Some("prior_cleanup_attempt".to_owned());
@@ -1601,7 +1719,7 @@ impl Store {
             now,
         )?;
         commit_transaction(tx, &self.write_faulted)?;
-        Ok((plan, response, true))
+        Ok((plan, response, Some(Arc::clone(&self.cleanup_attempts))))
     }
 
     /// Retirement planning gate for one artifact: quiescence first, then
@@ -1612,6 +1730,9 @@ impl Store {
     /// before any preflight; the apply-time recheck stays as the second
     /// gate.
     pub fn retirement_plan_gate(&self, artifact: &ArtifactView) -> Result<Option<&'static str>> {
+        if artifact.state == "unknown" {
+            return Ok(Some("owner_review_required"));
+        }
         if !self.cleanup_agent_quiescent(artifact)? {
             return Ok(Some("agent_not_quiescent"));
         }

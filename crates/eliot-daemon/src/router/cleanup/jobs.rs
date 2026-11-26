@@ -46,10 +46,12 @@ impl Router {
             return encoded(visible_apply(retained, active));
         }
         self.check_cleanup_admission()?;
-        let (plan, mut response, _) = store.begin_cleanup_apply(&name, &request, now_ms(), true)?;
+        let (plan, mut response, attempt) =
+            store.begin_cleanup_apply(&name, &request, now_ms(), true)?;
         let accepted = encoded(visible_apply(response.clone(), true))?;
         let worker = self.claim_cleanup_worker(&request.id);
         tokio::spawn(async move {
+            let _attempt = attempt;
             let router = &worker.0;
             let result = router
                 .run_cleanup_page(
@@ -336,7 +338,7 @@ impl Router {
                     .retain_cleanup_plan(OWNER, &plan, now)
                     .and_then(|()| store.begin_cleanup_apply(OWNER, &request, now, false))
             };
-            let (_, mut response, _) = match admission {
+            let (_, mut response, _attempt) = match admission {
                 Ok(admission) => admission,
                 Err(error) => {
                     count_unstarted_page(&plan.items, &mut status.tally, native_kept, &error);

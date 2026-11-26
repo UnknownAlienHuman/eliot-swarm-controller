@@ -198,39 +198,52 @@ pub(crate) async fn run_artifact(
     json: bool,
     id: Option<String>,
 ) -> Result<u8, Failure> {
-    let ArtifactCommand::Register {
-        path,
-        kind,
-        purpose,
-        ttl,
-    } = args.command;
-    let expires_at = ttl
-        .as_deref()
-        .map(|duration| {
-            let ttl_ms = eliot_daemon::operator::parse_stand_ttl_ms(duration)
-                .map_err(Failure::for_mutation)?;
-            eliot_daemon::operator::stand_now_ms()
-                .checked_add(ttl_ms)
-                .ok_or_else(|| Failure::new(2, "TTL overflows epoch timestamp"))
-        })
-        .transpose()?;
-    let request = ArtifactRegisterRequest {
-        id: mutation_id(id)?,
-        path,
-        purpose,
-        kind: match kind.as_str() {
-            "build" => ArtifactKind::Build,
-            "data_dir" => ArtifactKind::DataDir,
-            "temp" => ArtifactKind::Temp,
-            _ => ArtifactKind::Other,
-        },
-        expires_at,
-    };
-    request.validate().map_err(Failure::for_mutation)?;
-    let result: ArtifactView =
-        eliot_daemon::client_call_typed(&data, "artifact.register", &request)
-            .await
-            .map_err(Failure::for_mutation)?;
+    let result: ArtifactView = match args.command {
+        ArtifactCommand::Register {
+            path,
+            kind,
+            purpose,
+            ttl,
+        } => {
+            let expires_at = ttl
+                .as_deref()
+                .map(|duration| {
+                    let ttl_ms = eliot_daemon::operator::parse_stand_ttl_ms(duration)
+                        .map_err(Failure::for_mutation)?;
+                    eliot_daemon::operator::stand_now_ms()
+                        .checked_add(ttl_ms)
+                        .ok_or_else(|| Failure::new(2, "TTL overflows epoch timestamp"))
+                })
+                .transpose()?;
+            let request = ArtifactRegisterRequest {
+                id: mutation_id(id)?,
+                path,
+                purpose,
+                kind: match kind.as_str() {
+                    "build" => ArtifactKind::Build,
+                    "data_dir" => ArtifactKind::DataDir,
+                    "temp" => ArtifactKind::Temp,
+                    _ => ArtifactKind::Other,
+                },
+                expires_at,
+            };
+            request.validate().map_err(Failure::for_mutation)?;
+            eliot_daemon::client_call_typed(&data, "artifact.register", &request).await
+        }
+        ArtifactCommand::Reconcile {
+            artifact,
+            release_custody,
+        } => {
+            let request = ArtifactReconcileRequest {
+                id: mutation_id(id)?,
+                artifact,
+                release_custody,
+            };
+            request.validate().map_err(Failure::for_mutation)?;
+            eliot_daemon::client_call_typed(&data, "artifact.reconcile", &request).await
+        }
+    }
+    .map_err(Failure::for_mutation)?;
     print_value(
         &serde_json::to_value(result).map_err(|_| Failure::new(4, "invalid artifact result"))?,
         json,

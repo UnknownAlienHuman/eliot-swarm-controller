@@ -887,16 +887,25 @@ fn prepare_delete_tree_tx(tx: &Transaction<'_>, members: &[i64]) -> Result<Vec<S
         [MAX_DELETE_COMMANDS as i64 + 1],
     ));
     if command_count <= MAX_DELETE_COMMANDS {
-        // Selector and automation admission parents have no Agent target. The
-        // link check below still requires every member of each included set.
+        // Include targetless admission ancestors, including a handoff nested
+        // inside a switch. Every command in the resulting set still has to
+        // pass the link check below.
         command_count += delete_db!(tx.execute(
-            "INSERT INTO deleted_commands
-             SELECT DISTINCT p.id FROM deleted_commands d
-             JOIN commands c ON c.id=d.id JOIN commands p ON p.id=c.parent_command
-             WHERE p.target IS NULL AND p.parent_command IS NULL AND p.state='applied'
-               AND ((c.link_kind=?1 AND p.selector IS NOT NULL)
-                 OR (c.link_kind='rule_action' AND p.verb IN ('rule','timer.run','rule.catch_up')))
-             LIMIT ?2",
+            "WITH RECURSIVE selected(id) AS (
+                 SELECT id FROM deleted_commands
+                 UNION
+                 SELECT p.id FROM selected s
+                 JOIN commands c ON c.id=s.id JOIN commands p ON p.id=c.parent_command
+                 WHERE p.target IS NULL AND p.state='applied'
+                   AND ((p.parent_command IS NULL AND (
+                            (c.link_kind=?1 AND p.selector IS NOT NULL)
+                         OR (c.link_kind='rule_action' AND p.verb IN ('rule','timer.run','rule.catch_up'))
+                         OR (c.link_kind='switch' AND p.method='swarm.switch')))
+                     OR (c.link_kind='handoff' AND p.method='swarm.handoff'))
+             )
+             INSERT INTO deleted_commands
+             SELECT s.id FROM selected s JOIN commands p ON p.id=s.id
+             WHERE p.target IS NULL LIMIT ?2",
             params![
                 hierarchy::SELECTOR_LINK_KIND,
                 (MAX_DELETE_COMMANDS - command_count) as i64 + 1

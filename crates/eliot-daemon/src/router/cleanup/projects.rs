@@ -44,6 +44,7 @@ impl Router {
             };
             items.push(CleanupCandidate {
                 artifact: ArtifactView {
+                    reconciliation: None,
                     id: ulid::Ulid::new().to_string(),
                     agent: String::new(),
                     generation: 0,
