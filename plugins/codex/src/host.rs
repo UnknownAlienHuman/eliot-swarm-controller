@@ -3592,7 +3592,11 @@ async fn verify_resume_preflight(
     retained_unknown: bool,
 ) -> Result<()> {
     let thread = read_owned_thread(client, thread_id).await?;
-    let newest_turn = read_latest_native_turn_status(client, thread_id).await?;
+    let newest_turn = if retained_unknown {
+        read_latest_native_turn_status(client, thread_id).await?
+    } else {
+        read_latest_turn_status(client, thread_id, retained_turn, true).await?
+    };
     ResumePreflight {
         vendor: "Codex",
         subject: "thread",
@@ -3615,42 +3619,100 @@ async fn read_latest_native_turn_status(
     client: &NativeClient,
     thread_id: &str,
 ) -> Result<Option<(String, String)>> {
+    read_latest_turn_status(client, thread_id, None, false).await
+}
+
+async fn read_latest_turn_status(
+    client: &NativeClient,
+    thread_id: &str,
+    retained_turn: Option<&str>,
+    skip_compactions: bool,
+) -> Result<Option<(String, String)>> {
+    let deadline = Instant::now() + RPC_TIMEOUT;
+    let mut cursor = None;
+    let mut seen_cursors = HashSet::new();
+    for _ in 0..MAX_TURN_PAGES {
+        let mut params = json!({
+            "threadId": thread_id,
+            "limit": if skip_compactions { 8 } else { 1 },
+            "sortDirection": "desc",
+            "itemsView": "notLoaded",
+        });
+        if let Some(cursor) = cursor.take() {
+            params["cursor"] = Value::String(cursor);
+        }
+        let response = client.call("thread/turns/list", params, deadline).await?;
+        let turns = response
+            .get("data")
+            .and_then(Value::as_array)
+            .ok_or_else(|| Error::new("native_readback", "Codex newest-turn page omitted data"))?;
+        for turn in turns {
+            let id = resume_readback_field(turn, "id")?;
+            let status = resume_readback_field(turn, "status")?;
+            // Manual compaction persists a native turn without a Swarm work turn.
+            // Only skip a completed turn proved to contain a single compaction item.
+            if !skip_compactions
+                || retained_turn == Some(id)
+                || status != "completed"
+                || !is_standalone_compaction(client, thread_id, id, deadline).await?
+            {
+                return Ok(Some((id.to_owned(), status.to_owned())));
+            }
+        }
+        match response.get("nextCursor") {
+            None | Some(Value::Null) => return Ok(None),
+            Some(Value::String(next))
+                if !turns.is_empty() && !next.is_empty() && seen_cursors.insert(next.clone()) =>
+            {
+                cursor = Some(next.clone());
+            }
+            Some(_) => {
+                return Err(Error::new(
+                    "native_readback",
+                    "Codex newest-turn page has an invalid continuation",
+                ));
+            }
+        }
+    }
+    Err(Error::new(
+        "native_readback",
+        "Codex newest-turn read exceeded the pagination limit",
+    ))
+}
+
+fn resume_readback_field<'a>(turn: &'a Value, key: &str) -> Result<&'a str> {
+    turn.get(key)
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            Error::new(
+                "native_readback",
+                format!("Codex newest turn omitted its {key}"),
+            )
+        })
+}
+
+async fn is_standalone_compaction(
+    client: &NativeClient,
+    thread_id: &str,
+    turn_id: &str,
+    deadline: Instant,
+) -> Result<bool> {
     let response = client
         .call(
-            "thread/turns/list",
-            json!({
-                "threadId": thread_id,
-                "limit": 1,
-                "sortDirection": "desc",
-                "itemsView": "notLoaded",
-            }),
-            Instant::now() + RPC_TIMEOUT,
+            "thread/items/list",
+            json!({"threadId": thread_id, "turnId": turn_id, "limit": 2}),
+            deadline,
         )
         .await?;
-    let turns = response
+    let items = response
         .get("data")
         .and_then(Value::as_array)
-        .ok_or_else(|| Error::new("native_readback", "Codex newest-turn page omitted data"))?;
-    let Some(turn) = turns.first() else {
-        return match response.get("nextCursor") {
-            None | Some(Value::Null) => Ok(None),
-            Some(_) => Err(Error::new(
-                "native_readback",
-                "Codex empty newest-turn page has an unresolved continuation",
-            )),
-        };
-    };
-    let id = turn
-        .get("id")
-        .and_then(Value::as_str)
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| Error::new("native_readback", "Codex newest turn omitted its exact id"))?;
-    let status = turn
-        .get("status")
-        .and_then(Value::as_str)
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| Error::new("native_readback", "Codex newest turn omitted its status"))?;
-    Ok(Some((id.to_owned(), status.to_owned())))
+        .ok_or_else(|| Error::new("native_readback", "Codex compaction item page omitted data"))?;
+    Ok(matches!(items.as_slice(), [entry]
+        if entry.get("turnId").and_then(Value::as_str) == Some(turn_id)
+            && entry.pointer("/item/type").and_then(Value::as_str) == Some("contextCompaction"))
+        && response.get("nextCursor").is_some_and(Value::is_null))
 }
 
 /// Shared error re-coding, kept under the local path for the sibling

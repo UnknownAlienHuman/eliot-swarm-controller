@@ -360,7 +360,10 @@ adapter translates its readback into a resumable runtime state, any active turn,
 and the newest turn's terminal status. The preflight requires a resumable runtime,
 no vendor-exposed active turn, and an exact retained terminal turn. A
 retained subject with no turn needs vendor proof that no native turn ran (an empty
-turn page, or a zero turn counter where the vendor exposes one). The preflight proves
+turn page, or a zero turn counter where the vendor exposes one). For a settled
+Codex session, the adapter walks past completed native turns that contain only
+one context-compaction item before checking the retained work turn. An unknown
+retained turn still requires an exact newest-turn match. The preflight proves
 resumability by this new generation, not that the previous host generation is gone;
 Store admission and dispatch guarantee that.
 

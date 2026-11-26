@@ -4068,6 +4068,11 @@ above; single-target `--for turn|idle|stopped|goal` forms remain future (`agent.
 Command and turn resolution use `--status`. A completed command maps to the
 stored `applied` outcome.
 
+`swarm compact` captures and prints the current Agent generation when
+`--generation` is omitted. An explicit retry ID reuses the retained command's
+generation. Admission checks the generation before dispatch, as it does for an
+explicit `--generation`.
+
 `swarm daemon` (background) prints `starting` with the resolved data directory
 and log path, then polls `daemon.status` for up to 30 s. It prints `ready` with the
 resolved data directory and boot id on success. If Windows startup observed root
