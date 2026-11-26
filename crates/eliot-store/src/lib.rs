@@ -3287,6 +3287,7 @@ impl Store {
         // Retained children of producer generations that ended before this
         // start (including rows written before this rule existed).
         native_children::end_native_children_with_parent_tx(&tx, None, now, &mut events)?;
+        git::recover_ended_git_sources_tx(&tx, now, &mut events)?;
         // Settle only the exact pre-Git creation cancellation after restart
         // has reconciled both dispatched commands and Agent custody.
         workspace::recover_workspace_cancellations(&tx, now, &mut events)?;
@@ -4021,32 +4022,11 @@ impl Store {
             let closing_workspace = closed
                 .then(|| retained_git_workspace(&tx, agent, generation))
                 .transpose()?;
-            let state = if closed {
-                "closed"
-            } else {
-                source.state.as_str()
-            };
-            let mut events = Vec::new();
-            if state != source.state || health != source.health {
-                db!(tx.execute(
-                    "UPDATE source_state SET state = ?1, health = ?2, updated_at = ?3
-                     WHERE agent = ?4 AND generation = ?5 AND source = 'git'",
-                    params![state, health, now, agent_num, generation],
-                ));
-                events.push(insert_daemon_event(
-                    &tx,
-                    now,
-                    if state != source.state {
-                        "source.closed"
-                    } else {
-                        "source.health"
-                    },
-                    "source",
-                    Some(agent_num),
-                    Some(generation),
-                    json!({"source": GIT_SOURCE, "state": state, "health": health}),
-                )?);
-            }
+            let events = git::write_git_source_status_tx(
+                &tx, agent_num, generation, &source, health, closed, now,
+            )?
+            .into_iter()
+            .collect();
             let retire_workspace = if let Some(workspace) = closing_workspace {
                 let shared: bool = tx.query_row(
                     "SELECT EXISTS(SELECT 1 FROM source_state s JOIN agents a ON a.id=s.agent

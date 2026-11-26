@@ -734,7 +734,15 @@ probes back off up to 30 s. A binding's final read (its generation is
 terminal and its native stream closed) bypasses that backoff but keeps the 2 s minimum,
 and the stream's committed `source.closed` wakes the poller, so a stopped Agent's Git
 source closes within one probe interval even when its workspace is not a Git
-repository. CLI reads return the cache without forcing a scan.
+repository. Restart recovery also closes a retained Git source for an ended
+generation when owned exit and reader drain or exact restart custody prove its
+process family is gone, and no retained native file-change hints remain beyond
+the committed Git cursor. It preserves the cursor and any recorded gap, and
+closes with stale health without reading the workspace or publishing new Git
+facts. Without exact custody, or while a retained hint still needs readback or
+an explicit unavailable interval, the source stays open and blocks
+[Agent deletion](api.md#agent-and-daemon-read-views).
+CLI reads return the cache without forcing a scan.
 The target requirements above remain binding. `git-status AGENT` / `agent.git` returns
 the current generation's cached view; `edits AGENT` / `agent.edits` pages retained
 attribution, including historical generations for an authorized owner.
