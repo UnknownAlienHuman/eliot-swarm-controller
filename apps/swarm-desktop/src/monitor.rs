@@ -277,44 +277,39 @@ pub fn work_words(work: &WorkSummaryView, now_ms: i64) -> String {
     format!("code work: {}", parts.join(", "))
 }
 
-/// The Details pane's work summary: commits ahead of the base, files and
-/// lines, the last write and commit, and this turn's tool calls and
-/// messages; why instead of the Git counts when they could not be measured.
+/// The Details pane's work summary: files and lines, the last write and
+/// commit when there was one, and this turn's tool calls and messages
+/// while one runs; why instead of the Git counts when they could not be
+/// measured. Commits ahead are on the Branch row, the turn's state in the
+/// header.
 pub fn work_detail_lines(work: &WorkSummaryView, now_ms: i64) -> Vec<String> {
     let mut lines = Vec::new();
     if work.available {
         let count = |value: Option<u64>| value.unwrap_or_default();
-        lines.push(format!(
-            "{} ahead of its base",
-            eliot_core::count_words(count(work.commits_ahead), "commit", "commits")
-        ));
         lines.push(format!(
             "{} changed · +{} \u{2212}{} lines",
             eliot_core::count_words(count(work.files_changed), "file", "files"),
             group(count(work.insertions) as i64),
             group(count(work.deletions) as i64)
         ));
-        lines.push(match work.last_write_at {
-            Some(at) => format!("Last write {} ({})", ago(now_ms, at), clock(at)),
-            None => "No write seen yet".to_owned(),
-        });
-        lines.push(match work.last_commit_at {
-            Some(at) => format!("Last commit {} ({})", ago(now_ms, at), clock(at)),
-            None => "No commit yet".to_owned(),
-        });
+        if let Some(at) = work.last_write_at {
+            lines.push(format!("Last write {} ({})", ago(now_ms, at), clock(at)));
+        }
+        if let Some(at) = work.last_commit_at {
+            lines.push(format!("Last commit {} ({})", ago(now_ms, at), clock(at)));
+        }
     } else {
         lines.push(work_reason_words(
             work.reason.as_deref().unwrap_or("unavailable"),
         ));
     }
-    lines.push(match (work.tool_calls, work.messages) {
-        (Some(tools), Some(messages)) => format!(
+    if let (Some(tools), Some(messages)) = (work.tool_calls, work.messages) {
+        lines.push(format!(
             "This turn: {} · {}",
             eliot_core::count_words(tools, "tool call", "tool calls"),
             eliot_core::count_words(messages, "message", "messages")
-        ),
-        _ => "No turn running".to_owned(),
-    });
+        ));
+    }
     lines
 }
 
@@ -1535,16 +1530,6 @@ impl Monitor {
             children.sort_by(|a, b| id_order(&a.id, &b.id));
         }
         tree
-    }
-
-    /// Whether a live state holds more Agents than the bounded read
-    /// returned (its `state_totals` count exceeds its rows), including one
-    /// with no rows in the page at all: every count is then partial.
-    pub fn partial(&self) -> bool {
-        self.counts.iter().any(|count| {
-            count.state != AgentState::Stopped
-                && count.total.is_some_and(|total| total > count.shown)
-        })
     }
 
     pub fn apply(&mut self, snapshot: MonitorSnapshot) {

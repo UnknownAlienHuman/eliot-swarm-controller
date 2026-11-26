@@ -171,13 +171,11 @@ impl DesktopApp {
                 if epoch != self.handoff.epoch {
                     return;
                 }
+                // The list below shows what waits: no count line above it.
                 self.handoff.status = match &sends {
-                    Ok(rows) => format!(
-                        "{} SEND(s) in this run, {} undispatched.{}",
-                        rows.len(),
-                        rows.iter().filter(|row| row.transferable()).count(),
-                        handoff::omitted_note(omitted, client::MAX_LISTED_SENDS)
-                    ),
+                    Ok(_) => handoff::omitted_note(omitted, client::MAX_LISTED_SENDS)
+                        .trim()
+                        .to_owned(),
                     Err(error) => format!("SENDs not read: {error}"),
                 };
                 if let Ok(rows) = &sends {
@@ -696,7 +694,7 @@ impl DesktopApp {
             && state.task.is_some();
         let mut sections: Vec<KeyedView> = Vec::new();
         let mut push = |key: &str, view: View| sections.push(KeyedView::new(key.to_owned(), view));
-        if state.outcome.is_none() {
+        if state.outcome.is_none() && !state.status.is_empty() {
             push("status", small(state.status.clone()).into());
         }
 
@@ -717,11 +715,6 @@ impl DesktopApp {
                 Some(Choice::Adhoc) => Some(2),
                 None => None,
             });
-            push(
-                "lead",
-                small("A brief from the original task goes to the destination. Claims, workers and the goal move with the work.")
-                    .into(),
-            );
             let targets = self.handoff_targets();
             let profiles = &self.launch.profile_summaries;
             for (index, (title, supporting)) in [
@@ -967,13 +960,7 @@ impl DesktopApp {
 
             let transferable: Vec<&SendRow> =
                 rows.iter().filter(|row| row.transferable()).collect();
-            if transferable.is_empty() {
-                push(
-                "no-sends",
-                small("None are waiting in this run: the transfer carries context, claims, Goal and children only.")
-                    .into(),
-            );
-            } else {
+            if !transferable.is_empty() {
                 push(
                     "sends-note",
                     small(format!(

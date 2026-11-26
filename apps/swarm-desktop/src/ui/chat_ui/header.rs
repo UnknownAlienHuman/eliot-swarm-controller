@@ -298,10 +298,7 @@ impl DesktopApp {
                                     .foreground(ThemeBrush::SystemCritical)
                                     .text_trimming(TextTrimming::CharacterEllipsis),
                                 controls::text(
-                                    format!(
-                                        "Ends Agent {} (run {}) at once instead of a clean stop; an active turn is cut off.",
-                                        bound.agent, bound.generation
-                                    ),
+                                    "Ends it at once; a running turn is cut off.",
                                     tokens::text::CAPTION,
                                 )
                                 .foreground(ThemeBrush::SystemCritical)
@@ -315,9 +312,11 @@ impl DesktopApp {
                             .children((
                                 controls::destructive()
                                     .automation_name("Cancel force stop")
-                                    .on_click(context.message(Message::Chat(
-                                        ChatMsg::ForceStopAnswered(false),
-                                    )))
+                                    .on_click(
+                                        context.message(Message::Chat(ChatMsg::ForceStopAnswered(
+                                            false,
+                                        ))),
+                                    )
                                     .content(controls::label("Cancel")),
                                 controls::destructive()
                                     .is_enabled(!self.submitting())
@@ -325,13 +324,16 @@ impl DesktopApp {
                                         "Force stop {} run {}",
                                         bound.agent, bound.generation
                                     ))
-                                    .on_click(context.message(Message::Chat(
-                                        ChatMsg::ForceStopAnswered(true),
-                                    )))
+                                    .on_click(
+                                        context.message(Message::Chat(ChatMsg::ForceStopAnswered(
+                                            true,
+                                        ))),
+                                    )
                                     .content(controls::label("Force stop")),
                             )),
                     )),
-            ).into()
+            )
+            .into()
     }
 }
 

@@ -2,13 +2,7 @@ use super::*;
 
 impl DesktopApp {
     pub(super) fn routing_section(&self, context: &mut ViewContext<Self>) -> View {
-        let mut groups: Vec<KeyedView> = vec![KeyedView::new(
-            "intro",
-            controls::secondary(
-                "When a task starts on Auto, Swarm tries the role's profiles in order and runs the first one that is installed, not on hold, not out of quota and within capacity. The choice and the skipped profiles are recorded on the task.",
-            )
-            .text_wrapping(TextWrapping::Wrap),
-        )];
+        let mut groups: Vec<KeyedView> = Vec::new();
         // What Auto picks right now, from the saved policy.
         if let Some(Ok(decision)) = &self.launch.preview {
             let (headline, skipped) = model::decision_lines(decision);
@@ -42,9 +36,9 @@ impl DesktopApp {
                 other => other,
             };
             let supporting = match (role.as_str(), list.is_empty()) {
-                ("default", true) => "No profiles: tasks on Auto cannot start.",
+                ("default", true) => "No profiles: Auto cannot start tasks.",
                 ("default", false) => "New tasks on Auto.",
-                (_, true) => "Not set: launches that ask for this role are refused.",
+                (_, true) => "Not set",
                 (_, false) => "Launches that ask for this role.",
             };
             let mut rows: Vec<KeyedView> = Vec::new();

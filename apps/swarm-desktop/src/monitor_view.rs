@@ -312,7 +312,7 @@ pub fn observe_lines(read: &DetailRead) -> Vec<String> {
             .map(|category| format!(", latest {}", category.replace('_', " ")))
             .unwrap_or_default();
         lines.push(format!(
-            "Heavy work: {}{what}, {:.1} s of CPU",
+            "{}{what}, {:.1} s of CPU",
             eliot_core::count_words(heavy.episodes, "episode", "episodes"),
             heavy.total_cpu_ms as f64 / 1000.0
         ));
@@ -336,15 +336,18 @@ pub fn usage_lines(read: &DetailRead) -> Vec<String> {
         .session_usage
         .as_ref()
         .and_then(eliot_core::SessionUsage::context_tokens);
-    let mut lines = vec![match context {
-        Some((used, window)) => format!(
-            "Context {:.1}% filled · {} of {} tokens",
-            100.0 * used as f64 / window as f64,
-            group(used),
-            group(window)
-        ),
-        None => "Context fill unavailable.".to_owned(),
-    }];
+    // An unknown fill is the Used row's "not reported", not a second line.
+    let mut lines: Vec<String> = context
+        .map(|(used, window)| {
+            format!(
+                "Context {:.1}% filled · {} of {} tokens",
+                100.0 * used as f64 / window as f64,
+                group(used),
+                group(window)
+            )
+        })
+        .into_iter()
+        .collect();
     match &read.usage {
         Ok(usage) => {
             let turns = &usage.turns;

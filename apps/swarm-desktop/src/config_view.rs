@@ -909,8 +909,9 @@ pub fn scripts_screen(data: ScriptsData<'_>, actions: ScriptsActions) -> View {
             "none",
             crate::controls::form_row(
                 "Script",
-                small("No scripts yet. Put them in the scripts folder of Swarm's data folder, or in a project's .eliot\\scripts folder.")
-                    .into(),
+                small("No scripts yet.").tooltip(
+                    "Put them in the scripts folder of Swarm's data folder, or in a project's .eliot\\scripts folder",
+                ),
                 Some(refresh.into()),
             ),
         ));

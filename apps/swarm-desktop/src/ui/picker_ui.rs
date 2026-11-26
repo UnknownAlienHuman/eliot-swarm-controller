@@ -18,7 +18,6 @@ use crate::settings::Access;
 
 /// What a model row with no explicit effort launches: the harness's own
 /// default (its accessible name; the chip reads "Default").
-const DEFAULT_EFFORT: &str = "Default effort";
 /// Models a Manage models group lists before it asks for a search.
 const MANAGE_GROUP_ROWS: usize = 150;
 
@@ -504,8 +503,10 @@ impl DesktopApp {
 
     /// One choosable row: the check, the model name on the first line; its
     /// provider (or a remembered row's harness and provider), the effort it
-    /// launches and whether it can run now on the second (a row that
-    /// cannot be chosen says why). The highlighted row (hover or keyboard)
+    /// launches when it names one and whether it can run now when that is
+    /// known on the second (a row that cannot be chosen says why; an
+    /// unknown quota and the default effort say nothing, as in Codex and
+    /// Antigravity). The highlighted row (hover or keyboard)
     /// shows the favorite star. Choosing the row launches exactly the model
     /// and effort it shows (`Item::choice`).
     fn picker_row(
@@ -516,23 +517,22 @@ impl DesktopApp {
         context: &mut ViewContext<Self>,
     ) -> View {
         let enabled = item.disabled.is_none();
-        let model_row = matches!(item.kind, ItemKind::Model { .. });
         let lead = if item.detail.is_empty() {
             item.provider.clone()
         } else {
             item.detail.clone()
         };
-        let effort = match item.effort.as_deref() {
-            Some(effort) => Some(format!("{} effort", effort_words(effort))),
-            None if model_row => Some(DEFAULT_EFFORT.to_owned()),
-            None => None,
-        };
+        let effort = item
+            .effort
+            .as_deref()
+            .map(|effort| format!("{} effort", effort_words(effort)));
         // A row that cannot be chosen says why; a hold says it once.
         let state = match &item.disabled {
             Some(_) if item.availability == picker::Availability::Held => {
                 item.availability.label().map(str::to_owned)
             }
             Some(why) => Some(why.clone()),
+            None if item.availability == picker::Availability::Unknown => None,
             None => item.availability.label().map(str::to_owned),
         };
         let note = [Some(lead), effort, state]
@@ -1031,7 +1031,8 @@ fn group_heading(
     };
     let label = controls::section_label(title.to_owned())
         .font_weight(controls::weight(tokens::text::HEADER));
-    controls::sub_row(false)
+    // The harness version goes in the tooltip: the heading is its name.
+    let row = controls::sub_row(false)
         .margin(Thickness::new(indent, 0.0, 0.0, 0.0))
         .automation_name(format!("{title} models, {state}"))
         .on_click(context.message(Message::Launch(LaunchMsg::GroupToggled(group.to_owned()))))
@@ -1039,13 +1040,13 @@ fn group_heading(
             StackPanel::new()
                 .orientation(Orientation::Horizontal)
                 .spacing(tokens::spacing::SM)
-                .keyed_children(crate::views::slots([
-                    Some(controls::icon(glyph)),
-                    Some(label.into()),
-                    (!note.is_empty()).then(|| controls::secondary(note.to_owned()).into()),
-                ])),
-        )
-        .into()
+                .children((controls::icon(glyph), label)),
+        );
+    if note.is_empty() {
+        row.into()
+    } else {
+        row.tooltip(note)
+    }
 }
 
 /// An effort in full words, capitalized ("Medium", "Extra high").

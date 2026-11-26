@@ -72,64 +72,56 @@ impl DesktopApp {
                     context.callback(|index| Message::Settings(SettingsMsg::AccessChosen(index))),
                 ),
         )]);
-        let levels: Vec<KeyedView> = Access::ALL
-            .iter()
-            .map(|access| {
-                KeyedView::new(
-                    access.wire(),
-                    controls::setting_row(access.label(), access.description(), None),
-                )
-            })
-            .collect();
-        StackPanel::new().spacing(tokens::spacing::SM).children((
-            controls::card_title("Appearance"),
-            controls::settings_card(vec![
-                KeyedView::new(
-                    "theme",
-                    controls::setting_row(
-                        "Theme",
-                        "System follows Windows; High Contrast always does",
-                        View::from(theme_picker),
-                    ),
-                ),
-                KeyedView::new(
-                    "panels",
-                    controls::setting_row(
-                        "Panel widths",
-                        "Drag a panel's edge to resize it",
-                        View::from(
-                            controls::outlined()
-                                .is_enabled(self.prefs.panels.is_some())
-                                .automation_name("Reset panel widths")
-                                .on_click(context.message(Message::Shell(ShellMsg::PanelsReset)))
-                                .content(controls::label("Reset panel widths")),
+        StackPanel::new()
+            .spacing(tokens::spacing::SM)
+            .children((
+                controls::card_title("Appearance"),
+                controls::settings_card(vec![
+                    KeyedView::new(
+                        "theme",
+                        controls::setting_row(
+                            "Theme",
+                            "System follows Windows; High Contrast always does",
+                            View::from(theme_picker),
                         ),
                     ),
-                ),
-            ]),
-            controls::card_title("Start and work"),
-            controls::settings_card(
-                vec![
+                    KeyedView::new(
+                        "panels",
+                        controls::setting_row(
+                            "Panel widths",
+                            "Drag a panel's edge to resize it",
+                            View::from(
+                                controls::outlined()
+                                    .is_enabled(self.prefs.panels.is_some())
+                                    .automation_name("Reset panel widths")
+                                    .on_click(
+                                        context.message(Message::Shell(ShellMsg::PanelsReset)),
+                                    )
+                                    .content(controls::label("Reset panel widths")),
+                            ),
+                        ),
+                    ),
+                ]),
+                controls::card_title("Start and work"),
+                controls::settings_card(vec![
                     KeyedView::new(
                         "startup",
-                        controls::setting_row("On startup", "What the window opens with", View::from(startup_picker)),
+                        controls::setting_row(
+                            "On startup",
+                            "What the window opens with",
+                            View::from(startup_picker),
+                        ),
                     ),
                     KeyedView::new(
                         "access",
                         controls::setting_row(
                             "Default access",
-                            "For new tasks. You can change it in the composer",
+                            "For new tasks",
                             View::from(access_picker),
                         ),
                     ),
-                ],
-            ),
-            controls::card_title("What each access level allows"),
-            controls::settings_card(levels),
-            controls::secondary(
-                "Presets and Auto keep their own permissions. OpenCode has no Full access mode.",
-            )
-            .text_wrapping(TextWrapping::Wrap),
-        )).into()
+                ]),
+            ))
+            .into()
     }
 }

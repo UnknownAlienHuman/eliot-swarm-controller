@@ -426,38 +426,37 @@ impl DesktopApp {
             .spacing(tokens::spacing::SM)
             .children((
                 controls::card_title("Rules for every agent"),
-                controls::settings_card(
-                    vec![KeyedView::new(
-                        "text",
-                        StackPanel::new()
-                            .spacing(tokens::spacing::SM)
-                            .margin(Thickness::xy(0.0, tokens::spacing::INSET))
-                            .children((
-                                controls::secondary(
-                                    "Each new task receives this text at its start; a running task keeps the text it started with.",
-                                )
+                controls::settings_card(vec![KeyedView::new(
+                    "text",
+                    StackPanel::new()
+                        .spacing(tokens::spacing::SM)
+                        .margin(Thickness::xy(0.0, tokens::spacing::INSET))
+                        .children((
+                            controls::secondary("Sent to each new task at its start.")
                                 .text_wrapping(TextWrapping::Wrap),
-                                controls::field()
-                                    .text(text)
-                                    .accepts_return(true)
-                                    .text_wrapping(TextWrapping::Wrap)
-                                    .min_height(tokens::layout::SOURCE_MIN_HEIGHT)
-                                    .max_height(tokens::layout::SOURCE_MAX_HEIGHT)
-                                    .is_enabled(!self.settings.busy())
-                                    .automation_name("Owner rules")
-                                    .on_text_changed(crate::views::text_edits(context.callback(|text| {
-                                        Message::Settings(SettingsMsg::OwnerRulesText(text))
-                                    }))),
-                                controls::secondary(if bytes > 8 * 1024 {
-                                    format!("{bytes} bytes: longer than 8 KiB, which agents read slowly.")
-                                } else {
-                                    format!("{bytes} bytes")
-                                }),
-                            )),
-                    )],
-                ),
+                            controls::field()
+                                .text(text)
+                                .accepts_return(true)
+                                .text_wrapping(TextWrapping::Wrap)
+                                .min_height(tokens::layout::SOURCE_MIN_HEIGHT)
+                                .max_height(tokens::layout::SOURCE_MAX_HEIGHT)
+                                .is_enabled(!self.settings.busy())
+                                .automation_name("Owner rules")
+                                .on_text_changed(crate::views::text_edits(context.callback(
+                                    |text| Message::Settings(SettingsMsg::OwnerRulesText(text)),
+                                ))),
+                            controls::secondary(if bytes > 8 * 1024 {
+                                format!(
+                                    "{bytes} bytes: longer than 8 KiB, which agents read slowly."
+                                )
+                            } else {
+                                format!("{bytes} bytes")
+                            }),
+                        )),
+                )]),
                 self.save_bar(Page::OwnerRules, dirty, context),
-            )).into()
+            ))
+            .into()
     }
 
     /// Attention: the daemon's reactions by kind, each on by default; the
@@ -506,10 +505,6 @@ impl DesktopApp {
             .children((
                 controls::card_title("Reactions"),
                 controls::settings_card(rows),
-                controls::secondary(
-                    "The daemon applies a change at its next start. Save asks first.",
-                )
-                .text_wrapping(TextWrapping::Wrap),
                 self.save_bar(
                     Page::Attention,
                     self.settings.dirty(Page::Attention),
@@ -641,10 +636,6 @@ impl DesktopApp {
                         ),
                     ],
                 ),
-                controls::secondary(
-                    "On restart and the chats folder apply at the next start. Save asks first.",
-                )
-                .text_wrapping(TextWrapping::Wrap),
                 self.save_bar(Page::Daemon, self.settings.dirty(Page::Daemon), context),
             )).into()
     }
@@ -706,18 +697,17 @@ impl DesktopApp {
                 ),
             ),
         ));
-        StackPanel::new().spacing(tokens::spacing::SM).children((
-            controls::card_title("History"),
-            controls::settings_card(rows),
-            controls::secondary(
-                "Retention windows apply at once; a shorter one deletes older history. Save asks first.",
-            )
-            .text_wrapping(TextWrapping::Wrap),
-            self.save_bar(
-                Page::Retention,
-                self.settings.dirty(Page::Retention),
-                context,
-            ),
-        )).into()
+        StackPanel::new()
+            .spacing(tokens::spacing::SM)
+            .children((
+                controls::card_title("History"),
+                controls::settings_card(rows),
+                self.save_bar(
+                    Page::Retention,
+                    self.settings.dirty(Page::Retention),
+                    context,
+                ),
+            ))
+            .into()
     }
 }

@@ -495,17 +495,17 @@ impl DesktopApp {
             .or_else(|| self.daemon_down().then_some("Swarm is not running"));
         // Unknown until a read succeeds: a failed read never reads as "no
         // goal", so Save cannot replace a goal it did not see.
+        // A dialog without a goal yet has no status line: its title says it.
         let context_line = match (goal, read_error) {
-            (None, Some(error)) => format!("The goal could not be read: {error}"),
-            (None, None) => "Reading the goal…".to_owned(),
-            (Some(None), None) => {
-                "No goal yet. Swarm runs the task in rounds until the check passes or a limit is reached."
-                    .to_owned()
+            (None, Some(error)) => Some(format!("The goal could not be read: {error}")),
+            (None, None) => Some("Reading the goal…".to_owned()),
+            (Some(None), None) => None,
+            (Some(None), Some(error)) => {
+                Some(format!("No goal when last read. Not read again: {error}"))
             }
-            (Some(None), Some(error)) => format!("No goal when last read. Not read again: {error}"),
-            (Some(Some(goal)), None) => status_words(goal),
+            (Some(Some(goal)), None) => Some(status_words(goal)),
             (Some(Some(goal)), Some(error)) => {
-                format!("{} Not read again: {error}", status_words(goal))
+                Some(format!("{} Not read again: {error}", status_words(goal)))
             }
         };
         // The goal as the last read confirmed it: after a failed read the
@@ -542,11 +542,11 @@ impl DesktopApp {
         let body = StackPanel::new()
             .spacing(tokens::spacing::MD)
             .keyed_children(crate::views::slots([
-                Some(
-                    controls::secondary(context_line)
+                context_line.map(|line| {
+                    controls::secondary(line)
                         .text_wrapping(TextWrapping::Wrap)
-                        .into(),
-                ),
+                        .into()
+                }),
                 Some(
                     controls::field()
                         .element_ref(&self.dialog.field)
@@ -565,37 +565,20 @@ impl DesktopApp {
                         .into(),
                 ),
                 Some(
-                    StackPanel::new()
-                        .spacing(tokens::spacing::XS)
-                        .children((
-                            controls::field()
-                                .header(controls::secondary("Check command"))
-                                .automation_name("Check command")
-                                .is_enabled(!stale)
-                                .text(draft.check.clone())
-                                .placeholder_text("cargo test")
-                                .on_text_changed(crate::views::text_edits(
-                                    context.callback(|text| Message::Goal(GoalMsg::Check(text))),
-                                )),
-                            controls::secondary(
-                                "Runs in the task's worktree without a shell; exit 0 means the goal is met.",
-                            )
-                            .text_wrapping(TextWrapping::Wrap),
+                    controls::field()
+                        .header(controls::secondary("Check command"))
+                        .automation_name("Check command")
+                        .is_enabled(!stale)
+                        .text(draft.check.clone())
+                        .placeholder_text("cargo test")
+                        .on_text_changed(crate::views::text_edits(
+                            context.callback(|text| Message::Goal(GoalMsg::Check(text))),
                         ))
-                        .into(),
+                        .tooltip("Runs in the task's worktree without a shell; exit 0 means met"),
                 ),
-                Some(
-                    StackPanel::new()
-                        .spacing(tokens::spacing::XS)
-                        .children((
-                            limits,
-                            controls::secondary(
-                                "Limits stop the goal: rounds of checks, the task's turns, and rounds in a row with the same result. Set rounds or turns; empty means no limit.",
-                            )
-                            .text_wrapping(TextWrapping::Wrap),
-                        ))
-                        .into(),
-                ),
+                Some(limits.tooltip(
+                    "Rounds of checks, the task's turns, and rounds in a row with the same result; empty means no limit",
+                )),
                 error,
             ]))
             .into();

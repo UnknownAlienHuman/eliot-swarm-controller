@@ -1869,7 +1869,9 @@ fn log_head(part: &RenderedPart, head: LogHead, callbacks: &RowCallbacks) -> Vie
         .text_trimming(TextTrimming::CharacterEllipsis)
         .into(),
     };
-    let doing: Option<View> = (head.running && !head.doing.is_empty()).then(|| {
+    // An open log shows the running step itself: the label only stands in
+    // for it while the log is closed.
+    let doing: Option<View> = (head.running && !head.open && !head.doing.is_empty()).then(|| {
         StackPanel::new()
             .orientation(Orientation::Horizontal)
             .spacing(tokens::spacing::SM)

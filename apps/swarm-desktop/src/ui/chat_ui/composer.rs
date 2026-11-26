@@ -636,52 +636,33 @@ impl DesktopApp {
 
     /// The context beside the main action (brand book §9.5), small text as
     /// the harness reports it: "Context 34%" against a known window, else
-    /// the tokens used ("Context 54k tokens"), else "Context unavailable",
-    /// never 0%. Its tooltip says whose context it is and how fresh; a click
-    /// opens Details. Provider quota is the usage ring's, not this.
+    /// the tokens used ("Context 54k tokens"), never 0%; nothing while the
+    /// harness reports no tokens (Codex shows only a known usage). Its
+    /// tooltip says how fresh; a click opens Details. Provider quota is the
+    /// usage ring's, not this.
     fn context_ring(&self, context: &mut ViewContext<Self>) -> Option<View> {
         let detail = self.bound_detail().ok()?;
-        let harness = crate::picker::harness_label(&detail.harness);
-        let (label, words) = match &detail.context {
-            Some(fill) => {
-                let age = fill.observed_at.map_or_else(String::new, |at| {
-                    format!(
-                        ", reported {} ago",
-                        monitor::elapsed_label(crate::handoff::now_ms().saturating_sub(at))
-                    )
-                });
-                match (fill.used, fill.window, fill.percent()) {
-                    (Some(used), Some(window), Some(share)) => (
-                        format!("Context {}%", share.round()),
-                        format!(
-                            "This {harness} session's context: {} of {} tokens{age}.",
-                            monitor::group(used),
-                            monitor::group(window)
-                        ),
-                    ),
-                    (Some(used), _, _) => (
-                        format!("Context {}k tokens", used / 1_000),
-                        format!(
-                            "This {harness} session's context: {} tokens{age}; {harness} does not report the window.",
-                            monitor::group(used)
-                        ),
-                    ),
-                    (None, window, _) => (
-                        "Context unavailable".to_owned(),
-                        format!(
-                            "{harness} reports {}not the tokens this session's context holds{age}.",
-                            window.map_or_else(String::new, |window| format!(
-                                "a {}-token window but ",
-                                monitor::group(window)
-                            ))
-                        ),
-                    ),
-                }
-            }
-            None => (
-                "Context unavailable".to_owned(),
-                format!("{harness} has not reported this session's context."),
+        let fill = detail.context.as_ref()?;
+        let age = fill.observed_at.map_or_else(String::new, |at| {
+            format!(
+                ", {} ago",
+                monitor::elapsed_label(crate::handoff::now_ms().saturating_sub(at))
+            )
+        });
+        let (label, words) = match (fill.used, fill.window, fill.percent()) {
+            (Some(used), Some(window), Some(share)) => (
+                format!("Context {}%", share.round()),
+                format!(
+                    "{} of {} tokens{age}",
+                    monitor::group(used),
+                    monitor::group(window)
+                ),
             ),
+            (Some(used), _, _) => (
+                format!("Context {}k tokens", used / 1_000),
+                format!("{} tokens{age}", monitor::group(used)),
+            ),
+            (None, _, _) => return None,
         };
         Some(
             controls::bar_button(false)
