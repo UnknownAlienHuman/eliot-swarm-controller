@@ -8,7 +8,10 @@ use eliot_core::{
     },
 };
 use eliot_plugin::sync::LockExt;
-use eliot_store::{OwnerDecisionAdmission, OwnerInboxPage, OwnerProjection, Store, StuckStates};
+use eliot_store::{
+    OwnerDecisionAdmission, OwnerInboxPage, OwnerProjection, Store, StuckStates, WorkCommitProof,
+    WorkCommitRequest,
+};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
@@ -211,6 +214,11 @@ impl Router {
                         "checkpoint.restore.stop" => {
                             self.stop_checkpoint_restore(&action.args, principal).await
                         }
+                        "workspace.verify_work_commit" => {
+                            let request = serde_json::from_value(action.args)
+                                .map_err(|_| Error::new("invalid", "invalid work commit choice"))?;
+                            self.verify_work_commit(request).await
+                        }
                         "command.cancel" => self.command_cancel(&action.args, principal).await,
                         "command.settle_stopped" => {
                             self.command_settle_stopped(&action.args, principal).await
@@ -234,6 +242,33 @@ impl Router {
             snoozed: false,
             result: Some(result)
         }))
+    }
+
+    async fn verify_work_commit(&self, request: WorkCommitRequest) -> Result<Value> {
+        let item = OWNER_DECISION.with(|binding| binding.item.clone());
+        let work = {
+            let store = self.inner.store.lock().await;
+            if let Some(receipt) = store.work_commit_receipt(&request)? {
+                return Ok(receipt);
+            }
+            store.missing_work(&request, &item, super::now_ms())?
+        };
+        let ref_tip = crate::git_monitor::GitProbe::new()?
+            .verify_work_commit(&work, &request)
+            .await?;
+        let proof = WorkCommitProof {
+            observation_seq: request.observation_seq,
+            head: work.head,
+            dirty_digest: work.digest,
+            retained_ref: request.retained_ref.clone(),
+            ref_tip,
+            commit: request.commit.clone(),
+        };
+        self.inner
+            .store
+            .lock()
+            .await
+            .settle_work_commit(&request, &item, &proof, super::now_ms())
     }
 
     async fn owner_inbox_inspect(

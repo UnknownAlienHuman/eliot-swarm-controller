@@ -1010,11 +1010,20 @@ Agent to commit. That long turn also takes a checkpoint, at most once per ten mi
 `owner.inbox` shows `work_not_in_git` for a failed checkpoint, an Agent
 that ended with uncommitted work and no successor, or a managed worktree that
 [missing-folder reconciliation](coordination.md#registered-artifacts-and-cleanup-k69) settled while its last
-checkpoint or Git observation held uncommitted work. That item carries the exact commands
-that restore it: `git worktree prune`, `git worktree add <dir> <branch>`, and
+checkpoint or Git observation held uncommitted work. When a checkpoint is retained,
+the item carries the restore commands `git worktree prune`, `git worktree add <dir> <branch>`, and
 `swarm --data-dir <daemon-data> checkpoint restore --agent <agent> --generation <N>
 --checkpoint-ref <ref> --workspace <dir>`. Restore preserves staged and unstaged layers.
 A failed capture keeps the reference to the last good checkpoint.
+
+For a missing worktree without a checkpoint, the Owner can supply a retained
+branch ref and a commit reachable from it. Swarm can settle the item when the
+exact removal-bound observation retains the complete path list and dirty-content
+digest, and the commit reproduces that digest from regular file bytes and
+recorded deletions. To prove a recorded deletion, the candidate commit must be a
+strict descendant of the observed HEAD and the deleted path must be absent from
+its tree. Observations with staged changes, renames or missing content
+evidence remain Owner decisions. Commit ancestry alone cannot settle dirty work.
 
 Checkpoint capture and accounting share the repository write lane with managed Git
 operations. The unique repository intent serializes checkpoints, and Store reserves

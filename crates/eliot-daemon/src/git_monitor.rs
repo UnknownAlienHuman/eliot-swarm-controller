@@ -26,6 +26,8 @@ use tokio::{
     time::{Instant, timeout_at},
 };
 
+mod work_commit;
+
 const OUTPUT_BYTES: usize = 1024 * 1024;
 const STDERR_BYTES: usize = 32 * 1024;
 const INPUT_BYTES: usize = 32 * 1024;
@@ -69,9 +71,12 @@ fn is_metadata_read(args: &[&str]) -> bool {
         ["rev-parse", "--verify", "--end-of-options", reference] => {
             reference.ends_with("^{commit}")
         }
-        ["show-ref", "--verify", "--quiet" | "--hash", reference]
-        | ["for-each-ref", "--format=%(refname)", reference]
-        | ["check-ref-format", reference] => reference.starts_with("refs/heads/"),
+        ["show-ref", "--verify", "--quiet" | "--hash", reference] => {
+            reference.starts_with("refs/heads/") || reference.starts_with("refs/remotes/")
+        }
+        ["for-each-ref", "--format=%(refname)", reference] | ["check-ref-format", reference] => {
+            reference.starts_with("refs/heads/")
+        }
         ["merge-base", "--is-ancestor", base, tip] => is_git_oid(base) && is_git_oid(tip),
         _ => false,
     }
@@ -2457,12 +2462,7 @@ fn dirty_worktree_digest(
     let mut untracked_lines = BTreeMap::new();
     let mut total_bytes = 0_u64;
     for entry in dirty {
-        hash_digest_part(&mut hasher, b"entry");
-        hash_digest_part(&mut hasher, entry.path.as_bytes());
-        hash_digest_part(&mut hasher, entry.status.as_bytes());
-        if let Some(orig) = &entry.original_path {
-            hash_digest_part(&mut hasher, orig.as_bytes());
-        }
+        hash_dirty_entry(&mut hasher, entry);
         match read_path_content(
             root,
             &entry.path,
@@ -2478,10 +2478,7 @@ fn dirty_worktree_digest(
                 }
             }
             PathContent::File(bytes) => {
-                let content_hash = Sha256::digest(&bytes);
-                hash_digest_part(&mut hasher, b"file");
-                hash_digest_part(&mut hasher, &(bytes.len() as u64).to_le_bytes());
-                hash_digest_part(&mut hasher, content_hash.as_slice());
+                hash_dirty_file(&mut hasher, &bytes);
                 if entry.status == "??" {
                     let lines = if bytes.contains(&0) {
                         0
@@ -2613,6 +2610,21 @@ fn count_text_lines(bytes: &[u8]) -> u64 {
 fn hash_digest_part(hasher: &mut Sha256, bytes: &[u8]) {
     hasher.update((bytes.len() as u64).to_le_bytes());
     hasher.update(bytes);
+}
+
+fn hash_dirty_entry(hasher: &mut Sha256, entry: &GitPathStatus) {
+    hash_digest_part(hasher, b"entry");
+    hash_digest_part(hasher, entry.path.as_bytes());
+    hash_digest_part(hasher, entry.status.as_bytes());
+    if let Some(original) = &entry.original_path {
+        hash_digest_part(hasher, original.as_bytes());
+    }
+}
+
+fn hash_dirty_file(hasher: &mut Sha256, bytes: &[u8]) {
+    hash_digest_part(hasher, b"file");
+    hash_digest_part(hasher, &(bytes.len() as u64).to_le_bytes());
+    hash_digest_part(hasher, Sha256::digest(bytes).as_slice());
 }
 
 pub(crate) fn work_fingerprint_from_snapshot(snapshot: &GitSnapshot) -> Result<String> {
