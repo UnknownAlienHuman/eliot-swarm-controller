@@ -83,6 +83,7 @@ pub fn declaration() -> HarnessCapabilities {
         defer_harness_check: true, // #949
         resume_config: true,
         resume_previous_turn: true,
+        compact: true,
         launch_default_policy: LaunchDefaultPolicy::OmitForServerDefault,
         guard_refusal_point: Some(InjectPoint::ActiveTurn),
         guard_refusal_choice_error: Some("Muse guarded request offers multiple refusal options"),

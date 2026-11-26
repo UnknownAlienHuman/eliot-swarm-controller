@@ -120,7 +120,8 @@ native refusal alone does not prove a contract mismatch or an upstream failure.
 | approve/deny/answer | exact session/child request id and offered choice/requirement; public details are the shared ApprovalRequest/QuestionRequest, answers are the universal answers map |
 | configure | `session/setModel` carries the catalogue's provider and profile between turns. Its exact acknowledgment and `session/read` prove selector admission before the overlay commits. Effort travels in per-turn `reasoningEffort` in `turn/start`. An effort-only revision keeps the last selector. |
 | goal | native set/edit/pause/resume/clear where installed schema supports them |
-| compact/fork/background | native-only, advertised after implementation |
+| compact | Idle `session/compact` on the latest completed native turn. Swarm waits for the committed manual compaction item before reporting the command applied. |
+| fork/background | native-only, advertised after implementation |
 
 Muse 1.4.25's offline `muse schema generate-json-schema` export defines
 `session/compact` as manual compaction with an admission-only acknowledgment;
@@ -135,28 +136,32 @@ changes alone are never treated as compaction.
 
 ### Task cards after compaction (A12)
 
-On 2026-11-26, a private Windows stand ran Muse Code 1.4.25-R9361.1 with the
-`muse` profile under the stand Owner principal. Native model completions
-named `muse-spark-1.3-contributor`. Swarm retained `provider did not name a model`,
-so the served model stayed unverified.
+On 2026-11-26, Muse Code 1.4.25-R9361.1 refused manual compaction with
+`compaction_unavailable` both at default settings and with only
+`context_compaction.strategy = "summary-preserved-suffix/v1"`. The earlier
+threshold-only probe (#1247) reached 51,517 context tokens without a native
+compaction event.
 
-Swarm's Muse adapter has no manual compact verb. The automatic-compaction
-probe set `context_compaction.soft_threshold = 0.006` and
-`hard_threshold = 0.012` in private Muse settings. The installed CLI
-recognized both settings during defaults validation. Four real turns
-completed on `a2#1` at sequences 76, 146, 220 and 305. The largest retained
-context sample was 51,517 tokens at 221. The native session log contained no
-compaction event and the bus contained no `session.context.compacted`.
-The follow-up at 305 returned `NO_TASK_CARD`.
+Muse's settings validator accepted the strategy and thresholds. A direct
+MSP `session/start` reproduced `-32603` with thresholds 0.002 and 0.004. Muse's
+runtime refused construction because the startup prompt estimate of 25,723
+tokens exceeded the 4,031-token hard threshold in its 1,007,997-token effective
+window. These fields come from Muse's settings file. Swarm's `session/start`
+request supplies the command ID, workspace and optional approval mode.
 
-A fresh launch with explicit `summary-preserved-suffix/v1` and thresholds
-0.002 and 0.004 returned native `session/start` error `-32603` before the model
-turn. Swarm retained the launch as unknown at 268. Automatic task-card
-delivery on Muse remains unverified.
+With the explicit strategy and thresholds 0.030 and 0.080, a private Windows
+stand committed `session.context.compacted` for automatic (148) and manual
+(155) compaction on `a3#1`. The Owner's `swarm compact` returned the manual
+item's receipt at 156. A single pending task card covered both compactions
+before the next send and was delivered at 168. The follow-up repeated the
+original Goal line at 174. The stand used the Owner principal and requested
+`muse-spark-1.3-contributor` at low effort. The provider response omitted its
+model identity, so the served model remained unverified.
 
-The Swarm binary built from `4712d473f0f2c65d8299dfee5072c95005efeb4e`
-had SHA-256 `ecc3b3a180feb7371ffa62655d444c4cbb3aa266ee777e29902edf15d9e5d374`.
-The Muse executable had SHA-256
+The run used four short turns across two private stands. Stand cleanup drained
+their owned processes and removed both roots. The Swarm proof SHA-256 was
+`e3c5edba26ba713796b1335212a2c73b85138b96a9602fda2c8f00676841b386`.
+The Muse SHA-256 was
 `eb03512b06982dd02481fcf5f090442824d92ff6070607afe5c7228596f3b089`.
 
 ### Model selection

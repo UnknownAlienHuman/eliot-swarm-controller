@@ -148,6 +148,7 @@ pub(crate) struct EventStatus {
     /// itself stays unknown for Owner resolution.
     pub retained_unknown_turn: Option<String>,
     pub last_turn: Option<TurnFacts>,
+    pub last_manual_compaction: Option<ManualCompaction>,
     pub provider_model_turn: Option<String>,
     pub model_mismatch: Option<(String, String)>,
     model_stop_at: Option<Instant>,
@@ -182,6 +183,21 @@ pub(crate) struct EventStatus {
     /// request snapshots (resume pointers, listPending pulls), never a
     /// persisted epoch.
     pub observation: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ManualCompaction {
+    pub turn_id: String,
+    pub receipt_id: String,
+    pub outcome: ManualCompactionOutcome,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ManualCompactionOutcome {
+    Compacted,
+    Noop,
+    Failed,
+    Cancelled,
 }
 
 impl EventStatus {
@@ -854,6 +870,34 @@ impl EventHandle {
 
     pub fn status(&self) -> EventStatus {
         self.actor.watch().borrow().clone()
+    }
+
+    pub async fn wait_manual_compaction(
+        &self,
+        turn_id: &str,
+        previous: Option<&ManualCompaction>,
+        deadline: Instant,
+    ) -> Option<ManualCompaction> {
+        let mut status = self.actor.watch().clone();
+        let terminal = tokio::time::timeout_at(
+            deadline,
+            status.wait_for(|status| {
+                status.native_drained
+                    || status.source_unknown
+                    || status
+                        .last_manual_compaction
+                        .as_ref()
+                        .is_some_and(|fact| fact.turn_id == turn_id && Some(fact) != previous)
+            }),
+        )
+        .await
+        .ok()?
+        .ok()?;
+        terminal
+            .last_manual_compaction
+            .as_ref()
+            .filter(|fact| fact.turn_id == turn_id && Some(*fact) != previous)
+            .cloned()
     }
 
     async fn send<T>(
@@ -3235,21 +3279,22 @@ impl EventProcessor {
     /// durable view lifecycle for both manual and automatic compactions.
     async fn complete_compaction(&mut self, session_id: &str, item: &NativeItem) -> Result<()> {
         let active_turn = self.validate_compaction_binding(session_id, item.turn_id.as_deref())?;
-        if item.outcome.as_deref() != Some("compacted") {
-            match item.outcome.as_deref() {
-                Some("noop" | "failed" | "cancelled") => return Ok(()),
-                Some(outcome) => {
-                    self.record_unclassified_native("muse.compaction.outcome", outcome)
-                        .await?;
-                    return Ok(());
-                }
-                None => {
-                    return self
-                        .record_gap("Muse terminal compaction item omitted its outcome")
-                        .await;
-                }
+        let outcome = match item.outcome.as_deref() {
+            Some("compacted") => ManualCompactionOutcome::Compacted,
+            Some("noop") => ManualCompactionOutcome::Noop,
+            Some("failed") => ManualCompactionOutcome::Failed,
+            Some("cancelled") => ManualCompactionOutcome::Cancelled,
+            Some(outcome) => {
+                return self
+                    .record_unclassified_native("muse.compaction.outcome", outcome)
+                    .await;
             }
-        }
+            None => {
+                return self
+                    .record_gap("Muse terminal compaction item omitted its outcome")
+                    .await;
+            }
+        };
         if item.item_id.trim().is_empty() {
             return self
                 .record_gap("Muse compaction item omitted its exact item id")
@@ -3257,28 +3302,41 @@ impl EventProcessor {
         }
         let native_turn_id = item.turn_id.as_deref();
         let identity_turn = native_turn_id.unwrap_or("session");
-        let mut data = json!({});
-        if let Some(native_turn_id) = native_turn_id {
-            data["native_turn_id"] = json!(native_turn_id);
-        }
-        if active_turn && let Some(turn_id) = native_turn_id {
-            data["turn_id"] = json!(turn_id);
-        }
-        if let Some(trigger) = item.trigger.as_deref() {
-            if !matches!(trigger, "manual" | "auto") {
-                self.record_unclassified_native("muse.compaction.trigger", trigger)
-                    .await?;
-            }
-            data["trigger"] = json!(trigger);
-        }
         let native_id = event_id(
             session_id,
             identity_turn,
             &item.item_id,
             "session.context.compacted",
         )?;
-        self.commit_event("session.context.compacted", native_id, data)
-            .await
+        if outcome == ManualCompactionOutcome::Compacted {
+            let mut data = json!({});
+            if let Some(native_turn_id) = native_turn_id {
+                data["native_turn_id"] = json!(native_turn_id);
+                if active_turn {
+                    data["turn_id"] = json!(native_turn_id);
+                }
+            }
+            if let Some(trigger) = item.trigger.as_deref() {
+                if !matches!(trigger, "manual" | "auto") {
+                    self.record_unclassified_native("muse.compaction.trigger", trigger)
+                        .await?;
+                }
+                data["trigger"] = json!(trigger);
+            }
+            self.commit_event("session.context.compacted", native_id.clone(), data)
+                .await?;
+        }
+        if !active_turn
+            && item.trigger.as_deref() == Some("manual")
+            && let Some(turn_id) = native_turn_id
+        {
+            self.status.last_manual_compaction = Some(ManualCompaction {
+                turn_id: turn_id.to_owned(),
+                receipt_id: native_id,
+                outcome,
+            });
+        }
+        Ok(())
     }
 
     async fn complete_message(&mut self, turn_id: &str, item_id: &str, text: &str) -> Result<()> {

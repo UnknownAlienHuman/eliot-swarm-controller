@@ -141,12 +141,14 @@ engine, second scheduler or critic loop.
       bound turn completed with no native terminal reason.
       Codex CLI 0.167.1 with `gpt-6.2-sol` confirmed the first-input objective
       after manual compaction (delivery 90) and automatic compaction (237).
-      Live proof remains pending for Muse and Antigravity. Muse completed real
-      turns with lowered thresholds but produced no native compaction evidence.
-      Antigravity needs native compaction evidence bound to an exact prompt
-      or turn.
+      Muse Code 1.4.25-R9361.1 committed automatic and manual compaction
+      facts (148 and 155) with an explicit native strategy and thresholds that
+      allowed the startup prompt. The next input delivered one pending task
+      card for both (168) and the Agent repeated the Goal line (174).
+      Antigravity still needs native compaction evidence bound to an exact
+      prompt or turn.
       [Codex live proof](harnesses/codex.md#task-cards-after-compaction-a12)
-      · [Muse probe](harnesses/muse.md#task-cards-after-compaction-a12)
+      · [Muse live proof](harnesses/muse.md#task-cards-after-compaction-a12)
       [Compaction facts](spec/plugin-protocol.md#translation-and-normalization)
 
       A10–A12 passed formatting, locked all-target builds and warnings-denied
