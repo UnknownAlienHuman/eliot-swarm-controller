@@ -581,6 +581,9 @@ pub struct MonitorListInput {
     pub children: Callback<String>,
     /// Show or hide Recently stopped.
     pub stopped: Callback<()>,
+    /// The main area is narrow (the composer stacks there too): the
+    /// columns share its width differently ([`row_columns`]).
+    pub narrow: bool,
 }
 
 /// The Agents tree as its own component: a window render for anything but
@@ -596,7 +599,7 @@ impl Component for MonitorList {
     }
 
     fn view(&self, input: &MonitorListInput, _context: &mut ViewContext<Self>) -> View {
-        let mut entries: Vec<KeyedView> = vec![KeyedView::new("head", head_row())];
+        let mut entries: Vec<KeyedView> = vec![KeyedView::new("head", head_row(input.narrow))];
         entries.extend(input.entries.iter().map(|entry| entry_view(entry, input)));
         StackPanel::new().keyed_children(entries).into()
     }
@@ -604,14 +607,28 @@ impl Component for MonitorList {
 
 /// The tree's columns inside a row's button: Task, Model, Activity, CPU,
 /// Memory. Each row is its own Grid and WinUI has no shared size groups,
-/// so the text columns share the row's width by star (the task the most)
-/// to stay aligned under the header at any width; CPU and Memory hold
-/// fixed-size numbers.
-fn row_columns() -> [GridLength; 5] {
+/// so the text columns share the row's width by star to stay aligned under
+/// the header at any width (an Auto column would differ row by row, and a
+/// long status line would take the task's room); CPU and Memory hold
+/// fixed-size numbers. A wide main area gives the task the most; a narrow
+/// one gives Activity the task's share and Model half of it, so a short
+/// status ("Working · 1 min") shows whole.
+fn row_columns(narrow: bool) -> [GridLength; 5] {
+    let (model, activity) = if narrow {
+        (
+            tokens::page::FLEET_NARROW_MODEL_SHARE,
+            tokens::page::FLEET_TASK_SHARE,
+        )
+    } else {
+        (
+            tokens::page::FLEET_TEXT_SHARE,
+            tokens::page::FLEET_TEXT_SHARE,
+        )
+    };
     [
         GridLength::Star(tokens::page::FLEET_TASK_SHARE),
-        GridLength::Star(tokens::page::FLEET_TEXT_SHARE),
-        GridLength::Star(tokens::page::FLEET_TEXT_SHARE),
+        GridLength::Star(model),
+        GridLength::Star(activity),
         GridLength::Pixel(tokens::page::FLEET_NUMBER),
         GridLength::Pixel(tokens::page::FLEET_NUMBER),
     ]
@@ -637,7 +654,7 @@ fn number(text: &str, column: i32) -> View {
 
 /// The header row (`.trow.head`): the column names in `label-medium`, a
 /// hairline under them.
-fn head_row() -> View {
+fn head_row(narrow: bool) -> View {
     let label = |text: &str, column: i32, right: bool| -> View {
         crate::controls::text(text.to_owned(), tokens::text::LABEL)
             .grid_column(column)
@@ -663,7 +680,7 @@ fn head_row() -> View {
                         Grid::new()
                             .grid_column(1)
                             .margin(Thickness::xy(tokens::spacing::ROW, 0.0))
-                            .columns(row_columns())
+                            .columns(row_columns(narrow))
                             .column_spacing(tokens::spacing::SM)
                             .children((
                                 label("Task", 0, false),
@@ -734,7 +751,7 @@ fn fleet_row(entry: &RowEntry, input: &MonitorListInput) -> View {
         activity
     };
     let content = Grid::new()
-        .columns(row_columns())
+        .columns(row_columns(input.narrow))
         .column_spacing(tokens::spacing::SM)
         .children((
             Grid::new()

@@ -407,15 +407,35 @@ pub fn destructive() -> Button {
     Button::new()
 }
 
-/// An icon action: a subtle button around one icon, at least 32 DIPs
-/// square (`.content(icon(..))` last). Give it an accessible name and a
-/// tooltip.
+/// The stroke every WinUI button template draws inside its bounds
+/// (`ButtonBorderThemeThickness`), transparent on the subtle style.
+const BUTTON_BORDER: f64 = 1.0;
+
+/// An icon action: a subtle button around one icon, 32 DIPs square like
+/// every labelled button beside it (`.content(icon(..))` last): its padding
+/// leaves room for the template's own stroke. Give it an accessible name
+/// and a tooltip.
 pub fn icon_button() -> Button {
     Button::new()
         .style(ButtonStyle::Subtle)
-        .padding(Thickness::uniform((height::CONTROL - icon_size::ROW) / 2.0))
+        .padding(Thickness::uniform(
+            (height::CONTROL - icon_size::ROW) / 2.0 - BUTTON_BORDER,
+        ))
         .min_width(height::CONTROL)
         .min_height(height::CONTROL)
+}
+
+/// A text action inside a column of text (an Inbox item's title, a
+/// project's Open folder): a subtle button with no inset and no minimum
+/// height, so its label stands where a plain line of text would and lines
+/// up with the lines around it.
+pub fn inline_button() -> Button {
+    Button::new()
+        .style(ButtonStyle::Subtle)
+        .padding(Thickness::uniform(0.0))
+        .min_width(0.0)
+        .min_height(0.0)
+        .horizontal_alignment(HorizontalAlignment::Left)
 }
 
 /// An icon action that stays on (Wide pane, an open pane): the accent
@@ -792,10 +812,12 @@ pub fn file_chip_content(glyph: &str, name: &str) -> View {
 }
 
 /// A suggestion card on Home: a default button with its icon and label at
-/// the left.
+/// the left; it fills its row's height, so a card whose label takes two
+/// lines does not stand taller than the cards beside it.
 pub fn suggestion() -> Button {
     Button::new()
         .min_height(height::SUGGESTION)
+        .vertical_alignment(VerticalAlignment::Stretch)
         .horizontal_content_alignment(HorizontalAlignment::Left)
 }
 

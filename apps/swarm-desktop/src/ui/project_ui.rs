@@ -848,15 +848,8 @@ impl Component for ProjectView {
                 controls::secondary(format!("{path} ·"))
                     .vertical_alignment(VerticalAlignment::Center)
                     .text_trimming(TextTrimming::CharacterEllipsis),
-                controls::text_button()
-                    .height(tokens::text::CAPTION.size + tokens::spacing::SM)
-                    .min_height(0.0)
-                    .margin(Thickness::new(
-                        -tokens::spacing::ROW,
-                        0.0,
-                        -tokens::spacing::ROW,
-                        0.0,
-                    ))
+                controls::inline_button()
+                    .vertical_alignment(VerticalAlignment::Center)
                     .automation_name(format!("Open folder {path}"))
                     .on_click(
                         context

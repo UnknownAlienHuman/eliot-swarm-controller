@@ -300,6 +300,9 @@ pub mod page {
     /// title is the text that matters) and each of Model and Activity.
     pub const FLEET_TASK_SHARE: f64 = 3.0;
     pub const FLEET_TEXT_SHARE: f64 = 2.0;
+    /// Model's share in a narrow main area, where Activity takes the
+    /// task's share.
+    pub const FLEET_NARROW_MODEL_SHARE: f64 = 1.5;
     /// The Agents tree's CPU and Memory columns (fixed content).
     pub const FLEET_NUMBER: f64 = 60.0;
     /// A branch's preparation state on the project page.

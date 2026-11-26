@@ -655,10 +655,18 @@ impl DesktopApp {
                 _ => None,
             }
         };
+        // A word stands level with its row's first control (a field, a
+        // dropdown, a number), in a band as high as that control, so a
+        // second field or an error under the control does not move it.
         let word = |text: &str, row: i32| -> View {
-            controls::text(text.to_owned(), tokens::page::HEADING)
+            Border::new()
                 .grid_row(row)
-                .vertical_alignment(VerticalAlignment::Center)
+                .min_height(tokens::height::CONTROL)
+                .vertical_alignment(VerticalAlignment::Top)
+                .content(
+                    controls::text(text.to_owned(), tokens::page::HEADING)
+                        .vertical_alignment(VerticalAlignment::Center),
+                )
                 .into()
         };
         if generated {
