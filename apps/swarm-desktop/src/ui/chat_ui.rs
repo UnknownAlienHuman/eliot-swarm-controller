@@ -1673,8 +1673,8 @@ impl DesktopApp {
                     tokens::spacing::ROW,
                 ))
         };
-        // Each card with its tooltip: the whole label where it may trim.
-        let mut cards: Vec<(String, Button, Option<String>)> = vec![
+        // Each card with its label, whole in its tooltip where it trims.
+        let mut cards: Vec<(String, Button, String)> = vec![
             (
                 "review".to_owned(),
                 controls::suggestion()
@@ -1683,7 +1683,7 @@ impl DesktopApp {
                         context.message(Message::Chat(ChatMsg::ComposerChanged(REVIEW.to_owned()))),
                     )
                     .content(card(controls::glyph::DIFF, "Review the open PRs")),
-                None,
+                "Review the open PRs".to_owned(),
             ),
             (
                 "automation".to_owned(),
@@ -1693,7 +1693,7 @@ impl DesktopApp {
                         page_ui::Place::Automations,
                     ))))
                     .content(card(controls::glyph::SCHEDULE, "Schedule an automation")),
-                None,
+                "Schedule an automation".to_owned(),
             ),
         ];
         if let Some(agent) = last {
@@ -1704,7 +1704,7 @@ impl DesktopApp {
                     .automation_name(label.clone())
                     .on_click(context.message(Message::Shell(ShellMsg::AgentOpened(agent))))
                     .content(card(controls::glyph::HISTORY, &label)),
-                Some(label),
+                label,
             ));
         }
         let title: View = controls::page_title(if self.launch.chat {
@@ -1779,17 +1779,15 @@ impl DesktopApp {
                                     .columns(vec![GridLength::STAR; cards.len()])
                                     .column_spacing(tokens::spacing::SM)
                                     .keyed_children(cards.into_iter().enumerate().map(
-                                        |(index, (key, card, tip))| {
-                                            let card = card
-                                                .grid_column(index as i32)
-                                                .horizontal_alignment(HorizontalAlignment::Stretch)
-                                                .vertical_alignment(VerticalAlignment::Stretch);
+                                        |(index, (key, card, label))| {
                                             KeyedView::new(
                                                 key,
-                                                match tip {
-                                                    Some(tip) => card.tooltip(tip),
-                                                    None => card.into(),
-                                                },
+                                                card.grid_column(index as i32)
+                                                    .horizontal_alignment(
+                                                        HorizontalAlignment::Stretch,
+                                                    )
+                                                    .vertical_alignment(VerticalAlignment::Stretch)
+                                                    .tooltip(label),
                                             )
                                         },
                                     ))
