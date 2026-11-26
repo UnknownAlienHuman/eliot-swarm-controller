@@ -1949,12 +1949,28 @@ impl PluginHost {
         }
         #[cfg(not(unix))]
         {
-            std::fs::create_dir_all(&parent).map_err(|error| {
-                Error::new(
-                    "platform_io",
-                    format!("create plugin instance root: {error}"),
-                )
-            })?;
+            // A new daemon-owned parent starts protected so children inherit
+            // only safe entries. An existing parent stays the timer's repair
+            // job; the canonical checks below still own admission.
+            match std::fs::symlink_metadata(&parent) {
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    crate::platform::windows::create_private_directory(&parent).map_err(
+                        |error| {
+                            Error::new(
+                                "platform_io",
+                                format!("create plugin instance root: {error}"),
+                            )
+                        },
+                    )?;
+                }
+                Err(error) => {
+                    return Err(Error::new(
+                        "platform_io",
+                        format!("inspect plugin instance root: {error}"),
+                    ));
+                }
+            }
             self.plugin_instance_root()?;
         }
         let instance_dir = parent.join(format!("{}-g{}-{}", key.id, key.generation, Ulid::new()));
@@ -1973,12 +1989,22 @@ impl PluginHost {
         }
         #[cfg(not(unix))]
         {
-            std::fs::create_dir(&instance_dir).map_err(|error| {
-                Error::new(
+            // Create with the explicit protected DACL so the lifecycle repair
+            // below finds nothing to remove and logs nothing. A raced
+            // existing directory is never adopted.
+            if !crate::platform::windows::create_private_directory(&instance_dir).map_err(
+                |error| {
+                    Error::new(
+                        "platform_io",
+                        format!("create plugin instance directory: {error}"),
+                    )
+                },
+            )? {
+                return Err(Error::new(
                     "platform_io",
-                    format!("create plugin instance directory: {error}"),
-                )
-            })?;
+                    "plugin instance directory already exists",
+                ));
+            }
         }
         if let Err(error) = restrict(&instance_dir) {
             remove_empty_instance_dir(&instance_dir);

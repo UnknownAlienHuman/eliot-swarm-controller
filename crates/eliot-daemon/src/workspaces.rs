@@ -886,10 +886,25 @@ impl WorkspaceManager {
             return Ok(creation_unknown(result.code));
         }
         let mut outcome = git.inspect(preparation).await;
-        let verification_error = match &outcome {
+        let mut verification_error = match &outcome {
             WorkspaceCreationOutcome::Unknown { message, .. } => Some(message.clone()),
             _ => None,
         };
+        // Git created the directory with inherited ACLs. Claim it with the
+        // protected DACL now so the lifecycle repair below logs nothing. A
+        // directory that cannot be secured fails closed through the same
+        // rollback as a failed verification.
+        if verification_error.is_none()
+            && matches!(outcome, WorkspaceCreationOutcome::Verified { .. })
+            && let Err(error) = crate::platform::data_dir::protect_new_managed_dir(Path::new(
+                &preparation.worktree_path,
+            ))
+        {
+            verification_error = Some(format!(
+                "the created worktree could not be secured: {}",
+                error.message
+            ));
+        }
         if let Some(verification) = verification_error.as_deref() {
             let worktree = match git.prepare_created_worktree_rollback(preparation).await {
                 Ok(command) => command,
