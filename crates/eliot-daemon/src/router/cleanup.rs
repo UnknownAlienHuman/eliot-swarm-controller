@@ -3143,13 +3143,18 @@ impl Router {
             .into_iter()
             .chain(std::iter::once((path, false)))
         {
-            let top = probe
-                .workspace_command(
-                    location,
-                    &["rev-parse", "--path-format=absolute", "--show-toplevel"],
-                    deadline,
-                )
-                .await?;
+            // The identity and tracked-content probes are independent reads:
+            // the pathspec depends only on the artifact path, so both spawn
+            // together and the verdict logic below reads the joined results
+            // in the same order as the former sequential probes.
+            let argument = crate::git_monitor::git_path_argument(path)?;
+            let rev_args = ["rev-parse", "--path-format=absolute", "--show-toplevel"];
+            let ls_args = ["ls-files", "-z", "--", argument.as_str()];
+            let (top, files) = tokio::join!(
+                probe.workspace_command(location, &rev_args, deadline),
+                probe.workspace_command(location, &ls_args, deadline)
+            );
+            let top = top?;
             if top.code != 0 {
                 if !required && top.code == 128 {
                     continue;
@@ -3171,16 +3176,13 @@ impl Router {
                 ));
             }
             if path.starts_with(&top) {
-                let argument = crate::git_monitor::git_path_argument(path)?;
                 let (code, stdout) = if let Some((prior_top, code, stdout)) =
                     prior_ls_files.as_ref()
                     && *prior_top == top
                 {
                     (*code, stdout.clone())
                 } else {
-                    let files = probe
-                        .workspace_command(location, &["ls-files", "-z", "--", &argument], deadline)
-                        .await?;
+                    let files = files?;
                     prior_ls_files = Some((top.clone(), files.code, files.stdout.clone()));
                     (files.code, files.stdout)
                 };
@@ -3420,13 +3422,14 @@ impl Router {
         let probe = crate::git_monitor::GitProbe::new()?;
         let branch_ref = format!("refs/heads/{branch}");
         let archive_ref = format!("refs/eliot/archive/{branch}");
-        let tip = Self::cleanup_ref_oid(&probe, repo, common, &branch_ref, deadline)
-            .await?
-            .ok_or_else(|| Error::new("branch_absent", "local branch is absent"))?;
-        if Self::cleanup_ref_oid(&probe, repo, common, &archive_ref, deadline)
-            .await?
-            .is_some_and(|archived| archived != tip)
-        {
+        // Both ref reads are independent: joining them keeps the same
+        // commands and the same error precedence as the sequential reads.
+        let (branch, archive) = tokio::join!(
+            Self::cleanup_ref_oid(&probe, repo, common, &branch_ref, deadline),
+            Self::cleanup_ref_oid(&probe, repo, common, &archive_ref, deadline)
+        );
+        let tip = branch?.ok_or_else(|| Error::new("branch_absent", "local branch is absent"))?;
+        if archive?.is_some_and(|archived| archived != tip) {
             return Err(Error::new(
                 "archive_collision",
                 "local branch archive ref already names a different tip",
