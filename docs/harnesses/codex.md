@@ -553,13 +553,14 @@ The worker verifies the effective provider route before both launch and
 Resume. A catalogue digest change during launch returns
 `model_catalogue_changed` with both digests. Resume reads the current catalogue
 and resolves the retained selector on the same route. The native reply must
-echo the exact model. A catalogue omission is advisory where the native
-route accepts the explicit selector and the retained profile leaves effort
-unspecified. With a frozen effort and a changed catalogue, the exact resolved
-row must advertise that effort. An absent selector, absent required row, or
-unsupported effort refuses before opening the thread. Use Switch with a
-profile that supplies a supported selector and effort. A catalogue file read
-refusal names the cause without exposing the configured path.
+echo the exact model. On an unchanged catalogue, omission of an explicit
+profile selector is advisory. A daemon-selected default with frozen effort
+requires an exact row advertising that effort. After a catalogue change,
+a frozen effort requires the exact resolved row to advertise it. An absent
+selector, absent required row, or unsupported effort refuses before opening
+the thread. Use Switch with a profile that supplies a supported selector and
+effort. A catalogue file read refusal names the cause without exposing the
+configured path.
 
 The installed Codex 0.167.1 schemas, generated with
 `codex app-server generate-json-schema --out <dir>`, define `thread/unarchive`

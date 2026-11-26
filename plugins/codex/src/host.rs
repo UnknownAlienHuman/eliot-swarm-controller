@@ -2033,7 +2033,13 @@ impl CodexPlugin {
                 })?;
             ModelSelection::new(&default.id, Some(default))
         };
-        if let Some(effort) = requested_effort {
+        // An unchanged catalogue may omit an explicit profile selector as an
+        // advisory. A daemon-selected default needs a row to verify its effort.
+        let advisory_omission =
+            !catalogue_changed && requested_model.is_some() && selection.catalogue_omits_model();
+        if let Some(effort) = requested_effort
+            && !advisory_omission
+        {
             verify_catalogue_effort(selection.catalogue_entry, effort, catalogue_changed)?;
         }
         Ok((
@@ -3247,8 +3253,7 @@ fn verify_catalogue_effort(
             .supported_reasoning_efforts
             .iter()
             .any(|supported| supported.reasoning_effort == effort)
-    }) || (!changed && entry.is_none())
-    {
+    }) {
         return Ok(());
     }
     if changed {
