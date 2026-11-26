@@ -1639,7 +1639,9 @@ generation supports it and the note is still valid. The original id remains usab
 and settlement reports cancellation or `unknown` when applicable. `inject.wait` waits
 up to 30 seconds for delivery, a move, cancellation or uncertainty and returns the
 retained command. A timeout returns the current command. `command.get` also reports
-final settlement after a move.
+final settlement after a move. At its deadline, CLI `inject --wait` prints the
+last validated command snapshot and exits 0 for accepted or queued delivery,
+or 6 for dispatched delivery.
 
 The notes row of `autonomy.get` reports Swarm-generated fact notes by kind. It counts
 delivery, moves and cancellation in the requested window and reports later evidence
@@ -1760,13 +1762,14 @@ valid only for `send`. It is control metadata, never native input text or argume
 hold at dispatch before native I/O. Over-limit hierarchy admission reads `fanout_limit`
 (CLI exit 3) and persists nothing.
 
-The `command.submit` request has no `wait_ms`. CLI `--wait` can span more than the
-30 seconds one `swarm.wait` call permits, so it waits in bounded server-side
-slices until its client deadline. `swarm.wait` can complete a bound entry from
-its terminal turn while the command row still awaits settlement. CLI commands
-that need that exact row read it back and wait again only while it is open.
-A timeout leaves the admitted work running. Explicit `swarm wait` uses one
-bounded RPC over the captured set.
+The `command.submit` request has no `wait_ms`. CLI settlement waits use one
+client deadline and successive server waits of at most 30 seconds, retaining
+the original command ID and any observed Agent, generation, and turn binding.
+When a terminal turn wakes the wait before its command row settles, CLI paths
+that need the row read the exact command again while it remains open. Prompted
+waits then read the exact turn. If the deadline expires without settlement,
+the CLI reports `unknown` (exit 4). The admitted work continues and the CLI
+issues only reads after submission.
 
 Submit the targetless `git.integrate` verb through `command.submit`. Its
 [`GitIntegrateDefinitionArgs`](../../crates/eliot-core/src/api/git_integrate.rs)
@@ -1947,8 +1950,8 @@ in its plan.
 The daemon selects the retained managed worktree,
 preserves its branch and never removes a caller-supplied path. The
 CLI offers no force/path argument and uses its normal ULID binding and exit codes.
-It reads the exact command to settlement with a bounded 30-second wait; timeout does
-not cancel or retry removal. Same-ID retries return the retained outcome even after
+It waits up to 30 seconds for the exact command to settle. An unresolved wait
+reports `unknown` and leaves removal running. Same-ID retries return the retained outcome even after
 the directory has gone.
 
 A tree selector snapshots its members once at admission: the parent snapshots/sorts
@@ -2189,10 +2192,15 @@ frozen command or turn references and returns bounded `final_text` for each exac
 `swarm cmd show`, `swarm cmd children` and `swarm result` exit 0 after a valid read
 even if a returned command or turn is `unknown`; that state is not a successful task
 outcome. A binding mismatch is unknown and must not print the mismatched response.
+`swarm result --wait` waits on one exact retained turn. If `--turn-id` is omitted,
+the first read captures the newest retained turn and its generation. The wait
+returns the exact result with the turn outcome's exit code. A valid empty page
+returns immediately with exit 0.
 `swarm wait` prints its per-entry snapshot and exits 0 only when every waited entry
-succeeded (`--all`) or at least one succeeded (`--any`); timeout or an uncompleted
-snapshot exits 5, interrupted entries exit 7, `unknown`/`not_found`/`not_visible`
-entries exit 4, and plain failures exit 1.
+succeeded (`--all`) or at least one succeeded (`--any`). An unsettled deadline
+reports `unknown` and exits 4, retaining the last validated snapshot when available.
+A mailbox wake before completion exits 5, interrupted entries exit 7, and plain
+failures exit 1.
 
 ## Input, turn and unknown gates
 
@@ -2581,10 +2589,9 @@ Agent id, and any other `ID` is a command id. A slashed positional whose first
 segment is not an Agent id is a usage error, not a turn; Command ids
 containing `/` (linked `<id>/send`, nested derived ids) and ambiguous triples must use the
 repeatable `--command` option, which preserves them verbatim; exact turns may use the
-repeatable `--turn` option. Exit codes
-follow the read section: 0 only when every entry succeeded (`--all`) or at least one
-succeeded (`--any`), 5 on timeout, 7 when an entry was interrupted, 4 for
-`unknown`/`not_found`/`not_visible`, 1 for plain failure.
+repeatable `--turn` option. The CLI waits over the same set across RPC slices.
+With `--mail`, the CLI accepts at most 30 seconds so the mail watermark belongs
+to a single server wait.
 
 Each visible settled child Agent result (`succeeded`, `failed` or `interrupted`) also carries
 the shared bounded `ChildRunFacts` DTO: generation-attributed edit paths and their
@@ -3844,13 +3851,14 @@ swarm git-status A [--generation N]
 swarm patch-digest A [--generation N]
 swarm diff A [--generation N] [--source uncommitted|branch|last-turn] [--path P]
 swarm edits A [--generation N] [--after PATH] [--limit N]
-swarm send A TEXT [--probe] [--wait] [--timeout-seconds N] [--generation N]
+swarm send A TEXT [--probe] [--wait [--timeout-seconds N] | --wait-seconds N] [--generation N]
 swarm steer A TEXT [--generation N] [--turn ID]
 swarm inject A TEXT --point soonest|next_input|turn_safe_point|active_turn [--generation N] [--turn ID] [--expires-at-ms MS] [--wait]
 swarm project broadcast PROJECT TEXT
 swarm interrupt|abort A [--generation N] [--turn ID]
 swarm stop A [--force] [--tree | --generation N]
 swarm resume A [PROMPT] [--wait] [--timeout-seconds N]
+swarm result A [--generation N] [--turn-id ID] [--wait [--timeout-seconds N]]
 swarm wait --all|--any --timeout-seconds N ID...
 swarm wait --all|--any [--command ID]... [--turn AGENT/GENERATION/TURN_ID]...
 swarm result A [--generation N] [--before CURSOR_JSON | --turn-id TURN] [--limit N] [--metadata]
@@ -3900,8 +3908,8 @@ swarm plugin NAME | plugin-test ... | hook ... | mcp
 `cmd children`, `cmd resolve`, and `turn resolve` are available; `turn show`
 remains unavailable. `swarm wait` implements only the frozen `--all`/`--any` set form
 above; single-target `--for turn|idle|stopped|goal` forms remain future (`agent.wait`).
-The set wait takes 1 through 30 seconds. Command and turn resolution use
-`--status`. A completed command maps to the stored `applied` outcome.
+Command and turn resolution use `--status`. A completed command maps to the
+stored `applied` outcome.
 
 `swarm daemon` (background) prints `starting` with the resolved data directory
 and log path, then polls `daemon.status` for up to 30 s. It prints `ready` with the
@@ -3937,7 +3945,9 @@ SEND is cancelled as a result, a prompted wait reports the parent start
 failure rather than only the linked cancellation.
 
 Only current-layer commands appear in help and Agent guidance. Exit codes: 0 success/
-queued; 1 definite failure; 2 usage; 3 pre-effect rejection; 4 unknown; 5 wait timeout;
+queued; 1 definite failure; 2 usage; 3 pre-effect rejection; 4 unknown, including
+an unsettled command or turn at the wait deadline; 5 for a read-only condition
+that did not occur, a mailbox wake, or an operation-specific timeout;
 6 still dispatched/pending; 7 interrupted/cancelled. A queued/applied input is not
 successful task completion. Every mutation prints its generated command id as `id=...`
 on stderr so stdout stays pure response JSON; Windows PowerShell 5.1 turns that stderr

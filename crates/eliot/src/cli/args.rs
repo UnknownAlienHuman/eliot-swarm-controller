@@ -580,6 +580,9 @@ pub(crate) struct SendArgs {
     pub(crate) sources: Vec<String>,
     #[arg(long)]
     pub(crate) wait: bool,
+    /// Wait this many seconds for the exact input outcome.
+    #[arg(long, conflicts_with = "timeout_seconds", value_name = "SECONDS")]
+    pub(crate) wait_seconds: Option<u64>,
     /// Explicitly claim one eligible provider-hold probe for this send.
     #[arg(long)]
     pub(crate) probe: bool,
@@ -965,13 +968,18 @@ pub(crate) struct ResultArgs {
     #[arg(long, value_name = "TURN")]
     pub(crate) turn_id: Option<String>,
     /// Read older turns starting before the previous response's `next` cursor.
-    #[arg(long, value_name = "CURSOR_JSON", conflicts_with = "turn_id")]
+    #[arg(long, value_name = "CURSOR_JSON", conflicts_with_all = ["turn_id", "wait"])]
     pub(crate) before: Option<String>,
     #[command(flatten)]
     pub(crate) page: PageArgs,
     /// Include current Agent metadata; by default result output contains turns only.
     #[arg(long)]
     pub(crate) metadata: bool,
+    /// Wait for the exact retained turn, or the newest turn selected by the initial read.
+    #[arg(long)]
+    pub(crate) wait: bool,
+    #[arg(long, default_value_t = DEFAULT_WAIT_SECONDS, requires = "wait", value_name = "SECONDS")]
+    pub(crate) timeout_seconds: u64,
 }
 
 #[derive(Args)]
@@ -1243,7 +1251,7 @@ pub(crate) struct WaitArgs {
     /// Complete when any entry is terminal.
     #[arg(long, conflicts_with = "all")]
     pub(crate) any: bool,
-    /// Wait from 1 to 30 seconds for this set of commands or turns.
+    /// Wait for this set of commands or turns (at most 30 seconds with --mail).
     #[arg(long, default_value_t = DEFAULT_WAIT_SECONDS, value_name = "SECONDS")]
     pub(crate) timeout_seconds: u64,
     /// Command ids, or `agent/generation/turn_id` for exact turn bindings.

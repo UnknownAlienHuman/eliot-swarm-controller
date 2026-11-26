@@ -5,7 +5,11 @@ use super::args::{
     StatsArgs, TopArgs, UsageArgs, WatchArgs, WhyArgs,
 };
 use super::support::read_and_print;
-use super::support::{Failure, PAGE_SIZE, print_value, print_value_or_human, validate_limit};
+use super::support::{
+    Failure, PAGE_SIZE, print_value, print_value_or_human, turn_exit_code, validate_limit,
+    wait_deadline,
+};
+use super::waits::{WaitClient, unsettled, wait_read};
 use eliot_core::api::{
     AgentEditsRequest, AgentEditsResponse, AgentGetRequest, AgentGetResponse, AgentGitRequest,
     AgentGitResponse, AgentHistoryRequest, AgentListRequest, AgentListResponse, AgentListRow,
@@ -15,11 +19,11 @@ use eliot_core::api::{
     EventsBoundsResponse, EventsFilter, EventsReadRequest, EventsReadResponse,
     EventsSubscribeRequest, EventsSubscribeResponse, GoalCheckDeadlineSource, HarnessCheckOutcome,
     HarnessDoctorRequest, HarnessDoctorResponse, MAX_SWARM_MCP_TURNS, ObservationPage,
-    ObserveHeavyRequest, ObserveHeavyResponse, ProfileCommandIssue, TurnCounterMissing,
-    UsageSummaryRequest, UsageSummaryResponse,
+    ObserveHeavyRequest, ObserveHeavyResponse, ProfileCommandIssue, SwarmWaitRequest,
+    TurnCounterMissing, UsageSummaryRequest, UsageSummaryResponse, WaitTurnRef,
 };
 use eliot_core::api::{AgentSummary, activity_state_name};
-use eliot_core::{AgentState, Error as CoreError};
+use eliot_core::{AgentState, Error as CoreError, TurnState};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -1142,6 +1146,8 @@ pub(crate) async fn run_result(
         before,
         page: PageArgs { limit },
         metadata,
+        wait,
+        timeout_seconds,
     }: ResultArgs,
     data_dir: PathBuf,
     json_output: bool,
@@ -1152,22 +1158,45 @@ pub(crate) async fn run_result(
         .map(serde_json::from_str)
         .transpose()
         .map_err(|_| Failure::new(2, "--before must be a JSON result cursor"))?;
-    let params = AgentResultRequest {
+    let mut params = AgentResultRequest {
         id: agent,
         generation,
         turn_id,
         before,
-        limit,
+        limit: if wait { 1 } else { limit },
         metadata,
     };
     params.validate().map_err(Failure::for_read)?;
-    let response: AgentResultResponse =
-        eliot_daemon::client_call_typed(&data_dir, "agent.result", &params)
-            .await
-            .map_err(Failure::for_read)?;
-    params
-        .validate_response(&response)
-        .map_err(Failure::invalid_response)?;
+    let deadline = wait.then(|| wait_deadline(timeout_seconds)).transpose()?;
+    let mut response = read_result(&data_dir, &params, deadline).await?;
+    let exit = if let (Some(deadline), Some(turn)) = (deadline, response.turns.first()) {
+        let binding = WaitTurnRef::new(&turn.agent, turn.generation, &turn.turn_id);
+        let selected_latest = params.turn_id.is_none();
+        params.generation = Some(binding.generation);
+        params.turn_id = Some(binding.turn_id.clone());
+        if turn.state == TurnState::Running {
+            let request = SwarmWaitRequest::new(Vec::new(), vec![binding], "all", 0);
+            let reply = WaitClient::Caller(&data_dir)
+                .wait_set(request, deadline)
+                .await?;
+            if !reply.is_some_and(|reply| reply.completed) {
+                return Err(unsettled("turn", "still_running"));
+            }
+        }
+        if selected_latest || turn.state == TurnState::Running {
+            response = read_result(&data_dir, &params, Some(deadline)).await?;
+        }
+        let turn = &response.turns[0];
+        if turn.state == TurnState::Running {
+            return Err(Failure::new(
+                4,
+                "turn outcome is unknown; exact turn still running",
+            ));
+        }
+        turn_exit_code(turn)
+    } else {
+        0
+    };
     let value = serde_json::to_value(&response)
         .map_err(|_| Failure::new(4, "agent.result response is invalid"))?;
     print_value_or_human(&value, json_output, || {
@@ -1215,7 +1244,23 @@ pub(crate) async fn run_result(
             println!("Use --json to read additional turns and the page cursor.");
         }
     });
-    Ok(0)
+    Ok(exit)
+}
+
+async fn read_result(
+    data_dir: &Path,
+    params: &AgentResultRequest,
+    deadline: Option<tokio::time::Instant>,
+) -> Result<AgentResultResponse, Failure> {
+    let call = eliot_daemon::client_call_typed(data_dir, "agent.result", params);
+    let response = match deadline {
+        Some(end) => wait_read(call, end, "turn", "exact result read unavailable").await?,
+        None => call.await.map_err(Failure::for_read)?,
+    };
+    params
+        .validate_response(&response)
+        .map_err(Failure::invalid_response)?;
+    Ok(response)
 }
 
 pub(crate) async fn run_history(

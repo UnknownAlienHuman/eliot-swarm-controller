@@ -2,13 +2,13 @@
 
 use super::daemon::{STARTUP_WAIT, daemon_now_ms, startup_failure};
 use super::support::{Failure, command_state_result, mutation_id, submit_request};
+use super::waits::WaitClient;
 use eliot_core::api::{
     AgentGetRequest, AgentGetResponse, AgentListRequest, AgentListResponse, AgentSummary,
-    ArchivedFilter, CommandGetRequest, CommandSubmitResponse, DaemonShutdownRequest,
-    DaemonShutdownResponse, DaemonStatusRequest, DaemonStatusResponse, MAX_SWARM_WAIT_MS,
-    ShutdownMode, SwarmWaitRequest, SwarmWaitResponse,
+    ArchivedFilter, CommandSubmitResponse, DaemonShutdownRequest, DaemonShutdownResponse,
+    DaemonStatusRequest, DaemonStatusResponse, ShutdownMode,
 };
-use eliot_core::{Command as CoreCommand, CommandState, Error as CoreError, SubmitCommand};
+use eliot_core::{Error as CoreError, SubmitCommand};
 use eliot_daemon::operator::{DaemonInfo, daemon_alive, daemon_info};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -22,7 +22,7 @@ const STOP_WAIT: Duration = Duration::from_secs(90);
 const CUSTODY_SETTLE_WAIT: Duration = Duration::from_secs(10);
 const PROBE_INTERVAL: Duration = Duration::from_millis(200);
 
-async fn stand_owner_call_typed<P: Serialize + ?Sized, R: DeserializeOwned>(
+pub(super) async fn stand_owner_call_typed<P: Serialize + ?Sized, R: DeserializeOwned>(
     data_dir: &Path,
     method: &str,
     params: &P,
@@ -210,7 +210,10 @@ async fn stop_stand_agents(data_dir: &Path, stops: &mut Vec<String>) -> Result<(
         timeout_at(deadline, stand_submit_command(data_dir, &stop))
             .await
             .map_err(|_| Failure::timeout())??;
-        stand_wait_for_command(data_dir, &stop.id, deadline).await?;
+        let command = WaitClient::StandOwner(data_dir)
+            .command(&stop.id, deadline)
+            .await?;
+        command_state_result(&command)?;
     }
     Ok(())
 }
@@ -379,62 +382,6 @@ async fn stand_submit_command(
         .validate_response(&response)
         .map_err(Failure::invalid_response)?;
     Ok(response)
-}
-
-async fn stand_wait_for_command(
-    data_dir: &Path,
-    command_id: &str,
-    deadline: Instant,
-) -> Result<CoreCommand, Failure> {
-    let request = CommandGetRequest::new(command_id);
-    request.validate().map_err(Failure::readback)?;
-    loop {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return Err(Failure::timeout());
-        }
-        let wait_ms = u64::try_from(remaining.as_millis())
-            .unwrap_or(u64::MAX)
-            .min(MAX_SWARM_WAIT_MS);
-        let wait_req =
-            SwarmWaitRequest::new(vec![command_id.to_owned()], Vec::new(), "all", wait_ms);
-        wait_req.validate().map_err(Failure::readback)?;
-        let reply: SwarmWaitResponse = timeout_at(
-            deadline,
-            stand_owner_call_typed(data_dir, "swarm.wait", &wait_req),
-        )
-        .await
-        .map_err(|_| Failure::timeout())?
-        .map_err(Failure::readback)?;
-        wait_req
-            .validate_response(&reply)
-            .map_err(Failure::readback)?;
-        if !reply.completed {
-            continue;
-        }
-        let command: CoreCommand = timeout_at(
-            deadline,
-            stand_owner_call_typed(data_dir, "command.get", &request),
-        )
-        .await
-        .map_err(|_| Failure::timeout())?
-        .map_err(Failure::readback)?;
-        request
-            .validate_response(&command)
-            .map_err(Failure::readback)?;
-        if !matches!(
-            command.state,
-            CommandState::Accepted | CommandState::Queued | CommandState::Dispatched
-        ) {
-            command_state_result(&command)?;
-            return Ok(command);
-        }
-        #[expect(
-            clippy::disallowed_methods,
-            reason = "The local stand operator waits briefly for a settled command readback."
-        )]
-        sleep(PROBE_INTERVAL.min(deadline.saturating_duration_since(Instant::now()))).await;
-    }
 }
 
 async fn stand_shutdown(

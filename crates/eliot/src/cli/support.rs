@@ -1,5 +1,6 @@
 //! Shared submission, wait, exit-code and output plumbing for the
 //! CLI command families.
+use super::waits::{WaitClient, wait_read};
 use eliot_core::api::{CommandGetRequest, CommandSubmitResponse, TurnGetRequest};
 use eliot_core::{
     Command as CoreCommand, CommandState, Error as CoreError, SubmitCommand, Turn as CoreTurn,
@@ -283,32 +284,16 @@ pub(crate) fn wait_deadline(seconds: u64) -> Result<Instant, Failure> {
         .ok_or_else(|| Failure::new(2, "--timeout-seconds is too large"))
 }
 
-pub(crate) async fn wait_call<T>(
-    call: impl std::future::Future<Output = eliot_core::Result<T>>,
-    deadline: Instant,
-) -> Result<T, Failure> {
-    match timeout_at(deadline, call).await {
-        Ok(Ok(value)) => Ok(value),
-        Ok(Err(error)) => Err(Failure::readback(error)),
-        Err(_) => Err(Failure::timeout()),
-    }
-}
-
 /// Wait server-side until the command is terminal and return its record. A
-/// command bound to a turn completes only when that turn does. The deadline
-/// is a timeout; a known terminal error keeps its contract exit code.
+/// command bound to a turn completes only when that turn does.
 pub(crate) async fn wait_for_command(
     data_dir: &Path,
     command_id: &str,
     deadline: Instant,
 ) -> Result<CoreCommand, Failure> {
-    let params = CommandGetRequest::new(command_id);
-    let command = wait_call(
-        eliot_daemon::wait_command(data_dir, &params, deadline),
-        deadline,
-    )
-    .await?
-    .ok_or_else(Failure::timeout)?;
+    let command = WaitClient::Caller(data_dir)
+        .command(command_id, deadline)
+        .await?;
     command_state_result(&command)?;
     Ok(command)
 }
@@ -327,16 +312,21 @@ pub(crate) async fn wait_for_turn(
     };
     let params = TurnGetRequest::new(agent, generation, turn_id);
     params.validate().map_err(Failure::readback)?;
-    let turn: CoreTurn = wait_call(
+    let turn: CoreTurn = wait_read(
         eliot_daemon::client_call_typed(data_dir, "turn.get", &params),
         deadline,
+        &format!("command {command_id}"),
+        "exact turn read unavailable",
     )
     .await?;
     params.validate_response(&turn).map_err(Failure::readback)?;
     match turn.state {
         TurnState::Completed => Ok(turn),
         TurnState::Unknown => Err(Failure::new(4, "turn outcome is unknown")),
-        TurnState::Running => Err(Failure::timeout()),
+        TurnState::Running => Err(Failure::new(
+            4,
+            "turn outcome is unknown; exact turn still running",
+        )),
     }
 }
 

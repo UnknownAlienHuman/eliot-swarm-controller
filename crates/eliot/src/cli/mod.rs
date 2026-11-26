@@ -23,6 +23,7 @@ mod store;
 pub(crate) mod support;
 mod task;
 mod update;
+mod waits;
 
 use self::args::{AuthCommand, CliCommand, LsArgs, PageArgs, StandAction};
 use self::support::Failure;
