@@ -3889,7 +3889,8 @@ Daemon RPC commands accept `--json` and `--data-dir`, and RPC mutations accept
 `--id`. The local update and stand commands use individual IDs for their
 internal writes. Stand commands take the stand path directly. CLI Agent targets
 are positional; `--to` remains the named-recipient selector for `msg send` and
-`digest`. Pagination uses `--after` and `--limit`; `--data-dir`, `--json`,
+`digest`. Pagination uses `--after` and `--limit`; `task list`, `var list`
+and checkpoint pages use `--cursor`. `--data-dir`, `--json`,
 `--generation`, and `--project` keep one spelling across command families.
 For one compatibility release, the former pagination flags remain aliases:
 `events --since`, `discover --cursor`, `history --cursor`,
@@ -3910,7 +3911,7 @@ The synopsis is target grammar; later-layer forms are not an inventory of curren
 swarm daemon [--foreground]
 swarm daemon install [--dry-run] | uninstall [--dry-run]
 swarm daemon stop [--drain|--force]
-swarm daemon update <RELEASE> [--wait-seconds N] [--interrupt-on-deadline]
+swarm daemon update [RELEASE] [--wait-seconds N] [--interrupt-on-deadline]
 swarm daemon update --cancel PREPARE_ID
 swarm daemon update --health-decision PREPARE_ID
 swarm stand up [--root PATH] [--settings FILE] [--profile NAME]... [--binary PATH] [--ttl DURATION]
@@ -3921,15 +3922,15 @@ swarm stand prune
 swarm status
 swarm auth login --harness H [--json]
 swarm autonomy [--since TIME] [--json]
-swarm store compact
-swarm maintenance compact
-swarm cleanup plan [--after TOKEN]
+swarm store compact | retention-preview [--commands-days N] [--events-days N] [--events-seconds N] [--mail-days N] [--processes-seconds N]
+swarm maintenance compact | run | purge-legacy-attention-advisories [--apply --expected-count N]
+swarm cleanup plan [--scope self_tree|project|all] [--project PROJECT] [--older-than UNIX_MS] [--after TOKEN]
 swarm cleanup apply <PLAN_ID> [--artifact ID]... [--delete-remote]
 swarm cleanup apply-all [--scope all|project] [--project PROJECT] [--older-than TIMESTAMP]
 swarm cleanup status <ID>
 swarm artifact register <PATH> --kind build|data_dir|temp|other --purpose TEXT [--ttl DURATION]
 swarm artifact reconcile <ARTIFACT_ID> [--release-custody REASON]
-swarm launch [--profile P | --role R | --harness H] [--model M] [--effort E] --workspace PATH [--worktree BRANCH [--base REF]] [--parent AGENT] [--source PATH]... [--no-policy REASON] [--goal-json JSON_OBJECT] [PROMPT] [--queue] [--wait] [--timeout-seconds N]
+swarm launch [--profile P | --role R | --harness H] [--model M] [--effort E] [--auth INTEGRATION] [--access ask|auto|full] [--cmd PATH] --workspace PATH [--worktree [BRANCH] [--base REF]] [--parent AGENT] [--source PATH]... [--no-policy REASON] [--goal-json JSON_OBJECT] [PROMPT] [--queue] [--owner-override] [--wait] [--timeout-seconds N]
 swarm launch [--workspace PATH | --chat] [--parent AGENT] [--no-policy REASON] [--goal-json JSON_OBJECT] [PROMPT] [--queue] [--wait] [--timeout-seconds N]
 swarm settings read
 swarm settings save FILE [--dry-run]
@@ -3951,19 +3952,19 @@ swarm git-status A [--generation N]
 swarm patch-digest A [--generation N]
 swarm diff A [--generation N] [--source uncommitted|branch|last-turn] [--path P]
 swarm edits A [--generation N] [--after PATH] [--limit N]
-swarm send A TEXT [--probe] [--wait [--timeout-seconds N] | --wait-seconds N] [--generation N]
+swarm send A TEXT [--probe] [--source PATH]... [--wait [--timeout-seconds N] | --wait-seconds N] [--generation N]
 swarm steer A TEXT [--generation N] [--turn ID]
 swarm inject A TEXT --point soonest|next_input|turn_safe_point|active_turn [--generation N] [--turn ID] [--expires-at-ms MS] [--wait]
 swarm project broadcast PROJECT TEXT
 swarm interrupt|abort A [--generation N] [--turn ID]
 swarm stop A [--force] [--tree | --generation N]
-swarm resume A [PROMPT] [--wait] [--timeout-seconds N]
+swarm resume A [PROMPT] [--generation N] [--wait] [--timeout-seconds N]
 swarm result A [--generation N] [--turn-id ID] [--wait [--timeout-seconds N]]
-swarm wait --all|--any --timeout-seconds N ID...
-swarm wait --all|--any [--command ID]... [--turn AGENT/GENERATION/TURN_ID]...
+swarm wait [--all|--any] [--mail] [--timeout-seconds N] ID...
+swarm wait [--all|--any] [--mail] [--command ID]... [--turn AGENT/GENERATION/TURN_ID]...
 swarm result A [--generation N] [--before CURSOR_JSON | --turn-id TURN] [--limit N] [--metadata]
-swarm turn resolve A --generation N --turn ID --status completed|failed|interrupted --reason TEXT
-swarm approve|deny A [--request R] [--choice ID] [--feedback TEXT] | answer ... [--request R]
+swarm turn resolve A --generation N --turn-id TURN --status completed|failed|interrupted --reason TEXT
+swarm approve|deny A [--generation N] [--request R] [--choice ID] [--feedback TEXT] | answer A --answers-file PATH [--generation N] [--request R]
 swarm configure A [--model MODEL] [--effort EFFORT] [--generation N]
 swarm compact|fork|background ...
 swarm cmd show|children|cancel|resolve|settle-stopped ...
@@ -3971,26 +3972,28 @@ swarm cmd resolve ID --status completed|failed|rejected --reason TEXT
 swarm cmd resolve-custody A --generation N --reason TEXT
 swarm why CMD|AGENT|AGENT:TURN
 swarm events [--after SEQ] [--limit N]
-swarm msg send --to RECIPIENT... TEXT | msg show DELIVERY [AGENT] | msg ack [AGENT] --delivery DELIVERY...
-swarm inbox [AGENT] [--wait SECS] | inbox decide ITEM CHOICE | inbox snooze ITEM | inbox apply (--kind KIND [--yes] | --item REF...)
+swarm msg send --to RECIPIENT... [--mode queue|send|steer|inject] [--thread LABEL] [--reply-to DELIVERY] [--no-wake] TEXT | msg inbox [AGENT] [--after A] [--limit N] [--wait SECS] | msg show DELIVERY [AGENT] | msg ack [AGENT] --delivery DELIVERY...
+swarm inbox [AGENT] [--after A] [--limit N] [--thread LABEL] [--reply-to DELIVERY] [--wait SECS] [--aged] | inbox decide ITEM CHOICE [--arg KEY=VALUE]... | inbox snooze ITEM | inbox apply (--kind KIND [--yes] | --item REF...)
 swarm var set KEY [VALUE | --value-file PATH] [--as-json] [...] | var get ... | var list ... | who [--project P] [--history]
 swarm claim set GLOB [AGENT] [--note TEXT] [--ttl-secs N] | claim list [AGENT] [--project P] | claim release GLOB [AGENT]
-swarm project list | show ID
+swarm project list | show ID | overview [--project P] [--after C]
+swarm project assignment get PROJECT | usage PROJECT [--epoch E] [--after A] | release PROJECT --epoch E
+swarm project budget PROJECT --revision REV [...] | transfer PROJECT --revision REV (begin|launch|commit|cancel) ...
 swarm rule list [--project PROJECT] [--after ID] [--limit N]
 swarm rule show ID [--project PROJECT]
 swarm rule read NAME.toml [--project PROJECT]
 swarm rule save NAME.toml --file FILE [--expected-revision SHA256] [--project PROJECT]
 swarm rule delete NAME.toml --expected-revision SHA256 [--project PROJECT]
 swarm rule catch-up ID --after SEQ [--through SEQ] [--project PROJECT]
-swarm timer show ID [--project PROJECT] | run ID [--project PROJECT | --include NAME]
+swarm timer show ID [--project PROJECT] | run ID [--project PROJECT] [--include NAME]
 swarm timer list [--project PROJECT] [--after ID] [--limit N]
-swarm goal set A --text TEXT --check CMD [ARGS...] [--mode eliot|native] [--check-cwd PATH] [--check-timeout-ms MS] [--max-turns N] [--max-rounds N] [--max-without-progress N] [--cadence-ms MS] [--scope GLOB]... [--check-input GLOB]... [--max-cost AMOUNT --cost-unit UNIT] [--escalate-model M] [--escalate-effort E] [--escalate-reason TEXT]
+swarm goal set A --text TEXT [--check CMD [ARGS...]] [--mode eliot|native] [--check-cwd PATH] [--check-timeout-ms MS] [--check-timeout-retry-safe] [--max-turns N] [--max-rounds N] [--max-without-progress N] [--cadence-ms MS] [--scope GLOB]... [--check-input GLOB]... [--max-cost AMOUNT --cost-unit UNIT] [--escalate-model M] [--escalate-effort E] [--escalate-reason TEXT]
 swarm goal show|pause|clear|resume A [--mode eliot|native] [--reason R]
-swarm goal round A (--idle-seq SEQ | --slot N) [--mode eliot|native]
+swarm goal round [A] (--idle-seq SEQ | --slot N) [--mode eliot|native]
 swarm goal round close A --round KEY [--generation N] [--revision N]
 swarm discover --profile P [--harness H] [--scope S] [--after C] [--archived] [--limit N]
 swarm attach --profile P --harness H --scope S --ref R [--project LABEL]
-swarm history A --view subject|turns|items [--source native|rollout] [--turn-id ID] [--after C] [--limit N]
+swarm history A [--generation N] --view subject|turns|items [--source native|rollout] [--turn-id ID] [--after C] [--limit N]
 swarm detach A [--generation N]
 swarm chat organization [--project P] [--after P] [--archived]
 swarm chat attach CHAT... --project P
@@ -3999,10 +4002,20 @@ swarm chat tag AGENT... [--tag TAG]... [--revision REV]...
 swarm chat group AGENT --generation N --turn-id ID --revision REV --rule TAG=LITERAL [--rule TAG=LITERAL ...] [--replace-manual-tags]
 swarm provider holds [--after SCOPE] [--limit N]
 swarm provider clear-hold SCOPE --corrective-evidence credentials_updated|configuration_updated|owner_verified [--expected-probe-command ID]
-swarm project assignment claim PROJECT [AGENT --generation N --revision REVISION]
+swarm project assignment claim PROJECT [AGENT] [--generation N] [--revision REVISION] [--remote INSTANCE --grant-revision REV]
 swarm project assignment launch PROJECT --profile P [--adopt-worktree PATH] [--no-policy REASON] [--goal-json JSON_OBJECT]
 swarm plugin NAME | plugin-test ... | hook ... | mcp
+swarm harnesses | doctor | quota --harness H [--profile P] | identity
+swarm launch-queue [INTENT] [--project P] [--after A]
+swarm archive A | unarchive A | delete A
+swarm digest --to AGENT [--all|--any] [--command ID]... [--turn AGENT/GENERATION/TURN_ID]... [ID]...
+swarm reparent [AGENT] --parent M --generation N --parent-generation N [--children-of M]
+swarm handoff FROM --to AGENT --generation N --to-generation N --task-command CMD [COMMANDS]... [--no-wait] [--timeout-seconds N]
+swarm switch FROM --generation N [--task-command CMD] [COMMANDS]... [--profile P | --role R | --harness H] [--project PROJECT] [--no-wait]
+swarm rule install-review --project PROJECT --author PROFILE --workspace PATH [--expected-revision SHA256] [--reviewer R]
 ```
+
+The CLI does not expose `compact`, `fork`, `background`, `plugin-test` or `hook` yet; the compact verb is reachable through `command.submit`.
 
 `cmd cancel` implements only undispatched handoff-input withdrawal. `cmd show`,
 `cmd children`, `cmd resolve`, and `turn resolve` are available; `turn show`
