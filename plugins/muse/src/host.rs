@@ -598,6 +598,19 @@ impl MusePlugin {
         session.selected_effort = initialized_native.effort.clone();
         session.native_scope = initialized_native.scope;
 
+        // A resume that continues a retained `unknown` turn replays that
+        // turn's late native facts after the new host subscribes. Record
+        // the turn id before any native read: turn-bearing frames buffer
+        // until readiness, so those facts name expected history instead of
+        // racing it.
+        if let Some(turn_id) = resume_subject
+            .as_ref()
+            .filter(|subject| subject.retained_turn_unknown)
+            .and_then(|subject| subject.retained_turn.clone())
+        {
+            session.events.retain_unknown_turn(turn_id).await;
+        }
+
         if let Some(subject) = &resume_subject {
             if subject.native_scope != session.native_scope {
                 return self.fail_session_start(
