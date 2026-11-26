@@ -1076,17 +1076,20 @@ impl DesktopApp {
             ChatMsg::StopTurnChosen => {
                 // Bound as the composer binds its own Stop turn: the open
                 // Agent's running turn in the detail on screen.
-                let bound = self.bound_detail().ok().and_then(|detail| {
-                    let turn = detail
-                        .active_turn
-                        .as_deref()
-                        .filter(|_| !detail.observe_only)?;
-                    Some(BoundAction::turn_control(
-                        &detail.agent,
-                        detail.generation,
-                        turn,
-                    ))
-                });
+                let detail = match self.bound_detail() {
+                    Ok(detail) => detail,
+                    // The Agent on screen is not read yet: say that, not
+                    // that no turn runs.
+                    Err(why) => {
+                        self.alert(format!("Not stopped: {why}"));
+                        return;
+                    }
+                };
+                let bound = detail
+                    .active_turn
+                    .as_deref()
+                    .filter(|_| !detail.observe_only)
+                    .map(|turn| BoundAction::turn_control(&detail.agent, detail.generation, turn));
                 match bound {
                     Some(bound) => self.chat_update(ChatMsg::InterruptRequested(bound), context),
                     None => self.alert("No turn is running now; nothing was stopped."),
