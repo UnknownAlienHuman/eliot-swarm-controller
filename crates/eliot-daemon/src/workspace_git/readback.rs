@@ -656,7 +656,7 @@ impl WorkspaceGit {
         let watch_common = common.to_owned();
         let wake = Arc::clone(wake);
         let (watched, attempt) = tokio::task::spawn_blocking(move || {
-            let (watcher, checkout_roots, root_identity, reused) =
+            let (watcher, checkout_roots, root_identity) =
                 match previous.as_deref() {
                     Some(ProjectObservation::Current(entry))
                         if entry.watched.registrations == paths
@@ -670,7 +670,6 @@ impl WorkspaceGit {
                             Arc::clone(&entry.watched.watcher),
                             entry.watched.checkout_roots.clone(),
                             entry.watched.root_identity.clone(),
-                            true,
                         )
                     }
                     Some(ProjectObservation::Pending(pending))
@@ -685,14 +684,15 @@ impl WorkspaceGit {
                             Arc::clone(&pending.watcher),
                             pending.checkout_roots.clone(),
                             pending.root_identity.clone(),
-                            true,
                         )
                     }
                     _ => {
+                        // Pin the root before building: a swap during the
+                        // build must read as changed on the next tick.
+                        let root_identity = project_root_identity(&watch_common);
                         let (watcher, roots) = project_watcher(&watch_common, &paths, wake)
                             .map(|(watcher, roots)| (Arc::new(watcher), roots))?;
-                        let root_identity = project_root_identity(&watch_common);
-                        (watcher, roots, root_identity, false)
+                        (watcher, roots, root_identity)
                     }
                 };
             let revision = watcher.revision().ok_or_else(|| {
@@ -707,12 +707,12 @@ impl WorkspaceGit {
                 checkout_roots,
                 root_identity,
             };
+            // Carry the count across every Pending attempt for this
+            // repository, rebuilt watcher or not: only Ready resets it.
+            // Otherwise a watcher that degrades on every attempt would
+            // never reach the three-attempt fallback.
             let attempt = match previous.as_deref() {
-                Some(ProjectObservation::Pending(pending))
-                    if reused && pending.registrations == watched.registrations =>
-                {
-                    pending.count.saturating_add(1)
-                }
+                Some(ProjectObservation::Pending(pending)) => pending.count.saturating_add(1),
                 _ => 1,
             };
             Ok::<_, Error>((watched, attempt))
