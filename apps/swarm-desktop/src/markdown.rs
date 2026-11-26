@@ -248,6 +248,16 @@ impl Builder {
         }
     }
 
+    /// A line break: a space inside a one-line heading, link label or image
+    /// text (and table cell, below), a `Break` in a paragraph.
+    fn line_break(&mut self) {
+        if self.heading.is_some() || self.link.is_some() || self.image.is_some() {
+            self.write(" ", false);
+        } else {
+            self.inline(Inline::Break);
+        }
+    }
+
     fn inline(&mut self, inline: Inline) {
         if let Some(cell) = self.table_cell.as_mut() {
             match inline {
@@ -484,8 +494,8 @@ pub fn parse(text: &str) -> Doc {
             Event::DisplayMath(math) => builder.text(&format!("$${math}$$")),
             Event::Html(html) | Event::InlineHtml(html) => builder.text(&html),
             Event::FootnoteReference(label) => builder.text(&format!("[^{label}]")),
-            Event::SoftBreak => builder.text(" "),
-            Event::HardBreak => builder.inline(Inline::Break),
+            // Model output means its newlines, as chat surfaces show them.
+            Event::SoftBreak | Event::HardBreak => builder.line_break(),
             Event::Rule => {
                 builder.close_paragraph();
                 builder.push_block(Block::Rule);
