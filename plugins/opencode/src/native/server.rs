@@ -654,6 +654,8 @@ impl OwnedServer {
             // plugin's explicit startup cleanup still terminates failures;
             // dropping this handle must not perform a second force stop.
             .kill_on_drop(false);
+        #[cfg(windows)]
+        eliot_plugin::native_cli::detach_from_console(&mut command);
         let mut child = command.spawn().map_err(|error| {
             Error::new(
                 "native_spawn",

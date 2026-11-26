@@ -155,6 +155,10 @@ the exact native terminal can resolve the outcome.
 
 ## Native mapping
 
+On Windows, the controlled plugin and its per-Agent `opencode serve` child
+start without a console. Their standard streams are redirected, and the
+generation Job keeps custody of both processes and their descendants.
+
 | Eliot operation | Mechanism / settlement |
 | --- | --- |
 | launch | installed `POST /api/session` with the workspace directory, no input; per-Agent `serve` on loopback with a generated `OPENCODE_PASSWORD` and per-Agent `XDG_CONFIG_HOME`/`XDG_DATA_HOME`; before `serve`, the frozen nonsecret `auth_integration` selector's canonical credential transfers opaquely into the isolated store as described under [Authentication](#authentication), with no modification of owner global auth; exact session/model/directory echo required before Eliot `session.ready`; an exact `GET /api/model` row supplies model limits and allowed effort variants; a missing row is advisory. The installed server resolves inference availability on the turn. Readiness is the installed `GET /api/config` proving the live server honors the per-Agent roots (password plus our config document path), polled to a 60 s bound inside one 75 s start envelope shared with the transfer, spawn, subscribe, registration, and create phases, with every failure cleanup (event close plus owned-server terminate and diagnostics) clamped to the same envelope and 15 s reserved for the daemon's Job retirement and settlement, so a loaded cold start never outlives the daemon `agent.start` budget. A proven pre-create refusal retires the owned generation after confirmed server exit. An unconfirmed exit, lost or invalid create reply, or uncertain auth import stays `unknown`. Swarm retains the generation resources and any exact session ID from the create response or the owned server's early `session.created` event. A verification failure after a confirmed create attempts deletion once by that ID and settles failed only when removal is proved. Unconfirmed removal or a lost `session.ready` acknowledgement retains the exact session as `unknown`. Each create is dispatched once |

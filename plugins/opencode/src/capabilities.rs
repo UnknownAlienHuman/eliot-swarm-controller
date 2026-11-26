@@ -125,6 +125,7 @@ pub fn declaration() -> HarnessCapabilities {
         turn_completed_reports_effective_model: true,
         backfill_failed_turn_readback: true,
         executable_stems: &["opencode"],
+        windows_detached_stdio: true,
         version_prefixes: &["opencode"],
         input_token_accounting: InputTokenAccounting::ExcludesCacheWrites,
         output_excludes_reasoning: true,
