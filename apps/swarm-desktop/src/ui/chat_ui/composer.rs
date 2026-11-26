@@ -485,36 +485,16 @@ impl DesktopApp {
             })
             .collect();
         Some(
-            StackPanel::new()
-                .width(tokens::layout::USAGE_MENU_WIDTH)
-                .spacing(tokens::spacing::XS)
-                .automation_name("Usage")
-                .children((
-                    StackPanel::new()
-                        .margin(Thickness::new(
-                            tokens::spacing::SM,
-                            tokens::spacing::SM,
-                            tokens::spacing::SM,
-                            0.0,
-                        ))
-                        .children((
-                            controls::secondary(source).text_wrapping(TextWrapping::Wrap),
-                            StackPanel::new().keyed_children(rows),
-                        )),
-                    controls::divider(),
-                    controls::row(false)
-                        .automation_name("Manage usage")
-                        .on_click(context.message(Message::Shell(ShellMsg::SettingsPage(
-                            settings_ui::Page::Usage,
-                        ))))
-                        .content(controls::row_content(
-                            None,
-                            "Manage usage",
-                            "",
-                            controls::icon(controls::glyph::CHEVRON_RIGHT),
-                        )),
-                ))
-                .into(),
+            self.usage_menu(
+                tokens::layout::USAGE_MENU_WIDTH,
+                StackPanel::new()
+                    .children((
+                        controls::secondary(source).text_wrapping(TextWrapping::Wrap),
+                        StackPanel::new().keyed_children(rows),
+                    ))
+                    .into(),
+                context,
+            ),
         )
     }
 

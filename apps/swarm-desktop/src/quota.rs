@@ -47,22 +47,26 @@ pub struct Window {
 impl Window {
     /// "resets in 2 h 10 min", or that the time is not reported.
     pub fn resets_in(&self, now_ms: i64) -> String {
-        let Some(at) = self.resets_at_ms else {
-            return "reset time not reported".to_owned();
-        };
+        match self.until_reset(now_ms) {
+            Some(until) => format!("resets {until}"),
+            None => "reset time not reported".to_owned(),
+        }
+    }
+
+    /// The time from now to the reset: "now", "in 12 min", "in 4 h 2 min",
+    /// "in 3 days"; `None` when the reset time is not reported.
+    pub fn until_reset(&self, now_ms: i64) -> Option<String> {
+        let at = self.resets_at_ms?;
         let mins = (at - now_ms).max(0) / 60_000;
-        match mins {
-            0 => "resets now".to_owned(),
-            m if m < 60 => format!("resets in {m} min"),
-            m if m < DAY_MINS => format!("resets in {} h {} min", m / 60, m % 60),
+        Some(match mins {
+            0 => "now".to_owned(),
+            m if m < 60 => format!("in {m} min"),
+            m if m < DAY_MINS => format!("in {} h {} min", m / 60, m % 60),
             m => {
                 let days = (m + DAY_MINS - 1) / DAY_MINS;
-                format!(
-                    "resets in {days} {}",
-                    if days == 1 { "day" } else { "days" }
-                )
+                format!("in {days} {}", if days == 1 { "day" } else { "days" })
             }
-        }
+        })
     }
 
     /// The limit's name for a row title: "Weekly limit", "5-hour limit",
@@ -120,6 +124,13 @@ pub fn status_line(label: &str, reply: &HarnessQuotaResponse) -> String {
         == Some("error");
     if failed {
         if reply.harness == "muse" && !note.is_empty() {
+            // Muse reports some failures as a bare code
+            // (`server_sent_no_usage`): said in words.
+            let note = if note.contains(char::is_whitespace) {
+                note.to_owned()
+            } else {
+                note.replace('_', " ")
+            };
             return format!("{label}: {note}");
         }
         let provider = details

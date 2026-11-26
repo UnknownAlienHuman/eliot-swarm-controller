@@ -16,11 +16,158 @@ impl DesktopApp {
             })
     }
 
-    /// Models & Usage (Antigravity's page as the pattern): what Swarm runs
-    /// now, then each installed harness's limits as two-line rows (the
-    /// limit and when it refreshes) with the share left and its ring.
-    /// Storage and retention live in Advanced.
+    /// Settings › Usage, the detail behind the sidebar's Usage popover
+    /// (Antigravity's Models & Usage, Codex's usage settings): Limits with
+    /// when they were read and Refresh; one card per harness (its provider,
+    /// version and plan; each window with its exact reset and the time to
+    /// it; why a quota is unknown; its hold and what clears it); holds of
+    /// no harness; then what Swarm runs now. Storage and retention live in
+    /// Advanced.
     pub(super) fn usage_page(&self, context: &mut ViewContext<Self>) -> View {
+        let now = crate::handoff::now_ms();
+        let catalog = self
+            .launch
+            .catalog
+            .as_ref()
+            .and_then(|reply| reply.as_ref().ok());
+        let refresh = controls::text_button()
+            .is_enabled(
+                self.settings.quotas_loading == 0
+                    && !self.settings.fleet_loading
+                    && !self.usage.holds_loading,
+            )
+            .automation_name("Refresh the limits")
+            .on_click(context.message(Message::Settings(SettingsMsg::UsageRefresh)))
+            .content(controls::label("Refresh"));
+        let mut limits = vec![KeyedView::new(
+            "heading",
+            controls::section_heading("Limits", &self.usage_updated(now), Some(refresh.into())),
+        )];
+        for harness in crate::picker::HARNESSES {
+            let entry = catalog.and_then(|reply| {
+                reply
+                    .harnesses
+                    .iter()
+                    .find(|entry| entry.harness == harness)
+            });
+            let label = crate::picker::harness_label(harness);
+            let provider =
+                crate::picker::provider_label(&eliot_core::api::catalog_provider(harness, ""));
+            let title = if provider.eq_ignore_ascii_case(label) || provider.is_empty() {
+                label.to_owned()
+            } else {
+                format!("{label} · {provider}")
+            };
+            let read = self.settings.quotas.get(harness);
+            let quota = read.and_then(|result| result.as_ref().ok());
+            let observed = quota.and_then(crate::quota::observed_note);
+            let tier = quota
+                .filter(|_| harness == "muse")
+                .and_then(crate::quota::plan);
+            let metadata = [
+                entry.and_then(|entry| entry.version.as_deref()),
+                tier.as_deref(),
+                observed.as_deref(),
+            ]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join(" · ");
+            let mut rows = match (entry, read) {
+                (Some(entry), _) if !entry.installed => vec![KeyedView::new(
+                    "not-installed",
+                    controls::setting_row("Not installed", "", None),
+                )],
+                (_, None) if self.settings.quotas_loading > 0 => vec![KeyedView::new(
+                    "reading",
+                    controls::setting_row("Reading limits…", "", None),
+                )],
+                (_, None) => unknown_limits(""),
+                (_, Some(Err(error))) => unknown_limits(&crate::state::plain_reason(error)),
+                (_, Some(Ok(reply))) => {
+                    let windows = crate::quota::windows(reply);
+                    if windows.is_empty() {
+                        let status = crate::quota::status_line(label, reply);
+                        let note = status
+                            .strip_prefix(label)
+                            .and_then(|status| status.strip_prefix(": "))
+                            .map_or_else(|| status.clone(), crate::quota::sentence);
+                        unknown_limits(&note)
+                    } else {
+                        windows
+                            .iter()
+                            .enumerate()
+                            .map(|(index, window)| {
+                                let name = window.name();
+                                let note = resets_detail(window, now);
+                                KeyedView::new(
+                                    format!("{index}:{name}:{note}:{}", window.remaining),
+                                    controls::setting_row(
+                                        &name,
+                                        &note,
+                                        limit_value(window.remaining),
+                                    ),
+                                )
+                            })
+                            .collect()
+                    }
+                }
+            };
+            if let Some(hold) = self.harness_hold(harness) {
+                rows.push(hold_row(hold, &usage_ui::hold_line(hold, now), now));
+            }
+            limits.push(KeyedView::new(
+                format!("harness:{harness}:{metadata}"),
+                StackPanel::new().spacing(tokens::spacing::SM).children((
+                    Grid::new()
+                        .columns([GridLength::Auto, GridLength::STAR])
+                        .column_spacing(tokens::spacing::SM)
+                        .margin(Thickness::new(0.0, tokens::spacing::SM, 0.0, 0.0))
+                        .children((
+                            controls::text(title, tokens::text::SMALL_TITLE)
+                                .automation_heading_level(AutomationHeadingLevel::Level3)
+                                .vertical_alignment(VerticalAlignment::Center),
+                            controls::secondary(metadata)
+                                .grid_column(1)
+                                .vertical_alignment(VerticalAlignment::Center)
+                                .text_trimming(TextTrimming::CharacterEllipsis),
+                        )),
+                    controls::settings_card(rows),
+                )),
+            ));
+        }
+        // Holds no harness card names (an exact-profile or model hold).
+        let others: Vec<KeyedView> = self
+            .holds()
+            .iter()
+            .filter(|hold| {
+                hold.source.as_ref().is_none_or(|source| {
+                    !crate::picker::HARNESSES.contains(&source.harness.as_str())
+                })
+            })
+            .map(|hold| hold_row(hold, &hold.scope, now))
+            .collect();
+        if !others.is_empty() {
+            limits.push(KeyedView::new(
+                "other-holds-title",
+                controls::card_title("Other holds"),
+            ));
+            limits.push(KeyedView::new(
+                "other-holds",
+                controls::settings_card(others),
+            ));
+        }
+        if let Some(Err(error)) = &self.usage.holds {
+            limits.push(KeyedView::new(
+                format!("holds-error:{error}"),
+                controls::secondary(format!(
+                    "Holds not read: {}",
+                    crate::state::plain_reason(error)
+                ))
+                .foreground(ThemeBrush::SystemCritical)
+                .text_wrapping(TextWrapping::Wrap),
+            ));
+        }
         let loaded = self.nav.agents.len();
         let (tokens_today, reporting) = self.tokens_today();
         let fleet = self.settings.fleet.as_ref();
@@ -28,8 +175,8 @@ impl DesktopApp {
         let (running_value, running_note) = match fleet {
             None => ("…".to_owned(), "Counting…".to_owned()),
             Some(Ok(fleet)) => (
-                fleet.running.to_string(),
-                format!("Working or starting, of {} in Swarm", agents(fleet.agents)),
+                format!("{} of {}", fleet.running, fleet.agents),
+                "Working or starting".to_owned(),
             ),
             Some(Err(error)) => (
                 "—".to_owned(),
@@ -62,125 +209,15 @@ impl DesktopApp {
                 ),
             ),
         ]);
-        let catalog = self
-            .launch
-            .catalog
-            .as_ref()
-            .and_then(|reply| reply.as_ref().ok());
-        let now = crate::handoff::now_ms();
-        let mut cards = Vec::new();
-        for harness in crate::picker::HARNESSES {
-            let entry = catalog.and_then(|reply| {
-                reply
-                    .harnesses
-                    .iter()
-                    .find(|entry| entry.harness == harness)
-            });
-            let label = crate::picker::harness_label(harness);
-            let provider =
-                crate::picker::provider_label(&eliot_core::api::catalog_provider(harness, ""));
-            let title = if provider.eq_ignore_ascii_case(label) || provider.is_empty() {
-                label.to_owned()
-            } else {
-                format!("{label} · {provider}")
-            };
-            let read = self.settings.quotas.get(harness);
-            let quota = read.and_then(|result| result.as_ref().ok());
-            let observed = quota.and_then(crate::quota::observed_note);
-            let tier = quota
-                .filter(|_| harness == "muse")
-                .and_then(crate::quota::plan);
-            let metadata = [
-                entry.and_then(|entry| entry.version.as_deref()),
-                tier.as_deref(),
-                observed.as_deref(),
-            ]
-            .into_iter()
-            .flatten()
-            .collect::<Vec<_>>()
-            .join(" · ");
-            let rows = match (entry, read) {
-                (Some(entry), _) if !entry.installed => vec![KeyedView::new(
-                    "not-installed",
-                    controls::setting_row("Not installed", "", None),
-                )],
-                (_, None) if self.settings.quotas_loading > 0 => vec![KeyedView::new(
-                    "reading",
-                    controls::setting_row("Reading limits…", "", None),
-                )],
-                (_, None) => unknown_limits(""),
-                (_, Some(Err(error))) => unknown_limits(&crate::state::plain_error(error)),
-                (_, Some(Ok(reply))) => {
-                    let windows = crate::quota::windows(reply);
-                    if windows.is_empty() {
-                        let status = crate::quota::status_line(label, reply);
-                        let note = status
-                            .strip_prefix(label)
-                            .and_then(|status| status.strip_prefix(": "))
-                            .map_or_else(|| status.clone(), crate::quota::sentence);
-                        unknown_limits(&note)
-                    } else {
-                        windows
-                            .iter()
-                            .enumerate()
-                            .map(|(index, window)| {
-                                let title = format!("{} remaining", window.name());
-                                let note = crate::quota::sentence(&window.resets_in(now));
-                                KeyedView::new(
-                                    format!("{index}:{title}:{note}:{}", window.remaining),
-                                    controls::setting_row(
-                                        &title,
-                                        &note,
-                                        limit_value(window.remaining),
-                                    ),
-                                )
-                            })
-                            .collect()
-                    }
-                }
-            };
-            cards.push(KeyedView::new(
-                format!("harness:{harness}:{metadata}"),
-                StackPanel::new().spacing(tokens::spacing::SM).children((
-                    StackPanel::new()
-                        .orientation(Orientation::Horizontal)
-                        .spacing(tokens::spacing::SM)
-                        .margin(Thickness::new(0.0, tokens::spacing::SM, 0.0, 0.0))
-                        .children((
-                            controls::section_title(title),
-                            controls::secondary(metadata)
-                                .vertical_alignment(VerticalAlignment::Center),
-                        )),
-                    controls::settings_card(rows),
-                )),
-            ));
-        }
         StackPanel::new()
             .spacing(tokens::spacing::MD)
             .children((
-                StackPanel::new().spacing(tokens::spacing::SM).children((
-                    controls::section_heading(
-                        "Swarm",
-                        "",
-                        Some(
-                            controls::text_button()
-                                .is_enabled(
-                                    self.settings.quotas_loading == 0
-                                        && !self.settings.fleet_loading,
-                                )
-                                .automation_name("Read the limits again")
-                                .on_click(
-                                    context.message(Message::Settings(SettingsMsg::UsageRefresh)),
-                                )
-                                .content(controls::label("Refresh"))
-                                .into(),
-                        ),
-                    ),
-                    totals,
-                )),
                 StackPanel::new()
                     .spacing(tokens::spacing::SM)
-                    .keyed_children(cards),
+                    .keyed_children(limits),
+                StackPanel::new()
+                    .spacing(tokens::spacing::SM)
+                    .children((controls::section_heading("Swarm", "", None), totals)),
             ))
             .into()
     }
@@ -216,6 +253,41 @@ fn unknown_limits(note: &str) -> Vec<KeyedView> {
     )]
 }
 
+/// When a window resets, exactly and from now: "Resets Fri 09:00 · in 3
+/// days"; or that the time is not reported.
+fn resets_detail(window: &crate::quota::Window, now: i64) -> String {
+    match (window.resets_at_ms, window.until_reset(now)) {
+        (Some(at), Some(until)) => format!("Resets {} · {until}", usage_ui::clock(at, now)),
+        _ => crate::quota::sentence(&window.resets_in(now)),
+    }
+}
+
+/// A hold's row: its few words ("On hold until 19:27") or the scope it
+/// holds, why it holds and when Swarm checks again, with a critical ring.
+fn hold_row(hold: &eliot_core::ProviderHold, title: &str, now: i64) -> KeyedView {
+    use eliot_core::{ProviderHoldState, ProviderRestrictionKind as Kind};
+    let why = match hold.kind {
+        Kind::RateLimit => "Rate limited",
+        Kind::Quota => "Usage limit reached",
+        Kind::Auth => "Sign-in needed",
+        Kind::ModelRemoved => "Model no longer offered",
+        Kind::ModelMismatch => "Provider served another model",
+    };
+    let note = match (hold.state, hold.next_probe_at) {
+        (ProviderHoldState::Probing, _) => format!("{why} · checking now"),
+        (_, Some(at)) => format!("{why} · next check {}", usage_ui::clock(at, now)),
+        _ => why.to_owned(),
+    };
+    KeyedView::new(
+        format!("hold:{}:{title}:{note}", hold.scope),
+        controls::setting_row(
+            title,
+            &note,
+            controls::status_ring(ThemeBrush::SystemCritical),
+        ),
+    )
+}
+
 /// A limit's share left and its status ring.
 fn limit_value(remaining: i64) -> View {
     let status = if (remaining as f64) < controls::QUOTA_LOW {
@@ -227,7 +299,8 @@ fn limit_value(remaining: i64) -> View {
         .orientation(Orientation::Horizontal)
         .spacing(tokens::spacing::SM)
         .children((
-            controls::body(format!("{remaining}%")).vertical_alignment(VerticalAlignment::Center),
+            controls::body(format!("{remaining}% left"))
+                .vertical_alignment(VerticalAlignment::Center),
             controls::status_ring(status),
         ))
         .into()

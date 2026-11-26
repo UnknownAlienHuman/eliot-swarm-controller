@@ -1185,8 +1185,9 @@ impl DesktopApp {
                 .vertical_alignment(VerticalAlignment::Center)
                 .into(),
         };
+        // The summary, then the shared actions 16 DIPs under it: the gap
+        // every dialog keeps between its body and its actions.
         let footer = StackPanel::new()
-            .grid_row(1)
             .spacing(tokens::spacing::MD)
             .children((summary, super::dialog_ui::actions(close.into(), primary)));
         Some(super::dialog_ui::surface(

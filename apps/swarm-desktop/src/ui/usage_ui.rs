@@ -1,11 +1,17 @@
 //! The sidebar's Usage row and its popover (`Sidebar.dc.html` footer,
-//! `Hold.dc.html`; skeleton 5.12): the row shows the static Usage mark
-//! (§4.2) and a short word of the tightest harness window it knows ("Codex
-//! 62% · 1 hold"); it opens a real WinUI `Flyout` beside the sidebar
-//! ([`DesktopApp::anchored_popover`], `Pop::Quotas`) that lists each
-//! harness's tightest window (its share left, when it resets, a meter that
-//! turns `error` under 20 %), "Quota unknown" where none is reported (never
-//! 0 %), the provider holds (`provider.holds`) and Open usage settings.
+//! `Hold.dc.html`; skeleton 5.12), shaped as Codex shows usage (an ambient
+//! "{share} left" line, a Usage menu, Manage usage) with Antigravity's
+//! per-harness windows:
+//!
+//! * the row shows the static Usage mark (§4.2) and one short line for the
+//!   harness whose limit is active where the owner is ([`usage_harness`]):
+//!   "Claude Code 62% left", "Codex on hold" or "Codex quota unknown";
+//! * the popover, a real WinUI `Flyout` beside the sidebar
+//!   ([`DesktopApp::anchored_popover`], `Pop::Quotas`), lists each harness
+//!   once with every window it reports (its share left, when it resets, a
+//!   meter that turns `error` under 20 %), "Quota unknown" where it reports
+//!   none (never 0 %), its hold in a few words and Manage usage;
+//! * Settings › Usage holds the detail and the controls.
 //!
 //! Quota reads start the vendors' own processes, so they run only while
 //! their screen is open (skeleton 2.4): once when the popover (or Settings
@@ -21,21 +27,64 @@ use eliot_core::api::ProviderHoldsResponse;
 #[derive(Default)]
 pub(super) struct UsageState {
     pub(super) holds: Option<Fallible<ProviderHoldsResponse>>,
-    holds_loading: bool,
+    pub(super) holds_loading: bool,
     /// When the last quota read of every harness settled (ms since the
     /// epoch).
     pub(super) read_at: Option<i64>,
 }
 
-/// One harness's tightest window as the row and the popover say it.
-struct Tightest {
-    harness: &'static str,
-    window: crate::quota::Window,
+/// Where the owner is, for [`usage_harness`].
+pub(super) enum UsagePlace<'a> {
+    /// A chat is open: its Agent's harness.
+    Agent(&'a str),
+    /// A project page, by its sidebar key.
+    Project(&'a str),
+    /// Home or any other page.
+    Fleet,
+}
+
+/// The harness whose limit the Usage row shows: the limit active where the
+/// owner is, not the tightest one (owner, 2026-11-26). An open chat shows
+/// its Agent's harness; a project page the harness with the most running
+/// Agents there, else (a tie, or none running) its most recently active
+/// Agent's; any other page the harness with the most running Agents in
+/// the fleet, else `next`, the harness the composer launches next.
+pub(super) fn usage_harness<'a>(
+    place: UsagePlace<'a>,
+    agents: &'a [nav::UiAgent],
+    next: Option<&'a str>,
+) -> Option<&'a str> {
+    match place {
+        UsagePlace::Agent(harness) => Some(harness),
+        UsagePlace::Project(key) => {
+            let mine = agents
+                .iter()
+                .filter(|agent| nav::group_key(agent.organization.as_deref()) == key);
+            busiest(mine.clone()).or_else(|| {
+                mine.max_by_key(|agent| agent.updated_at)
+                    .map(|agent| agent.harness.as_str())
+            })
+        }
+        UsagePlace::Fleet => busiest(agents.iter()).or(next),
+    }
+}
+
+/// The harness with the most running Agents; `None` when none runs or two
+/// harnesses tie.
+fn busiest<'a>(agents: impl Iterator<Item = &'a nav::UiAgent>) -> Option<&'a str> {
+    let mut counts: std::collections::BTreeMap<&str, usize> = Default::default();
+    for agent in agents.filter(|agent| agent.running()) {
+        *counts.entry(agent.harness.as_str()).or_default() += 1;
+    }
+    let top = counts.values().copied().max()?;
+    let mut leaders = counts.into_iter().filter(|(_, count)| *count == top);
+    let (harness, _) = leaders.next()?;
+    leaders.next().is_none().then_some(harness)
 }
 
 impl DesktopApp {
     /// Read the limits of every harness and the provider holds once (the
-    /// popover opened, or its Refresh).
+    /// popover or Settings › Usage opened, or their Refresh).
     pub(super) fn read_usage(&mut self, context: &ComponentContext<Self>) {
         self.load_quotas(context);
         self.load_holds(context);
@@ -61,65 +110,97 @@ impl DesktopApp {
         self.usage.holds = Some(reply);
     }
 
-    /// The tightest window of every harness whose limits were read.
-    fn tightest_windows(&self) -> Vec<Tightest> {
-        crate::picker::HARNESSES
-            .into_iter()
-            .filter_map(|harness| {
-                let reply = self.settings.quotas.get(harness)?.as_ref().ok()?;
-                Some(Tightest {
-                    harness,
-                    window: crate::quota::tightest(reply)?,
-                })
-            })
-            .collect()
-    }
-
     /// The holds read, held or probing (a probe still holds new work).
-    fn holds(&self) -> &[eliot_core::ProviderHold] {
+    pub(super) fn holds(&self) -> &[eliot_core::ProviderHold] {
         match &self.usage.holds {
             Some(Ok(reply)) => &reply.holds,
             _ => &[],
         }
     }
 
+    /// A harness's hold, when it has one.
+    pub(super) fn harness_hold(&self, harness: &str) -> Option<&eliot_core::ProviderHold> {
+        self.holds().iter().find(|hold| {
+            hold.source
+                .as_ref()
+                .is_some_and(|source| source.harness == harness)
+        })
+    }
+
+    /// The harness the Usage row speaks for, where the owner is now.
+    fn row_harness(&self) -> Option<String> {
+        let open = self.selected_agent_id().and_then(|id| {
+            self.nav
+                .agents
+                .iter()
+                .find(|agent| agent.id == id)
+                .map(|agent| agent.harness.clone())
+                .or_else(|| {
+                    self.chat
+                        .detail
+                        .as_ref()
+                        .filter(|detail| detail.agent == id)
+                        .map(|detail| detail.harness.clone())
+                })
+        });
+        let place = match (self.main, &open) {
+            (Main::Conversation, Some(harness)) => UsagePlace::Agent(harness),
+            // An open chat speaks only for its own Agent: until its harness
+            // is known, no number (never the fleet's).
+            (Main::Conversation, None) if self.selected_agent_id().is_some() => return None,
+            (Main::Project, _) => UsagePlace::Project(&self.project.key),
+            _ => UsagePlace::Fleet,
+        };
+        let next = self.starting_harness();
+        usage_harness(place, &self.nav.agents, next.as_deref()).map(str::to_owned)
+    }
+
     /// The footer's Usage row (`Sidebar.dc.html`): the static Usage mark
-    /// (§4.2: no row draws a progress ring; critical under 20 % left),
-    /// "Usage" and its word ("Codex 62% · 1 hold"); before any reading, no
-    /// word. It carries the Usage popover while that is open.
+    /// (§4.2: no row draws a progress ring; critical under 20 % left or on
+    /// hold), "Usage" and one line for [`Self::row_harness`]: "Claude Code
+    /// 62% left" from its tightest window, "Claude Code on hold", or
+    /// "Claude Code quota unknown" when its read reports no window (never
+    /// another harness's number); before the first reading, no line. It
+    /// carries the Usage popover while that is open.
     pub(super) fn usage_row(&self, context: &mut ViewContext<Self>) -> View {
-        let tightest = self
-            .tightest_windows()
-            .into_iter()
-            .min_by_key(|tightest| tightest.window.remaining);
-        let holds = self.holds().len();
-        let mut word = tightest.as_ref().map_or_else(String::new, |tightest| {
-            format!(
-                "{} {}%",
-                crate::picker::harness_label(tightest.harness),
-                tightest.window.remaining
-            )
-        });
-        if holds > 0 {
-            if !word.is_empty() {
-                word.push_str(" · ");
+        let harness = self.row_harness();
+        let window = harness
+            .as_deref()
+            .and_then(|harness| self.settings.quotas.get(harness))
+            .and_then(|read| read.as_ref().ok())
+            .and_then(crate::quota::tightest);
+        let held = harness
+            .as_deref()
+            .is_some_and(|harness| self.harness_hold(harness).is_some());
+        let word = match harness.as_deref() {
+            None => String::new(),
+            Some(harness) => {
+                let label = crate::picker::harness_label(harness);
+                match &window {
+                    _ if held => format!("{label} on hold"),
+                    Some(window) => format!("{label} {}% left", window.remaining),
+                    None if self.usage.read_at.is_some() => format!("{label} quota unknown"),
+                    None => String::new(),
+                }
             }
-            word.push_str(&eliot_core::count_words(holds as u64, "hold", "holds"));
-        }
-        let low = tightest.as_ref().is_some_and(|tightest| {
-            (tightest.window.remaining as f64) < crate::controls::QUOTA_LOW
-        });
+        };
+        let low = held
+            || window
+                .as_ref()
+                .is_some_and(|window| (window.remaining as f64) < crate::controls::QUOTA_LOW);
         let open = self.launch.open == Some(Pop::Quotas);
-        // A static mark; the word beside it carries the share left.
+        // A static mark; the line beside it carries the share left.
         let mark: View = if low {
             controls::critical_icon(controls::glyph::USAGE, tokens::icon::ROW)
         } else {
             controls::icon(controls::glyph::USAGE)
         };
-        let spoken = if word.is_empty() {
-            "Usage: limits not read yet".to_owned()
-        } else {
-            format!("Usage: {word}")
+        // No line once read: no harness speaks here (nothing runs, and
+        // Auto has no previewed pick).
+        let spoken = match self.usage.read_at {
+            _ if !word.is_empty() => format!("Usage: {word}"),
+            None => "Usage: limits not read yet".to_owned(),
+            Some(_) => "Usage".to_owned(),
         };
         let row = controls::row(open)
             .height(tokens::height::CONTROL)
@@ -167,10 +248,11 @@ impl DesktopApp {
     }
 
     /// The Usage popover (`Hold.dc.html`): "Usage" with when the limits
-    /// were read and Refresh; per harness its tightest window ("Codex ·
-    /// weekly", "62% left · resets Fri 09:00", a meter), "Quota unknown"
-    /// where none is reported, and its hold ("On hold until 19:27"); holds
-    /// of no harness listed; then Open usage settings.
+    /// were read and Refresh; each harness once, its name and status
+    /// ("Quota unknown", "Not installed", "Reading…"), every window it
+    /// reports ("Weekly limit", "62% left · resets Fri 09:00", a meter) and
+    /// its hold ("On hold until 19:27"); holds of no harness; then Manage
+    /// usage.
     pub(super) fn quotas_popover(&self, context: &mut ViewContext<Self>) -> View {
         let now = crate::handoff::now_ms();
         let reading = self.settings.quotas_reading();
@@ -179,13 +261,7 @@ impl DesktopApp {
             .catalog
             .as_ref()
             .and_then(|reply| reply.as_ref().ok());
-        let holds = self.holds();
-        let hold_line =
-            |hold: &eliot_core::ProviderHold| match hold.retry_after.or(hold.next_probe_at) {
-                Some(at) => format!("On hold until {}", clock(at, now)),
-                None => "On hold".to_owned(),
-            };
-        let mut rows: Vec<KeyedView> = Vec::new();
+        let mut blocks: Vec<KeyedView> = Vec::new();
         for harness in crate::picker::HARNESSES {
             let label = crate::picker::harness_label(harness);
             let installed = catalog
@@ -197,99 +273,91 @@ impl DesktopApp {
                 })
                 .is_none_or(|entry| entry.installed);
             let read = self.settings.quotas.get(harness);
-            let window = read
+            let windows = read
                 .and_then(|read| read.as_ref().ok())
-                .and_then(crate::quota::tightest);
-            let (title, right) = match (&window, read) {
-                _ if !installed => (label.to_owned(), "Not installed".to_owned()),
-                (Some(window), _) => (
-                    format!("{label} · {}", window.label.to_lowercase()),
-                    format!(
-                        "{}% left · {}",
-                        window.remaining,
-                        match window.resets_at_ms {
-                            Some(at) => format!("resets {}", clock(at, now)),
-                            None => "reset time not reported".to_owned(),
-                        }
-                    ),
-                ),
-                (None, None) if reading => (label.to_owned(), "Reading…".to_owned()),
-                (None, _) => (label.to_owned(), "Quota unknown".to_owned()),
+                .map(crate::quota::windows)
+                .unwrap_or_default();
+            let status = match read {
+                _ if !installed => "Not installed",
+                _ if !windows.is_empty() => "",
+                None if reading => "Reading…",
+                _ => "Quota unknown",
             };
-            let held = holds
-                .iter()
-                .filter(|hold| {
-                    hold.source
-                        .as_ref()
-                        .is_some_and(|source| source.harness == harness)
-                })
-                .map(hold_line)
-                .next();
+            let held = self.harness_hold(harness).map(|hold| hold_line(hold, now));
             let mut parts: Vec<KeyedView> = vec![KeyedView::new(
-                "line",
-                Grid::new()
-                    .columns([GridLength::STAR, GridLength::Auto])
-                    .column_spacing(tokens::spacing::SM)
-                    .children((
-                        controls::body(title.clone())
-                            .vertical_alignment(VerticalAlignment::Center)
-                            .text_trimming(TextTrimming::CharacterEllipsis),
-                        controls::text(right.clone(), tokens::text::LABEL)
-                            .grid_column(1)
-                            .vertical_alignment(VerticalAlignment::Center),
-                    )),
+                format!("name:{status}"),
+                line(
+                    controls::text(label, tokens::text::SMALL_TITLE),
+                    controls::secondary(status),
+                ),
             )];
-            if let Some(window) = &window {
+            let mut spoken = vec![if status.is_empty() {
+                label.to_owned()
+            } else {
+                format!("{label}: {status}")
+            }];
+            for (index, window) in windows.iter().enumerate() {
+                let name = window.name();
+                let left = match window.resets_at_ms {
+                    Some(at) => format!("{}% left · resets {}", window.remaining, clock(at, now)),
+                    None => format!("{}% left", window.remaining),
+                };
                 let remaining = window.remaining as f64;
                 parts.push(KeyedView::new(
-                    format!("meter:{}", window.remaining),
-                    controls::meter(remaining, remaining < crate::controls::QUOTA_LOW),
+                    format!("window:{index}:{name}:{left}"),
+                    StackPanel::new()
+                        .spacing(tokens::spacing::XS)
+                        .automation_name(format!("{name}: {left}"))
+                        .children((
+                            line(
+                                controls::body(name.clone()),
+                                controls::secondary(left.clone()),
+                            ),
+                            controls::meter(remaining, remaining < crate::controls::QUOTA_LOW),
+                        )),
                 ));
+                spoken.push(format!("{name} {left}"));
             }
             if let Some(held) = &held {
                 parts.push(KeyedView::new(
                     format!("hold:{held}"),
                     controls::secondary(held.clone()).foreground(ThemeBrush::SystemCritical),
                 ));
+                spoken.push(held.clone());
             }
-            rows.push(KeyedView::new(
-                format!("harness:{harness}:{title}:{right}:{}", held.is_some()),
+            blocks.push(KeyedView::new(
+                format!("harness:{harness}"),
                 StackPanel::new()
                     .spacing(tokens::spacing::XS)
-                    .automation_name(match &held {
-                        Some(held) => format!("{title}: {right}. {held}"),
-                        None => format!("{title}: {right}"),
-                    })
+                    .automation_name(spoken.join("; "))
                     .keyed_children(parts),
             ));
         }
         // Holds no harness row names (an exact-profile or model hold).
-        for hold in holds.iter().filter(|hold| {
+        for hold in self.holds().iter().filter(|hold| {
             hold.source
                 .as_ref()
                 .is_none_or(|source| !crate::picker::HARNESSES.contains(&source.harness.as_str()))
         }) {
-            let line = format!("{}: {}", hold.scope, hold_line(hold).to_lowercase());
-            rows.push(KeyedView::new(
+            let text = format!("{}: {}", hold.scope, hold_line(hold, now).to_lowercase());
+            blocks.push(KeyedView::new(
                 format!("hold:{}", hold.scope),
-                controls::secondary(line)
+                controls::secondary(text)
                     .foreground(ThemeBrush::SystemCritical)
                     .text_wrapping(TextWrapping::Wrap),
             ));
         }
         if let Some(Err(error)) = &self.usage.holds {
-            rows.push(KeyedView::new(
+            blocks.push(KeyedView::new(
                 format!("holds-error:{error}"),
-                controls::secondary(format!("Holds not read: {error}"))
-                    .foreground(ThemeBrush::SystemCritical)
-                    .text_wrapping(TextWrapping::Wrap),
+                controls::secondary(format!(
+                    "Holds not read: {}",
+                    crate::state::plain_reason(error)
+                ))
+                .foreground(ThemeBrush::SystemCritical)
+                .text_wrapping(TextWrapping::Wrap),
             ));
         }
-        let updated = match self.usage.read_at {
-            Some(at) if !reading => format!("Updated {}", clock(at, now)),
-            _ if reading => "Reading…".to_owned(),
-            _ => String::new(),
-        };
         let header = Grid::new()
             .columns([GridLength::STAR, GridLength::Auto, GridLength::Auto])
             .column_spacing(tokens::spacing::SM)
@@ -297,7 +365,7 @@ impl DesktopApp {
                 controls::text("Usage", tokens::text::SMALL_TITLE)
                     .automation_heading_level(AutomationHeadingLevel::Level2)
                     .vertical_alignment(VerticalAlignment::Center),
-                controls::text(updated, tokens::text::LABEL)
+                controls::secondary(self.usage_updated(now))
                     .grid_column(1)
                     .vertical_alignment(VerticalAlignment::Center),
                 controls::icon_button()
@@ -307,33 +375,89 @@ impl DesktopApp {
                     .on_click(context.message(Message::Shell(ShellMsg::UsageRefresh)))
                     .content(controls::icon(controls::glyph::REFRESH)),
             ));
-        let footer = Border::new()
-            .border_brush(ThemeBrush::CardStroke)
-            .border_thickness(Thickness::new(0.0, tokens::layout::HAIRLINE, 0.0, 0.0))
-            .padding(Thickness::new(0.0, tokens::spacing::SM, 0.0, 0.0))
-            .content(
-                controls::text_button()
-                    .horizontal_alignment(HorizontalAlignment::Right)
-                    .automation_name("Open usage settings")
+        self.usage_menu(
+            tokens::layout::USAGE_POPOVER_WIDTH,
+            StackPanel::new()
+                .spacing(tokens::spacing::MD)
+                .children((
+                    header,
+                    StackPanel::new()
+                        .spacing(tokens::spacing::MD)
+                        .keyed_children(blocks),
+                ))
+                .into(),
+            context,
+        )
+    }
+
+    /// "Updated 14:05" once every harness was read, "Reading…" meanwhile.
+    pub(super) fn usage_updated(&self, now: i64) -> String {
+        match self.usage.read_at {
+            _ if self.settings.quotas_reading() => "Reading…".to_owned(),
+            Some(at) => format!("Updated {}", clock(at, now)),
+            None => String::new(),
+        }
+    }
+
+    /// A usage flyout (the sidebar's and the composer's): its content, then
+    /// Codex's Manage usage, which opens Settings › Usage.
+    pub(super) fn usage_menu(
+        &self,
+        width: f64,
+        content: View,
+        context: &mut ViewContext<Self>,
+    ) -> View {
+        StackPanel::new()
+            .width(width)
+            .spacing(tokens::spacing::XS)
+            .automation_name("Usage")
+            .children((
+                Border::new()
+                    .margin(Thickness::new(
+                        tokens::spacing::SM,
+                        tokens::spacing::SM,
+                        tokens::spacing::SM,
+                        0.0,
+                    ))
+                    .content(content),
+                controls::divider(),
+                controls::row(false)
+                    .automation_name("Manage usage")
                     .on_click(context.message(Message::Shell(ShellMsg::SettingsPage(
                         settings_ui::Page::Usage,
                     ))))
-                    .content(controls::label("Open usage settings")),
-            );
-        Border::new()
-            .width(tokens::layout::USAGE_POPOVER_WIDTH)
-            .padding(Thickness::uniform(tokens::spacing::INSET))
-            .automation_name("Usage")
-            .content(
-                StackPanel::new().spacing(tokens::spacing::SM).children((
-                    header,
-                    StackPanel::new()
-                        .spacing(tokens::spacing::SM)
-                        .keyed_children(rows),
-                    footer,
-                )),
-            )
+                    .content(controls::row_content(
+                        None,
+                        "Manage usage",
+                        "",
+                        controls::icon(controls::glyph::CHEVRON_RIGHT),
+                    )),
+            ))
             .into()
+    }
+}
+
+/// A popover line: its name on the left (trimmed where narrow), its value
+/// at the end.
+fn line(name: TextBlock, value: TextBlock) -> View {
+    Grid::new()
+        .columns([GridLength::STAR, GridLength::Auto])
+        .column_spacing(tokens::spacing::SM)
+        .children((
+            name.vertical_alignment(VerticalAlignment::Center)
+                .text_trimming(TextTrimming::CharacterEllipsis),
+            value
+                .grid_column(1)
+                .vertical_alignment(VerticalAlignment::Center),
+        ))
+        .into()
+}
+
+/// A hold in a few words: "On hold until 19:27", or "On hold".
+pub(super) fn hold_line(hold: &eliot_core::ProviderHold, now: i64) -> String {
+    match hold.retry_after.or(hold.next_probe_at) {
+        Some(at) => format!("On hold until {}", clock(at, now)),
+        None => "On hold".to_owned(),
     }
 }
 
