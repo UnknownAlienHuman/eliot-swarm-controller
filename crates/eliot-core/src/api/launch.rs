@@ -2,6 +2,14 @@ use crate::{Error, Result, RoutingDecision};
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::{Map, Value};
 
+const SELECTOR_FIELDS: [&str; 5] = [
+    "model",
+    "effort",
+    "model_source",
+    "effort_source",
+    "daemon_model",
+];
+
 /// Launch selectors shared by the CLI, Router and Store. The original
 /// envelope remains authoritative for key presence, adapter extensions and
 /// the replay digest. Boundary validators still refuse malformed fields.
@@ -21,7 +29,7 @@ pub struct LaunchCommandArgs {
     pub harness: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
-    /// Owner-only model selector within the explicitly named saved profile.
+    /// Compatibility spelling for a named profile's launch model.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub profile_model: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -61,6 +69,90 @@ pub struct LaunchCommandArgs {
 }
 
 impl LaunchCommandArgs {
+    pub fn selected_model(&self) -> Option<&str> {
+        self.model.as_deref().or(self.profile_model.as_deref())
+    }
+
+    pub fn has_selection(&self) -> bool {
+        self.selected_model().is_some() || self.effort.is_some()
+    }
+
+    /// Recover the saved bounds for an explicit delegated selection.
+    pub fn restore_saved_selectors(snapshot: &mut Value) {
+        let Some(snapshot) = snapshot.as_object_mut() else {
+            return;
+        };
+        if let Some(Value::Object(mut saved)) = snapshot.remove("launch_selection") {
+            for key in SELECTOR_FIELDS {
+                snapshot.remove(key);
+                if let Some(value) = saved.remove(key) {
+                    snapshot.insert(key.to_owned(), value);
+                }
+            }
+        }
+    }
+
+    pub fn check_model_bound(saved: &Value, model: Option<&str>) -> Result<()> {
+        if let Some(model) = model
+            && !saved["launch_models"]
+                .as_array()
+                .is_some_and(|models| models.iter().any(|allowed| allowed.as_str() == Some(model)))
+        {
+            return Err(Error::new(
+                "model_outside_launch_bounds",
+                "requested model is outside the saved profile's launch_models",
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn check_delegated_selectors(&self, saved: &Value) -> Result<()> {
+        Self::check_model_bound(saved, self.selected_model())?;
+        if let Some(effort) = self.effort.as_deref()
+            && saved["effort"].as_str() != Some(effort)
+        {
+            return Err(Error::new(
+                "not_allowed",
+                "delegated launch effort must match the saved profile",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Freeze the selection while retaining the default selectors for children.
+    pub fn freeze_saved_selectors(&self, snapshot: &mut Value) {
+        if !self.has_selection() {
+            return;
+        }
+        let Some(snapshot) = snapshot.as_object_mut() else {
+            return;
+        };
+        let saved = SELECTOR_FIELDS
+            .into_iter()
+            .filter_map(|key| {
+                snapshot
+                    .get(key)
+                    .map(|value| (key.to_owned(), value.clone()))
+            })
+            .collect();
+        snapshot.insert("launch_selection".to_owned(), Value::Object(saved));
+        if let Some(model) = self.selected_model() {
+            snapshot.remove("daemon_model");
+            snapshot.insert("model".to_owned(), Value::String(model.to_owned()));
+            snapshot.insert(
+                "model_source".to_owned(),
+                Value::String("launch".to_owned()),
+            );
+        }
+        if let Some(effort) = &self.effort {
+            snapshot.insert("effort".to_owned(), Value::String(effort.clone()));
+            snapshot.insert(
+                "effort_source".to_owned(),
+                Value::String("launch".to_owned()),
+            );
+        }
+    }
+
     pub fn required_text<'a>(value: Option<&'a str>, field: &str) -> Result<&'a str> {
         value
             .filter(|text| !text.trim().is_empty())

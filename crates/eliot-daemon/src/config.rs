@@ -1862,17 +1862,6 @@ pub(crate) fn resolve_profile_cached(
     data_root: &Path,
     name: &str,
 ) -> core::Result<Value> {
-    resolve_profile_for_launch(cache, data_root, name, None)
-}
-
-/// Resolve the route and validate the explicit model against the same config
-/// revision. Cache only the unmodified preset for the next call.
-pub(crate) fn resolve_profile_for_launch(
-    cache: &Mutex<ProfileCache>,
-    data_root: &Path,
-    name: &str,
-    model: Option<&str>,
-) -> core::Result<Value> {
     validate_profile_name(name)?;
     let current_source = read_config_source(data_root)?;
     let current_revision = current_source.as_deref().map(profiles_edit::revision_of);
@@ -1888,7 +1877,7 @@ pub(crate) fn resolve_profile_for_launch(
                     Some(hit) => hit.clone(),
                     None => resolve_profile_in(config, &cached.source, name)?,
                 };
-                return select_launch_model(config, name, model, snapshot);
+                return Ok(snapshot);
             }
             return Err(core::Error::new(
                 "profile_error",
@@ -1913,17 +1902,16 @@ pub(crate) fn resolve_profile_for_launch(
     };
     let config = parse_config(&source)?;
     let snapshot = resolve_profile_in(&config, &source, name)?;
-    let selected = select_launch_model(&config, name, model, snapshot.clone())?;
     let mut guard = cache
         .lock()
         .map_err(|_| core::Error::new("internal", "profile cache poisoned"))?;
     match guard.cached.as_mut() {
         Some(cached) if cached.revision == current_revision => {
-            cached.snapshots.insert(name.to_owned(), snapshot);
+            cached.snapshots.insert(name.to_owned(), snapshot.clone());
         }
         _ => {
             let mut snapshots = HashMap::new();
-            snapshots.insert(name.to_owned(), snapshot);
+            snapshots.insert(name.to_owned(), snapshot.clone());
             guard.cached = Some(CachedProfileConfig {
                 revision: current_revision,
                 source,
@@ -1931,28 +1919,6 @@ pub(crate) fn resolve_profile_for_launch(
                 snapshots,
             });
         }
-    }
-    Ok(selected)
-}
-
-fn select_launch_model(
-    config: &FileConfig,
-    name: &str,
-    model: Option<&str>,
-    mut snapshot: Value,
-) -> core::Result<Value> {
-    if let Some(model) = model {
-        if !config
-            .profiles
-            .get(name)
-            .is_some_and(|profile| profile.get_ref().launch_models.iter().any(|id| id == model))
-        {
-            return Err(core::Error::new(
-                "model_outside_launch_bounds",
-                "requested model is outside the saved profile's launch_models",
-            ));
-        }
-        snapshot["model"] = json!(model);
     }
     Ok(snapshot)
 }
@@ -2708,6 +2674,12 @@ fn snapshot_from_entry(
         freeze_native_route(&native, &tail.pass_env, &mut snapshot).map_err(native_refusal)?;
     }
     validate_launch_models(site, &entry.launch_models, &native, harness, mapping.model)?;
+    if model.is_some() {
+        snapshot.insert("model_source".to_owned(), json!("profile"));
+    }
+    if !entry.launch_models.is_empty() {
+        snapshot.insert("launch_models".to_owned(), json!(entry.launch_models));
+    }
     let control = || validated_control(name, entry.control.as_deref(), source, table_offset);
     let early_control = mapping.control_before_mcp.then(control).transpose()?;
     freeze_mcp_policy(

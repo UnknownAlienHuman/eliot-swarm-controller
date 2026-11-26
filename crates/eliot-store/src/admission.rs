@@ -899,17 +899,57 @@ fn admit_launch_tx(
             ));
         }
     };
-    if let Some(model) = launch.profile_model.as_deref() {
-        if principal != "owner" || parent_link.is_some() {
+    let has_selection = launch.has_selection();
+    if let Some(parent) = parent_link
+        .as_ref()
+        .filter(|parent| parent.launched_by_agent)
+    {
+        if profile == parent.profile {
+            if (has_selection
+                || profile_snapshot.get("launch_selection").is_some()
+                || parent.profile_snapshot.get("launch_selection").is_some())
+                && profile_snapshot
+                    != hierarchy::inherited_launch_snapshot(&parent.profile_snapshot, &launch)?
+            {
+                return Err(Error::new(
+                    "not_allowed",
+                    "child launch selectors differ from its frozen delegated profile",
+                ));
+            }
+        } else if has_selection {
+            let mut saved = profile_snapshot.clone();
+            LaunchCommandArgs::restore_saved_selectors(&mut saved);
+            launch.check_delegated_selectors(&saved)?;
+        }
+    }
+    if (has_selection && profile_snapshot.get("launch_selection").is_some())
+        || launch.profile_model.is_some()
+        || (has_selection
+            && parent_link
+                .as_ref()
+                .is_some_and(|parent| parent.launched_by_agent))
+    {
+        if !(principal == "owner" && parent_link.is_none()
+            || parent_link
+                .as_ref()
+                .is_some_and(|parent| parent.launched_by_agent))
+        {
             return Err(Error::new(
                 "not_allowed",
-                "saved profile model selection requires a parentless Owner launch",
+                "saved launch selection requires a parentless Owner or an authorized Agent",
             ));
         }
-        if profile_snapshot.get("model").and_then(Value::as_str) != Some(model) {
+        if launch
+            .selected_model()
+            .is_some_and(|model| profile_snapshot["model"].as_str() != Some(model))
+            || launch
+                .effort
+                .as_deref()
+                .is_some_and(|effort| profile_snapshot["effort"].as_str() != Some(effort))
+        {
             return Err(Error::new(
                 "invalid",
-                "profile_model does not match the frozen launch model",
+                "launch selectors do not match the frozen profile",
             ));
         }
     }

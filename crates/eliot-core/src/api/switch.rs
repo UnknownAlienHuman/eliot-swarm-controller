@@ -38,16 +38,11 @@ impl SwitchLaunch {
             + usize::from(self.role.is_some())
             + usize::from(self.harness.is_some());
         if selectors != 1
+            || (self.role.is_some() && (self.model.is_some() || self.effort.is_some()))
             || (self.harness.is_none()
-                && [
-                    &self.model,
-                    &self.effort,
-                    &self.auth,
-                    &self.cmd,
-                    &self.access,
-                ]
-                .iter()
-                .any(|value| value.is_some()))
+                && [&self.auth, &self.cmd, &self.access]
+                    .iter()
+                    .any(|value| value.is_some()))
             || (self.base.is_some() && self.worktree.is_none())
             || [
                 &self.profile,

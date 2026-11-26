@@ -428,6 +428,8 @@ fn require_switch_caller(
     let launch = &request.launch;
     if request.from == *id
         || launch.harness.is_some()
+        || launch.model.is_some()
+        || launch.effort.is_some()
         || launch.project.is_some()
         || launch.workspace.is_some()
         || launch.worktree.is_some()

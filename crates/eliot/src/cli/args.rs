@@ -499,10 +499,13 @@ pub(crate) struct LaunchArgs {
     /// per-harness defaults plus --model/--effort/--auth. Owner-only.
     #[arg(long, value_name = "HARNESS")]
     pub(crate) harness: Option<String>,
-    /// Ad-hoc model ID, or an exact model from the named Owner profile's launch_models.
+    /// Ad-hoc model ID, or an exact model from the named profile's harness catalogue.
+    /// Agent callers can explicitly select only a model in the profile's launch_models.
+    /// Model selection is rejected for role and default-role launches.
     #[arg(long, value_name = "MODEL")]
     pub(crate) model: Option<String>,
-    /// Ad-hoc reasoning effort; omitted uses the harness native default.
+    /// Reasoning effort for an ad-hoc harness or a named profile. Omitted uses the
+    /// saved profile effort or the harness default. Role/default launches reject it.
     /// Codex, Muse and Claude (closed low|medium|high|xhigh|max) map effort,
     /// as does OpenCode (installed per-model variant ids); other harnesses
     /// reject it.
@@ -1109,9 +1112,11 @@ pub(crate) struct SwitchArgs {
     pub(crate) role: Option<String>,
     #[arg(long)]
     pub(crate) harness: Option<String>,
-    #[arg(long, requires = "harness")]
+    /// Model for the named profile or ad-hoc harness.
+    #[arg(long, conflicts_with = "role")]
     pub(crate) model: Option<String>,
-    #[arg(long, requires = "harness")]
+    /// Reasoning effort for the named profile or ad-hoc harness.
+    #[arg(long, conflicts_with = "role")]
     pub(crate) effort: Option<String>,
     #[arg(long, requires = "harness")]
     pub(crate) auth: Option<String>,

@@ -130,6 +130,7 @@ pub fn declaration() -> HarnessCapabilities {
         }),
         documentation_section: Some("docs/harnesses/claude-code.md#sources-and-unresolved-facts"),
         turn_history_readback: Some(eliot_core::api::harness::TurnHistoryReadback::HistoryFile),
+        turn_completed_reports_effective_model: true,
         configure_effort_refusal: Some(
             "Claude effort applies only at launch and cannot change mid-session (launch_only)",
         ),

@@ -402,6 +402,102 @@ impl Router {
         Ok(response)
     }
 
+    pub(super) async fn validate_named_launch_selection(
+        &self,
+        harness: &str,
+        profile: &str,
+        snapshot: &Value,
+        launch: &eliot_core::api::LaunchCommandArgs,
+        deadline: Instant,
+    ) -> Result<()> {
+        use eliot_core::api::harness::LaunchModelScope;
+        use eliot_core::api::native_profile::NativeProfileInput;
+
+        let model = launch.selected_model();
+        let effort = launch.effort.as_deref();
+        if model.is_none() && effort.is_none() {
+            return Ok(());
+        }
+        let capabilities = eliot_core::api::harness::ProfileCapabilities::of(harness);
+        let scope = capabilities.launch_model_scope;
+        if matches!(scope, LaunchModelScope::Unsupported) {
+            return Err(Error::new(
+                "unsupported",
+                "this harness does not support named launch model or effort selection",
+            ));
+        }
+        if launch.profile_model.is_some() {
+            // The compatibility field keeps its original saved-list bound.
+            eliot_core::api::LaunchCommandArgs::check_model_bound(
+                snapshot,
+                launch.profile_model.as_deref(),
+            )?;
+        }
+        if let Some(model) = model {
+            if let Some(validate) = capabilities.named_profile.and_then(|mapping| mapping.model) {
+                validate(model).map_err(|error| Error::new(error.code, error.reason))?;
+            }
+            if let LaunchModelScope::Check(stays_on_route) = scope {
+                let local = snapshot
+                    .get("local_provider")
+                    .cloned()
+                    .map(serde_json::from_value)
+                    .transpose()
+                    .map_err(|_| Error::new("profile_error", "invalid frozen local provider"))?;
+                let saved = NativeProfileInput {
+                    model: snapshot["model"].as_str(),
+                    local_provider: local.as_ref(),
+                    ..Default::default()
+                };
+                if !stays_on_route(&saved, model) {
+                    return Err(Error::new(
+                        "not_allowed",
+                        "requested model would change the saved provider route",
+                    ));
+                }
+            }
+        }
+        if let Some(effort) = effort {
+            crate::adhoc::validate_adhoc_effort(harness, effort)?;
+        }
+        // Use the existing verified profile-scoped read. The Codex metadata
+        // reader strips the route credential and the cache binds the route.
+        let catalogue = self
+            .launch_catalogue(harness, snapshot.clone(), profile, deadline)
+            .await?;
+        let effective_model = model
+            .or_else(|| snapshot["model"].as_str())
+            .or(catalogue.default.as_deref());
+        if catalogue.catalogue == "aliases" {
+            return Err(Error::new(
+                "unavailable",
+                "the saved profile's native catalogue could not be verified",
+            ));
+        }
+        let entry = catalogue
+            .models
+            .iter()
+            .find(|entry| Some(entry.id.as_str()) == effective_model)
+            .ok_or_else(|| {
+                Error::new(
+                    "unknown_model",
+                    "selected model is absent from the saved profile's catalogue",
+                )
+            })?;
+        if let Some(effort) = effort
+            && !entry
+                .efforts
+                .as_ref()
+                .is_some_and(|efforts| efforts.iter().any(|allowed| allowed == effort))
+        {
+            return Err(Error::new(
+                "unsupported_effort",
+                "selected effort is absent from the model's catalogue entry",
+            ));
+        }
+        Ok(())
+    }
+
     pub(super) async fn launch_catalogue(
         &self,
         harness: &str,

@@ -1884,35 +1884,37 @@ removed from command arguments. The final source excerpt may be shorter to leave
 for the primary instruction and frozen Owner rules.
 
 A parentless Owner launch names a stored `profile`, requests the configured default
-by omitting profile/harness, or names an ad-hoc
-`harness` (mutually exclusive); `model`/`effort`/`cmd`/`auth` are ad-hoc
-only and require `harness` (`cmd` pins the native executable, e.g. a Muse
-binary version the launcher no longer marks current; OpenCode-only `auth`
-pins the native auth integration, defaulting to the model provider prefix
-when the native auth list holds exactly that id). Ad-hoc launch is
-Owner-only and freezes a profile-equivalent
-snapshot from built-in safe defaults plus flags (see
-[configuration](configuration.md#ad-hoc-owner-launch-no-stored-profile));
-Agent principals keep the profile and `child_profiles` rules and cannot
-ad-hoc launch. Same-ID retries bind the exact requested payload: a changed
-ad-hoc model is `id_conflict`, while the frozen snapshot stays replay-stable.
+by omitting profile and harness, or names an ad-hoc `harness` (mutually exclusive).
+`cmd` and `auth` require an ad-hoc harness. `cmd` pins the native executable.
+OpenCode's `auth` pins the integration and defaults to the model's provider prefix
+when the native auth list holds exactly that ID. Ad-hoc launch is Owner-only and
+freezes a profile-equivalent snapshot from the built-in defaults and supplied flags.
+See [ad-hoc configuration](configuration.md#ad-hoc-owner-launch-no-stored-profile).
 
-An Owner may select a saved route and one of its approved models with
-`swarm launch --profile P --model M`. The API sends `args.profile = P`
-and `args.profile_model = M`; `args.model` still denotes an ad-hoc
-selection. The saved profile's `launch_models` list must contain the exact
-ID. A selection outside that bound returns `model_outside_launch_bounds`
-before admission. This selection is only for parentless Owner launches.
-The profile's route, credentials, effort, permissions and delegation remain
-the source of authority. A caller cannot combine it with a role, harness
-or native overrides.
+For an explicitly named saved profile, `swarm launch --profile P --model M --effort E`
+sends `args.profile`, `args.model` and `args.effort`. Both selectors are optional.
+Admission checks the exact selected model against the saved route's harness catalogue
+and validates explicit effort against the adapter and the catalogue entry. The Claude
+catalogue accepts both reported aliases and their native resolved IDs.
+A model outside the catalogue returns `unknown_model`. The existing `args.profile_model`
+spelling still requires membership in the profile's `launch_models` list. Send a
+single model field.
 
-`profile.list` exposes each valid profile's permitted launch models.
-`command.get` retains the request's `profile` and `profile_model` plus the
-selected model in the frozen launch snapshot. `agent.get` reports that
-frozen profile and the effective native model when observed. An exact
-same-ID retry uses the retained profile and selection. A changed selection
-under that ID returns `id_conflict`.
+An authenticated Agent can select a model for its own child within the selected profile's
+frozen `launch_models` list and the existing `child_profiles` and control rules.
+An out-of-bounds request returns `model_outside_launch_bounds`. An Agent may
+specify the saved effort exactly. A child that reuses its parent's snapshot
+without explicit selectors inherits the frozen model and effort, including
+launch overrides. An explicit child selection starts from the saved profile
+selectors. Owner selection requires a parentless launch. Route, executable and
+other native overrides cannot accompany a named selection.
+
+`swarm show` and `agent.get` report the frozen model and its provenance in
+`profile_snapshot.model` and `profile_snapshot.model_source` (`launch` or `profile`)
+alongside the native effective model when observed. `command.get` retains the
+request and the frozen selection. Resume uses the retained generation snapshot.
+An exact same-ID retry reuses the retained admission. A changed selector under
+that ID returns `id_conflict`.
 
 Without `worktree`, `workspace` remains the existing execution directory. With it,
 `workspace` names the source repository; the daemon chooses the managed destination.
@@ -2558,6 +2560,14 @@ workspace/worktree/base overrides still use normal launch validation. The route
 preserves A's project authorization scope for handoff. The new Agent records the
 registration resolved from its workspace. No launch prompt or parent override is accepted.
 
+A switch reusing its source's preset carries each frozen launch override into
+the successor unless the Owner supplies that selector. An explicit Owner switch
+to a different named profile of the same harness also carries the overrides,
+subject to the destination catalogue and route. A routed or delegated switch to
+a different preset uses that preset's selectors. Cross-harness switches use the
+destination harness's selectors. Handoff to an already-created Agent uses its
+existing configuration.
+
 The immediate reply is the retained reservation, not proof of launch or transfer.
 Use `swarm.wait` on the switch ID or retry that same ID for component readback.
 The independent operation reserves launch/Handoff IDs before external preparation,
@@ -2572,7 +2582,7 @@ during drain; it never launches another B or repeats work. See
 [Coordination](coordination.md#agent-switch-implemented) for crash/boundary semantics.
 
 ```text
-swarm [--id ULID] switch A --generation N [--task-command COMMAND] [SEND_ID...] --profile PROFILE
+swarm [--id ULID] switch A --generation N [--task-command COMMAND] [SEND_ID...] --profile PROFILE [--model MODEL] [--effort EFFORT]
 swarm [--id ULID] switch A --generation N [--task-command COMMAND] [SEND_ID...] --harness HARNESS [--model MODEL] [--effort EFFORT] [--auth INTEGRATION] [--cmd PATH]
 ```
 
@@ -3878,7 +3888,7 @@ swarm cleanup apply-all [--scope all|project] [--project PROJECT] [--older-than 
 swarm cleanup status <ID>
 swarm artifact register <PATH> --kind build|data_dir|temp|other --purpose TEXT [--ttl DURATION]
 swarm artifact reconcile <ARTIFACT_ID> [--release-custody REASON]
-swarm launch [--profile P | --role R | --harness H] --workspace PATH [--worktree BRANCH [--base REF]] [--parent AGENT] [--source PATH]... [--no-policy REASON] [--goal-json JSON_OBJECT] [PROMPT] [--queue] [--wait] [--timeout-seconds N]
+swarm launch [--profile P | --role R | --harness H] [--model M] [--effort E] --workspace PATH [--worktree BRANCH [--base REF]] [--parent AGENT] [--source PATH]... [--no-policy REASON] [--goal-json JSON_OBJECT] [PROMPT] [--queue] [--wait] [--timeout-seconds N]
 swarm launch [--workspace PATH | --chat] [--parent AGENT] [--no-policy REASON] [--goal-json JSON_OBJECT] [PROMPT] [--queue] [--wait] [--timeout-seconds N]
 swarm settings read
 swarm settings save FILE [--dry-run]

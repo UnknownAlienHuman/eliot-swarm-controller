@@ -209,6 +209,16 @@ pub(crate) async fn run_show(
                 println!("Policy opt-out: {reason}");
             }
             println!("Harness/profile: {}/{}", agent.harness, agent.profile);
+            if let Some(model) = agent.profile_snapshot["model"].as_str() {
+                let source = agent.profile_snapshot["model_source"]
+                    .as_str()
+                    .or_else(|| (!agent.profile.is_empty()).then_some("profile"));
+                if let Some(source) = source {
+                    println!("Launch model: {model} (source: {source})");
+                } else {
+                    println!("Launch model: {model}");
+                }
+            }
             if let Some(effective) = &agent.effective
                 && let Some(model) = effective["model"].as_str()
             {

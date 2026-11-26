@@ -7,6 +7,7 @@ use serde_json::{Map, Value};
 
 /// Typed vendor-facing part of a named profile. The daemon retains the
 /// source location and validates all shared fields.
+#[derive(Default)]
 pub struct NativeProfileInput<'a> {
     pub model: Option<&'a str>,
     pub effort: Option<&'a str>,

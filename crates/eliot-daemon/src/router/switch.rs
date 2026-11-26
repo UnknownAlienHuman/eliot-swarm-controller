@@ -37,6 +37,34 @@ fn reuse_source_checkout(launch: &eliot_core::api::SwitchLaunch) -> bool {
     launch.workspace.is_none() && launch.worktree.is_none()
 }
 
+/// Carry selectors from the source generation without copying route authority.
+pub(super) fn carry_launch_selection(
+    args: &mut Value,
+    routing: super::routing::LaunchRouting<'_>,
+    harness: &str,
+    profile: &str,
+) -> Result<LaunchCommandArgs> {
+    if let Some(source) = routing.switch_source
+        && source.harness == harness
+        && (source.profile == profile || routing.switch_allows_other_profiles)
+    {
+        let snapshot = &source.profile_snapshot;
+        let previous_effort = snapshot["launch_selection"].get("effort");
+        let explicit_effort = snapshot["effort_source"] == "launch"
+            || (snapshot["launch_selection"].is_object()
+                && snapshot.get("effort") != previous_effort);
+        for (key, selected) in [
+            ("model", snapshot["model_source"] == "launch"),
+            ("effort", explicit_effort),
+        ] {
+            if selected && args.get(key).is_none() && snapshot[key].is_string() {
+                args[key] = snapshot[key].clone();
+            }
+        }
+    }
+    LaunchCommandArgs::read(args)
+}
+
 /// Whether a switch with no workspace override reuses the retained
 /// checkout: a freshly prepared worktree would leave the source's
 /// uncommitted edits behind in the old directory. Only an automatically
@@ -556,6 +584,11 @@ impl Router {
                         provider_source: (provider_failure.is_some()
                             || profile_authority.is_some())
                         .then_some(&source.profile_snapshot),
+                        switch_source: Some(&source),
+                        switch_allows_other_profiles: requested_by.is_none()
+                            && provider_route.is_none()
+                            && profile_authority.is_none()
+                            && request.launch.profile.is_some(),
                         growth_switch: profile_authority.is_some(),
                         ..Default::default()
                     },
