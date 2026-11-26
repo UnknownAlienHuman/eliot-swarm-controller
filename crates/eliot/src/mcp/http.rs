@@ -351,8 +351,14 @@ async fn serve_mcp(
         .await
     {
         Ok(verified) => verified,
-        Err(status) => return rejected(status),
+        Err(rejection) => {
+            state
+                .auth
+                .log_rejection(rejection, cf_ray(request.headers()), None);
+            return rejected(rejection.status());
+        }
     };
+    let ray = cf_ray(request.headers()).map(str::to_owned);
     request.extensions_mut().insert(verified.clone());
     use tower_service::Service as _;
     let mut service = state.service;
@@ -368,12 +374,17 @@ async fn serve_mcp(
     }
     match service.call(request).await {
         Ok(response) => {
-            if let Err(status) = state
+            if let Err(rejection) = state
                 .auth
                 .finish(&verified, &method, response.status(), response.headers())
                 .await
             {
-                return rejected(status);
+                state.auth.log_rejection(
+                    rejection,
+                    ray.as_deref(),
+                    Some(&verified.context.call_id),
+                );
+                return rejected(rejection.status());
             }
             // A persistent GET stream must not outlive the credential that
             // authorized that HTTP request, even if its MCP session survives.
@@ -389,6 +400,23 @@ async fn serve_mcp(
         }
         Err(error) => match error {},
     }
+}
+
+fn cf_ray(headers: &axum::http::HeaderMap) -> Option<&str> {
+    let mut rays = headers.get_all("cf-ray").iter();
+    let ray = rays.next()?.to_str().ok()?;
+    if rays.next().is_some() {
+        return None;
+    }
+    let (id, location) = ray
+        .split_once('-')
+        .map_or((ray, None), |(id, location)| (id, Some(location)));
+    (id.len() == 16
+        && id.bytes().all(|byte| byte.is_ascii_hexdigit())
+        && location.is_none_or(|location| {
+            location.len() == 3 && location.bytes().all(|byte| byte.is_ascii_uppercase())
+        }))
+    .then_some(ray)
 }
 
 fn rejected(status: axum::http::StatusCode) -> Response<axum::body::Body> {

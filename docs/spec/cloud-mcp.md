@@ -76,12 +76,19 @@ Cached signing keys are usable only before their validity deadline. Refresh atte
 serialize independently from cache reads; callers recheck the cache after acquiring
 the refresh lock, and the lock is held for at most 10 seconds including the HTTP
 fetch. The key-state lock is released before waiting for or performing a refresh. A
-successful fetch replaces the key set and its validity deadline together. A failed,
-canceled or timed-out refresh leaves the prior set and validity deadline unchanged,
-but expired keys are never used. The 30-second retry backoff remains in effect.
-Verification that attempts a failed refresh returns service unavailable. When the
-cache is expired, verification during the retry backoff also returns service
-unavailable.
+successful fetch replaces the key set and its validity deadline together. An
+absent `kid` requires a refresh even while the prior set is fresh. A failed,
+canceled or timed-out refresh leaves the prior set and validity deadline unchanged
+and returns HTTP 503. During the 30-second backoff, requests requiring a refresh
+also receive HTTP 503. A known key in a fresh set remains usable during backoff.
+A successful refresh that lacks the requested `kid` returns HTTP 401.
+
+Origin-auth rejections emit one JSON diagnostic on the HTTP process's stderr per
+reason per 10 seconds. Managed service status exposes the bounded, redacted HTTP
+stderr tail while the child is running. Records carry a Unix timestamp in
+milliseconds, HTTP status, fixed reason code and, when available, a format-checked
+Cloudflare Ray ID or a Swarm-generated request ID. Assertions, credentials,
+claim values, host and account names, and upstream error text are excluded.
 
 The module owns exactly these two children. It never discovers, adopts, signals,
 or stops a pre-existing `mcp-bridge` or other tunnel. HTTP stdin stays open

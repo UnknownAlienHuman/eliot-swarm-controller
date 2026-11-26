@@ -10,7 +10,7 @@ use eliot_core::{
     api::{CloudMcpCustody, CloudMcpHealth, CloudMcpStatus},
 };
 use eliot_plugin::{
-    StderrCapture,
+    StderrCapture, StderrView,
     protocol::{MAX_MCP_HTTP_READY_BYTES, McpHttpReady},
     spawn_stderr,
     sync::LockExt,
@@ -63,11 +63,27 @@ pub struct CloudMcpConfig {
 /// Core's typed daemon-status view is also this module's current snapshot.
 pub type CloudMcpSnapshot = CloudMcpStatus;
 
-static CURRENT: OnceLock<Mutex<Option<CloudMcpSnapshot>>> = OnceLock::new();
+#[derive(Default)]
+struct CurrentStatus {
+    snapshot: Option<CloudMcpSnapshot>,
+    http_stderr: Option<StderrView>,
+}
+
+static CURRENT: OnceLock<Mutex<CurrentStatus>> = OnceLock::new();
 
 /// Return the latest in-memory cloud service status, if it has been started.
 pub fn service_snapshot() -> Option<CloudMcpSnapshot> {
-    current_slot().lock_recover().clone()
+    let (mut snapshot, stderr) = {
+        let current = current_slot().lock_recover();
+        (current.snapshot.clone()?, current.http_stderr.clone())
+    };
+    if let Some(stderr) = stderr {
+        let tail = stderr.snapshot();
+        if !tail.text.is_empty() || tail.read_error {
+            snapshot.http_stderr = Some(tail);
+        }
+    }
+    Some(snapshot)
 }
 
 /// Supervise the HTTP MCP child and its dedicated `cloudflared` tunnel.
@@ -126,6 +142,7 @@ async fn supervise(
             "managed MCP stderr pipe is unavailable",
         ));
     };
+    current_slot().lock_recover().http_stderr = Some(http_stderr.view());
     let Some(http_stdin) = http.take_stdin() else {
         settle_child(&mut http, None, false, false).await?;
         let tail = http_stderr.view().snapshot();
@@ -705,8 +722,8 @@ fn combine_cleanup(first: Result<()>, second: Result<()>) -> Result<()> {
     }
 }
 
-fn current_slot() -> &'static Mutex<Option<CloudMcpSnapshot>> {
-    CURRENT.get_or_init(|| Mutex::new(None))
+fn current_slot() -> &'static Mutex<CurrentStatus> {
+    CURRENT.get_or_init(Mutex::default)
 }
 
 struct StatusGuard {
@@ -716,7 +733,7 @@ struct StatusGuard {
 impl StatusGuard {
     fn begin(snapshot: CloudMcpSnapshot) -> Result<Self> {
         let mut current = current_slot().lock_recover();
-        if current.as_ref().is_some_and(|snapshot| {
+        if current.snapshot.as_ref().is_some_and(|snapshot| {
             matches!(
                 snapshot.health,
                 CloudMcpHealth::StartingHttp
@@ -730,30 +747,35 @@ impl StatusGuard {
                 "a cloud MCP runtime is already active",
             ));
         }
-        *current = Some(snapshot);
+        *current = CurrentStatus {
+            snapshot: Some(snapshot),
+            http_stderr: None,
+        };
         Ok(Self { completed: false })
     }
 
     fn set(&self, health: CloudMcpHealth) {
-        if let Some(snapshot) = current_slot().lock_recover().as_mut() {
+        if let Some(snapshot) = current_slot().lock_recover().snapshot.as_mut() {
             snapshot.health = health;
         }
     }
 
     fn set_custody(&self, custody: CloudMcpCustody) {
-        if let Some(snapshot) = current_slot().lock_recover().as_mut() {
+        if let Some(snapshot) = current_slot().lock_recover().snapshot.as_mut() {
             snapshot.custody = custody;
         }
     }
 
     fn set_http_stderr(&self, snapshot: StderrSnapshot) {
-        if let Some(status) = current_slot().lock_recover().as_mut() {
+        let mut current = current_slot().lock_recover();
+        current.http_stderr = None;
+        if let Some(status) = current.snapshot.as_mut() {
             status.http_stderr = Some(snapshot);
         }
     }
 
     fn set_tunnel_stderr(&self, snapshot: StderrSnapshot) {
-        if let Some(status) = current_slot().lock_recover().as_mut() {
+        if let Some(status) = current_slot().lock_recover().snapshot.as_mut() {
             status.tunnel_stderr = Some(snapshot);
         }
     }
@@ -767,7 +789,7 @@ impl StatusGuard {
 impl Drop for StatusGuard {
     fn drop(&mut self) {
         if !self.completed
-            && let Some(snapshot) = current_slot().lock_recover().as_mut()
+            && let Some(snapshot) = current_slot().lock_recover().snapshot.as_mut()
         {
             snapshot.health = CloudMcpHealth::Failed;
         }

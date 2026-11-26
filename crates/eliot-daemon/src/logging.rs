@@ -136,6 +136,39 @@ pub(crate) fn record(
     write_record(policy, code, ids, None, None, error)
 }
 
+/// The HTTP origin is a separate process. Its stderr is drained by the managed
+/// supervisor, or by the operator for a manual HTTP listener.
+pub fn log_origin_rejection(
+    status: u16,
+    reason: &'static str,
+    ray: Option<&str>,
+    call_id: Option<&str>,
+) {
+    let mut detail = Map::from_iter([
+        ("status".to_owned(), json!(status)),
+        ("reason".to_owned(), json!(reason)),
+    ]);
+    if let Some(ray) = ray {
+        detail.insert("cf_ray".to_owned(), json!(ray));
+    }
+    let id = ("request_id", call_id.unwrap_or_default());
+    let ids = if call_id.is_some() {
+        std::slice::from_ref(&id)
+    } else {
+        &[]
+    };
+    if let Some(bytes) = encode_record(
+        &SecretPolicy::default(),
+        "mcp.origin.reject",
+        ids,
+        None,
+        Some(detail),
+        None,
+    ) {
+        let _ = std::io::stderr().lock().write_all(&bytes);
+    }
+}
+
 pub(crate) fn record_liveness_stuck(policy: &SecretPolicy, subject: &str, reason: &str) {
     let detail = Map::from_iter([
         (

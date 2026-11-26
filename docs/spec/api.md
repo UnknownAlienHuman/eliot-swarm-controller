@@ -374,12 +374,15 @@ The deployment is an owner-only Access app. Every origin POST/GET/DELETE validat
 the signed `Cf-Access-Jwt-Assertion` before MCP initialization or SDK dispatch.
 Managed OAuth's opaque client access token is not that assertion. The verifier uses
 the configured team issuer, fixed team signing-key endpoint, application AUD, RS256
-signature, expiry/not-before, application-token type and nonempty subject. Missing
-or invalid authentication is refused; key lookup failure fails closed. A local
-cloud-access snapshot load failure fails closed with 503 (retryable local
-outage); token, issuer and audience mismatches, and team or owner-audience
-changes, stay 401. Manual HTTP
-requires the same `[cloud_mcp]` Access configuration; stdio/local IPC are unchanged.
+signature, expiry/not-before, application-token type and nonempty subject. Key
+fetch failures, lookups requiring refresh during backoff, and local cloud-access
+snapshot load failures fail closed with HTTP 503 (retryable local outage). A
+successful refresh that lacks the requested key, invalid authentication, and
+changes to the pinned team or owner audience return HTTP 401. Origin-auth
+rejections emit rate-limited structured diagnostics as described in the
+[cloud MCP runtime spec](cloud-mcp.md#boundary).
+Manual HTTP requires the same `[cloud_mcp]` Access configuration. Stdio and local
+IPC are unchanged.
 Host/Origin checks and cloudflared's own JWT validation remain additional checks.
 
 Credential headers are stripped before request parts enter SDK extensions. The
