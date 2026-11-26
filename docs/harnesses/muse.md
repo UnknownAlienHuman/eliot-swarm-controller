@@ -133,6 +133,34 @@ manual result for the latest completed turn queues the task card for the next
 input; an exact active-turn result remains bound to that turn. Context usage
 changes alone are never treated as compaction.
 
+### Task cards after compaction (A12)
+
+On 2026-11-26, a private Windows stand ran Muse Code 1.4.25-R9361.1 with the
+`muse` profile under the stand Owner principal. Native model completions
+named `muse-spark-1.3-contributor`. Swarm retained `provider did not name a model`,
+so the served model stayed unverified.
+
+Swarm's Muse adapter has no manual compact verb. The automatic-compaction
+probe set `context_compaction.soft_threshold = 0.006` and
+`hard_threshold = 0.012` in private Muse settings. The installed CLI
+recognized both settings during defaults validation. Four real turns
+completed on `a2#1` at sequences 76, 146, 220 and 305. The largest retained
+context sample was 51,517 tokens at 221. The native session log contained no
+compaction event and the bus contained no `session.context.compacted`.
+The follow-up at 305 returned `NO_TASK_CARD`.
+
+A fresh launch with explicit `summary-preserved-suffix/v1` and thresholds
+0.002 and 0.004 returned native `session/start` error `-32603` before the model
+turn. Swarm retained the launch as unknown at 268. Automatic task-card
+delivery on Muse remains unverified.
+
+The Swarm binary built from `4712d473f0f2c65d8299dfee5072c95005efeb4e`
+had SHA-256 `ecc3b3a180feb7371ffa62655d444c4cbb3aa266ee777e29902edf15d9e5d374`.
+The Muse executable had SHA-256
+`eb03512b06982dd02481fcf5f090442824d92ff6070607afe5c7228596f3b089`.
+
+### Model selection
+
 The Muse 1.4.25 MSP schema documents that an omitted `session/setModel`
 `profileId` means no profile. In #949, the retained Contributor selector
 lost its `tbh` route and the provider answered with the ordinary model.
