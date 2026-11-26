@@ -129,7 +129,7 @@ pub fn check_changes(callback: Callback<bool>) -> impl Fn(Option<bool>) + 'stati
 /// A code block's font: the system monospace face, Cascadia Mono, then
 /// Consolas where it is missing. Set on the code `TextBlock` alone; no
 /// application font key changes.
-const CODE_FONT: &str = "Cascadia Mono, Consolas";
+pub(crate) const CODE_FONT: &str = "Cascadia Mono, Consolas";
 
 /// One display block, ready for the UI thread.
 #[derive(Clone)]

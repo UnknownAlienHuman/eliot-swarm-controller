@@ -3434,7 +3434,9 @@ paths and Git modes. Untracked additions use the current complete `agent.git`
 file observation. Missing observation coverage or any output limit sets
 `truncated`. Core bounds the returned text to 256 KiB, 100 files and 1,000
 hunks. The daemon starts at most one owned Git process per call with a
-five-second deadline and bounded cleanup. The desktop reads on open or Refresh.
+five-second deadline and bounded cleanup. The desktop reads the chosen source on
+open, on a source change, when the Agent's run or Git work changes, and on Refresh;
+a selected file whose patch that read cut is read alone, with its path, once.
 The CLI text view escapes terminal control characters except tabs and newlines.
 
 `who` composes existing L3 projections per current worker: the roster

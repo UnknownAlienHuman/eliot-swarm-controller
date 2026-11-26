@@ -146,6 +146,7 @@ checked! {
     eliot_core::api::SettingsSaveRequest => eliot_core::api::SettingsSaveResponse, "settings.save";
     eliot_core::api::AgentGitRequest => eliot_core::api::AgentGitResponse, "agent.git";
     eliot_core::api::AgentPatchDigestRequest => eliot_core::api::AgentPatchDigestResponse, "agent.patch_digest";
+    eliot_core::api::AgentDiffRequest => eliot_core::api::AgentDiffResponse, "agent.diff";
     eliot_core::api::AgentProcessesRequest => eliot_core::api::AgentProcessesResponse, "agent.processes";
     eliot_core::api::MailInboxRequest => eliot_core::api::MailInboxResponse, "mail.inbox";
     eliot_core::api::GoalSetRequest => eliot_core::api::GoalView, "goal.set";
@@ -1830,6 +1831,16 @@ pub async fn patch_digest(
     };
     let reply: eliot_core::api::AgentPatchDigestResponse = call(data_dir, &request).await?;
     Ok(reply)
+}
+
+/// One bounded unified patch of an Agent's current workspace for Changes
+/// (`agent.diff`): the source's files, or one literal path in it; with a
+/// generation, the read refuses a newer run (`stale_generation`).
+pub async fn agent_diff(
+    data_dir: &Path,
+    request: &eliot_core::api::AgentDiffRequest,
+) -> Result<eliot_core::api::AgentDiffResponse> {
+    call(data_dir, request).await
 }
 
 /// The first page of an Agent's scoped process records (`agent.processes`),

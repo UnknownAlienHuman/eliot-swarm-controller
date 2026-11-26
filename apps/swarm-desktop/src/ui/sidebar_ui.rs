@@ -900,9 +900,12 @@ fn agent_row(task: &TaskEntry, input: &SidebarInput, context: &mut ViewContext<S
         name.push_str(&format!(", {words}"));
     }
     let (mark, word) = task_look(task);
-    // A working row's static mark is named on screen by its tooltip.
-    let line =
-        line.or_else(|| (mark == Some(controls::RowMark::Working)).then(|| "Working".to_owned()));
+    // A working or idle row's static mark is named on screen by its tooltip.
+    let line = line.or_else(|| match mark {
+        Some(controls::RowMark::Working) => Some("Working".to_owned()),
+        Some(controls::RowMark::Idle) => Some("Ready".to_owned()),
+        _ => None,
+    });
     let diff = agent
         .work
         .as_deref()

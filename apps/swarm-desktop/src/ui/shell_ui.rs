@@ -1021,21 +1021,25 @@ impl DesktopApp {
             // A handle reports once, when its drag or key press ends (its
             // steps re-render only SplitShell, never the sliders); a
             // Settings slider reports every value it shows, the one a save
-            // just gave it too. Only a width other than the saved one is
+            // just gave it too. Both report the shown widths (Wide's 720
+            // stays unsaved). Only a width other than the saved one is
             // saved.
-            ShellMsg::PanelsResized(widths)
-                if widths != split_ui::PanelWidths::of(self.prefs.panels) =>
-            {
-                self.prefs.panels = Some(widths.saved());
-                self.prefs_rev += 1;
-                self.save_preferences(context);
+            ShellMsg::PanelsResized(widths) => {
+                let widths = self.saved_widths(widths);
+                if widths != split_ui::PanelWidths::of(self.prefs.panels) {
+                    self.prefs.panels = Some(widths.saved());
+                    self.prefs_rev += 1;
+                    self.save_preferences(context);
+                }
             }
-            ShellMsg::PanelsReset if self.prefs.panels.is_some() => {
-                self.prefs.panels = None;
-                self.prefs_rev += 1;
-                self.save_preferences(context);
+            ShellMsg::PanelsReset => {
+                self.pane.wide = false;
+                if self.prefs.panels.is_some() {
+                    self.prefs.panels = None;
+                    self.prefs_rev += 1;
+                    self.save_preferences(context);
+                }
             }
-            ShellMsg::PanelsResized(_) | ShellMsg::PanelsReset => {}
             ShellMsg::OverlayClosed => self.nav.overlay_open = false,
             // The list reports the value it shows when it is built: only a
             // change saves. WinUI redraws in the new theme by itself.
@@ -2547,7 +2551,7 @@ impl DesktopApp {
             main: split_ui::Built::new(main),
             pane: pane.map(split_ui::Built::new),
             over: !self.pane_docked(),
-            widths: split_ui::PanelWidths::of(self.prefs.panels),
+            widths: self.panel_widths(),
             on_layout: context.callback(|layout| Message::Shell(ShellMsg::Layout(layout))),
             on_widths: context.callback(|widths| Message::Shell(ShellMsg::PanelsResized(widths))),
             on_overlay_closed: context.callback(|_: bool| Message::Shell(ShellMsg::OverlayClosed)),

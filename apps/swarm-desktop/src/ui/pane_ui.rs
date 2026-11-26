@@ -4,35 +4,39 @@
 //! toggles and Close, inside the main card.
 //!
 //! Reads (the Owner watches daemon load): a tab reads only while the pane
-//! shows it, and nothing reads on render. Changes reads `agent.git` and
-//! `agent.patch_digest` when it opens, when the open task changes and on
-//! Refresh; the Terminal tab reads `agent.processes` the same way. Agents
-//! and Details ride the Monitor's refresh chain, which follows
-//! `events.wait` on their Agents' fleet events as the Agents page does.
-//! Every read waits while the window is minimized.
-//!
-//! The daemon has no diff-text read (skeleton 9.2): Changes shows the
-//! digest and the files, and says why the diff is not there.
+//! shows it, and nothing reads on render. Changes reads `agent.git`,
+//! `agent.patch_digest` and the chosen source's bounded `agent.diff` when
+//! it opens, when the open task or the source changes, when the open
+//! Agent's run or Git work changes (and, on Last turn, its last finished
+//! turn) and on Refresh. A selected file whose patch that read cut is read
+//! alone (`agent.diff` with its path), once. The Terminal tab reads
+//! `agent.processes` on open, task change and Refresh. Agents and Details
+//! ride the Monitor's refresh chain, which follows `events.wait` on their
+//! Agents' fleet events as the Agents page does. Every read waits while the
+//! window is minimized.
 
 use std::collections::HashSet;
+use std::sync::Arc;
 
 use eliot_core::api::{
-    AgentGitResponse, AgentPatchDigestResponse, AgentProcessesResponse, GitIntegrateOutcome,
-    GitIntegrateStatus, GitView,
+    AgentDiffRequest, AgentDiffResponse, AgentGitResponse, AgentPatchDigestResponse,
+    AgentProcessesResponse, GitDiffFile, GitDiffSource, GitIntegrateOutcome, GitIntegrateStatus,
+    GitView, MAX_DIFF_TEXT_BYTES, MAX_DIFF_TEXT_FILES, MAX_DIFF_TEXT_HUNKS,
 };
 
 use super::*;
 use crate::monitor::MonitorRow;
 
-/// What Changes compares (`.group` Compare).
+/// What Changes compares (brand book §11.1, `agent.diff` source).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) enum Source {
-    /// The worktree against its HEAD.
+    /// HEAD to the worktree, staged and unstaged.
     Uncommitted,
-    /// The task's branch and worktree against the task's base.
+    /// The recorded base to the current workspace.
     #[default]
     Branch,
-    /// The files the last finished turn reported editing.
+    /// The current patch of the files the last completed turn reported:
+    /// not a historical patch of that turn alone.
     LastTurn,
 }
 
@@ -46,6 +50,77 @@ impl Source {
             Self::LastTurn => "Last turn",
         }
     }
+
+    /// Its meaning under the current API (§11.1's table), as its tooltip.
+    fn meaning(self) -> &'static str {
+        match self {
+            Self::Uncommitted => "HEAD to the worktree, staged and unstaged changes",
+            Self::Branch => "The recorded base to the current workspace",
+            Self::LastTurn => "Current changes in files reported by the last completed turn",
+        }
+    }
+
+    fn wire(self) -> GitDiffSource {
+        match self {
+            Self::Uncommitted => GitDiffSource::Uncommitted,
+            Self::Branch => GitDiffSource::Branch,
+            Self::LastTurn => GitDiffSource::LastTurn,
+        }
+    }
+}
+
+/// One `agent.diff` reply, each file's patch parsed off the UI thread
+/// (`parsed` in `reply.files` order).
+#[derive(Clone, Debug)]
+pub(super) struct Diff {
+    reply: AgentDiffResponse,
+    parsed: Vec<Arc<diff_ui::Parsed>>,
+}
+
+impl Diff {
+    /// The read of `source` of `agent`: one literal `path` in it when
+    /// given; with `generation`, that run only.
+    fn request(
+        agent: &str,
+        generation: Option<i64>,
+        source: Source,
+        path: Option<String>,
+    ) -> AgentDiffRequest {
+        AgentDiffRequest {
+            id: agent.to_owned(),
+            generation,
+            source: source.wire(),
+            path,
+        }
+    }
+
+    fn of(reply: AgentDiffResponse) -> Self {
+        let parsed = reply
+            .files
+            .iter()
+            .map(|file| Arc::new(diff_ui::parse(file)))
+            .collect();
+        Self { reply, parsed }
+    }
+
+    fn file(&self, path: &str) -> Option<(&GitDiffFile, &Arc<diff_ui::Parsed>)> {
+        self.reply
+            .files
+            .iter()
+            .zip(&self.parsed)
+            .find(|(file, _)| file.path == path)
+    }
+}
+
+/// What reads Changes again when it changes: the open Agent's run and its
+/// Git work, and on Last turn its last finished turn.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(super) struct WorkStamp {
+    generation: Option<i64>,
+    /// The row's work summary without its current-turn tool and message
+    /// counts, which move with every step and say nothing of the files.
+    work: Option<eliot_core::api::WorkSummaryView>,
+    turn: Option<String>,
 }
 
 /// One group of the review digest (`agent.patch_digest`).
@@ -95,13 +170,38 @@ impl Digest {
     }
 }
 
-/// One Changes read: the Git snapshot and the review digest, each with its
-/// own failure.
+/// One Changes read: the Git snapshot, the review digest and the source's
+/// patch, each with its own failure.
 #[derive(Clone, Debug)]
 pub(super) struct ChangesRead {
     git: Result<AgentGitResponse, String>,
     digest: Result<AgentPatchDigestResponse, String>,
+    /// The source this read's patch is of.
+    source: Source,
+    diff: Result<Diff, eliot_core::Error>,
     at_ms: i64,
+}
+
+/// A selected file's own `agent.diff` read, when the source's read cut its
+/// patch: asked once per list read.
+#[derive(Default)]
+pub(super) struct FileState {
+    /// The path asked for (in flight or landed).
+    path: Option<String>,
+    epoch: u64,
+    task: Option<ComponentTask>,
+    read: Option<Result<Diff, eliot_core::Error>>,
+}
+
+impl FileState {
+    fn drop_read(&mut self) {
+        if let Some(task) = self.task.take() {
+            task.cancel();
+        }
+        self.epoch += 1;
+        self.path = None;
+        self.read = None;
+    }
 }
 
 /// Merge and check (`git.integrate`), bound to the Agent it was asked for.
@@ -123,8 +223,15 @@ pub(super) struct ChangesState {
     task: Option<ComponentTask>,
     reading: bool,
     read: Option<Box<ChangesRead>>,
+    /// The open Agent's work when the shown read started.
+    stamp: WorkStamp,
     filter: String,
     selected: Option<String>,
+    file: FileState,
+    /// Split chosen (it shows only in the wide pane; Unified otherwise).
+    split: bool,
+    /// Long patch lines scroll sideways instead of wrapping.
+    nowrap: bool,
     open: Option<Digest>,
     merge: Merge,
 }
@@ -148,8 +255,10 @@ const CLOSED_AT_FIRST: [&str; 2] = ["task", "technical"];
 pub(super) struct PaneState {
     /// Full view: the open panel over the whole main card.
     pub(super) full: bool,
-    /// The pane's width before Wide, which unpressing Wide returns to.
-    before_wide: Option<f64>,
+    /// Wide: the pane shown at 720 while pressed. The saved width stays
+    /// the handle's, so unpressing returns to the width before Wide, after
+    /// a restart too.
+    pub(super) wide: bool,
     changes: ChangesState,
     terminal: TerminalState,
     /// Agents tab rows whose workers are folded away.
@@ -169,20 +278,32 @@ pub(super) enum PaneMsg {
     /// The Full view toggle: the panel over the whole main card, or back
     /// beside the conversation.
     Full(bool),
-    /// The Wide toggle: the pane at its wide width (720), or back to the
-    /// width it had before (its default after a restart). The width is
-    /// saved as a handle's is.
+    /// The Wide toggle: the pane shown at its wide width (720), or back to
+    /// its saved width, the one it had before. Wide itself saves nothing.
     Wide(bool),
     /// The open tab's Refresh (and Retry).
     Refresh,
     /// A Changes read landed (its epoch), or was dropped (`None`).
     ChangesLoaded(u64, Option<Box<ChangesRead>>),
+    /// A selected file's own read landed (its epoch), or was dropped.
+    FileLoaded(u64, Option<Box<Result<Diff, eliot_core::Error>>>),
     Source(Source),
+    /// Unified (`false`) or Split (`true`).
+    Split(bool),
+    /// The Wrap toggle.
+    Wrap(bool),
     Filter(String),
     File(String),
     DigestGroup(Digest),
     OpenFile(String),
+    /// Show a changed file in File Explorer (its folder when it is gone).
+    OpenFolder(String),
+    /// Opening a changed file or its folder settled off the UI thread:
+    /// why it failed, if it did.
+    Opened(Option<String>),
     CopyPath(String),
+    /// Copy a changed file's whole patch as shown.
+    CopyDiff(String),
     /// The Edited files card's View changes: Changes on Last turn.
     ViewChanges,
     MergeAsked,
@@ -207,23 +328,19 @@ impl DesktopApp {
         match msg {
             PaneMsg::Full(on) => self.pane.full = on,
             PaneMsg::Wide(on) => {
-                let widths = split_ui::PanelWidths::of(self.prefs.panels);
-                let wide = tokens::layout::PANEL_WIDE_WIDTH;
-                let pane = if on {
-                    if widths.pane < wide {
-                        self.pane.before_wide = Some(widths.pane);
-                    }
-                    wide
-                } else {
-                    self.pane
-                        .before_wide
-                        .take()
-                        .unwrap_or(tokens::layout::PANEL_WIDTH)
-                };
-                self.shell_update(
-                    ShellMsg::PanelsResized(widths.with(split_ui::Edge::Pane, pane)),
-                    context,
-                );
+                let saved = split_ui::PanelWidths::of(self.prefs.panels);
+                if on || self.pane.wide {
+                    self.pane.wide = on;
+                } else if saved.pane >= tokens::layout::PANEL_WIDE_WIDTH {
+                    // The handle or Settings saved 720 itself: there is no
+                    // earlier width, so the pane takes its default.
+                    self.shell_update(
+                        ShellMsg::PanelsResized(
+                            saved.with(split_ui::Edge::Pane, tokens::layout::PANEL_WIDTH),
+                        ),
+                        context,
+                    );
+                }
             }
             PaneMsg::Refresh => match self.panel {
                 Panel::Changes => self.read_changes(context),
@@ -244,9 +361,29 @@ impl DesktopApp {
                 changes.task = None;
                 if let Some(read) = read {
                     changes.read = Some(read);
+                    // A new list: a file read of the old one is stale.
+                    changes.file.drop_read();
+                    self.read_file(context);
                 }
             }
-            PaneMsg::Source(source) => self.pane.changes.source = source,
+            PaneMsg::FileLoaded(epoch, read) => {
+                let file = &mut self.pane.changes.file;
+                if epoch != file.epoch {
+                    return;
+                }
+                file.task = None;
+                if let Some(read) = read {
+                    file.read = Some(*read);
+                }
+            }
+            PaneMsg::Source(source) => {
+                if self.pane.changes.source != source {
+                    self.pane.changes.source = source;
+                    self.read_changes(context);
+                }
+            }
+            PaneMsg::Split(on) => self.pane.changes.split = on,
+            PaneMsg::Wrap(on) => self.pane.changes.nowrap = !on,
             PaneMsg::Filter(text) => {
                 // A rebuilt field reports the text it already shows.
                 if self.pane.changes.filter != text {
@@ -260,6 +397,7 @@ impl DesktopApp {
                 } else {
                     Some(path)
                 };
+                self.read_file(context);
             }
             PaneMsg::DigestGroup(group) => {
                 let changes = &mut self.pane.changes;
@@ -270,20 +408,64 @@ impl DesktopApp {
                 };
             }
             PaneMsg::OpenFile(path) => match self.changes_file(&path) {
-                Some(full) => {
-                    if let Err(error) = super::reveal::open_with_default_app(&full) {
-                        self.alert(error);
-                    }
+                // The file system checks and the open run off the UI thread.
+                Ok((worktree, relative)) => {
+                    let _task = context.spawn_background(move |_| {
+                        match super::reveal::inside_worktree(&worktree, &relative)
+                            .and_then(|full| super::reveal::open_for_editing(&full))
+                        {
+                            Ok(()) => Message::Pane(PaneMsg::Opened(None)),
+                            Err(error) => Message::Pane(PaneMsg::Opened(Some(error))),
+                        }
+                    });
                 }
-                None => self.alert("This task has no worktree to open the file from."),
+                Err(error) => self.alert(error),
+            },
+            PaneMsg::OpenFolder(path) => match self.changes_file(&path) {
+                Ok((worktree, relative)) => {
+                    let _task = context.spawn_background(move |_| {
+                        // A deleted file's folder still shows where it was.
+                        let shown =
+                            super::reveal::inside_worktree(&worktree, &relative).or_else(|_| {
+                                match relative.parent() {
+                                    Some(parent) if !parent.as_os_str().is_empty() => {
+                                        super::reveal::inside_worktree(&worktree, parent)
+                                    }
+                                    _ => super::reveal::inside_worktree(&worktree, Path::new("")),
+                                }
+                            });
+                        match shown.and_then(|path| super::reveal::reveal(&path.to_string_lossy()))
+                        {
+                            Ok(()) => Message::Pane(PaneMsg::Opened(None)),
+                            Err(error) => Message::Pane(PaneMsg::Opened(Some(error))),
+                        }
+                    });
+                }
+                Err(error) => self.alert(error),
+            },
+            PaneMsg::Opened(failed) => {
+                if let Some(error) = failed {
+                    self.alert(error);
+                }
+            }
+            PaneMsg::CopyDiff(path) => match self.whole_patch(&path) {
+                Some(text) => match crate::clipboard::set_text(&text) {
+                    Ok(()) => self.set_status(format!("Copied the diff of {path}.")),
+                    Err(error) => self.alert(format!("Copy failed: {error}")),
+                },
+                None => self.alert(format!("{path} has no whole patch to copy.")),
             },
             PaneMsg::CopyPath(path) => match crate::clipboard::set_text(&path) {
                 Ok(()) => self.set_status(format!("Copied {path}.")),
                 Err(error) => self.alert(format!("Copy failed: {error}")),
             },
             PaneMsg::ViewChanges => {
+                let changed = self.pane.changes.source != Source::LastTurn;
                 self.pane.changes.source = Source::LastTurn;
                 if self.panel == Panel::Changes && self.panel_shown() {
+                    if changed {
+                        self.read_changes(context);
+                    }
                     return;
                 }
                 self.choose_panel(Panel::Changes, context);
@@ -391,12 +573,15 @@ impl DesktopApp {
     /// follows its task's root once the readback names it.
     pub(super) fn sync_pane(&mut self, context: &ComponentContext<Self>) {
         let shown = self.panel_shown();
-        if !(shown && self.panel == Panel::Changes)
-            && let Some(task) = self.pane.changes.task.take()
-        {
-            task.cancel();
-            self.pane.changes.epoch += 1;
-            self.pane.changes.reading = false;
+        if !(shown && self.panel == Panel::Changes) {
+            if let Some(task) = self.pane.changes.task.take() {
+                task.cancel();
+                self.pane.changes.epoch += 1;
+                self.pane.changes.reading = false;
+            }
+            if self.pane.changes.file.task.is_some() {
+                self.pane.changes.file.drop_read();
+            }
         }
         if !(shown && self.panel == Panel::Terminal)
             && let Some(task) = self.pane.terminal.task.take()
@@ -410,6 +595,12 @@ impl DesktopApp {
         };
         match self.panel {
             Panel::Changes if self.pane.changes.agent.as_deref() != Some(open.as_str()) => {
+                self.read_changes(context);
+            }
+            // The Agent's work changed since the shown read started.
+            Panel::Changes
+                if !self.pane.changes.reading && self.pane.changes.stamp != self.work_stamp() =>
+            {
                 self.read_changes(context);
             }
             Panel::Terminal if self.pane.terminal.agent.as_deref() != Some(open.as_str()) => {
@@ -450,9 +641,11 @@ impl DesktopApp {
             .filter(|workspace| !workspace.is_empty())
     }
 
-    /// A changed file's path on disk: the read's worktree joined with the
-    /// repository-relative path.
-    fn changes_file(&self, path: &str) -> Option<PathBuf> {
+    /// A changed file as the read's worktree and its repository-relative
+    /// path. The daemon's path is data: one with a root, a drive, `..` or
+    /// `.` is refused here, and [`super::reveal::inside_worktree`] checks
+    /// the canonical result stays inside the worktree before any open.
+    fn changes_file(&self, path: &str) -> Result<(PathBuf, PathBuf), String> {
         let root = self
             .pane
             .changes
@@ -465,8 +658,17 @@ impl DesktopApp {
                 },
                 Err(_) => None,
             })
-            .or_else(|| self.open_workspace())?;
-        Some(Path::new(&root).join(path.replace('/', "\\")))
+            .or_else(|| self.open_workspace())
+            .ok_or_else(|| "This task has no worktree to open the file from.".to_owned())?;
+        let relative = PathBuf::from(path.replace('/', "\\"));
+        let plain = !relative.as_os_str().is_empty()
+            && relative
+                .components()
+                .all(|part| matches!(part, std::path::Component::Normal(_)));
+        if !plain {
+            return Err(format!("{path} is not a path inside the worktree."));
+        }
+        Ok((PathBuf::from(root), relative))
     }
 
     /// The row of `id` as the menus and dialogs take it: the sidebar's, else
@@ -483,8 +685,54 @@ impl DesktopApp {
         })
     }
 
-    /// Read the open task's Git snapshot and review digest (together, on a
-    /// worker), keeping the last read shown until it lands.
+    /// A changed file's whole patch text as Changes shows it: the source's
+    /// read, else the file's own read when that one cut it.
+    fn whole_patch(&self, path: &str) -> Option<String> {
+        let changes = &self.pane.changes;
+        let read = changes.read.as_deref()?;
+        let (listed, _) = read.diff.as_ref().ok()?.file(path)?;
+        let file = if listed.truncated && !listed.binary {
+            changes
+                .file
+                .read
+                .as_ref()
+                .filter(|_| changes.file.path.as_deref() == Some(path))?
+                .as_ref()
+                .ok()?
+                .file(path)?
+                .0
+        } else {
+            listed
+        };
+        (!file.truncated).then(|| file.text.clone())
+    }
+
+    /// The open Agent's [`WorkStamp`] now.
+    fn work_stamp(&self) -> WorkStamp {
+        let open = self.selected_agent_id();
+        let work = self
+            .open_work()
+            .map(|work| eliot_core::api::WorkSummaryView {
+                tool_calls: None,
+                messages: None,
+                ..work.clone()
+            });
+        let turn = (self.pane.changes.source == Source::LastTurn)
+            .then(|| self.last_finished_turn().map(|item| item.key.clone()))
+            .flatten();
+        WorkStamp {
+            generation: open
+                .as_deref()
+                .and_then(|id| self.find_agent(id))
+                .map(|row| row.generation),
+            work,
+            turn,
+        }
+    }
+
+    /// Read the open task's Git snapshot, review digest and the chosen
+    /// source's patch (together, on a worker; each file's patch parsed
+    /// there), keeping the last read shown until it lands.
     fn read_changes(&mut self, context: &ComponentContext<Self>) {
         let (Some(agent), Ok(data_dir)) = (self.selected_agent_id(), self.data_dir.clone()) else {
             return;
@@ -492,6 +740,7 @@ impl DesktopApp {
         if self.daemon_down() {
             return;
         }
+        let stamp = self.work_stamp();
         let changes = &mut self.pane.changes;
         if let Some(task) = changes.task.take() {
             task.cancel();
@@ -500,29 +749,74 @@ impl DesktopApp {
             changes.agent = Some(agent.clone());
             changes.read = None;
             changes.selected = None;
+            changes.file.drop_read();
             changes.open = None;
             changes.merge = Merge::Idle;
         }
+        changes.stamp = stamp;
         changes.epoch += 1;
         changes.reading = true;
-        let epoch = changes.epoch;
+        let (epoch, source) = (changes.epoch, changes.source);
         changes.task = Some(context.spawn_background(move |cancel| {
-            let cancelled = || cancel.is_cancelled();
-            if !wait_shown(&cancelled) {
+            if cancel.is_cancelled() {
                 return Message::Pane(PaneMsg::ChangesLoaded(epoch, None));
             }
-            let (git, digest) = client::block_on(futures_util::future::join(
+            let request = Diff::request(&agent, None, source, None);
+            let (git, digest, diff) = client::block_on(futures_util::future::join3(
                 client::agent_git(&data_dir, &agent),
                 client::patch_digest(&data_dir, &agent),
+                client::agent_diff(&data_dir, &request),
             ));
             Message::Pane(PaneMsg::ChangesLoaded(
                 epoch,
                 Some(Box::new(ChangesRead {
                     git: git.map_err(|error| error.user_message()),
                     digest: digest.map_err(|error| error.user_message()),
+                    source,
+                    diff: diff.map(Diff::of),
                     at_ms: crate::handoff::now_ms(),
                 })),
             ))
+        }));
+    }
+
+    /// Read the selected file alone when the shown read cut its patch (the
+    /// read's run only), once per list read; nothing otherwise.
+    fn read_file(&mut self, context: &ComponentContext<Self>) {
+        let (Some(agent), Ok(data_dir)) = (self.selected_agent_id(), self.data_dir.clone()) else {
+            return;
+        };
+        let changes = &mut self.pane.changes;
+        let Some(path) = changes.selected.clone() else {
+            return;
+        };
+        let Some(read) = changes
+            .read
+            .as_deref()
+            .filter(|read| read.source == changes.source && changes.agent.as_ref() == Some(&agent))
+        else {
+            return;
+        };
+        let Ok(diff) = &read.diff else {
+            return;
+        };
+        let cut = diff
+            .file(&path)
+            .is_some_and(|(file, _)| file.truncated && !file.binary);
+        if !cut || changes.file.path.as_deref() == Some(path.as_str()) {
+            return;
+        }
+        let (source, generation) = (read.source, diff.reply.generation);
+        changes.file.drop_read();
+        changes.file.path = Some(path.clone());
+        let epoch = changes.file.epoch;
+        changes.file.task = Some(context.spawn_background(move |cancel| {
+            if cancel.is_cancelled() {
+                return Message::Pane(PaneMsg::FileLoaded(epoch, None));
+            }
+            let request = Diff::request(&agent, Some(generation), source, Some(path));
+            let read = client::block_on(client::agent_diff(&data_dir, &request)).map(Diff::of);
+            Message::Pane(PaneMsg::FileLoaded(epoch, Some(Box::new(read))))
         }));
     }
 
@@ -547,8 +841,7 @@ impl DesktopApp {
         terminal.reading = true;
         let epoch = terminal.epoch;
         terminal.task = Some(context.spawn_background(move |cancel| {
-            let cancelled = || cancel.is_cancelled();
-            if !wait_shown(&cancelled) {
+            if cancel.is_cancelled() {
                 return Message::Pane(PaneMsg::ProcessesLoaded(epoch, None));
             }
             let read = client::block_on(client::agent_processes(&data_dir, &agent))
@@ -639,11 +932,40 @@ impl DesktopApp {
             .into()
     }
 
+    /// The panel widths shown: `[desktop] panels`, the pane at 720 while
+    /// Wide is pressed.
+    pub(super) fn panel_widths(&self) -> split_ui::PanelWidths {
+        let saved = split_ui::PanelWidths::of(self.prefs.panels);
+        if self.pane.wide {
+            saved.with(split_ui::Edge::Pane, tokens::layout::PANEL_WIDE_WIDTH)
+        } else {
+            saved
+        }
+    }
+
+    /// Widths a handle or Settings reports, as `[desktop] panels` keeps
+    /// them: Wide's 720 is shown, never saved, so a report of it keeps the
+    /// saved pane width; any other pane width ends Wide.
+    pub(super) fn saved_widths(
+        &mut self,
+        reported: split_ui::PanelWidths,
+    ) -> split_ui::PanelWidths {
+        if !self.pane.wide {
+            return reported;
+        }
+        if reported.pane == tokens::layout::PANEL_WIDE_WIDTH {
+            let saved = split_ui::PanelWidths::of(self.prefs.panels);
+            reported.with(split_ui::Edge::Pane, saved.pane)
+        } else {
+            self.pane.wide = false;
+            reported
+        }
+    }
+
     /// The pane's content takes its wide layout: Full view, or the pane at
-    /// its widest (`[desktop] panels`).
+    /// its widest (Wide, or 720 in `[desktop] panels`).
     fn pane_wide(&self) -> bool {
-        self.pane.full
-            || split_ui::PanelWidths::of(self.prefs.panels).pane >= tokens::layout::PANEL_WIDE_WIDTH
+        self.pane.full || self.panel_widths().pane >= tokens::layout::PANEL_WIDE_WIDTH
     }
 
     /// The pane's bar, over a hairline: the open panel's title, then Wide
@@ -658,8 +980,7 @@ impl DesktopApp {
         let title = panel.label();
         let full = self.pane.full;
         // Wide and Full view are toggles: UIA reads their pressed state.
-        let wide =
-            split_ui::PanelWidths::of(self.prefs.panels).pane >= tokens::layout::PANEL_WIDE_WIDTH;
+        let wide = self.panel_widths().pane >= tokens::layout::PANEL_WIDE_WIDTH;
         let widen: Option<View> = (self.layout.wide_docks && !full).then(|| {
             controls::bar_toggle(wide)
                 .grid_column(1)
@@ -750,22 +1071,32 @@ impl DesktopApp {
             .into()
     }
 
-    /// Changes (skeleton 5.4, `Decision.dc.html`): Compare and Refresh;
-    /// the diff view and Filter files; the summary; the review digest; the
-    /// files; the selected file's actions; Merge and check.
+    /// Changes (brand book §11.1): the source, Unified/Split, Wrap and
+    /// Refresh; Filter files; the summary and what it compares; the review
+    /// digest; the source's files from `agent.diff`; the selected file's
+    /// actions and patch; Merge and check.
     fn changes_view(&self, context: &mut ViewContext<Self>) -> View {
         let changes = &self.pane.changes;
         let open = self.selected_agent_id();
         let read = changes.read.as_deref().filter(|_| changes.agent == open);
         let mut items: Vec<KeyedView> = Vec::new();
 
-        let compare: Vec<(&str, bool, Callback<()>)> = Source::ALL
+        let compare: Vec<KeyedView> = Source::ALL
             .iter()
             .map(|source| {
-                (
-                    source.label(),
-                    changes.source == *source,
-                    context.message(Message::Pane(PaneMsg::Source(*source))),
+                let selected = changes.source == *source;
+                let label = source.label();
+                KeyedView::new(
+                    format!("{label}:{selected}"),
+                    controls::segment(selected)
+                        .automation_name(if selected {
+                            format!("{label} (chosen): {}", source.meaning())
+                        } else {
+                            format!("{label}: {}", source.meaning())
+                        })
+                        .on_click(context.message(Message::Pane(PaneMsg::Source(*source))))
+                        .content(controls::segment_label(label))
+                        .tooltip(source.meaning()),
                 )
             })
             .collect();
@@ -775,7 +1106,7 @@ impl DesktopApp {
         items.push(KeyedView::new(
             "compare",
             toolbar(
-                vec![KeyedView::new("group", super::page_ui::choice(&compare))],
+                vec![KeyedView::new("group", controls::segmented(compare))],
                 vec![KeyedView::new(
                     "refresh",
                     controls::icon_button()
@@ -787,19 +1118,28 @@ impl DesktopApp {
                 )],
             ),
         ));
-        // The diff controls govern the diff, which the daemon cannot give
-        // yet: shown, unavailable, with the reason.
-        let no_diff = "Swarm cannot show diffs yet: the daemon has no diff-text read";
-        let view_group: Vec<KeyedView> = [("Unified", true), ("Split", false)]
+        // Split needs the wide pane; elsewhere Unified shows and says why,
+        // the choice kept for when the pane is wide again.
+        let wide = self.pane_wide();
+        let view_group: Vec<KeyedView> = [("Unified", false), ("Split", true)]
             .into_iter()
-            .map(|(label, selected)| {
-                KeyedView::new(
-                    label,
-                    controls::segment(selected)
-                        .is_enabled(false)
-                        .automation_name(format!("{label}: {no_diff}"))
-                        .content(controls::segment_label(label)),
-                )
+            .map(|(label, split)| {
+                let selected = changes.split == split;
+                let segment = controls::segment(selected)
+                    .is_enabled(wide || !split)
+                    .automation_name(match (selected, wide || !split) {
+                        (_, false) => format!("{label}: {NO_SPLIT}"),
+                        (true, true) => format!("{label} (chosen)"),
+                        (false, true) => label.to_owned(),
+                    })
+                    .on_click(context.message(Message::Pane(PaneMsg::Split(split))))
+                    .content(controls::segment_label(label));
+                let view: View = if wide || !split {
+                    segment.into()
+                } else {
+                    Border::new().content(segment).tooltip(NO_SPLIT)
+                };
+                KeyedView::new(format!("{label}:{selected}:{wide}"), view)
             })
             .collect();
         let filter = TextBox::new()
@@ -813,22 +1153,20 @@ impl DesktopApp {
             "view",
             toolbar(
                 vec![
-                    KeyedView::new(
-                        "group",
-                        Border::new()
-                            .content(controls::segmented(view_group))
-                            .tooltip(no_diff),
-                    ),
+                    KeyedView::new("group", controls::segmented(view_group)),
                     KeyedView::new(
                         "wrap",
-                        Border::new()
-                            .content(
-                                controls::icon_button()
-                                    .is_enabled(false)
-                                    .automation_name(format!("Word wrap: {no_diff}"))
-                                    .content(controls::icon(controls::glyph::WRAP)),
-                            )
-                            .tooltip(no_diff),
+                        controls::bar_toggle(!changes.nowrap)
+                            .automation_name("Wrap long lines")
+                            .on_is_checked_changed(crate::views::check_changes(
+                                context.callback(|on: bool| Message::Pane(PaneMsg::Wrap(on))),
+                            ))
+                            .content(controls::icon(controls::glyph::WRAP))
+                            .tooltip(if changes.nowrap {
+                                "Wrap long lines"
+                            } else {
+                                "Scroll long lines sideways"
+                            }),
                     ),
                 ],
                 vec![KeyedView::new(
@@ -884,12 +1222,21 @@ impl DesktopApp {
             },
         };
         let digest = read.digest.as_ref().ok();
-        if git.is_none() && digest.is_none() {
-            let why = [git_error.clone(), read.digest.as_ref().err().cloned()]
-                .into_iter()
-                .flatten()
-                .collect::<Vec<_>>()
-                .join(" · ");
+        // The shown read is of another source until the chosen one lands.
+        let diff = (read.source == changes.source).then_some(&read.diff);
+        if git.is_none()
+            && digest.is_none()
+            && let Some(Err(error)) = diff
+        {
+            let why = [
+                git_error.clone(),
+                read.digest.as_ref().err().cloned(),
+                Some(diff_error_words(changes.source, error)),
+            ]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join(" · ");
             items.push(KeyedView::new(
                 "failed",
                 super::page_ui::read_failed(
@@ -902,34 +1249,52 @@ impl DesktopApp {
             return self.pane_body("Changes", items);
         }
 
-        // The files of the chosen source, with their state words.
-        let files = self.source_files(changes.source, git, digest);
-        let partial = match changes.source {
-            Source::Uncommitted => git.is_none_or(|git| git.complete != Some(true)),
-            Source::Branch => digest.is_none_or(|digest| !digest.complete || digest.truncated),
-            Source::LastTurn => self.last_turn_edits().is_some_and(|(_, unnamed)| unnamed),
-        };
+        let unnamed = changes.source == Source::LastTurn && self.last_turn_unnamed();
+        let shown = diff.and_then(|diff| diff.as_ref().ok());
         let work = self.open_work();
-        let ahead = work.and_then(|work| work.commits_ahead);
         let base = self
             .chat
             .detail
             .as_ref()
             .filter(|detail| Some(&detail.agent) == open.as_ref())
             .and_then(|detail| detail.base_ref.clone());
+        // Line totals: the patch's own when every file's are known, else
+        // the daemon's Branch totals; never a guessed zero.
+        let lines = shown
+            .filter(|diff| !diff.reply.truncated)
+            .and_then(|diff| {
+                diff.parsed.iter().try_fold((0, 0), |(add, del), parsed| {
+                    parsed.counts.map(|(a, d)| (add + a, del + d))
+                })
+            })
+            .or_else(|| {
+                (changes.source == Source::Branch)
+                    .then(|| {
+                        git.and_then(|git| git.line_counts.as_ref())
+                            .map(|counts| (counts.insertions, counts.deletions))
+                            .or_else(|| work.and_then(|work| work.insertions.zip(work.deletions)))
+                    })
+                    .flatten()
+            });
         items.push(KeyedView::new(
             format!("summary:{:?}", changes.source),
             summary_line(
                 changes.source,
-                files.as_ref().ok().map(Vec::len),
-                git.and_then(|git| git.line_counts.as_ref())
-                    .map(|counts| (counts.insertions, counts.deletions))
-                    .or_else(|| work.and_then(|work| work.insertions.zip(work.deletions))),
-                ahead,
+                shown.map(|diff| diff.reply.files.len()),
+                lines,
+                work.and_then(|work| work.commits_ahead),
                 base.as_deref(),
-                partial,
+                shown.is_some_and(|diff| diff.reply.truncated) || unnamed,
             ),
         ));
+        if let Some(diff) = shown {
+            items.push(KeyedView::new(
+                "compared",
+                controls::secondary(compared_words(changes.source, &diff.reply))
+                    .text_wrapping(TextWrapping::Wrap)
+                    .is_text_selection_enabled(true),
+            ));
+        }
         if let Some(error) = &git_error
             && changes.source == Source::Uncommitted
         {
@@ -952,35 +1317,45 @@ impl DesktopApp {
             items.push(KeyedView::new("digest", self.digest_card(digest, context)));
         }
 
-        match files {
-            Err(why) => items.push(KeyedView::new("files-why", super::page_ui::quiet(why))),
-            Ok(files) if files.is_empty() => items.push(KeyedView::new(
+        match diff {
+            None => items.push(KeyedView::new(
+                "files-reading",
+                super::page_ui::quiet(format!("Reading {}\u{2026}", changes.source.label())),
+            )),
+            Some(Err(error)) => items.push(KeyedView::new(
+                "files-error",
+                super::page_ui::error_line(diff_error_words(changes.source, error)),
+            )),
+            Some(Ok(diff)) if diff.reply.files.is_empty() => items.push(KeyedView::new(
                 "empty",
                 super::page_ui::quiet(match changes.source {
-                    Source::LastTurn if partial => {
+                    _ if diff.reply.truncated => {
+                        "Partial: this read lists no files. Refresh reads it again."
+                    }
+                    Source::LastTurn if unnamed => {
                         "The last turn's edits did not name their files: Branch and Uncommitted list them."
                     }
                     Source::LastTurn => {
-                        "The last turn reported no file edits. Files its commands changed show under Uncommitted and Branch."
+                        "No current changes in the files the last completed turn reported. Files its commands changed show under Uncommitted and Branch."
                     }
-                    _ => "No changes yet.",
+                    _ => "No changes.",
                 }),
             )),
-            Ok(files) => {
+            Some(Ok(diff)) => {
                 let needle = changes.filter.trim().to_lowercase();
-                let shown: Vec<&(String, &'static str)> = files
-                    .iter()
-                    .filter(|(path, _)| needle.is_empty() || path.to_lowercase().contains(&needle))
-                    .collect();
                 let mut rows: Vec<KeyedView> = Vec::new();
-                for (path, state) in &shown {
-                    let selected = changes.selected.as_deref() == Some(path.as_str());
+                for (file, parsed) in diff.reply.files.iter().zip(&diff.parsed) {
+                    if !needle.is_empty() && !file.path.to_lowercase().contains(&needle) {
+                        continue;
+                    }
+                    let selected = changes.selected.as_deref() == Some(file.path.as_str());
+                    let state = file_state(file, git, digest);
                     rows.push(KeyedView::new(
-                        format!("file:{path}:{selected}"),
-                        file_row(path, state, selected, context),
+                        format!("file:{}:{selected}", file.path),
+                        file_row(file, state, parsed.counts, selected, context),
                     ));
                 }
-                if shown.is_empty() {
+                if rows.is_empty() {
                     rows.push(KeyedView::new(
                         "none",
                         super::page_ui::quiet(format!("No file matches \u{201c}{needle}\u{201d}.")),
@@ -993,20 +1368,212 @@ impl DesktopApp {
                         .automation_name("Changed files")
                         .keyed_children(rows),
                 ));
-                if let Some(path) = changes
-                    .selected
-                    .as_ref()
-                    .filter(|path| files.iter().any(|(file, _)| file == *path))
-                {
-                    items.push(KeyedView::new(
-                        format!("selected:{path}"),
-                        selected_file(path, context),
-                    ));
+                if let Some(path) = &changes.selected {
+                    // A selected file that left the list is explained,
+                    // never shown with its old patch.
+                    items.push(match diff.file(path) {
+                        Some((file, parsed)) => KeyedView::new(
+                            format!("selected:{path}"),
+                            self.selected_file(file, parsed, diff, git, digest, context),
+                        ),
+                        None => KeyedView::new(
+                            "selected-gone",
+                            super::page_ui::quiet(format!(
+                                "{path} no longer differs under {}.",
+                                changes.source.label()
+                            )),
+                        ),
+                    });
                 }
             }
         }
         items.push(KeyedView::new("merge", self.merge_view(context)));
         self.pane_body("Changes", items)
+    }
+
+    /// The selected file (§11.1): its path, state, counts and rename or
+    /// mode; Open in editor, Open folder, Copy path and Copy diff; then its
+    /// patch, or the short state that stands for it (binary, larger than
+    /// one read, rename or mode only, empty, being read, gone, failed).
+    fn selected_file(
+        &self,
+        listed: &GitDiffFile,
+        listed_parsed: &Arc<diff_ui::Parsed>,
+        diff: &Diff,
+        git: Option<&eliot_core::api::GitObservation>,
+        digest: Option<&AgentPatchDigestResponse>,
+        context: &mut ViewContext<Self>,
+    ) -> View {
+        let changes = &self.pane.changes;
+        let path = listed.path.as_str();
+        // The source's read cut this file's patch: its own read stands in.
+        let own = (listed.truncated && !listed.binary).then(|| {
+            changes
+                .file
+                .read
+                .as_ref()
+                .filter(|_| changes.file.path.as_deref() == Some(path))
+        });
+        let shown: Result<(&GitDiffFile, &Arc<diff_ui::Parsed>), String> = match own {
+            None => Ok((listed, listed_parsed)),
+            Some(None) => Err("Reading this file's patch\u{2026}".to_owned()),
+            Some(Some(Err(error))) => Err(diff_error_words(changes.source, error)),
+            Some(Some(Ok(own))) => own.file(path).ok_or_else(|| {
+                format!(
+                    "{path} no longer differs under {}. Refresh reads the list again.",
+                    changes.source.label()
+                )
+            }),
+        };
+        let (file, parsed) = shown
+            .as_ref()
+            .map_or((listed, listed_parsed), |shown| *shown);
+        let state = file_state(file, git, digest);
+
+        let mut facts = vec![state.to_owned()];
+        if let Some((add, del)) = parsed.counts {
+            facts.push(format!("+{add} \u{2212}{del}"));
+        }
+        if file.hunks > 0 {
+            facts.push(eliot_core::count_words(file.hunks as u64, "hunk", "hunks"));
+        }
+        if let Some(original) = &file.original_path {
+            facts.push(format!("from {original}"));
+        }
+        if file.old_mode != file.new_mode && file.old_mode != NO_FILE && file.new_mode != NO_FILE {
+            facts.push(format!("mode {} to {}", file.old_mode, file.new_mode));
+        }
+        let facts = facts.join(" \u{b7} ");
+
+        let whole = shown.is_ok() && !file.truncated;
+        let actions = toolbar(
+            vec![
+                KeyedView::new(
+                    "open",
+                    controls::outlined()
+                        .is_enabled(state != "Deleted")
+                        .automation_name(format!("Open {path} in its editor"))
+                        .on_click(
+                            context.message(Message::Pane(PaneMsg::OpenFile(path.to_owned()))),
+                        )
+                        .content(controls::icon_label(
+                            controls::glyph::EXTERNAL,
+                            "Open in editor",
+                        ))
+                        .tooltip(if state == "Deleted" {
+                            "The file is deleted"
+                        } else {
+                            "Open with its default app"
+                        }),
+                ),
+                KeyedView::new(
+                    "folder",
+                    controls::text_button()
+                        .automation_name(format!("Show {path} in File Explorer"))
+                        .on_click(
+                            context.message(Message::Pane(PaneMsg::OpenFolder(path.to_owned()))),
+                        )
+                        .content(controls::icon_label(
+                            controls::glyph::OPEN_FOLDER,
+                            "Open folder",
+                        )),
+                ),
+                KeyedView::new(
+                    "copy-path",
+                    controls::text_button()
+                        .automation_name(format!("Copy the path {path}"))
+                        .on_click(
+                            context.message(Message::Pane(PaneMsg::CopyPath(path.to_owned()))),
+                        )
+                        .content(controls::icon_label(controls::glyph::COPY, "Copy path")),
+                ),
+                KeyedView::new(
+                    "copy-diff",
+                    controls::text_button()
+                        .is_enabled(whole)
+                        .automation_name(if whole {
+                            format!("Copy the diff of {path}")
+                        } else {
+                            format!("Copy diff: {path} has no whole patch here")
+                        })
+                        .on_click(
+                            context.message(Message::Pane(PaneMsg::CopyDiff(path.to_owned()))),
+                        )
+                        .content(controls::icon_label(controls::glyph::COPY, "Copy diff")),
+                ),
+            ],
+            vec![],
+        );
+
+        let mut parts: Vec<KeyedView> = vec![
+            KeyedView::new(
+                "path",
+                controls::body(path.to_owned())
+                    .text_wrapping(TextWrapping::Wrap)
+                    .is_text_selection_enabled(true),
+            ),
+            KeyedView::new(
+                "facts",
+                controls::secondary(facts).text_wrapping(TextWrapping::Wrap),
+            ),
+            KeyedView::new("actions", actions),
+        ];
+        let split = changes.split && self.pane_wide();
+        let body: View = match &shown {
+            Err(words) if matches!(own, Some(None)) => StackPanel::new()
+                .orientation(Orientation::Horizontal)
+                .spacing(tokens::spacing::SM)
+                .children((controls::spinner(), controls::body(words.clone())))
+                .into(),
+            Err(words) => super::page_ui::error_line(words.clone()),
+            Ok(_) if file.binary => super::page_ui::quiet(
+                "Binary file: Swarm names it here and does not show its content.",
+            ),
+            Ok(_) if file.truncated => super::page_ui::quiet(format!(
+                "This file's patch is larger than one read ({} KiB, {} files, {} hunks), so Swarm shows none of it here. Open in editor shows the whole file.",
+                MAX_DIFF_TEXT_BYTES / 1024,
+                MAX_DIFF_TEXT_FILES,
+                MAX_DIFF_TEXT_HUNKS
+            )),
+            Ok(_) if file.hunks == 0 => super::page_ui::quiet(match state {
+                "Renamed" => "Renamed with the same content.",
+                "Mode changed" => "Only the file mode changed.",
+                "Added" | "Untracked" => "A new empty file.",
+                "Deleted" => "An empty file was deleted.",
+                _ => "No text changes.",
+            }),
+            Ok((_, parsed)) => {
+                if changes.split && !split {
+                    parts.push(KeyedView::new(
+                        "unified-why",
+                        controls::secondary(format!("{NO_SPLIT}; Unified here."))
+                            .text_wrapping(TextWrapping::Wrap),
+                    ));
+                }
+                diff_ui::patch_view(
+                    parsed,
+                    split,
+                    !changes.nowrap,
+                    (
+                        changes.epoch,
+                        changes.file.epoch,
+                        diff.reply.generation,
+                        path,
+                    ),
+                )
+            }
+        };
+        parts.push(KeyedView::new(
+            format!("body:{split}:{}", changes.nowrap),
+            body,
+        ));
+        controls::card()
+            .content(
+                StackPanel::new()
+                    .spacing(tokens::spacing::SM)
+                    .keyed_children(parts),
+            )
+            .into()
     }
 
     /// The open Agent's Git work summary (its sidebar row, else the
@@ -1025,83 +1592,32 @@ impl DesktopApp {
             })
     }
 
-    /// The files `source` lists with their state words, or why it lists
-    /// none.
-    fn source_files(
-        &self,
-        source: Source,
-        git: Option<&eliot_core::api::GitObservation>,
-        digest: Option<&AgentPatchDigestResponse>,
-    ) -> Result<Vec<(String, &'static str)>, String> {
-        match source {
-            Source::Uncommitted => {
-                let git = git.ok_or("Git status was not read.")?;
-                let dirty = git
-                    .dirty
-                    .as_ref()
-                    .ok_or("Git status did not list the worktree's files.")?;
-                Ok(dirty
+    /// The open conversation's last finished turn.
+    fn last_finished_turn(&self) -> Option<&crate::views::RenderedItem> {
+        use crate::chat::PartKind;
+        self.chat
+            .items
+            .iter()
+            .rev()
+            .find(|item| {
+                item.parts
                     .iter()
-                    .map(|entry| (entry.path.clone(), porcelain_word(&entry.status)))
-                    .collect())
-            }
-            Source::Branch => {
-                let digest = digest.ok_or("The review digest was not read.")?;
-                Ok(digest
-                    .files
-                    .iter()
-                    .map(|file| (file.path.clone(), change_word(&file.change)))
-                    .collect())
-            }
-            Source::LastTurn => {
-                let (paths, _) = self
-                    .last_turn_edits()
-                    .ok_or("No turn has finished in this conversation yet.")?;
-                let root = git
-                    .map(|git| git.workspace.clone())
-                    .or_else(|| self.open_workspace())
-                    .unwrap_or_default();
-                Ok(paths
-                    .into_iter()
-                    .map(|path| {
-                        let relative = relative_path(&root, &path);
-                        let word = digest
-                            .and_then(|digest| {
-                                digest.files.iter().find(|file| file.path == relative)
-                            })
-                            .map_or("Edited", |file| change_word(&file.change));
-                        (relative, word)
-                    })
-                    .collect())
-            }
-        }
+                    .any(|part| matches!(part.kind, PartKind::Final | PartKind::TurnFailed))
+            })
+            .map(Rc::as_ref)
     }
 
-    /// The files the last finished turn's steps reported editing (the
-    /// transcript's Edited files), or `None` before any turn finished.
-    /// Whether some of them did not name their files: the work log then
-    /// says "made N edits" instead of "edited N files" (only some
-    /// harnesses report changed paths).
-    fn last_turn_edits(&self) -> Option<(Vec<String>, bool)> {
+    /// Whether some of the last finished turn's edits did not name their
+    /// files: its work log then says "made N edits" instead of "edited N
+    /// files" (only some harnesses report changed paths), and Last turn,
+    /// which takes the reported paths, cannot list them.
+    fn last_turn_unnamed(&self) -> bool {
         use crate::chat::PartKind;
-        self.chat.items.iter().rev().find_map(|item| {
-            let finished = item
-                .parts
-                .iter()
-                .any(|part| matches!(part.kind, PartKind::Final | PartKind::TurnFailed));
-            finished.then(|| {
-                let paths = item
-                    .parts
-                    .iter()
-                    .find(|part| matches!(part.kind, PartKind::Edited))
-                    .map(|part| part.detail.clone())
-                    .unwrap_or_default();
-                let unnamed = item.parts.iter().any(|part| {
-                    matches!(part.kind, PartKind::Log)
-                        && part.label.contains("made ")
-                        && part.label.contains(" edit")
-                });
-                (paths, unnamed)
+        self.last_finished_turn().is_some_and(|item| {
+            item.parts.iter().any(|part| {
+                matches!(part.kind, PartKind::Log)
+                    && part.label.contains("made ")
+                    && part.label.contains(" edit")
             })
         })
     }
@@ -1680,17 +2196,6 @@ impl DesktopApp {
     }
 }
 
-/// Wait while the window is minimized or hidden (locally, no daemon
-/// request); false when cancelled meanwhile.
-fn wait_shown(cancelled: &dyn Fn() -> bool) -> bool {
-    while crate::window_place::hidden() {
-        if !feed::backoff(monitor::HIDDEN_CHECK_MS, cancelled) {
-            return false;
-        }
-    }
-    !cancelled()
-}
-
 /// A row of controls (`.toolbar-row`), 8 DIPs apart: `lead` at the start,
 /// `trail` pushed to the end.
 fn toolbar(lead: Vec<KeyedView>, trail: Vec<KeyedView>) -> View {
@@ -1740,25 +2245,87 @@ fn change_word(change: &str) -> &'static str {
     }
 }
 
-/// `path` relative to the worktree `root`, with forward slashes (as Git
-/// and the digest name it); a path outside it stays as given.
-fn relative_path(root: &str, path: &str) -> String {
-    let normal = |text: &str| text.replace('\\', "/").trim_end_matches('/').to_owned();
-    let (root, path) = (normal(root), normal(path));
-    if !root.is_empty()
-        && path.len() > root.len()
-        && path[..root.len()].eq_ignore_ascii_case(&root)
-        && path.as_bytes()[root.len()] == b'/'
-    {
-        path[root.len() + 1..].to_owned()
+/// Why Split is not offered in a narrow pane.
+const NO_SPLIT: &str = "Split needs the wide pane: Wide or Full view shows it";
+
+/// The Git mode of a side that has no file (an added file's old side, a
+/// deleted file's new side).
+const NO_FILE: &str = "000000";
+
+/// A file's state word from its `agent.diff` record: Renamed, Added,
+/// Deleted, Mode changed or Modified, with Git's Untracked or Conflicted
+/// where the same read's status or digest names the path so.
+fn file_state(
+    file: &GitDiffFile,
+    git: Option<&eliot_core::api::GitObservation>,
+    digest: Option<&AgentPatchDigestResponse>,
+) -> &'static str {
+    let porcelain = git
+        .and_then(|git| git.dirty.as_ref())
+        .and_then(|dirty| dirty.iter().find(|entry| entry.path == file.path))
+        .map(|entry| porcelain_word(&entry.status));
+    let change = digest
+        .and_then(|digest| digest.files.iter().find(|entry| entry.path == file.path))
+        .map(|entry| change_word(&entry.change));
+    if file.original_path.is_some() {
+        "Renamed"
+    } else if porcelain == Some("Conflicted") {
+        "Conflicted"
+    } else if file.old_mode == NO_FILE {
+        if porcelain == Some("Untracked") || change == Some("Untracked") {
+            "Untracked"
+        } else {
+            "Added"
+        }
+    } else if file.new_mode == NO_FILE {
+        "Deleted"
+    } else if file.old_mode != file.new_mode && file.hunks == 0 && !file.binary {
+        "Mode changed"
     } else {
-        path
+        "Modified"
+    }
+}
+
+/// What the read compared, from the reply's own base and HEAD (§11.1's
+/// table): Branch without a recorded base says it compared with HEAD.
+fn compared_words(source: Source, reply: &AgentDiffResponse) -> String {
+    let short = |oid: &str| oid.chars().take(7).collect::<String>();
+    let (base, head) = (short(&reply.base), short(&reply.head));
+    match source {
+        Source::Uncommitted => {
+            format!("HEAD {head} to the worktree, staged and unstaged changes.")
+        }
+        Source::Branch if reply.base == reply.head => {
+            format!("No recorded base: HEAD {head} to the worktree.")
+        }
+        Source::Branch => format!("Base {base} to the worktree (HEAD {head})."),
+        Source::LastTurn => format!(
+            "Current changes in files reported by the last completed turn, from base {base}. Not that turn's own historical patch."
+        ),
+    }
+}
+
+/// A failed `agent.diff` in words: the states §11.1 names get their own
+/// (no finished turn, a newer run, a checkout that moved during the read).
+fn diff_error_words(source: Source, error: &eliot_core::Error) -> String {
+    match error.code.as_str() {
+        "not_found" if source == Source::LastTurn => {
+            "No turn has finished in this run yet, so Last turn has no files.".to_owned()
+        }
+        "stale_generation" => {
+            "The task started a new run since this list was read. Refresh reads the new run."
+                .to_owned()
+        }
+        "stale_workspace" => {
+            "The worktree changed while it was being read. Refresh reads it again.".to_owned()
+        }
+        _ => format!("Couldn't read the diff: {}", error.user_message()),
     }
 }
 
 /// The summary line: "{N} files changed +A -D · {commits} commits ahead of
-/// {base}", with Partial when the read was cut. Counts the daemon does not
-/// give for a source are left out, never shown as zero.
+/// {base}", with Partial when the read was cut. Counts not known for a
+/// source are left out (`None`), never shown as zero.
 fn summary_line(
     source: Source,
     files: Option<usize>,
@@ -1770,10 +2337,10 @@ fn summary_line(
     let mut parts: Vec<KeyedView> = Vec::new();
     let files_words = match (source, files) {
         (_, None) => "Files not read".to_owned(),
-        (Source::LastTurn, Some(0)) => "No file edits reported in the last turn".to_owned(),
+        (Source::LastTurn, Some(0)) => "No current changes in the last turn's files".to_owned(),
         (Source::LastTurn, Some(count)) => {
             format!(
-                "{} edited in the last turn",
+                "{} of the last turn changed",
                 eliot_core::count_words(count as u64, "file", "files")
             )
         }
@@ -1783,9 +2350,7 @@ fn summary_line(
         ),
     };
     parts.push(KeyedView::new("files", controls::secondary(files_words)));
-    if source == Source::Branch
-        && let Some((add, del)) = lines
-    {
+    if let Some((add, del)) = lines {
         parts.push(KeyedView::new("lines", controls::diff_counts(add, del)));
     }
     if let Some(ahead) = ahead {
@@ -1809,26 +2374,40 @@ fn summary_line(
 }
 
 /// A changed file (component 48, `.filelist .f`): its icon, the name
-/// bright and the folder quiet, its state word; selected on the
-/// selection role.
+/// bright and the folder quiet, its `+A −D` when known and its state word;
+/// selected on the selection role.
 fn file_row(
-    path: &str,
+    file: &GitDiffFile,
     state: &str,
+    counts: Option<(u64, u64)>,
     selected: bool,
     context: &mut ViewContext<DesktopApp>,
 ) -> View {
+    let path = file.path.as_str();
+    let state = if file.binary {
+        format!("{state}, binary")
+    } else {
+        state.to_owned()
+    };
     let (folder, name) = match path.rsplit_once('/') {
         Some((folder, name)) => (folder, name),
         None => ("", path),
     };
-    let glyph = match state {
-        "Added" | "Untracked" => controls::glyph::NEW_FILE,
-        "Deleted" => controls::glyph::DELETE,
+    let glyph = match state.split(',').next() {
+        Some("Added" | "Untracked") => controls::glyph::NEW_FILE,
+        Some("Deleted") => controls::glyph::DELETE,
         _ => controls::glyph::EDIT,
+    };
+    let counted = counts.map_or_else(String::new, |(add, del)| {
+        format!(", {add} added, {del} removed")
+    });
+    let tooltip = match &file.original_path {
+        Some(original) => format!("{path} (from {original})"),
+        None => path.to_owned(),
     };
     controls::row(selected)
         .automation_name(format!(
-            "{path}, {state}{}",
+            "{tooltip}, {state}{counted}{}",
             if selected { ", selected" } else { "" }
         ))
         .on_click(context.message(Message::Pane(PaneMsg::File(path.to_owned()))))
@@ -1838,6 +2417,7 @@ fn file_row(
                     GridLength::Auto,
                     GridLength::Auto,
                     GridLength::STAR,
+                    GridLength::Auto,
                     GridLength::Auto,
                 ])
                 .column_spacing(tokens::spacing::SM)
@@ -1853,47 +2433,16 @@ fn file_row(
                         .grid_column(2)
                         .vertical_alignment(VerticalAlignment::Center)
                         .text_trimming(TextTrimming::CharacterEllipsis),
-                    controls::text(state.to_owned(), tokens::text::CAPTION)
+                    Border::new()
                         .grid_column(3)
+                        .vertical_alignment(VerticalAlignment::Center)
+                        .maybe_content(counts.map(|(add, del)| controls::diff_counts(add, del))),
+                    controls::text(state, tokens::text::CAPTION)
+                        .grid_column(4)
                         .vertical_alignment(VerticalAlignment::Center),
                 )),
         )
-        .tooltip(path)
-}
-
-/// The selected file: Open in editor and Copy path, and why its diff is
-/// not shown.
-fn selected_file(path: &str, context: &mut ViewContext<DesktopApp>) -> View {
-    controls::card()
-        .content(
-            StackPanel::new().spacing(tokens::spacing::SM).children((
-                controls::body(path.to_owned())
-                    .text_trimming(TextTrimming::CharacterEllipsis)
-                    .is_text_selection_enabled(true),
-                controls::secondary(
-                    "Swarm cannot show this file's diff yet: the daemon gives the changed files and line totals, not the diff text.",
-                )
-                .text_wrapping(TextWrapping::Wrap),
-                toolbar(vec![
-                    KeyedView::new(
-                        "open",
-                        controls::outlined()
-                            .automation_name(format!("Open {path} in its editor"))
-                            .on_click(context.message(Message::Pane(PaneMsg::OpenFile(path.to_owned()))))
-                            .content(controls::icon_label(controls::glyph::EXTERNAL, "Open in editor"))
-                            .tooltip("Open with its default app"),
-                    ),
-                    KeyedView::new(
-                        "copy",
-                        controls::text_button()
-                            .automation_name(format!("Copy the path {path}"))
-                            .on_click(context.message(Message::Pane(PaneMsg::CopyPath(path.to_owned()))))
-                            .content(controls::icon_label(controls::glyph::COPY, "Copy path")),
-                    ),
-                    ], vec![
-                ]),
-            )),
-        ).into()
+        .tooltip(tooltip)
 }
 
 /// Merge and check's result card: merged and checked, conflicting paths,

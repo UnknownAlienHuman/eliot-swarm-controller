@@ -44,6 +44,7 @@ mod bulk_ui;
 mod chat_ui;
 mod configure_ui;
 mod dialog_ui;
+mod diff_ui;
 mod goal_ui;
 mod handoff_ui;
 mod inbox_ui;

@@ -1166,8 +1166,8 @@ pub enum RowMark {
     /// Waiting for you: the attention icon in the accent text color.
     Waiting,
     /// Idle or ready: no mark, its slot left empty so the title stays in
-    /// line with the others (§4.2: a resting task is the normal case, not
-    /// a ring).
+    /// line with the others (§4.2: a resting task is the neutral, normal
+    /// case; Codex's sidebar shows an idle chat by its title alone).
     Idle,
     /// Queued: the clock icon.
     Queued,

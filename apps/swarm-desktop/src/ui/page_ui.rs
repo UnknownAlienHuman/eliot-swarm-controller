@@ -307,7 +307,7 @@ pub(crate) fn agent_mark(state: AgentState, status_line: Option<&str>) -> Option
 
 /// An Agent's state mark in a page row, the sidebar's static marks: the
 /// accent dot while it works, the attention icon while it waits, the
-/// error icon; an empty slot when ready, none when stopped.
+/// error icon; the resting icon when ready, none when stopped.
 pub(crate) fn state_mark(state: AgentState) -> Option<View> {
     let (mark, word) = match state {
         AgentState::Created | AgentState::Starting | AgentState::Busy => {
