@@ -457,6 +457,10 @@ impl Store {
                 .filter(|item| {
                     item.kind == OwnerInboxKind::Stuck
                         && item.reason != super::owner_inbox::REPEATED_FAILURE_REASON
+                        // A fenced probe artifact is already reportable from the
+                        // startup recovery attempt; a second liveness sample only
+                        // duplicates the daemon log line.
+                        && item.reason != super::owner_inbox::PROBE_RECOVERY_NEEDS_OWNER
                 })
                 .map(|item| {
                     (
