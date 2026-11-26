@@ -27,7 +27,7 @@ use std::{
     time::Duration,
 };
 
-use eliot_core::local_provider::LocalProvider;
+use crate::local_provider::LocalProvider;
 use eliot_core::{Error, FailureOrigin, Result, SecretPolicy};
 use eliot_plugin::{
     StderrCapture,

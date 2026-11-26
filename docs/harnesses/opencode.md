@@ -309,10 +309,10 @@ a syntax-validated npm `package`, an absolute HTTP(S) `base_url`, an optional
 `api_key_env`, and a list of models. Each model has an `id` and optional integer
 `context_limit` and `output_limit`. Model IDs may contain slash segments.
 `base_url` rejects userinfo, queries, fragments, and substitutions. The OpenCode
-adapter applies the same validation to saved profiles and retained snapshots,
-including the npm package grammar and JavaScript integer limits. The
-serialized `local_provider` shape is unchanged. The adapter validates again
-before each isolated-config write.
+adapter declares decoding and validation of this payload through its profile
+capability for save and launch admission. Retained startup uses the same decoder
+and validation, including npm package grammar and JavaScript integer limits.
+The adapter validates again before each isolated-config write.
 
 Swarm generates the OpenCode `providers.<id>` entry with `settings.baseURL`,
 the configured model limits, and `settings.apiKey = "{env:NAME}"` when a key

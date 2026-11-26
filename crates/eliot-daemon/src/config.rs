@@ -1781,8 +1781,23 @@ struct ProfileEntry {
     setup: Vec<crate::setup::SetupEntry>,
     #[serde(default = "default_scratch")]
     scratch: Vec<String>,
-    #[serde(default)]
-    local_provider: Option<core::local_provider::LocalProvider>,
+    #[serde(default, deserialize_with = "decode_local_provider")]
+    local_provider: Option<Value>,
+}
+
+fn decode_local_provider<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<Value>, D::Error> {
+    let payload = Value::deserialize(deserializer)?;
+    // Preserve the strict settings parser. Harness support for this field is
+    // checked separately when the profile is prepared for admission.
+    if let Some(schema) = core::api::HarnessCapabilities::declarations()
+        .iter()
+        .find_map(|(_, capabilities)| capabilities.profile.local_provider)
+    {
+        (schema.check_shape)(&payload).map_err(serde::de::Error::custom)?;
+    }
+    Ok(Some(payload))
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -2728,7 +2743,7 @@ fn validate_launch_models(
             validate(model).map_err(|error| invalid(&error.reason))?;
         }
         if let LaunchModelScope::Check(stays_on_route) = scope
-            && !stays_on_route(profile, model)
+            && !stays_on_route(profile, model).map_err(|error| invalid(&error.message))?
         {
             return Err(invalid("every model must use the saved provider route"));
         }

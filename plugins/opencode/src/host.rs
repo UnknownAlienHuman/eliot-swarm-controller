@@ -1,3 +1,4 @@
+use crate::local_provider::LocalProvider;
 use crate::{
     events::{self, EventConfig, EventHandle, EventStatus, InboxRecord, SteerVerdict, TurnFacts},
     native::{
@@ -18,7 +19,6 @@ use crate::{
     },
 };
 use eliot_core::api::HarnessModelEntry;
-use eliot_core::local_provider::LocalProvider;
 use eliot_core::{ContextItem, Error, FailureOrigin, InjectPoint, McpPolicy, Result, SecretPolicy};
 use eliot_plugin::start_classification::{StartPoint, is_proven_no_effect, start_failure};
 use eliot_plugin::{
@@ -3785,7 +3785,7 @@ fn start_local_provider(profile: &serde_json::Map<String, Value>) -> Result<Opti
             None => Ok(None),
         };
     };
-    let provider: LocalProvider = serde_json::from_value(value.clone()).map_err(|_| {
+    let provider = LocalProvider::decode(value).map_err(|_| {
         Error::new(
             "profile_error",
             "OpenCode retained local_provider has invalid fields",
