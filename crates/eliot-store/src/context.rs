@@ -28,6 +28,46 @@ const CONTEXT_ITEMS_ARG: &str = "context_items";
 const MAX_CONTEXT_QUERY_ROWS: usize = 32;
 const MAX_CONTEXT_QUERY_BYTES: usize = MAX_FRAME_BYTES;
 const PROJECT_CHECK_PRINCIPAL: &str = "project_check";
+
+pub(super) const UNDISPATCHED_SWARM_NOTE_SQL: &str = undispatched_swarm_note_sql!();
+
+pub(super) fn withdraw_swarm_notes_tx(
+    tx: &Transaction<'_>,
+    agent: i64,
+    reason: &str,
+    now: i64,
+    mut events: Option<&mut Vec<Event>>,
+) -> Result<()> {
+    let commands = tx
+        .prepare_cached(&format!(
+            "SELECT c.id,c.generation FROM commands c
+             WHERE c.target=?1 AND {UNDISPATCHED_SWARM_NOTE_SQL} ORDER BY c.created_at,c.id"
+        ))
+        .map_err(sql_error)?
+        .query_map([agent], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Option<i64>>(1)?))
+        })
+        .map_err(sql_error)?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(sql_error)?;
+    let outcome = json!({"delivery":"withdrawn", "reason":reason});
+    for (id, generation) in commands {
+        update_command_state(tx, &id, CommandState::Cancelled, Some(&outcome), None, now)?;
+        if let Some(events) = events.as_deref_mut() {
+            events.push(insert_daemon_command_event(
+                tx,
+                now,
+                "command.cancelled",
+                Some(agent),
+                generation,
+                &id,
+                json!({"command_id":id,"state":"cancelled","outcome":outcome}),
+            )?);
+        }
+    }
+    Ok(())
+}
+
 enum FactNote<'a> {
     Text { text: &'a str, id: Option<&'a str> },
     Edits(&'a [ContextEditPath]),
@@ -458,7 +498,10 @@ impl Store {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(sql_error)?;
         let Some(agent) = load_agent_by_num(&tx, agent_num)?.filter(|agent| {
-            agent.generation == generation && !agent.is_terminal() && !agent.observe_only
+            agent.generation == generation
+                && !agent.is_terminal()
+                && !agent.observe_only
+                && !agent.archived
         }) else {
             return Ok(empty);
         };

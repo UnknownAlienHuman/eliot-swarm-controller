@@ -1007,9 +1007,11 @@ notes can be admitted for a turn.
 The note worker logs individual fact errors and advances its persisted cursor
 after processing each event. A task card summarizes the retained task brief, branch and Goal in
 at most 700 bytes. With no Goal set, it names the first linked input as the objective
-([Default Goal objective](#default-goal-objective)). Swarm sends it after native
+([Default Goal objective](#default-goal-objective)). Swarm adds it after native
 compaction (manual or automatic, on every harness that reports one), resume, switch or
-handoff, at most once per turn. Lifecycle notes can queue before the first linked input.
+handoff, at most once per turn. On an idle generation it waits for the next real input,
+which can be the first linked input. See [context notes](coordination.md#context-notes)
+for the lifecycle and attention behavior of the deferred note.
 
 A completed fast project check records a daemon event in the `project` family
 with kind `project.check.finished`, its triggering edit sequence and exit code.
