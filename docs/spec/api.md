@@ -375,7 +375,10 @@ the signed `Cf-Access-Jwt-Assertion` before MCP initialization or SDK dispatch.
 Managed OAuth's opaque client access token is not that assertion. The verifier uses
 the configured team issuer, fixed team signing-key endpoint, application AUD, RS256
 signature, expiry/not-before, application-token type and nonempty subject. Missing
-or invalid authentication is refused; key lookup failure fails closed. Manual HTTP
+or invalid authentication is refused; key lookup failure fails closed. A local
+cloud-access snapshot load failure fails closed with 503 (retryable local
+outage); token, issuer and audience mismatches, and team or owner-audience
+changes, stay 401. Manual HTTP
 requires the same `[cloud_mcp]` Access configuration; stdio/local IPC are unchanged.
 Host/Origin checks and cloudflared's own JWT validation remain additional checks.
 
@@ -3049,7 +3052,8 @@ scope of `turn.get`. Supply the visible turn's exact binding and the last
 returned non-null revision. The first call returns the current state. A long
 poll waits up to 20 seconds. On timeout it returns the same revision with
 `preview:null,ended:false`. The daemon limits concurrent calls to 32 overall
-and four per principal. Excess calls return `busy`. A changed revision
+and four per principal. Excess calls return `busy`. A client disconnect
+releases its slot without waiting for the timeout. A changed revision
 replaces the preview with `{message_id,text,truncated}`, or clears it if
 `preview` is null. A turn that is no longer active returns `ended:true` with
 a null preview. Discard the preview on terminal notification or selection change.
