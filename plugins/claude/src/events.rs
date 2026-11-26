@@ -3481,35 +3481,37 @@ impl EventProcessor {
         }
         // The native /compact control result has a success subtype and no
         // terminal reason. Its already committed boundary ties it to this turn.
-        let native_reason = if manual_compaction_completed {
-            "success"
-        } else {
-            &parsed.terminal_reason
-        };
-        let reported = native_terminal_reason(native_reason);
-        if reported == TerminalOutcome::Unknown {
+        let reported = native_terminal_reason(&parsed.terminal_reason);
+        if reported == TerminalOutcome::Unknown && !manual_compaction_completed {
             self.record_unclassified("claude.result.terminal_reason", &parsed.terminal_reason)
                 .await?;
         }
         let secrets = SecretPolicy::new(self.secrets.iter().cloned());
-        let terminal_reason = if reported == TerminalOutcome::Unknown {
+        let terminal_reason = if manual_compaction_completed {
+            String::new()
+        } else if reported == TerminalOutcome::Unknown {
             "other".to_owned()
         } else {
-            secrets.redact_text(native_reason)
+            secrets.redact_text(&parsed.terminal_reason)
         };
-        let outcome = eliot_plugin::settle::terminal_outcome(
+        let outcome = eliot_plugin::settle::terminal_outcome_with_manual_compaction(
             reported,
             self.native_provider_restriction
                 .as_ref()
                 .map(|restriction| restriction.kind),
+            record.get("subtype").and_then(Value::as_str) == Some("success")
+                && record.get("is_error").and_then(Value::as_bool) == Some(false),
+            manual_compaction_completed,
         );
         let mut data = json!({
             "command_id": command_id.clone(),
             "turn_id": turn_id.clone(),
-            "status": if outcome == TerminalOutcome::Failure { "failed" } else { &terminal_reason },
+            "status": if outcome == TerminalOutcome::Failure { "failed" } else if manual_compaction_completed { "completed" } else { &terminal_reason },
             "outcome": outcome,
-            "native_status": terminal_reason.clone(),
         });
+        if !manual_compaction_completed {
+            data["native_status"] = json!(terminal_reason);
+        }
         self.scope_turn_command(&mut data);
         let mut provider_restriction = self.native_provider_restriction.take();
         let rate_limit_event = self.native_rate_limit_event.take();
@@ -3649,7 +3651,7 @@ impl EventProcessor {
             command_id,
             turn_id,
             status: outcome.terminal_status().map(str::to_owned),
-            native_status: Some(terminal_reason),
+            native_status: (!manual_compaction_completed).then_some(terminal_reason),
             final_text: data
                 .get("final_text")
                 .and_then(Value::as_str)
