@@ -471,6 +471,8 @@ fn encode_record(
                 | "restart_count"
                 | "attempt"
                 | "retry_after_ms"
+                | "peer_pid"
+                | "suppressed_refusals"
         ) {
             let limit = if matches!(key, "native_scope" | "native_ref") {
                 1024

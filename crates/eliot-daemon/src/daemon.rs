@@ -2313,15 +2313,20 @@ async fn serve_connection_with_write_timeout(
                             }
                         }
                         Err(error) => {
-                            logging::record(
-                                &policy,
-                                "rpc.error",
-                                &[
-                                    ("principal", context.principal.as_str()),
-                                    ("method", context.method.as_str()),
-                                ],
-                                Some(&error),
-                            );
+                            // Desktop guard refusals already log once per peer,
+                            // rate-limited, at the refusal site; a line per
+                            // poll would bury the log.
+                            if !crate::router::is_interactive_desktop_refusal(&error) {
+                                logging::record(
+                                    &policy,
+                                    "rpc.error",
+                                    &[
+                                        ("principal", context.principal.as_str()),
+                                        ("method", context.method.as_str()),
+                                    ],
+                                    Some(&error),
+                                );
+                            }
                             RpcResponse {
                                 jsonrpc: "2.0".to_owned(),
                                 id: request.id,

@@ -9,7 +9,11 @@ use eliot_core::{
 };
 use eliot_plugin::sync::LockExt;
 use serde_json::{Value, json};
+#[cfg(windows)]
+use std::collections::HashMap;
 use std::sync::atomic::Ordering;
+#[cfg(windows)]
+use std::sync::{Mutex, OnceLock};
 
 pub(super) fn authorize_local(
     method: &str,
@@ -37,10 +41,76 @@ pub(super) fn authorize_local(
     if peer.is_some_and(LocalPeer::is_interactive_desktop) {
         return Ok(());
     }
-    Err(Error::new(
-        "not_allowed",
-        "vendor sign-in requires the interactive Swarm desktop",
-    ))
+    #[cfg(windows)]
+    note_desktop_refusal(method, peer.map(LocalPeer::process_id).unwrap_or(0));
+    Err(Error::new("not_allowed", INTERACTIVE_DESKTOP_REFUSAL))
+}
+
+/// Wire-stable refusal when the peer is not the interactive Swarm desktop.
+/// The message is matched by [`is_interactive_desktop_refusal`] so the
+/// daemon can throttle this log line without changing the desktop contract.
+const INTERACTIVE_DESKTOP_REFUSAL: &str = "vendor sign-in requires the interactive Swarm desktop";
+
+/// Re-log a refused desktop peer at most this often; the first refusal per
+/// peer always logs. A refused poller retries every few seconds, so a line
+/// per call buries the daemon log.
+#[cfg(windows)]
+const DESKTOP_REFUSAL_LOG_COOLDOWN_MS: i64 = 15 * 60 * 1000;
+
+/// Last refusal-log time per peer pid (`0` when the peer had no pid), plus
+/// the refusals suppressed since that log.
+#[cfg(windows)]
+static DESKTOP_REFUSAL_LOGS: OnceLock<Mutex<HashMap<u32, (i64, u64)>>> = OnceLock::new();
+
+/// Whether this error is the interactive-desktop guard refusal. The daemon
+/// logs those once per peer (rate-limited) at the refusal site instead of on
+/// every call.
+pub(crate) fn is_interactive_desktop_refusal(error: &Error) -> bool {
+    error.code == "not_allowed" && error.message.as_str() == INTERACTIVE_DESKTOP_REFUSAL
+}
+
+/// Log a desktop guard refusal once per peer, rate-limited. Callers keep
+/// returning the wire-stable refusal for every poll.
+#[cfg(windows)]
+fn note_desktop_refusal(method: &str, pid: u32) {
+    let suppressed = {
+        let mut logs = DESKTOP_REFUSAL_LOGS
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock_recover();
+        let now = now_ms();
+        match logs.get_mut(&pid) {
+            Some((last, suppressed)) => {
+                if now.wrapping_sub(*last) < DESKTOP_REFUSAL_LOG_COOLDOWN_MS {
+                    *suppressed += 1;
+                    return;
+                }
+                let dropped = *suppressed;
+                *last = now;
+                *suppressed = 0;
+                dropped
+            }
+            None => {
+                logs.insert(pid, (now, 0));
+                0
+            }
+        }
+    };
+    let pid_text = pid.to_string();
+    let suppressed_text = suppressed.to_string();
+    let mut ids = vec![
+        ("principal", "owner"),
+        ("method", method),
+        ("peer_pid", pid_text.as_str()),
+    ];
+    if suppressed > 0 {
+        ids.push(("suppressed_refusals", suppressed_text.as_str()));
+    }
+    crate::logging::record(
+        &eliot_core::SecretPolicy::default(),
+        "rpc.error",
+        &ids,
+        Some(&Error::new("not_allowed", INTERACTIVE_DESKTOP_REFUSAL)),
+    );
 }
 
 pub(super) fn supports_login(harness: &str) -> bool {
