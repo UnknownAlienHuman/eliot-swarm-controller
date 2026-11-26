@@ -1694,9 +1694,15 @@ transfers to B. When the last turn may have left partial effects, the brief tell
 to repeat its steps before checking them, and the Owner inbox gets a `handoff` item.
 Swarm never replays that turn.
 The inbox omits an applied handoff notice after the source is archived or
-the linked source turn settles. It shows the exact linked unknown command
+the linked source turn settles. It also omits the notice once the recorded
+successor ended cleanly: the successor ran at least one turn, every
+successor turn completed, no successor command still needs an outcome, and
+no successor Goal is active or blocked. Linked unknown commands and turns
+keep their own items; uncertain effects are never settled by omitting the
+notice. It shows the exact linked unknown command
 or turn once. An uncertain handoff with no recorded task binding stays
-visible while the source is unarchived. A failed or interrupted turn with
+visible while the source is unarchived, unless the successor ended cleanly
+as above. A failed or interrupted turn with
 possible partial effects can still need review.
 
 A session-loss wait records its unfinished turn when known. It closes on

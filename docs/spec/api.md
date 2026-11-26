@@ -929,7 +929,12 @@ uncertain effects (`handoff`) and [work not recorded in Git](monitoring.md#work-
 `goal.round` action (`round`) as the recommended choice alongside `goal.get`
 (`inspect`) when the Agent is cleanly idle with an unconsumed key or due cadence
 slot. Recommendations
-are derived from retained facts. Send `owner.decide` with the item kind,
+are derived from retained facts. Every item carries either a recommended action or instructions with the
+exact Owner command: owner-required holds name
+`swarm provider clear-hold <scope> --corrective-evidence <evidence>`,
+unknown turns name
+`swarm turn resolve <agent> --generation <n> --turn-id <turn> --status <status> --reason "<verified evidence>"`,
+and unknown commands name `swarm cmd resolve`. Send `owner.decide` with the item kind,
 subject, revision, and an offered choice name, `recommended`, or `snooze`.
 The daemon checks the revision under the Store writer when it admits the
 selected mutation. For every kind, the revision binds the subject facts, reason,
