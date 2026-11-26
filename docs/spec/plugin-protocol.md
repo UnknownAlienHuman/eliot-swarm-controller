@@ -979,9 +979,10 @@ else for the next input. Codex `contextCompaction` item completion, Claude
 compaction items produce this fact.
 Each uses exact native identity when available and the active turn only when
 bound. Claude exposes the `manual` or `auto` trigger in its boundary metadata
-when supplied. Swarm sends a native Claude `/compact` as input to the session
-and observes its exact `compact_boundary`. The adapter keeps Eliot's
-`compact` capability false. Its CLI `--autocompact` option only changes native
+when supplied. The `compact` verb writes a native Claude `/compact` on the
+idle boundary, tracks its echo and terminal in memory without starting a
+turn, and reports only a fresh exact observed `compact_boundary`; the
+adapter declares Eliot's `compact` capability true. Its CLI `--autocompact` option only changes native
 automatic compaction behavior. [Claude Code compaction](../harnesses/claude-code.md)
 An exactly associated OpenCode SSE execution terminal proves its status even when
 HTTP transcript enrichment is unavailable, including after the native server exits.
