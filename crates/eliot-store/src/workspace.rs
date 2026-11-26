@@ -2218,11 +2218,11 @@ pub struct StandWorkspaceRecord {
 }
 
 impl Store {
-    /// Read managed workspace records under the stand root and count foreign
-    /// rows without opening the Store writer or resolving their paths.
+    /// Read owned managed workspace records and count foreign rows without
+    /// opening the Store writer. The caller supplies the stand's ownership check.
     pub fn list_stand_workspaces_readonly(
         db_path: &Path,
-        stand_root: &Path,
+        mut owns_worktree: impl FnMut(&str) -> bool,
     ) -> Result<(Vec<StandWorkspaceRecord>, usize)> {
         if !db_path.exists() {
             return Ok((Vec::new(), 0));
@@ -2253,20 +2253,11 @@ impl Store {
             ))
             .map_err(sql_error)?;
         let mut rows = statement.query([]).map_err(sql_error)?;
-        let root = stand_root.to_string_lossy();
-        let root_key = core::workspace_path_key(&root);
         let mut records = Vec::new();
         let mut skipped = 0;
         while let Some(row) = rows.next().map_err(sql_error)? {
             let worktree_path: String = row.get("worktree_path").map_err(sql_error)?;
-            let worktree_key = core::workspace_path_key(&worktree_path);
-            let relative = Path::new(worktree_key.as_ref()).strip_prefix(root_key.as_ref());
-            if !relative.is_ok_and(|path| {
-                !path.as_os_str().is_empty()
-                    && path
-                        .components()
-                        .all(|part| matches!(part, std::path::Component::Normal(_)))
-            }) {
+            if !owns_worktree(&worktree_path) {
                 skipped += 1;
                 continue;
             }

@@ -1598,7 +1598,7 @@ fn load_external_workspaces(stand_root: &Path) -> Result<(Vec<StandWorkspaceReco
             }
         }
     }
-    let (owned, skipped) = Store::list_stand_workspaces_readonly(&db_path, stand_root)?;
+    let (owned, skipped) = load_stand_workspaces(stand_root, &db_path)?;
     let mut external = Vec::new();
     for record in owned {
         if is_external_repo(stand_root, &record.preparation.repo_common_dir)? {
@@ -1616,30 +1616,60 @@ fn external_branch_key(common_dir: &str, branch: &str) -> String {
     format!("{}::refs/heads/{branch}", workspace_path_key(common_dir))
 }
 
+fn canonical_stand_worktrees(stand_root: &Path) -> Result<PathBuf> {
+    let worktrees = stand_root
+        .canonicalize()
+        .map_err(|_| Error::new("source_integrity", "stand root is unavailable"))?
+        .join("worktrees");
+    reject_links(&worktrees)?;
+    match worktrees.canonicalize() {
+        Ok(root) => Ok(root),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(worktrees),
+        Err(_) => Err(Error::new(
+            "source_integrity",
+            "stand worktree directory is unavailable",
+        )),
+    }
+}
+
+fn stand_owns_worktree(worktrees: &Path, path: &Path) -> bool {
+    if !path.is_absolute() {
+        return false;
+    }
+    // The worktree itself may be gone while its Git branch still needs cleanup.
+    let resolved = path.ancestors().find_map(|ancestor| {
+        let prefix = ancestor.canonicalize().ok()?;
+        Some(prefix.join(path.strip_prefix(ancestor).ok()?))
+    });
+    let path = resolved.as_deref().unwrap_or(path);
+    let root = worktrees.to_string_lossy();
+    let worktree = path.to_string_lossy();
+    let root_key = workspace_path_key(&root);
+    let worktree_key = workspace_path_key(&worktree);
+    Path::new(worktree_key.as_ref())
+        .strip_prefix(root_key.as_ref())
+        .is_ok_and(|relative| {
+            !relative.as_os_str().is_empty()
+                && relative
+                    .components()
+                    .all(|part| matches!(part, Component::Normal(_)))
+        })
+}
+
+fn load_stand_workspaces(
+    stand_root: &Path,
+    db_path: &Path,
+) -> Result<(Vec<StandWorkspaceRecord>, usize)> {
+    let worktrees = canonical_stand_worktrees(stand_root)?;
+    Store::list_stand_workspaces_readonly(db_path, |path| {
+        stand_owns_worktree(&worktrees, Path::new(path))
+    })
+}
+
 fn check_stand_worktree_location(stand_root: &Path, worktree_path: &str) -> Result<()> {
     let path = Path::new(worktree_path);
     reject_links(path)?;
-    let canonical_stand_worktrees =
-        fs::canonicalize(stand_root.join("worktrees")).map_err(|_| {
-            Error::new(
-                "source_integrity",
-                "stand worktree directory is unavailable",
-            )
-        })?;
-    let canonical_worktree = match fs::canonicalize(path) {
-        Ok(resolved) => resolved,
-        Err(_) => std::path::absolute(path).map_err(|_| {
-            Error::new(
-                "source_integrity",
-                "stand worktree path could not be resolved",
-            )
-        })?,
-    };
-    let root_key = workspace_path_key(&canonical_stand_worktrees.to_string_lossy()).into_owned();
-    let wt_key = workspace_path_key(&canonical_worktree.to_string_lossy()).into_owned();
-    let root_path = Path::new(&root_key);
-    let wt_path = Path::new(&wt_key);
-    if wt_path == root_path || !wt_path.starts_with(root_path) {
+    if !stand_owns_worktree(&canonical_stand_worktrees(stand_root)?, path) {
         return Err(Error::new(
             "not_allowed",
             "recorded stand worktree escapes stand worktrees directory",
@@ -2604,13 +2634,23 @@ fn require_stand_cleanup_custody_closed(stand_root: &Path) -> Result<()> {
     let store_path = stand_root.join("eliot.db");
     reject_links(&store_path)?;
     let store = Store::open_read_only(&store_path)?;
-    if store.stand_has_unsettled_cleanup_work()? {
-        return Err(Error::new(
+    let unsettled = || {
+        Error::new(
             "stand_custody_unsettled",
             "stand has live custody or unresolved work",
-        ));
+        )
+    };
+    if store.stand_has_unsettled_cleanup_work()? {
+        return Err(unsettled());
     }
-    let (workspaces, _) = Store::list_stand_workspaces_readonly(&store_path, stand_root)?;
+    // Foreign workspace rows belong to the source Store. The stand never acts on them.
+    let (workspaces, _) = load_stand_workspaces(stand_root, &store_path)?;
+    if workspaces
+        .iter()
+        .any(|entry| entry.preparation.phase == eliot_core::WorkspacePhase::Unknown)
+    {
+        return Err(unsettled());
+    }
     for workspace in workspaces {
         if workspace.preparation.phase != eliot_core::WorkspacePhase::Removed
             && !is_external_repo(stand_root, &workspace.preparation.repo_common_dir)?

@@ -1707,7 +1707,7 @@ impl Store {
     }
 
     /// An offline writable stand must also have settled its internal custody.
-    /// A read-only snapshot stand has no owned processes of its own.
+    /// Workspace phases are checked by the caller against stand-owned paths.
     pub fn stand_has_unsettled_cleanup_work(&self) -> Result<bool> {
         self.connection.query_row(
             "SELECT EXISTS(SELECT 1 FROM processes WHERE state IN ('running','unknown'))
@@ -1717,8 +1717,7 @@ impl Store {
               OR EXISTS(SELECT 1 FROM commands WHERE state IN ('accepted','queued','dispatched','unknown'))
               OR EXISTS(SELECT 1 FROM turns WHERE state IN ('running','unknown'))
               OR EXISTS(SELECT 1 FROM goal_markers)
-              OR EXISTS(SELECT 1 FROM artifacts WHERE json_extract(body,'$.state')='unknown')
-              OR EXISTS(SELECT 1 FROM workspaces WHERE phase='unknown')",
+              OR EXISTS(SELECT 1 FROM artifacts WHERE json_extract(body,'$.state')='unknown')",
             [], |r|r.get(0),
         ).map_err(sql_error)
     }
