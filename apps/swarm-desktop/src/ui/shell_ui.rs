@@ -2426,21 +2426,25 @@ impl DesktopApp {
         // programmatic. Reactor applies only visuals that differ from the
         // default, so this declaration also carries the title-bar theme.
         let (min_width, min_height) = eliot_daemon::DESKTOP_WINDOW_MIN;
-        context.window_visuals(
-            WindowVisuals::new()
-                .client_size(
-                    self.preferred_window
-                        .map_or(tokens::layout::WINDOW_WIDTH, |w| f64::from(w.0)),
-                    self.preferred_window
-                        .map_or(tokens::layout::WINDOW_HEIGHT, |w| f64::from(w.1)),
-                )
-                .constraints(WindowConstraints {
-                    min_width: Some(f64::from(min_width)),
-                    min_height: Some(f64::from(min_height)),
-                    ..WindowConstraints::default()
-                })
-                .theme(window_theme(self.prefs.theme)),
-        );
+        let visuals = WindowVisuals::new()
+            .client_size(
+                self.preferred_window
+                    .map_or(tokens::layout::WINDOW_WIDTH, |w| f64::from(w.0)),
+                self.preferred_window
+                    .map_or(tokens::layout::WINDOW_HEIGHT, |w| f64::from(w.1)),
+            )
+            .constraints(WindowConstraints {
+                min_width: Some(f64::from(min_width)),
+                min_height: Some(f64::from(min_height)),
+                ..WindowConstraints::default()
+            })
+            .theme(window_theme(self.prefs.theme));
+        // The saved place and size, restored by Reactor before the first
+        // show (`window_place`).
+        context.window_visuals(match self.initial_bounds {
+            Some(bounds) => visuals.initial_placement(bounds),
+            None => visuals,
+        });
         let main: View = match self.main {
             main if main != Main::Settings && self.link_view_shown() => {
                 self.startup_error_view(context)
