@@ -1420,9 +1420,16 @@ mod native {
             == (b.dwVolumeSerialNumber, b.nFileIndexHigh, b.nFileIndexLow))
     }
     pub(super) fn replace(parent: &File, temp: &File, _: &str, name: &str) -> io::Result<()> {
+        use windows_sys::Wdk::Storage::FileSystem::FILE_RENAME_REPLACE_IF_EXISTS;
+        rename_relative(parent, temp, name, FILE_RENAME_REPLACE_IF_EXISTS)
+    }
+    pub(super) fn publish_new(parent: &File, temp: &File, name: &str) -> io::Result<()> {
+        rename_relative(parent, temp, name, 0)
+    }
+    fn rename_relative(parent: &File, temp: &File, name: &str, flags: u32) -> io::Result<()> {
         use windows_sys::Wdk::Storage::FileSystem::{
-            FILE_RENAME_INFORMATION, FILE_RENAME_POSIX_SEMANTICS, FILE_RENAME_REPLACE_IF_EXISTS,
-            FileRenameInformationEx, NtSetInformationFile,
+            FILE_RENAME_INFORMATION, FILE_RENAME_POSIX_SEMANTICS, FileRenameInformationEx,
+            NtSetInformationFile,
         };
         let wide: Vec<u16> = name.encode_utf16().collect();
         let length = std::mem::size_of::<FILE_RENAME_INFORMATION>() + wide.len() * 2;
@@ -1430,7 +1437,7 @@ mod native {
         let mut buffer = vec![0usize; length.div_ceil(std::mem::size_of::<usize>())];
         let rename = buffer.as_mut_ptr().cast::<FILE_RENAME_INFORMATION>();
         unsafe {
-            (*rename).Anonymous.Flags = FILE_RENAME_REPLACE_IF_EXISTS | FILE_RENAME_POSIX_SEMANTICS;
+            (*rename).Anonymous.Flags = flags | FILE_RENAME_POSIX_SEMANTICS;
             (*rename).RootDirectory = parent.as_raw_handle();
             (*rename).FileNameLength = (wide.len() * 2) as u32;
             std::ptr::copy_nonoverlapping(
@@ -1441,40 +1448,6 @@ mod native {
             // Use the documented native rename form: the Win32 wrapper on
             // supported hosts can reject a non-null RootDirectory (error 87).
             // There is no pathname fallback.
-            let mut status_block: IO_STATUS_BLOCK = std::mem::zeroed();
-            let status = NtSetInformationFile(
-                temp.as_raw_handle(),
-                &mut status_block,
-                rename.cast(),
-                length as u32,
-                FileRenameInformationEx,
-            );
-            if status < 0 {
-                return Err(io::Error::other(format!(
-                    "NtSetInformationFile status {status:#x}"
-                )));
-            }
-        }
-        Ok(())
-    }
-    pub(super) fn publish_new(parent: &File, temp: &File, name: &str) -> io::Result<()> {
-        use windows_sys::Wdk::Storage::FileSystem::{
-            FILE_RENAME_INFORMATION, FILE_RENAME_POSIX_SEMANTICS, FileRenameInformationEx,
-            NtSetInformationFile,
-        };
-        let wide: Vec<u16> = name.encode_utf16().collect();
-        let length = std::mem::size_of::<FILE_RENAME_INFORMATION>() + wide.len() * 2;
-        let mut buffer = vec![0usize; length.div_ceil(std::mem::size_of::<usize>())];
-        let rename = buffer.as_mut_ptr().cast::<FILE_RENAME_INFORMATION>();
-        unsafe {
-            (*rename).Anonymous.Flags = FILE_RENAME_POSIX_SEMANTICS;
-            (*rename).RootDirectory = parent.as_raw_handle();
-            (*rename).FileNameLength = (wide.len() * 2) as u32;
-            std::ptr::copy_nonoverlapping(
-                wide.as_ptr(),
-                (*rename).FileName.as_mut_ptr(),
-                wide.len(),
-            );
             let mut status_block: IO_STATUS_BLOCK = std::mem::zeroed();
             let status = NtSetInformationFile(
                 temp.as_raw_handle(),
