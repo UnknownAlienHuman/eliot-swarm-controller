@@ -1362,7 +1362,7 @@ fn project_work_not_in_git(
             )
         } else {
             format!(
-                "Compare {branch} with a worktree backup or decide whether to discard the missing edits. Recorded paths are {}.",
+                "Recover the listed paths for {branch} from a worktree backup. Recorded paths are {}.",
                 paths.as_deref().unwrap_or("unavailable")
             )
         });

@@ -52,6 +52,7 @@ impl GitProbe {
         {
             return Err(Error::new("unproven", "object ID does not name a commit"));
         }
+        // Retained refs, including remote-tracking refs, can move. Settlement records this tip.
         let tip = self
             .project_git_metadata(
                 root,
@@ -77,6 +78,25 @@ impl GitProbe {
             return Err(Error::new(
                 "unproven",
                 "commit is not reachable from the retained ref",
+            ));
+        }
+        if work.dirty.iter().any(|entry| entry.status == ".D")
+            && (!is_git_oid(&work.head)
+                || work.head.eq_ignore_ascii_case(&request.commit)
+                || self
+                    .project_git_metadata(
+                        root,
+                        &["merge-base", "--is-ancestor", &work.head, &request.commit],
+                        Some(binding),
+                        deadline,
+                    )
+                    .await?
+                    .code
+                    != 0)
+        {
+            return Err(Error::new(
+                "unproven",
+                "deletion proof requires a commit strictly descended from the observed HEAD",
             ));
         }
         let overrides = self
@@ -107,7 +127,10 @@ impl GitProbe {
         for entry in &work.dirty {
             hash_dirty_entry(&mut digest, entry);
             let object = entries.get(entry.path.as_str());
-            if entry.status == ".D" && object.is_none() {
+            if entry.status == ".D" {
+                if object.is_some() {
+                    return Err(content_mismatch());
+                }
                 hash_digest_part(&mut digest, b"missing");
                 continue;
             }

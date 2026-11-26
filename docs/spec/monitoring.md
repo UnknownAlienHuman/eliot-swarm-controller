@@ -1020,7 +1020,9 @@ For a missing worktree without a checkpoint, the Owner can supply a retained
 branch ref and a commit reachable from it. Swarm can settle the item when the
 exact removal-bound observation retains the complete path list and dirty-content
 digest, and the commit reproduces that digest from regular file bytes and
-recorded deletions. Observations with staged changes, renames or missing content
+recorded deletions. To prove a recorded deletion, the candidate commit must be a
+strict descendant of the observed HEAD and the deleted path must be absent from
+its tree. Observations with staged changes, renames or missing content
 evidence remain Owner decisions. Commit ancestry alone cannot settle dirty work.
 
 Checkpoint capture and accounting share the repository write lane with managed Git
