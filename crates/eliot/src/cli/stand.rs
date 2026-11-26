@@ -2,6 +2,7 @@
 
 use super::operator::{start_owned_stand, stop_and_drain_stand, verify_stand_daemon_exit};
 use super::support::{Failure, print_value};
+use eliot_core::api::discovery::{IdentityRequest, IdentityResponse};
 use eliot_core::api::{
     ArtifactKind, ArtifactRegisterRequest, ArtifactView, DEFAULT_STAND_TTL_MS,
     SWARM_STAND_ARTIFACT_PURPOSE,
@@ -330,9 +331,7 @@ struct DownOutcome {
     data_dir: String,
     daemon_pid: Option<u32>,
     force_blocker: Option<String>,
-    external_worktrees: Vec<eliot_daemon::operator::StandWorktreeOutcome>,
-    external_branches: Vec<eliot_daemon::operator::StandBranchOutcome>,
-    unusable_records: Vec<String>,
+    cleanup: StandExternalCleanupReport,
     /// What happened to a former-location registration, and its path.
     former_registration: Option<(String, String)>,
 }
@@ -364,7 +363,7 @@ fn print_former(former: Option<&(String, String)>) {
 }
 
 pub(crate) async fn down(path: PathBuf, json_output: bool) -> Result<u8, Failure> {
-    let outcome = tokio::spawn(async move { Box::pin(down_inner(&path)).await })
+    let outcome = tokio::spawn(async move { Box::pin(down_inner(&path, None)).await })
         .await
         .map_err(|error| Failure::new(1, format!("stand teardown task failed: {error}")))??;
     let payload = json!({
@@ -372,9 +371,10 @@ pub(crate) async fn down(path: PathBuf, json_output: bool) -> Result<u8, Failure
         "data_dir": outcome.data_dir,
         "daemon_pid": outcome.daemon_pid,
         "force_blocker": outcome.force_blocker,
-        "external_worktrees": outcome.external_worktrees,
-        "external_branches": outcome.external_branches,
-        "unusable_records": outcome.unusable_records,
+        "external_worktrees": outcome.cleanup.worktrees,
+        "external_branches": outcome.cleanup.branches,
+        "unusable_records": outcome.cleanup.unusable_records,
+        "skipped_foreign_workspaces": outcome.cleanup.skipped_foreign_workspaces,
         "former_registration": former_value(outcome.former_registration.as_ref()),
     });
     if json_output {
@@ -392,7 +392,7 @@ pub(crate) async fn down(path: PathBuf, json_output: bool) -> Result<u8, Failure
             println!("Removed read-only Store copy {}", outcome.data_dir);
         }
         print_former(outcome.former_registration.as_ref());
-        print_external_summary(&outcome.external_worktrees, &outcome.external_branches);
+        print_external_summary(&outcome.cleanup);
     } else {
         if let Some(blocker) = &outcome.force_blocker {
             eprintln!("Forced shutdown after graceful drain failed: {blocker}");
@@ -408,8 +408,8 @@ pub(crate) async fn down(path: PathBuf, json_output: bool) -> Result<u8, Failure
             ),
         }
         print_former(outcome.former_registration.as_ref());
-        print_external_summary(&outcome.external_worktrees, &outcome.external_branches);
-        for message in &outcome.unusable_records {
+        print_external_summary(&outcome.cleanup);
+        for message in &outcome.cleanup.unusable_records {
             println!("  {message}");
         }
         eprintln!(
@@ -420,7 +420,7 @@ pub(crate) async fn down(path: PathBuf, json_output: bool) -> Result<u8, Failure
     Ok(if outcome.state == "removed" { 0 } else { 4 })
 }
 
-async fn down_inner(path: &Path) -> Result<DownOutcome, Failure> {
+async fn down_inner(path: &Path, pruner: Option<&StandPruneAgent>) -> Result<DownOutcome, Failure> {
     let path =
         std::path::absolute(path).map_err(|error| io_failure("resolve stand path", error))?;
     let parent = path
@@ -439,6 +439,7 @@ async fn down_inner(path: &Path) -> Result<DownOutcome, Failure> {
     ensure_registry_is_external(&root, &located.registry).map_err(Failure::for_read)?;
     let removal = lock_stand_removal(&root).map_err(Failure::for_read)?;
     let mut record = located.record.clone();
+    require_prune_registrant(pruner, &record)?;
     let finish_removed = |record: &StandRegistration| -> Result<DownOutcome, Failure> {
         remove_stand_registration(&located.registry, &reg_name).map_err(Failure::for_read)?;
         Ok(DownOutcome {
@@ -446,9 +447,7 @@ async fn down_inner(path: &Path) -> Result<DownOutcome, Failure> {
             data_dir: display(&root),
             daemon_pid: record.removing_pid.filter(|pid| *pid != 0),
             force_blocker: None,
-            external_worktrees: Vec::new(),
-            external_branches: Vec::new(),
-            unusable_records: Vec::new(),
+            cleanup: StandExternalCleanupReport::default(),
             former_registration: located.former.then(|| {
                 (
                     "removed".to_owned(),
@@ -472,6 +471,7 @@ async fn down_inner(path: &Path) -> Result<DownOutcome, Failure> {
     let _transition = lock_transition(&root).map_err(Failure::for_read)?;
     record =
         read_stand_registration(&located.registry, &reg_name, &root).map_err(Failure::for_read)?;
+    require_prune_registrant(pruner, &record)?;
     verify_stand_marker(&root, &record).map_err(Failure::for_read)?;
     verify_stand_target(&root, &record).map_err(Failure::for_read)?;
     #[cfg(windows)]
@@ -523,43 +523,33 @@ async fn down_inner(path: &Path) -> Result<DownOutcome, Failure> {
         settle_former_registration(&root, &located, &record).map_err(Failure::for_read)?;
     let registry = settled.registry;
     let former_registration = settled.former;
-    let (external_worktrees, external_branches, unusable_records) = if read_only_copy {
-        (Vec::new(), Vec::new(), Vec::new())
+    let cleanup = if read_only_copy {
+        StandExternalCleanupReport::default()
     } else {
-        let report: StandExternalCleanupReport = Box::pin(cleanup_stand_external_git(
+        Box::pin(cleanup_stand_external_git(
             &root,
             &registry,
             &reg_name,
             &mut record,
         ))
         .await
-        .map_err(Failure::for_mutation)?;
-        if report.has_retained_or_unknown() {
-            return Ok(DownOutcome {
-                state: "retained",
-                data_dir: display(&root),
-                daemon_pid,
-                force_blocker,
-                external_worktrees: report.worktrees,
-                external_branches: report.branches,
-                unusable_records: report.unusable_records,
-                former_registration,
-            });
-        }
-        (report.worktrees, report.branches, report.unusable_records)
+        .map_err(Failure::for_mutation)?
     };
-    record.removing_pid = Some(daemon_pid.unwrap_or_default());
-    write_stand_registration(&registry, &reg_name, &record).map_err(Failure::for_read)?;
-    remove_offline_stand_root(&root, offline).map_err(Failure::for_read)?;
-    remove_stand_registration(&registry, &reg_name).map_err(Failure::for_read)?;
+    let state = if cleanup.has_retained_or_unknown() {
+        "retained"
+    } else {
+        record.removing_pid = Some(daemon_pid.unwrap_or_default());
+        write_stand_registration(&registry, &reg_name, &record).map_err(Failure::for_read)?;
+        remove_offline_stand_root(&root, offline).map_err(Failure::for_read)?;
+        remove_stand_registration(&registry, &reg_name).map_err(Failure::for_read)?;
+        "removed"
+    };
     Ok(DownOutcome {
-        state: "removed",
+        state,
         data_dir: display(&root),
         daemon_pid,
         force_blocker,
-        external_worktrees,
-        external_branches,
-        unusable_records,
+        cleanup,
         former_registration,
     })
 }
@@ -634,7 +624,57 @@ pub(crate) async fn list(json_output: bool) -> Result<u8, Failure> {
     Ok(0)
 }
 
+#[derive(Clone)]
+struct StandPruneAgent {
+    parent: PathBuf,
+    id: String,
+    generation: i64,
+}
+
+async fn stand_prune_agent() -> Result<Option<StandPruneAgent>, Failure> {
+    let Some(parent) = eliot_daemon::operator::stand_prune_parent().map_err(Failure::for_read)?
+    else {
+        return Ok(None);
+    };
+    let identity: IdentityResponse =
+        eliot_daemon::client_call_typed(&parent, "api.identity", &IdentityRequest::default())
+            .await
+            .map_err(Failure::for_read)?;
+    match (
+        identity.principal.as_str(),
+        identity.agent_id,
+        identity.generation,
+    ) {
+        ("agent", Some(id), Some(generation)) => Ok(Some(StandPruneAgent {
+            parent,
+            id,
+            generation,
+        })),
+        _ => Err(Failure::new(
+            3,
+            "stand prune requires a bound Agent principal",
+        )),
+    }
+}
+
+fn require_prune_registrant(
+    pruner: Option<&StandPruneAgent>,
+    registration: &StandRegistration,
+) -> Result<(), Failure> {
+    if let Some(agent) = pruner {
+        eliot_daemon::operator::verify_stand_registrant(
+            registration,
+            &agent.parent,
+            &agent.id,
+            agent.generation,
+        )
+        .map_err(Failure::for_read)?;
+    }
+    Ok(())
+}
+
 pub(crate) async fn prune(json_output: bool) -> Result<u8, Failure> {
+    let pruner = stand_prune_agent().await?;
     let StandRegistryScan { entries, unusable } = scan_registry()?;
     let now = stand_now_ms();
     let mut results: Vec<Value> = Vec::with_capacity(entries.len());
@@ -644,6 +684,21 @@ pub(crate) async fn prune(json_output: bool) -> Result<u8, Failure> {
     for entry in entries {
         let root = entry.registration.marker.root.clone();
         let data_dir = display(&root);
+        if let Err(error) = require_prune_registrant(pruner.as_ref(), &entry.registration) {
+            let skipped = matches!(
+                error.code.as_deref(),
+                Some("stand_owner_unknown" | "stand_not_owned")
+            );
+            any_blocked |= !skipped;
+            results.push(json!({
+                "data_dir": data_dir,
+                "outcome": if skipped { "skipped" } else { "error" },
+                "reason": error.code,
+                "message": error.message,
+                "former_registry": entry.former_path,
+            }));
+            continue;
+        }
         if fs::symlink_metadata(&root)
             .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
         {
@@ -651,18 +706,24 @@ pub(crate) async fn prune(json_output: bool) -> Result<u8, Failure> {
             // drain and no expiry to wait for: drop the registration instead
             // of lingering until the TTL (or erroring past it).
             let reg_name = registry_name(&root);
-            match locate_stand_registration(&root)
-                .map_err(Failure::for_read)
-                .and_then(|located| {
-                    remove_stand_registration(&located.registry, &reg_name)
-                        .map_err(Failure::for_read)?;
-                    Ok(located.former.then(|| {
-                        (
-                            "removed".to_owned(),
-                            located.registry.join(&reg_name).display().to_string(),
-                        )
-                    }))
-                }) {
+            match (|| {
+                let _removal = lock_stand_removal(&root).map_err(Failure::for_read)?;
+                let located = locate_stand_registration(&root).map_err(Failure::for_read)?;
+                require_prune_registrant(pruner.as_ref(), &located.record)?;
+                if !fs::symlink_metadata(&root)
+                    .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+                {
+                    return Err(Failure::new(4, "stand root changed during prune"));
+                }
+                remove_stand_registration(&located.registry, &reg_name)
+                    .map_err(Failure::for_read)?;
+                Ok(located.former.then(|| {
+                    (
+                        "removed".to_owned(),
+                        located.registry.join(&reg_name).display().to_string(),
+                    )
+                }))
+            })() {
                 Ok(former) => {
                     results.push(json!({
                         "data_dir": data_dir,
@@ -701,17 +762,20 @@ pub(crate) async fn prune(json_output: bool) -> Result<u8, Failure> {
             continue;
         }
         let root_for_down = root.clone();
-        let down_result = tokio::spawn(async move { Box::pin(down_inner(&root_for_down)).await })
-            .await
-            .map_err(|error| Failure::new(1, format!("stand prune task failed: {error}")))?;
+        let agent = pruner.clone();
+        let down_result =
+            tokio::spawn(async move { Box::pin(down_inner(&root_for_down, agent.as_ref())).await })
+                .await
+                .map_err(|error| Failure::new(1, format!("stand prune task failed: {error}")))?;
         match down_result {
             Ok(outcome) if outcome.state == "removed" => {
                 results.push(json!({
                     "data_dir": outcome.data_dir,
                     "outcome": "removed",
                     "daemon_pid": outcome.daemon_pid,
-                    "external_worktrees": outcome.external_worktrees,
-                    "external_branches": outcome.external_branches,
+                    "external_worktrees": outcome.cleanup.worktrees,
+                    "external_branches": outcome.cleanup.branches,
+                    "skipped_foreign_workspaces": outcome.cleanup.skipped_foreign_workspaces,
                     "former_registration": former_value(outcome.former_registration.as_ref()),
                 }));
             }
@@ -721,9 +785,10 @@ pub(crate) async fn prune(json_output: bool) -> Result<u8, Failure> {
                     "data_dir": outcome.data_dir,
                     "outcome": "retained",
                     "daemon_pid": outcome.daemon_pid,
-                    "external_worktrees": outcome.external_worktrees,
-                    "external_branches": outcome.external_branches,
-                    "unusable_records": outcome.unusable_records,
+                    "external_worktrees": outcome.cleanup.worktrees,
+                    "external_branches": outcome.cleanup.branches,
+                    "unusable_records": outcome.cleanup.unusable_records,
+                    "skipped_foreign_workspaces": outcome.cleanup.skipped_foreign_workspaces,
                     "former_registration": former_value(outcome.former_registration.as_ref()),
                 }));
             }
@@ -779,6 +844,9 @@ pub(crate) async fn prune(json_output: bool) -> Result<u8, Failure> {
                     println!("  {detail}");
                 }
             }
+            print_skipped_foreign_workspaces(
+                item["skipped_foreign_workspaces"].as_u64().unwrap_or(0),
+            );
             for message in item["unusable_records"]
                 .as_array()
                 .into_iter()
@@ -793,11 +861,9 @@ pub(crate) async fn prune(json_output: bool) -> Result<u8, Failure> {
     Ok(if any_blocked { 4 } else { 0 })
 }
 
-fn print_external_summary(
-    worktrees: &[eliot_daemon::operator::StandWorktreeOutcome],
-    branches: &[eliot_daemon::operator::StandBranchOutcome],
-) {
-    for wt in worktrees {
+fn print_external_summary(cleanup: &StandExternalCleanupReport) {
+    print_skipped_foreign_workspaces(cleanup.skipped_foreign_workspaces as u64);
+    for wt in &cleanup.worktrees {
         println!(
             "  external worktree {} (branch {}): {}{}",
             wt.worktree_path,
@@ -806,7 +872,7 @@ fn print_external_summary(
             outcome_note(wt.reason.as_deref(), wt.detail.as_deref())
         );
     }
-    for branch in branches {
+    for branch in &cleanup.branches {
         println!(
             "  external branch {} in {}: {}{}",
             branch.branch,
@@ -814,6 +880,12 @@ fn print_external_summary(
             branch.outcome,
             outcome_note(branch.reason.as_deref(), branch.detail.as_deref())
         );
+    }
+}
+
+fn print_skipped_foreign_workspaces(count: u64) {
+    if count != 0 {
+        println!("  Skipped {count} workspace records outside the stand");
     }
 }
 

@@ -2218,11 +2218,14 @@ pub struct StandWorkspaceRecord {
 }
 
 impl Store {
-    /// Read all managed workspace records and their frozen scratch lists from
-    /// an offline stand SQLite database without opening the Store writer.
-    pub fn list_stand_workspaces_readonly(db_path: &Path) -> Result<Vec<StandWorkspaceRecord>> {
+    /// Read managed workspace records under the stand root and count foreign
+    /// rows without opening the Store writer or resolving their paths.
+    pub fn list_stand_workspaces_readonly(
+        db_path: &Path,
+        stand_root: &Path,
+    ) -> Result<(Vec<StandWorkspaceRecord>, usize)> {
         if !db_path.exists() {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), 0));
         }
         let connection = Connection::open_with_flags(
             db_path,
@@ -2240,31 +2243,41 @@ impl Store {
             )
             .map_err(sql_error)?;
         if !table_exists {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), 0));
         }
         let mut statement = connection
             .prepare(&format!(
                 "SELECT {WORKSPACE_COLUMNS},
                         (SELECT a.profile_snapshot FROM agents a WHERE a.id = workspaces.agent)
-                 FROM workspaces ORDER BY agent LIMIT 257"
+                 AS profile_snapshot FROM workspaces ORDER BY agent"
             ))
             .map_err(sql_error)?;
-        let rows = statement
-            .query_map([], |row| {
-                let preparation = workspace_from_row(row)?;
-                let snapshot_text: Option<String> = row.get(15)?;
-                Ok((preparation, snapshot_text))
-            })
-            .map_err(sql_error)?;
+        let mut rows = statement.query([]).map_err(sql_error)?;
+        let root = stand_root.to_string_lossy();
+        let root_key = core::workspace_path_key(&root);
         let mut records = Vec::new();
-        for item in rows {
-            let (preparation, snapshot_text) = item.map_err(sql_error)?;
+        let mut skipped = 0;
+        while let Some(row) = rows.next().map_err(sql_error)? {
+            let worktree_path: String = row.get("worktree_path").map_err(sql_error)?;
+            let worktree_key = core::workspace_path_key(&worktree_path);
+            let relative = Path::new(worktree_key.as_ref()).strip_prefix(root_key.as_ref());
+            if !relative.is_ok_and(|path| {
+                !path.as_os_str().is_empty()
+                    && path
+                        .components()
+                        .all(|part| matches!(part, std::path::Component::Normal(_)))
+            }) {
+                skipped += 1;
+                continue;
+            }
             if records.len() >= 256 {
                 return Err(Error::new(
                     "unavailable",
                     "stand workspace count exceeds cleanup bound",
                 ));
             }
+            let preparation = workspace_from_row(row).map_err(sql_error)?;
+            let snapshot_text: Option<String> = row.get("profile_snapshot").map_err(sql_error)?;
             let scratch = snapshot_text
                 .and_then(|text| serde_json::from_str::<Value>(&text).ok())
                 .and_then(|value| value.get("scratch").cloned())
@@ -2275,7 +2288,7 @@ impl Store {
                 scratch,
             });
         }
-        Ok(records)
+        Ok((records, skipped))
     }
 
     /// Retain original filesystem permissions before changing them, using the

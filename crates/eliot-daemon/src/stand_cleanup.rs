@@ -144,6 +144,7 @@ pub struct StandBranchOutcome {
 pub struct StandExternalCleanupReport {
     pub worktrees: Vec<StandWorktreeOutcome>,
     pub branches: Vec<StandBranchOutcome>,
+    pub skipped_foreign_workspaces: usize,
     /// Unusable creation records not already reported on a worktree or branch.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub unusable_records: Vec<String>,
@@ -1575,10 +1576,10 @@ fn is_external_repo(stand_root: &Path, repo_common_dir: &str) -> Result<bool> {
     Ok(!Path::new(&repo_key).starts_with(Path::new(&stand_key)))
 }
 
-fn load_external_workspaces(stand_root: &Path) -> Result<Vec<StandWorkspaceRecord>> {
+fn load_external_workspaces(stand_root: &Path) -> Result<(Vec<StandWorkspaceRecord>, usize)> {
     let db_path = stand_root.join("eliot.db");
     match fs::symlink_metadata(&db_path) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok((Vec::new(), 0)),
         Err(error) => {
             return Err(Error::new(
                 "unavailable",
@@ -1597,14 +1598,14 @@ fn load_external_workspaces(stand_root: &Path) -> Result<Vec<StandWorkspaceRecor
             }
         }
     }
-    let all = Store::list_stand_workspaces_readonly(&db_path)?;
+    let (owned, skipped) = Store::list_stand_workspaces_readonly(&db_path, stand_root)?;
     let mut external = Vec::new();
-    for record in all {
+    for record in owned {
         if is_external_repo(stand_root, &record.preparation.repo_common_dir)? {
             external.push(record);
         }
     }
-    Ok(external)
+    Ok((external, skipped))
 }
 
 fn external_worktree_key(path: &str) -> String {
@@ -1947,7 +1948,7 @@ pub(crate) async fn plan_external_git(
     {
         return Err(Error::new("not_allowed", message));
     }
-    let workspaces = load_external_workspaces(stand_root)?;
+    let (workspaces, _) = load_external_workspaces(stand_root)?;
     if workspaces.is_empty() {
         return Ok(());
     }
@@ -2036,8 +2037,11 @@ async fn cleanup_stand_external_git_with_policy(
         write_stand_registration(registry, registry_file, registration)?;
     }
     let unusable = unusable_worktree_records(registry, registry_file)?;
-    let workspaces = load_external_workspaces(stand_root)?;
-    let mut report = StandExternalCleanupReport::default();
+    let (workspaces, skipped_foreign_workspaces) = load_external_workspaces(stand_root)?;
+    let mut report = StandExternalCleanupReport {
+        skipped_foreign_workspaces,
+        ..StandExternalCleanupReport::default()
+    };
     if workspaces.is_empty() {
         report.unusable_records = unusable;
         return Ok(report);
@@ -2606,7 +2610,8 @@ fn require_stand_cleanup_custody_closed(stand_root: &Path) -> Result<()> {
             "stand has live custody or unresolved work",
         ));
     }
-    for workspace in Store::list_stand_workspaces_readonly(&store_path)? {
+    let (workspaces, _) = Store::list_stand_workspaces_readonly(&store_path, stand_root)?;
+    for workspace in workspaces {
         if workspace.preparation.phase != eliot_core::WorkspacePhase::Removed
             && !is_external_repo(stand_root, &workspace.preparation.repo_common_dir)?
         {

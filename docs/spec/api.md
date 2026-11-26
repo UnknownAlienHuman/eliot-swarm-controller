@@ -3738,8 +3738,11 @@ opened, read or parsed refuses with `not_allowed`. Both refusals precede any
 effect and name the exact lookup path; the second names the reason without
 quoting file content. An existing worktree record or stand marker that cannot
 be used is refused the same way. `stand list` inspects registered stands with
-expiry and liveness state, and `stand prune` tears down expired registered
-stands. Both report every registry file they cannot use with its path and
+expiry and liveness state. The local Owner can prune every expired registered
+stand. An Agent can prune only stands its current generation registered, as
+verified against the issuing daemon's artifact ownership record. Missing
+ownership records are reported as `stand_owner_unknown` and skipped. Both
+commands report every registry file they cannot use with its path and
 reason. `stand prune` never tears down such an entry, because it cannot prove
 its expiry or root, and exits 4.
 
@@ -3771,6 +3774,12 @@ exit proof, start the registered stand again so boot can reconcile custody,
 then retry teardown. [Workspace cancellation recovery](monitoring.md#workspace-preparation)
 settles exact pre-effect cancellations before drain. Stand cleanup still requires
 its own proof for any remaining Git artifacts.
+
+After proving the stand daemon stopped, cleanup skips Store workspace rows
+whose worktree paths are outside the stand root, including rows inherited
+from a Store backup. They do not count toward the 256-workspace cleanup
+bound. `stand down` and `stand prune` report the skipped count as
+`skipped_foreign_workspaces` in JSON.
 
 After proving the stand daemon stopped, `stand down`, `stand prune`, and parent
 `cleanup` remove stand files owned by the stand, including its scratch
