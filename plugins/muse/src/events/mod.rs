@@ -1236,15 +1236,21 @@ impl EventProcessor {
                         BufferedNativeFrame::Notification { method, params },
                         &mut self.loss_reason,
                     );
-                } else if let Err(error) = self.process_notification(method, params).await {
+                } else if let Err(error) = self.process_notification(method.clone(), params).await {
                     self.status.source_unknown = true;
                     if !self.gap_reported
                         && !self.writes_blocked
                         && error.failure_where.as_deref() != Some("plugin.events.put")
                     {
-                        let _ = self
-                            .record_gap("Muse notification could not be normalized")
-                            .await;
+                        // Method and error code only: no native payload text.
+                        // The rejection diagnostics name the method so the
+                        // next send names the failing frame instead of an
+                        // empty snapshot.
+                        let reason = format!(
+                            "Muse {method} notification could not be normalized ({})",
+                            error.code
+                        );
+                        let _ = self.record_gap(reason.as_str()).await;
                     }
                     if self.status.failure.is_none() {
                         self.status.failure = Some(*error.message);
@@ -1730,6 +1736,15 @@ impl EventProcessor {
     }
 
     async fn process_buffered_frame(&mut self, frame: BufferedNativeFrame) -> Result<()> {
+        // Method and error code only: no native payload text.
+        let label = match &frame {
+            BufferedNativeFrame::Notification { method, .. } => {
+                format!("Buffered Muse {method} notification could not be normalized")
+            }
+            BufferedNativeFrame::Request { method, .. } => {
+                format!("Buffered Muse {method} request could not be normalized")
+            }
+        };
         let result = match frame {
             BufferedNativeFrame::Notification { method, params } => {
                 self.process_notification(method, params).await
@@ -1739,10 +1754,8 @@ impl EventProcessor {
             }
         };
         if let Err(error) = result {
-            return Err(self
-                .stream_source()
-                .buffered_failure(error, "Buffered Muse native frame could not be normalized")
-                .await);
+            let reason = format!("{label} ({})", error.code);
+            return Err(self.stream_source().buffered_failure(error, &reason).await);
         }
         Ok(())
     }
@@ -2946,10 +2959,24 @@ impl EventProcessor {
                             "Muse item/updated did not match the 1.4 schema",
                         )
                     })?;
-                self.validate_item_turn(
-                    &notification.session_id,
-                    notification.item.turn_id.as_ref(),
-                )?;
+                // A session mismatch still gaps: the frame names another
+                // stream. A non-active turn binding (stale replay, batch
+                // race on the self-updating host) carries no committable
+                // state, so it is ignored instead of gapping the source;
+                // the terminal `item/completed` keeps strict validation
+                // and still commits every tool fact.
+                if self.status.session_id.as_deref() != Some(notification.session_id.as_str()) {
+                    return Err(Error::new(
+                        "source_integrity",
+                        "Muse notification did not belong to the owned native session",
+                    ));
+                }
+                if let Some(turn_id) = notification.item.turn_id.as_deref()
+                    && !turn_id.trim().is_empty()
+                    && self.status.active_turn_id.as_deref() != Some(turn_id)
+                {
+                    return Ok(());
+                }
             }
             "item/completed" => {
                 let notification: NativeItemCompletedNotification =
@@ -2987,8 +3014,21 @@ impl EventProcessor {
                     self.complete_tool(&notification.item).await?;
                 }
             }
+            "item/delta" => {
+                // Streaming deltas for delta-streamed kinds (installed
+                // 1.4.25 stable surface, SS4.4.1): deltas never bump the
+                // item revision, and the authoritative terminal
+                // `item/completed` carries every committed tool fact, so a
+                // delta folds no bus fact and is explicitly ignored.
+            }
             "turn/completed" => {
                 self.complete_turn(params).await?;
+            }
+            "turn/toolBatchSubmitted" => {
+                // Batch-submission scheduling signal (installed 1.4.25
+                // experimental surface): the submitted calls arrive as
+                // `item/started`, so the batch notice itself carries no
+                // committable lifecycle fact and is explicitly ignored.
             }
             "usage/changed" => {
                 // Optional quota sample: a malformed sample is dropped

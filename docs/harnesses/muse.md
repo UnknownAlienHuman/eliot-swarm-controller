@@ -50,6 +50,21 @@ commits `session.native_unclassified` with only a static site and the sanitized 
 method tag; it does not persist the vendor payload, infer a lifecycle fact, or stop the
 stream. Notifications explicitly naming another session are ignored.
 
+Observed 2026-11-26 against installed Muse Code `1.4.25-R9361.1`, the self-updating
+host emits streaming notifications the 1.4.0-era mapping never modeled. Two carry no
+committable lifecycle state and are explicitly ignored: `item/delta` (stable-surface
+streaming deltas; deltas never bump the item revision and the authoritative terminal
+`item/completed` carries every committed tool fact) and `turn/toolBatchSubmitted`
+(experimental-surface scheduling signal; the submitted calls arrive as `item/started`).
+Session snapshots without a
+bus fact — `session/todoListChanged`, `session/statusChanged`, `session/branchChanged`
+— and the corroborating `turn/foregroundCompleted` terminal keep the
+`session.native_unclassified` record above: unknown-safe, no lifecycle folded, with
+the method tag preserved for a future mapping. A normalization failure names the
+method and the error code (`Muse {method} notification could not be normalized
+({code})`, buffered frames likewise), so the rejection diagnostics and the retained
+failure snapshot name the failing frame instead of an empty snapshot.
+
 On live events, unknown `health`, `noneReason`, `turn/completed.terminal`, and
 workflow-child terminal values decode as `Other` and produce the same neutral diagnostic
 with the native schema tag. An unknown health value does not change source health.
@@ -481,9 +496,15 @@ with the Codex adapter's DTO fields (`command_id`, `turn_id`, `item_id`,
 session/turn while the turn runs ([`NativeItem`](../../plugins/muse/src/native/types.rs)).
 `callId`, `args` and result payloads are never persisted. `item/updated`
 folds no per-delta events; the authoritative terminal `item/completed` carries
-every committed tool fact. Turn-less `userShell` (the one kind outside any
-turn) stays unmapped, as do `agentMessage` (already `message.completed`),
-`workflow` (the workflow-child observer above) and unknown future kinds.
+every committed tool fact. An update bound to another turn (stale replay, batch
+race on the self-updating 1.4.25 host) therefore carries no committable state
+and is explicitly ignored instead of gapping the source; only the exact active
+turn falls through, and a foreign session still gaps. This is the 2026-11-26
+production lesson: one such misbound `item/updated` latched the source unknown,
+rejected every later send, and left an empty diagnostic snapshot. Turn-less
+`userShell` (the one kind outside any turn) stays unmapped, as do `agentMessage`
+(already `message.completed`), `workflow` (the workflow-child observer above)
+and unknown future kinds.
 These committed facts advance liveness model progress like Codex tool events;
 CPU alone still never counts.
 
