@@ -33,49 +33,36 @@ pub(super) fn recover_ended_git_sources_tx(
             if capacity::has_exact_restart_custody_tx(tx, agent, generation)?
                 || capacity::owned_exit_proof_tx(tx, agent, generation)?.is_complete()
             {
-                let closed = finish_ended_git_source_tx(tx, agent, generation, now, Some(events))?;
-                events.extend(closed);
+                close_ended_git_source_tx(tx, agent, generation, now, events)?;
             }
         }
     }
 }
 
+/// Call during restart recovery, once exact exit evidence proves the
+/// generation ended. Its generation-bound final Git read cannot be recovered.
 pub(super) fn close_ended_git_source_tx(
     tx: &Transaction<'_>,
     agent: i64,
     generation: i64,
     now: i64,
-) -> Result<Option<Event>> {
-    finish_ended_git_source_tx(tx, agent, generation, now, None)
-}
-
-/// Call only with exact exit evidence for an ended generation. Startup can
-/// append an unavailable interval when the generation-bound final read is gone.
-fn finish_ended_git_source_tx(
-    tx: &Transaction<'_>,
-    agent: i64,
-    generation: i64,
-    now: i64,
-    recovery_events: Option<&mut Vec<Event>>,
-) -> Result<Option<Event>> {
+    events: &mut Vec<Event>,
+) -> Result<()> {
     let Some(source) = load_source_state(tx, agent, generation, GIT_SOURCE)? else {
-        return Ok(None);
+        return Ok(());
     };
     if source.state != "open" {
-        return Ok(None);
+        return Ok(());
     }
     let source = match require_git_source(tx, agent, generation) {
         Ok(source) => source,
-        Err(error) if error.code == "source_integrity" => return Ok(None),
+        Err(error) if error.code == "source_integrity" => return Ok(()),
         Err(error) => return Err(error),
     };
     let Ok(cursor) = git_source_cursor(&source) else {
-        return Ok(None);
+        return Ok(());
     };
     if let Some(last_hint) = last_pending_git_hint(tx, agent, generation, cursor)? {
-        let Some(events) = recovery_events else {
-            return Ok(None);
-        };
         let from = cursor.to_string();
         let to = last_hint.to_string();
         let gap_id = format!("git-restart-final:a{agent}:{generation}:{to}");
@@ -113,7 +100,10 @@ fn finish_ended_git_source_tx(
         ));
         events.push(event);
     }
-    write_git_source_status_tx(tx, agent, generation, &source, "stale", true, now)
+    events.extend(write_git_source_status_tx(
+        tx, agent, generation, &source, "stale", true, now,
+    )?);
+    Ok(())
 }
 
 pub(super) fn write_git_source_status_tx(

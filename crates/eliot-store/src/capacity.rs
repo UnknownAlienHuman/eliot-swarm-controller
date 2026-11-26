@@ -800,9 +800,7 @@ impl Store {
                 )?);
             }
             if !orphan_possible {
-                events.extend(git::close_ended_git_source_tx(
-                    &tx, agent_num, generation, now,
-                )?);
+                git::close_ended_git_source_tx(&tx, agent_num, generation, now, &mut events)?;
             }
             commit_transaction(tx, &self.write_faulted).map(|()| events)
         })();

@@ -1081,16 +1081,21 @@ pub(super) fn require_workspace_removable(
         ));
     }
     let mut sources = connection
-        .prepare("SELECT repo_path FROM workspaces WHERE agent <> ?1 AND phase <> 'removed'")
+        .prepare("SELECT agent,repo_path FROM workspaces WHERE agent <> ?1 AND phase <> 'removed' ORDER BY agent")
         .map_err(sql_error)?;
     let sources = sources
-        .query_map([parse_agent_id(&agent.id)?], |row| row.get::<_, String>(0))
+        .query_map([parse_agent_id(&agent.id)?], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })
         .map_err(sql_error)?;
     for source in sources {
-        if managed_path_contains(&workspace.worktree_path, &source.map_err(sql_error)?) {
+        let (dependent, source) = source.map_err(sql_error)?;
+        if managed_path_contains(&workspace.worktree_path, &source) {
             return Err(Error::new(
                 "busy",
-                "another retained worktree depends on this source repository",
+                format!(
+                    "another retained worktree depends on this source repository; preserve its work and run swarm worktree remove a{dependent} first"
+                ),
             ));
         }
     }
