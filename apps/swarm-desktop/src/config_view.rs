@@ -462,8 +462,7 @@ pub fn profiles_screen(data: ProfilesData<'_>, actions: ProfilesActions) -> View
     } else if !data.editable {
         format!("Not editable: {}", data.reason.unwrap_or("not editable"))
     } else {
-        "Running Agents keep the settings they started with; the next task uses the saved ones."
-            .to_owned()
+        String::new()
     };
     let toggle = crate::controls::text_button()
         .horizontal_alignment(HorizontalAlignment::Left)
@@ -505,7 +504,9 @@ pub fn profiles_screen(data: ProfilesData<'_>, actions: ProfilesActions) -> View
     if let Some(new_preset) = new_preset {
         parts.push(KeyedView::new("new-preset", new_preset));
     }
-    parts.push(KeyedView::new("state", small(state)));
+    if !state.is_empty() {
+        parts.push(KeyedView::new("state", small(state)));
+    }
     parts.push(KeyedView::new("toggle", toggle));
     if let Some(source) = source {
         parts.push(KeyedView::new("source", source));

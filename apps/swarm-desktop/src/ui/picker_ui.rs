@@ -957,11 +957,7 @@ impl DesktopApp {
         StackPanel::new()
             .spacing(tokens::spacing::SM)
             .children((
-                controls::section_heading(
-                    "Models in the selector",
-                    "Which models the model picker lists; a search there still finds a hidden one.",
-                    None,
-                ),
+                controls::section_heading("Models in the selector", "", None),
                 search,
                 StackPanel::new()
                     .automation_name("Model groups")
