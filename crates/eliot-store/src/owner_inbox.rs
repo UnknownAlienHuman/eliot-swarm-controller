@@ -1205,8 +1205,10 @@ fn project_work_not_in_git(
 ) -> eliot_core::Result<()> {
     let mut stmt = projection_query(
         db,
-        "SELECT c.agent, c.generation, c.state, c.updated_at, c.error
+        "SELECT c.agent, c.generation, c.state, c.updated_at, c.error,
+                w.requested_branch, c.paths, a.workspace
          FROM git_checkpoints c CROSS JOIN agents a ON a.id = c.agent AND a.generation = c.generation
+         LEFT JOIN workspaces w ON w.agent = c.agent AND w.target_generation = c.generation
          WHERE a.archived = 0
            AND (c.state = 'failed'
                 OR (c.state = 'snapshot' AND a.state IN ('stopped','lost','failed')))
@@ -1224,11 +1226,15 @@ fn project_work_not_in_git(
                 r.get::<_, String>(2)?,
                 r.get::<_, i64>(3)?,
                 r.get::<_, Option<String>>(4)?,
+                r.get::<_, Option<String>>(5)?,
+                r.get::<_, String>(6)?,
+                r.get::<_, String>(7)?,
             ))
         })
         .map_err(sql_error)?;
     for row in rows {
-        let (agent, generation, state, since, error) = row.map_err(sql_error)?;
+        let (agent, generation, state, since, error, branch, paths, workspace) =
+            row.map_err(sql_error)?;
         let reason = if state == "failed" {
             "checkpoint_failed"
         } else {
@@ -1249,20 +1255,41 @@ fn project_work_not_in_git(
             )],
         );
         checkpoint.detail = error;
+        let paths = super::decode_json(&paths)?;
+        let paths = paths
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>();
+        checkpoint.instructions = Some(format!(
+            "Inspect the checkpoint for {}. Recorded paths are {}.",
+            branch.as_deref().unwrap_or(&workspace),
+            if paths.is_empty() {
+                "unavailable".into()
+            } else {
+                paths.join(", ")
+            }
+        ));
         items.push(checkpoint);
     }
     drop(stmt);
     let mut stmt = projection_query(
         db,
         "SELECT w.agent, w.target_generation, w.updated_at, w.repo_path, w.worktree_path,
-                w.requested_branch, c.checkpoint_ref
+                w.requested_branch, c.checkpoint_ref, w.outcome, c.state IS NULL
          FROM workspaces w JOIN agents a ON a.id = w.agent
          LEFT JOIN git_checkpoints c
              ON c.agent = w.agent AND c.generation = w.target_generation
          WHERE w.phase = 'removed' AND a.archived = 0
            AND json_extract(w.outcome,'$.result.directory_absent_before_remove') = 1
            AND (c.state = 'snapshot'
-                OR json_extract(w.outcome,'$.last_available_git_observation.dirty') = 1)",
+                OR (json_extract(w.outcome,'$.last_available_git_observation.dirty') = 1
+                    AND (json_extract(w.outcome,'$.work_in_git.observation_seq') IS NULL
+                         OR json_extract(w.outcome,'$.work_in_git.dirty_digest') IS NOT
+                            json_extract(w.outcome,'$.last_available_git_observation.dirty_digest')
+                         OR json_extract(w.outcome,'$.work_in_git.head') IS NOT
+                            json_extract(w.outcome,'$.last_available_git_observation.head'))))",
         "w.agent = ?1 AND w.target_generation = ?2",
         bindings,
     )?;
@@ -1276,34 +1303,69 @@ fn project_work_not_in_git(
                 r.get::<_, String>(4)?,
                 r.get::<_, String>(5)?,
                 r.get::<_, Option<String>>(6)?,
+                r.get::<_, String>(7)?,
+                r.get::<_, bool>(8)?,
             ))
         })
         .map_err(sql_error)?;
     for row in rows {
-        let (agent, generation, since, repo, worktree, branch, checkpoint) =
+        let (agent, generation, since, repo, worktree, branch, checkpoint, outcome, no_checkpoint) =
             row.map_err(sql_error)?;
+        let outcome: Value = super::decode_json(&outcome)?;
+        let observed = super::owner_decisions::recorded_missing_work(
+            db, agent, generation, &worktree, &outcome,
+        )?;
+        let agent = format!("a{agent}");
+        let mut choices = vec![action("inspect", "agent.get", json!({"id": &agent}))];
+        if let Some(observed) = &observed
+            && no_checkpoint
+            && observed.supports_reconciliation()
+        {
+            choices.push(action(
+                "verify_commit",
+                "workspace.verify_work_commit",
+                json!({
+                    "agent": &agent,
+                    "generation": generation,
+                    "observation_seq": observed.seq,
+                    "retained_ref": null,
+                    "commit": null
+                }),
+            ));
+        }
         let mut missing = item(
             OwnerInboxKind::WorkNotInGit,
-            format!("a{agent}:g{generation}:worktree"),
+            format!("{agent}:g{generation}:worktree"),
             format!("removed:{since}"),
             now,
             since,
             "worktree_missing_with_uncommitted_work",
             None,
-            vec![action(
-                "inspect",
-                "agent.get",
-                json!({"id": format!("a{agent}")}),
-            )],
+            choices,
         );
-        missing.instructions = Some(restore_commands(
-            &eliot_core::display_path(&repo),
-            &eliot_core::display_path(&worktree),
-            &branch,
-            &format!("a{agent}"),
-            generation,
-            checkpoint.as_deref(),
-        ));
+        let paths = observed.as_ref().map(|observation| {
+            observation
+                .dirty
+                .iter()
+                .map(|entry| entry.path.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        });
+        missing.instructions = Some(if let Some(checkpoint) = checkpoint.as_deref() {
+            restore_commands(
+                &eliot_core::display_path(&repo),
+                &eliot_core::display_path(&worktree),
+                &branch,
+                &agent,
+                generation,
+                checkpoint,
+            )
+        } else {
+            format!(
+                "Compare {branch} with a worktree backup or decide whether to discard the missing edits. Recorded paths are {}.",
+                paths.as_deref().unwrap_or("unavailable")
+            )
+        });
         items.push(missing);
     }
     Ok(())
@@ -1316,23 +1378,17 @@ fn restore_commands(
     branch: &str,
     agent: &str,
     generation: i64,
-    checkpoint: Option<&str>,
+    checkpoint: &str,
 ) -> String {
-    let mut commands = format!(
-        "git -C {} worktree prune\ngit -C {} worktree add {} {}",
+    format!(
+        "git -C {} worktree prune\ngit -C {} worktree add {} {}\nswarm checkpoint restore --agent {agent} --generation {generation} --checkpoint-ref {} --workspace {}",
         powershell_quote(repo),
         powershell_quote(repo),
         powershell_quote(worktree),
         powershell_quote(branch),
-    );
-    if let Some(checkpoint) = checkpoint {
-        commands.push_str(&format!(
-            "\nswarm checkpoint restore --agent {agent} --generation {generation} --checkpoint-ref {} --workspace {}",
-            powershell_quote(checkpoint),
-            powershell_quote(worktree),
-        ));
-    }
-    commands
+        powershell_quote(checkpoint),
+        powershell_quote(worktree),
+    )
 }
 
 fn powershell_quote(value: &str) -> String {

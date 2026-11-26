@@ -18,6 +18,9 @@ use std::{
 };
 
 const METHOD: &str = "owner.decide";
+mod work_not_in_git;
+pub(super) use work_not_in_git::recorded_missing_work;
+pub use work_not_in_git::{MissingWork, WorkCommitProof, WorkCommitRequest};
 
 /// The existing writes table binds the decision ID and its exact inner
 /// mutation ID. An admitted command replays through its own ordinary receipt.
@@ -636,6 +639,9 @@ fn complete_action(action: &mut OwnerAction, supplied: Option<&Map<String, Value
         match action.method.as_str() {
             "command.resolve" | "turn.resolve" => (&mut action.args, supplied, &["reason"]),
             "checkpoint.restore.abandon" => (&mut action.args, supplied, &["confirm", "reason"]),
+            "workspace.verify_work_commit" => {
+                (&mut action.args, supplied, &["retained_ref", "commit"])
+            }
             "provider.clear_hold" => (&mut action.args, supplied, &["corrective_evidence"]),
             "command.submit" if approval || action.args["verb"] == "answer" => {
                 let supplied = match supplied {

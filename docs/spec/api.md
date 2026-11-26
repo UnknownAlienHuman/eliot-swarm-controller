@@ -968,6 +968,13 @@ For a missing worktree with a retained checkpoint, the inbox instructions includ
 workspace exclusion and restart reconciliation. An exact retry reads the retained
 receipt.
 
+A missing-worktree item with a complete, replayable dirty-content observation
+offers `verify_commit`. Pass `--arg retained_ref=refs/remotes/origin/main`
+(or another full local branch or remote-tracking ref) and
+`--arg commit=<full-commit-oid>` to `swarm inbox decide`. The Owner's choice
+settles that observation only after read-only Git verification. The receipt
+records the observation event, digest, ref, ref tip and matching commit.
+
 An uncertain restore with a retained reservation appears in the Owner inbox as
 `unknown_command`, with subject `checkpoint_restore:<restore id>`. After
 inspecting the worktree and index, the Owner can choose
