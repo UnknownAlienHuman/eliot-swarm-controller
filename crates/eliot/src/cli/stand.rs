@@ -12,10 +12,10 @@ use eliot_daemon::operator::{
     check_directory_chain, check_nested_roots, cleanup_stand_external_git, create_stand_root,
     daemon_alive, daemon_info, data_dirs_match, ensure_registry_is_external,
     inherited_agent_parent_data_dir, list_stand_registrations, locate_stand_registration,
-    lock_offline, lock_transition, parse_stand_ttl_ms, read_stand_registration, registry_name,
-    remove_offline_stand_root, remove_stand_registration, settle_former_registration, stand_base,
-    stand_now_ms, stand_registry, verify_stand_marker, verify_stand_target,
-    write_stand_registration,
+    lock_stand_removal, lock_transition, parse_stand_ttl_ms, read_stand_registration,
+    registry_name, remove_offline_stand_root, remove_stand_registration,
+    settle_former_registration, stand_base, stand_now_ms, stand_registry, verify_stand_marker,
+    verify_stand_target, write_stand_registration,
 };
 use serde_json::{Value, json};
 use std::fs::{self, File};
@@ -437,8 +437,7 @@ async fn down_inner(path: &Path) -> Result<DownOutcome, Failure> {
     let reg_name = registry_name(&root);
     let located = locate_stand_registration(&root).map_err(Failure::for_read)?;
     ensure_registry_is_external(&root, &located.registry).map_err(Failure::for_read)?;
-    #[cfg(windows)]
-    let _startup = eliot_daemon::operator::lock_stand_removal(&root).map_err(Failure::for_read)?;
+    let removal = lock_stand_removal(&root).map_err(Failure::for_read)?;
     let mut record = located.record.clone();
     let finish_removed = |record: &StandRegistration| -> Result<DownOutcome, Failure> {
         remove_stand_registration(&located.registry, &reg_name).map_err(Failure::for_read)?;
@@ -498,7 +497,7 @@ async fn down_inner(path: &Path) -> Result<DownOutcome, Failure> {
         };
         (Some(pid), blocker)
     };
-    let offline = lock_offline(&root).map_err(Failure::for_read)?;
+    let offline = removal.lock_offline().map_err(Failure::for_read)?;
     verify_stand_marker(&root, &record).map_err(Failure::for_read)?;
     verify_stand_target(&root, &record).map_err(Failure::for_read)?;
     let current_daemon = daemon_info(&root).map_err(Failure::for_read)?;

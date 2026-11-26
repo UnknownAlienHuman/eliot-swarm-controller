@@ -184,10 +184,12 @@ pub struct DataDir {
     owner_token: Option<String>,
 }
 
-/// Holds the OS file lock for one daemon lifetime.
+/// Holds the OS file lock for a daemon or an offline operation.
 pub struct DaemonLock {
     root: PathBuf,
     _file: File,
+    #[cfg(windows)]
+    _start_removal: Option<OperatorLock>,
 }
 
 #[cfg(windows)]
@@ -348,6 +350,8 @@ impl DataDir {
             Ok(()) => Ok(DaemonLock {
                 root: self.path.clone(),
                 _file: file,
+                #[cfg(windows)]
+                _start_removal: None,
             }),
             Err(std::fs::TryLockError::WouldBlock) => Err(Error::new(
                 "daemon_already_running",
@@ -357,6 +361,19 @@ impl DataDir {
                 Err(io_error("lock daemon data directory", error))
             }
         }
+    }
+
+    pub(crate) fn acquire_offline_daemon_lock(&self) -> Result<DaemonLock> {
+        #[cfg(windows)]
+        {
+            let fence = super::windows::acquire_start_removal_event(&self.path)?;
+            self.acquire_daemon_lock().map(|lock| DaemonLock {
+                _start_removal: Some(fence),
+                ..lock
+            })
+        }
+        #[cfg(not(windows))]
+        self.acquire_daemon_lock()
     }
 
     #[cfg(windows)]

@@ -138,7 +138,7 @@ pub fn compact_store_offline(
 ) -> Result<StoreCompactionOutcome> {
     require_local_store_owner("compaction")?;
     let data_dir = DataDir::open_existing(path)?;
-    let _daemon_lock = data_dir.acquire_daemon_lock()?;
+    let _daemon_lock = data_dir.acquire_offline_daemon_lock()?;
     let store_path = data_dir.path().join("eliot.db");
     crate::platform::data_dir::validate_store_files(data_dir.path())?;
     let metadata = fs::symlink_metadata(&store_path).map_err(|error| {

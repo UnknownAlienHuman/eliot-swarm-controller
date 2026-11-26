@@ -3,7 +3,7 @@
 use crate::common::now_ms;
 use crate::git_monitor::{GitProbe, canonical_root, reject_links};
 use crate::operator::{
-    DaemonLock, create_stand_root, daemon_alive, daemon_info, lock_offline, lock_transition,
+    DaemonLock, create_stand_root, daemon_alive, daemon_info, lock_stand_removal, lock_transition,
     validate_stand_directory, write_stand_record,
 };
 use crate::platform::script_file::{CleanupPath, Directory, directory_identity};
@@ -1464,6 +1464,7 @@ fn remove_pinned_offline_stand_root(
     offline: DaemonLock,
     _scratch_git: Option<&str>,
 ) -> Result<()> {
+    // This path-based teardown is compiled only outside Windows.
     let root = &pinned.root;
     let io_fail = |error| {
         Error::new(
@@ -2706,14 +2707,13 @@ pub(crate) async fn apply_stand_artifact(
     ensure_registry_is_external(stand_root, &registry)?;
     let reg_name = registry_name(stand_root);
     let transition = lock_transition(stand_root)?;
-    #[cfg(windows)]
-    let startup = crate::operator::lock_stand_removal(stand_root)?;
+    let removal = lock_stand_removal(stand_root)?;
     let mut registration = read_stand_registration(&registry, &reg_name, stand_root)?;
     verify_stand_marker(stand_root, &registration)?;
     refuse_parent_root(daemon_data_root, stand_root)?;
     crate::operator::verify_stand_target(stand_root, &registration)?;
     let pid = verify_stand_stopped(stand_root, &registration)?.unwrap_or_default();
-    let offline = lock_offline(stand_root)?;
+    let offline = removal.lock_offline()?;
     check_directory_chain(stand_root)?;
     owned_path.require_identity(expected_identity)?;
     registration = read_stand_registration(&registry, &reg_name, stand_root)?;
@@ -2764,8 +2764,7 @@ pub(crate) async fn apply_stand_artifact(
     drop(owned_path);
     tokio::task::spawn_blocking(move || {
         let _transition = transition;
-        #[cfg(windows)]
-        let _startup = startup;
+        let _removal = removal;
         remove_pinned_offline_stand_root(pinned, offline, scratch_identity.as_deref())?;
         remove_stand_registration(&registry, &reg_name)
     })
