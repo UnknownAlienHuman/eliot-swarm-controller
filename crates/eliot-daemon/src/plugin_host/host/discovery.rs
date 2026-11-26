@@ -1,5 +1,5 @@
 //! A bounded read-only plugin instance, independent of every Agent identity.
-use super::reader::READER_CLOSE_BUDGET;
+use super::reader::{READER_CLOSE_BUDGET, ReaderTransport};
 use super::{
     AgentKey, PluginHost, build_process_environment, metadata_secret_snapshot, redact_native_error,
     require_proxy_capability, signal_progress,
@@ -687,27 +687,8 @@ impl PluginHost {
                 error.with_message(format!("{checked}: {message}"))
             }
         });
-        let secrets = reader.secrets.clone();
-        let close_until = metadata_reader_close_deadline(&stop);
-        let closure = reader.close_until(self, None, close_until).await;
-        let result = require_reader_cleanup(result, closure.closed, "quota.read");
-        let result = result.map_err(|error| {
-            let error = redact_native_error(
-                error.with_stderr(StderrSource::Plugin, closure.stderr),
-                &secrets,
-            );
-            crate::logging::record(
-                &SecretPolicy::new(secrets.iter()),
-                &error.code,
-                &[("operation", "quota.read")],
-                Some(&error),
-            );
-            error
-        });
-        MetadataRead {
-            result,
-            cleanup: cleanup_state(closure.closed),
-        }
+        self.close_metadata_reader(reader, &stop, result, "quota.read")
+            .await
     }
 
     async fn read_archive(
@@ -813,27 +794,8 @@ impl PluginHost {
                 error.with_message(format!("native.archive: {message}"))
             }
         });
-        let secrets = reader.secrets.clone();
-        let close_until = metadata_reader_close_deadline(&stop);
-        let closure = reader.close_until(self, None, close_until).await;
-        let result = require_reader_cleanup(result, closure.closed, "native.archive");
-        let result = result.map_err(|error| {
-            let error = redact_native_error(
-                error.with_stderr(StderrSource::Plugin, closure.stderr),
-                &secrets,
-            );
-            crate::logging::record(
-                &SecretPolicy::new(secrets.iter()),
-                &error.code,
-                &[("operation", "native.archive")],
-                Some(&error),
-            );
-            error
-        });
-        MetadataRead {
-            result,
-            cleanup: cleanup_state(closure.closed),
-        }
+        self.close_metadata_reader(reader, &stop, result, "native.archive")
+            .await
     }
 
     async fn read_model_catalogue(
@@ -952,10 +914,21 @@ impl PluginHost {
                 ))),
             _ = stop.changed() => Err(Error::new("cancelled", "model.list was cancelled")),
         };
+        self.close_metadata_reader(reader, &stop, result, "model.list")
+            .await
+    }
+
+    async fn close_metadata_reader<T>(
+        &self,
+        reader: ReaderTransport,
+        stop: &watch::Receiver<Option<Instant>>,
+        result: Result<T>,
+        operation: &str,
+    ) -> MetadataRead<T> {
         let secrets = reader.secrets.clone();
-        let close_until = metadata_reader_close_deadline(&stop);
+        let close_until = metadata_reader_close_deadline(stop);
         let closure = reader.close_until(self, None, close_until).await;
-        let result = require_reader_cleanup(result, closure.closed, "model.list");
+        let result = require_reader_cleanup(result, closure.closed, operation);
         let result = result.map_err(|error| {
             let error = redact_native_error(
                 error.with_stderr(StderrSource::Plugin, closure.stderr),
@@ -964,7 +937,7 @@ impl PluginHost {
             crate::logging::record(
                 &SecretPolicy::new(secrets.iter()),
                 &error.code,
-                &[("operation", "model.list")],
+                &[("operation", operation)],
                 Some(&error),
             );
             error
@@ -1147,27 +1120,8 @@ impl PluginHost {
                 result.unwrap_or_else(|_| Err(Error::new("unavailable", "profile.store deadline exceeded"))),
             _ = stop.changed() => Err(Error::new("cancelled", "profile.store was cancelled")),
         };
-        let secrets = reader.secrets.clone();
-        let close_until = metadata_reader_close_deadline(&stop);
-        let closure = reader.close_until(self, None, close_until).await;
-        let result = require_reader_cleanup(result, closure.closed, "profile.store");
-        let result = result.map_err(|error| {
-            let error = redact_native_error(
-                error.with_stderr(StderrSource::Plugin, closure.stderr),
-                &secrets,
-            );
-            crate::logging::record(
-                &SecretPolicy::new(secrets.iter()),
-                &error.code,
-                &[("operation", "profile.store")],
-                Some(&error),
-            );
-            error
-        });
-        MetadataRead {
-            result,
-            cleanup: cleanup_state(closure.closed),
-        }
+        self.close_metadata_reader(reader, &stop, result, "profile.store")
+            .await
     }
 
     #[allow(
