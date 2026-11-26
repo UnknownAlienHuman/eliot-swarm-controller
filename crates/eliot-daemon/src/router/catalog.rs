@@ -438,18 +438,12 @@ impl Router {
                 validate(model).map_err(|error| Error::new(error.code, error.reason))?;
             }
             if let LaunchModelScope::Check(stays_on_route) = scope {
-                let local = snapshot
-                    .get("local_provider")
-                    .cloned()
-                    .map(serde_json::from_value)
-                    .transpose()
-                    .map_err(|_| Error::new("profile_error", "invalid frozen local provider"))?;
                 let saved = NativeProfileInput {
                     model: snapshot["model"].as_str(),
-                    local_provider: local.as_ref(),
+                    local_provider: snapshot.get("local_provider"),
                     ..Default::default()
                 };
-                if !stays_on_route(&saved, model) {
+                if !stays_on_route(&saved, model)? {
                     return Err(Error::new(
                         "not_allowed",
                         "requested model would change the saved provider route",

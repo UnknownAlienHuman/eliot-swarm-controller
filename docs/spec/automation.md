@@ -1007,9 +1007,11 @@ notes can be admitted for a turn.
 The note worker logs individual fact errors and advances its persisted cursor
 after processing each event. A task card summarizes the retained task brief, branch and Goal in
 at most 700 bytes. With no Goal set, it names the first linked input as the objective
-([Default Goal objective](#default-goal-objective)). Swarm sends it after native
+([Default Goal objective](#default-goal-objective)). Swarm adds it after native
 compaction (manual or automatic, on every harness that reports one), resume, switch or
-handoff, at most once per turn. Lifecycle notes can queue before the first linked input.
+handoff, at most once per turn. On an idle generation it waits for the next real input,
+which can be the first linked input. See [context notes](coordination.md#context-notes)
+for the lifecycle and attention behavior of the deferred note.
 
 A completed fast project check records a daemon event in the `project` family
 with kind `project.check.finished`, its triggering edit sequence and exit code.
@@ -1972,7 +1974,7 @@ toward no-progress only when both streams were captured in full. A continuation
 presents the observation in a quoted data fence with its capture summary outside
 the fence. The Goal and check policy govern the next action. The commit then
 applies **all** results in one transaction only if generation, revision and
-round still match — the key unconsumed, no newer Agent event (past an idle
+round still match — the key unconsumed, no newer round-relevant event (past an idle
 key, or since the claim for a slot), sources still healthy, no open or
 unknown command, no active turn, no pending request — together with an
 optional ordinary `send` continuation admitted by the same transaction:
@@ -2248,7 +2250,10 @@ skips cadenced Goals (slot-keyed), paused or terminal Goals, drifted
 generations, and anything while automation is draining; it waits while an
 active native Goal drives. The driver starts each automatic round in its own task
 and runs up to four across Goals. Automatic and explicit rounds share the same
-per-Goal single-flight marker. A Swarm note's admission and dispatch schedule no
+per-Goal single-flight marker. Git checkpoint receipts, advisory attention and
+automatic checker custody-closure receipts leave Goal round freshness unchanged
+and supply no new idle key. Retained spent keys from older versions still fence
+their idle points. A Swarm note's admission and dispatch schedule no
 round; its settlement re-offers the latest unspent idle key. After
 `stale_round`, the driver moves to the latest unspent idle key if it is strictly
 newer and sends it through the same gates, so no idle point runs twice and each
@@ -2266,7 +2271,7 @@ the rounds to settle their markers.
 Setting or resuming an enabled idle-keyed Goal also reconciles the
 retained exact-generation idle subject: the set/resume wakes the driver,
 which sweeps every active non-cadenced Goal bound to its Agent's current
-generation and reserves a round on the latest event only when that row
+generation and reserves a round only when the latest round-relevant event
 still names an idle event of that generation. The sweep uses the same
 reservation as a bus event — same scope, enablement and single-flight —
 without re-offering mail, and waits for a real event when the

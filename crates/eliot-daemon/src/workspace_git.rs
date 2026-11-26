@@ -497,6 +497,8 @@ impl WorkspaceGit {
         let target = destination_path(&preparation.worktree_path)?;
         separate_target(&source, &target)?;
         require_absent(&target)?;
+        #[cfg(windows)]
+        create_private_worktree_parents(&target)?;
         if self
             .branch_oid(&source.root, &preparation.requested_branch, deadline)
             .await?
@@ -2245,6 +2247,48 @@ fn destination_path(path: &str) -> Result<PathBuf> {
         canonical.push(component);
     }
     Ok(canonical)
+}
+
+/// Pre-create the daemon-owned `worktrees/` and `worktrees/<project>/`
+/// parents with the protected DACL so `git worktree add` inherits only safe
+/// entries. Only these two managed levels are claimed, never anything above
+/// them. Existing parents stay the timer's repair job.
+#[cfg(windows)]
+fn create_private_worktree_parents(target: &Path) -> Result<()> {
+    let project = target
+        .parent()
+        .ok_or_else(|| problem("invalid", "managed worktree has no parent"))?;
+    let root = project
+        .parent()
+        .ok_or_else(|| problem("invalid", "managed worktree has no project parent"))?;
+    if root.file_name().and_then(|name| name.to_str()) != Some("worktrees") {
+        return Err(problem(
+            "invalid",
+            "managed worktree is outside the managed worktree root",
+        ));
+    }
+    for parent in [root, project] {
+        match fs::symlink_metadata(parent) {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                // A raced creation reports success without adoption; the
+                // checks above own admission.
+                if let Err(error) = crate::platform::windows::create_private_directory(parent) {
+                    return Err(problem(
+                        "unavailable",
+                        &format!("managed worktree parent cannot be created: {error}"),
+                    ));
+                }
+            }
+            Err(_) => {
+                return Err(problem(
+                    "unavailable",
+                    "managed worktree parent cannot be inspected",
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn metadata_line(path: &Path) -> Result<String> {

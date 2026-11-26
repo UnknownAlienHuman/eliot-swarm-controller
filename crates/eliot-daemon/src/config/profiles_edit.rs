@@ -262,7 +262,7 @@ fn has_unsafe_profile_or_proxy(config: &super::FileConfig) -> bool {
                 .collect();
             super::ProfileCapabilities::of(entry.harness.trim())
                 .local_provider
-                .is_none_or(|validate| validate(provider, &pass_env).is_err())
+                .is_none_or(|schema| (schema.validate)(provider, &pass_env).is_err())
         })
     }) || config.proxies.iter().any(|(name, entry)| {
         let proxy = entry.get_ref();

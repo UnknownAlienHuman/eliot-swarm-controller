@@ -93,6 +93,7 @@ pub(super) fn persist_turn_fact(
     tx: &Transaction<'_>,
     agent: &Agent,
     event: &NativeEvent,
+    now: i64,
 ) -> Result<()> {
     if event.kind == core::NATIVE_WARNING_EVENT {
         return core::NativeWarning::validate_data(&event.data, agent.native_ref.as_deref());
@@ -242,6 +243,16 @@ pub(super) fn persist_turn_fact(
                 agent.generation,
                 turn_id
             ],
+        ));
+    }
+    if agent.archived
+        && agent.origin == core::AgentOrigin::Native
+        && turn.state != TurnState::Completed
+    {
+        db!(tx.execute(
+            "UPDATE agents SET archived = 0, updated_at = ?1
+             WHERE id = ?2 AND generation = ?3 AND archived = 1",
+            params![now, id, agent.generation],
         ));
     }
     Ok(())

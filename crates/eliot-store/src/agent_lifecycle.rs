@@ -1,5 +1,7 @@
 //! Explicit owner tree operations, sharing retention's command deletion.
 use super::*;
+use context::{UNDISPATCHED_SWARM_NOTE_SQL, withdraw_swarm_notes_tx};
+use eliot_core::NativeChildActivityState;
 use eliot_core::api::AgentTreeResponse;
 
 fn delete_sql_error(error: rusqlite::Error) -> Error {
@@ -123,6 +125,16 @@ fn current_agent_tree_tx(
     } else {
         "agent.delete"
     };
+    let blocking_command_sql = format!(
+        "SELECT c.id,c.state,c.generation FROM commands c WHERE c.target=?1
+           AND (c.state IN ('accepted','queued','dispatched') OR (c.state='unknown' AND NOT ?2))
+           AND NOT {UNDISPATCHED_SWARM_NOTE_SQL}
+           AND NOT (?3 AND c.state='unknown' AND (c.verb IN ('launch','stop') OR (c.verb='send' AND c.probe=1)))
+           AND NOT (?4 AND c.generation<=?5 AND c.verb='send' AND c.turn_id IS NULL
+                    AND c.state IN ('accepted','queued') AND EXISTS (
+                        SELECT 1 FROM restart_deferred_sends d WHERE d.command_id=c.id AND d.sealed=1))
+         ORDER BY c.created_at,c.id LIMIT 1"
+    );
     let mut agents = Vec::with_capacity(members.len());
     for num in &members {
         let row = load_agent_by_num(tx, *num)?
@@ -133,24 +145,34 @@ fn current_agent_tree_tx(
         // observer is an observe-only Unknown row with no live reader:
         // the custody check below still refuses an attached observer
         // with an open source, and the turn/command checks still apply.
-        // Native observed children keep their own rule: live ones are
-        // Unknown and stay blocked here; ended ones are stopped.
+        // A terminal child turn can qualify as idle while its producer still
+        // owns the live reader.
+        let idle = row.state == AgentState::Idle
+            || row.activity.as_ref().is_some_and(|activity| {
+                !activity.has_open_turn
+                    && matches!(
+                        activity.state,
+                        NativeChildActivityState::Idle | NativeChildActivityState::Interrupted
+                    )
+            });
         let detached_observer = row.observe_only
             && row.origin == core::AgentOrigin::External
             && row.state == AgentState::Unknown;
         let probe_cleanup = archived.is_none() && row.is_automatic_provider_probe();
         let check_cleanup = archived.is_none() && row.is_harness_check();
         let allowed = if archived.is_some() {
-            matches!(
-                row.state,
-                AgentState::Idle | AgentState::Stopped | AgentState::Failed | AgentState::Lost
-            ) || detached_observer
+            idle || row.state.is_terminal() || detached_observer
         } else {
             matches!(row.state, AgentState::Stopped | AgentState::Failed)
                 || ((probe_cleanup || check_cleanup) && row.state == AgentState::Lost)
                 || detached_observer
         };
         if !allowed {
+            if archived.is_some()
+                && let Some(message) = native_children::archive_blocker(tx, &row)?
+            {
+                return Err(Error::new("busy", message));
+            }
             return Err(Error::new(
                 "busy",
                 format!(
@@ -205,15 +227,16 @@ fn current_agent_tree_tx(
             && row.state.is_terminal()
             && unknown_generations_drained(tx, *num)?;
         let command: Option<(String, String, Option<i64>)> = tx
+            .prepare_cached(&blocking_command_sql)
+            .map_err(sql_error)?
             .query_row(
-                "SELECT id,state,generation FROM commands WHERE target=?1
-               AND (state IN ('accepted','queued','dispatched') OR (state='unknown' AND NOT ?2))
-                 AND NOT (?3 AND state='unknown' AND (verb IN ('launch','stop') OR (verb='send' AND probe=1)))
-                 AND NOT (?4 AND generation<=?5 AND verb='send' AND turn_id IS NULL
-                          AND state IN ('accepted','queued') AND EXISTS (
-                              SELECT 1 FROM restart_deferred_sends d WHERE d.command_id=commands.id AND d.sealed=1))
-             ORDER BY created_at,id LIMIT 1",
-                params![num, allow_drained_unknowns, probe_cleanup, archived == Some(true), row.generation],
+                params![
+                    num,
+                    allow_drained_unknowns,
+                    probe_cleanup,
+                    archived == Some(true),
+                    row.generation
+                ],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .optional()
@@ -229,6 +252,10 @@ fn current_agent_tree_tx(
                 ),
             ));
         }
+        // A stopped native observation preserves unknown turns after its
+        // producer grant ended. A running turn still blocks even if an
+        // earlier unknown turn is retained.
+        let ended_observation = row.activity.is_some() && row.state == AgentState::Stopped;
         let turn: Option<(String, String, i64)> = tx
             .query_row(
                 "SELECT t.turn_id,t.state,t.generation FROM turns t WHERE t.agent=?1
@@ -237,32 +264,20 @@ fn current_agent_tree_tx(
                  SELECT 1 FROM commands c WHERE c.target=t.agent AND c.generation=t.generation
                    AND c.turn_id=t.turn_id AND c.verb='send' AND c.probe=1))
              ORDER BY t.generation,t.turn_id LIMIT 1",
-                params![num, probe_cleanup, allow_drained_unknowns],
+                params![
+                    num,
+                    probe_cleanup,
+                    allow_drained_unknowns || ended_observation
+                ],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .optional()
             .map_err(sql_error)?;
         if let Some((turn, state, generation)) = turn {
-            // Ended native observation keeps its unknown turn as retained
-            // evidence, not a live gate: the child reaches stopped only
-            // through the ended-with-parent sweep, whose producer check
-            // proves the granting generation ended, so no live source
-            // remains to complete it. The other guards (no active turn,
-            // no pending or live commands, drained custody) still apply,
-            // and running turns still block everywhere.
-            let ended_observation = state == "unknown"
-                && row.observe_only
-                && row.origin == core::AgentOrigin::Native
-                && row.state == AgentState::Stopped;
-            if !ended_observation {
-                return Err(Error::new(
-                    "busy",
-                    format!(
-                        "{} generation {generation} has {state} turn {turn}; stopped lifecycle does not resolve an uncertain turn",
-                        row.id
-                    ),
-                ));
-            }
+            return Err(Error::new(
+                "busy",
+                format!("{} generation {generation} has {state} turn {turn}", row.id),
+            ));
         }
         // Delete needs drained custody. Archive of an ended member needs
         // resolved custody, so it never hides a process, artifact or
@@ -272,7 +287,7 @@ fn current_agent_tree_tx(
         // stops a generation); unarchive only reveals.
         let guard = match archived {
             None => Some(true),
-            Some(true) if row.state != AgentState::Idle => Some(false),
+            Some(true) if !idle => Some(false),
             Some(_) => None,
         };
         let workspace_cleanup_generation = if before_cleanup {
@@ -716,6 +731,7 @@ impl Store {
             let mut events = Vec::new();
             for (num, member) in members.iter().zip(agents) {
                 if archived {
+                    withdraw_swarm_notes_tx(&tx, *num, "agent_archived", now, Some(&mut events))?;
                     events.extend(super::restart_queue::retire_sealed(
                         &tx,
                         *num,
@@ -1009,6 +1025,10 @@ pub const AGENT_DELETE_RULE_CURSOR: &str = "store.agent_delete.rule_cursor";
 
 fn delete_tree_tx(tx: &Transaction<'_>, members: &[i64], now: i64) -> Result<()> {
     let ids = prepare_delete_tree_tx(tx, members)?;
+    for agent in members {
+        // Delete prunes the tree's history in this transaction.
+        withdraw_swarm_notes_tx(tx, *agent, "agent_deleted", now, None)?;
+    }
     delete_db!(tx.execute("DELETE FROM processes WHERE EXISTS(SELECT 1 FROM deleted_agents d WHERE processes.owner GLOB 'agent:a'||d.id||'#*' OR processes.owner GLOB 'workspace:a'||d.id||'#*')",[]));
     delete_db!(tx.execute("DELETE FROM child_process_counts WHERE EXISTS(SELECT 1 FROM deleted_agents d WHERE child_process_counts.owner GLOB 'agent:a'||d.id||'#*' OR child_process_counts.owner GLOB 'workspace:a'||d.id||'#*')",[]));
     // Preserve existing mutation receipts. Create retry tombstones only

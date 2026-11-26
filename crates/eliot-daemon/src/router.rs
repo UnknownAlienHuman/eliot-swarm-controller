@@ -3,6 +3,7 @@ mod attention;
 mod attribution;
 mod auth;
 mod auth_login;
+pub(crate) use auth_login::is_interactive_desktop_refusal;
 mod background_wake;
 mod catalog;
 mod checkpoint_reads;

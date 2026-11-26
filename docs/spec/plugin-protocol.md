@@ -216,6 +216,9 @@ The controller and offline desktop settings editor register the same profile
 capabilities from the built-in adapters before using them. Store entry points
 return an error when registration is missing. Adapter declarations identify
 adopted proxy support, catalogue route labels, and the native approval field.
+OpenCode declares its `local_provider` payload decoder and validation through the
+profile capability. The adapter applies the same package grammar and payload
+contract when it reads a retained profile before native startup.
 Claude `AGENTS.md` is `unknown` at prelaunch because the adapter cannot establish
 which project instructions the native loader will select. Swarm's normal project
 source delivery applies, and any installed version is provenance.
@@ -234,7 +237,7 @@ quota decisions, routing, and hold settlement.
 | Method | Essential fields | Meaning |
 | --- | --- | --- |
 | `initialize` | protocol, frozen plugin config, private instance directory, optional `store_root` (required by OpenCode) | return actual manifest |
-| `agent.start` | agent/generation, profile, workspace, target environment, note, source plan/state, optional resume subject/linked initial input | establish session; input/result settle separately; a proven startup refusal returns a bound `"state": "failed"` with a short non-secret `reason` |
+| `agent.start` | agent/generation, profile, workspace, target environment, note, source plan/state, optional resume subject/linked initial input | establish session; input/result settle separately; Muse and OpenCode return bound [startup failure facts](../../crates/eliot-plugin/src/start_classification.rs) for shared settlement |
 | `native.unarchive` | exact [`ArchivedResumeBinding`](../../crates/eliot-plugin/src/protocol.rs) from the typed `native_session_archived` start refusal | translate one native restore on the still-owned plugin, and acknowledge the exact binding only after native confirmation |
 | `agent.start.continue` | the acknowledged archived Resume binding | open the already-prepared subject and return the normal readiness or failure result |
 | `agent.command` | agent/generation, command id, verb/args, exact turn/request where required | applied/rejected/failed/unknown, native mechanism and application point |
@@ -253,15 +256,24 @@ The native command envelope carries the stable verb spelling. Host and adapter
 dispatch use the shared typed verb. The frozen launch model and effort share one
 projection for adapters that apply retained effort overrides at turn time.
 
-The shared [start classification](../../crates/eliot-plugin/src/start_classification.rs)
-uses adapter-reported dispatch, refusal and cleanup facts. Proven
-non-dispatch or native pre-admission refusal permits local cleanup and a
-bound failed result. After possible session admission, a lost reply,
-unverified readiness or unproved cleanup settles `unknown`. Keep the exact
-native identity, process and generation files available for cleanup when
-observed. A native removal proved for the exact newly created session
-permits a failed result after verification failure. A missing reply or
-identity never authorizes another create or deletion by guesswork.
+Muse and OpenCode report a startup failure with the exact Agent, generation
+and command binding, a named native phase and dispatch evidence. They include
+the native scope and session ID when known and the native PID when observed.
+The daemon uses its verified process custody to retire the generation and
+drain its event source. A proven pre-admission failure settles `failed` after
+owned exit and releases capacity. A possible native write or unproved exit
+settles `unknown`.
+
+When the native session may exist and its identity is known, Swarm records an
+`unknown` native-session artifact before retiring the process tree. If that
+artifact write is refused, the unknown command outcome keeps the exact
+scope and session ID with the custody error for Owner readback. The daemon
+log retains the identity if command persistence also fails. The Owner
+can release that custody with `swarm artifact reconcile ID --release-custody REASON`
+after verified generation exit and source drain. This releases the artifact
+binding and leaves the vendor session and command outcome intact. An
+unidentified or uncertain native effect never authorizes another create or
+deletion by guesswork.
 
 An ordinary stop attempts `agent.command` with `interrupt` for the captured
 active or uncertain turn under the stop's authority, then sends `agent.stop` to
@@ -510,18 +522,9 @@ absent or null; when supplied, it must match the unique Resume command for that 
 generation. The plugin need not add command correlation when its readiness observation does
 not carry it.
 
-A bound failed start follows a pre-dispatch refusal or a definitive verification
-refusal before `session.ready` and input, after confirmed native cleanup. When the
-native subject was established, the failed result includes its `native_scope` and
-`native_ref`. Store retains that subject in the command outcome and the failure
-does not authorize automatic pre-dispatch worktree rollback. Unconfirmed cleanup
-retains an unknown outcome.
-
-If a just-created OpenCode session fails verification and its removal cannot
-be proved, the plugin returns `unknown` and keeps the server running with the
-exact session identity in memory for readback. The generation stays unready.
-If the plugin exits, the controller lacks a durable native subject for resume
-or reconciliation. An unknown create is never replayed.
+The startup failure facts above preserve the exact subject even when
+`session.ready` never commits. The daemon keeps possible effects fenced
+for Owner reconciliation.
 
 For an input-created session, perform start+linked input once but report session,
 input-to-turn association and terminal result independently. Ready alone never proves

@@ -252,14 +252,23 @@ impl Router {
             .effective
             .as_ref()
             .and_then(|effective| effective["model_mismatch"].as_str());
+        let native_activity = row.activity.as_ref();
+        let native_blocker = store.native_child_archive_blocker(&row)?;
         let mut steps = vec![DiagnoseStep {
             kind: "agent".to_owned(),
             code: Some(if model_mismatch.is_some() {
                 "model_mismatch".to_owned()
             } else {
-                eliot_core::api::agent_state_name(row.state).to_owned()
+                native_activity
+                    .map_or_else(
+                        || eliot_core::api::agent_state_name(row.state),
+                        |activity| eliot_core::api::activity_state_name(activity.state),
+                    )
+                    .to_owned()
             }),
-            message: model_mismatch.map(|message| bound_chars(message, 1024)),
+            message: model_mismatch
+                .map(|message| bound_chars(message, 1024))
+                .or(native_blocker),
             failure_where: None,
             origin: model_mismatch.map(|_| "harness".to_owned()),
             origin_evidence: None,
@@ -417,8 +426,13 @@ impl Router {
             let reason = step.message.as_deref().map_or_else(String::new, |message| {
                 format!("; {}", bound_chars(message, 256))
             });
+            let action = if native_activity.is_some() {
+                ""
+            } else {
+                "; resolve with swarm turn resolve using an exact Owner assertion"
+            };
             unresolved.push(format!(
-                "unknown turn {} (generation {}){reason}; resolve with swarm turn resolve using an exact Owner assertion",
+                "unknown turn {} (generation {}){reason}{action}",
                 turn.turn_id, turn.generation
             ));
             step.message = unresolved.last().cloned();

@@ -53,16 +53,16 @@ database connection.
 
 ### Internal module boundaries
 
-Use these boundaries when decomposing the current large Store/Router owners. They are
-ordinary modules inside the existing crates, not new services or dispatch abstractions.
+These owners already exist as ordinary modules. Extend them directly; a refactor must
+remove repeated work or separate a real phase, not introduce a forwarding layer.
 
-| Existing owner | Extraction boundary |
+| Existing owner | Responsibility to preserve |
 | --- | --- |
-| Store `submit_tx` | command admission and its private validation helpers, sharing the caller's transaction and event accumulator |
-| Store `dispatch_inner` | dispatch state/generation changes, retaining the same writer, transaction scope and ordering |
-| Store migrations, workspace actions and source batches | separate cohesive schema, workspace and source-persistence helpers; keep publication after commit |
-| Router `process_command_inner` | command execution and its private preparation/settlement helpers as an internal `impl Router`; native I/O remains outside the Store lock |
-| Store `rules.rs` | timer scheduling apart from event-rule traversal; reuse existing `rule_history.rs` for finite catch-up rather than building a second history engine |
+| Store `admission.rs` | command admission and private validation helpers in the caller's transaction and event accumulator |
+| Store `dispatch.rs` | dispatch state/generation changes in the same writer transaction and order |
+| Store `schema.rs`, `workspace.rs`, `source_batches.rs` | schema, workspace and source persistence; publication follows commit |
+| Router `router/command.rs` and `command_verbs.rs` | preparation, dispatch, effect and settlement; native I/O remains outside the Store lock |
+| Store `rules.rs`, `rule_timers.rs`, `rule_history.rs` | event traversal, timer scheduling and bounded catch-up with the existing rule and slot bindings |
 
 Keep entry points small by moving their existing work, not by duplicating gates or
 adding forwarding traits. Retain authority, generation, idempotency and source checks at
@@ -71,6 +71,9 @@ contracts; file size alone is not a reason to remove them or add another integri
 
 All five native adapters use the same protocol through their `plugins/*` process;
 the desktop is an optional client on the daemon API and `settings.*`.
+Its current visual contract is [native Windows Fluent](design/fluent-design-system.md)
+through WinUI 3/Reactor. Material is frozen; the current client does not maintain
+a second theme/template system for a possible future return.
 Adapters declare the capabilities that govern shared control paths when the binary is
 composed. Shared code resolves the declaration from the configured identity, then uses
 its capabilities to prepare and validate operations. Keep vendor request and response
@@ -105,8 +108,8 @@ keep their original bindings and outcome.
 L3 through L6 are implemented (monitoring, worktrees and the proxy route; automation and
 scripts; agent communication; the five harnesses with worker MCP and the `eliot-swarm`
 skill; the cloud MCP caller; diagnosis and notification), and queue assignment runs as an
-automation timer plus a completion rule, not a task engine. L7 qualification is next;
-see [roadmap](roadmap.md) for the only project status list. Neither mail nor timers
+automation timer plus a completion rule, not a task engine. Remaining implementation
+and qualification belong to [roadmap](roadmap.md), the only project status list. Neither mail nor timers
 require a second vendor. Unimplemented features are not advertised.
 
 ## Cloud MCP caller and agent-health diagnosis
@@ -174,6 +177,16 @@ truth about work is stored in Git and in the file system, outside every harness.
   limit, a model or cost choice, a failed or lost session, or an Owner request.
 - **Store's role.** Store records who works in which worktree and what happened. Git and
   the file system hold the work itself.
+
+Retained task inputs and source copies live in the private `work-truth.git` repository;
+Store binds their refs/revisions to the admitted work. The existing scoped `task.list/get`
+and `checkpoint.list/get` reads expose that history without copying a vendor transcript
+into another context database. Delivery of a source proves which bytes were supplied,
+not that a model understood or followed them.
+
+Live turn previews are bounded, disposable memory in `turn_preview`, served through
+`turn.preview.watch`. They are not Store events, completion evidence or retained history.
+The final native result and its committed readback remain authoritative.
 
 [Coordination](spec/coordination.md#agent-switch-implemented) owns the switch and handoff
 contract, including when a handoff is admitted, what transfers and how uncertain effects

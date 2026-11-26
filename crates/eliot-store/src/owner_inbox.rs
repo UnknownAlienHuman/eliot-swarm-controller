@@ -1,6 +1,6 @@
 //! Read-only owner decision and liveness projections over existing Store rows.
 
-use crate::sql_error;
+use crate::{context::UNDISPATCHED_SWARM_NOTE_SQL, sql_error};
 use eliot_core::api::{
     GoalMode, GoalStatus, LaunchIntentState, LaunchIntentView, OwnerAction, OwnerInboxItem,
     OwnerInboxKind, SwarmLiveness,
@@ -512,7 +512,7 @@ fn project_unknown_commands(
     stats: &mut SwarmLiveness,
     bindings: &[&dyn ToSql],
 ) -> eliot_core::Result<()> {
-    let mut stmt = projection_query(db,
+    let sql = format!(
         "SELECT c.id,c.verb,c.method,c.target,c.generation,c.turn_id,c.created_at,c.state,
                 COALESCE((SELECT e.ts FROM events e INDEXED BY owner_inbox_unknown_receipt
                   WHERE e.kind='command.unknown'
@@ -542,8 +542,11 @@ fn project_unknown_commands(
                 EXISTS(SELECT 1 FROM agents a WHERE a.id=c.target AND a.archived=1
                     AND a.state IN ('stopped','failed','lost'))
          FROM commands c WHERE c.state IN ('accepted','queued','dispatched','unknown')
+           AND NOT {UNDISPATCHED_SWARM_NOTE_SQL}
            AND NOT EXISTS (SELECT 1 FROM agents check_agent WHERE check_agent.id=c.target
-                 AND json_type(check_agent.profile_snapshot, '$._harness_check') IS NOT NULL)", "c.id=?1", bindings)?;
+                 AND json_type(check_agent.profile_snapshot, '$._harness_check') IS NOT NULL)"
+    );
+    let mut stmt = projection_query(db, &sql, "c.id=?1", bindings)?;
     let rows = stmt
         .query_map(bindings, |r| {
             Ok((
@@ -1814,8 +1817,7 @@ fn project_agents(
     stats: &mut SwarmLiveness,
     bindings: &[&dyn ToSql],
 ) -> eliot_core::Result<()> {
-    let mut stmt = projection_query(
-        db,
+    let sql = format!(
         "SELECT a.id,a.generation,a.state,a.updated_at,a.active_turn,
                 CASE WHEN a.state IN ('created','starting') THEN EXISTS(SELECT 1 FROM commands c
                   WHERE c.target=a.id AND (c.generation=a.generation OR c.expected_generation=a.generation)
@@ -1835,7 +1837,8 @@ fn project_agents(
                 CASE WHEN a.state IN ('busy','waiting') AND a.active_turn IS NULL THEN EXISTS(
                   SELECT 1 FROM commands c WHERE c.target=a.id
                   AND (c.generation=a.generation OR c.expected_generation=a.generation)
-                  AND c.state IN ('accepted','queued','dispatched','unknown')) ELSE 0 END,
+                  AND c.state IN ('accepted','queued','dispatched','unknown')
+                  AND NOT {UNDISPATCHED_SWARM_NOTE_SQL}) ELSE 0 END,
                 CASE WHEN a.state IN ('busy','waiting') AND a.active_turn IS NULL THEN EXISTS(
                   SELECT 1 FROM processes p WHERE p.owner='agent:a'||a.id||'#'||a.generation
                     AND p.role='plugin' AND p.state='running') ELSE 0 END,
@@ -1861,10 +1864,9 @@ fn project_agents(
                   ))
          WHERE a.observe_only=0 AND a.archived=0
            AND a.state IN ('created','starting','idle','busy','waiting','unknown')
-           AND json_type(a.profile_snapshot, '$._harness_check') IS NULL",
-        "a.id=?1",
-        bindings,
-    )?;
+           AND json_type(a.profile_snapshot, '$._harness_check') IS NULL"
+    );
+    let mut stmt = projection_query(db, &sql, "a.id=?1", bindings)?;
     let rows = stmt
         .query_map(bindings, |r| {
             Ok((

@@ -1523,7 +1523,7 @@ impl Store {
                     native_event,
                 )?;
             let (mut next, effects) = if observed {
-                observer_live::persist_turn_fact(tx, &projection, native_event)?;
+                observer_live::persist_turn_fact(tx, &projection, native_event, now)?;
                 (projection.clone(), Vec::new())
             } else if resolves_recovered
                 && projection.active_turn.as_deref() != native_event.data["turn_id"].as_str()

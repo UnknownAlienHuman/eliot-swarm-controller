@@ -27,7 +27,7 @@ use std::{
     time::Duration,
 };
 
-use eliot_core::local_provider::LocalProvider;
+use crate::local_provider::LocalProvider;
 use eliot_core::{Error, FailureOrigin, Result, SecretPolicy};
 use eliot_plugin::{
     StderrCapture,
@@ -369,21 +369,13 @@ impl OwnedServer {
         }
     }
 
-    /// Write the per-generation config, prepare the selected native
-    /// credential in the isolated store, reserve a loopback port, spawn the
-    /// server on the per-Agent store, and wait for readiness. Every failure
-    /// from this function happens before any native session or prompt
-    /// exists, so the caller settles it as a definite failed start, except
-    /// an uncertain auth-import outcome (code `unknown`): the isolated
-    /// credential store may already have been written and reconciliation
-    /// failed, so that error propagates for the caller to settle unknown per
-    /// the authentication contract. Unconfirmed exit also stays unknown.
-    /// The child gets the host-built target environment, generated
-    /// password and XDG roots. Local providers use isolated config discovery.
+    /// Prepare the isolated store, spawn its server and prove readiness.
+    /// The generation Job retains the process if any later phase fails.
     pub async fn spawn(
         launch: ServerLaunch,
         secrets: &[String],
         envelope: Instant,
+        native_pid: &mut Option<u32>,
     ) -> Result<Self> {
         let prepare_timing = super::startup::Step::new("config_environment");
         // OpenCode keeps plugin and session contexts per directory. Use the
@@ -675,8 +667,7 @@ impl OwnedServer {
             .stderr(std::process::Stdio::piped())
             // Normal Agent stop preserves the native session and hands any
             // lingering serve process to the daemon's generation Job. The
-            // plugin's explicit startup cleanup still terminates failures;
-            // dropping this handle must not perform a second force stop.
+            // same Job owns retirement after a failed start.
             .kill_on_drop(false);
         #[cfg(windows)]
         eliot_plugin::native_cli::detach_from_console(&mut command);
@@ -693,6 +684,7 @@ impl OwnedServer {
                 "OS could not start the native serve binary",
             )
         })?;
+        *native_pid = child.id();
         drop(spawn_timing);
         let ready_timing = super::startup::Step::new("serve_readiness");
         let stdout = child.stdout.take().ok_or_else(|| {
@@ -731,13 +723,10 @@ impl OwnedServer {
         // full 60 s bound, but the whole launch still answers inside the
         // daemon agent.start budget.
         let ready_deadline = (Instant::now() + NATIVE_READINESS_BUDGET).min(envelope);
-        if let Err(error) = server.await_launch_ready(listening, ready_deadline).await {
-            let stop_by = (Instant::now() + Duration::from_secs(10)).min(envelope);
-            return Err(match server.terminate(true, stop_by).await {
-                Ok(()) => error,
-                Err(cleanup) => unconfirmed_server_exit(error, cleanup),
-            });
-        }
+        server
+            .await_launch_ready(listening, ready_deadline)
+            .await
+            .map_err(|error| server.diagnostic_error(error))?;
         drop(ready_timing);
         Ok(server)
     }
@@ -1052,14 +1041,6 @@ impl OwnedServer {
             let _ = stderr.finish(deadline).await;
         }
     }
-}
-
-pub(crate) fn unconfirmed_server_exit(error: Error, cleanup: Error) -> Error {
-    let message = format!(
-        "{}; owned OpenCode server exit is unconfirmed ({})",
-        error.message, cleanup.message
-    );
-    error.with_code("unknown").with_message(message)
 }
 
 /// The per-Agent session store: `opencode-{agent_id}/data` next to the

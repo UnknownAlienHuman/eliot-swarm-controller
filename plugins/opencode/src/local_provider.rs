@@ -1,8 +1,74 @@
 //! OpenCode local provider configuration checks shared by settings and native startup.
 
-use eliot_core::{api::HarnessCapabilities, local_provider::LocalProvider};
+use eliot_core::api::{HarnessCapabilities, harness::LocalProviderProfile};
 use reqwest::Url;
+use serde::{Deserialize, Deserializer, Serialize};
+use serde_json::Value;
 use std::collections::HashSet;
+
+/// The OpenCode provider payload as saved and frozen by Swarm.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct LocalProvider {
+    pub id: String,
+    pub package: String,
+    pub base_url: String,
+    #[serde(
+        default,
+        deserialize_with = "present",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub api_key_env: Option<String>,
+    pub models: Vec<LocalModel>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct LocalModel {
+    pub id: String,
+    #[serde(
+        default,
+        deserialize_with = "present",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub context_limit: Option<u64>,
+    #[serde(
+        default,
+        deserialize_with = "present",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub output_limit: Option<u64>,
+}
+
+fn present<'de, D: Deserializer<'de>, T: Deserialize<'de>>(
+    deserializer: D,
+) -> Result<Option<T>, D::Error> {
+    T::deserialize(deserializer).map(Some)
+}
+
+impl LocalProvider {
+    pub(crate) fn decode(payload: &Value) -> Result<Self, serde_json::Error> {
+        Self::deserialize(payload)
+    }
+
+    pub fn contains_model(&self, provider: &str, model: &str) -> bool {
+        self.id == provider && self.models.iter().any(|entry| entry.id == model)
+    }
+}
+
+pub(super) const PROFILE: LocalProviderProfile = LocalProviderProfile {
+    check_shape: |payload| LocalProvider::decode(payload).map(drop),
+    validate: |payload, pass_env| decode_and_validate(payload, pass_env).map(drop),
+};
+
+pub(super) fn decode_and_validate(
+    payload: &Value,
+    pass_env: &[String],
+) -> Result<LocalProvider, String> {
+    let provider = LocalProvider::decode(payload).map_err(|error| error.to_string())?;
+    validate(&provider, pass_env)?;
+    Ok(provider)
+}
 
 pub(crate) fn validate(provider: &LocalProvider, pass_env: &[String]) -> Result<(), String> {
     if provider.id.len() > 64

@@ -1555,6 +1555,9 @@ async fn spawn_auto_round(
             mail_router.reoffer_mail_notice(&mail_agent).await;
         });
     }
+    if eliot_store::Store::goal_event_is_round_bookkeeping(&event.kind) {
+        return;
+    }
     if !idle_goal_is_eligible(router, &agent, event.generation).await {
         return;
     }

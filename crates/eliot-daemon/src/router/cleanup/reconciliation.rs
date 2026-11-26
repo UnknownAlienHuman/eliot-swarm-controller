@@ -26,7 +26,9 @@ impl Router {
             }
             self.check_cleanup_admission()?;
             let artifact = store.unknown_cleanup_artifact(&request.artifact)?;
-            if !store.cleanup_agent_quiescent(&artifact)? {
+            if !store
+                .artifact_reconciliation_quiescent(&artifact, request.release_custody.is_some())?
+            {
                 return Err(Error::new(
                     "agent_not_quiescent",
                     "artifact Agent custody is still active",

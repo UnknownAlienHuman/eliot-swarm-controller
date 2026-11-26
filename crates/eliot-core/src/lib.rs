@@ -22,7 +22,6 @@ mod context;
 mod diagnostics;
 mod harness_check;
 mod ids;
-pub mod local_provider;
 mod mcp_policy;
 mod naming;
 mod native_child;
