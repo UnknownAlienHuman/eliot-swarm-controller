@@ -605,33 +605,31 @@ impl Component for MonitorList {
     }
 }
 
-/// The tree's columns inside a row's button: Task, Model, Activity, CPU,
-/// Memory. Each row is its own Grid and WinUI has no shared size groups,
-/// so the text columns share the row's width by star to stay aligned under
-/// the header at any width (an Auto column would differ row by row, and a
-/// long status line would take the task's room); CPU and Memory hold
-/// fixed-size numbers. A wide main area gives the task the most; a narrow
-/// one gives Activity the task's share and Model half of it, so a short
-/// status ("Working · 1 min") shows whole.
-fn row_columns(narrow: bool) -> [GridLength; 5] {
-    let (model, activity) = if narrow {
-        (
-            tokens::page::FLEET_NARROW_MODEL_SHARE,
-            tokens::page::FLEET_TASK_SHARE,
-        )
+/// The tree's columns inside a row's button. Each row is its own Grid and
+/// WinUI has no shared size groups, so the text columns share the row's
+/// width by star to stay aligned under the header at any width (an Auto
+/// column would differ row by row, and a long status line would take the
+/// task's room); CPU and Memory hold fixed-size numbers. A wide main area
+/// shows Task, Model, Activity, CPU and Memory, the task the most. A narrow
+/// one has no Model column: the model stands in the task's second line, as
+/// the reference apps' list rows put their details under the title, and
+/// Activity takes a smaller share that holds a short status.
+fn row_columns(narrow: bool) -> Vec<GridLength> {
+    let mut columns = vec![GridLength::Star(tokens::page::FLEET_TASK_SHARE)];
+    if narrow {
+        columns.push(GridLength::Star(tokens::page::FLEET_NARROW_ACTIVITY_SHARE));
     } else {
-        (
-            tokens::page::FLEET_TEXT_SHARE,
-            tokens::page::FLEET_TEXT_SHARE,
-        )
-    };
-    [
-        GridLength::Star(tokens::page::FLEET_TASK_SHARE),
-        GridLength::Star(model),
-        GridLength::Star(activity),
-        GridLength::Pixel(tokens::page::FLEET_NUMBER),
-        GridLength::Pixel(tokens::page::FLEET_NUMBER),
-    ]
+        columns.push(GridLength::Star(tokens::page::FLEET_TEXT_SHARE));
+        columns.push(GridLength::Star(tokens::page::FLEET_TEXT_SHARE));
+    }
+    columns.push(GridLength::Pixel(tokens::page::FLEET_NUMBER));
+    columns.push(GridLength::Pixel(tokens::page::FLEET_NUMBER));
+    columns
+}
+
+/// Activity's column; CPU and Memory follow it.
+fn activity_column(narrow: bool) -> i32 {
+    if narrow { 1 } else { 2 }
 }
 
 /// A row's outer columns: the chevron, the row's button, its action.
@@ -655,6 +653,7 @@ fn number(text: &str, column: i32) -> View {
 /// The header row (`.trow.head`): the column names in `label-medium`, a
 /// hairline under them.
 fn head_row(narrow: bool) -> View {
+    let at = activity_column(narrow);
     let label = |text: &str, column: i32, right: bool| -> View {
         crate::controls::text(text.to_owned(), tokens::text::LABEL)
             .grid_column(column)
@@ -670,7 +669,11 @@ fn head_row(narrow: bool) -> View {
         .height(tokens::height::CONTROL)
         .border_brush(ThemeBrush::CardStroke)
         .border_thickness(Thickness::new(0.0, 0.0, 0.0, tokens::layout::HAIRLINE))
-        .automation_name("Columns: Task, Model, Activity, CPU, Memory")
+        .automation_name(if narrow {
+            "Columns: Task, Activity, CPU, Memory"
+        } else {
+            "Columns: Task, Model, Activity, CPU, Memory"
+        })
         .content(
             Grid::new()
                 .columns(outer_columns())
@@ -682,13 +685,13 @@ fn head_row(narrow: bool) -> View {
                             .margin(Thickness::xy(tokens::spacing::ROW, 0.0))
                             .columns(row_columns(narrow))
                             .column_spacing(tokens::spacing::SM)
-                            .children((
-                                label("Task", 0, false),
-                                label("Model", 1, false),
-                                label("Activity", 2, false),
-                                label("CPU", 3, true),
-                                label("Memory", 4, true),
-                            ))
+                            .keyed_children(crate::views::slots([
+                                Some(label("Task", 0, false)),
+                                (!narrow).then(|| label("Model", 1, false)),
+                                Some(label("Activity", at, false)),
+                                Some(label("CPU", at + 1, true)),
+                                Some(label("Memory", at + 2, true)),
+                            ]))
                             .into(),
                     ),
                 ])),
@@ -697,8 +700,9 @@ fn head_row(narrow: bool) -> View {
 }
 
 /// One tree row (`.trow`): the chevron of its children, then the row (its
-/// state mark, title and project; model; activity; CPU; memory), which
-/// opens its conversation, then Resume or Stop.
+/// state mark, title and project; model, or in a narrow main area the model
+/// after the project; activity; CPU; memory), which opens its
+/// conversation, then Resume or Stop.
 fn fleet_row(entry: &RowEntry, input: &MonitorListInput) -> View {
     let row = &entry.row;
     let mut task: Vec<KeyedView> = vec![KeyedView::new(
@@ -718,11 +722,26 @@ fn fleet_row(entry: &RowEntry, input: &MonitorListInput) -> View {
         crate::controls::text(entry.title.clone(), tokens::page::HEADING)
             .text_trimming(TextTrimming::CharacterEllipsis),
     )];
-    if !entry.observed && !entry.project.is_empty() {
+    // The project and the model in one line ("repo · Claude Code ·
+    // claude-haiku-5-5"): a narrow row, which has no Model column, shows it
+    // under the title (trimmed at its end); the row's name and tooltip always
+    // carry it whole.
+    let project = (!entry.observed && !entry.project.is_empty()).then_some(entry.project.as_str());
+    let model = (!entry.model.is_empty()).then_some(entry.model.as_str());
+    let details = project
+        .into_iter()
+        .chain(model)
+        .collect::<Vec<_>>()
+        .join(" · ");
+    let second = if input.narrow {
+        (!details.is_empty()).then(|| details.clone())
+    } else {
+        project.map(str::to_owned)
+    };
+    if let Some(second) = second {
         names.push(KeyedView::new(
             "project",
-            crate::controls::secondary(entry.project.clone())
-                .text_trimming(TextTrimming::CharacterEllipsis),
+            crate::controls::secondary(second).text_trimming(TextTrimming::CharacterEllipsis),
         ));
     }
     task.push(KeyedView::new(
@@ -741,8 +760,9 @@ fn fleet_row(entry: &RowEntry, input: &MonitorListInput) -> View {
                 .content(crate::controls::badge("observed")),
         ));
     }
+    let at = activity_column(input.narrow);
     let activity = crate::controls::text(entry.activity.clone(), tokens::text::BODY)
-        .grid_column(2)
+        .grid_column(at)
         .vertical_alignment(VerticalAlignment::Center)
         .text_trimming(TextTrimming::CharacterEllipsis);
     let activity = if entry.attention {
@@ -753,36 +773,42 @@ fn fleet_row(entry: &RowEntry, input: &MonitorListInput) -> View {
     let content = Grid::new()
         .columns(row_columns(input.narrow))
         .column_spacing(tokens::spacing::SM)
-        .children((
-            Grid::new()
-                .margin(Thickness::new(
-                    if entry.kid {
-                        tokens::layout::TREE_INDENT
-                    } else {
-                        0.0
-                    },
-                    0.0,
-                    0.0,
-                    0.0,
-                ))
-                .columns([GridLength::Auto, GridLength::STAR, GridLength::Auto])
-                .column_spacing(tokens::spacing::SM)
-                .keyed_children(task),
-            crate::controls::secondary(entry.model.clone())
-                .grid_column(1)
-                .vertical_alignment(VerticalAlignment::Center)
-                .text_trimming(TextTrimming::CharacterEllipsis),
-            activity,
-            number(&entry.cpu, 3),
-            number(&entry.memory, 4),
-        ));
+        .keyed_children(crate::views::slots([
+            Some(
+                Grid::new()
+                    .margin(Thickness::new(
+                        if entry.kid {
+                            tokens::layout::TREE_INDENT
+                        } else {
+                            0.0
+                        },
+                        0.0,
+                        0.0,
+                        0.0,
+                    ))
+                    .columns([GridLength::Auto, GridLength::STAR, GridLength::Auto])
+                    .column_spacing(tokens::spacing::SM)
+                    .keyed_children(task)
+                    .into(),
+            ),
+            (!input.narrow).then(|| {
+                crate::controls::secondary(entry.model.clone())
+                    .grid_column(1)
+                    .vertical_alignment(VerticalAlignment::Center)
+                    .text_trimming(TextTrimming::CharacterEllipsis)
+                    .into()
+            }),
+            Some(activity.into()),
+            Some(number(&entry.cpu, at + 1)),
+            Some(number(&entry.memory, at + 2)),
+        ]));
     let open = input.open.clone();
     let id = row.id.clone();
     let name = format!(
         "{}, {}, {}, {}{}",
         entry.title,
         row.status_words(),
-        entry.model,
+        details,
         entry.activity,
         entry.words
     );
