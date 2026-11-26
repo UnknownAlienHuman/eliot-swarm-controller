@@ -455,19 +455,26 @@ impl DesktopApp {
         if open.new_task() {
             return self.launch_goal_drafts().1;
         }
-        match self.dialog_goal(&open.agent) {
-            Some(None) => Draft {
+        // No goal was ever set (a cleared one is not seeded again): the
+        // daemon's default objective, the first linked input.
+        let unset = self
+            .chat
+            .goal
+            .as_ref()
+            .is_some_and(|(id, goal)| *id == open.agent && goal.is_none());
+        if unset {
+            return Draft {
                 text: self
                     .bound_detail()
                     .ok()
                     .filter(|detail| detail.agent == open.agent)
                     // Save checks the goal text limit like any edit.
-                    .and_then(|detail| detail.first_owner_message.clone())
+                    .and_then(|detail| detail.default_goal_objective.clone())
                     .unwrap_or_default(),
                 ..Draft::empty()
-            },
-            goal => Draft::of(goal.flatten()),
+            };
         }
+        Draft::of(self.dialog_goal(&open.agent).flatten())
     }
 
     /// The open dialog's goal: none while it is read, `Some(None)` with no

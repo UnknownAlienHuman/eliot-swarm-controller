@@ -247,9 +247,33 @@ impl DesktopApp {
             None => place,
         };
         let goal_read = self.chat.goal.as_ref().filter(|(read, _)| read == agent);
+        // A blocked Goal's audit cycles (A10): the last cycle of its
+        // `owner.inbox` item's history, of the project policy's
+        // `budget.max_audits`.
+        let audit = self
+            .chat
+            .decisions
+            .as_ref()
+            .filter(|(read, _, _)| read == agent)
+            .and_then(|(_, items, _)| {
+                items.iter().find(|item| {
+                    item.kind == eliot_core::api::OwnerInboxKind::BlockedGoal
+                        && item.subject.split(':').next() == Some(agent)
+                })
+            })
+            .and_then(|item| item.audit_history.as_deref())
+            .and_then(|history| history.iter().map(|entry| entry.cycle).max())
+            .zip(detail.map(|detail| self.settings.max_audits_of(&detail.project)));
         let goal = goal_read
             .and_then(|(_, goal)| goal.as_ref())
-            .and_then(goal_words);
+            .and_then(|goal| goal_words(goal, audit));
+        // With no goal set, the first message is the objective (brand book
+        // §9.1; `default_goal_objective`, A11), shown on the Goal button.
+        let objective = goal_read
+            .filter(|(_, goal)| goal.is_none())
+            .and(detail)
+            .and_then(|detail| detail.default_goal_objective.as_deref())
+            .and_then(crate::nav::title);
         // Unknown until a read succeeds: shown as unknown, never as "no goal".
         let goal_unknown = goal_read.is_none().then(|| {
             if self
@@ -286,6 +310,7 @@ impl DesktopApp {
             subtitle,
             state: shown,
             goal,
+            objective,
             goal_offered,
             goal_unknown,
             changes,
@@ -374,14 +399,19 @@ impl DesktopApp {
 }
 
 /// The Goal button's words for a set goal ("Goal · round 2 of 3", "Goal
-/// blocked"); none for a cleared goal (the button then says "Goal").
-fn goal_words(goal: &eliot_core::api::GoalView) -> Option<String> {
+/// blocked", "Goal · audit 1 of 2" for a blocked goal with audit cycles:
+/// the last cycle and the policy's limit); none for a cleared goal (the
+/// button then says "Goal").
+fn goal_words(goal: &eliot_core::api::GoalView, audit: Option<(u8, i64)>) -> Option<String> {
     use eliot_core::api::GoalStatus;
     let rounds = goal.counters.rounds;
     Some(match goal.status {
         GoalStatus::Cleared => return None,
         GoalStatus::Completed => "Goal met".to_owned(),
-        GoalStatus::Blocked => "Goal blocked".to_owned(),
+        GoalStatus::Blocked => match audit {
+            Some((cycle, max)) => format!("Goal \u{b7} audit {cycle} of {max}"),
+            None => "Goal blocked".to_owned(),
+        },
         GoalStatus::Paused => "Goal paused".to_owned(),
         GoalStatus::Active => match goal.definition.max_rounds {
             _ if rounds <= 0 => "Goal \u{b7} active".to_owned(),
@@ -447,6 +477,9 @@ pub(super) struct HeaderInput {
     state: State,
     /// The goal's words, when the Agent has a goal.
     goal: Option<String>,
+    /// With no goal set, the first message as the objective (its first
+    /// line).
+    objective: Option<String>,
     /// The task menu offers Goal, or its detail is not read: the Goal
     /// button shows (it also shows while a goal exists).
     goal_offered: bool,
@@ -539,21 +572,34 @@ impl Component for Header {
             // An unknown state is said on the button itself, not only in
             // its name (§4.2: never hidden, never colour alone).
             let (words, tooltip) = match (&input.goal, input.goal_unknown) {
-                (Some(goal), _) => (goal.clone(), "Edit, pause or clear this task's goal"),
+                (Some(goal), _) => (
+                    goal.clone(),
+                    "Edit, pause or clear this task's goal".to_owned(),
+                ),
                 (None, Some(GoalUnknown::NotRead)) => (
                     "Goal · not read yet".to_owned(),
-                    "This task's goal is not read yet: open Goal to read it",
+                    "This task's goal is not read yet: open Goal to read it".to_owned(),
                 ),
                 (None, Some(GoalUnknown::Failed)) => (
                     "Goal · not readable".to_owned(),
-                    "This task's goal could not be read: open Goal to try again",
+                    "This task's goal could not be read: open Goal to try again".to_owned(),
                 ),
                 (None, None) => (
                     "Goal".to_owned(),
-                    "Set a goal this task keeps working toward",
+                    match &input.objective {
+                        // Brand book §9.1: the first message serves as the goal.
+                        Some(objective) => {
+                            format!("No goal set: the first message is the objective: {objective}")
+                        }
+                        None => "Set a goal this task keeps working toward".to_owned(),
+                    },
                 ),
             };
-            let name = words.clone();
+            // The objective is part of the name: a reader hears it too.
+            let name = match (&input.goal, input.goal_unknown, &input.objective) {
+                (None, None, Some(_)) => format!("{words}. {tooltip}"),
+                _ => words.clone(),
+            };
             controls::bar_button(false)
                 .automation_name(name)
                 .on_click(context.message(Message::Chat(ChatMsg::AgentMenu(Action::Goal))))

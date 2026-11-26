@@ -371,7 +371,7 @@ Enter выбирает явно выделенный результат. Для 
 
 В центре — короткий заголовок `What should we build?`, выбранный project и composer. Без hero-иллюстрации и больших карточек метрик. Под composer максимум три полезных быстрых действия: продолжить последнюю задачу, заполнить промпт обзором проекта, открыть Automations. Они не отправляют запрос модели без пользовательского запуска.
 
-Composer Home содержит prompt, attachments, Project, Workspace, Model/Effort, Access и Start task. На узком экране параметры переносятся на вторую строку; главный текст и кнопка не исчезают.
+Composer Home содержит prompt, attachments, Project, Workspace, Model/Effort, Access, Goal и Start task. На узком экране параметры переносятся на вторую строку; главный текст и кнопка не исчезают.
 
 | Поле | Поведение |
 |---|---|
@@ -380,6 +380,7 @@ Composer Home содержит prompt, attachments, Project, Workspace, Model/Ef
 | Model | Auto по routing role либо выбранный preset/model. Выбранное значение видно до старта. |
 | Effort | Только реально поддерживаемые уровни выбранной модели; не универсальные Low/High для всех harness. |
 | Access | Ask / Auto / Full в терминах текущих пресетов; объяснять итоговый режим, не подменять его более слабой операцией. |
+| Goal | Goal, с которым стартует задача: Goal политики проекта (`[projects.ID.policy]`, «Goal · 3 rounds») с полями владельца поверх него, без политики — «Goal». Открывает тот же диалог Goal; в `args.goal` уходят только изменённые поля. Политика правится только в Settings › Projects, диалог ссылается туда. |
 | Start task | Один admitted launch с устойчивым ID; состояние Starting/Queued и последующий переход. |
 | More start actions | Queue it, Attach existing session. Skip project policy — отдельное редкое действие с обязательной причиной, когда подключён существующий backend opt-out. |
 
@@ -459,7 +460,7 @@ Composer растёт от одной строки до разумной дол�
 |---|---|---|---|
 | Idle, можно начать turn | Send disabled | Send | Одна команда с устойчивой идентичностью. |
 | Working, steer разрешён | Stop turn | Steer; Stop turn остаётся отдельной доступной командой | Steer адресуется текущим Agent/generation/turn. |
-| Stopped / Lost | Resume, если разрешён | Resume with message, если поддерживается текущим API | Возобновление не изображается обычным продолжением ещё работающей сессии. |
+| Stopped / Lost | Resume, если разрешён | Resume with message, если поддерживается текущим API (кнопка остаётся «Resume», «Resume with message» — её имя и подсказка, чтобы строка не резала chips) | Возобновление не изображается обычным продолжением ещё работающей сессии. |
 | Blocking approval / question | Decision panel | Draft сохранён за decision panel | Не отправлять текст в модель вместо ответа на запрос. |
 | Provider hold | Причина + разрешённые действия | Ввод можно сохранить как draft | Доступность Send/Steer определяет daemon; чтение, Stop и ответ владельца не блокируются без основания. |
 | Команда ещё подтверждается | Pending indicator в соответствующем действии | Новый ввод не стирать | Повторный запуск той же операции закрыт; приложение целиком не заморожено. |
@@ -548,7 +549,7 @@ Scoped tree показывает manager, children и наблюдаемые nat
 |---|---|
 | Summary | Project, workspace, branch, profile/model, state, started/last activity; Copy paths/IDs отдельно. |
 | Task | Доступный prompt/brief preview и связанные данные. Backend `task.list/get` существует, desktop caller/browser пока не найден; не подменять Task record реконструкцией из transcript. [C31], [C32], [C41] |
-| Goal | Текущие Goal get/set/status UI; Owner-approved Goal audit/continuation, first-input default objective и task card after compaction остаются требованиями roadmap, не заявлением о реализованном поведении. [C36], [C37] |
+| Goal | Текущие Goal get/set/status UI; шапка и диалог Goal показывают default objective (A11, `default_goal_objective`), шапка, Resolve card и Inbox — audit cycles (A10, `audit_history`); task card after compaction (A12) остаётся требованием roadmap. [C36], [C37] |
 | Work | Git base/head, worktree ownership, claims и интеграция. Backend/CLI предоставляет `checkpoint.list/get/restore`; desktop caller/browser пока не найден. [C33], [C34] |
 | Mail | Read-only просмотр адресованной агенту координации и доставки; явная Send note/Broadcast action. Просмотр владельцем не подтверждает чтение от имени агента. |
 | What went wrong | Последние релевантные failure/refusal/unknown facts, recovery action и Copy details. Один и тот же сбой не размножается в три красных карточки. |
@@ -937,7 +938,7 @@ Display names, favorites/recent и имеющиеся preferences использ
 | Project manager/transfer | Backend и UI | Assignment conflict, progress, successor и recovery. |
 | Fleet/resources/diagnostics | Backend и monitor UI | Сохранить freshness/coverage, bounded reads и понятные колонки. |
 | Native subagents | Observe-only evidence для поддерживаемых harness | Отдельный тип строки, без недоступных Agent controls. |
-| Goals | Backend и базовый текущий Goal dialog/status; дополнительные Owner-approved defaults/audit/continuation/task-card behavior — roadmap work | Не считать A10–A12 реализованными по наличию базового Goal UI; сохранять актуальные actions/status без выдуманной истории. [C36], [C37] |
+| Goals | Backend, Goal dialog/status, Goal новой задачи, default objective и audit history (A10, A11); task card after compaction (A12) — roadmap work | Не считать A12 реализованным по наличию Goal UI; сохранять актуальные actions/status без выдуманной истории. [C36], [C37] |
 | Task record browser | Backend `task.list`/`task.get` есть; desktop caller/browser пока не найден | Подключать только pinned, bounded reader с manifest/source coverage; не восстанавливать записи из ленты. [C31], [C32], [C41] |
 | Checkpoints | Backend/CLI `checkpoint.list/get/restore` реализованы; desktop caller/browser не найден | Подключить точные pinned reads и guarded restore в desktop; до этого не обещать checkpoint history/restore в UI. [C33], [C34], [C41] |
 | Mail | Backend queue/read/delivery/ack и client helpers | Details/team communication; owner просмотр не agent ack. Отдельный mail client не требуется. |
@@ -991,7 +992,7 @@ WinUI Gallery snapshot использует `2.6.6-experimental` в `standalone.
 
 ### 22.4. Текущая база и оставшиеся UI gaps
 
-Текущий Fluent desktop уже использует `TextBlock::font_family`, ScrollView metrics/requests и native Flyout/MenuFlyout bridge в `views.rs`, `flyout.rs` и `menu_ui.rs`; предмет оставшейся проверки — реальные Windows focus, scroll, accessibility и deployment scenarios. §21 остаётся единственной картой продуктовых UI gaps: различать готовый backend contract и отсутствующий desktop caller, например для task/checkpoint reads и `agent.diff`. Не создавать задачи на миграцию отсутствующих Material modules/resources и не объявлять roadmap Goal increments A10–A12 реализованными по наличию базового Goal UI. [C29], [C35], [C39]
+Текущий Fluent desktop уже использует `TextBlock::font_family`, ScrollView metrics/requests и native Flyout/MenuFlyout bridge в `views.rs`, `flyout.rs` и `menu_ui.rs`; предмет оставшейся проверки — реальные Windows focus, scroll, accessibility и deployment scenarios. §21 остаётся единственной картой продуктовых UI gaps: различать готовый backend contract и отсутствующий desktop caller, например для task/checkpoint reads и `agent.diff`. Не создавать задачи на миграцию отсутствующих Material modules/resources и не объявлять roadmap Goal increment A12 реализованным по наличию Goal UI. [C29], [C35], [C39]
 
 ### 22.5. Legacy theme values
 

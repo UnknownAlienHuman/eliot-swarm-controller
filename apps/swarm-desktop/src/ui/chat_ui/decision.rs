@@ -882,10 +882,18 @@ impl DesktopApp {
                 let reason = goal
                     .and_then(|goal| goal.blocked_reason.clone())
                     .unwrap_or_else(|| eliot_core::reason_words(&item.reason));
-                let body: Option<View> = goal.and_then(goal_budget).map(|budget| {
+                let budget: Option<View> = goal.and_then(goal_budget).map(|budget| {
                     controls::secondary(format!("Budget used: {budget}"))
                         .text_wrapping(TextWrapping::Wrap)
                         .is_text_selection_enabled(true)
+                        .into()
+                });
+                // The audit cycles that ran before it blocked (A10).
+                let audits = self.goal_audits(item);
+                let body: Option<View> = (budget.is_some() || audits.is_some()).then(|| {
+                    StackPanel::new()
+                        .spacing(tokens::spacing::SM)
+                        .keyed_children(crate::views::slots([budget, audits]))
                         .into()
                 });
                 (

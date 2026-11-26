@@ -254,6 +254,20 @@ pub struct PolicyFields {
 /// `docs/spec/configuration.md` (`[projects.ID.policy]`).
 pub const DEFAULT_POLICY_ROUNDS: i64 = 3;
 
+/// `policy.budget.max_audits` when omitted: the documented default of
+/// audit and continuation cycles for a blocked Goal.
+pub const DEFAULT_POLICY_AUDITS: i64 = 2;
+
+/// A project's audit cycles per blocked Goal (`policy.budget.max_audits`,
+/// else the default), as the projects section reads.
+pub fn policy_max_audits(draft: &Value, id: &str) -> i64 {
+    draft
+        .get(id)
+        .and_then(|project| project.pointer("/policy/budget/max_audits"))
+        .and_then(Value::as_i64)
+        .unwrap_or(DEFAULT_POLICY_AUDITS)
+}
+
 /// The lists of a policy that the editor shows one entry per field.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PolicyList {

@@ -197,9 +197,10 @@ struct UiDetail {
     /// The session's context fill, when the harness reports the tokens
     /// used.
     context: Option<ContextFill>,
-    /// The first Owner input pinned for the task (`first_owner_message`):
-    /// with no Goal set it is the objective the Goal dialog shows.
-    first_owner_message: Option<String>,
+    /// With no Eliot Goal installed, the first linked input as the Goal
+    /// objective (`default_goal_objective`, automation.md "Default Goal
+    /// objective"): the header and the Goal dialog show it.
+    default_goal_objective: Option<String>,
 }
 
 /// Admission of one draft submission (Send, Steer or Resume): bound Agent,
@@ -799,7 +800,7 @@ fn detail_from(reply: &AgentGetResponse) -> UiDetail {
             };
             (fill.used.is_some() || fill.window.is_some()).then_some(fill)
         }),
-        first_owner_message: reply.first_owner_message.clone(),
+        default_goal_objective: reply.default_goal_objective.clone(),
     }
 }
 

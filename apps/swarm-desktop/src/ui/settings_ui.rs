@@ -605,6 +605,11 @@ impl SettingsState {
         model::policy_fields(&self.base(Section::Projects), id)
     }
 
+    /// One project's audit cycles per blocked Goal.
+    pub(super) fn max_audits_of(&self, id: &str) -> i64 {
+        model::policy_max_audits(&self.base(Section::Projects), id)
+    }
+
     fn busy(&self) -> bool {
         self.reading || self.saving.is_some()
     }
