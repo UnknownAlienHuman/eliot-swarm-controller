@@ -606,11 +606,12 @@ the connected product. Keep results in the PR/CI, not a permanent audit/readines
       `CLAUDE_CONFIG_DIR` credential mount; readiness commits, never unknown.
       Muse/Antigravity Linux binaries install and run, but their authenticated
       turns are not qualified here. Custody stays honestly degraded (see Docker README).
-- [ ] Retention/WAL/backpressure and representative load. The 10,000-Agent
-      release check requires 9,992 settled native histories and eight
-      simultaneously active native tasks. Report sustained committed ingress
-      against 2,000 events/s separately from retained replay and client work.
-      Store-only write probes and replay throughput leave this check open.
+- [ ] Retention/WAL/backpressure and representative load. Run this last, after
+      the other roadmap work, with 100 Agents total on free or cheap models
+      (OpenCode free, Claude Haiku). The later target is 10,000 Agents and 2,000
+      committed events/s. Report sustained ingress separately from retained
+      replay and client work. Store-only write probes and replay throughput
+      leave this check open.
 
 Fix the root cause and keep focused regressions. No runtime readiness claim until the
 relevant real path is exercised. A missing optional harness does not block qualification
