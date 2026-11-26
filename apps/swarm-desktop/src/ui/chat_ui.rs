@@ -1648,6 +1648,7 @@ impl DesktopApp {
     ) -> View {
         const REVIEW: &str =
             "Review the open pull requests in this repository and summarize what needs attention.";
+        let narrow = self.narrow_main();
         let last = self
             .nav
             .agents
@@ -1774,15 +1775,18 @@ impl DesktopApp {
                             Some(composer),
                             Some(
                                 // The cards share the column in equal cells
-                                // of one height.
-                                Grid::new()
-                                    .columns(vec![GridLength::STAR; cards.len()])
-                                    .column_spacing(tokens::spacing::SM)
+                                // of one height; a narrow main area stacks
+                                // them, one full-width card per line, so no
+                                // label is cut.
+                                cards_grid(narrow, cards.len())
                                     .keyed_children(cards.into_iter().enumerate().map(
                                         |(index, (key, card, label))| {
+                                            let (row, column) =
+                                                if narrow { (index, 0) } else { (0, index) };
                                             KeyedView::new(
                                                 key,
-                                                card.grid_column(index as i32)
+                                                card.grid_row(row as i32)
+                                                    .grid_column(column as i32)
                                                     .horizontal_alignment(
                                                         HorizontalAlignment::Stretch,
                                                     )
@@ -2048,5 +2052,19 @@ impl DesktopApp {
                 .flatten(),
             )
             .into()
+    }
+}
+
+/// The Home cards' grid: equal columns of one height, or one full-width
+/// card per line in a narrow main area.
+fn cards_grid(narrow: bool, count: usize) -> Grid {
+    if narrow {
+        Grid::new()
+            .rows(vec![GridLength::Auto; count])
+            .row_spacing(tokens::spacing::SM)
+    } else {
+        Grid::new()
+            .columns(vec![GridLength::STAR; count])
+            .column_spacing(tokens::spacing::SM)
     }
 }
