@@ -220,6 +220,9 @@ pub(crate) fn is_reportable(item: &OwnerInboxItem, now: i64, confirmed: &StuckSt
         // Repeated failures are already grouped by cause in their projection;
         // waiting for a second liveness sample would delay the alert.
         || item.reason == super::owner_inbox::REPEATED_FAILURE_REASON
+        // The startup probe-recovery attempt already establishes the wait for
+        // a fenced unknown artifact; a second sample would delay the alert.
+        || item.reason == super::owner_inbox::PROBE_RECOVERY_NEEDS_OWNER
         || confirmed.get(&item.subject).is_some_and(|state| {
             state.reason == item.reason && state.due_at == StuckState::due_at(item, now)
         })
@@ -651,6 +654,7 @@ fn complete_action(action: &mut OwnerAction, supplied: Option<&Map<String, Value
                 (&mut action.args, supplied, &["retained_ref", "commit"])
             }
             "provider.clear_hold" => (&mut action.args, supplied, &["corrective_evidence"]),
+            "artifact.reconcile" => (&mut action.args, supplied, &["release_custody"]),
             "command.submit" if approval || action.args["verb"] == "answer" => {
                 let supplied = match supplied {
                     Some(args) if args.contains_key("args") && args.len() == 1 => Some(
