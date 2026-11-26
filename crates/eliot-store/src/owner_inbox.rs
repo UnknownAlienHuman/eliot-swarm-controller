@@ -535,7 +535,9 @@ fn project_unknown_commands(
                         WHEN 'compact' THEN json_extract(c.outcome,'$.message')
                         WHEN 'worktree.remove' THEN json_extract(c.outcome,'$.result.message')
                     END,1,1024) END,
-                CASE WHEN c.verb='worktree.remove' AND c.state='unknown' THEN c.outcome END
+                CASE WHEN c.verb='worktree.remove' AND c.state='unknown' THEN c.outcome END,
+                EXISTS(SELECT 1 FROM agents a WHERE a.id=c.target AND a.archived=1
+                    AND a.state IN ('stopped','failed','lost'))
          FROM commands c WHERE c.state IN ('accepted','queued','dispatched','unknown')
            AND NOT EXISTS (SELECT 1 FROM agents check_agent WHERE check_agent.id=c.target
                  AND json_type(check_agent.profile_snapshot, '$._harness_check') IS NOT NULL)", "c.id=?1", bindings)?;
@@ -559,6 +561,7 @@ fn project_unknown_commands(
                 r.get::<_, bool>(14)?,
                 r.get::<_, Option<String>>(15)?,
                 r.get::<_, Option<String>>(16)?,
+                r.get::<_, bool>(17)?,
             ))
         })
         .map_err(sql_error)?;
@@ -581,6 +584,7 @@ fn project_unknown_commands(
             owner_handoff_send,
             detail,
             removal_outcome,
+            archived_ended,
         ) = row.map_err(sql_error)?;
         let state = match raw_state.as_str() {
             "accepted" => eliot_core::CommandState::Accepted,
@@ -590,6 +594,13 @@ fn project_unknown_commands(
             _ => return Err(crate::Error::new("corrupt", "invalid command state")),
         };
         let unknown = state == eliot_core::CommandState::Unknown;
+        if unknown
+            && archived_ended
+            && let (Some(agent), Some(generation)) = (target, generation)
+            && crate::capacity::has_owned_exit_and_reader_drain_tx(db, agent, generation)?
+        {
+            continue;
+        }
         let result = liveness::mover(
             &LivenessObject::Command {
                 state,
@@ -886,7 +897,8 @@ fn project_unknown_turns(
                   WHERE e.agent=t.agent AND e.generation=t.generation
                   AND json_type(e.data,'$.turn_id')='text'
                   AND CAST(json_extract(e.data,'$.turn_id') AS TEXT)=t.turn_id
-                  ORDER BY e.seq DESC LIMIT 1),0)
+                  ORDER BY e.seq DESC LIMIT 1),0),
+                a.archived=1 AND a.state IN ('stopped','failed','lost')
          FROM turns t CROSS JOIN agents a INDEXED BY owner_inbox_ordinary_agent ON a.id=t.agent
          WHERE t.state='unknown' AND json_type(a.profile_snapshot, '$._harness_check') IS NULL",
         "t.agent=?1 AND t.generation=?2 AND t.turn_id=?3",
@@ -900,11 +912,17 @@ fn project_unknown_turns(
                 r.get::<_, String>(2)?,
                 r.get::<_, i64>(3)?,
                 r.get::<_, i64>(4)?,
+                r.get::<_, bool>(5)?,
             ))
         })
         .map_err(sql_error)?;
     for row in rows {
-        let (agent, generation, turn, since, seq) = row.map_err(sql_error)?;
+        let (agent, generation, turn, since, seq, archived_ended) = row.map_err(sql_error)?;
+        if archived_ended
+            && crate::capacity::has_owned_exit_and_reader_drain_tx(db, agent, generation)?
+        {
+            continue;
+        }
         let result = liveness::mover(
             &LivenessObject::Turn {
                 state: eliot_core::TurnState::Unknown,
@@ -1019,14 +1037,25 @@ fn project_handoffs(
              AND c.target = e.agent AND c.generation = e.generation
          LEFT JOIN turns t ON t.agent = c.target AND t.generation = c.generation
              AND t.turn_id = c.turn_id
-         LEFT JOIN agents source ON source.id = c.target
+         LEFT JOIN agents source ON source.id = e.agent
          WHERE e.kind = 'handoff.settled' AND json_extract(e.data,'$.uncertain') = 1
            AND json_extract(e.data,'$.state') = 'applied'
+           AND NOT COALESCE(source.archived = 1, 0)
            AND NOT COALESCE(
                t.state = 'completed' OR (
                  json_type(source.profile_snapshot, '$._harness_check') IS NULL
                  AND (c.state = 'unknown' OR t.state = 'unknown')
-               ), 0)",
+               ), 0)
+           AND NOT (
+               COALESCE(json_extract(e.data,'$.task_command'), '') = ''
+               AND COALESCE((SELECT prior.kind = 'turn.completed'
+                      AND json_extract(prior.data,'$.outcome') = 'success'
+                   FROM events prior INDEXED BY events_agent
+                   WHERE prior.agent=e.agent AND prior.generation=e.generation
+                     AND prior.seq < e.seq
+                     AND prior.kind IN ('turn.started','turn.completed','turn.unknown','turn.resolved')
+                   ORDER BY prior.seq DESC LIMIT 1), 0)
+           )",
         "CAST(json_extract(e.data,'$.switch_command') AS TEXT) = ?1",
         bindings,
     )?;
@@ -1087,6 +1116,21 @@ fn project_handoffs(
            AND NOT EXISTS(SELECT 1 FROM events newer INDEXED BY events_agent
                WHERE newer.agent = a.id AND newer.generation = a.generation AND newer.seq > e.seq
                  AND newer.kind IN ('handoff.waiting','handoff.queued','handoff.settled'))
+           AND NOT (
+             json_extract(e.data,'$.reason') = 'session_lost'
+             AND json_extract(e.data,'$.waiting_turn') IS NULL
+             AND a.generation = 1 AND a.state = 'failed'
+             AND EXISTS(SELECT 1 FROM commands launch WHERE launch.target=a.id
+               AND launch.generation=a.generation AND launch.verb='launch' AND launch.state='failed'
+               AND json_extract(launch.outcome,'$.unspawned_start') = 1
+               AND launch.updated_at <= e.ts)
+             AND NOT EXISTS(SELECT 1 FROM turns t WHERE t.agent=a.id AND t.generation=a.generation)
+             AND NOT EXISTS(SELECT 1 FROM commands c WHERE c.target=a.id AND c.generation=a.generation
+               AND c.verb='send' AND NOT (c.state='cancelled'
+                 AND COALESCE(json_extract(c.outcome,'$.reason') = 'launch_failed', 0)))
+             AND NOT EXISTS(SELECT 1 FROM goals g WHERE g.agent=a.id AND g.generation=a.generation
+               AND json_extract(g.state,'$.status') IN ('active','blocked'))
+           )
            AND NOT (
              EXISTS(SELECT 1 FROM turns t WHERE t.agent=a.id AND t.generation=a.generation
                AND t.turn_id=json_extract(e.data,'$.waiting_turn') AND t.state='completed')
@@ -1543,6 +1587,11 @@ fn project_resume_failures(
            AND json_type(a.profile_snapshot,'$._harness_check') IS NULL
            AND NOT EXISTS (SELECT 1 FROM agent_successors s
                WHERE s.agent=a.id AND s.generation=a.generation)
+           AND NOT EXISTS (SELECT 1 FROM commands stop WHERE stop.target=a.id
+               AND stop.generation=a.generation AND stop.verb='stop' AND stop.principal='owner'
+               AND stop.state='applied' AND stop.created_at > c.updated_at
+               AND json_extract(stop.outcome,'$.process_custody_exit_proven') = 1
+               AND json_extract(stop.outcome,'$.native_source_drain_proven') = 1)
            AND c.id=(SELECT newest.id FROM commands newest INDEXED BY owner_inbox_resume_tip
              WHERE newest.target=a.id AND newest.generation=a.generation
                AND newest.verb='resume' AND newest.principal='owner' AND newest.state<>'cancelled'

@@ -925,22 +925,26 @@ selected mutation. For every kind, the revision binds the subject facts, reason,
 offered choices, and recommendation, including the methods and arguments. An
 item gets a new revision when a recommendation appears, changes, or disappears.
 A stale item returns `stale_item`. A snooze lasts until
-the next event on that subject. An unknown outcome remains visible until
-settled, including when an older revision has a retained snooze. Supply required inputs in `args` to fill the
+the next event on that subject. An unknown command or turn remains visible
+until settled or its ended Agent is archived with owned exit and reader drain
+proved for the exact generation. A retained snooze leaves an unknown outcome
+visible. Archived unknowns remain in diagnosis and exact reads and return to
+the inbox on unarchive. Supply required inputs in `args` to fill the
 choice's displayed input fields. The same decision ID and payload reuse the
 same inner mutation ID. [Owner inbox DTOs](../../crates/eliot-core/src/api/owner_inbox.rs)
 
 Lost, failed, stopped, archived and handed-off Agents leave no general
-lifecycle reminder in the inbox. An explicit Owner Resume that failed or\nwas rejected leaves one item for a stopped, failed or lost Agent until a\nnewer non-cancelled Resume, a new generation, archiving or handoff\nsupersedes it. The item shows the exact latest failure and its receipt.\nThe Owner can still inspect an Agent and
+lifecycle reminder in the inbox. An explicit Owner Resume that failed or
+was rejected leaves one item for a stopped, failed or lost Agent until a
+newer non-cancelled Resume, a new generation, archiving, handoff or an applied
+Owner Stop requested after the failure supersedes it. The Stop must prove
+owned exit and reader drain for the same generation. The item shows the exact
+latest failure and its receipt. The Owner can still inspect an Agent and
 its latest failed Resume through `agent.get`, and inspect each exact command
 receipt. Open requests and ordinary Goal items require a current subject.
-Work-at-risk and unknown outcomes keep their own items. An applied handoff
-no longer duplicates a separately displayed unknown source command or turn.
-Exact settlement of the linked source turn also closes that handoff notice.
-A notice stays visible when the source outcome cannot be established. A
-session-loss wait records its unfinished turn when known and closes on
-exact settlement when no other turn, queued input or active Goal still
-needs that generation.
+Work-at-risk and unknown outcomes have their own items. The
+[handoff contract](coordination.md#agent-switch-implemented) governs when a
+handoff has an independent decision in the inbox.
 
 Current handoff waits with the same recorded routing refusal, harness,
 profile and account appear once with `group.affected`. The oldest unsnoozed

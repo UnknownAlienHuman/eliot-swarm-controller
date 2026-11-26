@@ -1078,8 +1078,8 @@ impl State {
         }
         if !self.hook_turn_is_live(&self.conversation, &turn_id) {
             return Err(Error::new(
-                "stale_turn",
-                "Antigravity steer does not match the exact active prompt",
+                "native_not_dispatched",
+                crate::capabilities::STEER_TURN_REFUSAL,
             ));
         }
         let (reply, receiver) = oneshot::channel();

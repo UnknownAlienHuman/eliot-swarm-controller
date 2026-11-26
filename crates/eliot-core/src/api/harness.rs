@@ -545,6 +545,8 @@ pub struct HarnessCapabilities {
     /// Failed turns backfill `native_error_message` / `effective_model` on readback.
     pub backfill_failed_turn_readback: bool,
     pub turn_history_readback: Option<TurnHistoryReadback>,
+    /// Exact legacy stale-turn diagnostics emitted only before a native write.
+    pub legacy_stale_turn_refusals: &'static [(crate::CommandVerb, &'static str)],
     /// Supports `source.gap` view-projection recovery on active turns.
     pub view_projection_recovery: Option<ViewProjectionRecovery>,
     pub oversized_frame_prefixes: &'static [&'static str],

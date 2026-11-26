@@ -313,6 +313,10 @@ Use the same `--after` value on preview and apply when following a page's `next`
 cursor. The page also lists candidates awaiting proof. Start a new preview
 without `--after` after their process and reader evidence arrives. An effect
 whose outcome requires other evidence remains unknown.
+An exact retained Antigravity interrupt or steer pre-write refusal can settle
+as rejected. Reconciliation recognizes the legacy stale-turn diagnostics
+emitted by the adapter's pre-write checks and records the refusal as evidence.
+The end of a generation alone supplies no command or turn outcome.
 
 Stall is a flag only for busy work with a healthy authoritative source. Waiting on a
 request is waiting, not stalled solely through silence. Native progress clears a stall;
@@ -1249,7 +1253,9 @@ never stops a generation. Archive/unarchive requires idle, ended (stopped, faile
 lost), an external observer in `unknown` state, or an ended native observation, with
 no active turn, pending request, or open command. Unknown turns and commands can
 remain in an archived ended controlled Agent's history when all their exact
-generations have committed ownership exit and reader drain. Archive never hides custody the owner
+generations have committed ownership exit and reader drain. Archive removes
+those items from the decision queue while preserving the unknown state and
+its effect on command admission. Archive never hides custody the owner
 must still resolve (an unexited owned process, `unknown` artifact or open native
 source): archiving an ended member or external observer in `unknown` state requires
 its custody resolved. The default list still shows an archived ended Agent while
