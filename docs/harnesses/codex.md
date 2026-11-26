@@ -590,6 +590,12 @@ arguments/digests or replay input. See
 [profile binding](../spec/configuration.md#frozen-profile-and-route-binding) and the
 [shared binding type](../../crates/eliot-core/src/native_store.rs).
 
+A `native.archive` reader is bound to the same retained store: the daemon sends
+the frozen profile's retained store selectors (`CODEX_HOME`/`CODEX_SQLITE_HOME`)
+as the call's target environment, and the adapter pins its short-lived reader to
+the frozen binding, verifies the archive scope and the initialized store, then
+calls `thread/archive` with no turn and no inference.
+
 ### Broken native tool history
 
 For the owned thread, the specific native error `Custom tool call output is missing
