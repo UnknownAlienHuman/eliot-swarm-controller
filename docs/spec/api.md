@@ -1297,10 +1297,14 @@ optional members are omitted when requests are serialized.
 
 `agent.archive {id, agent:"aN", archived:bool}` is Owner-only and atomically
 archives or unarchives the selected Agent and all current descendants. Every
-member must be idle, ended (stopped, failed or lost), an external observer in
-`unknown` state, or an ended native observation (a stopped observed
-child keeping its `unknown` turn as retained ended-observation evidence), with no
-active turn, no other uncertain turn, no pending request and no blocking command.
+member must be idle, ended (stopped, failed or lost), or an external observer in
+`unknown` state, with no active turn, no pending request and no blocking command.
+Native observed children use the same committed activity as the fleet.
+`idle` or `interrupted` activity with no open turn qualifies as idle and keeps
+the observation source open. A subsequent open child turn clears that child's
+archive flag in the same transaction as the new turn fact. An ended native
+observation keeps its `unknown` turn as retained ended-observation evidence.
+Other uncertain turns block archive unless their ended generation has drained.
 An accepted or queued `swarm_note:*` context injection has no native claim.
 Archive cancels it in the same transaction as the flag change and records
 `delivery: "withdrawn"` and `reason: "agent_archived"` on the command.
@@ -1313,8 +1317,10 @@ observers may stay open). Archiving an external observer in `unknown` state
 also requires resolved custody, so an open `observe` source blocks it.
 A failed guard returns typed `busy` and names the blocking Agent and its state,
 request, command, turn, process, source or artifact. Archive stops nothing and
-preserves retained unknown evidence. An unknown artifact names its exact ledger
-ID. The Owner can use [artifact reconciliation](coordination.md#registered-artifacts-and-cleanup-k69)
+preserves retained unknown evidence. For a native observation with uncertain
+activity and a current producer, both the refusal and `swarm why` name the
+generation-bound Owner Stop command for that producer. An unknown artifact names
+its exact ledger ID. The Owner can use [artifact reconciliation](coordination.md#registered-artifacts-and-cleanup-k69)
 before retrying Archive or Delete.
 The desktop offers Archive and Unarchive in the task row and header menus.
 Show archived in the sidebar includes archived tasks in the list.
