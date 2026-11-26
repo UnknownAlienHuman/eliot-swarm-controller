@@ -599,6 +599,18 @@ impl Store {
             ));
         }
         let state = request.resolution.state();
+        if state == CommandState::Rejected
+            && (record.command.method != "command.submit"
+                || !CommandResolution::supports_rejected(
+                    &record.command.verb,
+                    record.command.turn_id.is_some(),
+                ))
+        {
+            return Err(Error::new(
+                "bad_state",
+                "rejected resolution requires a Send without a bound turn, a Steer, or an Interrupt",
+            ));
+        }
         let workspace_launch = state == CommandState::Failed
             && record.command.verb == "launch"
             && record.command.generation == Some(0)
@@ -729,6 +741,9 @@ impl Store {
             resolution_outcome,
             now,
         )?);
+        if state == CommandState::Rejected && record.command.verb == "send" {
+            super::context::settle_send_claims_tx(&tx, &record, state, now, &mut events)?;
+        }
         if workspace_launch && let Some(agent_num) = record.target {
             super::capacity::release_unstarted_tx(&tx, agent_num, 1, &request.command_id)?;
             super::lifecycle::apply_settle_agent_transition(
@@ -1323,7 +1338,7 @@ fn turn_resolution_digest(request: &TurnResolveRequest) -> Result<Vec<u8>> {
 
 /// Move one unknown command to its asserted terminal state and record the
 /// owner assertion in the outcome and the event. The shared transition
-/// check keeps ordinary resolutions on the Unknown -> Applied/Failed edges.
+/// check keeps ordinary resolutions on the allowed Unknown edges.
 fn resolve_command_tx(
     tx: &Transaction<'_>,
     record: &CommandRecord,

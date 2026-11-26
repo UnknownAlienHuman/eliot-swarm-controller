@@ -2320,7 +2320,7 @@ require their own evidence. A stop dispatched after loss leaves the prior
 unknown turn for Owner resolution when `command.dispatched` records
 `live_at_dispatch: false`. Older rows retain the legacy turn-link rules.
 
-`command.resolve {id, command_id, as: applied|failed, reason}` requires the target
+`command.resolve {id, command_id, as: applied|failed|rejected, reason}` requires the target
 command to be stored `unknown`. The one additional Owner assertion is
 `failed -> applied` for an exact handoff brief; ordinary terminal commands,
 dispatched, queued and accepted commands refuse with `bad_state`. `launch` and `resume` resolve as `failed`
@@ -2361,14 +2361,30 @@ supplies no outcome. The retained archived-session refusal must name the same
 native subject, with process exit and reader drain proven. SEND and INJECT
 require their own committed receipt. A Stop can use exact-generation owned
 exit and reader drain. A retained stale attention-subject rejection proves
-failure before event insertion. No effect is replayed.
+failure before event insertion. Exact legacy pre-write diagnostics can also
+settle a command as `rejected`. This covers a Codex or Antigravity source gate
+that refused a Send before writing the input, Claude Steer context rendering
+that failed before plugin handoff, and a Windows force Stop that refused
+missing custody before opening the generation's Job. The reconciliation
+binds each diagnostic to the original command and generation. An Antigravity
+legacy refusal requires the original plugin error location and origin fields.
+A legacy Claude Steer also requires a retained ordinary dispatch for its exact
+turn, with no conflicting dispatch, claim or delivery receipt. Plugin exit,
+timeouts and a terminal for another input leave the command unknown. No
+effect is replayed.
 
 A Worktree removal with an exact no-write marker can fail after verifying
 that its checkout and registration remain, or complete after verifying
 that both are absent and checking the recorded branch. The Store rechecks
 the command and workspace binding in the settlement transaction. Unsupported
 evidence leaves the item unknown. The Owner inbox names the receipt or
-readback to check and the exact resolution command.
+readback to check and the exact resolution command. For an unknown Send, Steer
+or Interrupt, use `--status completed` with evidence of delivery bound to that
+command. Use `--status rejected` with evidence of refusal before native delivery.
+A Send with a committed turn binding cannot resolve as `rejected`. Rejecting
+a Send settles its exact pending next-input context claims in the same
+transaction. An exact linked Interrupt fallback Stop can use the reviewed
+`swarm cmd settle-stopped` path above.
 
 `turn.resolve {id, agent, generation, turn_id, status: completed|failed|interrupted,
 reason}` requires the turn to be stored `unknown`; running and terminal turns
@@ -3926,7 +3942,7 @@ swarm approve|deny A [--request R] [--choice ID] [--feedback TEXT] | answer ... 
 swarm configure A [--model MODEL] [--effort EFFORT] [--generation N]
 swarm compact|fork|background ...
 swarm cmd show|children|cancel|resolve|settle-stopped ...
-swarm cmd resolve ID --status completed|failed --reason TEXT
+swarm cmd resolve ID --status completed|failed|rejected --reason TEXT
 swarm cmd resolve-custody A --generation N --reason TEXT
 swarm why CMD|AGENT|AGENT:TURN
 swarm events [--after SEQ] [--limit N]

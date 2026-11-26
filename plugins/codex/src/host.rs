@@ -2543,11 +2543,11 @@ impl CodexPlugin {
         }
         let event_status = session.events.status();
         if let Some(reason) = event_status.failure {
-            return Err(Error::new("unknown", reason)
-                .with_where("plugin.codex.command.send")
+            return Err(Error::new("native_not_dispatched", reason)
+                .with_where(crate::capabilities::SEND_SOURCE_GATE_LOCATION)
                 .with_origin(
                     eliot_core::FailureOrigin::Swarm,
-                    "send gate refused on event-source failure",
+                    crate::capabilities::SEND_SOURCE_GATE_EVIDENCE,
                 ));
         }
         if event_status.active_turn_id.is_some() {

@@ -41,6 +41,7 @@ pub struct FailedCustodyResolveResponse {
 pub enum CommandResolution {
     Applied,
     Failed,
+    Rejected,
 }
 
 impl CommandResolution {
@@ -48,6 +49,7 @@ impl CommandResolution {
         match self {
             Self::Applied => "applied",
             Self::Failed => "failed",
+            Self::Rejected => "rejected",
         }
     }
 
@@ -55,9 +57,10 @@ impl CommandResolution {
         match value {
             "applied" => Ok(Self::Applied),
             "failed" => Ok(Self::Failed),
+            "rejected" => Ok(Self::Rejected),
             _ => Err(Error::new(
                 "invalid",
-                "command.resolve outcome must be applied or failed",
+                "command.resolve outcome must be applied, failed, or rejected",
             )),
         }
     }
@@ -66,7 +69,12 @@ impl CommandResolution {
         match self {
             Self::Applied => CommandState::Applied,
             Self::Failed => CommandState::Failed,
+            Self::Rejected => CommandState::Rejected,
         }
+    }
+
+    pub fn supports_rejected(verb: &str, has_bound_turn: bool) -> bool {
+        matches!(verb, "steer" | "interrupt") || (verb == "send" && !has_bound_turn)
     }
 }
 

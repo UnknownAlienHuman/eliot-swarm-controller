@@ -485,6 +485,18 @@ pub struct NativeAuthCapability {
     pub signed_in_check: Option<NativeAuthCheck>,
 }
 
+/// Legacy outcomes whose original preparation gates prove no native write.
+#[derive(Clone, Debug)]
+pub enum LegacyPreWriteRefusal {
+    StaleTurn(crate::CommandVerb, &'static str),
+    SendStreamUnresolved(&'static str),
+    SendSourceGate {
+        location: &'static str,
+        origin_evidence: &'static str,
+    },
+    SteerContextRendering,
+}
+
 /// Prelaunch capability declaration supplied by each built-in adapter.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct HarnessCapabilities {
@@ -545,8 +557,7 @@ pub struct HarnessCapabilities {
     /// Failed turns backfill `native_error_message` / `effective_model` on readback.
     pub backfill_failed_turn_readback: bool,
     pub turn_history_readback: Option<TurnHistoryReadback>,
-    /// Exact legacy stale-turn diagnostics emitted only before a native write.
-    pub legacy_stale_turn_refusals: &'static [(crate::CommandVerb, &'static str)],
+    pub legacy_pre_write_refusals: &'static [LegacyPreWriteRefusal],
     /// Supports `source.gap` view-projection recovery on active turns.
     pub view_projection_recovery: Option<ViewProjectionRecovery>,
     pub oversized_frame_prefixes: &'static [&'static str],
