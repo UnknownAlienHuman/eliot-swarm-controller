@@ -2202,7 +2202,6 @@ impl Conversation {
             .find(|part| part.key == key)
     }
 
-    /// Full retained text of one part, for Copy message.
     /// Whether the turn is resident and no longer running: its live draft
     /// is over.
     pub fn turn_ended(&self, generation: i64, turn_id: &str) -> bool {
@@ -2223,6 +2222,7 @@ impl Conversation {
             })
     }
 
+    /// Full retained text of one part, for Copy message.
     pub fn part_text(&self, key: &str) -> Option<String> {
         self.part(key).map(|part| {
             if part.detail.is_empty() {
