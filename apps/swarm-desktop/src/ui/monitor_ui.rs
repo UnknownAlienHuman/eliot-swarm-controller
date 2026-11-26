@@ -1158,11 +1158,12 @@ impl DesktopApp {
         page_ui::page("Agents", tokens::page::WIDTH, items)
     }
 
-    /// Details (skeleton 5.5, `Finished.dc.html`): the open Agent in
-    /// collapsible sections (Summary, Task, Goal, Work, Mail, What went
-    /// wrong, Activity & resources, Context, Heavy work, Technical). Ids and
-    /// readback text live here, not in the conversation. Moving it under
-    /// another task is a menu action ([`super::move_ui`]).
+    /// Details (§11.3, `Finished.dc.html`): the open Agent in native
+    /// Expander sections (Summary, Task, Goal, Work, Mail, What went wrong,
+    /// Activity & resources, Context, Heavy work, Technical); Summary open,
+    /// the technical blocks closed, a section that does not apply hidden.
+    /// Ids and readback text live here, not in the conversation. Moving it
+    /// under another task is a menu action ([`super::move_ui`]).
     pub(super) fn details_view(&self, context: &mut ViewContext<Self>) -> Option<View> {
         let id = self.monitor.selected.clone()?;
         let mut items: Vec<KeyedView> = Vec::new();
@@ -1311,8 +1312,63 @@ impl DesktopApp {
                 ));
             }
         }
-        if let Some(generation) = generation {
-            technical.push(format!("Run {generation}"));
+        // Where it works: its project (a chat has none), its folders (each
+        // opens in File Explorer) and its branch.
+        let sidebar_row = self.find_agent(&id);
+        let (project_id, workspace) = match (detail, read) {
+            (Some(detail), _) => (Some(detail.project.clone()), detail.workspace.clone()),
+            (None, Some(read)) => (
+                Some(read.agent.agent.project.clone()),
+                read.agent.agent.workspace.clone(),
+            ),
+            (None, None) => (
+                sidebar_row.map(|agent| agent.project_id.clone()),
+                sidebar_row.and_then(|agent| agent.workspace.clone()),
+            ),
+        };
+        let workspace = workspace.filter(|workspace| !workspace.is_empty());
+        let registered = project_id
+            .as_deref()
+            .and_then(|id| self.nav.projects.iter().find(|project| project.id == id));
+        let chat = sidebar_row.is_some_and(|agent| agent.chat)
+            || read.is_some_and(|read| read.agent.agent.chat);
+        let place = match registered {
+            Some(project) => Some(self.project_label(project)),
+            None => workspace.as_deref().map(|folder| self.place_title(folder)),
+        };
+        if let Some(place) = place.filter(|_| !chat) {
+            summary.push(KeyedView::new(
+                "project",
+                page_ui::kv_text("Project", place),
+            ));
+        }
+        let project_folder = registered
+            .map(|project| project.workspace.clone())
+            .or_else(|| workspace.clone())
+            .filter(|folder| !folder.is_empty());
+        if let Some(project_folder) = &project_folder {
+            if let Some(worktree) = workspace
+                .clone()
+                .filter(|workspace| nav::path_key(workspace) != nav::path_key(project_folder))
+            {
+                summary.push(KeyedView::new(
+                    "worktree",
+                    self.path_row(context, "Worktree", "", &worktree),
+                ));
+            }
+            summary.push(KeyedView::new(
+                "project-folder",
+                self.path_row(context, "Project folder", "", project_folder),
+            ));
+        }
+        let branch = detail
+            .and_then(|detail| detail.branch.clone())
+            .or_else(|| read.and_then(|read| read.agent.agent.branch.clone()));
+        if let Some(branch) = &branch {
+            summary.push(KeyedView::new(
+                "branch",
+                page_ui::kv_text("Branch", branch.clone()),
+            ));
         }
         let created = detail
             .map(|detail| detail.created_at)
@@ -1324,6 +1380,22 @@ impl DesktopApp {
                 page_ui::kv_text("Started", created.replacen("Last read ", "", 1)),
             ));
         }
+        // Its last confirmed model progress (the daemon's liveness read).
+        let progressed = read
+            .and_then(|read| match &read.agent.observation {
+                eliot_core::api::ObservationView::Data(data) => data.liveness.last_model_progress,
+                eliot_core::api::ObservationView::Unavailable { .. } => None,
+            })
+            .or_else(|| data.row(&id).and_then(|row| row.last_progress_at));
+        if let Some(at) = progressed {
+            summary.push(KeyedView::new(
+                "activity",
+                page_ui::kv_text(
+                    "Last activity",
+                    format!("{} ago", monitor::elapsed_label(now.saturating_sub(at))),
+                ),
+            ));
+        }
         let parent = detail
             .and_then(|detail| detail.parent.clone())
             .or_else(|| read.and_then(|read| read.agent.agent.parent.clone()));
@@ -1333,14 +1405,45 @@ impl DesktopApp {
                 page_ui::kv_text("Parent", self.agent_title(&parent)),
             ));
         }
+        // Copy the path and the ID, each on its own.
+        let mut copies: Vec<KeyedView> = Vec::new();
+        if let Some(folder) = workspace.clone().or_else(|| project_folder.clone()) {
+            copies.push(KeyedView::new(
+                "copy-path",
+                controls::text_button()
+                    .automation_name(format!("Copy path {}", nav::display_path(&folder)))
+                    .on_click(
+                        context.message(Message::Pane(super::pane_ui::PaneMsg::CopyPath(folder))),
+                    )
+                    .content(controls::icon_label(controls::glyph::COPY, "Copy path")),
+            ));
+        }
+        copies.push(KeyedView::new(
+            "copy-id",
+            controls::text_button()
+                .automation_name(format!("Copy ID {id}"))
+                .on_click(
+                    context.message(Message::Pane(super::pane_ui::PaneMsg::CopyPath(id.clone()))),
+                )
+                .content(controls::icon_label(controls::glyph::COPY, "Copy ID")),
+        ));
+        summary.push(KeyedView::new(
+            "copies",
+            StackPanel::new()
+                .orientation(Orientation::Horizontal)
+                .spacing(tokens::spacing::SM)
+                .keyed_children(copies),
+        ));
         items.push(KeyedView::new(
             "summary",
             self.details_section("summary", "Summary", summary, context),
         ));
 
-        // Task: what the task record would hold, where the desktop can read
-        // it (branch, base, preset, goal); the record itself is a daemon
-        // read the desktop does not have yet.
+        // Task: the run's Git task record (`task.list`/`task.get`, read
+        // while the section is open): the task text's first page and the
+        // record's coverage, then the related data the readback holds
+        // (profile, Goal and check).
+        let run = generation.map(|generation| (id.clone(), generation));
         let goal = self
             .chat
             .goal
@@ -1348,12 +1451,26 @@ impl DesktopApp {
             .filter(|(agent, _)| *agent == id)
             .map(|(_, goal)| goal.as_ref());
         let mut task: Vec<KeyedView> = Vec::new();
-        if let Some(branch) = detail.and_then(|detail| detail.branch.clone()) {
-            task.push(KeyedView::new("branch", page_ui::kv_text("Branch", branch)));
+        let record = run
+            .as_ref()
+            .and_then(|run| self.pane.task_record.shown(run));
+        if let Some(Ok(super::pane_ui::TaskRecord {
+            newest: Some(newest),
+            ..
+        })) = record
+        {
+            technical.push(format!(
+                "Task record {} at {}",
+                newest.item.task_ref, newest.revision
+            ));
         }
-        if let Some(base) = detail.and_then(|detail| detail.base_ref.clone()) {
-            task.push(KeyedView::new("base", page_ui::kv_text("Base", base)));
+        if self.pane.section_open("task") {
+            task.extend(task_record_views(
+                record,
+                &context.message(Message::Pane(super::pane_ui::PaneMsg::Refresh)),
+            ));
         }
+        // Related data (the branch is in Summary, the base in Work).
         if let Some(detail) = detail {
             task.push(KeyedView::new(
                 "profile",
@@ -1372,13 +1489,6 @@ impl DesktopApp {
                 ));
             }
         }
-        task.push(KeyedView::new(
-            "record",
-            controls::secondary(
-                "The task's text, card and journal live in its record in Git; the desktop cannot read that record yet.",
-            )
-            .text_wrapping(TextWrapping::Wrap),
-        ));
         items.push(KeyedView::new(
             "task",
             self.details_section("task", "Task", task, context),
@@ -1404,10 +1514,12 @@ impl DesktopApp {
             self.details_section("goal", "Goal", goal_rows, context),
         ));
 
-        // Work: the worktree (opens in Explorer) and its project's
-        // checkout, the branch and its commits, the Git-aware work summary
-        // of this generation (an open `no_code_progress` report in the
-        // attention tone), and the last checkpoint.
+        // Work: the Git base and head, whether Swarm manages the worktree,
+        // the commits ahead and the Git-aware work summary of this
+        // generation (an open `no_code_progress` report in the attention
+        // tone), then the run's retained checkpoints and its claims
+        // (`checkpoint.list/get`, `claim.list`, read while the section is
+        // open). Hidden when none of it applies.
         let row = data
             .row(&id)
             .filter(|row| generation.is_none_or(|generation| row.generation == generation));
@@ -1419,53 +1531,51 @@ impl DesktopApp {
             .filter(|row| row.state != eliot_core::AgentState::Stopped)
             .and_then(|row| data.incident(row))
             .filter(|incident| incident.no_code());
-        let (project_id, workspace) = match (detail, read) {
-            (Some(detail), _) => (Some(detail.project.clone()), detail.workspace.clone()),
-            (None, Some(read)) => (
-                Some(read.agent.agent.project.clone()),
-                read.agent.agent.workspace.clone(),
-            ),
-            (None, None) => {
-                let agent = self.find_agent(&id);
-                (
-                    agent.map(|agent| agent.project_id.clone()),
-                    agent.and_then(|agent| agent.workspace.clone()),
-                )
-            }
-        };
-        let project = project_id
-            .as_deref()
-            .and_then(|id| self.nav.projects.iter().find(|project| project.id == id))
-            .map(|project| project.workspace.clone())
-            .or_else(|| workspace.clone());
+        let observed = read.and_then(|read| match &read.agent.observation {
+            eliot_core::api::ObservationView::Data(data) => Some(data),
+            eliot_core::api::ObservationView::Unavailable { .. } => None,
+        });
+        let git = observed.and_then(|observed| match &observed.git {
+            eliot_core::api::GitView::Data(git) => Some(git),
+            _ => None,
+        });
         let mut work_rows: Vec<KeyedView> = Vec::new();
-        if let Some(project) = project.filter(|project| !project.is_empty()) {
-            if let Some(worktree) = workspace
-                .clone()
-                .filter(|workspace| nav::path_key(workspace) != nav::path_key(&project))
-            {
-                work_rows.push(KeyedView::new(
-                    "worktree",
-                    self.path_row(context, "Worktree", "", &worktree),
-                ));
-            }
+        let base_ref = detail
+            .and_then(|detail| detail.base_ref.clone())
+            .or_else(|| read.and_then(|read| read.agent.agent.base_ref.clone()));
+        let base_oid = read
+            .and_then(|read| read.agent.agent.base_oid.clone())
+            .or_else(|| git.and_then(|git| git.base_oid.clone()));
+        let base = match (base_ref, base_oid) {
+            (Some(name), Some(oid)) => Some(format!("{name} · {}", short_oid(&oid))),
+            (Some(name), None) => Some(name),
+            (None, Some(oid)) => Some(short_oid(&oid).to_owned()),
+            (None, None) => None,
+        };
+        if let Some(base) = base {
+            work_rows.push(KeyedView::new("base", page_ui::kv_text("Base", base)));
+        }
+        if let Some(head) = git.and_then(|git| git.head.as_deref()) {
             work_rows.push(KeyedView::new(
-                "project",
-                self.path_row(context, "Project folder", "", &project),
+                "head",
+                page_ui::kv_text("Head", short_oid(head).to_owned()),
             ));
         }
-        if let Some(branch) = detail.and_then(|detail| detail.branch.clone()) {
-            let ahead =
-                work.and_then(|work| work.commits_ahead)
-                    .map_or_else(String::new, |ahead| {
-                        format!(
-                            " · {} ahead",
-                            eliot_core::count_words(ahead, "commit", "commits")
-                        )
-                    });
+        if observed.is_some_and(|observed| {
+            matches!(
+                observed.workspace,
+                Some(eliot_core::api::WorkspaceView::Data(_))
+            )
+        }) {
             work_rows.push(KeyedView::new(
-                "branch",
-                page_ui::kv_text("Branch", format!("{branch}{ahead}")),
+                "managed",
+                page_ui::kv_text("Worktree", "Managed worktree"),
+            ));
+        }
+        if let Some(ahead) = work.and_then(|work| work.commits_ahead) {
+            work_rows.push(KeyedView::new(
+                "ahead",
+                page_ui::kv_text("Ahead", eliot_core::count_words(ahead, "commit", "commits")),
             ));
         }
         if let Some(incident) = no_code {
@@ -1488,10 +1598,31 @@ impl DesktopApp {
                 ));
             }
         }
-        items.push(KeyedView::new(
-            "work",
-            self.details_section("work", "Work", work_rows, context),
-        ));
+        let record = run
+            .as_ref()
+            .and_then(|run| self.pane.work_record.shown(run));
+        if let Some(Ok(record)) = record
+            && let Some(Ok(newest)) = &record.newest
+        {
+            technical.push(format!(
+                "Checkpoint {} at {}",
+                newest.checkpoint_ref, newest.oid
+            ));
+        }
+        let applies = !work_rows.is_empty() || workspace.is_some() || branch.is_some();
+        if self.pane.section_open("work") {
+            work_rows.extend(work_record_views(
+                record,
+                now,
+                &context.message(Message::Pane(super::pane_ui::PaneMsg::Refresh)),
+            ));
+        }
+        if applies || !work_rows.is_empty() {
+            items.push(KeyedView::new(
+                "work",
+                self.details_section("work", "Work", work_rows, context),
+            ));
+        }
 
         // Mail: this Agent's unread mail, read-only (reading marks nothing).
         let mut mail: Vec<KeyedView> = Vec::new();
@@ -1552,11 +1683,49 @@ impl DesktopApp {
         ));
 
         // What went wrong: why and where the Agent last failed, in one line
-        // (the full chain lives behind `swarm why`).
+        // (the full chain lives behind `swarm why`), its recovery (Resume
+        // for a lost or failed run, bound to that run) and Copy details.
         if let Some(line) = read
             .and_then(|read| read.diagnosis.as_ref().ok())
             .and_then(monitor::diagnosis_line)
         {
+            let mut actions: Vec<KeyedView> = Vec::new();
+            // The run to resume: the open conversation's readback, else
+            // the Monitor's row, when it is lost or failed and idle.
+            let resume = match detail {
+                Some(detail) => (matches!(
+                    detail.state,
+                    eliot_core::AgentState::Lost | eliot_core::AgentState::Failed
+                ) && !detail.observe_only
+                    && detail.active_turn.is_none())
+                .then_some(detail.generation),
+                None => row.filter(|row| row.resumable()).map(|row| row.generation),
+            };
+            if let Some(generation) = resume {
+                actions.push(KeyedView::new(
+                    "resume",
+                    controls::tonal()
+                        .is_enabled(!self.submitting())
+                        .automation_name(format!("Resume run {generation}"))
+                        .on_click(
+                            context.message(Message::Monitor(MonitorMsg::ResumeRequested(
+                                id.clone(),
+                                generation,
+                            ))),
+                        )
+                        .content(controls::label("Resume")),
+                ));
+            }
+            actions.push(KeyedView::new(
+                "copy",
+                controls::text_button()
+                    .automation_name("Copy details")
+                    .on_click(context.message(Message::Pane(super::pane_ui::PaneMsg::Copy(
+                        "the details".to_owned(),
+                        line.clone(),
+                    ))))
+                    .content(controls::icon_label(controls::glyph::COPY, "Copy details")),
+            ));
             items.push(KeyedView::new(
                 "diagnosis",
                 self.details_section(
@@ -1565,22 +1734,16 @@ impl DesktopApp {
                     vec![
                         KeyedView::new(
                             "line",
-                            controls::body(line.clone())
+                            controls::body(line)
                                 .text_wrapping(TextWrapping::Wrap)
                                 .is_text_selection_enabled(true),
                         ),
                         KeyedView::new(
-                            "copy",
-                            controls::text_button()
-                                .horizontal_alignment(HorizontalAlignment::Left)
-                                .automation_name("Copy diagnosis")
-                                .on_click(context.message(Message::Pane(
-                                    super::pane_ui::PaneMsg::Copy("the diagnosis".to_owned(), line),
-                                )))
-                                .content(controls::icon_label(
-                                    controls::glyph::COPY,
-                                    "Copy diagnosis",
-                                )),
+                            "actions",
+                            StackPanel::new()
+                                .orientation(Orientation::Horizontal)
+                                .spacing(tokens::spacing::SM)
+                                .keyed_children(actions),
                         ),
                     ],
                     context,
@@ -1601,13 +1764,17 @@ impl DesktopApp {
             }
         }
 
-        let resources = if previous_generation {
+        // Built only while the section is open (§11.3: shown only when
+        // needed).
+        let resources = if !self.pane.section_open("resources") {
+            Vec::new()
+        } else if previous_generation {
             vec![KeyedView::new(
                 "new-session",
                 controls::secondary("No resource sample for this session yet."),
             )]
         } else {
-            monitor_view::resource_views(data, &id)
+            monitor_view::resource_views(data, &id, read.map(|read| &read.agent.observation))
         };
         items.push(KeyedView::new(
             "resources",
@@ -1767,14 +1934,17 @@ impl DesktopApp {
                         "copy",
                         controls::text_button()
                             .horizontal_alignment(HorizontalAlignment::Left)
-                            .automation_name("Copy technical details")
+                            .automation_name("Copy diagnostic details")
                             .on_click(context.message(Message::Pane(
                                 super::pane_ui::PaneMsg::Copy(
-                                    "the technical details".to_owned(),
+                                    "the diagnostic details".to_owned(),
                                     text,
                                 ),
                             )))
-                            .content(controls::icon_label(controls::glyph::COPY, "Copy")),
+                            .content(controls::icon_label(
+                                controls::glyph::COPY,
+                                "Copy diagnostic details",
+                            )),
                     ),
                 ],
                 context,
@@ -1880,6 +2050,264 @@ fn goal_lines(goal: &eliot_core::api::GoalView, now: i64) -> Vec<KeyedView> {
         ));
     }
     rows
+}
+
+/// A Git object ID as Details shows it: its first 12 hex digits.
+fn short_oid(oid: &str) -> &str {
+    oid.get(..12).unwrap_or(oid)
+}
+
+/// Details › Task's record views (§11.3): the newest task record's text,
+/// its first page, and the record's coverage from its manifest; the
+/// record's absence, the read's failure, or that it is still read. Never
+/// a reconstruction from the conversation.
+fn task_record_views(
+    record: Option<&Result<super::pane_ui::TaskRecord, String>>,
+    retry: &Callback<()>,
+) -> Vec<KeyedView> {
+    let record = match record {
+        None => {
+            return vec![KeyedView::new(
+                "record-reading",
+                controls::secondary("Reading…"),
+            )];
+        }
+        Some(Err(error)) => {
+            return vec![KeyedView::new(
+                "record-error",
+                page_ui::read_failed(
+                    format!("Task record not read: {error}"),
+                    "Retry",
+                    true,
+                    retry.clone(),
+                ),
+            )];
+        }
+        Some(Ok(record)) => record,
+    };
+    let Some(newest) = &record.newest else {
+        return vec![KeyedView::new(
+            "record-none",
+            controls::secondary("No task record for this run."),
+        )];
+    };
+    let mut views: Vec<KeyedView> = Vec::new();
+    match &newest.text {
+        None => views.push(KeyedView::new(
+            "text-none",
+            controls::secondary("The record saved no task text."),
+        )),
+        Some(Err(error)) => views.push(KeyedView::new(
+            "text-error",
+            page_ui::read_failed(
+                format!("Task text not read: {error}"),
+                "Retry",
+                true,
+                retry.clone(),
+            ),
+        )),
+        Some(Ok((text, more))) => {
+            views.push(KeyedView::new(
+                "text",
+                controls::body(text.clone())
+                    .text_wrapping(TextWrapping::Wrap)
+                    .max_lines(12)
+                    .is_text_selection_enabled(true),
+            ));
+            if *more {
+                views.push(KeyedView::new(
+                    "text-more",
+                    controls::secondary(format!(
+                        "Partial: the first {} KiB of the task text are shown.",
+                        eliot_core::api::TASK_RECORD_TEXT_PAGE_BYTES / 1024
+                    )),
+                ));
+            }
+        }
+    }
+    // The record's coverage: what this Git revision holds.
+    let manifest = &newest.manifest;
+    let mut coverage = vec![eliot_core::count_words(
+        manifest.corrections_retained as u64,
+        "correction kept",
+        "corrections kept",
+    )];
+    if manifest.corrections_omitted_at_least > 0 {
+        coverage.push(format!(
+            "at least {} left out",
+            manifest.corrections_omitted_at_least
+        ));
+    }
+    if manifest.correction_history_incomplete {
+        coverage.push("correction history incomplete".to_owned());
+    }
+    if manifest.correction_history_unresolved {
+        coverage.push("correction history unresolved".to_owned());
+    }
+    views.push(KeyedView::new(
+        "corrections",
+        page_ui::kv_text("Corrections", coverage.join(" · ")),
+    ));
+    if !manifest.sources.is_empty() {
+        views.push(KeyedView::new(
+            "sources",
+            page_ui::kv_text(
+                "Sources",
+                manifest
+                    .sources
+                    .iter()
+                    .map(|source| source.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            ),
+        ));
+    }
+    if let Some(unsaved) = manifest
+        .references_without_saved_content
+        .filter(|count| *count > 0)
+    {
+        views.push(KeyedView::new(
+            "unsaved",
+            page_ui::kv_text(
+                "Not saved",
+                eliot_core::count_words(unsaved as u64, "referenced file", "referenced files"),
+            ),
+        ));
+    }
+    if record.records > 1 || record.partial {
+        views.push(KeyedView::new(
+            "records",
+            controls::secondary(if record.partial {
+                format!(
+                    "Partial: the newest of the first {} task records of this run is shown.",
+                    record.records
+                )
+            } else {
+                format!(
+                    "The newest of {} task records of this run is shown.",
+                    record.records
+                )
+            }),
+        ));
+    }
+    views
+}
+
+/// Details › Work's record views (§11.3): the run's newest retained
+/// checkpoint at its exact ref and object ID (when, its captured head and
+/// the files of its staged and worktree layers) and how many the run keeps,
+/// then its claims; or why they were not read. Restore is not offered here.
+fn work_record_views(
+    record: Option<&Result<super::pane_ui::WorkRecord, String>>,
+    now: i64,
+    retry: &Callback<()>,
+) -> Vec<KeyedView> {
+    let record = match record {
+        None => {
+            return vec![KeyedView::new(
+                "record-reading",
+                controls::secondary("Reading…"),
+            )];
+        }
+        Some(Err(error)) => {
+            return vec![KeyedView::new(
+                "record-error",
+                page_ui::read_failed(
+                    format!("Checkpoints not read: {error}"),
+                    "Retry",
+                    true,
+                    retry.clone(),
+                ),
+            )];
+        }
+        Some(Ok(record)) => record,
+    };
+    let mut views: Vec<KeyedView> = Vec::new();
+    let mut failed: Vec<String> = Vec::new();
+    match &record.checkpoints {
+        Err(error) => failed.push(format!("Checkpoints not read: {error}")),
+        Ok(list) if list.entries.is_empty() => views.push(KeyedView::new(
+            "checkpoints-none",
+            page_ui::kv_text("Checkpoint", "None retained for this run"),
+        )),
+        Ok(list) => {
+            let newest = &list.entries[0];
+            // The ref's last part starts with its capture time (ms).
+            let captured = newest
+                .checkpoint_ref
+                .rsplit('/')
+                .next()
+                .and_then(|leaf| leaf.split('-').next())
+                .and_then(|time| time.parse::<i64>().ok())
+                .map(|at| format!("{} ago · ", monitor::elapsed_label(now.saturating_sub(at))))
+                .unwrap_or_default();
+            let files = match &record.newest {
+                Some(Ok(got)) => format!(
+                    " · at head {} · {} staged, {} in the worktree{}",
+                    short_oid(&got.head),
+                    got.staged.len(),
+                    got.worktree.len(),
+                    if got.next.is_some() {
+                        " (first page)"
+                    } else {
+                        ""
+                    }
+                ),
+                Some(Err(error)) => {
+                    failed.push(format!("Checkpoint files not read: {error}"));
+                    String::new()
+                }
+                None => String::new(),
+            };
+            views.push(KeyedView::new(
+                "checkpoint",
+                page_ui::kv_text(
+                    "Last checkpoint",
+                    format!("{captured}{}{files}", short_oid(&newest.oid)),
+                ),
+            ));
+            views.push(KeyedView::new(
+                "checkpoints",
+                page_ui::kv_text(
+                    "Checkpoints",
+                    if list.next.is_some() {
+                        format!("{}+ retained for this run", list.entries.len())
+                    } else {
+                        format!("{} retained for this run", list.entries.len())
+                    },
+                ),
+            ));
+        }
+    }
+    match &record.claims {
+        Err(error) => failed.push(format!("Claims not read: {error}")),
+        // No claims: nothing to show (§11.3 hides what does not apply).
+        Ok(claims) if claims.claims.is_empty() => {}
+        Ok(claims) => views.push(KeyedView::new(
+            "claims",
+            page_ui::kv_text(
+                "Claims",
+                format!(
+                    "{}{}",
+                    claims
+                        .claims
+                        .iter()
+                        .map(|claim| claim.glob.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    if claims.truncated { " (partial)" } else { "" }
+                ),
+            ),
+        )),
+    }
+    // One Retry for what this read could not read.
+    if !failed.is_empty() {
+        views.push(KeyedView::new(
+            "failed",
+            page_ui::read_failed(failed.join(" "), "Retry", true, retry.clone()),
+        ));
+    }
+    views
 }
 
 /// An Agent state code in words.

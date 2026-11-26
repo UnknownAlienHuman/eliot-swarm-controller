@@ -172,7 +172,7 @@ pub(super) fn open_terminal(folder: &str) -> Result<(), String> {
 /// Windows Terminal's command without Swarm's variables (but `ELIOT_HOME`).
 #[expect(
     clippy::disallowed_types,
-    reason = "This helper returns the Windows Terminal command Open in Windows Terminal starts."
+    reason = "This helper returns the Windows Terminal command Open Windows Terminal starts."
 )]
 fn terminal_command(wt: &Path) -> std::process::Command {
     #[expect(

@@ -42,14 +42,20 @@ pub trait MaybeContent: Sized {
     fn maybe_content(self, content: Option<View>) -> Self;
 }
 
-impl MaybeContent for Border {
-    fn maybe_content(self, content: Option<View>) -> Self {
-        match content {
-            Some(content) => self.content(content),
-            None => self,
+macro_rules! maybe_content {
+    ($($control:ty),*) => {$(
+        impl MaybeContent for $control {
+            fn maybe_content(self, content: Option<View>) -> Self {
+                match content {
+                    Some(content) => self.content(content),
+                    None => self,
+                }
+            }
         }
-    }
+    )*};
 }
+
+maybe_content!(Border, Expander);
 
 /// A content column (§6.3): stretched across its slot less the 32-DIP side
 /// gutters, at most `widest` wide and at least [`tokens::layout::MIN_COLUMN`];

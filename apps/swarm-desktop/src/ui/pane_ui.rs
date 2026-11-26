@@ -10,18 +10,24 @@
 //! Agent's run or Git work changes (and, on Last turn, its last finished
 //! turn) and on Refresh. A selected file whose patch that read cut is read
 //! alone (`agent.diff` with its path), once. The Terminal tab reads
-//! `agent.processes` on open, task change and Refresh. Agents and Details
-//! ride the Monitor's refresh chain, which follows `events.wait` on their
-//! Agents' fleet events as the Agents page does. Every read waits while the
-//! window is minimized.
+//! `agent.processes` and `agent.stats` on open, task change and Refresh.
+//! Agents and Details ride the Monitor's refresh chain, which follows
+//! `events.wait` on their Agents' fleet events as the Agents page does;
+//! Details › Task reads the run's Git task record (`task.list`, `task.get`)
+//! and Details › Work its checkpoints and claims (`checkpoint.list`,
+//! `checkpoint.get`, `claim.list`) while their section is open, once per
+//! Agent run and on Refresh. Every read waits while the window is
+//! minimized.
 
 use std::collections::HashSet;
 use std::sync::Arc;
 
 use eliot_core::api::{
     AgentDiffRequest, AgentDiffResponse, AgentGitResponse, AgentPatchDigestResponse,
-    AgentProcessesResponse, GitDiffFile, GitDiffSource, GitIntegrateOutcome, GitIntegrateStatus,
-    GitView, MAX_DIFF_TEXT_BYTES, MAX_DIFF_TEXT_FILES, MAX_DIFF_TEXT_HUNKS,
+    AgentProcessesResponse, AgentStatsResponse, CheckpointGetResponse, CheckpointListResponse,
+    ClaimListResponse, GitDiffFile, GitDiffSource, GitIntegrateOutcome, GitIntegrateStatus,
+    GitView, MAX_DIFF_TEXT_BYTES, MAX_DIFF_TEXT_FILES, MAX_DIFF_TEXT_HUNKS, ObservationView,
+    TaskGetRequest, TaskListItem, TaskSnapshotManifest,
 };
 
 use super::*;
@@ -236,19 +242,128 @@ pub(super) struct ChangesState {
     merge: Merge,
 }
 
+/// One Terminal read: the Agent's process records and, beside them, their
+/// current OS samples (`agent.stats`), each with its own failure.
+#[derive(Clone, Debug)]
+pub(super) struct ProcessesRead {
+    processes: Result<AgentProcessesResponse, String>,
+    stats: Result<AgentStatsResponse, String>,
+}
+
 #[derive(Default)]
 pub(super) struct TerminalState {
     agent: Option<String>,
     epoch: u64,
     task: Option<ComponentTask>,
     reading: bool,
-    read: Option<Result<AgentProcessesResponse, String>>,
-    /// Why Open in Windows Terminal did not start.
-    note: Option<String>,
+    read: Option<ProcessesRead>,
+    /// Why Open Windows Terminal did not start, and the folder it was for.
+    note: Option<(String, String)>,
 }
 
-/// Details sections closed until the owner opens them.
-const CLOSED_AT_FIRST: [&str; 2] = ["task", "technical"];
+/// Details › Task's read of one Agent run's Git task record (§11.3):
+/// `task.list`, then the newest record's `manifest` and the first page of
+/// its `task.md`, pinned to the manifest's Git revision.
+#[derive(Clone, Debug)]
+pub(super) struct TaskRecord {
+    /// The run's records on the page read.
+    pub(super) records: usize,
+    /// The run has more records than one page holds.
+    pub(super) partial: bool,
+    /// The newest record listed, and what was read of it.
+    pub(super) newest: Option<TaskRecordRead>,
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct TaskRecordRead {
+    pub(super) item: TaskListItem,
+    /// The Git commit every section was read at.
+    pub(super) revision: String,
+    pub(super) manifest: TaskSnapshotManifest,
+    /// The first page of the task text and whether more follows; `None`
+    /// when the record saved no task text.
+    pub(super) text: Option<Result<(String, bool), String>>,
+}
+
+/// Details › Work's reads of one Agent run (§11.3): its newest retained
+/// checkpoints, the newest one's manifest metadata at its exact ref and
+/// object ID, and its claims.
+#[derive(Clone, Debug)]
+pub(super) struct WorkRecord {
+    pub(super) checkpoints: Result<CheckpointListResponse, String>,
+    pub(super) newest: Option<Result<CheckpointGetResponse, String>>,
+    pub(super) claims: Result<ClaimListResponse, String>,
+}
+
+/// The checkpoints one Work read lists: the generation keeps its newest 20.
+pub(super) const CHECKPOINT_ROWS: usize = 20;
+
+/// One Details section's own read, bound to the Agent run (Agent and
+/// generation) it is of. It reads while its section is open and Details
+/// shows, once per run, and again on Refresh.
+pub(super) struct SectionRead<T> {
+    of: Option<(String, i64)>,
+    epoch: u64,
+    task: Option<ComponentTask>,
+    read: Option<Result<T, String>>,
+}
+
+impl<T> Default for SectionRead<T> {
+    fn default() -> Self {
+        Self {
+            of: None,
+            epoch: 0,
+            task: None,
+            read: None,
+        }
+    }
+}
+
+impl<T> SectionRead<T> {
+    /// Cancel the read in flight; what was read stays.
+    fn stop(&mut self) {
+        if let Some(task) = self.task.take() {
+            task.cancel();
+            self.epoch += 1;
+        }
+    }
+
+    /// Start a read of `run`: the one in flight is dropped, and a read of
+    /// another run no longer shows. Its epoch.
+    fn begin(&mut self, run: &(String, i64)) -> u64 {
+        self.stop();
+        if self.of.as_ref() != Some(run) {
+            self.of = Some(run.clone());
+            self.read = None;
+        }
+        self.epoch += 1;
+        self.epoch
+    }
+
+    fn land(&mut self, epoch: u64, read: Option<Result<T, String>>) {
+        if epoch != self.epoch {
+            return;
+        }
+        self.task = None;
+        if let Some(read) = read {
+            self.read = Some(read);
+        }
+    }
+
+    /// Whether `run` has no read of its own, landed or in flight.
+    fn wants(&self, run: &(String, i64)) -> bool {
+        self.of.as_ref() != Some(run) || (self.read.is_none() && self.task.is_none())
+    }
+
+    /// The read shown for `run`: `None` until one of it lands.
+    pub(super) fn shown(&self, run: &(String, i64)) -> Option<&Result<T, String>> {
+        self.read.as_ref().filter(|_| self.of.as_ref() == Some(run))
+    }
+}
+
+/// Details sections closed until the owner opens them: Task, and the
+/// technical blocks (§11.3: Summary open, technical blocks closed).
+const CLOSED_AT_FIRST: [&str; 5] = ["task", "resources", "context", "heavy", "technical"];
 
 /// Full view, the panels' reads and the owner's choices in them.
 #[derive(Default)]
@@ -261,15 +376,24 @@ pub(super) struct PaneState {
     pub(super) wide: bool,
     changes: ChangesState,
     terminal: TerminalState,
-    /// Agents tab rows whose workers are folded away.
-    folded: HashSet<String>,
+    /// Agents tab rows whose open state the owner flipped: a row with
+    /// workers starts open, any other closed.
+    flipped_rows: HashSet<String>,
     /// Details sections whose open state the owner flipped.
     flipped: HashSet<&'static str>,
+    pub(super) task_record: SectionRead<TaskRecord>,
+    pub(super) work_record: SectionRead<WorkRecord>,
 }
 
 impl PaneState {
     pub(super) fn section_open(&self, key: &'static str) -> bool {
         CLOSED_AT_FIRST.contains(&key) == self.flipped.contains(key)
+    }
+
+    /// Whether an Agents tab row is open: its resources and its workers
+    /// show. A row with workers starts open.
+    fn row_open(&self, id: &str, has_children: bool) -> bool {
+        has_children != self.flipped_rows.contains(id)
     }
 }
 
@@ -309,13 +433,18 @@ pub(super) enum PaneMsg {
     MergeDismissed,
     /// An Agents row: open its conversation.
     TreeOpen(String),
+    /// An Agents row's chevron: show or hide its resources and workers.
     TreeFold(String),
     TreeStop(String, i64),
     TreeHandoff(String, i64),
-    ProcessesLoaded(u64, Option<Box<Result<AgentProcessesResponse, String>>>),
+    ProcessesLoaded(u64, Option<Box<ProcessesRead>>),
     OpenTerminal,
-    /// Open or close a Details section.
-    Section(&'static str),
+    /// A Details section's Expander opened (`true`) or closed.
+    Section(&'static str, bool),
+    /// Details › Task's record read landed (its epoch), or was dropped.
+    TaskRecordLoaded(u64, Option<Box<Result<TaskRecord, String>>>),
+    /// Details › Work's checkpoint and claim reads landed, or were dropped.
+    WorkRecordLoaded(u64, Option<Box<Result<WorkRecord, String>>>),
     /// Copy text (what it is, the text).
     Copy(String, String),
 }
@@ -345,6 +474,7 @@ impl DesktopApp {
                 Panel::Details => {
                     self.monitor.detail_due = true;
                     self.read_monitor(0, context);
+                    self.read_records(true, context);
                 }
                 Panel::Agents => self.read_monitor(0, context),
                 Panel::Closed => {}
@@ -471,8 +601,8 @@ impl DesktopApp {
                 }
             }
             PaneMsg::TreeFold(id) => {
-                if !self.pane.folded.remove(&id) {
-                    self.pane.folded.insert(id);
+                if !self.pane.flipped_rows.remove(&id) {
+                    self.pane.flipped_rows.insert(id);
                 }
             }
             PaneMsg::TreeStop(id, generation) => {
@@ -500,16 +630,26 @@ impl DesktopApp {
                 }
             }
             PaneMsg::OpenTerminal => {
-                let folder = self.open_workspace();
-                self.pane.terminal.note = match folder {
-                    Some(folder) => super::reveal::open_terminal(&folder).err(),
-                    None => Some("This task has no worktree yet.".to_owned()),
+                // The folder the button showed: the daemon's readback.
+                self.pane.terminal.note = match self.open_workspace() {
+                    Some(folder) => super::reveal::open_terminal(&folder)
+                        .err()
+                        .map(|why| (why, folder)),
+                    None => Some(("This task has no worktree yet.".to_owned(), String::new())),
                 };
             }
-            PaneMsg::Section(key) => {
-                if !self.pane.flipped.remove(key) {
+            PaneMsg::Section(key, open) => {
+                // The Expander reports its own state; a rebuilt one reports
+                // the state it already shows.
+                if self.pane.section_open(key) != open && !self.pane.flipped.remove(key) {
                     self.pane.flipped.insert(key);
                 }
+            }
+            PaneMsg::TaskRecordLoaded(epoch, read) => {
+                self.pane.task_record.land(epoch, read.map(|read| *read));
+            }
+            PaneMsg::WorkRecordLoaded(epoch, read) => {
+                self.pane.work_record.land(epoch, read.map(|read| *read));
             }
             PaneMsg::Copy(what, text) => match crate::clipboard::set_text(&text) {
                 Ok(()) => self.set_status(format!("Copied {what}.")),
@@ -570,6 +710,13 @@ impl DesktopApp {
             self.pane.terminal.epoch += 1;
             self.pane.terminal.reading = false;
         }
+        let details = shown && self.panel == Panel::Details;
+        if !details || !self.pane.section_open("task") {
+            self.pane.task_record.stop();
+        }
+        if !details || !self.pane.section_open("work") {
+            self.pane.work_record.stop();
+        }
         let Some(open) = self.selected_agent_id().filter(|_| shown) else {
             return;
         };
@@ -593,6 +740,69 @@ impl DesktopApp {
                 self.read_monitor(0, context);
             }
             _ => {}
+        }
+        if details {
+            self.read_records(false, context);
+        }
+    }
+
+    /// The Agent run Details shows: its Agent and generation (the open
+    /// conversation's readback, else its sidebar row, else the Monitor's
+    /// read of it).
+    pub(super) fn details_run(&self) -> Option<(String, i64)> {
+        let id = self.monitor.selected.clone()?;
+        let generation = self
+            .chat
+            .detail
+            .as_ref()
+            .filter(|detail| detail.agent == id)
+            .map(|detail| detail.generation)
+            .or_else(|| self.find_agent(&id).map(|agent| agent.generation))
+            .or_else(|| {
+                self.monitor
+                    .data
+                    .detail
+                    .as_ref()
+                    .map(|cached| &cached.read.agent.agent)
+                    .filter(|agent| agent.id == id)
+                    .map(|agent| agent.generation)
+            })?;
+        Some((id, generation))
+    }
+
+    /// Details › Task and Work read their records while open: once per
+    /// Agent run, or now (`again`, Refresh). The shown read stays until the
+    /// next one lands.
+    fn read_records(&mut self, again: bool, context: &ComponentContext<Self>) {
+        let (Some(run), Ok(data_dir)) = (self.details_run(), self.data_dir.clone()) else {
+            return;
+        };
+        if self.daemon_down() {
+            return;
+        }
+        if self.pane.section_open("task") && (again || self.pane.task_record.wants(&run)) {
+            let epoch = self.pane.task_record.begin(&run);
+            let data_dir = data_dir.clone();
+            let run = run.clone();
+            self.pane.task_record.task = Some(context.spawn_background(move |cancel| {
+                let cancelled = || cancel.is_cancelled();
+                if !wait_shown(&cancelled) {
+                    return Message::Pane(PaneMsg::TaskRecordLoaded(epoch, None));
+                }
+                let read = client::block_on(task_record(&data_dir, &run.0, run.1));
+                Message::Pane(PaneMsg::TaskRecordLoaded(epoch, Some(Box::new(read))))
+            }));
+        }
+        if self.pane.section_open("work") && (again || self.pane.work_record.wants(&run)) {
+            let epoch = self.pane.work_record.begin(&run);
+            self.pane.work_record.task = Some(context.spawn_background(move |cancel| {
+                let cancelled = || cancel.is_cancelled();
+                if !wait_shown(&cancelled) {
+                    return Message::Pane(PaneMsg::WorkRecordLoaded(epoch, None));
+                }
+                let read = client::block_on(work_record(&data_dir, &run.0, run.1));
+                Message::Pane(PaneMsg::WorkRecordLoaded(epoch, Some(Box::new(read))))
+            }));
         }
     }
 
@@ -791,7 +1001,8 @@ impl DesktopApp {
         }));
     }
 
-    /// Read the open Agent's process records once (the Terminal tab).
+    /// Read the open Agent's process records and their current OS samples
+    /// once, together (the Terminal tab).
     fn read_processes(&mut self, context: &ComponentContext<Self>) {
         let (Some(agent), Ok(data_dir)) = (self.selected_agent_id(), self.data_dir.clone()) else {
             return;
@@ -816,8 +1027,14 @@ impl DesktopApp {
             if !wait_shown(&cancelled) {
                 return Message::Pane(PaneMsg::ProcessesLoaded(epoch, None));
             }
-            let read = client::block_on(client::agent_processes(&data_dir, &agent))
-                .map_err(|error| error.user_message());
+            let (processes, stats) = client::block_on(futures_util::future::join(
+                client::agent_processes(&data_dir, &agent),
+                client::agent_stats(&data_dir, &agent),
+            ));
+            let read = ProcessesRead {
+                processes: processes.map_err(|error| error.user_message()),
+                stats: stats.map_err(|error| error.user_message()),
+            };
             Message::Pane(PaneMsg::ProcessesLoaded(epoch, Some(Box::new(read))))
         }));
     }
@@ -1783,9 +2000,11 @@ impl DesktopApp {
         }
     }
 
-    /// Agents (skeleton 5.5, component 49): this task's manager and its
-    /// workers nested, each with its state, name, model, activity and
-    /// +/-; Open, Stop Agent and Hand off. Native subagents are observed.
+    /// Agents (§11.2, component 49): the daemon's scoped tree of this task,
+    /// its manager, workers and observed native subagents nested by their
+    /// parent links, each with its name, role, state, last confirmed action
+    /// and +/-, its resources when opened; Open, Stop Agent and Hand off.
+    /// Reparent is the task menu's Move under another task.
     fn tree_view(&self, context: &mut ViewContext<Self>) -> View {
         let tree = &self.monitor.data.tree;
         let root = self.tree_root();
@@ -1902,7 +2121,8 @@ impl DesktopApp {
         self.pane_body("Agents of this task", items)
     }
 
-    /// One tree row and, unless folded, its children one step in.
+    /// One tree row and, while it is open, its resources and its children
+    /// one step in.
     #[allow(
         clippy::too_many_arguments,
         reason = "The row's distinct inputs stay explicit at its one recursive call site."
@@ -1919,32 +2139,65 @@ impl DesktopApp {
     ) {
         let tree = &self.monitor.data.tree;
         let children = tree.children(&row.id);
-        let folded = self.pane.folded.contains(&row.id);
         let mut entries = Vec::new();
         self.monitor_entries(row, depth, None, selected, String::new(), now, &mut entries);
         let Some(monitor_view::MonitorEntry::Row(entry)) = entries.pop() else {
             return;
         };
+        // What opening the row reveals: its sampled resources (the tree read
+        // carries each row's observation) and its children.
+        let resources = tree_resources(row);
+        let open = self.pane.row_open(&row.id, !children.is_empty());
+        let fold = (!children.is_empty() || resources.is_some()).then_some(open);
+        // The role the daemon's hierarchy gives it (§2.2): a manager has
+        // Swarm workers, a worker has a manager; a native subagent is
+        // Observed instead.
+        let role = if row.native_child {
+            None
+        } else if children.iter().any(|child| !child.native_child) {
+            Some("Manager")
+        } else if row.parent.is_some() {
+            Some("Worker")
+        } else {
+            None
+        };
         rows.push(KeyedView::new(
-            format!("row:{}:{}:{folded}", row.id, entry.selected),
-            tree_row(
-                &entry,
-                depth,
-                (!children.is_empty()).then_some(!folded),
-                one_line,
-                context,
-            ),
+            format!("row:{}:{}:{open}", row.id, entry.selected),
+            tree_row(&entry, role, depth, fold, one_line, context),
         ));
-        if !folded && depth < 6 {
+        if !open {
+            return;
+        }
+        if let Some(resources) = resources {
+            rows.push(KeyedView::new(
+                format!("resources:{}", row.id),
+                controls::secondary(resources)
+                    .margin(Thickness::new(
+                        depth as f64 * tokens::layout::TREE_INDENT
+                            + tokens::height::CONTROL
+                            + tokens::layout::MARK
+                            + tokens::spacing::SM,
+                        0.0,
+                        0.0,
+                        0.0,
+                    ))
+                    .text_wrapping(TextWrapping::Wrap)
+                    .is_text_selection_enabled(true),
+            ));
+        }
+        if depth < 6 {
             for child in children {
                 self.tree_rows(child, depth + 1, now, selected, one_line, context, rows);
             }
         }
     }
 
-    /// Terminal (skeleton 5.6): the worktree with Open in Windows Terminal,
-    /// and the Agent's processes, read-only. No embedded terminal until
-    /// that dependency is decided (skeleton 9.3).
+    /// Terminal (§11.4): Open Windows Terminal in the task's confirmed
+    /// working folder, the main action (when it cannot start, why, and Copy
+    /// path), then the selected task's processes, read-only: name, PID,
+    /// state, time and, when sampled, resources. No embedded terminal, PTY,
+    /// terminal input or terminal tabs; a tool command's stdout is read in
+    /// the work log.
     fn terminal_view(&self, context: &mut ViewContext<Self>) -> View {
         let terminal = &self.pane.terminal;
         let open = self.selected_agent_id();
@@ -1970,9 +2223,9 @@ impl DesktopApp {
                                 .vertical_alignment(VerticalAlignment::Center)
                                 .text_trimming(TextTrimming::CharacterEllipsis)
                                 .is_text_selection_enabled(true),
-                            controls::tonal()
+                            controls::filled()
                                 .grid_column(2)
-                                .automation_name(format!("Open {shown} in Windows Terminal"))
+                                .automation_name(format!("Open Windows Terminal in {shown}"))
                                 .on_click(context.message(Message::Pane(PaneMsg::OpenTerminal)))
                                 .content(
                                     StackPanel::new()
@@ -1985,7 +2238,7 @@ impl DesktopApp {
                                         .children((
                                             controls::small_icon(controls::glyph::TERMINAL),
                                             controls::text(
-                                                "Open in Windows Terminal",
+                                                "Open Windows Terminal",
                                                 tokens::text::BUTTON,
                                             )
                                             .vertical_alignment(VerticalAlignment::Center),
@@ -1995,11 +2248,21 @@ impl DesktopApp {
                 ));
             }
         }
-        if let Some(note) = &terminal.note {
+        if let Some((note, folder)) = &terminal.note {
             items.push(KeyedView::new(
                 "note",
                 super::page_ui::error_line(note.clone()),
             ));
+            if !folder.is_empty() {
+                items.push(KeyedView::new(
+                    "copy-path",
+                    controls::text_button()
+                        .horizontal_alignment(HorizontalAlignment::Left)
+                        .automation_name(format!("Copy path {}", nav::display_path(folder)))
+                        .on_click(context.message(Message::Pane(PaneMsg::CopyPath(folder.clone()))))
+                        .content(controls::icon_label(controls::glyph::COPY, "Copy path")),
+                ));
+            }
         }
         items.push(KeyedView::new(
             "processes-head",
@@ -2022,9 +2285,9 @@ impl DesktopApp {
             ),
         ));
         let read = terminal.read.as_ref().filter(|_| terminal.agent == open);
-        match read {
+        match read.map(|read| (&read.processes, &read.stats)) {
             None => items.push(KeyedView::new("reading", super::page_ui::quiet("Reading…"))),
-            Some(Err(error)) => items.push(KeyedView::new(
+            Some((Err(error), _)) => items.push(KeyedView::new(
                 "failed",
                 super::page_ui::read_failed(
                     format!("Couldn't read the processes: {error}"),
@@ -2033,12 +2296,30 @@ impl DesktopApp {
                     context.message(Message::Pane(PaneMsg::Refresh)),
                 ),
             )),
-            Some(Ok(reply)) if reply.processes.is_empty() => items.push(KeyedView::new(
+            Some((Ok(reply), _)) if reply.processes.is_empty() => items.push(KeyedView::new(
                 "none",
                 super::page_ui::quiet("No processes recorded for this Agent."),
             )),
-            Some(Ok(reply)) => {
+            Some((Ok(reply), stats)) => {
                 let now = crate::handoff::now_ms();
+                // The samples of this run's processes, matched by exact
+                // identity (boot, PID, start time).
+                let stats = stats.as_ref().map_err(String::as_str).and_then(|stats| {
+                    if stats.generation == reply.generation {
+                        Ok(stats)
+                    } else {
+                        Err("the samples are of another run")
+                    }
+                });
+                let samples: &[eliot_core::ProcessSample] = match stats {
+                    Ok(stats) => match &stats.observation {
+                        ObservationView::Data(data) => {
+                            data.stats.samples.as_deref().unwrap_or_default()
+                        }
+                        ObservationView::Unavailable { .. } => &[],
+                    },
+                    Err(_) => &[],
+                };
                 let rows: Vec<KeyedView> = reply
                     .processes
                     .iter()
@@ -2052,11 +2333,29 @@ impl DesktopApp {
                             eliot_core::ProcessState::Unknown => "State unknown ·".to_owned(),
                         };
                         let age = monitor::elapsed_label(now.saturating_sub(process.updated_at));
+                        let resources: String = samples
+                            .iter()
+                            .find(|sample| sample.record.identity == process.identity)
+                            .map(|sample| {
+                                [
+                                    sample
+                                        .rss_bytes
+                                        .map(|bytes| monitor::bytes_label(Some(bytes))),
+                                    sample
+                                        .cpu_time_ns
+                                        .map(|ns| monitor::cpu_time_label(Some(ns))),
+                                ]
+                                .into_iter()
+                                .flatten()
+                                .map(|part| format!(" · {part}"))
+                                .collect()
+                            })
+                            .unwrap_or_default();
                         KeyedView::new(
                             format!("{}:{}", process.identity.pid, process.identity.start_time),
                             super::page_ui::kv_text(
                                 &format!("{} · {}", process.role, process.identity.pid),
-                                format!("{state} {age} ago"),
+                                format!("{state} {age} ago{resources}"),
                             ),
                         )
                     })
@@ -2069,6 +2368,13 @@ impl DesktopApp {
                             .keyed_children(rows),
                     ),
                 ));
+                // When the resources were sampled and how completely, or
+                // why they are not shown.
+                let sampled = match stats {
+                    Ok(stats) => monitor::Obs::from_view(Some(&stats.observation)).freshness(),
+                    Err(why) => format!("Resources not shown: {why}."),
+                };
+                items.push(KeyedView::new("sampled", super::page_ui::quiet(sampled)));
                 // `next` names the last row even on the last page: a full
                 // page is what says more may follow.
                 if reply.processes.len() >= eliot_core::api::AgentProcessesRequest::new("").limit {
@@ -2082,8 +2388,9 @@ impl DesktopApp {
         self.pane_body("Terminal", items)
     }
 
-    /// A collapsible Details section (`.sec` with `.sec-h`): its head
-    /// toggles it; closed, only the head shows.
+    /// A Details section (§11.3): a native `Expander` whose header is the
+    /// section's title, opened and closed by the owner and kept so across
+    /// refreshes. Its content is built only while it is open.
     pub(super) fn details_section(
         &self,
         key: &'static str,
@@ -2092,49 +2399,24 @@ impl DesktopApp {
         context: &mut ViewContext<Self>,
     ) -> View {
         let open = self.pane.section_open(key);
-        let head = controls::row(false)
-            .automation_name(format!(
-                "{title} ({})",
-                if open { "expanded" } else { "collapsed" }
-            ))
-            .on_click(context.message(Message::Pane(PaneMsg::Section(key))))
-            .content(
-                Grid::new()
-                    .columns([GridLength::STAR, GridLength::Auto])
-                    .children((
-                        controls::text(title.to_owned(), tokens::text::SMALL_TITLE)
-                            .automation_heading_level(AutomationHeadingLevel::Level3)
-                            .vertical_alignment(VerticalAlignment::Center),
-                        Border::new()
-                            .grid_column(1)
-                            .vertical_alignment(VerticalAlignment::Center)
-                            .content(controls::muted_icon(if open {
-                                controls::glyph::CHEVRON_DOWN
-                            } else {
-                                controls::glyph::CHEVRON_RIGHT
-                            })),
-                    )),
-            );
-        let mut parts = vec![KeyedView::new(format!("head:{open}"), head)];
-        if open {
-            parts.extend(body);
-        }
-        controls::card()
-            .padding(Thickness::new(
-                tokens::spacing::SM,
-                tokens::spacing::XS,
-                tokens::spacing::SM,
-                if open {
-                    tokens::spacing::INSET
-                } else {
-                    tokens::spacing::XS
-                },
-            ))
-            .content(
-                StackPanel::new()
-                    .spacing(tokens::spacing::CHIP_GAP)
-                    .keyed_children(parts),
+        let content: Option<View> = open.then(|| {
+            StackPanel::new()
+                .spacing(tokens::spacing::CHIP_GAP)
+                .keyed_children(body)
+                .into()
+        });
+        Expander::new()
+            .is_expanded(open)
+            .horizontal_alignment(HorizontalAlignment::Stretch)
+            .horizontal_content_alignment(HorizontalAlignment::Stretch)
+            .on_is_expanded_changed(
+                context.callback(move |open| Message::Pane(PaneMsg::Section(key, open))),
             )
+            .header(
+                controls::text(title.to_owned(), tokens::text::SMALL_TITLE)
+                    .automation_heading_level(AutomationHeadingLevel::Level3),
+            )
+            .maybe_content(content)
             .into()
     }
 
@@ -2166,6 +2448,85 @@ impl DesktopApp {
                 ),
         )
     }
+}
+
+/// Read one Agent run's newest Git task record (§11.3 Task): the run's
+/// bindings (`task.list`), the newest record's coverage (`manifest`), then
+/// the first page of its saved task text at that same Git revision. Never
+/// a reconstruction from the conversation.
+async fn task_record(data_dir: &Path, agent: &str, generation: i64) -> Result<TaskRecord, String> {
+    let list = client::task_list(data_dir, agent, generation)
+        .await
+        .map_err(|error| error.user_message())?;
+    let records = list.tasks.len();
+    let partial = list.next_cursor.is_some();
+    let Some(item) = list.tasks.last().cloned() else {
+        return Ok(TaskRecord {
+            records,
+            partial,
+            newest: None,
+        });
+    };
+    let section = |section: &str, revision: Option<String>| TaskGetRequest {
+        agent: agent.to_owned(),
+        generation,
+        task_command: item.task_command.clone(),
+        section: section.to_owned(),
+        revision,
+        content_digest: None,
+        offset: None,
+    };
+    let manifest_page = client::task_get(data_dir, &section("manifest", None))
+        .await
+        .map_err(|error| error.user_message())?;
+    let manifest: TaskSnapshotManifest = serde_json::from_str(&manifest_page.text)
+        .map_err(|_| "The task record's coverage could not be read.".to_owned())?;
+    let revision = manifest_page.revision;
+    let text = if manifest.task_saved {
+        Some(
+            client::task_get(data_dir, &section("task.md", Some(revision.clone())))
+                .await
+                .map(|page| (page.text, page.next_offset.is_some()))
+                .map_err(|error| error.user_message()),
+        )
+    } else {
+        None
+    };
+    Ok(TaskRecord {
+        records,
+        partial,
+        newest: Some(TaskRecordRead {
+            item,
+            revision,
+            manifest,
+            text,
+        }),
+    })
+}
+
+/// Read one Agent run's Git work records (§11.3 Work): its newest retained
+/// checkpoints, the newest one's manifest metadata at its exact ref and
+/// object ID, and its claims, each with its own failure.
+async fn work_record(data_dir: &Path, agent: &str, generation: i64) -> Result<WorkRecord, String> {
+    let (checkpoints, claims) = futures_util::future::join(
+        client::checkpoint_list(data_dir, agent, generation, CHECKPOINT_ROWS),
+        client::claim_list(data_dir, agent),
+    )
+    .await;
+    let checkpoints = checkpoints.map_err(|error| error.user_message());
+    let newest = match checkpoints.as_ref().map(|list| list.entries.first()) {
+        Ok(Some(entry)) => Some(
+            client::checkpoint_get(data_dir, agent, generation, entry)
+                .await
+                .map_err(|error| error.user_message()),
+        ),
+        _ => None,
+    };
+    Ok(WorkRecord {
+        checkpoints,
+        newest,
+        claims: claims.map_err(|error| error.user_message()),
+    })
 }
 
 /// Wait while the window is minimized or hidden (locally, no daemon
@@ -2532,14 +2893,41 @@ fn merge_result(
         .into()
 }
 
-/// One Agents tab row (component 49): its fold chevron, then the row (its
-/// state mark, name, "observed" for a native subagent, model, activity and
-/// +/-), which opens its conversation, then Stop Agent and Hand off. In
-/// the Normal width the model and activity take a second line.
+/// An Agents tab row's sampled resources (§11.2, revealed when the row
+/// opens): its processes, memory and CPU time with when they were sampled
+/// and how completely; `None` when nothing was sampled.
+fn tree_resources(row: &MonitorRow) -> Option<String> {
+    let monitor::Obs::Data {
+        rss_bytes,
+        cpu_time_ns,
+        sampled_at: Some(_),
+        processes,
+        ..
+    } = &row.obs
+    else {
+        return None;
+    };
+    let mut parts = vec![eliot_core::count_words(
+        *processes as u64,
+        "process",
+        "processes",
+    )];
+    parts.extend(rss_bytes.map(|bytes| monitor::bytes_label(Some(bytes))));
+    parts.extend(cpu_time_ns.map(|ns| monitor::cpu_time_label(Some(ns))));
+    Some(format!("{} · {}", parts.join(" · "), row.obs.freshness()))
+}
+
+/// One Agents tab row (§11.2, component 49): its chevron (right closed,
+/// down open; only when opening reveals something), then the row (its
+/// state mark, name, role or `Observed`, model, its state and last
+/// confirmed action, and +/-), which opens its conversation, then Stop
+/// Agent and Hand off, which an observed native subagent does not get. In
+/// the Normal width the model, state and action take a second line.
 fn tree_row(
     entry: &monitor_view::RowEntry,
+    role: Option<&str>,
     depth: usize,
-    children: Option<bool>,
+    fold: Option<bool>,
     one_line: bool,
     context: &mut ViewContext<DesktopApp>,
 ) -> View {
@@ -2567,19 +2955,32 @@ fn tree_row(
                 .text_trimming(TextTrimming::CharacterEllipsis),
         ),
     ];
-    if entry.observed {
+    // The role, or `Observed` for a native subagent (§2.2, §11.2).
+    let label = if entry.observed {
+        Some("Observed")
+    } else {
+        role
+    };
+    if let Some(label) = label {
         name.push(KeyedView::new(
-            "observed",
+            format!("role:{label}"),
             Border::new()
                 .grid_column(2)
                 .vertical_alignment(VerticalAlignment::Center)
-                .content(controls::badge("observed")),
+                .content(controls::badge(label)),
         ));
     }
+    // Its state in words, unless the last action already starts with them.
+    let status = row.status_words();
+    let action = if entry.activity.starts_with(status) {
+        entry.activity.clone()
+    } else {
+        format!("{status} · {}", entry.activity)
+    };
     let model = controls::text(entry.model.clone(), tokens::text::CAPTION)
         .vertical_alignment(VerticalAlignment::Center)
         .text_trimming(TextTrimming::CharacterEllipsis);
-    let activity = controls::text(entry.activity.clone(), tokens::text::CAPTION)
+    let activity = controls::text(action.clone(), tokens::text::CAPTION)
         .vertical_alignment(VerticalAlignment::Center)
         .text_trimming(TextTrimming::CharacterEllipsis);
     let activity = if entry.attention {
@@ -2638,12 +3039,11 @@ fn tree_row(
             .into()
     };
     let words = format!(
-        "{}, {}, {}, {}{}",
+        "{}{}, {}, {}",
         entry.title,
-        row.status_words(),
+        label.map_or_else(String::new, |label| format!(", {label}")),
         entry.model,
-        entry.activity,
-        if entry.observed { ", observed" } else { "" }
+        action,
     );
     let height = if one_line {
         tokens::height::CONTROL
@@ -2658,11 +3058,11 @@ fn tree_row(
         .on_click(context.message(Message::Pane(PaneMsg::TreeOpen(row.id.clone()))))
         .content(content)
         .tooltip(words.clone());
-    let chevron: Option<View> = children.map(|open| {
+    let chevron: Option<View> = fold.map(|open| {
         controls::icon_button()
             .automation_name(format!(
-                "{} the workers of {}",
-                if open { "Hide" } else { "Show" },
+                "{} {}",
+                if open { "Collapse" } else { "Expand" },
                 entry.title
             ))
             .on_click(context.message(Message::Pane(PaneMsg::TreeFold(row.id.clone()))))

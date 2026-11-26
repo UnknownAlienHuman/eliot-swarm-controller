@@ -148,6 +148,12 @@ checked! {
     eliot_core::api::AgentPatchDigestRequest => eliot_core::api::AgentPatchDigestResponse, "agent.patch_digest";
     eliot_core::api::AgentDiffRequest => eliot_core::api::AgentDiffResponse, "agent.diff";
     eliot_core::api::AgentProcessesRequest => eliot_core::api::AgentProcessesResponse, "agent.processes";
+    eliot_core::api::AgentStatsRequest => eliot_core::api::AgentStatsResponse, "agent.stats";
+    eliot_core::api::TaskListRequest => eliot_core::api::TaskListResponse, "task.list";
+    eliot_core::api::TaskGetRequest => eliot_core::api::TaskGetResponse, "task.get";
+    eliot_core::api::CheckpointListRequest => eliot_core::api::CheckpointListResponse, "checkpoint.list";
+    eliot_core::api::CheckpointGetRequest => eliot_core::api::CheckpointGetResponse, "checkpoint.get";
+    eliot_core::api::ClaimListRequest => eliot_core::api::ClaimListResponse, "claim.list";
     eliot_core::api::MailInboxRequest => eliot_core::api::MailInboxResponse, "mail.inbox";
     eliot_core::api::GoalSetRequest => eliot_core::api::GoalView, "goal.set";
     eliot_core::api::GoalPauseRequest => eliot_core::api::GoalView, "goal.pause";
@@ -1852,6 +1858,85 @@ pub async fn agent_processes(
     let request = eliot_core::api::AgentProcessesRequest::new(id);
     let reply: eliot_core::api::AgentProcessesResponse = call(data_dir, &request).await?;
     Ok(reply)
+}
+
+/// The current OS samples of an Agent's processes (`agent.stats`), for the
+/// Terminal tab's resources beside each process record.
+pub async fn agent_stats(data_dir: &Path, id: &str) -> Result<eliot_core::api::AgentStatsResponse> {
+    call(data_dir, &eliot_core::api::AgentStatsRequest::new(id)).await
+}
+
+/// The first page of one exact Agent run's retained task bindings
+/// (`task.list`), for Details › Task.
+pub async fn task_list(
+    data_dir: &Path,
+    agent: &str,
+    generation: i64,
+) -> Result<eliot_core::api::TaskListResponse> {
+    let request = eliot_core::api::TaskListRequest {
+        agent: agent.to_owned(),
+        generation,
+        limit: eliot_core::api::TASK_RECORD_PAGE_SIZE,
+        cursor: None,
+    };
+    call(data_dir, &request).await
+}
+
+/// One page of one allowlisted section of a task record (`task.get`); with
+/// `revision`, pinned to that Git snapshot.
+pub async fn task_get(
+    data_dir: &Path,
+    request: &eliot_core::api::TaskGetRequest,
+) -> Result<eliot_core::api::TaskGetResponse> {
+    call(data_dir, request).await
+}
+
+/// The newest retained checkpoints of one exact Agent run, newest first
+/// (`checkpoint.list`), for Details › Work.
+pub async fn checkpoint_list(
+    data_dir: &Path,
+    agent: &str,
+    generation: i64,
+    limit: usize,
+) -> Result<eliot_core::api::CheckpointListResponse> {
+    let request = eliot_core::api::CheckpointListRequest {
+        agent: agent.to_owned(),
+        generation,
+        limit,
+        cursor: None,
+    };
+    call(data_dir, &request).await
+}
+
+/// The first page of one checkpoint's staged and worktree manifest metadata
+/// at its exact ref and object ID (`checkpoint.get`); no file bodies.
+pub async fn checkpoint_get(
+    data_dir: &Path,
+    agent: &str,
+    generation: i64,
+    entry: &eliot_core::api::CheckpointListEntry,
+) -> Result<eliot_core::api::CheckpointGetResponse> {
+    let request = eliot_core::api::CheckpointGetRequest {
+        agent: agent.to_owned(),
+        generation,
+        checkpoint_ref: entry.checkpoint_ref.clone(),
+        oid: entry.oid.clone(),
+        limit: 100,
+        cursor: None,
+    };
+    call(data_dir, &request).await
+}
+
+/// An Agent's active advisory claims (`claim.list`), for Details › Work.
+pub async fn claim_list(
+    data_dir: &Path,
+    agent: &str,
+) -> Result<eliot_core::api::ClaimListResponse> {
+    let request = eliot_core::api::ClaimListRequest {
+        project: None,
+        agent: Some(agent.to_owned()),
+    };
+    call(data_dir, &request).await
 }
 
 /// One page of an Agent's unread mail (`mail.inbox`, no long-poll). Reading

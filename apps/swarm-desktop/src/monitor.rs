@@ -368,7 +368,7 @@ pub enum Obs {
 }
 
 impl Obs {
-    fn from_view(view: Option<&ObservationView>) -> Self {
+    pub fn from_view(view: Option<&ObservationView>) -> Self {
         match view {
             None => Self::Unavailable("missing from the reply".to_owned()),
             Some(ObservationView::Unavailable { error_code, .. }) => {
@@ -1694,6 +1694,14 @@ impl Monitor {
             }
         };
         let identity = &read.agent.agent;
+        // Its samples feed the same history as a fleet row's, so Details ›
+        // Activity & resources has them without the Agents page.
+        if let ObservationView::Data(data) = &read.agent.observation {
+            self.series
+                .entry(identity.id.clone())
+                .or_default()
+                .observe(&data.stats, &data.processes);
+        }
         let previous = self.detail.take().filter(|last| {
             last.read.agent.agent.id == identity.id
                 && last.read.agent.agent.generation == identity.generation
