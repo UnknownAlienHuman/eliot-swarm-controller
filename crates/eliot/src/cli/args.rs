@@ -1593,11 +1593,11 @@ pub(crate) struct CmdChildrenArgs {
 pub(crate) struct CmdResolveArgs {
     #[arg(value_name = "COMMAND_ID", value_parser = command_id)]
     pub(crate) command_id: String,
-    /// Assert a completed command effect or a definite failure.
+    /// Assert a completed effect, definite failure, or pre-delivery refusal.
     #[arg(
         long,
         value_name = "STATUS",
-        value_parser = ["completed", "failed"],
+        value_parser = ["completed", "failed", "rejected"],
         required_unless_present = "legacy_as",
         conflicts_with = "legacy_as"
     )]

@@ -245,13 +245,14 @@ pub(crate) async fn run_cmd(
                 }
                 (Some("completed"), None) | (None, Some("applied")) => CommandResolution::Applied,
                 (Some("failed"), None) | (None, Some("failed")) => CommandResolution::Failed,
+                (Some("rejected"), None) => CommandResolution::Rejected,
                 (None, None) => {
                     return Err(Failure::new(2, "--status or legacy --as is required"));
                 }
                 _ => {
                     return Err(Failure::new(
                         2,
-                        "--status must be completed or failed; --as must be applied or failed",
+                        "--status must be completed, failed, or rejected; --as must be applied or failed",
                     ));
                 }
             };

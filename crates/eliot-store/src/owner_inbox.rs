@@ -658,6 +658,8 @@ fn project_unknown_commands(
         let mut choices = Vec::new();
         let workspace_launch = verb == "launch" && stage.as_deref() == Some("workspace");
         let start_command = matches!(verb.as_str(), "launch" | "resume");
+        let pre_delivery_resolution =
+            eliot_core::api::CommandResolution::supports_rejected(&verb, turn.is_some());
         let removal_outcome = removal_outcome
             .as_deref()
             .map(crate::decode_json)
@@ -688,7 +690,12 @@ fn project_unknown_commands(
                 recommended = Some(applied.clone());
                 choices.push(applied);
             } else if !start_command && (verb != "worktree.remove" || legacy_absence) {
-                for resolution in ["applied", "failed"] {
+                let negative_resolution = if pre_delivery_resolution {
+                    "rejected"
+                } else {
+                    "failed"
+                };
+                for resolution in ["applied", negative_resolution] {
                     choices.push(action(
                         resolution,
                         "command.resolve",
@@ -761,19 +768,28 @@ fn project_unknown_commands(
                     true,
                 )),
                 "send" => Some((
-                    "Check the original generation's native session for an input receipt bound to this command. Use failed only with proof of refusal before the input was written. Plugin exit and a terminal for an earlier input leave this Send unknown.",
+                    "Check the original generation's native session for an input receipt bound to this Send. Plugin exit and a terminal for an earlier input leave this Send unknown.",
                     true,
                 )),
                 "steer" => Some((
-                    "Check the exact turn for a native delivery or hook receipt bound to this Steer. Use failed only with proof the steer was refused before delivery or the hook closed without claiming it. A timeout and the turn's terminal leave delivery unknown.",
+                    "Check the exact turn for a native delivery or hook receipt bound to this Steer. A timeout and the turn's terminal leave delivery unknown.",
+                    true,
+                )),
+                "interrupt" => Some((
+                    "Check the captured generation and turn for a native interrupt receipt bound to this command. A turn terminal or process exit alone leaves delivery unknown. If a linked fallback Stop has owned exit and reader-drain proof, review it with `swarm cmd settle-stopped`.",
                     true,
                 )),
                 _ => None,
             };
             if let Some((check, allow_completed)) = check {
                 let id = &projected.subject;
+                let (status, evidence) = if pre_delivery_resolution {
+                    ("rejected", "a proven refusal before native delivery")
+                } else {
+                    ("failed", "a verified failure")
+                };
                 let mut instructions = format!(
-                    "{check} For a verified failure, run `swarm cmd resolve {id} --status failed --reason \"<verified evidence>\"`."
+                    "{check} For {evidence}, run `swarm cmd resolve {id} --status {status} --reason \"<verified evidence>\"`."
                 );
                 if allow_completed {
                     instructions.push_str(&format!(

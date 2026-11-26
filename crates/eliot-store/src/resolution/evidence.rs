@@ -210,7 +210,10 @@ fn reconcile_command_tx(
     if generation > agent.generation {
         return Ok(());
     }
-    if let Some(evidence) = retained_pre_write_refusal(record, &agent.harness, outcome) {
+    if let Some(evidence) = retained_pre_write_refusal(record, &agent.harness, outcome)
+        && (!matches!(evidence, CommandEvidence::ClaudeSteerContextRefusal)
+            || has_unclaimed_steer_dispatch(tx, record, target, generation)?)
+    {
         events.push(settle_evidence_tx(
             tx,
             record,
@@ -314,6 +317,8 @@ fn retained_pre_write_refusal(
     let message = outcome["message"].as_str()?;
     let command = &record.command;
     let diagnostic = (command.verb.as_str(), location, code);
+    let legacy_unclassified_origin = outcome["origin"] == "unknown"
+        && outcome["origin_evidence"] == "no origin classified where this error was created";
     let bound_turn = command
         .turn_id
         .as_ref()
@@ -337,6 +342,7 @@ fn retained_pre_write_refusal(
             }
             LegacyPreWriteRefusal::SendStreamUnresolved(refusal_message)
                 if diagnostic == ("send", "plugin.command.unknown", "unknown")
+                    && legacy_unclassified_origin
                     && command.turn_id.is_none()
                     && message == *refusal_message =>
             {
@@ -354,15 +360,50 @@ fn retained_pre_write_refusal(
             }
             LegacyPreWriteRefusal::SteerContextRendering
                 if diagnostic == ("steer", "plugin.command", "source_integrity")
+                    && legacy_unclassified_origin
                     && bound_turn
                     && record.expected_turn_id == command.turn_id
                     && message == "persisted inject args are malformed"
+                    && outcome.get("claim").is_none()
                     && super::super::context::decode_inject_args(&command.args).is_err() =>
             {
                 Some(CommandEvidence::ClaudeSteerContextRefusal)
             }
             _ => None,
         })
+}
+
+fn has_unclaimed_steer_dispatch(
+    tx: &Transaction<'_>,
+    record: &CommandRecord,
+    target: i64,
+    generation: i64,
+) -> Result<bool> {
+    // An ordinary dispatch records the exact turn. A hook dispatch records
+    // its consumer and application point. Require the former and rule out
+    // any other dispatch, claim or delivery receipt for this command.
+    tx.query_row(
+        "SELECT COUNT(*) = 1 AND COALESCE(MAX(
+            kind='command.dispatched' AND source='daemon'
+            AND json_extract(data,'$.verb')='steer'
+            AND json_extract(data,'$.turn_id')=?4
+            AND json_type(data,'$.consumer_id') IS NULL
+            AND json_type(data,'$.application_point') IS NULL
+        ),0)
+         FROM events INDEXED BY events_agent
+         WHERE agent=?1 AND generation=?2 AND json_extract(data,'$.command_id')=?3
+           AND (kind IN ('command.dispatched','command.applied','command.resolved')
+                OR json_type(data,'$.outcome.claim') IS NOT NULL
+                OR json_type(data,'$.outcome.context_outcome') IS NOT NULL)",
+        params![
+            target,
+            generation,
+            record.command.id,
+            record.command.turn_id
+        ],
+        |row| row.get(0),
+    )
+    .map_err(sql_error)
 }
 
 fn archived_resume_refusal(outcome: &Value, native_ref: &str) -> bool {
