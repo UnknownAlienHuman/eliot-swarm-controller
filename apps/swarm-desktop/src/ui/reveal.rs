@@ -133,6 +133,115 @@ pub(super) fn open_with_default_app(path: &Path) -> Result<(), String> {
         .map_err(|error| format!("File Explorer did not start: {error}"))
 }
 
+/// `relative` under `worktree` as an existing canonical path that stays
+/// inside the worktree's canonical root (a link or junction that leads
+/// out is refused). Runs file system calls: call it off the UI thread.
+pub(super) fn inside_worktree(worktree: &Path, relative: &Path) -> Result<PathBuf, String> {
+    let root = std::fs::canonicalize(worktree)
+        .map_err(|error| format!("The worktree could not be read: {error}"))?;
+    let full = std::fs::canonicalize(worktree.join(relative)).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            format!(
+                "{} is not on this computer (it was moved or deleted).",
+                relative.display()
+            )
+        } else {
+            format!("{} could not be opened: {error}", relative.display())
+        }
+    })?;
+    if full.starts_with(&root) {
+        Ok(full)
+    } else {
+        Err(format!(
+            "{} leads outside the worktree.",
+            relative.display()
+        ))
+    }
+}
+
+/// Open a changed file to read or edit it, never to run it: a program, a
+/// script, a link or an installer (its extension in `PATHEXT` or in
+/// [`RUNS`]) is refused, since its default action would execute it; any
+/// other file opens with its default app. Nothing is waited for.
+pub(super) fn open_for_editing(path: &Path) -> Result<(), String> {
+    let extension = path
+        .extension()
+        .map(|extension| extension.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    let path_ext = std::env::var("PATHEXT")
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let runs = !extension.is_empty()
+        && (RUNS.contains(&extension.as_str())
+            || path_ext
+                .split(';')
+                .any(|listed| listed.trim_start_matches('.') == extension));
+    if runs {
+        return Err(format!(
+            "{} would run if opened, so it is not opened. Use Open folder to see it.",
+            path.file_name().map_or_else(
+                || path.display().to_string(),
+                |name| name.to_string_lossy().into_owned()
+            )
+        ));
+    }
+    open_with_default_app(path)
+}
+
+/// Extensions whose default action runs code, beyond `PATHEXT`.
+const RUNS: &[&str] = &[
+    "exe",
+    "com",
+    "bat",
+    "cmd",
+    "ps1",
+    "psm1",
+    "psd1",
+    "ps1xml",
+    "psc1",
+    "vbs",
+    "vbe",
+    "js",
+    "jse",
+    "wsf",
+    "wsh",
+    "ws",
+    "wsc",
+    "msc",
+    "msi",
+    "msp",
+    "mst",
+    "scr",
+    "pif",
+    "lnk",
+    "url",
+    "hta",
+    "cpl",
+    "reg",
+    "jar",
+    "appref-ms",
+    "application",
+    "gadget",
+    "inf",
+    "scf",
+    "chm",
+    "dll",
+    "sys",
+    "appx",
+    "appxbundle",
+    "msix",
+    "msixbundle",
+    "library-ms",
+    "search-ms",
+    "settingcontent-ms",
+    "website",
+    "py",
+    "pyw",
+    "pyz",
+    "rb",
+    "pl",
+];
+
 /// Open `folder` in Windows Terminal (`wt.exe -d <folder>`): the app
 /// execution alias under `%LOCALAPPDATA%\Microsoft\WindowsApps`, by
 /// absolute path with explicit argv and no shell. The terminal is the
