@@ -343,7 +343,7 @@ pub fn profiles_screen(data: ProfilesData<'_>, actions: ProfilesActions) -> View
         form.push(KeyedView::new(
             "name",
             crate::controls::section_title(name.to_owned())
-                .height(tokens::height::FORM_ROW)
+                .min_height(tokens::height::FORM_ROW)
                 .vertical_alignment(VerticalAlignment::Center),
         ));
         if let Some(error) = data

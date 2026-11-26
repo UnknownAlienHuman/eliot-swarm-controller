@@ -43,9 +43,10 @@
 use std::cell::Cell;
 use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 
-use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{
-    GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromRect,
+    GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTOPRIMARY, MONITORINFO,
+    MonitorFromPoint, MonitorFromRect,
 };
 use windows_sys::Win32::System::Threading::{
     GetCurrentThreadId, GetStartupInfoW, STARTF_USESHOWWINDOW, STARTUPINFOW,
@@ -83,14 +84,34 @@ pub struct Closed {
 /// its HWND's styles.
 const WINUI_FRAME: (u32, u32) = (WS_OVERLAPPEDWINDOW, WS_EX_WINDOWEDGE);
 
-/// The outer bounds the window opens at: the saved top-left and client size
-/// placed by [`place`] (none without a saved top-left: Windows chooses the
-/// place). The maximized state is applied by the hook's first activation.
+/// The outer bounds the window opens at, always inside a monitor's work
+/// area (§6.2): the saved top-left and client size placed by [`place`];
+/// without a saved top-left, the saved client size (else `default`, the
+/// first window's) centred in the primary monitor's work area and never
+/// larger than it. The maximized state is applied by the hook's first
+/// activation.
 pub fn initial_bounds(
     saved: Option<crate::settings::WindowPlacement>,
+    default: (u32, u32),
 ) -> Option<windows_reactor::WindowPlacement> {
-    let saved = saved?;
-    let (x, y, width, height) = place(saved.position()?, (saved.width, saved.height), WINUI_FRAME);
+    let size = saved.map_or(default, |saved| (saved.width, saved.height));
+    let (x, y, width, height) = match saved.and_then(|saved| saved.position()) {
+        Some(position) => place(position, size, WINUI_FRAME),
+        None => {
+            // SAFETY: a point; PRIMARY always returns a monitor.
+            let monitor =
+                unsafe { MonitorFromPoint(POINT { x: 0, y: 0 }, MONITOR_DEFAULTTOPRIMARY) };
+            let work = monitor_info(monitor)?.rcWork;
+            let (_, _, width, height) = place((work.left, work.top), size, WINUI_FRAME);
+            let spare = |from: i32, to: i32, length: i32| from + (to - from - length).max(0) / 2;
+            (
+                spare(work.left, work.right, width),
+                spare(work.top, work.bottom, height),
+                width,
+                height,
+            )
+        }
+    };
     Some(windows_reactor::WindowPlacement {
         x,
         y,

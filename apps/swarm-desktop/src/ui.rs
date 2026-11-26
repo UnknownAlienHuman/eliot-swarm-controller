@@ -1037,7 +1037,7 @@ impl Component for DesktopApp {
                 place_epoch: 0,
                 batch: None,
                 project_reads: 0,
-                projects_error: None,
+                projects_failing: false,
             },
             launch: launch_ui::LaunchState {
                 workspace: input
@@ -1191,7 +1191,13 @@ pub fn run(workspace: Option<PathBuf>) -> Result<(), String> {
     let result = App::run_component::<DesktopApp>(DesktopInput {
         workspace,
         window,
-        bounds: crate::window_place::initial_bounds(window),
+        bounds: crate::window_place::initial_bounds(
+            window,
+            (
+                tokens::layout::WINDOW_WIDTH as u32,
+                tokens::layout::WINDOW_HEIGHT as u32,
+            ),
+        ),
         panels: saved.panels,
         close_note: close_note.clone(),
     })

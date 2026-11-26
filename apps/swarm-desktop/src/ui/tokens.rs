@@ -248,9 +248,10 @@ pub mod layout {
     pub const BUBBLE_SHARE: f64 = 0.8;
     /// The narrowest content column.
     pub const MIN_COLUMN: f64 = 320.0;
-    /// First window client size; the user resizes freely after.
-    pub const WINDOW_WIDTH: f64 = 1440.0;
-    pub const WINDOW_HEIGHT: f64 = 900.0;
+    /// First window client size (§6.2: 1280×800, the Wide class at its
+    /// threshold); the user resizes freely after.
+    pub const WINDOW_WIDTH: f64 = 1280.0;
+    pub const WINDOW_HEIGHT: f64 = 800.0;
     /// The model picker above the composer. WinUI's default FlyoutPresenter
     /// is at most `FlyoutThemeMaxWidth` (456) wide and scrolls sideways past
     /// it; inside its `FlyoutContentPadding` (16 a side) and border (1, or

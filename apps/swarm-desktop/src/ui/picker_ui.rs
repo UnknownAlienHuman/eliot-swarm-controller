@@ -541,10 +541,8 @@ impl DesktopApp {
             name.push_str(", ");
             name.push_str(&note);
         }
-        let mut button = controls::row(false)
+        let mut button = controls::two_line_row(false)
             .is_enabled(enabled)
-            .height(tokens::height::TWO_LINE_ROW)
-            .min_height(tokens::height::TWO_LINE_ROW)
             .automation_name(name)
             .on_click(context.message(Message::Launch(LaunchMsg::PickerChosen(item.key.clone()))));
         if let ItemKind::Model {

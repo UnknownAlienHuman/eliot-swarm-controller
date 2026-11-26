@@ -5,8 +5,10 @@
 //! [`SplitShell`] owns both panel widths and is the one observer of the
 //! window's size, so a drag or resize step re-renders it alone: the
 //! window's subtrees reach it as input and compare equal. It posts to the
-//! window only when the size class or the docking result changes (§6.2),
-//! so a resize inside one class costs the window nothing.
+//! window only when the size class, the docking result or a full-column
+//! crossing (Home's and the reading column's, §8.1 and §9.4) changes
+//! ([`Layout`], §6.2), so a resize inside one layout costs the window
+//! nothing.
 
 use super::*;
 use tokens::layout::{
@@ -497,7 +499,10 @@ impl Component for SplitShell {
         // without rebuilding it: docked, its own width behind a hairline
         // with its handle; over the main area, both columns on the opaque
         // base, the conversation beneath keeping its scroll, selection and
-        // draft for Back to conversation.
+        // draft for Back to conversation. That conversation stays in UIA
+        // and the Tab order: Reactor 0.101 exposes no `Visibility`,
+        // `AccessibilityView` or `TabFocusNavigation` to take it out
+        // without disposing it (brand book §22.2).
         let pane: Option<View> = input.pane.as_ref().map(|pane| {
             let surface = Border::new().content(subtree(pane));
             let border = if input.over {

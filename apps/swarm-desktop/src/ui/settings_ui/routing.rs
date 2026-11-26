@@ -146,7 +146,7 @@ impl DesktopApp {
 /// reorder / remove buttons.
 fn candidate_row(place: usize, name: &str, buttons: View) -> View {
     Grid::new()
-        .height(tokens::height::CONTROL)
+        .min_height(tokens::height::CONTROL)
         .columns([
             GridLength::Pixel(tokens::layout::TREE_INDENT),
             GridLength::STAR,

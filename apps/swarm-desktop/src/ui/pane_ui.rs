@@ -835,7 +835,7 @@ impl DesktopApp {
                     "filter",
                     Border::new()
                         .width(tokens::layout::FILTER_WIDTH)
-                        .height(tokens::height::CONTROL)
+                        .min_height(tokens::height::CONTROL)
                         .corner_radius(tokens::radius::CONTROL)
                         .border_brush(ThemeBrush::CardStroke)
                         .border_thickness(Thickness::uniform(tokens::layout::HAIRLINE))

@@ -270,9 +270,9 @@ pub fn status_mark(tone: StatusTone, size: f64) -> Option<View> {
     match tone {
         StatusTone::Active => Some(circle(ThemeBrush::Accent)),
         StatusTone::Attention => Some(circle(ThemeBrush::SystemCritical)),
-        // Work in flight (starting) shows the native progress indicator.
-        StatusTone::Pending => Some(spinner()),
-        StatusTone::Neutral => None,
+        // Starting is a state, not an action in flight: its words say it,
+        // with no ring in the row (§4.2, §5.1).
+        StatusTone::Pending | StatusTone::Neutral => None,
         StatusTone::Failed => Some(
             Border::new()
                 .background(ThemeBrush::SystemCritical)
@@ -525,6 +525,13 @@ pub fn row(selected: bool) -> Button {
 /// A row under its parent (same height as every row).
 pub fn sub_row(selected: bool) -> Button {
     row(selected)
+}
+
+/// A two-line row (a title over its note): a [`row`] whose minimum is the
+/// two-line height (§4.5); like every row it grows with the text scale,
+/// never clipped to a fixed height.
+pub fn two_line_row(selected: bool) -> Button {
+    row(selected).min_height(height::TWO_LINE_ROW)
 }
 
 /// A row's content: an optional icon, the title (trimmed), an optional
@@ -875,7 +882,13 @@ pub fn status_pill(tone: StatusTone, label: &str) -> View {
         .vertical_alignment(VerticalAlignment::Center)
         .automation_name(label)
         .content(row_grid(
-            status_mark(tone, layout::BADGE_DOT),
+            // A pill is its own block: work starting there shows the
+            // native progress indicator beside its words (§4.2); rows keep
+            // the static marks, with no ring.
+            match tone {
+                StatusTone::Pending => Some(spinner()),
+                _ => status_mark(tone, layout::BADGE_DOT),
+            },
             trimmed(label, style::CAPTION).into(),
             None,
             spacing::CHIP_GAP,

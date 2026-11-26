@@ -666,7 +666,7 @@ fn head_row(narrow: bool) -> View {
             .into()
     };
     Border::new()
-        .height(tokens::height::CONTROL)
+        .min_height(tokens::height::CONTROL)
         .border_brush(ThemeBrush::CardStroke)
         .border_thickness(Thickness::new(0.0, 0.0, 0.0, tokens::layout::HAIRLINE))
         .automation_name(if narrow {
@@ -914,7 +914,7 @@ fn entry_view(entry: &MonitorEntry, input: &MonitorListInput) -> KeyedView {
         MonitorEntry::Section(key, label) => KeyedView::new(
             key.clone(),
             Border::new()
-                .height(tokens::height::CONTROL)
+                .min_height(tokens::height::CONTROL)
                 .padding(Thickness::xy(tokens::spacing::SM, 0.0))
                 .content(
                     crate::controls::text(label.clone(), tokens::text::LABEL)

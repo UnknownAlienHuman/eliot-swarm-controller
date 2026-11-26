@@ -198,9 +198,7 @@ const TOOLTIP: &str = "Open in Explorer";
 pub(super) fn path_row(title: &str, note: &str, path: &str, open: Callback<()>) -> View {
     let shown = nav::display_path(path);
     let note = if note.is_empty() { &shown } else { note };
-    controls::row(false)
-        .height(tokens::height::TWO_LINE_ROW)
-        .min_height(tokens::height::TWO_LINE_ROW)
+    controls::two_line_row(false)
         .automation_name(format!("Open {title} in Explorer: {shown}"))
         .on_click(open)
         .content(
@@ -253,8 +251,7 @@ pub(super) fn path_link(path: &str, open: Callback<()>) -> View {
     let shown = nav::display_path(path);
     controls::text_button()
         .style(ButtonStyle::Subtle)
-        .min_height(0.0)
-        .height(tokens::height::SUB_ROW)
+        .min_height(tokens::height::SUB_ROW)
         .horizontal_alignment(HorizontalAlignment::Left)
         .margin(Thickness::new(-tokens::spacing::XS, 0.0, 0.0, 0.0))
         .automation_name(format!("Open in Explorer: {shown}"))
