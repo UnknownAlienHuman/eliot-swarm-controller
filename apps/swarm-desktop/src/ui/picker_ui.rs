@@ -127,9 +127,10 @@ impl DesktopApp {
 
     /// The new task's chips (the design's bar, after +): the project,
     /// where it works, the model (Auto by default, Swarm's pick in its
-    /// tooltip) and the access level (a preset's is read-only). The
-    /// project's label trims to the composer's room.
-    pub(super) fn composer_chips(&self, context: &mut ViewContext<Self>) -> View {
+    /// tooltip) and the access level (a preset's is read-only), as the
+    /// composer's chip lines. Each line's first label trims to the room
+    /// left.
+    pub(super) fn composer_chips(&self, context: &mut ViewContext<Self>) -> Vec<View> {
         let auto_profile = self.launch.auto_profile();
         let label = match self.launch.choice {
             Choice::Auto => "Auto".to_owned(),
@@ -206,9 +207,9 @@ impl DesktopApp {
                 .tooltip("Set by the preset.")
             }
         };
-        // The design: project, place, model, access, 6 DIPs apart, on
-        // their own line; a narrow main area wraps them two to a line
-        // (Reactor 0.101 has no wrap panel), so no chip is cut.
+        // The design: project, place, model, access, 6 DIPs apart, on one
+        // line with Start task; below the full Home width they wrap two to
+        // a line (Reactor 0.101 has no wrap panel), so no chip is cut.
         let chips: Vec<View> = [
             Some(self.project_chip(context)),
             self.place_chip(context),
@@ -218,17 +219,15 @@ impl DesktopApp {
         .into_iter()
         .flatten()
         .collect();
-        if self.narrow_main() {
-            page_ui::chip_rows(
-                chips
-                    .into_iter()
-                    .enumerate()
-                    .map(|(index, chip)| KeyedView::new(index, chip))
-                    .collect(),
-                2,
-            )
+        if self.layout.full_home {
+            vec![controls::chip_row(chips)]
         } else {
-            controls::chip_row(chips)
+            let mut chips = chips.into_iter();
+            std::iter::from_fn(|| {
+                let line: Vec<View> = chips.by_ref().take(2).collect();
+                (!line.is_empty()).then(|| controls::chip_row(line))
+            })
+            .collect()
         }
     }
 

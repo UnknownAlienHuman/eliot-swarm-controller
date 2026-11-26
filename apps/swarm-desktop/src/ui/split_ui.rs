@@ -41,8 +41,9 @@ impl SizeClass {
     }
 }
 
-/// What the window lays out by: the size class and whether the requested
-/// pane docks beside the main area (§6.2's docking condition).
+/// What the window lays out by: the size class, whether the requested
+/// pane docks beside the main area (§6.2's docking condition) and whether
+/// Home's column has its full width.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct Layout {
     pub(super) class: SizeClass,
@@ -52,6 +53,11 @@ pub(super) struct Layout {
     /// pane would render the opening once with a stale answer and lay it
     /// out again after this component observed the pane.
     pub(super) docks: bool,
+    /// The main card holds the Home column at its full width
+    /// (`HOME_WIDTH` inside its side gutters): Home's composer then keeps
+    /// its parameters and Start task on one line, and wraps them below it
+    /// (§8.1).
+    pub(super) full_home: bool,
 }
 
 impl Layout {
@@ -65,9 +71,13 @@ impl Layout {
         } else {
             sidebar
         };
+        // The main card: the window less the sidebar, the card's right
+        // gap and its two hairlines.
+        let main = width - sidebar - tokens::layout::CARD_GAP - 2.0 * tokens::layout::HAIRLINE;
         Self {
             class,
             docks: spare(width, sidebar, pane) >= 0.0,
+            full_home: main >= tokens::layout::HOME_WIDTH + 2.0 * tokens::spacing::XL,
         }
     }
 }

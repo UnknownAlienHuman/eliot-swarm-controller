@@ -72,9 +72,9 @@ impl DesktopApp {
             _ if running || reading == Some(RowMode::Running) => "Type to steer the running turn",
             _ => "Send a follow-up",
         };
-        let chips: Option<View> = match (agent.as_deref(), detail) {
-            (None, _) => Some(self.composer_chips(context)),
-            (Some(_), Some(detail)) => Some(controls::chip_row(
+        let chips: Vec<View> = match (agent.as_deref(), detail) {
+            (None, _) => self.composer_chips(context),
+            (Some(_), Some(detail)) => vec![controls::chip_row(
                 [
                     Some(self.model_chip(detail, running, context)),
                     access_chip(detail),
@@ -82,8 +82,8 @@ impl DesktopApp {
                 .into_iter()
                 .flatten()
                 .collect(),
-            )),
-            (Some(_), None) => None,
+            )],
+            (Some(_), None) => Vec::new(),
         };
         let retry = agent
             .as_ref()
@@ -169,7 +169,11 @@ impl DesktopApp {
             primary,
             enabled: !self.submitting() && !(home && self.launch_folder_missing()),
             pending,
-            stacked: self.narrow_main(),
+            stacked: if home {
+                !self.layout.full_home
+            } else {
+                self.narrow_main()
+            },
             agent,
             send: context.forward(),
         })
@@ -766,7 +770,9 @@ pub(in crate::ui) struct ComposerInput {
     /// projects.
     folder: Option<View>,
     attached: Vec<String>,
-    chips: Option<View>,
+    /// The chip lines: a conversation's one, or Home's one or two
+    /// (`composer_chips`).
+    chips: Vec<View>,
     usage: Option<View>,
     /// Add as a note is offered: the Agent's generation.
     note: Option<i64>,
@@ -776,16 +782,17 @@ pub(in crate::ui) struct ComposerInput {
     /// This composer's own command is being confirmed: its action carries
     /// the pending ring.
     pending: bool,
-    /// The main area is narrow: the parameters take their own line and the
-    /// action its own, at the right.
+    /// A conversation: the main area is narrow, the parameters take their
+    /// own line and the action its own, at the right. Home: its column is
+    /// below its full width and its chips wrap two to a line.
     stacked: bool,
     send: Callback<Message>,
 }
 
 /// The one composer, one rounded card, as its own component. A new task:
-/// the project chip as the card's first row, then the field and the model
-/// and access chips. An open Agent: the field, then the model-and-effort
-/// chip. Usage and the one trailing button (Send, Stop, Steer or Resume)
+/// the field, then + and the project, place, model and access chips with
+/// Start task at the end of their last line. An open Agent: the field, then
+/// the model-and-effort chip. Usage and the one trailing button (Send, Stop, Steer or Resume)
 /// sit at the right. A keystroke is stored here and redraws this card
 /// only; an edit that also concerns the window (Enter's line break, an
 /// unresolved submission) and every control go to the window.
@@ -874,31 +881,17 @@ impl Component for Composer {
                 0.0,
             ))
             .content(field);
-        // The design: + (attach files), then the chips, 6 DIPs apart; the
-        // chips' row trims its widest label to the room left.
-        let chips = Grid::new()
-            .columns([GridLength::Auto, GridLength::STAR])
-            .column_spacing(tokens::spacing::CHIP_GAP)
-            .keyed_children(crate::views::slots([
-                Some(
-                    controls::bar_button(false)
-                        .style(ButtonStyle::Subtle)
-                        .automation_name("Attach files")
-                        .on_click(context.message(Message::Launch(LaunchMsg::AttachRequested)))
-                        .content(controls::icon(controls::glyph::NEW_TASK))
-                        .tooltip("Attach files"),
-                ),
-                input
-                    .chips
-                    .clone()
-                    .map(|chips| Border::new().grid_column(1).content(chips).into()),
-            ]));
-        // Home's parameters always take their own line (§8.1): its four
-        // chips do not fit beside Start task; a narrow main area wraps
-        // them further (`composer_chips`). A conversation's one chip
-        // shares the bar until the main area is narrow.
+        // The design: + (attach files), then the chips, 6 DIPs apart; each
+        // line of chips trims its first label to the room left.
+        let attach: View = controls::bar_button(false)
+            .style(ButtonStyle::Subtle)
+            .vertical_alignment(VerticalAlignment::Center)
+            .automation_name("Attach files")
+            .on_click(context.message(Message::Launch(LaunchMsg::AttachRequested)))
+            .content(controls::icon(controls::glyph::NEW_TASK))
+            .tooltip("Attach files");
         let home = input.agent.is_none();
-        let stacked = input.stacked || home;
+        let stacked = input.stacked;
         // The hint before the ring and the action, while Enter steers: the
         // lowest-priority cell, it trims away first.
         let hint: Option<View> = match &input.primary {
@@ -921,10 +914,60 @@ impl Component for Composer {
             GridLength::Auto
         };
         let actions = composer_actions(input, blank, context);
-        // One line of parameters and the action (§8.1); stacked, the
-        // parameters keep their line and the action takes the next, at the
-        // right, so neither trims away.
-        let bottom: View = if stacked {
+        // A conversation's one line of chips beside +.
+        let chips = Grid::new()
+            .columns([GridLength::Auto, GridLength::STAR])
+            .column_spacing(tokens::spacing::CHIP_GAP)
+            .keyed_children(crate::views::slots([
+                Some(attach.clone()),
+                input
+                    .chips
+                    .first()
+                    .map(|chips| Border::new().grid_column(1).content(chips.clone()).into()),
+            ]));
+        // One line of parameters and the action (§8.1). Home: +, the chip
+        // lines (one, or two to a line below the full Home width) and Start
+        // task at the end of the last line, so no line holds the action
+        // alone. A conversation stacked: the parameters keep their line and
+        // the action takes the next, at the right, so neither trims away.
+        let bottom: View = if home {
+            let last = input.chips.len().saturating_sub(1);
+            let mut cells = vec![KeyedView::new("attach", attach)];
+            cells.extend(input.chips.iter().enumerate().map(|(index, line)| {
+                KeyedView::new(
+                    format!("chips:{index}"),
+                    Border::new()
+                        .grid_row(index as i32)
+                        .grid_column(1)
+                        // A line above the last also takes the action's
+                        // column.
+                        .grid_column_span(if index == last { 1 } else { 2 })
+                        .vertical_alignment(VerticalAlignment::Center)
+                        .content(line.clone()),
+                )
+            }));
+            cells.push(KeyedView::new(
+                "actions",
+                Border::new()
+                    .grid_row(last as i32)
+                    .grid_column(2)
+                    .margin(Thickness::new(
+                        tokens::spacing::SM - tokens::spacing::CHIP_GAP,
+                        0.0,
+                        0.0,
+                        0.0,
+                    ))
+                    .vertical_alignment(VerticalAlignment::Center)
+                    .content(actions),
+            ));
+            Grid::new()
+                .columns([GridLength::Auto, GridLength::STAR, GridLength::Auto])
+                .rows(vec![GridLength::Auto; last + 1])
+                .column_spacing(tokens::spacing::CHIP_GAP)
+                .row_spacing(tokens::spacing::CHIP_GAP)
+                .keyed_children(cells)
+                .into()
+        } else if stacked {
             StackPanel::new()
                 .spacing(tokens::spacing::SM)
                 .children((
@@ -971,7 +1014,11 @@ impl Component for Composer {
         }
         rows.push(KeyedView::new("field", field));
         rows.push(KeyedView::new(
-            if stacked { "bottom:stacked" } else { "bottom" },
+            match (home, stacked) {
+                (true, _) => "bottom:home",
+                (false, true) => "bottom:stacked",
+                (false, false) => "bottom",
+            },
             bottom,
         ));
         // Home's composer stretches across the home column; a
