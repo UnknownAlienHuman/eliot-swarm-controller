@@ -246,18 +246,13 @@ impl DesktopApp {
             Some(branch) => format!("{place} \u{b7} {branch}"),
             None => place,
         };
-        let goal_read = self
+        let goal = self
             .chat
             .goal
             .as_ref()
             .filter(|(read, _)| read == agent)
-            .map(|(_, goal)| goal.as_ref());
-        let goal = goal_read.flatten().and_then(goal_words).or_else(|| {
-            (goal_read.is_some_and(|goal| goal.is_none()))
-                .then(|| detail.and_then(|detail| detail.default_goal_objective.as_ref()))
-                .flatten()
-                .map(|_| "Goal · default".to_owned())
-        });
+            .and_then(|(_, goal)| goal.as_ref())
+            .and_then(goal_words);
         let changes = row
             .and_then(|row| row.work.as_deref())
             .and_then(|work| work.insertions.zip(work.deletions));
