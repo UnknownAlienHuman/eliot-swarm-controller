@@ -3966,6 +3966,7 @@ swarm result A [--generation N] [--before CURSOR_JSON | --turn-id TURN] [--limit
 swarm turn resolve A --generation N --turn-id TURN --status completed|failed|interrupted --reason TEXT
 swarm approve|deny A [--generation N] [--request R] [--choice ID] [--feedback TEXT] | answer A --answers-file PATH [--generation N] [--request R]
 swarm configure A [--model MODEL] [--effort EFFORT] [--generation N]
+swarm compact|fork|background ...
 swarm cmd show|children|cancel|resolve|settle-stopped ...
 swarm cmd resolve ID --status completed|failed|rejected --reason TEXT
 swarm cmd resolve-custody A --generation N --reason TEXT
@@ -4003,7 +4004,7 @@ swarm provider holds [--after SCOPE] [--limit N]
 swarm provider clear-hold SCOPE --corrective-evidence credentials_updated|configuration_updated|owner_verified [--expected-probe-command ID]
 swarm project assignment claim PROJECT [AGENT] [--generation N] [--revision REVISION] [--remote INSTANCE --grant-revision REV]
 swarm project assignment launch PROJECT --profile P [--adopt-worktree PATH] [--no-policy REASON] [--goal-json JSON_OBJECT]
-swarm mcp [--http --port N] [--public-url URL] [--require-agent]
+swarm plugin NAME | plugin-test ... | hook ... | mcp
 swarm harnesses | doctor | quota --harness H [--profile P] | identity
 swarm launch-queue [INTENT] [--project P] [--after A]
 swarm archive A | unarchive A | delete A
@@ -4014,8 +4015,7 @@ swarm switch FROM --generation N [--task-command CMD] [COMMANDS]... [--profile P
 swarm rule install-review --project PROJECT --author PROFILE --workspace PATH [--expected-revision SHA256] [--reviewer R]
 ```
 
-`swarm plugin` is a hidden internal daemon entry point (subcommands
-`codex|muse|claude|opencode|antigravity|antigravity-hook`), not for direct use.
+The CLI does not expose `compact`, `fork`, `background`, `plugin-test` or `hook` yet; the compact verb is reachable through `command.submit`.
 
 `cmd cancel` implements only undispatched handoff-input withdrawal. `cmd show`,
 `cmd children`, `cmd resolve`, and `turn resolve` are available; `turn show`
