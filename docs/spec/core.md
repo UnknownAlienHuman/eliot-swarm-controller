@@ -348,11 +348,13 @@ producer_state}` (`superseded` when the producer generation moved on). This is p
 end of observation, not a guess about native completion: the child's grant requires
 that live producer generation, so it can never publish again. A turn still `running`
 is retained `unknown`, never completed; completed turns and `activity` keep their
-facts, and source rows stay with the producer's retirement
-(`mark_native_children_unavailable`, which owns the reader-closure proof). Restart
-recovery applies the same rule to retained rows and never resets an ended child to
-`unknown`. An ended child opens no `children_unattended` incident. Detached external
-observers keep their `unknown` state.
+facts, and the producer's reader retirement closes the child sources. Startup
+under the exclusive daemon lock also closes retained child sources, including
+those of already-stopped children, because their private producer connections
+belonged to the previous daemon. It records the coverage gap and preserves
+unknown turn outcomes independently of native process exit. An ended child
+opens no `children_unattended` incident. Detached external observers keep their
+`unknown` state.
 For a reusable native child, one terminal turn settles its activity, while the
 harness can still send it more work. Only the end of the child session or its
 producer grant is a lifecycle terminal.
