@@ -18,9 +18,9 @@
 //! prepares only the owner's explicitly selected integration in that
 //! private store: the canonical list must show the selection exactly once
 //! with exactly one credential for this current path (anything else refuses
-//! without fallback). List and the selected export are independent reads;
-//! both finish before export pipes opaquely, in memory only, into
-//! import under the exact isolated roots the server will use. On explicit
+//! without fallback). List and the selected export share one temporary
+//! loopback server and both finish before import receives the opaque export
+//! under the exact isolated roots the Agent server will use. On explicit
 //! resume the isolated list is read first and a correctly present
 //! integration is reused without re-import; an unknown import outcome
 //! settles to success only after the original child is proven exited and an
@@ -49,7 +49,7 @@ use serde::Deserialize;
 )]
 use tokio::process::Command;
 use tokio::{
-    io::AsyncWriteExt,
+    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     time::{Instant, timeout_at},
 };
 
@@ -138,13 +138,6 @@ pub struct AuthTransfer<'a> {
     pub reuse_existing: bool,
 }
 
-/// `auth export <selector> --standalone`, in the installed help's order.
-/// The selector is positional and mandatory: omitting it would export every
-/// integration.
-fn export_argv(selector: &IntegrationSelector) -> [&str; 4] {
-    ["auth", "export", selector.as_str(), "--standalone"]
-}
-
 /// `auth import --standalone` with no file argument, so the child reads the
 /// piped export document from stdin.
 fn import_argv() -> [&'static str; 3] {
@@ -195,14 +188,109 @@ pub async fn transfer_selected_integration(
             }
         }
     }
-    // Both helpers only read the canonical store. Overlap their native
-    // standalone-server startup, but await BOTH even on failure: try_join!
-    // would cancel the other helper before its bounded reap completes.
-    // Import still cannot start until the exact metadata gate and export
-    // have succeeded. Never cache credentials or export without a selector.
+    let password = format!("eliot-{}-{}", ulid::Ulid::new(), ulid::Ulid::new());
+    let mut command = canonical_command(transfer);
+    command
+        .args(["serve", "--stdio", "--hostname", "127.0.0.1", "--port", "0"])
+        .env("OPENCODE_PASSWORD", &password)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null());
+    let mut server = command.spawn().map_err(|_| {
+        Error::new(
+            "native_spawn",
+            "OpenCode canonical auth server could not start",
+        )
+    })?;
+    let exported = match canonical_endpoint(&mut server, deadline).await {
+        Ok(url) => canonical_export(transfer, &url, &password, deadline).await,
+        Err(error) => Err(error),
+    };
+    // Both canonical readers have finished. Tokio's wait closes the stdin
+    // lease so OpenCode can shut down while the separate isolated import runs.
+    let retirement = async {
+        if matches!(timeout_at(deadline, server.wait()).await, Ok(Ok(status)) if status.success()) {
+            return Ok(());
+        }
+        let _ = kill_and_reap(&mut server).await;
+        Err(Error::new(
+            "native_readback",
+            "OpenCode canonical auth server exit could not be confirmed cleanly",
+        ))
+    };
+    match exported {
+        Ok(secret) => {
+            let (imported, retired) = tokio::join!(
+                import_with_reconcile(transfer, &secret, deadline),
+                retirement
+            );
+            imported?;
+            retired
+        }
+        Err(error) => {
+            let _ = retirement.await;
+            Err(error)
+        }
+    }
+}
+
+/// OpenCode 2.2.7+ uses a one-line JSON endpoint and an stdin EOF lease for
+/// its own standalone commands (packages/cli/src/services/standalone.ts).
+///
+/// Borrow stdout from the owned child so the pipe stays open after reading
+/// the bounded readiness line. The CLI readers authenticate separately
+/// before sending either credential request.
+async fn canonical_endpoint(
+    server: &mut tokio::process::Child,
+    deadline: Instant,
+) -> Result<String> {
+    let _timing = super::startup::Step::new("auth_canonical_ready");
+    #[derive(Deserialize)]
+    struct Ready {
+        url: String,
+    }
+    let unreadable = || {
+        Error::new(
+            "native_readback",
+            "OpenCode canonical auth server endpoint was unreadable",
+        )
+    };
+    let mut output = BufReader::new(server.stdout.as_mut().ok_or_else(unreadable)?.take(4096));
+    let mut line = Vec::new();
+    timeout_at(deadline, output.read_until(b'\n', &mut line))
+        .await
+        .map_err(|_| {
+            Error::new(
+                "native_readback",
+                "OpenCode canonical auth server was not ready before its deadline",
+            )
+        })?
+        .map_err(|_| unreadable())?;
+    let ready: Ready = serde_json::from_slice(&line).map_err(|_| unreadable())?;
+    let port = ready
+        .url
+        .strip_prefix("http://127.0.0.1:")
+        .unwrap_or_default();
+    if line.last() != Some(&b'\n')
+        || !port.bytes().all(|byte| byte.is_ascii_digit())
+        || port.parse::<u16>().ok().is_none_or(|port| port == 0)
+    {
+        return Err(unreadable());
+    }
+    Ok(ready.url)
+}
+
+async fn canonical_export(
+    transfer: &AuthTransfer<'_>,
+    url: &str,
+    password: &str,
+    deadline: Instant,
+) -> Result<SecretBytes> {
+    // Both readers use the same private server. Await both even on failure
+    // so a cancelled helper cannot outlive the canonical connection lease.
     let (selection, exported) = tokio::join!(
-        canonical_gate(transfer, deadline),
-        export_selected(transfer, deadline),
+        canonical_gate(transfer, url, password, deadline),
+        export_selected(transfer, url, password, deadline),
     );
     match selection? {
         Gate::ExactlyOne => {}
@@ -214,8 +302,7 @@ pub async fn transfer_selected_integration(
              .with_origin(eliot_core::FailureOrigin::Environment, "selected external credential is absent or ambiguous"));
         }
     }
-    let secret = exported?;
-    import_with_reconcile(transfer, &secret, deadline).await
+    exported
 }
 
 /// Owned secret bytes. No `Debug`/`Display` by design, and no parsing into
@@ -248,11 +335,17 @@ struct ListEntry {
 
 /// The canonical gate: the selection must name exactly one integration
 /// entry (by ID or name) holding exactly one connection.
-async fn canonical_gate(transfer: &AuthTransfer<'_>, deadline: Instant) -> Result<Gate> {
+async fn canonical_gate(
+    transfer: &AuthTransfer<'_>,
+    url: &str,
+    password: &str,
+    deadline: Instant,
+) -> Result<Gate> {
     let _timing = super::startup::Step::new("auth_canonical_list");
     let mut command = canonical_command(transfer);
     command
-        .args(list_argv())
+        .args(["auth", "list", "--format", "json", "--server", url])
+        .env("OPENCODE_PASSWORD", password)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null());
@@ -375,10 +468,23 @@ async fn run_list(command: Command, deadline: Instant) -> Result<Vec<ListEntry>>
 /// the native importer owns the document format. Stderr is discarded:
 /// native error text may echo secrets, so failures surface as static
 /// strings only.
-async fn export_selected(transfer: &AuthTransfer<'_>, deadline: Instant) -> Result<SecretBytes> {
+async fn export_selected(
+    transfer: &AuthTransfer<'_>,
+    url: &str,
+    password: &str,
+    deadline: Instant,
+) -> Result<SecretBytes> {
     let _timing = super::startup::Step::new("auth_export");
     let mut command = canonical_command(transfer);
-    command.args(export_argv(transfer.selector));
+    command
+        .args([
+            "auth",
+            "export",
+            transfer.selector.as_str(),
+            "--server",
+            url,
+        ])
+        .env("OPENCODE_PASSWORD", password);
     let buffer = run_bounded(
         command,
         MAX_AUTH_BYTES,

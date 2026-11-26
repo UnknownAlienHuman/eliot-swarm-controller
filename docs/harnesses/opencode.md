@@ -45,14 +45,17 @@ by exact equality against a native integration's id OR display name; the
 installed selector `openrouter` names ID `openrouter` (display name
 `OpenRouter`). The canonical `auth list` must show precisely one matched
 integration with `connections.len() == 1`; zero matches, several matches, or
-any other connection count refuses without fallback, and never all
-integrations are exported. Canonical list and the explicitly selected export
-run concurrently as independent reads under the same start deadline; both
-reader futures complete, including bounded cleanup attempts on failure,
-before the gate permits any isolated import. There is no cross-launch
-credential cache. The selected
-document moves opaquely, in memory only, from canonical `auth export
-<selector> --standalone` into isolated `auth import --standalone` under the
+any other connection count refuses without fallback. Export always names
+the selected integration. Canonical list and export run concurrently
+against one password-protected loopback `serve --stdio --port 0` in the
+generation Job. The [native standalone implementation](https://github.com/anomalyco/opencode/blob/v2.4.1/packages/cli/src/services/standalone.ts)
+uses this server mode and its JSON endpoint line for readiness. Swarm
+closes its stdin lease after both readers finish. The canonical server
+shuts down while the isolated import runs, and its exit is confirmed before
+the Agent server starts. There is no cross-launch credential cache.
+The selected document moves opaquely, in memory only, from canonical
+`auth export <selector> --server <loopback-url>` into isolated
+`auth import --standalone` under the
 exact per-Agent `XDG_CONFIG_HOME`/`XDG_DATA_HOME` roots the server receives
 (`native/auth.rs`, `native/server.rs`). The owner global auth store is never
 modified: no login, switch, global flag, hand-copied `auth.json`, or edit of
