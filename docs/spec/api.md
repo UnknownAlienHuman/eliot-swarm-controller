@@ -1639,8 +1639,9 @@ generation supports it and the note is still valid. The original id remains usab
 and settlement reports cancellation or `unknown` when applicable. `inject.wait` waits
 up to 30 seconds for delivery, a move, cancellation or uncertainty and returns the
 retained command. A timeout returns the current command. `command.get` also reports
-final settlement after a move. CLI `inject --wait` reports `unknown` if delivery
-is still open at its deadline.
+final settlement after a move. At its deadline, CLI `inject --wait` prints the
+last validated command snapshot and exits 0 for accepted or queued delivery,
+or 6 for dispatched delivery.
 
 The notes row of `autonomy.get` reports Swarm-generated fact notes by kind. It counts
 delivery, moves and cancellation in the requested window and reports later evidence
@@ -2193,7 +2194,8 @@ even if a returned command or turn is `unknown`; that state is not a successful 
 outcome. A binding mismatch is unknown and must not print the mismatched response.
 `swarm result --wait` waits on one exact retained turn. If `--turn-id` is omitted,
 the first read captures the newest retained turn and its generation. The wait
-returns the exact result with the turn outcome's exit code.
+returns the exact result with the turn outcome's exit code. A valid empty page
+returns immediately with exit 0.
 `swarm wait` prints its per-entry snapshot and exits 0 only when every waited entry
 succeeded (`--all`) or at least one succeeded (`--any`). An unsettled deadline
 reports `unknown` and exits 4, retaining the last validated snapshot when available.
@@ -3943,7 +3945,9 @@ SEND is cancelled as a result, a prompted wait reports the parent start
 failure rather than only the linked cancellation.
 
 Only current-layer commands appear in help and Agent guidance. Exit codes: 0 success/
-queued; 1 definite failure; 2 usage; 3 pre-effect rejection; 4 unknown; 5 wait timeout;
+queued; 1 definite failure; 2 usage; 3 pre-effect rejection; 4 unknown, including
+an unsettled command or turn at the wait deadline; 5 for a read-only condition
+that did not occur, a mailbox wake, or an operation-specific timeout;
 6 still dispatched/pending; 7 interrupted/cancelled. A queued/applied input is not
 successful task completion. Every mutation prints its generated command id as `id=...`
 on stderr so stdout stays pure response JSON; Windows PowerShell 5.1 turns that stderr

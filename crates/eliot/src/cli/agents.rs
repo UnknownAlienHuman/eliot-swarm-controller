@@ -658,8 +658,8 @@ pub(crate) async fn run_inject(
     if !wait {
         return submit_and_print(&data_dir, &params, json_output).await;
     }
-    let deadline = wait_deadline(DEFAULT_WAIT_SECONDS)?;
     let submitted = submit_command(&data_dir, &params).await?;
+    let deadline = wait_deadline(DEFAULT_WAIT_SECONDS)?;
     let command = WaitClient::Caller(&data_dir)
         .inject(submitted.command_id, deadline)
         .await?;

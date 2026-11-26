@@ -48,18 +48,12 @@ impl WaitClient<'_> {
             |wait_ms| {
                 let mut request = request.clone();
                 request.wait_ms = wait_ms;
-                async move {
-                    let reply = self
-                        .call("swarm.wait", &request)
-                        .await
-                        .map_err(Failure::readback)?;
-                    request
-                        .validate_response(&reply)
-                        .map_err(Failure::readback)?;
-                    Ok(reply)
-                }
+                async move { self.call("swarm.wait", &request).await }
             },
             |reply: &SwarmWaitResponse| {
+                request
+                    .validate_response(reply)
+                    .map_err(Failure::readback)?;
                 for (binding, entry) in bindings.iter_mut().zip(&reply.results) {
                     if let Some(observed) = turn_binding(entry) {
                         if binding.get_or_insert_with(|| observed.clone()) != &observed {
@@ -161,11 +155,7 @@ impl WaitClient<'_> {
                     id: id.clone(),
                     wait_ms,
                 };
-                async move {
-                    self.call("inject.wait", &request)
-                        .await
-                        .map_err(Failure::readback)
-                }
+                async move { self.call("inject.wait", &request).await }
             },
             |command: &Command| {
                 query
@@ -178,9 +168,7 @@ impl WaitClient<'_> {
             },
         )
         .await?;
-        reply
-            .filter(injection_reportable)
-            .ok_or_else(|| unsettled(&format!("command {}", query.id), "delivery unsettled"))
+        reply.ok_or_else(|| unsettled(&format!("command {}", query.id), "no validated snapshot"))
     }
 }
 
@@ -193,14 +181,15 @@ fn injection_reportable(command: &Command) -> bool {
             .is_some_and(|outcome| outcome["delivery"] == "moved" || outcome["moved"] == true)
 }
 
-async fn wait_slices<T, F: Future<Output = Result<T, Failure>>>(
+async fn wait_slices<T, F: Future<Output = eliot_core::Result<T>>>(
     deadline: Instant,
     mut poll: impl FnMut(u64) -> F,
     mut settled: impl FnMut(&T) -> Result<bool, Failure>,
 ) -> Result<Option<T>, Failure> {
     let mut last = None;
     loop {
-        let remaining = deadline.saturating_duration_since(Instant::now());
+        let started = Instant::now();
+        let remaining = deadline.saturating_duration_since(started);
         if remaining.is_zero() {
             break;
         }
@@ -208,17 +197,32 @@ async fn wait_slices<T, F: Future<Output = Result<T, Failure>>>(
         let Ok(reply) = timeout_at(deadline, poll(wait_ms)).await else {
             break;
         };
-        let reply = reply?;
+        let reply = match reply {
+            Ok(reply) => reply,
+            Err(error) if retryable_wait_read(&error) => {
+                pause(deadline).await;
+                continue;
+            }
+            Err(error) => return Err(Failure::readback(error)),
+        };
         if settled(&reply)? {
             return Ok(Some(reply));
         }
         last = Some(reply);
-        if wait_ms == 0 {
-            // Near the deadline, pace immediate snapshots instead of busy-spinning.
+        if wait_ms == 0 || started.elapsed() < Duration::from_millis(wait_ms) {
+            // Pace snapshots that came back before the requested wait elapsed.
             sleep_until((Instant::now() + Duration::from_millis(25)).min(deadline)).await;
         }
     }
     Ok(last)
+}
+
+fn retryable_wait_read(error: &eliot_core::Error) -> bool {
+    matches!(error.code.as_str(), "unavailable" | "busy")
+        || (error.code == "unknown"
+            && error
+                .message
+                .starts_with("daemon RPC exceeded its absolute deadline"))
 }
 
 fn slice_ms(remaining: Duration) -> u64 {

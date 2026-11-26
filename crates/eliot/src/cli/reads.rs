@@ -1169,10 +1169,7 @@ pub(crate) async fn run_result(
     params.validate().map_err(Failure::for_read)?;
     let deadline = wait.then(|| wait_deadline(timeout_seconds)).transpose()?;
     let mut response = read_result(&data_dir, &params, deadline).await?;
-    let exit = if let Some(deadline) = deadline {
-        let turn = response.turns.first().ok_or_else(|| {
-            Failure::new(4, "turn outcome is unknown; no retained turn to wait for")
-        })?;
+    let exit = if let (Some(deadline), Some(turn)) = (deadline, response.turns.first()) {
         let binding = WaitTurnRef::new(&turn.agent, turn.generation, &turn.turn_id);
         let selected_latest = params.turn_id.is_none();
         params.generation = Some(binding.generation);
