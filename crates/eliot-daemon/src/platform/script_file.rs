@@ -35,12 +35,6 @@ pub(crate) struct Directory {
     pub(crate) path: PathBuf,
 }
 
-/// Resolve a cleanup directory with no links in its existing ancestry.
-/// Missing suffixes are retained so absence cannot waive path custody.
-pub(crate) fn canonical_cleanup_path(path: &Path) -> Result<PathBuf> {
-    Ok(CleanupPath::open(path)?.path)
-}
-
 /// Canonical cleanup location and the handles used to establish its ancestry.
 pub(crate) struct CleanupPath {
     path: PathBuf,
@@ -122,20 +116,13 @@ impl CleanupPath {
     }
 }
 
-pub(crate) fn cleanup_canonical_path_in_root(path: &Path, root: &Path) -> Result<bool> {
-    let Some(root) = open_cleanup_root(root)? else {
-        return Ok(false);
-    };
-    Ok(path != root.path && path.starts_with(root.path))
-}
-
 fn open_cleanup_root(root: &Path) -> Result<Option<Directory>> {
     match std::fs::symlink_metadata(root) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(_) => return Err(refused()),
         Ok(_) => {}
     }
-    let mut directory = Directory::open(root).map_err(|_| unsafe_cleanup_root())?;
+    let directory = Directory::open(root).map_err(|_| unsafe_cleanup_root())?;
     let canonical = directory
         .canonical_path()
         .map_err(|_| unsafe_cleanup_root())?;
@@ -144,7 +131,6 @@ fn open_cleanup_root(root: &Path) -> Result<Option<Directory>> {
     {
         return Err(unsafe_cleanup_root());
     }
-    directory.path = canonical;
     Ok(Some(directory))
 }
 
@@ -176,32 +162,6 @@ impl Directory {
         self.chain.pop();
         self.path.pop();
         Ok((self, path))
-    }
-
-    #[cfg(windows)]
-    pub(crate) fn remove_empty(self) -> Result<()> {
-        let expected = eliot_plugin::file_identity(self.handle()).map_err(io)?;
-        let (parent, path) = self.into_parent()?;
-        let name = path.file_name().ok_or_else(refused)?;
-        let leaf = native::open_cleanup(parent.handle(), name, true).map_err(|error| {
-            if error.kind() == std::io::ErrorKind::NotFound {
-                Error::new(
-                    "identity_changed",
-                    "stand directory disappeared before removal",
-                )
-            } else {
-                cleanup_open_error(error)
-            }
-        })?;
-        check(&leaf, true)?;
-        if eliot_plugin::file_identity(&leaf).map_err(io)? != expected {
-            return Err(Error::new(
-                "identity_changed",
-                "stand directory changed before removal",
-            ));
-        }
-        native::delete_handle(&leaf)
-            .map_err(|error| Error::new("platform_io", format!("remove empty stand: {error}")))
     }
 
     pub(crate) fn direct_child_path(&self, child: &Path) -> std::io::Result<PathBuf> {
@@ -741,6 +701,16 @@ enum CleanupEntry {
 }
 
 #[cfg(windows)]
+struct StandTreeScan<'a> {
+    identity: String,
+    expected_marker: Option<eliot_plugin::FileIdentity>,
+    scratch_git: Option<&'a str>,
+    offline: Option<super::data_dir::DaemonLock>,
+    daemon_lock: Option<File>,
+    marker: Option<File>,
+}
+
+#[cfg(windows)]
 impl CleanupTree {
     pub(crate) fn open(
         parent: std::sync::Arc<Directory>,
@@ -748,17 +718,66 @@ impl CleanupTree {
         deadline: std::time::Instant,
         cargo_links: bool,
     ) -> Result<Self> {
-        if let Some(name) = path.file_name().and_then(|name| name.to_str()) {
+        Self::open_tree(parent, path, deadline, cargo_links, None)
+    }
+
+    pub(crate) fn open_stand(
+        directory: Directory,
+        expected_marker: Option<eliot_plugin::FileIdentity>,
+        scratch_git: Option<&str>,
+        offline: Option<super::data_dir::DaemonLock>,
+        deadline: std::time::Instant,
+    ) -> Result<Self> {
+        let identity = directory.identity()?;
+        let (parent, path) = directory.into_parent()?;
+        let mut stand = StandTreeScan {
+            identity,
+            expected_marker,
+            scratch_git,
+            offline,
+            daemon_lock: None,
+            marker: None,
+        };
+        Self::open_tree(
+            std::sync::Arc::new(parent),
+            &path,
+            deadline,
+            false,
+            Some(&mut stand),
+        )
+    }
+
+    fn open_tree(
+        parent: std::sync::Arc<Directory>,
+        path: &Path,
+        deadline: std::time::Instant,
+        cargo_links: bool,
+        mut stand: Option<&mut StandTreeScan<'_>>,
+    ) -> Result<Self> {
+        if stand.is_none()
+            && let Some(name) = path.file_name().and_then(|name| name.to_str())
+        {
             cleanup_name(name)?;
         }
         if path.parent() != Some(parent.path.as_path()) {
             return Err(refused());
         }
         let name = path.file_name().ok_or_else(refused)?;
-        let root = native::open_cleanup(parent.handle(), name, true).map_err(cleanup_open_error)?;
+        let root = native::open_cleanup(parent.handle(), name, true).map_err(|error| {
+            if stand.is_some() && error.kind() == std::io::ErrorKind::NotFound {
+                return stand_identity_changed();
+            }
+            cleanup_open_error(error)
+        })?;
         check(&root, true)?;
         let identity = serde_json::to_string(&eliot_plugin::file_identity(&root).map_err(io)?)
             .map_err(|_| refused())?;
+        if stand
+            .as_ref()
+            .is_some_and(|stand| stand.identity != identity)
+        {
+            return Err(stand_identity_changed());
+        }
         let mut tree = Self {
             _parent: parent,
             entries: Vec::new(),
@@ -770,9 +789,30 @@ impl CleanupTree {
         let mut links = cargo_links
             .then(|| hard_links::Scan::new(&root, path))
             .transpose()?;
-        tree.visit(&root, Path::new(""), 0, deadline, links.as_mut())?;
+        tree.visit(
+            &root,
+            Path::new(""),
+            0,
+            deadline,
+            links.as_mut(),
+            stand.as_deref_mut(),
+        )?;
         if let Some(links) = links {
             links.finish()?;
+        }
+        if let Some(stand) = stand {
+            if stand.scratch_git.is_some()
+                || stand.offline.is_some()
+                || (stand.expected_marker.is_some() && stand.marker.is_none())
+            {
+                return Err(stand_identity_changed());
+            }
+            // Keep startup fenced during disposition and leave the recovery
+            // marker until the rest of the contents have been removed.
+            tree.entries
+                .extend(stand.daemon_lock.take().map(CleanupEntry::Plain));
+            tree.entries
+                .extend(stand.marker.take().map(CleanupEntry::Plain));
         }
         tree.entries.push(CleanupEntry::Plain(root));
         Ok(tree)
@@ -785,16 +825,30 @@ impl CleanupTree {
         depth: usize,
         deadline: std::time::Instant,
         mut links: Option<&mut hard_links::Scan<'_>>,
+        mut stand: Option<&mut StandTreeScan<'_>>,
     ) -> Result<()> {
         if depth >= 64 {
             return Err(Error::new("unavailable", "cleanup depth bound"));
         }
         let children = native::children(directory, deadline).map_err(io)?;
-        if ["HEAD", "objects", "refs"].iter().all(|expected| {
+        let has = |expected: &str| {
             children
                 .iter()
                 .any(|(name, _)| name.eq_ignore_ascii_case(expected))
-        }) {
+        };
+        if stand.is_some()
+            && depth != 0
+            && (has(crate::stand_cleanup::STAND_MARKER)
+                || (has("owner.token") && has("daemon.lock")))
+        {
+            return Err(Error::new(
+                "nested_daemon_lock",
+                "stand contains another daemon data directory",
+            ));
+        }
+        // A registry-bound stand owns its private configuration and scratch Git
+        // data. Ordinary artifacts cannot remove repository or configuration entries.
+        if stand.is_none() && ["HEAD", "objects", "refs"].into_iter().all(has) {
             return Err(Error::new(
                 "protected_content",
                 "repository root is protected",
@@ -807,13 +861,15 @@ impl CleanupTree {
             }
             let text = name.to_str().ok_or_else(refused)?;
             plain(text)?;
-            cleanup_name(text)?;
+            if stand.is_none() {
+                cleanup_name(text)?;
+            }
             if text.eq_ignore_ascii_case("daemon.lock")
                 || text.eq_ignore_ascii_case(crate::stand_cleanup::STAND_MARKER)
             {
                 self.contains_daemon_lock = true;
             }
-            let child_relative = links.as_ref().map(|_| relative.join(&name));
+            let child_relative = (links.is_some() || stand.is_some()).then(|| relative.join(&name));
             if let Some((links, relative)) = links.as_deref_mut().zip(child_relative.as_deref())
                 && links.visited(relative)
             {
@@ -822,8 +878,52 @@ impl CleanupTree {
                 }
                 continue;
             }
+            let daemon_lock = depth == 0 && text.eq_ignore_ascii_case("daemon.lock");
+            let lock_identity = if daemon_lock {
+                // Transfer the offline lock to an exclusive, delete-capable
+                // handle. A startup winning the gap prevents the open before
+                // any disposition. The caller also holds the operator event.
+                stand
+                    .as_deref_mut()
+                    .and_then(|stand| stand.offline.take())
+                    .map(|lock| lock.file_identity())
+                    .transpose()?
+            } else {
+                None
+            };
             let child =
                 native::open_cleanup(directory, &name, is_dir).map_err(cleanup_open_error)?;
+            if let Some(stand) = stand.as_deref_mut() {
+                if child_relative.as_deref() == Some(Path::new("repo/.git"))
+                    && let Some(expected) = stand.scratch_git.take()
+                {
+                    let identity =
+                        serde_json::to_string(&eliot_plugin::file_identity(&child).map_err(io)?)
+                            .map_err(|_| refused())?;
+                    if !is_dir || identity != expected {
+                        return Err(stand_identity_changed());
+                    }
+                }
+                let marker =
+                    depth == 0 && text.eq_ignore_ascii_case(crate::stand_cleanup::STAND_MARKER);
+                if daemon_lock || marker {
+                    let len = cleanup_file_size(&child)?;
+                    require_single_cleanup_link(&child)?;
+                    let (slot, expected) = if daemon_lock {
+                        (&mut stand.daemon_lock, lock_identity)
+                    } else {
+                        (&mut stand.marker, stand.expected_marker)
+                    };
+                    if let Some(expected) = expected
+                        && eliot_plugin::file_identity(&child).map_err(io)? != expected
+                    {
+                        return Err(stand_identity_changed());
+                    }
+                    *slot = Some(child);
+                    self.bytes = self.bytes.checked_add(len).ok_or_else(refused)?;
+                    continue;
+                }
+            }
             if is_dir {
                 check(&child, true)?;
                 self.visit(
@@ -832,6 +932,7 @@ impl CleanupTree {
                     depth + 1,
                     deadline,
                     links.as_deref_mut(),
+                    stand.as_deref_mut(),
                 )?;
                 self.entries.push(CleanupEntry::Plain(child));
             } else {
@@ -904,6 +1005,14 @@ impl CleanupTree {
         }
         Ok(self.bytes)
     }
+}
+
+#[cfg(windows)]
+fn stand_identity_changed() -> Error {
+    Error::new(
+        "identity_changed",
+        "stand directory or ownership entry changed",
+    )
 }
 
 #[cfg(windows)]

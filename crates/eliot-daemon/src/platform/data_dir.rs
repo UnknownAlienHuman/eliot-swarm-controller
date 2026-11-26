@@ -191,6 +191,14 @@ pub struct DaemonLock {
 }
 
 #[cfg(windows)]
+impl DaemonLock {
+    pub(crate) fn file_identity(&self) -> Result<eliot_plugin::FileIdentity> {
+        eliot_plugin::file_identity(&self._file)
+            .map_err(|error| io_error("identify daemon lock", error))
+    }
+}
+
+#[cfg(windows)]
 pub type OperatorLock = std::os::windows::io::OwnedHandle;
 #[cfg(not(windows))]
 pub type OperatorLock = File;

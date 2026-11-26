@@ -6,7 +6,9 @@ use crate::operator::{
     DaemonLock, create_stand_root, daemon_alive, daemon_info, lock_offline, lock_transition,
     validate_stand_directory, write_stand_record,
 };
-use crate::platform::script_file::{CleanupPath, directory_identity};
+#[cfg(windows)]
+use crate::platform::script_file::CleanupTree;
+use crate::platform::script_file::{CleanupPath, Directory, directory_identity};
 use crate::platform::{OwnedChild, is_reparse_point, worktree_guard::WorktreeWriteGuard};
 use crate::workspace_git::{RemovalBranch, WorkspaceGit, containment::branch_rev_parse};
 use eliot_core::api::{CleanupGitBinding, MAX_ARTIFACT_TTL_MS};
@@ -1005,13 +1007,15 @@ pub fn stand_key_root(path: &Path) -> Result<PathBuf> {
 /// the held root. `stand up` holds one from creation through the owner bind.
 pub struct PinnedStandRoot {
     root: PathBuf,
-    dir: crate::platform::script_file::Directory,
+    dir: Directory,
     identity: String,
+    #[cfg(windows)]
+    marker_identity: Option<eliot_plugin::FileIdentity>,
 }
 
 impl PinnedStandRoot {
     pub fn open(root: &Path) -> Result<Self> {
-        let dir = crate::platform::script_file::Directory::open(root).map_err(|_| {
+        let dir = Directory::open(root).map_err(|_| {
             Error::new(
                 "not_allowed",
                 "stand root must be a plain directory chain without links or reparse points",
@@ -1022,6 +1026,8 @@ impl PinnedStandRoot {
             root: root.to_owned(),
             dir,
             identity,
+            #[cfg(windows)]
+            marker_identity: None,
         })
     }
 
@@ -1032,28 +1038,45 @@ impl PinnedStandRoot {
 
     /// Dispose of an exclusively created stand before it is ever started.
     pub fn discard_unstarted(self) -> std::io::Result<()> {
-        let parent = self.root.parent().ok_or(std::io::ErrorKind::InvalidInput)?;
-        let parent =
-            crate::platform::script_file::Directory::open(parent).map_err(std::io::Error::other)?;
-        let Self { root, dir, .. } = self;
-        drop(dir);
-        crate::router::remove_dir_all(&parent, &root)
+        #[cfg(windows)]
+        return self.remove_tree(None, None).map_err(std::io::Error::other);
+        #[cfg(not(windows))]
+        {
+            let parent = self.root.parent().ok_or(std::io::ErrorKind::InvalidInput)?;
+            let parent = Directory::open(parent).map_err(std::io::Error::other)?;
+            let Self { root, dir, .. } = self;
+            drop(dir);
+            crate::router::remove_dir_all(&parent, &root)
+        }
     }
 
-    /// Read `name` relative to the held root; `None` when it does not exist.
-    fn read(&self, name: &str) -> Result<Option<Vec<u8>>> {
+    #[cfg(windows)]
+    fn remove_tree(self, scratch_git: Option<&str>, offline: Option<DaemonLock>) -> Result<()> {
+        let deadline = std::time::Instant::now() + Duration::from_secs(120);
+        CleanupTree::open_stand(
+            self.dir,
+            self.marker_identity,
+            scratch_git,
+            offline,
+            deadline,
+        )?
+        .remove(|| false)
+        .map(|_| ())
+    }
+
+    /// Open `name` relative to the held root; `None` when it does not exist.
+    fn file(&self, name: &str) -> Result<Option<File>> {
         if fs::symlink_metadata(self.root.join(name))
             .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
         {
             return Ok(None);
         }
-        let mut file = self.dir.file(name).map_err(|_| {
+        self.dir.file(name).map(Some).map_err(|_| {
             Error::new(
                 "not_allowed",
                 "stand file must be a plain single-link file inside the held root",
             )
-        })?;
-        crate::platform::script_file::read(&mut file).map(Some)
+        })
     }
 }
 
@@ -1073,28 +1096,35 @@ fn pinned_stand_root(root: &Path, registration: &StandRegistration) -> Result<Pi
             "stand root is not the directory stand up created",
         ));
     }
-    let marker = pinned
-        .read(STAND_MARKER)?
-        .and_then(|bytes| serde_json::from_slice::<StandMarker>(&bytes).ok())
-        .filter(|marker| {
-            marker.format == registration.marker.format
-                && marker.root == registration.marker.root
-                && marker.token == registration.marker.token
-        });
-    if marker.is_none() {
-        return Err(Error::new(
+    let marker_changed = || {
+        Error::new(
             "identity_changed",
             "stand ownership marker does not match the external registration",
-        ));
+        )
+    };
+    let mut file = pinned.file(STAND_MARKER)?.ok_or_else(marker_changed)?;
+    let bytes = crate::platform::script_file::read(&mut file)?;
+    let marker = serde_json::from_slice::<StandMarker>(&bytes).map_err(|_| marker_changed())?;
+    if marker.format != registration.marker.format
+        || marker.root != registration.marker.root
+        || marker.token != registration.marker.token
+    {
+        return Err(marker_changed());
     }
+    #[cfg(windows)]
+    let pinned = PinnedStandRoot {
+        marker_identity: Some(eliot_plugin::file_identity(&file).map_err(|_| marker_changed())?),
+        ..pinned
+    };
     Ok(pinned)
 }
 
 impl PinnedStandRoot {
     /// The owner token read from the held root, if minted.
     fn owner_token(&self) -> Result<Option<String>> {
-        self.read("owner.token")?
-            .map(|bytes| {
+        self.file("owner.token")?
+            .map(|mut file| {
+                let bytes = crate::platform::script_file::read(&mut file)?;
                 String::from_utf8(bytes)
                     .map(|token| token.trim().to_owned())
                     .map_err(|_| Error::new("not_allowed", "stand owner token is not UTF-8"))
@@ -1354,10 +1384,24 @@ pub fn check_nested_roots(root: &Path) -> Result<()> {
 
 pub fn remove_offline_stand_root(root: &Path, offline: DaemonLock) -> Result<()> {
     let registration = locate_stand_registration(root)?.record;
-    remove_pinned_offline_stand_root(pinned_stand_root(root, &registration)?, offline)
+    remove_pinned_offline_stand_root(pinned_stand_root(root, &registration)?, offline, None)
 }
 
-fn remove_pinned_offline_stand_root(pinned: PinnedStandRoot, offline: DaemonLock) -> Result<()> {
+#[cfg(windows)]
+fn remove_pinned_offline_stand_root(
+    pinned: PinnedStandRoot,
+    offline: DaemonLock,
+    scratch_git: Option<&str>,
+) -> Result<()> {
+    pinned.remove_tree(scratch_git, Some(offline))
+}
+
+#[cfg(not(windows))]
+fn remove_pinned_offline_stand_root(
+    pinned: PinnedStandRoot,
+    offline: DaemonLock,
+    _scratch_git: Option<&str>,
+) -> Result<()> {
     let root = &pinned.root;
     let io_fail = |error| {
         Error::new(
@@ -1394,13 +1438,8 @@ fn remove_pinned_offline_stand_root(pinned: PinnedStandRoot, offline: DaemonLock
             Err(error) => return Err(io_fail(error)),
         }
     }
-    #[cfg(windows)]
-    return pinned.dir.remove_empty();
-    #[cfg(not(windows))]
-    {
-        drop(pinned.dir);
-        fs::remove_dir(root).map_err(io_fail)
-    }
+    drop(pinned.dir);
+    fs::remove_dir(root).map_err(io_fail)
 }
 
 /// Bounded offline tree walk for stand size calculation and link/nested-root
@@ -2445,13 +2484,14 @@ fn require_stand_cleanup_custody_closed(stand_root: &Path) -> Result<()> {
     Ok(())
 }
 
-async fn require_empty_stand_scratch(stand_root: &Path) -> Result<()> {
+async fn require_empty_stand_scratch(stand_root: &Path) -> Result<Option<Directory>> {
     if crate::operator::read_only_stand_exists(stand_root)? {
-        return Ok(());
+        return Ok(None);
     }
     let scratch = stand_root.join("repo");
     check_directory_chain(&scratch)?;
     reject_links(&scratch.join(".git"))?;
+    let git = Directory::open(&scratch.join(".git"))?;
     let probe = GitProbe::new()?;
     let deadline = Instant::now() + Duration::from_secs(5);
     for (args, expected) in [
@@ -2478,7 +2518,7 @@ async fn require_empty_stand_scratch(stand_root: &Path) -> Result<()> {
             ));
         }
     }
-    Ok(())
+    Ok(Some(git))
 }
 
 pub(crate) async fn plan_stand_artifact(
@@ -2533,12 +2573,7 @@ pub(crate) async fn apply_stand_artifact(
     let pid = verify_stand_stopped(stand_root, &registration)?.unwrap_or_default();
     let offline = lock_offline(stand_root)?;
     check_directory_chain(stand_root)?;
-    if directory_identity(stand_root)? != expected_identity {
-        return Err(Error::new(
-            "identity_changed",
-            "stand directory identity changed",
-        ));
-    }
+    owned_path.require_identity(expected_identity)?;
     registration = read_stand_registration(&registry, &reg_name, stand_root)?;
     verify_stand_marker(stand_root, &registration)?;
     crate::operator::verify_stand_target(stand_root, &registration)?;
@@ -2552,7 +2587,7 @@ pub(crate) async fn apply_stand_artifact(
         ));
     }
     require_stand_cleanup_custody_closed(stand_root)?;
-    require_empty_stand_scratch(stand_root).await?;
+    let scratch_git = require_empty_stand_scratch(stand_root).await?;
     let bytes = stand_tree_bytes(stand_root)?;
     Box::pin(plan_external_git(
         stand_root,
@@ -2576,8 +2611,20 @@ pub(crate) async fn apply_stand_artifact(
     registration.removing_pid = Some(pid);
     write_stand_registration(&registry, &reg_name, &registration)?;
     let pinned = pinned_stand_root(stand_root, &registration)?;
+    if pinned.identity() != expected_identity {
+        return Err(Error::new(
+            "identity_changed",
+            "stand directory identity changed",
+        ));
+    }
+    let scratch_identity = scratch_git.as_ref().map(Directory::identity).transpose()?;
+    drop(scratch_git);
     drop(owned_path);
-    remove_pinned_offline_stand_root(pinned, offline)?;
+    tokio::task::spawn_blocking(move || {
+        remove_pinned_offline_stand_root(pinned, offline, scratch_identity.as_deref())
+    })
+    .await
+    .map_err(|_| Error::new("unknown", "stand deletion worker did not settle"))??;
     remove_stand_registration(&registry, &reg_name)?;
     Ok(bytes)
 }
