@@ -1038,21 +1038,14 @@ const MAX_RETENTION_INTERVAL_SECONDS: i64 = 24 * 60 * 60;
 /// Physical retention policy and SQLite space maintenance. Only explicitly
 /// configured windows delete history.
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
+#[serde(default, deny_unknown_fields)]
 pub(crate) struct RetentionConfig {
-    #[serde(default)]
     pub(crate) events_days: Option<i64>,
-    #[serde(default)]
     pub(crate) events_seconds: Option<i64>,
-    #[serde(default)]
     pub(crate) processes_seconds: Option<i64>,
-    #[serde(default)]
     pub(crate) interval_seconds: Option<i64>,
-    #[serde(default)]
     pub(crate) compact_on_start: bool,
-    #[serde(default)]
     pub(crate) commands_days: Option<i64>,
-    #[serde(default)]
     pub(crate) mail_days: Option<i64>,
 }
 
@@ -1130,19 +1123,17 @@ impl RetentionConfig {
 /// docs/spec/configuration.md: mail. Unlike retention windows, these always
 /// apply: an unset value keeps its coordination-contract default.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
+#[serde(default, deny_unknown_fields)]
 pub(crate) struct MailConfig {
-    #[serde(default = "default_max_unread_bytes_per_agent")]
     pub(crate) max_unread_bytes_per_agent: i64,
-    #[serde(default = "default_max_unread_messages_per_agent")]
     pub(crate) max_unread_messages_per_agent: i64,
 }
 
 impl Default for MailConfig {
     fn default() -> Self {
         Self {
-            max_unread_bytes_per_agent: default_max_unread_bytes_per_agent(),
-            max_unread_messages_per_agent: default_max_unread_messages_per_agent(),
+            max_unread_bytes_per_agent: core::api::DEFAULT_MAX_UNREAD_BYTES_PER_AGENT,
+            max_unread_messages_per_agent: core::api::DEFAULT_MAX_UNREAD_MESSAGES_PER_AGENT,
         }
     }
 }
@@ -1172,20 +1163,10 @@ impl MailConfig {
     }
 }
 
-fn default_max_unread_bytes_per_agent() -> i64 {
-    core::api::DEFAULT_MAX_UNREAD_BYTES_PER_AGENT
-}
-
-fn default_max_unread_messages_per_agent() -> i64 {
-    core::api::DEFAULT_MAX_UNREAD_MESSAGES_PER_AGENT
-}
-
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
+#[serde(default, deny_unknown_fields)]
 pub(crate) struct TimedAttentionConfig {
-    #[serde(default = "default_attention_enabled")]
     pub(crate) enabled: bool,
-    #[serde(default)]
     pub(crate) threshold_secs: Option<i64>,
 }
 
@@ -1199,14 +1180,11 @@ impl Default for TimedAttentionConfig {
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
+#[serde(default, deny_unknown_fields)]
 pub(crate) struct NoProgressAttentionConfig {
-    #[serde(default = "default_attention_enabled")]
     pub(crate) enabled: bool,
-    #[serde(default)]
     pub(crate) threshold_secs: Option<i64>,
     /// Automatic interruption after a no-progress notice is opt-in.
-    #[serde(default)]
     pub(crate) interrupt: bool,
 }
 
@@ -1221,9 +1199,8 @@ impl Default for NoProgressAttentionConfig {
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
+#[serde(default, deny_unknown_fields)]
 pub(crate) struct SwitchAttentionConfig {
-    #[serde(default = "default_attention_enabled")]
     pub(crate) enabled: bool,
 }
 
@@ -1234,12 +1211,10 @@ impl Default for SwitchAttentionConfig {
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
+#[serde(default, deny_unknown_fields)]
 pub(crate) struct SessionGrowthAttentionConfig {
-    #[serde(default = "default_attention_enabled")]
     pub(crate) enabled: bool,
     /// Automatic switching after session-growth attention is opt-in.
-    #[serde(default)]
     pub(crate) switch: bool,
 }
 
@@ -1252,28 +1227,16 @@ impl Default for SessionGrowthAttentionConfig {
     }
 }
 
-fn default_attention_enabled() -> bool {
-    true
-}
-
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
+#[serde(default, deny_unknown_fields)]
 pub(crate) struct AttentionConfig {
-    #[serde(default)]
     pub(crate) no_progress: NoProgressAttentionConfig,
-    #[serde(default)]
     pub(crate) no_code_progress: TimedAttentionConfig,
-    #[serde(default)]
     pub(crate) children_unattended: TimedAttentionConfig,
-    #[serde(default)]
     pub(crate) source_unhealthy: SwitchAttentionConfig,
-    #[serde(default)]
     pub(crate) agent_lost: SwitchAttentionConfig,
-    #[serde(default)]
     pub(crate) provider_refusal: SwitchAttentionConfig,
-    #[serde(default)]
     pub(crate) session_growth: SessionGrowthAttentionConfig,
-    #[serde(default)]
     pub(crate) repeated_command_failure: SwitchAttentionConfig,
 }
 
@@ -1304,64 +1267,47 @@ impl AttentionConfig {
     }
 }
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
+#[serde(default, deny_unknown_fields)]
 pub(crate) struct DaemonConfig {
     /// Whether to reopen eligible idle retained sessions after restart.
-    #[serde(default)]
     pub(crate) on_restart: OnRestart,
-    #[serde(default)]
     pub(crate) chats_root: Option<String>,
-    #[serde(default)]
     pub(crate) artifact_roots: Vec<String>,
-    #[serde(default)]
     pub(crate) retention: RetentionConfig,
-    #[serde(default)]
     pub(crate) agent_retirement: eliot_store::AgentRetirementPolicy,
     /// Daemon log verbosity: `standard` (working mode) or `debug`
     /// (everything mode). Hot-reloadable through `settings.save`; changing
     /// only this key never requires a restart. See
     /// docs/spec/configuration.md: daemon logging.
-    #[serde(default = "default_log_level")]
     pub(crate) log_level: String,
     /// Hierarchy fanout bounds consumed by launch/selector admission. See
     /// docs/spec/configuration.md: daemon limits. Deserialized directly as
     /// the core type: unlike retention windows these always apply, so an
     /// unset value keeps its coordination-contract default.
-    #[serde(default)]
     pub(crate) limits: core::api::HierarchyLimits,
     /// Legacy fallback for per-kind attention thresholds. Retained for older
     /// config files; new settings belong under daemon.attention.<kind>.
     /// The value remains advisory and never infers agent death.
-    #[serde(default = "default_attention_suspicion_secs")]
     pub(crate) attention_suspicion_secs: i64,
-    #[serde(default)]
     pub(crate) attention: AttentionConfig,
     /// Heavy-episode thresholds for one `activity.heavy` event: a child
     /// process tree whose wall time, consumed CPU or peak RSS crosses any one
     /// threshold. See docs/spec/monitoring.md; defaults tune from real data.
-    #[serde(default = "default_heavy_wall_secs")]
     pub(crate) heavy_wall_secs: i64,
-    #[serde(default = "default_heavy_cpu_secs")]
     pub(crate) heavy_cpu_secs: i64,
-    #[serde(default = "default_heavy_rss_bytes")]
     pub(crate) heavy_rss_bytes: i64,
     /// Context occupancy that warns, in thousandths (800 is 0.8). Integer
     /// for TOML simplicity; validated to the (0, 1000] range.
-    #[serde(default = "default_session_growth_ratio_permille")]
     pub(crate) session_growth_ratio_permille: i64,
     /// Native session file size that warns, in bytes, where the harness
     /// exposes a documented size source.
-    #[serde(default = "default_session_file_bytes")]
     pub(crate) session_file_bytes: i64,
     /// Maximum seconds Swarm waits after turn end for an Agent-started
     /// background process to exit before delivering a still-running Swarm note.
-    #[serde(default = "default_background_wake_max_wait_secs")]
     pub(crate) background_wake_max_wait_secs: i64,
     /// A changed file above this size stays out of worktree checkpoints.
-    #[serde(default = "default_checkpoint_max_file_bytes")]
     pub(crate) checkpoint_max_file_bytes: i64,
     /// Most changed-file bytes one worktree checkpoint reads and stores.
-    #[serde(default = "default_checkpoint_max_total_bytes")]
     pub(crate) checkpoint_max_total_bytes: i64,
 }
 
@@ -1383,10 +1329,6 @@ pub(crate) enum OnRestart {
     Continue,
 }
 
-fn default_log_level() -> String {
-    "standard".to_owned()
-}
-
 impl Default for DaemonConfig {
     fn default() -> Self {
         Self {
@@ -1395,28 +1337,20 @@ impl Default for DaemonConfig {
             artifact_roots: Vec::new(),
             retention: RetentionConfig::default(),
             agent_retirement: eliot_store::AgentRetirementPolicy::default(),
-            log_level: default_log_level(),
+            log_level: "standard".to_owned(),
             limits: core::api::HierarchyLimits::default(),
             attention_suspicion_secs: default_attention_suspicion_secs(),
             attention: AttentionConfig::default(),
-            heavy_wall_secs: default_heavy_wall_secs(),
-            heavy_cpu_secs: default_heavy_cpu_secs(),
-            heavy_rss_bytes: default_heavy_rss_bytes(),
-            session_growth_ratio_permille: default_session_growth_ratio_permille(),
-            session_file_bytes: default_session_file_bytes(),
-            background_wake_max_wait_secs: default_background_wake_max_wait_secs(),
-            checkpoint_max_file_bytes: default_checkpoint_max_file_bytes(),
-            checkpoint_max_total_bytes: default_checkpoint_max_total_bytes(),
+            heavy_wall_secs: core::DEFAULT_HEAVY_WALL_SECS as i64,
+            heavy_cpu_secs: core::DEFAULT_HEAVY_CPU_SECS as i64,
+            heavy_rss_bytes: core::DEFAULT_HEAVY_RSS_BYTES as i64,
+            session_growth_ratio_permille: (core::DEFAULT_SESSION_GROWTH_RATIO * 1000.0) as i64,
+            session_file_bytes: core::DEFAULT_SESSION_FILE_BYTES as i64,
+            background_wake_max_wait_secs: core::DEFAULT_BACKGROUND_WAKE_MAX_WAIT_SECS,
+            checkpoint_max_file_bytes: 16 * 1024 * 1024,
+            checkpoint_max_total_bytes: 64 * 1024 * 1024,
         }
     }
-}
-
-fn default_checkpoint_max_file_bytes() -> i64 {
-    16 * 1024 * 1024
-}
-
-fn default_checkpoint_max_total_bytes() -> i64 {
-    64 * 1024 * 1024
 }
 
 /// Upper bound for one checkpoint, whose changed files are held in memory.
@@ -1425,30 +1359,6 @@ const CHECKPOINT_GENERATION_FACTOR: u64 = 8;
 
 fn default_attention_suspicion_secs() -> i64 {
     15 * 60
-}
-
-fn default_heavy_wall_secs() -> i64 {
-    core::DEFAULT_HEAVY_WALL_SECS as i64
-}
-
-fn default_heavy_cpu_secs() -> i64 {
-    core::DEFAULT_HEAVY_CPU_SECS as i64
-}
-
-fn default_heavy_rss_bytes() -> i64 {
-    core::DEFAULT_HEAVY_RSS_BYTES as i64
-}
-
-fn default_session_growth_ratio_permille() -> i64 {
-    (core::DEFAULT_SESSION_GROWTH_RATIO * 1000.0) as i64
-}
-
-fn default_session_file_bytes() -> i64 {
-    core::DEFAULT_SESSION_FILE_BYTES as i64
-}
-
-fn default_background_wake_max_wait_secs() -> i64 {
-    core::DEFAULT_BACKGROUND_WAKE_MAX_WAIT_SECS
 }
 
 fn validate_absolute_setting_path(path: &str) -> std::result::Result<(), &'static str> {
