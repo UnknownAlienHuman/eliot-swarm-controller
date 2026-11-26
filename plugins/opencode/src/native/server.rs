@@ -360,8 +360,8 @@ impl OwnedServer {
     /// an uncertain auth-import outcome (code `unknown`): the isolated
     /// credential store may already have been written and reconciliation
     /// failed, so that error propagates for the caller to settle unknown per
-    /// the authentication contract. Any failure leaves no running child
-    /// behind. The child gets the host-built target environment, generated
+    /// the authentication contract. Unconfirmed exit also stays unknown.
+    /// The child gets the host-built target environment, generated
     /// password and XDG roots. Local providers use isolated config discovery.
     pub async fn spawn(
         launch: ServerLaunch,
@@ -706,14 +706,11 @@ impl OwnedServer {
         // daemon agent.start budget.
         let ready_deadline = (Instant::now() + NATIVE_READINESS_BUDGET).min(envelope);
         if let Err(error) = server.await_launch_ready(listening, ready_deadline).await {
-            // Bounded best-effort cleanup: the generation Job reaps anything
-            // left once the daemon retires the plugin on the failed value,
-            // so a wedged child cannot stack another minute here. The
-            // readiness cause is returned, never masked by a cleanup outcome.
-            let _ = server
-                .terminate(true, Instant::now() + Duration::from_secs(10))
-                .await;
-            return Err(error);
+            let stop_by = (Instant::now() + Duration::from_secs(10)).min(envelope);
+            return Err(match server.terminate(true, stop_by).await {
+                Ok(()) => error,
+                Err(cleanup) => unconfirmed_server_exit(error, cleanup),
+            });
         }
         drop(ready_timing);
         Ok(server)
@@ -1032,6 +1029,14 @@ impl OwnedServer {
             let _ = stderr.finish(deadline).await;
         }
     }
+}
+
+pub(crate) fn unconfirmed_server_exit(error: Error, cleanup: Error) -> Error {
+    let message = format!(
+        "{}; owned OpenCode server exit is unconfirmed ({})",
+        error.message, cleanup.message
+    );
+    error.with_code("unknown").with_message(message)
 }
 
 /// The per-Agent session store: `opencode-{agent_id}/data` next to the

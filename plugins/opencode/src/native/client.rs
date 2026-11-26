@@ -247,6 +247,9 @@ impl OpenCodeHttp {
             *native_ref = Some(envelope.data.id.clone());
             return Ok(envelope.data);
         }
+        // OpenCode v2.4.1 performs schema decoding and authorization before
+        // the handler. Session.create checks the parent before publishing
+        // SessionEvent.Created and treats failed post-create readback as a defect.
         Err(map_write_error("session/create", &response))
     }
 

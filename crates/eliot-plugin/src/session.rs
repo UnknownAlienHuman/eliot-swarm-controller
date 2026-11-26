@@ -978,7 +978,12 @@ pub async fn register_native_process(
                 "{harness} {process_noun} process registration failed ({})",
                 error.code
             );
-            contextual_error(error, "process_registration", message)
+            let code = if error.code == "timeout" {
+                "unknown"
+            } else {
+                "process_registration"
+            };
+            contextual_error(error, code, message)
         })?;
     let record: ProcessRecord = serde_json::from_value(value).map_err(|_| {
         Error::new(

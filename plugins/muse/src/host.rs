@@ -447,11 +447,13 @@ impl MusePlugin {
         self.failed_start = Some(FailedStart);
         let (point, error) = if is_proven_no_effect(point) {
             discard_unstarted(&mut session).await;
-            if session.phase == SessionPhase::Stopped {
-                (point, error)
-            } else {
+            if session.phase != SessionPhase::Stopped {
                 let message = format!("{}; owned host exit is unconfirmed", error.message);
                 (StartPoint::TransportLost, error.with_message(message))
+            } else if error.code == "unknown" {
+                (StartPoint::TransportLost, error)
+            } else {
+                (point, error)
             }
         } else {
             (point, error)
