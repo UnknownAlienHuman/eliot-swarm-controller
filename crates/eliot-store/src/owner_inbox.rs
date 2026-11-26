@@ -980,6 +980,9 @@ fn project_unknown_turns(
             None,
             choices,
         );
+        projected.instructions = Some(format!(
+            "Determine the exact terminal outcome from the retained native session and history for this turn. Then run `swarm turn resolve a{agent} --generation {generation} --turn-id {turn} --status <completed|failed|interrupted> --reason \"<verified evidence>\"`. Never resolve a turn that is still running."
+        ));
         let queued = queued_sends_blocked_by(db, agent, generation, &turn)?;
         if !queued.is_empty() {
             projected.blocks_work = true;
@@ -1055,6 +1058,50 @@ fn project_switch_fences(
     Ok(())
 }
 
+/// A settled uncertain handoff needs no Owner decision once the recorded
+/// successor ended cleanly: it ran at least one turn, every turn completed,
+/// no command still needs an outcome, and no Goal is active or blocked.
+/// This retires only the notice; linked unknown commands and turns keep
+/// their own items, and uncertain effects are never settled here.
+fn successor_resolved(db: &Connection, successor: &str) -> eliot_core::Result<bool> {
+    let Some(id) = successor
+        .strip_prefix('a')
+        .and_then(|id| id.parse::<i64>().ok())
+    else {
+        return Ok(false);
+    };
+    let (total, completed): (i64, i64) = db
+        .query_row(
+            "SELECT COUNT(*), COALESCE(SUM(state = 'completed'), 0) FROM turns WHERE agent = ?1",
+            [id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(sql_error)?;
+    if total == 0 || completed != total {
+        return Ok(false);
+    }
+    let pending: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM commands WHERE target = ?1
+             AND state IN ('accepted','queued','dispatched','unknown')",
+            [id],
+            |row| row.get(0),
+        )
+        .map_err(sql_error)?;
+    if pending != 0 {
+        return Ok(false);
+    }
+    let open: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM goals WHERE agent = ?1
+             AND json_extract(state, '$.status') IN ('active','blocked')",
+            [id],
+            |row| row.get(0),
+        )
+        .map_err(sql_error)?;
+    Ok(open == 0)
+}
+
 fn project_handoffs(
     db: &Connection,
     now: i64,
@@ -1095,6 +1142,9 @@ fn project_handoffs(
         .map_err(sql_error)?;
     for row in rows {
         let (seq, since, switch, successor) = row.map_err(sql_error)?;
+        if successor_resolved(db, &successor)? {
+            continue;
+        }
         let mut notice = item(
             OwnerInboxKind::Handoff,
             switch,
@@ -1548,7 +1598,7 @@ fn project_holds(
                 .map(|mismatch| mismatch.reason());
             let mut projected = item(
                 OwnerInboxKind::Hold,
-                scope,
+                scope.clone(),
                 format!("held:{since}:updated:{updated}:event:{seq}"),
                 now,
                 since,
@@ -1557,6 +1607,11 @@ fn project_holds(
                 choices,
             );
             projected.outcome_unknown = unknown;
+            if state == eliot_core::ProviderHoldState::Held && probe_command.is_none() {
+                projected.instructions = Some(format!(
+                    "Verify the provider restriction for this scope is resolved (rotated credentials, fixed configuration, or restored quota). Then run `swarm provider clear-hold {scope} --corrective-evidence <credentials_updated|configuration_updated|owner_verified>`. Clearing without verified corrective evidence re-holds on the next probe."
+                ));
+            }
             items.push(projected);
         } else if let Mover::Stuck { reason } = result {
             let inspect = action("inspect", "provider.holds", json!({}));
