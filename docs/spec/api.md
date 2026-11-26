@@ -1339,11 +1339,12 @@ Agent remains readable by ID and in history.
 its `unknown` turn retained as ended-observation evidence, using retention's leaf-first
 command cleanup. A failed launch can be removed after its sources and custody drain; an
 already-terminal `stop` does not need to rewrite its failure state. Delete removes
-applied targetless selector, rule, timer, switch and handoff ancestors with their
-full member command set in the same transaction. Each member must pass the ordinary
-deletion checks. A set with commands outside the requested Agent tree returns
-`busy`. The Owner can select a common Agent ancestor that covers the full set, or
-archive the affected Agent trees separately when the set spans independent roots.
+settled targetless selector, rule, timer, switch and handoff ancestors when their
+full member command set retires. A settled targetless ancestor shared with another
+tree keeps its receipt and surviving members at their original ordinals. Its
+`command.children` readback reports `history_gap` if any direct members were deleted.
+Delete refuses a crossing that would remove a parent still needed by a retained
+child, or cut a link still needed by a targeted or unsettled parent or a held switch.
 A `busy` refusal names
 the blocking Agent and its actual state, pending requests, command, turn (including
 generation and retained state) or undrained process, source or artifact, rather than
@@ -1353,8 +1354,9 @@ tree instead. Delete removes the tree's turns and events without resolving them:
 resolution is recorded and no `turn.resolved` event is emitted. Live custody, open
 commands, uncertain turns, active or uncertain cleanup attempts, or a pinned history
 floor return `busy`; oversized operations return `unavailable` before cleanup.
-For a live rule cursor, retry with a fresh mutation ID after the rule has consumed
-the retained events. If the rule is obsolete, the Owner can remove it with
+After cleanup, Delete gives rules a bounded interval to consume the new events
+before rechecking the cursor guard. A refusal names the blocking rule. Retry with
+a fresh mutation ID after it catches up. If the rule is obsolete, the Owner can remove it with
 `swarm rule delete` using its current revision or remove the assignment that
 generates it in Settings.
 Before removing the records, Delete uses the [cleanup ledger](coordination.md#registered-artifacts-and-cleanup-k69)
@@ -1988,7 +1990,8 @@ lifecycle stays with their manager/native harness. Parent applied means expansio
 `command.children` pages that fixed set; a child created after admission is never
 part of it. Retention removes selector parents and expired members atomically,
 detaching any [pinned first messages](core.md#retention). Explicit Agent deletion
-removes the selector parent and its member commands atomically. Ordered rule actions reuse the
+retires the selected members and marks any surviving shared parent expansion as a
+history gap. Ordered rule actions reuse the
 same representation with a distinct link kind, not selector execution semantics.
 
 `command.children` is implemented for retained expansions through Core

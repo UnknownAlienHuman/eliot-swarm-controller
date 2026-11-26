@@ -33,39 +33,77 @@ pub(super) fn recover_ended_git_sources_tx(
             if capacity::has_exact_restart_custody_tx(tx, agent, generation)?
                 || capacity::owned_exit_proof_tx(tx, agent, generation)?.is_complete()
             {
-                events.extend(close_ended_git_source_tx(tx, agent, generation, now)?);
+                close_ended_git_source_tx(tx, agent, generation, now, events)?;
             }
         }
     }
 }
 
-/// Call only with exact exit evidence for an ended generation. Preserve the
-/// committed coverage and any gap. A retained hint still needs the ordinary
-/// readback or an explicit unavailable interval before it can be acknowledged.
+/// Call during restart recovery, once exact exit evidence proves the
+/// generation ended. Its generation-bound final Git read cannot be recovered.
 pub(super) fn close_ended_git_source_tx(
     tx: &Transaction<'_>,
     agent: i64,
     generation: i64,
     now: i64,
-) -> Result<Option<Event>> {
+    events: &mut Vec<Event>,
+) -> Result<()> {
     let Some(source) = load_source_state(tx, agent, generation, GIT_SOURCE)? else {
-        return Ok(None);
+        return Ok(());
     };
     if source.state != "open" {
-        return Ok(None);
+        return Ok(());
     }
     let source = match require_git_source(tx, agent, generation) {
         Ok(source) => source,
-        Err(error) if error.code == "source_integrity" => return Ok(None),
+        Err(error) if error.code == "source_integrity" => return Ok(()),
         Err(error) => return Err(error),
     };
     let Ok(cursor) = git_source_cursor(&source) else {
-        return Ok(None);
+        return Ok(());
     };
-    if pending_git_hints(tx, agent, generation, cursor)? {
-        return Ok(None);
+    if let Some(last_hint) = last_pending_git_hint(tx, agent, generation, cursor)? {
+        let from = cursor.to_string();
+        let to = last_hint.to_string();
+        let gap_id = format!("git-restart-final:a{agent}:{generation}:{to}");
+        let data = json!({
+            "gap_id": gap_id, "agent_id": format!("a{agent}"), "generation": generation,
+            "source": GIT_SOURCE, "families": ["git", "file"],
+            "reason": "restart_final_git_observation_unavailable", "from": from, "to": to,
+        });
+        let digest = canonical::digest(&data)?;
+        let event = insert_daemon_event(
+            tx,
+            now,
+            "source.gap",
+            "source",
+            Some(agent),
+            Some(generation),
+            data,
+        )?;
+        // The final gap is retained in the event log. Only seed the source
+        // projection when there is no earlier gap acknowledgement to keep.
+        db!(tx.execute(
+            "UPDATE source_state SET gap_id=?1,gap_digest=?2,gap_from=?3,gap_to=?4,gap_seq=?5
+             WHERE agent=?6 AND generation=?7 AND source='git'
+               AND gap_id IS NULL AND gap_digest IS NULL AND gap_from IS NULL
+               AND gap_to IS NULL AND gap_seq IS NULL",
+            params![
+                gap_id,
+                digest.as_slice(),
+                from,
+                to,
+                event.seq,
+                agent,
+                generation
+            ],
+        ));
+        events.push(event);
     }
-    write_git_source_status_tx(tx, agent, generation, &source, "stale", true, now)
+    events.extend(write_git_source_status_tx(
+        tx, agent, generation, &source, "stale", true, now,
+    )?);
+    Ok(())
 }
 
 pub(super) fn write_git_source_status_tx(

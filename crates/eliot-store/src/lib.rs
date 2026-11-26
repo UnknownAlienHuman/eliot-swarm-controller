@@ -325,6 +325,7 @@ pub use native_children::{
     NATIVE_CHILD_ATTENTION_PAGE_SIZE, NativeChildrenAttention, NativeChildrenAttentionPage,
 };
 mod agent_lifecycle;
+pub use agent_lifecycle::AGENT_DELETE_RULE_CURSOR;
 mod agent_retirement;
 pub use agent_retirement::AgentRetirementPolicy;
 mod auth_login;
@@ -4136,11 +4137,19 @@ fn pending_git_hints(
     generation: i64,
     cursor: u64,
 ) -> Result<bool> {
+    Ok(last_pending_git_hint(connection, agent, generation, cursor)?.is_some())
+}
+
+fn last_pending_git_hint(
+    connection: &Connection,
+    agent: i64,
+    generation: i64,
+    cursor: u64,
+) -> Result<Option<i64>> {
     // Persisted native hints remain authoritative after their family changes owner.
     connection
         .query_row(
-            "SELECT EXISTS(
-            SELECT 1 FROM events e
+            "SELECT MAX(e.seq) FROM events e
             WHERE e.agent = ?1 AND e.generation = ?2 AND e.seq > ?3 AND e.family = 'tool'
               AND e.kind = 'tool.completed' AND e.native_id IS NOT NULL
               AND e.source NOT IN ('git', 'os', 'daemon')
@@ -4149,7 +4158,7 @@ fn pending_git_hints(
               AND (CASE WHEN json_type(e.data, '$.changed_paths') = 'array'
                         THEN json_array_length(e.data, '$.changed_paths') > 0 ELSE 0 END
                    OR json_type(e.data, '$.changed_paths_truncated') = 'true'
-                   OR json_type(e.data, '$.redacted') = 'true'))",
+                   OR json_type(e.data, '$.redacted') = 'true')",
             params![agent, generation, git_sequence(cursor)?],
             |row| row.get(0),
         )

@@ -736,11 +736,13 @@ and the stream's committed `source.closed` wakes the poller, so a stopped Agent'
 source closes within one probe interval even when its workspace is not a Git
 repository. Restart recovery also closes a retained Git source for an ended
 generation when owned exit and reader drain or exact restart custody prove its
-process family is gone, and no retained native file-change hints remain beyond
-the committed Git cursor. It preserves the cursor and any recorded gap, and
-closes with stale health without reading the workspace or publishing new Git
-facts. Without exact custody, or while a retained hint still needs readback or
-an explicit unavailable interval, the source stays open and blocks
+process family is gone. When restart has made the ended generation's final read
+unrecoverable, recovery appends one explicit unavailable Git/file interval for
+any unread native file-change hints, from the committed cursor through the last
+retained hint. It preserves the prior gap metadata and events, the cursor, and
+all existing observations. It closes with stale health and records no readback
+or edit attribution for that interval. Without exact custody or valid Git source
+binding, the source stays open and blocks
 [Agent deletion](api.md#agent-and-daemon-read-views).
 CLI reads return the cache without forcing a scan.
 The target requirements above remain binding. `git-status AGENT` / `agent.git` returns

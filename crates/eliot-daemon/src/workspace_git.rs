@@ -1206,7 +1206,10 @@ impl WorkspaceGit {
         if !snapshot.dirty.is_empty() {
             return Err(problem(
                 "dirty",
-                "worktree contains staged or unstaged tracked changes",
+                &format!(
+                    "worktree contains staged or unstaged tracked changes at {}; commit or stash them before retrying",
+                    subject.target.root.display()
+                ),
             ));
         }
         Ok(())
@@ -1780,9 +1783,11 @@ impl WorkspaceGit {
             return Err(problem(
                 "source_integrity",
                 &format!(
-                    "workspace branch differs: original '{}' and observed '{}'",
+                    "workspace branch differs: original '{}' and observed '{}' at {}; preserve the current work and switch back to '{}' before retrying",
                     preparation.requested_branch,
-                    branch.strip_prefix("refs/heads/").unwrap_or(&branch)
+                    branch.strip_prefix("refs/heads/").unwrap_or(&branch),
+                    target.root.display(),
+                    preparation.requested_branch,
                 ),
             ));
         }
