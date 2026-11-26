@@ -1310,9 +1310,10 @@ before retrying Archive or Delete.
 The desktop offers Archive and Unarchive in the task row and header menus.
 Show archived in the sidebar includes archived tasks in the list.
 Unarchive applies the same state, turn, request and command guards and skips
-the custody check. The flag is durable. Admission of send, resume, steer or inject
-atomically unarchives its target, including selector members, so new activity appears in
-the default list. Reattaching an archived observer opens a new `observe` source and
+the custody check. The flag is durable. An explicit Owner Resume, or admission of
+steer or inject, atomically unarchives its target, including selector members,
+so new activity appears in the default list. Send and other Resume paths require
+an unarchived target. Reattaching an archived observer opens a new `observe` source and
 clears the flag, so a live reader is never hidden.
 `agent.list` accepts `archived:"exclude"` (default), `"only"` or `"include"`;
 totals and cursors use the same filter. The default also lists an archived ended

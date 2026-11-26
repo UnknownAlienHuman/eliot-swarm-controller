@@ -1567,12 +1567,17 @@ fn admit_worktree_remove_tx(
 
 /// Admit one `resume`: terminal-state and native-subject checks, then the
 /// resumed generation with optional linked input. Returns the linked id.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "The admission inputs include whether the Owner explicitly requested Resume."
+)]
 fn admit_resume_tx(
     tx: &Transaction<'_>,
     principal: &str,
     request: &SubmitCommand,
     payload_digest: &[u8],
     continuation_text: Option<&str>,
+    explicit_owner_resume: bool,
     now: i64,
     events: &mut Vec<Event>,
 ) -> Result<Option<String>> {
@@ -1585,7 +1590,7 @@ fn admit_resume_tx(
         .ok_or_else(|| Error::new("not_found", format!("Agent {target} was not found")))?;
     super::native_session_failure::require_usable(tx, &agent)?;
     provider_holds::require_model_unheld(tx, &agent)?;
-    if agent.archived {
+    if agent.archived && !explicit_owner_resume {
         return Err(Error::new(
             "bad_state",
             "archived Agents cannot be resumed; unarchive the Agent first",
@@ -2552,6 +2557,7 @@ fn submit_tx_mode(
             &request,
             &payload_digest,
             continuation_text.as_deref(),
+            principal == "owner" && !derived_rule && !restart_resume && !implicit_resume,
             now,
             &mut events,
         )

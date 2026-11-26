@@ -1269,7 +1269,8 @@ of a resumable Agent may stay open during archive. Delete's drain waits for them
 An idle member keeps its live custody. Unarchive skips the custody check.
 A refusal names the Agent and its first blocker. Reattaching an archived
 observer opens a new `observe` source and clears the flag, so a live reader is never hidden.
-Send, resume, steer and inject admission atomically clears the target's archive flag.
+An explicit Owner Resume or an admitted steer or inject atomically clears the
+target's archive flag. Send and other Resume paths require an unarchived target.
 When an adapter reports a correlated archive refusal for the retained native
 subject, the daemon may restore that exact session through the documented
 native operation. The refusal must prove that the earlier open had no effect.
