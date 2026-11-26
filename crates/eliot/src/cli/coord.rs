@@ -355,18 +355,7 @@ pub(crate) async fn run_msg(
                 agent: resolve_agent_target(agent_positional, legacy_agent)?,
                 delivery_id: delivery,
             };
-            request.validate().map_err(Failure::for_read)?;
-            let response: MailDelivery =
-                eliot_daemon::client_call_typed(&data_dir, "mail.read", &request)
-                    .await
-                    .map_err(Failure::for_read)?;
-            request
-                .validate_response(&response)
-                .map_err(Failure::invalid_response)?;
-            let value = serde_json::to_value(response)
-                .map_err(|_| Failure::new(4, "mail.read response is invalid"))?;
-            print_value(&value, json_output);
-            Ok(0)
+            read_and_print!(&data_dir, json_output, "mail.read", request, MailDelivery)
         }
         MsgCommand::Ack(MsgAckArgs {
             delivery,
@@ -1107,17 +1096,7 @@ pub(crate) async fn run_who_command(
         project,
         history: Some(history),
     };
-    request.validate().map_err(Failure::for_read)?;
-    let response: WhoResponse = eliot_daemon::client_call_typed(data_dir, "who", &request)
-        .await
-        .map_err(Failure::for_read)?;
-    request
-        .validate_response(&response)
-        .map_err(Failure::invalid_response)?;
-    let value =
-        serde_json::to_value(response).map_err(|_| Failure::new(4, "who response is invalid"))?;
-    print_value(&value, json_output);
-    Ok(0)
+    read_and_print!(data_dir, json_output, "who", request, WhoResponse)
 }
 
 pub(crate) async fn run_claim_command(

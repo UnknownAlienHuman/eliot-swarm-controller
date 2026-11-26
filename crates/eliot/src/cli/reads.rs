@@ -6,8 +6,8 @@ use super::args::{
 };
 use super::support::read_and_print;
 use super::support::{
-    Failure, PAGE_SIZE, print_value, print_value_or_human, turn_exit_code, validate_limit,
-    wait_deadline,
+    Failure, PAGE_SIZE, print_value, print_value_or_human, read_and_print_or_human, turn_exit_code,
+    validate_limit, wait_deadline,
 };
 use super::waits::{WaitClient, unsettled, wait_read};
 use eliot_core::api::{
@@ -424,26 +424,14 @@ pub(crate) async fn run_stats(
         id: agent,
         generation,
     };
-    if json_output {
-        read_and_print!(
-            &data_dir,
-            json_output,
-            "agent.stats",
-            params,
-            AgentStatsResponse
-        )
-    } else {
-        params.validate().map_err(Failure::for_read)?;
-        let response: AgentStatsResponse =
-            eliot_daemon::client_call_typed(&data_dir, "agent.stats", &params)
-                .await
-                .map_err(Failure::for_read)?;
-        params
-            .validate_response(&response)
-            .map_err(Failure::invalid_response)?;
-        print_stats_table(&response);
-        Ok(0)
-    }
+    read_and_print_or_human!(
+        &data_dir,
+        json_output,
+        "agent.stats",
+        params,
+        AgentStatsResponse,
+        |response| print_stats_table(&response)
+    )
 }
 
 /// Observe readback for `swarm stats`: the heavy-work rollup and the live
@@ -550,26 +538,14 @@ pub(crate) async fn run_usage(
         project,
         root,
     };
-    if json_output {
-        read_and_print!(
-            &data_dir,
-            json_output,
-            "usage.summary",
-            params,
-            UsageSummaryResponse
-        )
-    } else {
-        params.validate().map_err(Failure::for_read)?;
-        let response: UsageSummaryResponse =
-            eliot_daemon::client_call_typed(&data_dir, "usage.summary", &params)
-                .await
-                .map_err(Failure::for_read)?;
-        params
-            .validate_response(&response)
-            .map_err(Failure::invalid_response)?;
-        print_usage_table(&response);
-        Ok(0)
-    }
+    read_and_print_or_human!(
+        &data_dir,
+        json_output,
+        "usage.summary",
+        params,
+        UsageSummaryResponse,
+        |response| print_usage_table(&response)
+    )
 }
 
 pub(crate) async fn run_doctor(
@@ -954,26 +930,14 @@ pub(crate) async fn run_heavy(
         generation,
         window_secs,
     };
-    if json_output {
-        read_and_print!(
-            &data_dir,
-            json_output,
-            "observe.heavy",
-            params,
-            ObserveHeavyResponse
-        )
-    } else {
-        params.validate().map_err(Failure::for_read)?;
-        let response: ObserveHeavyResponse =
-            eliot_daemon::client_call_typed(&data_dir, "observe.heavy", &params)
-                .await
-                .map_err(Failure::for_read)?;
-        params
-            .validate_response(&response)
-            .map_err(Failure::invalid_response)?;
-        print_heavy_table(&response);
-        Ok(0)
-    }
+    read_and_print_or_human!(
+        &data_dir,
+        json_output,
+        "observe.heavy",
+        params,
+        ObserveHeavyResponse,
+        |response| print_heavy_table(&response)
+    )
 }
 
 pub(crate) fn print_heavy_table(response: &ObserveHeavyResponse) {
@@ -1066,45 +1030,35 @@ pub(crate) async fn run_diff(
         },
         path: args.path,
     };
-    if json_output {
-        read_and_print!(
-            &data_dir,
-            json_output,
-            "agent.diff",
-            request,
-            AgentDiffResponse
-        )
-    } else {
-        request.validate().map_err(Failure::for_read)?;
-        let response: AgentDiffResponse =
-            eliot_daemon::client_call_typed(&data_dir, "agent.diff", &request)
-                .await
-                .map_err(Failure::for_read)?;
-        request
-            .validate_response(&response)
-            .map_err(Failure::invalid_response)?;
-        for file in response.files {
-            let mut text = String::with_capacity(file.text.len());
-            for character in file.text.chars() {
-                if character.is_control() && !matches!(character, '\t' | '\n') {
-                    text.extend(character.escape_default());
-                } else {
-                    text.push(character);
+    read_and_print_or_human!(
+        &data_dir,
+        json_output,
+        "agent.diff",
+        request,
+        AgentDiffResponse,
+        |response: AgentDiffResponse| {
+            for file in response.files {
+                let mut text = String::with_capacity(file.text.len());
+                for character in file.text.chars() {
+                    if character.is_control() && !matches!(character, '\t' | '\n') {
+                        text.extend(character.escape_default());
+                    } else {
+                        text.push(character);
+                    }
+                }
+                print!("{text}");
+                if file.truncated {
+                    if !file.text.is_empty() && !file.text.ends_with('\n') {
+                        println!();
+                    }
+                    println!("[Diff truncated for {}]", file.path);
                 }
             }
-            print!("{text}");
-            if file.truncated {
-                if !file.text.is_empty() && !file.text.ends_with('\n') {
-                    println!();
-                }
-                println!("[Diff truncated for {}]", file.path);
+            if response.truncated {
+                eprintln!("Diff is truncated or has incomplete file coverage.");
             }
         }
-        if response.truncated {
-            eprintln!("Diff is truncated or has incomplete file coverage.");
-        }
-        Ok(0)
-    }
+    )
 }
 
 pub(crate) async fn run_edits(
@@ -2189,20 +2143,14 @@ pub(crate) async fn run_why(
     json_output: bool,
 ) -> Result<u8, Failure> {
     let params = DiagnoseRequest { target };
-    if json_output {
-        read_and_print!(&data_dir, json_output, "diagnose", params, DiagnoseResponse)
-    } else {
-        params.validate().map_err(Failure::for_read)?;
-        let response: DiagnoseResponse =
-            eliot_daemon::client_call_typed(&data_dir, "diagnose", &params)
-                .await
-                .map_err(Failure::for_read)?;
-        params
-            .validate_response(&response)
-            .map_err(Failure::invalid_response)?;
-        print_why_diagnosis(&response);
-        Ok(0)
-    }
+    read_and_print_or_human!(
+        &data_dir,
+        json_output,
+        "diagnose",
+        params,
+        DiagnoseResponse,
+        |response| print_why_diagnosis(&response)
+    )
 }
 
 fn why_heading(response: &DiagnoseResponse) -> String {
