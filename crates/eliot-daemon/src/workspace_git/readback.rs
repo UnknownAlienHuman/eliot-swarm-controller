@@ -27,8 +27,13 @@ pub(crate) struct ProjectReadCache {
 
 enum ProjectObservation {
     Current(CachedProjectReadback),
-    Pending(u8),
+    Pending(PendingProjectWatch),
     Fallback(Error),
+}
+
+enum ObserveOutcome {
+    Ready(CachedProjectReadback),
+    Unverified(PendingProjectWatch),
 }
 
 struct CachedProjectReadback {
@@ -43,6 +48,28 @@ struct WatchedProject {
     registrations: Vec<String>,
     stamps: Vec<CheckoutReadStamp>,
     checkout_roots: HashSet<String>,
+    root_identity: Option<RootIdentity>,
+}
+
+/// The repository root behind a retained watcher. `None` when the root
+/// could not be pinned: the watcher still observes, it is just never
+/// reused, so an identity failure can never force a fallback by itself.
+#[derive(Clone)]
+struct RootIdentity {
+    root: PathBuf,
+    identity: Vec<eliot_plugin::FileIdentity>,
+}
+
+/// A watcher retained across `Pending` attempts so sampler ticks do not
+/// rebuild it while the revision keeps moving. The count preserves the
+/// three-attempt fallback; the watcher is rebuilt only when the checkout
+/// set or the root identity changes, or when it reports an error.
+struct PendingProjectWatch {
+    count: u8,
+    watcher: Arc<WorkspaceInvalidation>,
+    registrations: Vec<String>,
+    checkout_roots: HashSet<String>,
+    root_identity: Option<RootIdentity>,
 }
 
 impl ProjectReadCache {
@@ -168,11 +195,11 @@ impl ProjectReadCache {
         matches!(stamps, Ok(Ok(stamps)) if stamps == entry.watched.stamps && entry.watched.current())
     }
 
-    fn take_current(&self, common: &str) -> Option<Arc<ProjectObservation>> {
+    fn take_reusable(&self, common: &str) -> Option<Arc<ProjectObservation>> {
         let mut entries = self.entries.lock_recover();
         if matches!(
             entries.get(common).map(Arc::as_ref),
-            Some(ProjectObservation::Current(_))
+            Some(ProjectObservation::Current(_)) | Some(ProjectObservation::Pending(_))
         ) {
             entries.remove(common)
         } else {
@@ -219,16 +246,22 @@ impl ProjectReadCache {
         self.request_failures.lock_recover().remove(common);
     }
 
-    fn record_unverified(&self, common: String, reporter: &WorkerReporter) {
+    fn record_pending(
+        &self,
+        common: String,
+        pending: PendingProjectWatch,
+        reporter: &WorkerReporter,
+    ) {
         {
             let mut entries = self.entries.lock_recover();
-            let count = match entries.get(&common).map(Arc::as_ref) {
-                Some(ProjectObservation::Fallback(_)) => return,
-                Some(ProjectObservation::Pending(count)) => count + 1,
-                _ => 1,
-            };
-            if count < MAX_UNVERIFIED_PROJECT_READS {
-                entries.insert(common, Arc::new(ProjectObservation::Pending(count)));
+            if entries
+                .get(&common)
+                .is_some_and(|entry| matches!(entry.as_ref(), ProjectObservation::Fallback(_)))
+            {
+                return;
+            }
+            if pending.count < MAX_UNVERIFIED_PROJECT_READS {
+                entries.insert(common, Arc::new(ProjectObservation::Pending(pending)));
                 return;
             }
         }
@@ -254,6 +287,30 @@ fn project_stamps(paths: &[String], common: &str) -> Result<Vec<CheckoutReadStam
         .iter()
         .map(|path| DiffCheckout::open(path, Some(common))?.read_stamp())
         .collect()
+}
+
+/// Pin the repository root behind a retained `Pending` watcher. A replaced
+/// or moved root must rebuild even when the checkout paths still match.
+/// `None` when the root cannot be pinned; the caller then never reuses.
+fn project_root_identity(common: &str) -> Option<RootIdentity> {
+    let canonical = canonical_root(common).ok()?;
+    let identity = Directory::open(&canonical)
+        .ok()?
+        .directory_identities(1)
+        .ok()?;
+    Some(RootIdentity {
+        root: canonical,
+        identity,
+    })
+}
+
+fn reused_root_identity(common: &str, stored: &RootIdentity) -> bool {
+    canonical_root(common).is_ok_and(|current| current.as_path() == stored.root.as_path())
+        && Directory::open(&stored.root).is_ok_and(|directory| {
+            directory
+                .directory_identities(1)
+                .is_ok_and(|identity| identity.as_slice() == stored.identity.as_slice())
+        })
 }
 
 /// The worktree and Git administration directories stay pinned through the
@@ -527,7 +584,7 @@ impl WorkspaceGit {
                     if cache.verified(&common, &paths).await {
                         return;
                     }
-                    let previous = cache.take_current(&common);
+                    let previous = cache.take_reusable(&common);
                     let result = match git.get_or_init(Self::new) {
                         Ok(git) => {
                             git.observe_project(&common, paths, &cache.wake, previous)
@@ -539,13 +596,15 @@ impl WorkspaceGit {
                         }
                     };
                     match result {
-                        Ok(Some(readback)) => {
+                        Ok(ObserveOutcome::Ready(readback)) => {
                             cache
                                 .entries
                                 .lock_recover()
                                 .insert(common, Arc::new(ProjectObservation::Current(readback)));
                         }
-                        Ok(None) => cache.record_unverified(common, reporter),
+                        Ok(ObserveOutcome::Unverified(pending)) => {
+                            cache.record_pending(common, pending, reporter);
+                        }
                         Err(error) => cache.record_fallback(common, error, reporter),
                     }
                 }
@@ -593,23 +652,49 @@ impl WorkspaceGit {
         paths: Vec<String>,
         wake: &Arc<tokio::sync::Notify>,
         previous: Option<Arc<ProjectObservation>>,
-    ) -> Result<Option<CachedProjectReadback>> {
+    ) -> Result<ObserveOutcome> {
         let watch_common = common.to_owned();
         let wake = Arc::clone(wake);
-        let watched = tokio::task::spawn_blocking(move || {
-            let (watcher, checkout_roots) = match previous.as_deref() {
-                Some(ProjectObservation::Current(entry))
-                    if entry.watched.registrations == paths
-                        && !entry.watched.watcher.is_degraded() =>
-                {
-                    (
-                        Arc::clone(&entry.watched.watcher),
-                        entry.watched.checkout_roots.clone(),
-                    )
-                }
-                _ => project_watcher(&watch_common, &paths, wake)
-                    .map(|(watcher, roots)| (Arc::new(watcher), roots))?,
-            };
+        let (watched, attempt) = tokio::task::spawn_blocking(move || {
+            let (watcher, checkout_roots, root_identity) =
+                match previous.as_deref() {
+                    Some(ProjectObservation::Current(entry))
+                        if entry.watched.registrations == paths
+                            && !entry.watched.watcher.is_degraded()
+                            && entry.watched.watcher.revision().is_some()
+                            && entry.watched.root_identity.as_ref().is_some_and(|stored| {
+                                reused_root_identity(&watch_common, stored)
+                            }) =>
+                    {
+                        (
+                            Arc::clone(&entry.watched.watcher),
+                            entry.watched.checkout_roots.clone(),
+                            entry.watched.root_identity.clone(),
+                        )
+                    }
+                    Some(ProjectObservation::Pending(pending))
+                        if pending.registrations == paths
+                            && !pending.watcher.is_degraded()
+                            && pending.watcher.revision().is_some()
+                            && pending.root_identity.as_ref().is_some_and(|stored| {
+                                reused_root_identity(&watch_common, stored)
+                            }) =>
+                    {
+                        (
+                            Arc::clone(&pending.watcher),
+                            pending.checkout_roots.clone(),
+                            pending.root_identity.clone(),
+                        )
+                    }
+                    _ => {
+                        // Pin the root before building: a swap during the
+                        // build must read as changed on the next tick.
+                        let root_identity = project_root_identity(&watch_common);
+                        let (watcher, roots) = project_watcher(&watch_common, &paths, wake)
+                            .map(|(watcher, roots)| (Arc::new(watcher), roots))?;
+                        (watcher, roots, root_identity)
+                    }
+                };
             let revision = watcher.revision().ok_or_else(|| {
                 problem("unavailable", "project Git watcher lost checkout coverage")
             })?;
@@ -620,14 +705,30 @@ impl WorkspaceGit {
                 registrations: paths,
                 stamps,
                 checkout_roots,
+                root_identity,
             };
-            Ok::<_, Error>(watched.current().then_some(watched))
+            // Carry the count across every Pending attempt for this
+            // repository, rebuilt watcher or not: only Ready resets it.
+            // Otherwise a watcher that degrades on every attempt would
+            // never reach the three-attempt fallback.
+            let attempt = match previous.as_deref() {
+                Some(ProjectObservation::Pending(pending)) => pending.count.saturating_add(1),
+                _ => 1,
+            };
+            Ok::<_, Error>((watched, attempt))
         })
         .await
         .map_err(|_| problem("internal", "project Git watcher task failed"))??;
-        let Some(watched) = watched else {
-            return Ok(None);
+        let unverified = |attempt: u8| PendingProjectWatch {
+            count: attempt,
+            watcher: Arc::clone(&watched.watcher),
+            registrations: watched.registrations.clone(),
+            checkout_roots: watched.checkout_roots.clone(),
+            root_identity: watched.root_identity.clone(),
         };
+        if !watched.current() {
+            return Ok(ObserveOutcome::Unverified(unverified(attempt)));
+        }
         let deadline = Instant::now() + ORIGIN_READ_TIME;
         let (origin, mut checkouts, complete) = self
             .read_project(
@@ -638,7 +739,7 @@ impl WorkspaceGit {
             )
             .await;
         if !watched.current() {
-            return Ok(None);
+            return Ok(ObserveOutcome::Unverified(unverified(attempt)));
         }
         if !complete {
             return Err(problem(
@@ -653,13 +754,15 @@ impl WorkspaceGit {
             .map_err(|_| problem("internal", "project checkout stamp task failed"))??;
         let mut remaining = CHECKOUT_READBACK_BYTES;
         bound_checkouts(&mut checkouts, &mut remaining);
-        Ok(
-            (stamps == watched.stamps && watched.current()).then_some(CachedProjectReadback {
+        if stamps == watched.stamps && watched.current() {
+            Ok(ObserveOutcome::Ready(CachedProjectReadback {
                 watched,
                 origin,
                 checkouts,
-            }),
-        )
+            }))
+        } else {
+            Ok(ObserveOutcome::Unverified(unverified(attempt)))
+        }
     }
 
     async fn read_project(
@@ -1084,9 +1187,18 @@ fn project_watcher(
     // that could appear without a Git administration change. Parent watches
     // cover deletion, replacement and .git changes without watching content.
     let mut bindings = HashSet::new();
+    // A modify-only event on one of these `.git` directories is metadata
+    // (an index or ref write bumping the directory), not a binding change.
+    // Creation, removal, rename, `.git` files, ancestors, the registry and
+    // the worktree endpoints stay binding.
+    let mut git_dirs = HashSet::new();
     let key = |path: &Path| eliot_core::workspace_path_key(&path.to_string_lossy()).into_owned();
     for root in roots.iter().chain(std::iter::once(&common)) {
         bindings.insert(key(&root.join(".git")));
+        if matches!(fs::symlink_metadata(root.join(".git")), Ok(metadata) if metadata.is_dir() && !is_reparse_point(&metadata))
+        {
+            git_dirs.insert(key(&root.join(".git")));
+        }
         for path in root.ancestors().filter(|path| path.has_root()) {
             bindings.insert(key(path));
             match fs::symlink_metadata(path) {
@@ -1110,56 +1222,71 @@ fn project_watcher(
     let checkout_roots = roots.iter().map(|root| key(root)).collect();
     let common = key(&common);
     let registry = key(&registry);
-    WorkspaceInvalidation::watch_paths(paths.into_iter().collect(), Some(wake), move |path| {
-        if path.to_str().is_none() {
-            return (true, true);
-        }
-        let path = key(path);
-        let admin = path
-            .strip_prefix(&registry)
-            .and_then(|tail| tail.strip_prefix('/'));
-        let binding = bindings.contains(&path)
-            || path == registry
-            || ["refs", "info", "reftable"].iter().any(|name| {
-                path.strip_prefix(&common)
-                    .and_then(|tail| tail.strip_prefix('/'))
-                    == Some(*name)
-            })
-            || admin.is_some_and(|tail| {
-                !tail.contains('/') || tail.ends_with("/gitdir") || tail.ends_with("/commondir")
-            });
-        let tracked_file = |name: &str| {
-            matches!(
-                name,
-                "HEAD"
-                    | "head"
-                    | "index"
-                    | "config"
-                    | "config.worktree"
-                    | "packed-refs"
-                    | "commondir"
-                    | "gitdir"
-                    | "locked"
-                    | "objects"
+    WorkspaceInvalidation::watch_paths(
+        paths.into_iter().collect(),
+        Some(wake),
+        move |path, kind| {
+            if path.to_str().is_none() {
+                return (true, true);
+            }
+            let path = key(path);
+            // A modify-only event on a `.git` directory means files inside it
+            // changed, not the checkout binding: keep it relevant metadata.
+            let git_dir_modify = git_dirs.contains(&path)
+                && matches!(kind, notify::EventKind::Modify(_))
+                && !matches!(
+                    kind,
+                    notify::EventKind::Modify(notify::event::ModifyKind::Name(_))
+                );
+            let admin = path
+                .strip_prefix(&registry)
+                .and_then(|tail| tail.strip_prefix('/'));
+            let binding = (!git_dir_modify && bindings.contains(&path))
+                || path == registry
+                || ["refs", "info", "reftable"].iter().any(|name| {
+                    path.strip_prefix(&common)
+                        .and_then(|tail| tail.strip_prefix('/'))
+                        == Some(*name)
+                })
+                || admin.is_some_and(|tail| {
+                    !tail.contains('/') || tail.ends_with("/gitdir") || tail.ends_with("/commondir")
+                });
+            let tracked_file = |name: &str| {
+                matches!(
+                    name,
+                    "HEAD"
+                        | "head"
+                        | "index"
+                        | "config"
+                        | "config.worktree"
+                        | "packed-refs"
+                        | "commondir"
+                        | "gitdir"
+                        | "locked"
+                        | "objects"
+                )
+            };
+            let common_metadata = path
+                .strip_prefix(&common)
+                .and_then(|tail| tail.strip_prefix('/'))
+                .is_some_and(|tail| {
+                    tracked_file(tail)
+                        || ["refs", "info", "reftable"].iter().any(|directory| {
+                            tail == *directory
+                                || tail
+                                    .strip_prefix(directory)
+                                    .is_some_and(|rest| rest.starts_with('/'))
+                        })
+                });
+            let worktree_metadata = admin
+                .and_then(|tail| tail.split_once('/'))
+                .is_some_and(|(_, file)| tracked_file(file));
+            (
+                binding || common_metadata || worktree_metadata || git_dir_modify,
+                binding,
             )
-        };
-        let common_metadata = path
-            .strip_prefix(&common)
-            .and_then(|tail| tail.strip_prefix('/'))
-            .is_some_and(|tail| {
-                tracked_file(tail)
-                    || ["refs", "info", "reftable"].iter().any(|directory| {
-                        tail == *directory
-                            || tail
-                                .strip_prefix(directory)
-                                .is_some_and(|rest| rest.starts_with('/'))
-                    })
-            });
-        let worktree_metadata = admin
-            .and_then(|tail| tail.split_once('/'))
-            .is_some_and(|(_, file)| tracked_file(file));
-        (binding || common_metadata || worktree_metadata, binding)
-    })
+        },
+    )
     .map_err(|_| unsupported())
     .map(|watcher| (watcher, checkout_roots))
 }
