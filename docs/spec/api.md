@@ -1173,9 +1173,12 @@ origin or checkout details while a watched observation is pending. They can
 poll again on their normal refresh cadence. When monitoring cannot cover or
 verify a repository, the daemon uses the bounded live Git read and includes
 `git_watch_unsupported: true` for opted-in callers. This fallback also
-starts after three consecutive attempts invalidated by a moving revision and
-reports that transition once until a verified read succeeds.
-A new verified observation restores the cached path.
+starts after three consecutive attempts invalidated by a moving revision.
+It reports one warning per repository per burst with the invalidated attempt
+count at entry. The fallback remains visible until the same watcher revision,
+registered checkout stamps and bindings verify for ten seconds. Recovery
+restores the cached path and records the total invalidated attempts at debug
+log level.
 Malformed and pathless remotes produce no name, and the origin URL itself
 never leaves the daemon.
 

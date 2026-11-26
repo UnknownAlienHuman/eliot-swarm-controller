@@ -17,6 +17,7 @@ use std::{
 const MAX_CHECKOUTS: usize = 1_000;
 const CHECKOUT_READBACK_BYTES: usize = 900 * 1024;
 const MAX_UNVERIFIED_PROJECT_READS: u8 = 3;
+const PROJECT_REVISION_QUIET: Duration = Duration::from_secs(10);
 const PROJECT_WATCH_BINDINGS_UNAVAILABLE: &str =
     "project Git watcher cannot cover the checkout bindings";
 #[cfg(any(windows, target_os = "linux"))]
@@ -25,14 +26,29 @@ const PROJECT_WATCH_CHECKOUTS: usize = 256;
 #[derive(Default)]
 pub(crate) struct ProjectReadCache {
     entries: Mutex<HashMap<String, Arc<ProjectObservation>>>,
+    revision_bursts: Mutex<HashMap<String, u64>>,
     request_failures: Mutex<HashMap<String, Error>>,
     wake: Arc<tokio::sync::Notify>,
 }
 
 enum ProjectObservation {
-    Current(CachedProjectReadback),
+    Current(Arc<CachedProjectReadback>),
+    Settling {
+        readback: Arc<CachedProjectReadback>,
+        since: Instant,
+    },
     Pending(PendingProjectWatch),
     Fallback(Error),
+}
+
+impl ProjectObservation {
+    fn uses_live_fallback(&self) -> bool {
+        match self {
+            Self::Pending(pending) => pending.count >= MAX_UNVERIFIED_PROJECT_READS,
+            Self::Settling { .. } | Self::Fallback(_) => true,
+            Self::Current(_) => false,
+        }
+    }
 }
 
 enum ObserveOutcome {
@@ -119,7 +135,9 @@ impl ProjectReadCache {
 
                     let unsupported = force_fallback
                         || !cfg!(any(windows, target_os = "linux"))
-                        || matches!(entry.as_deref(), Some(ProjectObservation::Fallback(_)));
+                        || entry
+                            .as_deref()
+                            .is_some_and(ProjectObservation::uses_live_fallback);
                     if include_git_state && !unsupported {
                         for registration in group {
                             registration.git_refreshing = true;
@@ -163,6 +181,7 @@ impl ProjectReadCache {
 
     pub(crate) fn clear(&self) {
         let retired = std::mem::take(&mut *self.entries.lock_recover());
+        self.revision_bursts.lock_recover().clear();
         tokio::task::spawn_blocking(move || drop(retired));
     }
 
@@ -181,32 +200,70 @@ impl ProjectReadCache {
         self.request_failures
             .lock_recover()
             .retain(|key, _| registrations.contains_key(key));
+        self.revision_bursts
+            .lock_recover()
+            .retain(|key, _| registrations.contains_key(key));
     }
 
-    async fn verified(&self, common: &str, registrations: &[String]) -> bool {
-        let entry = self.entries.lock_recover().get(common).cloned();
-        let Some(ProjectObservation::Current(entry)) = entry.as_deref() else {
-            return false;
+    async fn verified(
+        &self,
+        common: &str,
+        registrations: &[String],
+        reporter: &WorkerReporter,
+    ) -> bool {
+        let observation = self.entries.lock_recover().get(common).cloned();
+        let (entry, settling_since) = match observation.as_deref() {
+            Some(ProjectObservation::Current(entry)) => (entry, None),
+            Some(ProjectObservation::Settling { readback, since }) => (readback, Some(*since)),
+            _ => return false,
         };
         if entry.watched.watch.registrations != registrations || !entry.watched.current() {
             return false;
         }
         let paths = registrations.to_vec();
-        let common = common.to_owned();
-        let stamps = tokio::task::spawn_blocking(move || project_stamps(&paths, &common)).await;
-        matches!(stamps, Ok(Ok(stamps)) if stamps == entry.watched.stamps && entry.watched.current())
+        let stamp_common = common.to_owned();
+        let stamps =
+            tokio::task::spawn_blocking(move || project_stamps(&paths, &stamp_common)).await;
+        if !matches!(stamps, Ok(Ok(stamps)) if stamps == entry.watched.stamps && entry.watched.current())
+        {
+            return false;
+        }
+        if settling_since.is_some_and(|since| since.elapsed() >= PROJECT_REVISION_QUIET) {
+            let burst = self.revision_bursts.lock_recover().remove(common);
+            self.entries.lock_recover().insert(
+                common.to_owned(),
+                Arc::new(ProjectObservation::Current(Arc::clone(entry))),
+            );
+            if let Some(count) = burst {
+                reporter.project_revision_settled(common, count);
+            }
+        }
+        true
     }
 
     fn take_reusable(&self, common: &str) -> Option<Arc<ProjectObservation>> {
         let mut entries = self.entries.lock_recover();
-        if matches!(
-            entries.get(common).map(Arc::as_ref),
-            Some(ProjectObservation::Current(_)) | Some(ProjectObservation::Pending(_))
-        ) {
-            entries.remove(common)
-        } else {
-            None
+        let entry = entries.get(common)?;
+        match entry.as_ref() {
+            ProjectObservation::Fallback(_) => None,
+            observation if observation.uses_live_fallback() => Some(Arc::clone(entry)),
+            _ => entries.remove(common),
         }
+    }
+
+    fn record_ready(&self, common: String, readback: CachedProjectReadback) {
+        let readback = Arc::new(readback);
+        let observation = if self.revision_bursts.lock_recover().contains_key(&common) {
+            ProjectObservation::Settling {
+                readback,
+                since: Instant::now(),
+            }
+        } else {
+            ProjectObservation::Current(readback)
+        };
+        self.entries
+            .lock_recover()
+            .insert(common, Arc::new(observation));
     }
 
     fn record_fallback(&self, common: String, error: Error, reporter: &WorkerReporter) {
@@ -251,30 +308,44 @@ impl ProjectReadCache {
     fn record_pending(
         &self,
         common: String,
-        pending: PendingProjectWatch,
+        mut pending: PendingProjectWatch,
         reporter: &WorkerReporter,
     ) {
+        let mut first_warning = None;
         {
-            let mut entries = self.entries.lock_recover();
-            if entries
-                .get(&common)
-                .is_some_and(|entry| matches!(entry.as_ref(), ProjectObservation::Fallback(_)))
-            {
-                return;
-            }
-            if pending.count < MAX_UNVERIFIED_PROJECT_READS {
-                entries.insert(common, Arc::new(ProjectObservation::Pending(pending)));
-                return;
+            let mut bursts = self.revision_bursts.lock_recover();
+            if let Some(count) = bursts.get_mut(&common) {
+                *count = count.saturating_add(1);
+                pending.count = MAX_UNVERIFIED_PROJECT_READS;
+            } else if pending.count >= MAX_UNVERIFIED_PROJECT_READS {
+                let count = u64::from(pending.count);
+                bursts.insert(common.clone(), count);
+                first_warning = Some(count);
             }
         }
-        self.record_fallback(
-            common,
-            problem(
-                "unavailable",
-                "project Git checkout revision changed during three consecutive observations",
-            ),
-            reporter,
-        );
+        {
+            let mut entries = self.entries.lock_recover();
+            if !matches!(
+                entries.get(&common).map(Arc::as_ref),
+                Some(ProjectObservation::Fallback(_))
+            ) {
+                entries.insert(
+                    common.clone(),
+                    Arc::new(ProjectObservation::Pending(pending)),
+                );
+            }
+        }
+        if let Some(count) = first_warning {
+            reporter.project_read_failed(
+                &common,
+                &Error::new(
+                    "unavailable",
+                    format!(
+                        "project Git checkout revision changed during three consecutive observations ({count} invalidated observations)"
+                    ),
+                ),
+            );
+        }
     }
 }
 
@@ -610,7 +681,7 @@ impl WorkspaceGit {
             .for_each_concurrent(4, |(common, paths)| {
                 let git = &git;
                 async move {
-                    if cache.verified(&common, &paths).await {
+                    if cache.verified(&common, &paths, reporter).await {
                         return;
                     }
                     let previous = cache.take_reusable(&common);
@@ -626,10 +697,7 @@ impl WorkspaceGit {
                     };
                     match result {
                         Ok(ObserveOutcome::Ready(readback)) => {
-                            cache
-                                .entries
-                                .lock_recover()
-                                .insert(common, Arc::new(ProjectObservation::Current(readback)));
+                            cache.record_ready(common, readback);
                         }
                         Ok(ObserveOutcome::Unverified(pending)) => {
                             cache.record_pending(common, pending, reporter);
@@ -688,6 +756,9 @@ impl WorkspaceGit {
         let (mut watch, mut rebuilt, attempt) = tokio::task::spawn_blocking(move || {
             let (old, attempt) = match previous.as_deref() {
                 Some(ProjectObservation::Current(entry)) => (Some(&entry.watched.watch), 1),
+                Some(ProjectObservation::Settling { readback, .. }) => {
+                    (Some(&readback.watched.watch), 1)
+                }
                 Some(ProjectObservation::Pending(pending)) => {
                     (Some(&pending.watch), pending.count.saturating_add(1))
                 }
