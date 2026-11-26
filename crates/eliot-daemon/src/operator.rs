@@ -1,7 +1,9 @@
 //! Local process and directory custody used by the operator CLI.
 
 use crate::platform::data_dir::{DataDir, sync_directory, validate_private_file};
-use eliot_core::api::{AgentListRequest, AgentListResponse, AgentListRow};
+use eliot_core::api::{
+    AgentListRequest, AgentListResponse, AgentListRow, ArtifactKind, SWARM_STAND_ARTIFACT_PURPOSE,
+};
 use eliot_core::{Error, Result};
 use eliot_store::{AgentListFilter, Store};
 use std::fs;
@@ -107,6 +109,65 @@ pub fn inherited_agent_parent_data_dir() -> Option<PathBuf> {
         return None;
     }
     Some(resolved)
+}
+
+pub fn stand_prune_parent() -> Result<Option<PathBuf>> {
+    if let Some(parent) = inherited_agent_parent_data_dir() {
+        return Ok(Some(parent));
+    }
+    let target = crate::platform::data_dir::resolve_data_dir(None)?;
+    if crate::daemon::client_is_owner(&target)? {
+        return Ok(None);
+    }
+    Err(Error::new(
+        "not_allowed",
+        "stand prune requires the local Owner or a bound Agent principal",
+    ))
+}
+
+pub fn verify_stand_registrant(
+    registration: &StandRegistration,
+    parent: &Path,
+    agent: &str,
+    generation: i64,
+) -> Result<()> {
+    let missing = || {
+        Error::new(
+            "stand_owner_unknown",
+            "stand lacks a matching artifact ownership record",
+        )
+    };
+    let artifact_id = registration.artifact_id.as_deref().ok_or_else(missing)?;
+    let issuing = registration
+        .parent_data_dir
+        .as_deref()
+        .ok_or_else(missing)?;
+    let identity = registration.root_identity.as_deref().ok_or_else(missing)?;
+    let not_owned = || {
+        Error::new(
+            "stand_not_owned",
+            "stand was registered by another principal",
+        )
+    };
+    if !data_dirs_match(issuing, parent) {
+        return Err(not_owned());
+    }
+    let store = Store::open_read_only(&parent.join("eliot.db"))?;
+    let path = registration.marker.root.to_str().ok_or_else(missing)?;
+    let artifact = store
+        .known_artifact_path(path)?
+        .filter(|artifact| {
+            artifact.id == artifact_id
+                && artifact.identity == identity
+                && artifact.kind == ArtifactKind::DataDir
+                && artifact.purpose == SWARM_STAND_ARTIFACT_PURPOSE
+                && artifact.state == "registered"
+        })
+        .ok_or_else(missing)?;
+    if artifact.agent != agent || artifact.generation != generation {
+        return Err(not_owned());
+    }
+    Ok(())
 }
 
 /// Checks whether `candidate` matches `expected` data directory identity.
