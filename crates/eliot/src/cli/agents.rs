@@ -692,8 +692,40 @@ pub(crate) async fn run_compact(
     id: Option<String>,
 ) -> Result<u8, Failure> {
     let deadline = wait_seconds.map(wait_deadline).transpose()?;
-    let mut params = submit_request(id, Some(agent), "compact", json!({}))?;
-    params.expected_generation = generation;
+    let supplied_id = id.is_some();
+    let mut params = submit_request(id, Some(agent.clone()), "compact", json!({}))?;
+    params.expected_generation = match generation {
+        Some(generation) => Some(generation),
+        None => {
+            let retained = if supplied_id {
+                let query = CommandGetRequest::new(&params.id);
+                match eliot_daemon::client_call_typed::<_, eliot_core::Command>(
+                    &data_dir,
+                    "command.get",
+                    &query,
+                )
+                .await
+                {
+                    Ok(command) => command.expected_generation,
+                    Err(error) if error.code == "not_found" => None,
+                    Err(error) => return Err(Failure::for_read(error)),
+                }
+            } else {
+                None
+            };
+            let generation = match retained {
+                Some(generation) => generation,
+                None => {
+                    read_agent_for_control(&data_dir, &agent)
+                        .await?
+                        .agent
+                        .generation
+                }
+            };
+            eprintln!("compact target: agent={agent} generation={generation}");
+            Some(generation)
+        }
+    };
     let submitted = submit_command(&data_dir, &params).await?;
     let submit_exit = response_exit_code(submitted.state);
     if matches!(submit_exit, 1 | 3 | 4) {
@@ -1164,6 +1196,20 @@ pub(crate) async fn capture_exact_turn(
     verb: &'static str,
     agent: &str,
 ) -> Result<ExactTurnCapture, Failure> {
+    let response = read_agent_for_control(data_dir, agent).await?;
+    let turn_id = response
+        .agent
+        .active_turn
+        .ok_or_else(|| missing_turn_failure(verb, agent))?;
+    Ok(ExactTurnCapture {
+        verb,
+        agent: agent.to_owned(),
+        generation: response.agent.generation,
+        turn_id,
+    })
+}
+
+async fn read_agent_for_control(data_dir: &Path, agent: &str) -> Result<AgentGetResponse, Failure> {
     let params = AgentGetRequest::new(agent);
     params.validate().map_err(Failure::for_read)?;
     let response: AgentGetResponse =
@@ -1173,17 +1219,7 @@ pub(crate) async fn capture_exact_turn(
     params
         .validate_response(&response)
         .map_err(Failure::invalid_response)?;
-    let turn_id = response
-        .agent
-        .active_turn
-        .clone()
-        .ok_or_else(|| missing_turn_failure(verb, agent))?;
-    Ok(ExactTurnCapture {
-        verb,
-        agent: agent.to_owned(),
-        generation: response.agent.generation,
-        turn_id,
-    })
+    Ok(response)
 }
 
 /// Resolve the exact binding a turn-control command submits. Explicit flags
