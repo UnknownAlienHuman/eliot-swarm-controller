@@ -7,6 +7,7 @@ use eliot_core::{RemoteCallContext, RemoteIdentity};
 use eliot_plugin::sync::LockExt;
 use jsonwebtoken::{
     Algorithm, DecodingKey, Validation, decode, decode_header,
+    errors::ErrorKind,
     jwk::{JwkSet, KeyAlgorithm, PublicKeyUse},
 };
 use rmcp::transport::streamable_http_server::session::{
@@ -30,6 +31,60 @@ const MAX_SESSIONS: usize = 1024;
 const KEY_LIFETIME: Duration = Duration::from_secs(300);
 const REFRESH_BACKOFF: Duration = Duration::from_secs(30);
 const KEY_REFRESH_TIMEOUT: Duration = Duration::from_secs(10);
+const REJECTION_LOG_INTERVAL: Duration = Duration::from_secs(10);
+
+#[derive(Clone, Copy, Eq, Hash, PartialEq)]
+pub(super) enum Rejection {
+    AssertionHeader,
+    InvalidAssertion,
+    KeyUnavailable,
+    KeyUnknown,
+    BadSignature,
+    Expired,
+    NotYetValid,
+    AudienceMismatch,
+    IssuerMismatch,
+    ConfigUnavailable,
+    InvalidSession,
+    SessionUnavailable,
+    SessionNotFound,
+    SessionForbidden,
+    InvalidSessionResponse,
+}
+
+impl Rejection {
+    pub fn status(self) -> StatusCode {
+        match self {
+            Self::KeyUnavailable | Self::ConfigUnavailable | Self::SessionUnavailable => {
+                StatusCode::SERVICE_UNAVAILABLE
+            }
+            Self::SessionNotFound => StatusCode::NOT_FOUND,
+            Self::SessionForbidden => StatusCode::FORBIDDEN,
+            Self::InvalidSessionResponse => StatusCode::INTERNAL_SERVER_ERROR,
+            _ => StatusCode::UNAUTHORIZED,
+        }
+    }
+
+    fn code(self) -> &'static str {
+        match self {
+            Self::AssertionHeader => "assertion_header",
+            Self::InvalidAssertion => "invalid_assertion",
+            Self::KeyUnavailable => "key_unavailable",
+            Self::KeyUnknown => "key_unknown",
+            Self::BadSignature => "bad_signature",
+            Self::Expired => "expired",
+            Self::NotYetValid => "not_yet_valid",
+            Self::AudienceMismatch => "audience_mismatch",
+            Self::IssuerMismatch => "issuer_mismatch",
+            Self::ConfigUnavailable => "config_unavailable",
+            Self::InvalidSession => "invalid_session",
+            Self::SessionUnavailable => "session_unavailable",
+            Self::SessionNotFound => "session_not_found",
+            Self::SessionForbidden => "session_forbidden",
+            Self::InvalidSessionResponse => "invalid_session_response",
+        }
+    }
+}
 
 #[derive(Deserialize, Serialize)]
 struct Claims {
@@ -118,6 +173,7 @@ pub(super) struct OriginAuth {
     client: reqwest::Client,
     keys: Mutex<Keys>,
     key_refresh: Mutex<()>,
+    rejection_logs: StdMutex<HashMap<Rejection, Instant>>,
     sessions: Mutex<HashMap<String, Session>>,
     slots: Arc<Semaphore>,
     sdk_sessions: Arc<LocalSessionManager>,
@@ -227,6 +283,7 @@ impl OriginAuth {
             owner_audience,
             client,
             key_refresh: Mutex::new(()),
+            rejection_logs: StdMutex::default(),
             keys: Mutex::new(Keys {
                 set: JwkSet { keys: Vec::new() },
                 valid_until: Instant::now(),
@@ -242,46 +299,65 @@ impl OriginAuth {
         Ok(auth)
     }
 
-    async fn fetch_keys(&self) -> Result<JwkSet, StatusCode> {
+    pub fn log_rejection(&self, rejection: Rejection, ray: Option<&str>, call_id: Option<&str>) {
+        {
+            let mut logged = self.rejection_logs.lock_recover();
+            let now = Instant::now();
+            if logged
+                .get(&rejection)
+                .is_some_and(|last| now.duration_since(*last) < REJECTION_LOG_INTERVAL)
+            {
+                return;
+            }
+            logged.insert(rejection, now);
+        }
+        eliot_daemon::log_origin_rejection(
+            rejection.status().as_u16(),
+            rejection.code(),
+            ray,
+            call_id,
+        );
+    }
+
+    async fn fetch_keys(&self) -> Result<JwkSet, Rejection> {
         // Never derive a URL from an unverified JWT's iss/jku/x5u/kid.
         let mut response = self
             .client
             .get(format!("{}/cdn-cgi/access/certs", self.issuer))
             .send()
             .await
-            .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+            .map_err(|_| Rejection::KeyUnavailable)?;
         if !response.status().is_success() {
-            return Err(StatusCode::SERVICE_UNAVAILABLE);
+            return Err(Rejection::KeyUnavailable);
         }
         let mut bytes = Vec::new();
         while let Some(chunk) = response
             .chunk()
             .await
-            .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?
+            .map_err(|_| Rejection::KeyUnavailable)?
         {
             if bytes.len().saturating_add(chunk.len()) > MAX_JWKS_BYTES {
-                return Err(StatusCode::SERVICE_UNAVAILABLE);
+                return Err(Rejection::KeyUnavailable);
             }
             bytes.extend_from_slice(&chunk);
         }
-        let set: JwkSet =
-            serde_json::from_slice(&bytes).map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+        let set: JwkSet = serde_json::from_slice(&bytes).map_err(|_| Rejection::KeyUnavailable)?;
         if set.keys.is_empty() || set.keys.len() > 32 {
-            return Err(StatusCode::SERVICE_UNAVAILABLE);
+            return Err(Rejection::KeyUnavailable);
         }
         Ok(set)
     }
 
-    async fn refresh(&self) -> Result<(), StatusCode> {
+    async fn refresh(&self) -> Result<(), Rejection> {
         timeout(KEY_REFRESH_TIMEOUT, async {
             let _refresh = self.key_refresh.lock().await;
             self.fetch_and_cache_keys().await
         })
         .await
-        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?
+        .map_err(|_| Rejection::KeyUnavailable)?
     }
 
-    async fn refresh_for_key(&self, kid: &str) -> Result<(), StatusCode> {
+    async fn refresh_for_key(&self, kid: &str) -> Result<(), Rejection> {
         timeout(KEY_REFRESH_TIMEOUT, async {
             let _refresh = self.key_refresh.lock().await;
             {
@@ -291,21 +367,17 @@ impl OriginAuth {
                     return Ok(());
                 }
                 if now < keys.retry_after {
-                    return if now < keys.valid_until {
-                        Ok(())
-                    } else {
-                        Err(StatusCode::SERVICE_UNAVAILABLE)
-                    };
+                    return Err(Rejection::KeyUnavailable);
                 }
             }
             // The cache lock is released before the bounded network refresh.
             self.fetch_and_cache_keys().await
         })
         .await
-        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?
+        .map_err(|_| Rejection::KeyUnavailable)?
     }
 
-    async fn fetch_and_cache_keys(&self) -> Result<(), StatusCode> {
+    async fn fetch_and_cache_keys(&self) -> Result<(), Rejection> {
         {
             let mut keys = self.keys.lock().await;
             keys.retry_after = Instant::now() + REFRESH_BACKOFF;
@@ -317,27 +389,27 @@ impl OriginAuth {
         Ok(())
     }
 
-    fn decoding_key(jwk: &jsonwebtoken::jwk::Jwk) -> Result<DecodingKey, StatusCode> {
+    fn decoding_key(jwk: &jsonwebtoken::jwk::Jwk) -> Result<DecodingKey, Rejection> {
         if jwk.common.key_algorithm != Some(KeyAlgorithm::RS256)
             || jwk.common.public_key_use != Some(PublicKeyUse::Signature)
         {
-            return Err(StatusCode::UNAUTHORIZED);
+            return Err(Rejection::InvalidAssertion);
         }
-        DecodingKey::from_jwk(jwk).map_err(|_| StatusCode::UNAUTHORIZED)
+        DecodingKey::from_jwk(jwk).map_err(|_| Rejection::KeyUnavailable)
     }
 
-    async fn verify(&self, assertion: &str) -> Result<(Claims, String), StatusCode> {
+    async fn verify(&self, assertion: &str) -> Result<(Claims, String), Rejection> {
         if assertion.is_empty() || assertion.len() > MAX_ASSERTION_BYTES {
-            return Err(StatusCode::UNAUTHORIZED);
+            return Err(Rejection::InvalidAssertion);
         }
-        let header = decode_header(assertion).map_err(|_| StatusCode::UNAUTHORIZED)?;
+        let header = decode_header(assertion).map_err(|_| Rejection::InvalidAssertion)?;
         if header.alg != Algorithm::RS256 {
-            return Err(StatusCode::UNAUTHORIZED);
+            return Err(Rejection::InvalidAssertion);
         }
         let kid = header
             .kid
             .filter(|s| !s.is_empty() && s.len() <= 256)
-            .ok_or(StatusCode::UNAUTHORIZED)?;
+            .ok_or(Rejection::InvalidAssertion)?;
         let key = {
             let keys = self.keys.lock().await;
             if Instant::now() < keys.valid_until {
@@ -352,9 +424,9 @@ impl OriginAuth {
                 self.refresh_for_key(&kid).await?;
                 let keys = self.keys.lock().await;
                 if Instant::now() >= keys.valid_until {
-                    return Err(StatusCode::SERVICE_UNAVAILABLE);
+                    return Err(Rejection::KeyUnavailable);
                 }
-                let jwk = keys.set.find(&kid).ok_or(StatusCode::UNAUTHORIZED)?;
+                let jwk = keys.set.find(&kid).ok_or(Rejection::KeyUnknown)?;
                 Self::decoding_key(jwk)?
             }
         };
@@ -365,17 +437,30 @@ impl OriginAuth {
         validation.validate_nbf = true;
         validation.leeway = 0;
         let claims = decode::<Claims>(assertion, &key, &validation)
-            .map_err(|_| StatusCode::UNAUTHORIZED)?
+            .map_err(|error| match error.kind() {
+                ErrorKind::InvalidSignature => Rejection::BadSignature,
+                ErrorKind::ExpiredSignature => Rejection::Expired,
+                ErrorKind::ImmatureSignature => Rejection::NotYetValid,
+                ErrorKind::InvalidIssuer => Rejection::IssuerMismatch,
+                _ => Rejection::InvalidAssertion,
+            })?
             .claims;
         if claims.sub.is_empty()
             || claims.sub.len() > 512
             || claims.sub.chars().any(char::is_control)
             || claims.token_type != "app"
-            || claims.iss != self.issuer
-            || claims.exp <= now_seconds()
-            || claims.nbf > now_seconds()
         {
-            return Err(StatusCode::UNAUTHORIZED);
+            return Err(Rejection::InvalidAssertion);
+        }
+        if claims.iss != self.issuer {
+            return Err(Rejection::IssuerMismatch);
+        }
+        let now = now_seconds();
+        if claims.exp <= now {
+            return Err(Rejection::Expired);
+        }
+        if claims.nbf > now {
+            return Err(Rejection::NotYetValid);
         }
         // One config snapshot per verification: a newly added grant is
         // accepted and a revoked grant is rejected before the next request
@@ -387,17 +472,20 @@ impl OriginAuth {
         // or secret is logged or persisted here.
         let (issuer, owner_audience, audiences) =
             eliot_daemon::load_cloud_access_snapshot(&self.data_dir)
-                .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
-        if issuer != self.issuer || owner_audience != self.owner_audience {
-            return Err(StatusCode::UNAUTHORIZED);
+                .map_err(|_| Rejection::ConfigUnavailable)?;
+        if issuer != self.issuer {
+            return Err(Rejection::IssuerMismatch);
+        }
+        if owner_audience != self.owner_audience {
+            return Err(Rejection::AudienceMismatch);
         }
         let mut matches = claims
             .aud
             .iter()
             .filter(|claim_audience| audiences.iter().any(|allowed| allowed == *claim_audience));
-        let selected = matches.next().cloned().ok_or(StatusCode::UNAUTHORIZED)?;
+        let selected = matches.next().cloned().ok_or(Rejection::AudienceMismatch)?;
         if matches.next().is_some() {
-            return Err(StatusCode::UNAUTHORIZED);
+            return Err(Rejection::AudienceMismatch);
         }
         Ok((claims, selected))
     }
@@ -406,26 +494,26 @@ impl OriginAuth {
         &self,
         headers: &mut HeaderMap,
         method: &Method,
-    ) -> Result<VerifiedRequest, StatusCode> {
+    ) -> Result<VerifiedRequest, Rejection> {
         let values = headers
             .get_all("cf-access-jwt-assertion")
             .iter()
             .collect::<Vec<_>>();
         if values.len() != 1 {
-            return Err(StatusCode::UNAUTHORIZED);
+            return Err(Rejection::AssertionHeader);
         }
-        let assertion = values[0].to_str().map_err(|_| StatusCode::UNAUTHORIZED)?;
+        let assertion = values[0].to_str().map_err(|_| Rejection::AssertionHeader)?;
         let (claims, audience) = self.verify(assertion).await?;
         let observed_at = Instant::now();
         let epoch = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .map_err(|_| StatusCode::UNAUTHORIZED)?;
+            .map_err(|_| Rejection::InvalidAssertion)?;
         let remaining = Duration::from_secs(claims.exp)
             .checked_sub(epoch)
-            .ok_or(StatusCode::UNAUTHORIZED)?;
+            .ok_or(Rejection::Expired)?;
         let deadline = observed_at
             .checked_add(remaining)
-            .ok_or(StatusCode::UNAUTHORIZED)?;
+            .ok_or(Rejection::InvalidAssertion)?;
         let identity = RemoteIdentity {
             issuer: self.issuer.clone(),
             audience,
@@ -435,9 +523,9 @@ impl OriginAuth {
             .get("mcp-session-id")
             .map(|v| v.to_str().map(str::to_owned))
             .transpose()
-            .map_err(|_| StatusCode::UNAUTHORIZED)?;
+            .map_err(|_| Rejection::InvalidSession)?;
         if headers.get_all("mcp-session-id").iter().count() > 1 {
-            return Err(StatusCode::UNAUTHORIZED);
+            return Err(Rejection::InvalidSession);
         }
         let (connection_id, lease, slot) = if let Some(id) = &session_id {
             let mut sessions = self.sessions.lock().await;
@@ -445,23 +533,23 @@ impl OriginAuth {
                 .sdk_sessions
                 .has_session(&id.clone().into())
                 .await
-                .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?
+                .map_err(|_| Rejection::SessionUnavailable)?
             {
                 drop(sessions.remove(id));
-                return Err(StatusCode::NOT_FOUND);
+                return Err(Rejection::SessionNotFound);
             }
-            let session = sessions.get_mut(id).ok_or(StatusCode::NOT_FOUND)?;
+            let session = sessions.get_mut(id).ok_or(Rejection::SessionNotFound)?;
             if session.identity != identity {
-                return Err(StatusCode::FORBIDDEN);
+                return Err(Rejection::SessionForbidden);
             }
             if session.lease.current_authorization().is_none() {
-                return Err(StatusCode::NOT_FOUND);
+                return Err(Rejection::SessionNotFound);
             }
             session.lease.extend(claims.exp, deadline);
             (session.connection_id.clone(), session.lease.clone(), None)
         } else {
             if method != Method::POST {
-                return Err(StatusCode::UNAUTHORIZED);
+                return Err(Rejection::InvalidSession);
             }
             // Reclaim a bounded batch before taking a new-session permit.
             // Otherwise a full set of abandoned expired sessions cannot GC.
@@ -470,7 +558,7 @@ impl OriginAuth {
                 .slots
                 .clone()
                 .try_acquire_owned()
-                .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+                .map_err(|_| Rejection::SessionUnavailable)?;
             (
                 ulid::Ulid::new().to_string(),
                 Arc::new(SessionLease::new(claims.exp, deadline)),
@@ -497,7 +585,7 @@ impl OriginAuth {
             mcp_request_id: None,
             expires_at: claims.exp,
         };
-        context.validate().map_err(|_| StatusCode::UNAUTHORIZED)?;
+        context.validate().map_err(|_| Rejection::InvalidSession)?;
         // Refresh the addressed session before reaping, so a valid renewed
         // assertion can continue its existing SDK session after the old expiry.
         if context.session_id.is_some() {
@@ -572,7 +660,7 @@ impl OriginAuth {
         method: &Method,
         status: StatusCode,
         headers: &HeaderMap,
-    ) -> Result<(), StatusCode> {
+    ) -> Result<(), Rejection> {
         let mut sessions = self.sessions.lock().await;
         if let Some(id) = &request.context.session_id
             && matches!(
@@ -592,23 +680,23 @@ impl OriginAuth {
             && request.context.session_id.is_none()
             && let Some(id) = headers.get("mcp-session-id")
         {
-            let id = id.to_str().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+            let id = id.to_str().map_err(|_| Rejection::InvalidSessionResponse)?;
             if id.len() > 256 {
-                return Err(StatusCode::INTERNAL_SERVER_ERROR);
+                return Err(Rejection::InvalidSessionResponse);
             }
             if request.lease.current_authorization().is_none()
                 || !self
                     .sdk_sessions
                     .has_session(&id.to_owned().into())
                     .await
-                    .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?
+                    .map_err(|_| Rejection::SessionUnavailable)?
             {
-                return Err(StatusCode::NOT_FOUND);
+                return Err(Rejection::SessionNotFound);
             }
             let slot = request
                 .slot
                 .clone()
-                .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
+                .ok_or(Rejection::InvalidSessionResponse)?;
             sessions.insert(
                 id.to_owned(),
                 Session {

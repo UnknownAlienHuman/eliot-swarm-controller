@@ -58,6 +58,7 @@ pub use daemon::{
     run_with_agent_mcp_url, verify_explicit_agent_identity, wait_command, wait_terminal,
 };
 pub use daemon::{client_call_with_remote_context, client_call_with_remote_mcp_tool};
+pub use logging::log_origin_rejection;
 pub use platform::data_dir::{
     DataDir, ForeignDataDirAce, data_dir_acl_report, owner_stopped, persist_selected_root,
     resolve_data_dir,
