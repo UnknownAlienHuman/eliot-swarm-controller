@@ -229,6 +229,33 @@ macro_rules! mutate_and_print {
 }
 pub(crate) use mutate_and_print;
 
+/// Read-side twin of [`read_and_print!`] for commands with a typed human
+/// table: fetch and validate exactly once, then print the raw DTO as JSON
+/// or hand the owned DTO to the human renderer. Both branches share the
+/// same validation order, error text, exit codes and stdout as the
+/// previously duplicated inline sequences.
+macro_rules! read_and_print_or_human {
+    ($data_dir:expr, $json_output:expr, $method:literal, $params:expr, $response:ty, $human:expr) => {{
+        let params = $params;
+        params.validate().map_err(Failure::for_read)?;
+        let response: $response = eliot_daemon::client_call_typed($data_dir, $method, &params)
+            .await
+            .map_err(Failure::for_read)?;
+        params
+            .validate_response(&response)
+            .map_err(Failure::invalid_response)?;
+        if $json_output {
+            let result = serde_json::to_value(&response)
+                .map_err(|_| Failure::new(4, concat!($method, " response is invalid")))?;
+            print_value(&result, true);
+        } else {
+            $human(response);
+        }
+        Ok(0)
+    }};
+}
+pub(crate) use read_and_print_or_human;
+
 pub(crate) fn mutation_id(supplied_id: Option<String>) -> Result<String, Failure> {
     let id = match supplied_id {
         Some(id) => {

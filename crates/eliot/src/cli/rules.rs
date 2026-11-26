@@ -156,18 +156,13 @@ pub(crate) async fn run_provider(
     match command {
         ProviderCommand::Holds(ProviderHoldsArgs { after, limit }) => {
             let request = ProviderHoldsRequest { after, limit };
-            request.validate().map_err(Failure::for_read)?;
-            let response: ProviderHoldsResponse =
-                eliot_daemon::client_call_typed(&data_dir, "provider.holds", &request)
-                    .await
-                    .map_err(Failure::for_read)?;
-            request
-                .validate_response(&response)
-                .map_err(Failure::invalid_response)?;
-            let value = serde_json::to_value(response)
-                .map_err(|_| Failure::new(4, "provider.holds response is invalid"))?;
-            print_value(&value, json_output);
-            Ok(0)
+            read_and_print!(
+                &data_dir,
+                json_output,
+                "provider.holds",
+                request,
+                ProviderHoldsResponse
+            )
         }
         ProviderCommand::ClearHold(ProviderClearHoldArgs {
             scope,
