@@ -2781,11 +2781,8 @@ fn native_removal_may_have_begun(preparation: &WorkspacePreparation) -> bool {
 }
 
 pub(crate) fn require_managed_cleanup_path(data_root: &Path, path: &Path) -> Result<()> {
-    let path = crate::platform::script_file::canonical_cleanup_path(path)?;
-    if !crate::platform::script_file::cleanup_canonical_path_in_root(
-        &path,
-        &data_root.join("worktrees"),
-    )? {
+    let path = crate::platform::script_file::CleanupPath::open(path)?;
+    if !path.in_root(&data_root.join("worktrees"))? {
         return Err(problem(
             "worktree_root_foreign",
             "worktree is outside this daemon's managed root",

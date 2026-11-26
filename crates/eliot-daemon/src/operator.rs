@@ -201,12 +201,36 @@ pub fn daemon_info(path: &Path) -> Result<Option<DaemonInfo>> {
 }
 
 pub fn lock_offline(path: &Path) -> Result<DaemonLock> {
-    DataDir::open_existing(path)?.acquire_daemon_lock()
+    DataDir::open_existing(path)?.acquire_offline_daemon_lock()
 }
 
 pub fn lock_transition(path: &Path) -> Result<OperatorLock> {
     DataDir::open_existing(path)?.acquire_operator_lock(true)
 }
+
+/// Hold the Windows fence across removal even after daemon.lock is closed.
+pub struct StandRemovalLock {
+    path: PathBuf,
+    #[cfg(windows)]
+    _start_removal: OperatorLock,
+}
+
+impl StandRemovalLock {
+    pub fn lock_offline(&self) -> Result<DaemonLock> {
+        DataDir::open_existing(&self.path)?.acquire_daemon_lock()
+    }
+}
+
+pub fn lock_stand_removal(path: &Path) -> Result<StandRemovalLock> {
+    Ok(StandRemovalLock {
+        path: path.to_owned(),
+        #[cfg(windows)]
+        _start_removal: crate::platform::windows::acquire_start_removal_event(path)?,
+    })
+}
+
+#[cfg(windows)]
+pub use crate::stand_cleanup::resume_empty_stand_removal;
 
 pub fn create_stand_root(path: &Path) -> Result<()> {
     crate::platform::data_dir::refuse_unverified_write(path)?;

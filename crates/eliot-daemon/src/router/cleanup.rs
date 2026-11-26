@@ -3,7 +3,7 @@ use super::*;
 use crate::git_monitor::GitBinding;
 #[cfg(windows)]
 use crate::platform::script_file::CleanupTree;
-use crate::platform::script_file::{Directory, directory_identity};
+use crate::platform::script_file::{CleanupPath, Directory, directory_identity};
 use crate::workspace_git::containment::{BranchClassification, classify_branch};
 use eliot_core::FailureOrigin;
 use eliot_core::api::*;
@@ -56,18 +56,22 @@ impl CleanupRemoval {
 
 #[cfg(windows)]
 async fn open_cleanup_tree(
-    path: PathBuf,
+    path: CleanupPath,
     budget: Duration,
     cargo_links: bool,
 ) -> Result<CleanupTree> {
     let deadline = std::time::Instant::now() + budget;
     let retry_until = Instant::now() + budget.min(Duration::from_secs(2));
+    let (parent, path) = path.into_parent()?;
+    let parent = std::sync::Arc::new(parent);
     loop {
         let path = path.clone();
-        let result =
-            tokio::task::spawn_blocking(move || CleanupTree::open(&path, deadline, cargo_links))
-                .await
-                .map_err(|_| Error::new("internal", "cleanup scan worker did not settle"))?;
+        let parent = parent.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            CleanupTree::open(parent, &path, deadline, cargo_links)
+        })
+        .await
+        .map_err(|_| Error::new("internal", "cleanup scan worker did not settle"))?;
         if !result.as_ref().is_err_and(|error| error.code == "busy")
             || Instant::now() >= retry_until
         {
@@ -2534,13 +2538,19 @@ impl Router {
         let path = self
             .checked_cleanup_artifact_path(&agent, artifact, false)
             .await?;
-        require_same_cleanup_path(owned_path.as_deref(), &path)?;
+        let owned_path = require_same_cleanup_path(owned_path, &path)?;
         self.cleanup_check_git(&agent, &path, artifact.is_owned_cleanup_child())
             .await?;
         if is_stand_artifact(artifact) {
+            if !cfg!(windows) {
+                return Err(Error::new(
+                    "unsupported",
+                    "handle deletion is unavailable on this platform",
+                ));
+            }
             return crate::stand_cleanup::plan_stand_artifact(
                 &self.inner.data_root,
-                &path,
+                owned_path.path(),
                 &artifact.identity,
             )
             .await
@@ -2549,7 +2559,10 @@ impl Router {
         #[cfg(windows)]
         {
             let tree =
-                open_cleanup_tree(path, scan_budget, is_cargo_target_artifact(artifact)).await?;
+                open_cleanup_tree(owned_path, scan_budget, is_cargo_target_artifact(artifact))
+                    .await?;
+            // The leaf was reopened by name under the held parent. Verify
+            // the reopened directory against the retained artifact identity.
             if tree.identity != artifact.identity {
                 return Err(Error::new(
                     "identity_changed",
@@ -2580,7 +2593,7 @@ impl Router {
         }
         #[cfg(not(windows))]
         {
-            let _ = (path, scan_budget);
+            let _ = (owned_path, scan_budget);
             Err(Error::new(
                 "unsupported",
                 "handle deletion is unavailable on this platform",
@@ -2916,6 +2929,12 @@ impl Router {
             ));
         }
         if let Some((missing, parent)) = self.observe_cleanup_directory_absence(artifact)? {
+            if item.reason != "already_absent" && missing != Path::new(&artifact.path) {
+                return Err(Error::new(
+                    "identity_changed",
+                    "artifact ancestor disappeared after planning",
+                ));
+            }
             let absence_deadline = Instant::now() + CLEANUP_ABSENCE_OBSERVATION_BUDGET;
             {
                 let store = self.inner.store.lock().await;
@@ -2957,6 +2976,18 @@ impl Router {
                 "artifact directory reappeared after planning",
             ));
         }
+        if is_stand_artifact(artifact) {
+            if !cfg!(windows) {
+                return Err(Error::new(
+                    "unsupported",
+                    "handle deletion is unavailable on this platform",
+                ));
+            }
+            owned_path
+                .as_ref()
+                .ok_or_else(|| Error::new("identity_changed", "stand directory is no longer held"))?
+                .require_identity(&artifact.identity)?;
+        }
         let agent = self
             .inner
             .store
@@ -2967,7 +2998,7 @@ impl Router {
         let path = self
             .checked_cleanup_artifact_path(&agent, artifact, true)
             .await?;
-        require_same_cleanup_path(owned_path.as_deref(), &path)?;
+        let owned_path = require_same_cleanup_path(owned_path, &path)?;
         self.cleanup_check_git(&agent, &path, artifact.is_owned_cleanup_child())
             .await?;
         if is_stand_artifact(artifact) {
@@ -2986,7 +3017,7 @@ impl Router {
             }
             return crate::stand_cleanup::apply_stand_artifact(
                 &self.inner.data_root,
-                &path,
+                owned_path,
                 &artifact.identity,
             )
             .await
@@ -2995,7 +3026,7 @@ impl Router {
         #[cfg(windows)]
         {
             let tree = open_cleanup_tree(
-                path,
+                owned_path,
                 Duration::from_secs(120),
                 is_cargo_target_artifact(artifact),
             )
@@ -3050,7 +3081,7 @@ impl Router {
         }
         #[cfg(not(windows))]
         {
-            let _ = path;
+            let _ = owned_path;
             Err(Error::new(
                 "unsupported",
                 "handle deletion is unavailable on this platform",
@@ -4129,14 +4160,13 @@ fn cleanup_operation_failed(code: &str) -> bool {
     )
 }
 
-fn require_same_cleanup_path(owned_path: Option<&Path>, checked: &Path) -> Result<()> {
-    if owned_path != Some(checked) {
-        return Err(Error::new(
+fn require_same_cleanup_path(owned: Option<CleanupPath>, checked: &Path) -> Result<CleanupPath> {
+    owned.filter(|path| path.path() == checked).ok_or_else(|| {
+        Error::new(
             "identity_changed",
             "cleanup path changed after custody verification",
-        ));
-    }
-    Ok(())
+        )
+    })
 }
 
 fn cleanup_plan_refusal(candidate: &mut CleanupCandidate, bulk: bool, error: Error) {

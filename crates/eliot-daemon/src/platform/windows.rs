@@ -131,6 +131,37 @@ pub(crate) fn acquire_operator_event(data_dir: &Path) -> Result<OwnedHandle> {
     })
 }
 
+/// Shared by the daemon process itself and stand teardown, including when
+/// the last directory disposition has already made the root absent.
+pub(crate) fn acquire_start_removal_event(data_dir: &Path) -> Result<OwnedHandle> {
+    let path = crate::daemon::normalize_identity_data_dir(data_dir);
+    for prefix in path.ancestors() {
+        let mut canonical = match fs::canonicalize(prefix) {
+            Ok(canonical) => canonical,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(io_error("resolve daemon startup root", error)),
+        };
+        let suffix = path
+            .strip_prefix(prefix)
+            .expect("prefix comes from ancestors");
+        if !suffix.as_os_str().is_empty() {
+            canonical.push(suffix);
+        }
+        let hash = crate::daemon::identity_data_scope(&canonical);
+        return try_acquire_global_event(&format!(r"Global\EliotSwarmStartRemoval.{hash}"))?
+            .ok_or_else(|| {
+                Error::new(
+                    "operator_busy",
+                    "daemon startup or stand removal is in progress",
+                )
+            });
+    }
+    Err(Error::new(
+        "unavailable",
+        "daemon startup root has no existing ancestor",
+    ))
+}
+
 fn try_acquire_global_event(name: &str) -> Result<Option<OwnedHandle>> {
     let name: Vec<u16> = name.encode_utf16().chain([0]).collect();
     let descriptor = private_security_descriptor(false)?;

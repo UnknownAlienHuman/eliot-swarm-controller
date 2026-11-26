@@ -12,10 +12,10 @@ use eliot_daemon::operator::{
     check_directory_chain, check_nested_roots, cleanup_stand_external_git, create_stand_root,
     daemon_alive, daemon_info, data_dirs_match, ensure_registry_is_external,
     inherited_agent_parent_data_dir, list_stand_registrations, locate_stand_registration,
-    lock_offline, lock_transition, parse_stand_ttl_ms, read_stand_registration, registry_name,
-    remove_offline_stand_root, remove_stand_registration, settle_former_registration, stand_base,
-    stand_now_ms, stand_registry, verify_stand_marker, verify_stand_target,
-    write_stand_registration,
+    lock_stand_removal, lock_transition, parse_stand_ttl_ms, read_stand_registration,
+    registry_name, remove_offline_stand_root, remove_stand_registration,
+    settle_former_registration, stand_base, stand_now_ms, stand_registry, verify_stand_marker,
+    verify_stand_target, write_stand_registration,
 };
 use serde_json::{Value, json};
 use std::fs::{self, File};
@@ -437,27 +437,31 @@ async fn down_inner(path: &Path) -> Result<DownOutcome, Failure> {
     let reg_name = registry_name(&root);
     let located = locate_stand_registration(&root).map_err(Failure::for_read)?;
     ensure_registry_is_external(&root, &located.registry).map_err(Failure::for_read)?;
+    let removal = lock_stand_removal(&root).map_err(Failure::for_read)?;
     let mut record = located.record.clone();
+    let finish_removed = |record: &StandRegistration| -> Result<DownOutcome, Failure> {
+        remove_stand_registration(&located.registry, &reg_name).map_err(Failure::for_read)?;
+        Ok(DownOutcome {
+            state: "removed",
+            data_dir: display(&root),
+            daemon_pid: record.removing_pid.filter(|pid| *pid != 0),
+            force_blocker: None,
+            external_worktrees: Vec::new(),
+            external_branches: Vec::new(),
+            unusable_records: Vec::new(),
+            former_registration: located.former.then(|| {
+                (
+                    "removed".to_owned(),
+                    located.registry.join(&reg_name).display().to_string(),
+                )
+            }),
+        })
+    };
     match fs::symlink_metadata(&root) {
         Err(error)
             if error.kind() == std::io::ErrorKind::NotFound && record.removing_pid.is_some() =>
         {
-            remove_stand_registration(&located.registry, &reg_name).map_err(Failure::for_read)?;
-            return Ok(DownOutcome {
-                state: "removed",
-                data_dir: display(&root),
-                daemon_pid: record.removing_pid.filter(|pid| *pid != 0),
-                force_blocker: None,
-                external_worktrees: Vec::new(),
-                external_branches: Vec::new(),
-                unusable_records: Vec::new(),
-                former_registration: located.former.then(|| {
-                    (
-                        "removed".to_owned(),
-                        located.registry.join(&reg_name).display().to_string(),
-                    )
-                }),
-            });
+            return finish_removed(&record);
         }
         Err(error) => return Err(io_failure("inspect stand root", error)),
         Ok(_) => {}
@@ -470,6 +474,12 @@ async fn down_inner(path: &Path) -> Result<DownOutcome, Failure> {
         read_stand_registration(&located.registry, &reg_name, &root).map_err(Failure::for_read)?;
     verify_stand_marker(&root, &record).map_err(Failure::for_read)?;
     verify_stand_target(&root, &record).map_err(Failure::for_read)?;
+    #[cfg(windows)]
+    if eliot_daemon::operator::resume_empty_stand_removal(&root, &record)
+        .map_err(Failure::for_read)?
+    {
+        return finish_removed(&record);
+    }
     let read_only_copy = read_only_copy_store(&root)? || record.removing_pid == Some(0);
     if read_only_copy && record.removing_pid.is_some_and(|pid| pid != 0) {
         return Err(Failure::new(
@@ -487,7 +497,7 @@ async fn down_inner(path: &Path) -> Result<DownOutcome, Failure> {
         };
         (Some(pid), blocker)
     };
-    let offline = lock_offline(&root).map_err(Failure::for_read)?;
+    let offline = removal.lock_offline().map_err(Failure::for_read)?;
     verify_stand_marker(&root, &record).map_err(Failure::for_read)?;
     verify_stand_target(&root, &record).map_err(Failure::for_read)?;
     let current_daemon = daemon_info(&root).map_err(Failure::for_read)?;

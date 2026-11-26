@@ -3,10 +3,12 @@
 use crate::common::now_ms;
 use crate::git_monitor::{GitProbe, canonical_root, reject_links};
 use crate::operator::{
-    DaemonLock, create_stand_root, daemon_alive, daemon_info, lock_offline, lock_transition,
+    DaemonLock, create_stand_root, daemon_alive, daemon_info, lock_stand_removal, lock_transition,
     validate_stand_directory, write_stand_record,
 };
-use crate::platform::script_file::directory_identity;
+use crate::platform::script_file::{CleanupPath, Directory, directory_identity};
+#[cfg(windows)]
+use crate::platform::script_file::{CleanupTree, remove_cleanup_file, remove_guarded_cleanup_file};
 use crate::platform::{OwnedChild, is_reparse_point, worktree_guard::WorktreeWriteGuard};
 use crate::workspace_git::{RemovalBranch, WorkspaceGit, containment::branch_rev_parse};
 use eliot_core::api::{CleanupGitBinding, MAX_ARTIFACT_TTL_MS};
@@ -1005,13 +1007,15 @@ pub fn stand_key_root(path: &Path) -> Result<PathBuf> {
 /// the held root. `stand up` holds one from creation through the owner bind.
 pub struct PinnedStandRoot {
     root: PathBuf,
-    dir: crate::platform::script_file::Directory,
+    dir: Directory,
     identity: String,
+    #[cfg(windows)]
+    marker_identity: Option<eliot_plugin::FileIdentity>,
 }
 
 impl PinnedStandRoot {
     pub fn open(root: &Path) -> Result<Self> {
-        let dir = crate::platform::script_file::Directory::open(root).map_err(|_| {
+        let dir = Directory::open(root).map_err(|_| {
             Error::new(
                 "not_allowed",
                 "stand root must be a plain directory chain without links or reparse points",
@@ -1022,6 +1026,8 @@ impl PinnedStandRoot {
             root: root.to_owned(),
             dir,
             identity,
+            #[cfg(windows)]
+            marker_identity: None,
         })
     }
 
@@ -1032,34 +1038,49 @@ impl PinnedStandRoot {
 
     /// Dispose of an exclusively created stand before it is ever started.
     pub fn discard_unstarted(self) -> std::io::Result<()> {
-        let parent = self.root.parent().ok_or(std::io::ErrorKind::InvalidInput)?;
-        let parent =
-            crate::platform::script_file::Directory::open(parent).map_err(std::io::Error::other)?;
-        let Self { root, dir, .. } = self;
-        drop(dir);
-        crate::router::remove_dir_all(&parent, &root)
+        #[cfg(windows)]
+        return self.remove_tree(None, None).map_err(std::io::Error::other);
+        #[cfg(not(windows))]
+        {
+            let parent = self.root.parent().ok_or(std::io::ErrorKind::InvalidInput)?;
+            let parent = Directory::open(parent).map_err(std::io::Error::other)?;
+            let Self { root, dir, .. } = self;
+            drop(dir);
+            crate::router::remove_dir_all(&parent, &root)
+        }
     }
 
-    /// Read `name` relative to the held root; `None` when it does not exist.
-    fn read(&self, name: &str) -> Result<Option<Vec<u8>>> {
+    #[cfg(windows)]
+    fn remove_tree(self, scratch_git: Option<&str>, offline: Option<DaemonLock>) -> Result<()> {
+        let deadline = std::time::Instant::now() + Duration::from_secs(120);
+        CleanupTree::open_stand(
+            self.dir,
+            self.marker_identity,
+            scratch_git,
+            offline,
+            deadline,
+        )?
+        .remove(|| false)
+        .map(|_| ())
+    }
+
+    /// Open `name` relative to the held root; `None` when it does not exist.
+    fn file(&self, name: &str) -> Result<Option<File>> {
         if fs::symlink_metadata(self.root.join(name))
             .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
         {
             return Ok(None);
         }
-        let mut file = self.dir.file(name).map_err(|_| {
+        self.dir.file(name).map(Some).map_err(|_| {
             Error::new(
                 "not_allowed",
                 "stand file must be a plain single-link file inside the held root",
             )
-        })?;
-        crate::platform::script_file::read(&mut file).map(Some)
+        })
     }
 }
 
-/// Open the stand root by handle and prove it is the exact directory `stand
-/// up` created and marked for `registration`. Returns the held root.
-fn pinned_stand_root(root: &Path, registration: &StandRegistration) -> Result<PinnedStandRoot> {
+fn registered_stand_root(root: &Path, registration: &StandRegistration) -> Result<PinnedStandRoot> {
     let pinned = PinnedStandRoot::open(root)?;
     let expected = registration.root_identity.as_deref().ok_or_else(|| {
         Error::new(
@@ -1073,28 +1094,68 @@ fn pinned_stand_root(root: &Path, registration: &StandRegistration) -> Result<Pi
             "stand root is not the directory stand up created",
         ));
     }
-    let marker = pinned
-        .read(STAND_MARKER)?
-        .and_then(|bytes| serde_json::from_slice::<StandMarker>(&bytes).ok())
-        .filter(|marker| {
-            marker.format == registration.marker.format
-                && marker.root == registration.marker.root
-                && marker.token == registration.marker.token
-        });
-    if marker.is_none() {
-        return Err(Error::new(
+    Ok(pinned)
+}
+
+/// Prove the held directory and marker are the ones `stand up` registered.
+fn pinned_stand_root(root: &Path, registration: &StandRegistration) -> Result<PinnedStandRoot> {
+    let pinned = registered_stand_root(root, registration)?;
+    let marker_changed = || {
+        Error::new(
             "identity_changed",
             "stand ownership marker does not match the external registration",
+        )
+    };
+    let mut file = pinned.file(STAND_MARKER)?.ok_or_else(marker_changed)?;
+    let bytes = crate::platform::script_file::read(&mut file)?;
+    let marker = serde_json::from_slice::<StandMarker>(&bytes).map_err(|_| marker_changed())?;
+    if marker.format != registration.marker.format
+        || marker.root != registration.marker.root
+        || marker.token != registration.marker.token
+    {
+        return Err(marker_changed());
+    }
+    #[cfg(windows)]
+    let pinned = PinnedStandRoot {
+        marker_identity: Some(eliot_plugin::file_identity(&file).map_err(|_| marker_changed())?),
+        ..pinned
+    };
+    Ok(pinned)
+}
+
+/// Finish the last disposition of an interrupted removal. The caller holds
+/// the startup and operator guards and has verified the stand target.
+#[cfg(windows)]
+pub fn resume_empty_stand_removal(root: &Path, registration: &StandRegistration) -> Result<bool> {
+    if registration.removing_pid.is_none()
+        || !fs::symlink_metadata(root.join(STAND_MARKER))
+            .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+    {
+        return Ok(false);
+    }
+    let pinned = registered_stand_root(root, registration)?;
+    if pinned
+        .dir
+        .entries()
+        .map_err(registry_remove_io)?
+        .next()
+        .is_some()
+    {
+        return Err(Error::new(
+            "identity_changed",
+            "markerless stand is not empty",
         ));
     }
-    Ok(pinned)
+    pinned.dir.remove_empty()?;
+    Ok(true)
 }
 
 impl PinnedStandRoot {
     /// The owner token read from the held root, if minted.
     fn owner_token(&self) -> Result<Option<String>> {
-        self.read("owner.token")?
-            .map(|bytes| {
+        self.file("owner.token")?
+            .map(|mut file| {
+                let bytes = crate::platform::script_file::read(&mut file)?;
                 String::from_utf8(bytes)
                     .map(|token| token.trim().to_owned())
                     .map_err(|_| Error::new("not_allowed", "stand owner token is not UTF-8"))
@@ -1289,26 +1350,57 @@ fn unusable_worktree_records(registry: &Path, registry_file: &str) -> Result<Vec
 
 /// Remove the external registration and its worktree records after the
 /// stand root is gone.
+#[cfg(windows)]
 pub fn remove_stand_registration(registry: &Path, registry_file: &str) -> Result<()> {
-    let io_fail = |error: std::io::Error| {
-        Error::new("platform_io", format!("remove stand registration: {error}"))
-    };
+    let registry = Directory::open(registry)?;
+    let records = worktree_records_dir(&registry.path, registry_file);
+    match fs::symlink_metadata(&records) {
+        Ok(_) => {
+            let directory = Directory::open(&records)?;
+            for entry in directory.entries().map_err(registry_remove_io)? {
+                let name = entry.map_err(registry_remove_io)?.file_name();
+                if let Some(file) = directory.open_cleanup_file(&name)? {
+                    remove_cleanup_file(file)?;
+                }
+            }
+            directory.remove_empty()?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(registry_remove_io(error)),
+    }
+    if let Some(file) = registry.open_cleanup_file(registry_file.as_ref())? {
+        remove_cleanup_file(file)?;
+    }
+    Ok(())
+}
+
+fn registry_remove_io(error: std::io::Error) -> Error {
+    Error::new("platform_io", format!("remove stand registration: {error}"))
+}
+
+#[cfg(not(windows))]
+pub fn remove_stand_registration(registry: &Path, registry_file: &str) -> Result<()> {
     let dir = worktree_records_dir(registry, registry_file);
     if let Ok(entries) = fs::read_dir(&dir) {
         for entry in entries {
-            let path = entry.map_err(io_fail)?.path();
-            if !fs::symlink_metadata(&path).map_err(io_fail)?.is_file() {
+            let path = entry.map_err(registry_remove_io)?.path();
+            if !fs::symlink_metadata(&path)
+                .map_err(registry_remove_io)?
+                .is_file()
+            {
                 return Err(Error::new(
                     "not_allowed",
                     "stand worktree records contain an unexpected entry",
                 ));
             }
-            fs::remove_file(path).map_err(io_fail)?;
+            fs::remove_file(path).map_err(registry_remove_io)?;
         }
-        fs::remove_dir(&dir).map_err(io_fail)?;
+        fs::remove_dir(&dir).map_err(registry_remove_io)?;
     }
     match fs::remove_file(registry.join(registry_file)) {
-        Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(io_fail(error)),
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+            Err(registry_remove_io(error))
+        }
         _ => Ok(()),
     }
 }
@@ -1354,7 +1446,26 @@ pub fn check_nested_roots(root: &Path) -> Result<()> {
 
 pub fn remove_offline_stand_root(root: &Path, offline: DaemonLock) -> Result<()> {
     let registration = locate_stand_registration(root)?.record;
-    let pinned = pinned_stand_root(root, &registration)?;
+    remove_pinned_offline_stand_root(pinned_stand_root(root, &registration)?, offline, None)
+}
+
+#[cfg(windows)]
+fn remove_pinned_offline_stand_root(
+    pinned: PinnedStandRoot,
+    offline: DaemonLock,
+    scratch_git: Option<&str>,
+) -> Result<()> {
+    pinned.remove_tree(scratch_git, Some(offline))
+}
+
+#[cfg(not(windows))]
+fn remove_pinned_offline_stand_root(
+    pinned: PinnedStandRoot,
+    offline: DaemonLock,
+    _scratch_git: Option<&str>,
+) -> Result<()> {
+    // This path-based teardown is compiled only outside Windows.
+    let root = &pinned.root;
     let io_fail = |error| {
         Error::new(
             "platform_io",
@@ -1390,7 +1501,7 @@ pub fn remove_offline_stand_root(root: &Path, offline: DaemonLock) -> Result<()>
             Err(error) => return Err(io_fail(error)),
         }
     }
-    drop(pinned);
+    drop(pinned.dir);
     fs::remove_dir(root).map_err(io_fail)
 }
 
@@ -1616,12 +1727,22 @@ async fn worktree_present_or_registered(
     Ok(keys.contains(&external_worktree_key(&rec.preparation.worktree_path)))
 }
 
+#[cfg(windows)]
+struct StandScratchFile {
+    _parent: Directory,
+    file: File,
+}
+
+#[cfg(not(windows))]
+type StandScratchFile = PathBuf;
+
 fn checked_stand_scratch_file(
     stand_root: &Path,
     preparation: &WorkspacePreparation,
     scratch: &[String],
     candidate: &Path,
-) -> Result<PathBuf> {
+    #[cfg(windows)] guard: &WorktreeWriteGuard,
+) -> Result<StandScratchFile> {
     let managed = fs::canonicalize(stand_root.join("worktrees"))
         .map_err(|_| Error::new("not_allowed", "stand worktree root unavailable"))?;
     let workspace = canonical_root(&preparation.worktree_path)?;
@@ -1639,17 +1760,43 @@ fn checked_stand_scratch_file(
             "scratch file is outside its stand worktree",
         ));
     }
-    reject_links(candidate)?;
-    let metadata = fs::symlink_metadata(candidate)
-        .map_err(|_| Error::new("unknown", "scratch file cannot be inspected"))?;
-    if !metadata.file_type().is_file() || is_reparse_point(&metadata) {
-        return Err(Error::new(
-            "invalid",
-            "scratch candidate is not a regular file",
-        ));
-    }
-    let file = fs::canonicalize(candidate)
-        .map_err(|_| Error::new("unknown", "scratch file cannot be resolved"))?;
+    #[cfg(windows)]
+    let (pinned, file) = {
+        let parent = Directory::open(
+            candidate
+                .parent()
+                .ok_or_else(|| Error::new("invalid", "scratch file has no parent"))?,
+        )?;
+        let name = candidate
+            .file_name()
+            .ok_or_else(|| Error::new("invalid", "scratch file has no name"))?;
+        let file = parent
+            .open_guarded_cleanup_file(name)?
+            .ok_or_else(|| Error::new("unknown", "scratch file cannot be inspected"))?;
+        let path = eliot_plugin::file_final_path(&file)
+            .map_err(|_| Error::new("unknown", "scratch file cannot be resolved"))?;
+        (
+            StandScratchFile {
+                _parent: parent,
+                file,
+            },
+            path,
+        )
+    };
+    #[cfg(not(windows))]
+    let file = {
+        reject_links(candidate)?;
+        let metadata = fs::symlink_metadata(candidate)
+            .map_err(|_| Error::new("unknown", "scratch file cannot be inspected"))?;
+        if !metadata.file_type().is_file() || is_reparse_point(&metadata) {
+            return Err(Error::new(
+                "invalid",
+                "scratch candidate is not a regular file",
+            ));
+        }
+        fs::canonicalize(candidate)
+            .map_err(|_| Error::new("unknown", "scratch file cannot be resolved"))?
+    };
     if !file.starts_with(&workspace) || file == workspace {
         return Err(Error::new(
             "not_allowed",
@@ -1665,6 +1812,18 @@ fn checked_stand_scratch_file(
             && file != root
             && file.starts_with(&root)
         {
+            #[cfg(windows)]
+            {
+                let relative = file
+                    .strip_prefix(&workspace)
+                    .ok()
+                    .and_then(Path::to_str)
+                    .ok_or_else(|| Error::new("not_allowed", "scratch file escaped its worktree"))?
+                    .replace('\\', "/");
+                guard.require_entry_identity(&relative, &pinned.file)?;
+                return Ok(pinned);
+            }
+            #[cfg(not(windows))]
             return Ok(file);
         }
     }
@@ -1994,7 +2153,7 @@ async fn cleanup_stand_external_git_with_policy(
             stand_root,
             &git,
             rec,
-            &mut guard,
+            &guard,
             deadline,
             require_merged,
         ))
@@ -2222,14 +2381,25 @@ async fn remove_guarded_stand_worktree(
     stand_root: &Path,
     git: &WorkspaceGit,
     rec: &StandWorkspaceRecord,
-    _guard: &mut WorktreeWriteGuard,
+    guard: &WorktreeWriteGuard,
     deadline: Instant,
     require_merged: bool,
 ) -> GuardedOutcome {
+    #[cfg(not(windows))]
+    let _ = guard;
     let scratch = if require_merged {
         &[][..]
     } else {
         rec.scratch.as_slice()
+    };
+    #[cfg(windows)]
+    let scratch_worktree = if scratch.is_empty() {
+        None
+    } else {
+        match Directory::open(Path::new(&rec.preparation.worktree_path)) {
+            Ok(directory) => Some(directory),
+            Err(error) => return GuardedOutcome::Kept(error.code),
+        }
     };
     let (tip, files) = match timeout_at(
         deadline,
@@ -2256,6 +2426,8 @@ async fn remove_guarded_stand_worktree(
             &rec.preparation,
             &rec.scratch,
             &candidate,
+            #[cfg(windows)]
+            guard,
         ) {
             Ok(file) => file,
             Err(error) => {
@@ -2270,7 +2442,14 @@ async fn remove_guarded_stand_worktree(
             }
         };
         mutated = true;
-        if fs::remove_file(&verified).is_err() {
+        #[cfg(windows)]
+        let removed = {
+            let StandScratchFile { _parent, file } = verified;
+            remove_guarded_cleanup_file(file).is_ok()
+        };
+        #[cfg(not(windows))]
+        let removed = fs::remove_file(&verified).is_ok();
+        if !removed {
             return GuardedOutcome::Unknown {
                 code: "workspace_scratch_delete_unknown".to_owned(),
                 leave_guard_active: false,
@@ -2278,6 +2457,10 @@ async fn remove_guarded_stand_worktree(
         }
     }
 
+    #[cfg(windows)]
+    drop(scratch_worktree);
+    // Git owns reciprocal worktree metadata. Use its guarded, non-force
+    // removal command after disposing of admitted scratch files by handle.
     let command = match timeout_at(
         deadline,
         Box::pin(git.prepare_stand_worktree_remove(&rec.preparation, &tip, deadline)),
@@ -2436,13 +2619,14 @@ fn require_stand_cleanup_custody_closed(stand_root: &Path) -> Result<()> {
     Ok(())
 }
 
-async fn require_empty_stand_scratch(stand_root: &Path) -> Result<()> {
+async fn require_empty_stand_scratch(stand_root: &Path) -> Result<Option<Directory>> {
     if crate::operator::read_only_stand_exists(stand_root)? {
-        return Ok(());
+        return Ok(None);
     }
     let scratch = stand_root.join("repo");
     check_directory_chain(&scratch)?;
     reject_links(&scratch.join(".git"))?;
+    let git = Directory::open(&scratch.join(".git"))?;
     let probe = GitProbe::new()?;
     let deadline = Instant::now() + Duration::from_secs(5);
     for (args, expected) in [
@@ -2469,7 +2653,7 @@ async fn require_empty_stand_scratch(stand_root: &Path) -> Result<()> {
             ));
         }
     }
-    Ok(())
+    Ok(Some(git))
 }
 
 pub(crate) async fn plan_stand_artifact(
@@ -2507,34 +2691,31 @@ pub(crate) async fn plan_stand_artifact(
 
 pub(crate) async fn apply_stand_artifact(
     daemon_data_root: &Path,
-    stand_root: &Path,
+    owned_path: CleanupPath,
     expected_identity: &str,
 ) -> Result<u64> {
-    if directory_identity(stand_root)? != expected_identity {
+    if !cfg!(windows) {
         return Err(Error::new(
-            "identity_changed",
-            "stand directory identity changed",
+            "unsupported",
+            "handle deletion is unavailable on this platform",
         ));
     }
+    let stand_root = owned_path.path();
     check_directory_chain(stand_root)?;
     check_nested_roots(stand_root)?;
     let registry = stand_registry(false)?;
     ensure_registry_is_external(stand_root, &registry)?;
     let reg_name = registry_name(stand_root);
-    let _transition = lock_transition(stand_root)?;
+    let transition = lock_transition(stand_root)?;
+    let removal = lock_stand_removal(stand_root)?;
     let mut registration = read_stand_registration(&registry, &reg_name, stand_root)?;
     verify_stand_marker(stand_root, &registration)?;
     refuse_parent_root(daemon_data_root, stand_root)?;
     crate::operator::verify_stand_target(stand_root, &registration)?;
     let pid = verify_stand_stopped(stand_root, &registration)?.unwrap_or_default();
-    let offline = lock_offline(stand_root)?;
+    let offline = removal.lock_offline()?;
     check_directory_chain(stand_root)?;
-    if directory_identity(stand_root)? != expected_identity {
-        return Err(Error::new(
-            "identity_changed",
-            "stand directory identity changed",
-        ));
-    }
+    owned_path.require_identity(expected_identity)?;
     registration = read_stand_registration(&registry, &reg_name, stand_root)?;
     verify_stand_marker(stand_root, &registration)?;
     crate::operator::verify_stand_target(stand_root, &registration)?;
@@ -2548,7 +2729,7 @@ pub(crate) async fn apply_stand_artifact(
         ));
     }
     require_stand_cleanup_custody_closed(stand_root)?;
-    require_empty_stand_scratch(stand_root).await?;
+    let scratch_git = require_empty_stand_scratch(stand_root).await?;
     let bytes = stand_tree_bytes(stand_root)?;
     Box::pin(plan_external_git(
         stand_root,
@@ -2569,10 +2750,26 @@ pub(crate) async fn apply_stand_artifact(
         let (code, detail) = report.first_blocker_reason();
         return Err(Error::new(code, detail));
     }
+    let pinned = pinned_stand_root(stand_root, &registration)?;
+    if pinned.identity() != expected_identity {
+        return Err(Error::new(
+            "identity_changed",
+            "stand directory identity changed",
+        ));
+    }
+    let scratch_identity = scratch_git.as_ref().map(Directory::identity).transpose()?;
     registration.removing_pid = Some(pid);
     write_stand_registration(&registry, &reg_name, &registration)?;
-    remove_offline_stand_root(stand_root, offline)?;
-    remove_stand_registration(&registry, &reg_name)?;
+    drop(scratch_git);
+    drop(owned_path);
+    tokio::task::spawn_blocking(move || {
+        let _transition = transition;
+        let _removal = removal;
+        remove_pinned_offline_stand_root(pinned, offline, scratch_identity.as_deref())?;
+        remove_stand_registration(&registry, &reg_name)
+    })
+    .await
+    .map_err(|_| Error::new("unknown", "stand deletion worker did not settle"))??;
     Ok(bytes)
 }
 

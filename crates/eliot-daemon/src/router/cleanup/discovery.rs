@@ -349,9 +349,7 @@ impl Router {
         let root = self.verify_discovery_root(&root).await?;
         let source = Path::new(&artifact.path);
         validate_cleanup_path(source)?;
-        // Hold the original path against renames while normalizing it. The
-        // cleanup tree opens the normalized path again without following links
-        // and checks its pinned identity before the first disposition.
+        // Hold the original path against renames while normalizing it.
         let directory = Directory::open(source)?;
         let identity = directory.identity()?;
         let canonical = source.canonicalize().map_err(discovery_io)?;

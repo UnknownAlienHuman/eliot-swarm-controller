@@ -49,7 +49,7 @@ fn open_offline(path: &Path) -> Result<(DataDir, DaemonLock, SecretPolicy)> {
         ));
     }
     let root = DataDir::open_existing(path)?;
-    let lock = root.acquire_daemon_lock()?;
+    let lock = root.acquire_offline_daemon_lock()?;
     let policy = SecretPolicy::new([root.read_owner_token()?]);
     Ok((root, lock, policy))
 }
