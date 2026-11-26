@@ -15,7 +15,7 @@ use eliot_core::requests::{
     AnswerArgs, ApprovalChoice, ApprovalDecision, ApprovalRequest, Question, QuestionKind,
     QuestionOption, QuestionRequest,
 };
-use eliot_core::{Error, Result};
+use eliot_core::{Error, PendingRequest, Result};
 use serde_json::{Map, Value};
 
 use crate::native::types::{FormInfo, PermissionRequest};
@@ -25,7 +25,7 @@ use crate::native::types::{FormInfo, PermissionRequest};
 /// shared QuestionRequest. Native binding and offers stay private in the
 /// pending entry; every initial, refresh and reopen branch publishes
 /// through this projection.
-pub(crate) fn public_request_view(request: &CorePending) -> Result<(String, Value)> {
+pub(crate) fn public_request_view(request: &PendingRequest) -> Result<(String, Value)> {
     let details = request.details.as_object().ok_or_else(|| {
         Error::new(
             "source_integrity",
@@ -137,17 +137,6 @@ fn public_question_details(details: &Map<String, Value>) -> Result<Value> {
         .map_err(|_| Error::new("internal", "question public details could not be encoded"))
 }
 
-/// Native request metadata returned to the EventProcessor for durable
-/// opening. `details` carries the offered decision data the owner decides
-/// from (raw native JSON, validated structurally first).
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) struct CorePending {
-    pub id: String,
-    pub turn_id: String,
-    pub kind: String,
-    pub details: Value,
-}
-
 /// One validated native reply: which route to write and its exact payload.
 /// The Eliot command id is retained host-side; HTTP has no idempotency
 /// handle, so a lost reply settles unknown and is never written again.
@@ -178,7 +167,7 @@ pub(crate) fn describe_permission(
     asked: &PermissionRequest,
     expected_session: &str,
     active_turn: &str,
-) -> Result<CorePending> {
+) -> Result<PendingRequest> {
     if asked.session_id != expected_session {
         return Err(Error::new(
             "source_integrity",
@@ -190,7 +179,7 @@ pub(crate) fn describe_permission(
     for resource in &asked.resources {
         require_nonempty(resource, "permission resource")?;
     }
-    Ok(CorePending {
+    Ok(PendingRequest {
         id: asked.id.clone(),
         turn_id: active_turn.to_owned(),
         kind: "approval".to_owned(),
@@ -212,7 +201,7 @@ pub(crate) fn describe_form(
     form: &FormInfo,
     expected_session: &str,
     active_turn: &str,
-) -> Result<CorePending> {
+) -> Result<PendingRequest> {
     if form.session_id != expected_session {
         return Err(Error::new(
             "source_integrity",
@@ -244,7 +233,7 @@ pub(crate) fn describe_form(
     }
     let details = serde_json::to_value(form)
         .map_err(|_| Error::new("internal", "OpenCode form details could not be encoded"))?;
-    Ok(CorePending {
+    Ok(PendingRequest {
         id: form.id.clone(),
         turn_id: active_turn.to_owned(),
         kind: "question".to_owned(),
@@ -255,7 +244,7 @@ pub(crate) fn describe_form(
 /// Stage the one-shot native write for a previously described request.
 /// Every error here becomes a rejected reply: the caller's choice/answer
 /// did not match the currently offered set.
-pub(crate) fn reply_for(request: &CorePending, verb: &str, args: &Value) -> Result<StagedReply> {
+pub(crate) fn reply_for(request: &PendingRequest, verb: &str, args: &Value) -> Result<StagedReply> {
     match (request.kind.as_str(), verb) {
         ("approval", "approve") => reply_to_approval(request, true, args),
         ("approval", "deny") => reply_to_approval(request, false, args),
@@ -273,7 +262,7 @@ pub(crate) fn reply_for(request: &CorePending, verb: &str, args: &Value) -> Resu
 /// name one with `choice_id` (no default choice); deny has only `reject`.
 /// An explicit `choice_id` must name an offered decision the verb can
 /// decide. `feedback` travels as the reply `message`.
-fn reply_to_approval(request: &CorePending, approve: bool, args: &Value) -> Result<StagedReply> {
+fn reply_to_approval(request: &PendingRequest, approve: bool, args: &Value) -> Result<StagedReply> {
     let args = eliot_plugin::session::approval_reply_args(args)?;
     let offered = ["once", "always", "reject"];
     let wanted = match args.get("choice_id") {
@@ -345,7 +334,7 @@ fn reply_to_approval(request: &CorePending, approve: bool, args: &Value) -> Resu
 /// string-array, number or boolean by the offered field type. Unknown
 /// fields and non-offered option values reject before any write; the
 /// native endpoint enforces required, when, formats, bounds and defaults.
-fn reply_to_form(request: &CorePending, args: &Value) -> Result<StagedReply> {
+fn reply_to_form(request: &PendingRequest, args: &Value) -> Result<StagedReply> {
     let parsed = AnswerArgs::parse(args)?;
     let form: FormInfo = serde_json::from_value(request.details.clone()).map_err(|_| {
         Error::new(
@@ -459,7 +448,7 @@ fn native_value(field: &crate::native::types::FormField, answers: &[String]) -> 
 }
 
 /// Deny on a question cancels the native form. No answers travel.
-fn reply_to_form_cancel(request: &CorePending, args: &Value) -> Result<StagedReply> {
+fn reply_to_form_cancel(request: &PendingRequest, args: &Value) -> Result<StagedReply> {
     if args.as_object().is_none_or(|args| !args.is_empty()) {
         return Err(Error::new(
             "invalid",

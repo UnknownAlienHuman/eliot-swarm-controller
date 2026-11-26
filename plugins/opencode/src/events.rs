@@ -19,8 +19,8 @@ use std::{
 };
 
 use eliot_core::{
-    ContextItem, ContextOutcome, Error, InjectPoint, ProviderRestriction, ProviderRestrictionKind,
-    Result, SecretPolicy, SessionUsage, TurnUsage,
+    ContextItem, ContextOutcome, Error, InjectPoint, PendingRequest, ProviderRestriction,
+    ProviderRestrictionKind, Result, SecretPolicy, SessionUsage, TurnUsage,
     api::{AGENT_NOTICE_MESSAGE_CHARS, NativeNotice, NativeNoticeKind},
     limits::{
         MAX_NATIVE_INBOUND_FRAME_BYTES, MAX_TOOL_COMMAND_BYTES, NATIVE_TERMINAL_DEADLINE_REASON,
@@ -52,8 +52,7 @@ use tokio::{
 use crate::native::{
     client::{HttpOutcome, OpenCodeHttp},
     requests::{
-        CorePending, ReplyRoute, StagedReply, describe_form, describe_permission,
-        public_request_view, reply_for,
+        ReplyRoute, StagedReply, describe_form, describe_permission, public_request_view, reply_for,
     },
     sse::SseFrame,
     types::{
@@ -392,7 +391,7 @@ pub(crate) struct InboxRecord {
 /// decides from, plus the reply lane state. The public request id IS the
 /// native `per_...`/`frm_...` id, so no index map is needed.
 struct PendingNativeRequest {
-    request: CorePending,
+    request: PendingRequest,
     reply_command_id: Option<String>,
     reply_state: NativeReplyState,
     /// True when the staged write is a native cancel (form deny): the
@@ -3107,7 +3106,7 @@ impl EventProcessor {
 
     /// Durably open a described native request. Details commit redacted;
     /// Raw offer values stay available for exact native replies.
-    async fn open_request(&mut self, pending: CorePending) -> Result<()> {
+    async fn open_request(&mut self, pending: PendingRequest) -> Result<()> {
         if self.resolved_native_ids.contains(&pending.id) {
             self.record_gap("OpenCode native request was re-issued after resolution")
                 .await?;

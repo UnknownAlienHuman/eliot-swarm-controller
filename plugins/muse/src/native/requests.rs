@@ -14,32 +14,6 @@ use serde_json::{Map, Value};
 const APPROVAL_REQUEST: &str = "approval/request";
 const USER_INPUT_REQUEST: &str = "userInput/request";
 
-/// Native request metadata returned to the EventProcessor for durable opening.
-/// The public pending id binds the exact session, active turn and native
-/// request id; `details` privately retains the native binding, offers,
-/// requirement and view cursor (raw native JSON, validated structurally first
-/// so future additive-optional members survive without DTO churn). The public
-/// `request.opened` kind and details come from `public_request_view`, never
-/// from these native fields directly.
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) struct CorePending {
-    pub id: String,
-    pub turn_id: String,
-    pub kind: String,
-    pub details: Value,
-}
-
-impl From<CorePending> for PendingRequest {
-    fn from(request: CorePending) -> Self {
-        Self {
-            id: request.id,
-            turn_id: request.turn_id,
-            kind: request.kind,
-            details: request.details,
-        }
-    }
-}
-
 /// One validated native reply: the exact command-lane method plus its params.
 /// The decision/answer never travels as the transport response — the receipt
 /// (`{}`) only acknowledges presentation (SS5.3.3).
@@ -59,7 +33,7 @@ pub(crate) fn describe_request(
     params: &Value,
     expected_session: &str,
     active_turn: &str,
-) -> Result<CorePending> {
+) -> Result<PendingRequest> {
     validate_request_scope(expected_session, active_turn)?;
     match method {
         APPROVAL_REQUEST => describe_approval(params, expected_session, active_turn),
@@ -75,7 +49,7 @@ fn describe_approval(
     params: &Value,
     expected_session: &str,
     active_turn: &str,
-) -> Result<CorePending> {
+) -> Result<PendingRequest> {
     let request: NativeApprovalRequestParams =
         decode_params(params, "approval request params are invalid")?;
     validate_session_turn(
@@ -197,7 +171,7 @@ fn describe_user_input(
     params: &Value,
     expected_session: &str,
     active_turn: &str,
-) -> Result<CorePending> {
+) -> Result<PendingRequest> {
     let request: NativeUserInputRequestParams =
         decode_params(params, "user-input request params are invalid")?;
     validate_session_turn(
@@ -295,7 +269,7 @@ fn describe_user_input(
 /// initial, refresh and reopen branch publishes through this projection.
 /// Unknown future approval decisions stay out of the public offer: no verb
 /// can decide them, so presenting them would invite an undecidable choice.
-pub(crate) fn public_request_view(request: &CorePending) -> Result<(String, Value)> {
+pub(crate) fn public_request_view(request: &PendingRequest) -> Result<(String, Value)> {
     let details = request.details.as_object().ok_or_else(|| {
         Error::new(
             "source_integrity",
@@ -506,7 +480,7 @@ fn public_question_details(details: &Map<String, Value>) -> Result<Value> {
 /// Every error here becomes a rejected (never applied, never unknown) reply:
 /// the caller's choice/answer did not match the currently offered set.
 pub(crate) fn reply_for(
-    request: &CorePending,
+    request: &PendingRequest,
     verb: &str,
     args: &Value,
     command_id: &str,
@@ -525,7 +499,7 @@ pub(crate) fn reply_for(
 }
 
 fn reply_to_approval(
-    request: &CorePending,
+    request: &PendingRequest,
     approve: bool,
     args: &Value,
     command_id: &str,
@@ -678,7 +652,7 @@ fn resolve_choice<'a>(
 }
 
 fn reply_to_user_input(
-    request: &CorePending,
+    request: &PendingRequest,
     args: &Value,
     command_id: &str,
     session_id: &str,
@@ -882,7 +856,7 @@ fn answer_for_canonical(
 }
 
 fn reply_to_user_input_cancel(
-    request: &CorePending,
+    request: &PendingRequest,
     args: &Value,
     command_id: &str,
     session_id: &str,
@@ -1028,7 +1002,7 @@ fn make_pending(
     native_id: &str,
     kind: &str,
     details: Map<String, Value>,
-) -> Result<CorePending> {
+) -> Result<PendingRequest> {
     let id = format!("muse-request:{expected_session}:{active_turn}:{native_id}");
     if id.len() > MAX_COMMAND_ID_BYTES {
         return Err(Error::new(
@@ -1045,7 +1019,7 @@ fn make_pending(
             "native request details exceed the persisted-event limit",
         ));
     }
-    Ok(CorePending {
+    Ok(PendingRequest {
         id,
         turn_id: active_turn.to_owned(),
         kind: kind.to_owned(),

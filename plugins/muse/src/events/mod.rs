@@ -3,7 +3,8 @@ mod provider;
 mod workflow_child;
 
 use eliot_core::{
-    ContextItem, Error, ProviderRestriction, Result, SecretPolicy, SessionUsage, SourceHealthUpdate,
+    ContextItem, Error, PendingRequest, ProviderRestriction, Result, SecretPolicy, SessionUsage,
+    SourceHealthUpdate,
 };
 use eliot_plugin::{
     CommitSink, MAX_EVENT_BYTES, PeerClient,
@@ -40,7 +41,7 @@ use self::workflow_child::{
 use crate::native::{
     NativeClient, NativeFrame, StreamState, native_error_code,
     requests::{
-        CorePending, describe_request, is_newer_approval_requirement, public_request_view,
+        describe_request, is_newer_approval_requirement, public_request_view,
         refresh_offer_from_raw, reply_for, same_approval_offer,
     },
     types::{
@@ -337,7 +338,7 @@ enum Control {
         reply: oneshot::Sender<bool>,
     },
     AdoptPulled {
-        entries: Vec<CorePending>,
+        entries: Vec<PendingRequest>,
         expected: Vec<String>,
         capture: u64,
         snapshot_had_undecodable: bool,
@@ -371,7 +372,7 @@ enum NativeReplyState {
 }
 
 struct PendingNativeRequest {
-    request: CorePending,
+    request: PendingRequest,
     reply_command_id: Option<String>,
     /// Native `commandId` of the outstanding reply while Writing, retained
     /// while its outcome stays Unknown so a later `approval/resolved` can
@@ -611,7 +612,7 @@ struct EventProcessor {
 }
 
 struct StashedPending {
-    request: CorePending,
+    request: PendingRequest,
     capture: u64,
 }
 
@@ -777,7 +778,7 @@ impl EventHandle {
 
     pub async fn adopt_pulled(
         &self,
-        entries: Vec<CorePending>,
+        entries: Vec<PendingRequest>,
         expected: Vec<String>,
         capture: u64,
         snapshot_had_undecodable: bool,
@@ -2514,7 +2515,7 @@ impl EventProcessor {
     /// re-adopted, and an id dropped after the snapshot capture stays dropped.
     async fn adopt_pulled(
         &mut self,
-        entries: Vec<CorePending>,
+        entries: Vec<PendingRequest>,
         expected: Vec<String>,
         capture: u64,
         snapshot_had_undecodable: bool,
@@ -2559,7 +2560,7 @@ impl EventProcessor {
     /// Whether a pulled snapshot entry lost to a newer stream observation: a
     /// terminal resolution always wins, and a drop newer than the snapshot
     /// capture wins too.
-    fn snapshot_superseded(&self, entry: &CorePending, capture: u64) -> bool {
+    fn snapshot_superseded(&self, entry: &PendingRequest, capture: u64) -> bool {
         pending_native_id(entry).is_some_and(|native_id| {
             self.resolved_native_ids.contains(native_id)
                 || self
@@ -2569,7 +2570,7 @@ impl EventProcessor {
         })
     }
 
-    async fn open_pulled_entry(&mut self, entry: CorePending) -> Result<()> {
+    async fn open_pulled_entry(&mut self, entry: PendingRequest) -> Result<()> {
         if self.pending_requests.len() >= MAX_PENDING_REQUESTS {
             self.defer_gap("Muse pending native request bound was exceeded");
             return Ok(());
@@ -4600,7 +4601,7 @@ impl EventProcessor {
     /// call was handled but nothing was persisted (a gap was recorded, or
     /// an oversized envelope was deferred); `Err` carries the write failure.
     /// Callers that need persistence proof must require `Ok(true)`.
-    async fn commit_offer_update(&mut self, refreshed: &CorePending) -> Result<bool> {
+    async fn commit_offer_update(&mut self, refreshed: &PendingRequest) -> Result<bool> {
         let command_id = self.status.active_command_id.clone();
         let (Some(seq), Some(cursor)) = (
             refreshed.details.get("offer_seq").and_then(Value::as_i64),
@@ -4832,7 +4833,7 @@ fn orphan_request_id(method: &str, params: &Value) -> Option<String> {
 }
 
 /// The native approval/user-input id a described request answers to.
-fn pending_native_id(request: &CorePending) -> Option<&str> {
+fn pending_native_id(request: &PendingRequest) -> Option<&str> {
     match request.kind.as_str() {
         "approval" => request.details.get("approval_id").and_then(Value::as_str),
         "user_input" => request.details.get("user_input_id").and_then(Value::as_str),

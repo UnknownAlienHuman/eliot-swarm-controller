@@ -18,26 +18,6 @@ const COMMAND_APPROVAL: &str = "item/commandExecution/requestApproval";
 const FILE_CHANGE_APPROVAL: &str = "item/fileChange/requestApproval";
 const USER_INPUT: &str = "item/tool/requestUserInput";
 
-/// Native request metadata returned to the EventProcessor for durable opening.
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) struct CorePending {
-    pub id: String,
-    pub turn_id: String,
-    pub kind: String,
-    pub details: Value,
-}
-
-impl From<CorePending> for PendingRequest {
-    fn from(request: CorePending) -> Self {
-        Self {
-            id: request.id,
-            turn_id: request.turn_id,
-            kind: request.kind,
-            details: request.details,
-        }
-    }
-}
-
 /// Describe only the three 0.161 server-request families Eliot can answer.
 /// `transport_id` is retained in details for the later native response write;
 /// the public pending id binds it to the exact thread and active turn.
@@ -47,7 +27,7 @@ pub(crate) fn describe_request(
     transport_id: &Value,
     expected_thread: &str,
     active_turn: &str,
-) -> Result<CorePending> {
+) -> Result<PendingRequest> {
     validate_request_scope(expected_thread, active_turn)?;
     serde_json::from_value::<NativeRequestId>(transport_id.clone()).map_err(|_| {
         Error::new(
@@ -211,7 +191,7 @@ pub(crate) fn describe_request(
 }
 
 /// Build the one-shot native response body for a previously described request.
-pub(crate) fn reply_for(request: &CorePending, verb: &str, args: &Value) -> Result<Value> {
+pub(crate) fn reply_for(request: &PendingRequest, verb: &str, args: &Value) -> Result<Value> {
     match (request.kind.as_str(), verb) {
         ("command_execution_approval", "approve") => {
             require_approval_args(args, true)?;
@@ -245,7 +225,7 @@ pub(crate) fn reply_for(request: &CorePending, verb: &str, args: &Value) -> Resu
     }
 }
 
-fn reply_to_user_input(request: &CorePending, args: &Value) -> Result<Value> {
+fn reply_to_user_input(request: &PendingRequest, args: &Value) -> Result<Value> {
     let args = AnswerArgs::parse(args)?;
     let questions: Vec<OfferedQuestion> = request
         .details
@@ -328,7 +308,7 @@ fn make_pending(
     active_turn: &str,
     kind: &str,
     mut details: Map<String, Value>,
-) -> Result<CorePending> {
+) -> Result<PendingRequest> {
     let encoded_identity = serde_json::to_string(&(expected_thread, active_turn, transport_id))
         .map_err(|_| Error::new("internal", "native request identity could not be encoded"))?;
     let id = format!("codex-request:{encoded_identity}");
@@ -349,7 +329,7 @@ fn make_pending(
             "native request details exceed the persisted-event limit",
         ));
     }
-    Ok(CorePending {
+    Ok(PendingRequest {
         id,
         turn_id: active_turn.to_owned(),
         kind: kind.to_owned(),
@@ -412,7 +392,7 @@ fn encode_response<T: serde::Serialize>(response: T) -> Result<Value> {
         .map_err(|_| Error::new("internal", "native request response could not be encoded"))
 }
 /// Project the retained native offer to its public `request.opened` kind and details.
-pub(crate) fn public_request_view(request: &CorePending) -> Result<(String, Value)> {
+pub(crate) fn public_request_view(request: &PendingRequest) -> Result<(String, Value)> {
     let details = request.details.as_object().ok_or_else(|| {
         Error::new(
             "source_integrity",
