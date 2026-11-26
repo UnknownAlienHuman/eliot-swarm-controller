@@ -1174,8 +1174,10 @@ artifact also appears in the Owner inbox as a `stuck` item with subject
 for a native session), and a structured `artifact.reconcile` choice;
 recovery never settles the uncertain effect itself. The startup recovery
 attempt already establishes the wait, so the item is exempt from the
-second liveness sample other `stuck` items need. After the Owner
-reconciles the artifact, the next recovery run deletes the ended probe.
+second liveness sample other `stuck` items need: the sweep skips the
+fenced artifact and no `daemon.liveness_stuck` line is emitted for it.
+After the Owner reconciles the artifact, the next recovery run deletes
+the ended probe.
 If a minimal request cannot be prepared safely for the frozen profile, the daemon
 paces background preparation with a five-minute defer. The persisted deadline
 for a fresh launch and the admission budget stay available. A maintenance probe
