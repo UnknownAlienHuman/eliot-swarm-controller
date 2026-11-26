@@ -447,7 +447,9 @@ pub(super) struct HeaderInput {
 
 /// The header (`ConversationHeader`, §9.1), as its own component. Left, in
 /// the star cell: the title (trimmed with "…") over one line of project ·
-/// branch and the state. Right: Goal, Changes, Agents, Details and More,
+/// branch and the state (in a narrow main area the title spans the header
+/// and the commands sit beside that line). Right: Goal, Changes, Agents,
+/// Details and More,
 /// stock buttons of one height. Goal opens the Goal dialog and says the
 /// goal's state when there is one ("Goal · round 1 of 4", "Goal met"). The
 /// pane commands are toggle buttons, pressed while their panel is open
@@ -645,21 +647,32 @@ impl Component for Header {
             .border_thickness(Thickness::new(0.0, 0.0, 0.0, tokens::layout::HAIRLINE))
             .padding(Thickness::xy(tokens::spacing::MD, tokens::spacing::XS))
             .content(
+                // The title over its line, the commands beside both; in a
+                // narrow main area the title takes the whole width and the
+                // commands sit beside the line, so the title is not cut to
+                // a word.
                 Grid::new()
+                    .rows([GridLength::Auto, GridLength::Auto])
                     .columns([GridLength::STAR, GridLength::Auto])
                     .column_spacing(tokens::spacing::MD)
+                    .row_spacing(if input.compact {
+                        tokens::spacing::XS
+                    } else {
+                        0.0
+                    })
+                    .vertical_alignment(VerticalAlignment::Center)
                     .children((
-                        StackPanel::new()
-                            .vertical_alignment(VerticalAlignment::Center)
-                            .children((
-                                controls::text(input.title.clone(), tokens::text::HEADER)
-                                    .automation_heading_level(AutomationHeadingLevel::Level2)
-                                    .text_trimming(TextTrimming::CharacterEllipsis)
-                                    .is_text_selection_enabled(true),
-                                line,
-                            )),
+                        controls::text(input.title.clone(), tokens::text::HEADER)
+                            .grid_column_span(if input.compact { 2 } else { 1 })
+                            .automation_heading_level(AutomationHeadingLevel::Level2)
+                            .text_trimming(TextTrimming::CharacterEllipsis)
+                            .is_text_selection_enabled(true),
+                        line.grid_row(1)
+                            .vertical_alignment(VerticalAlignment::Center),
                         StackPanel::new()
                             .grid_column(1)
+                            .grid_row(if input.compact { 1 } else { 0 })
+                            .grid_row_span(if input.compact { 1 } else { 2 })
                             .orientation(Orientation::Horizontal)
                             .spacing(tokens::spacing::XS)
                             .vertical_alignment(VerticalAlignment::Center)
