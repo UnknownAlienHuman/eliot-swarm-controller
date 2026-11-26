@@ -12,6 +12,7 @@
 //! models `[desktop] model_visibility` shows, while a search still finds a
 //! hidden model and marks it hidden.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 
 use eliot_core::api::{
@@ -102,14 +103,15 @@ const MODEL_ORGS: [&str; 6] = [
 /// - drop the route's `provider/` prefix (every segment up to the last
 ///   `/`) and a `:free` suffix;
 /// - then drop the first dash token when the next token starts with it
-///   (`qwen-qwen4-max`) or it is a known organization ([`MODEL_ORGS`]).
+///   (`qwen-qwen4-max`) or it is a known organization ([`MODEL_ORGS`]);
+/// - a Claude id then loses `claude-` and dots its version ([`claude_short`]).
 ///
 /// `nous/qwen-qwen4-max:free` reads `qwen4-max`,
 /// `kilo/baidu-ernie-5.5-flash-preview:free` reads `ernie-5.5-flash-preview`
 /// (a preview keeps its suffix, so it never shares a label with the stable model);
-/// `claude-haiku-5-5` and `gpt-6.2-sol` stay as they are. A slug with
-/// nothing left stays whole.
-pub fn model_short(slug: &str) -> &str {
+/// `claude-haiku-5-5` and `anthropic/claude-haiku-5-5` read `haiku 5.5`;
+/// `gpt-6.2-sol` stays as it is. A slug with nothing left stays whole.
+pub fn model_short(slug: &str) -> Cow<'_, str> {
     let name = slug.rsplit_once('/').map_or(slug, |(_, name)| name);
     let name = name.strip_suffix(":free").unwrap_or(name);
     let name = match name.split_once('-') {
@@ -122,12 +124,43 @@ pub fn model_short(slug: &str) -> &str {
         }
         _ => name,
     };
-    if name.trim().is_empty() { slug } else { name }
+    if name.trim().is_empty() {
+        return Cow::Borrowed(slug);
+    }
+    match name.strip_prefix("claude-").map(claude_short) {
+        Some(short) if !short.trim().is_empty() => Cow::Owned(short),
+        _ => Cow::Borrowed(name),
+    }
+}
+
+/// A Claude id's words after `claude-`: its family and its version with
+/// dots (`haiku-5-5` reads `haiku 5.5`); a dated snapshot keeps its date
+/// (`sonnet-4-5-20250929` reads `sonnet 4.5 20250929`), so it never shares
+/// a label with the alias, and a `[1m]` suffix stays as it is.
+fn claude_short(rest: &str) -> String {
+    let (body, suffix) = rest.find('[').map_or((rest, ""), |at| rest.split_at(at));
+    let mut words: Vec<String> = Vec::new();
+    // The last word is a version that the next number continues.
+    let mut version = false;
+    for token in body.split('-').filter(|token| !token.is_empty()) {
+        let number = token.len() <= 2 && token.bytes().all(|byte| byte.is_ascii_digit());
+        match words.last_mut() {
+            Some(last) if number && version => {
+                last.push('.');
+                last.push_str(token);
+            }
+            _ => words.push(token.to_owned()),
+        }
+        version = number;
+    }
+    let mut short = words.join(" ");
+    short.push_str(suffix);
+    short
 }
 
 /// What runs an Agent, as the Monitor rows and the conversation header name
 /// it: the harness and, once the harness reported it, the short effective
-/// model (`Codex · qwen4-max`, `Claude Code · claude-opus-5-5`).
+/// model (`Codex · qwen4-max`, `Claude Code · opus 5.5`).
 pub fn harness_model_label(harness: &str, model: Option<&str>) -> String {
     let harness = harness_label(harness);
     match model.map(model_short) {
@@ -167,14 +200,14 @@ pub fn effort_label(effort: &str) -> &str {
 }
 
 /// A model chip's short words, Home's and the conversation's alike: the
-/// short model ([`model_short`]) and a chosen effort (`qwen4-max · high`),
+/// short model ([`model_short`]) and a chosen effort (`haiku 5.5 · low`),
 /// the model alone at its default effort; the full id and the effort in
 /// words are the chip's accessible name and tooltip.
 pub fn model_effort_label(model: Option<&str>, effort: Option<&str>) -> String {
-    let model = model.map_or("default model", model_short);
+    let model = model.map_or(Cow::Borrowed("default model"), model_short);
     match effort {
         Some(effort) => format!("{model} · {}", effort_label(effort)),
-        None => model.to_owned(),
+        None => model.into_owned(),
     }
 }
 
@@ -221,7 +254,7 @@ pub enum Choice {
 
 impl Choice {
     /// The model chip's short words, as the conversation's chip says them
-    /// (`haiku · low`): the short model and a chosen effort, or the
+    /// (`haiku 5.5 · low`): the short model and a chosen effort, or the
     /// preset's name; the harness and full words are its accessible name
     /// and tooltip ([`Self::chip_name`]).
     pub fn chip_label(&self, auto_profile: Option<&str>) -> String {
