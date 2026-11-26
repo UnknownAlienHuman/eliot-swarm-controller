@@ -8,7 +8,8 @@ use crate::native_child::{
 };
 use eliot_core::{
     ChildRegistration, ContextItem, ContextWindowTracker, Error, NATIVE_WARNING_EVENT,
-    ProviderRestriction, Result, SecretPolicy, SessionTokenTotals, SessionUsage, TurnUsage,
+    PendingRequest, ProviderRestriction, Result, SecretPolicy, SessionTokenTotals, SessionUsage,
+    TurnUsage,
     api::{NativeNotice, NativeNoticeKind},
     limits::{MAX_TOOL_COMMAND_BYTES, MAX_TOOL_ERROR_TAIL_BYTES},
     turn_started_data,
@@ -37,7 +38,7 @@ use tokio::{
 
 use crate::native::{
     NativeClient, NativeFrame, StreamState,
-    requests::{self, CorePending},
+    requests::{self},
     types::{
         NativeCommandExecutionItem, NativeErrorNotification, NativeFileChangeItem,
         NativeItemCompletedNotification, NativePatchChangeKind,
@@ -175,7 +176,7 @@ enum NativeReplyState {
 }
 
 struct PendingNativeRequest {
-    request: CorePending,
+    request: PendingRequest,
     transport_id: Value,
     reply_command_id: Option<String>,
     reply_state: NativeReplyState,
