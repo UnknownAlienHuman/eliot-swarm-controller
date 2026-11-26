@@ -54,6 +54,9 @@ pub(super) enum ChatMsg {
     SendSubmitted(Result<SendOutcome, SendFailure>),
     /// Interrupt the turn shown on the button (Agent, generation, turn).
     InterruptRequested(BoundAction),
+    /// The composer ▾'s Stop turn while Steer shows: interrupt the running
+    /// turn of the detail on screen.
+    StopTurnChosen,
     /// A Stop or interrupt was submitted; its final state is watched.
     ControlWatched(String, Box<MutationResult<CommandSubmitResponse>>),
     /// The final state of a watched control, or why it was not read.
@@ -1069,6 +1072,25 @@ impl DesktopApp {
                         turn,
                     ))
                 });
+            }
+            ChatMsg::StopTurnChosen => {
+                // Bound as the composer binds its own Stop turn: the open
+                // Agent's running turn in the detail on screen.
+                let bound = self.bound_detail().ok().and_then(|detail| {
+                    let turn = detail
+                        .active_turn
+                        .as_deref()
+                        .filter(|_| !detail.observe_only)?;
+                    Some(BoundAction::turn_control(
+                        &detail.agent,
+                        detail.generation,
+                        turn,
+                    ))
+                });
+                match bound {
+                    Some(bound) => self.chat_update(ChatMsg::InterruptRequested(bound), context),
+                    None => self.alert("No turn is running now; nothing was stopped."),
+                }
             }
             ChatMsg::GoalRead(agent, read) => {
                 self.chat.goal_reading = false;

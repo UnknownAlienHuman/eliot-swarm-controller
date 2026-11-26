@@ -1031,8 +1031,9 @@ impl Component for Composer {
 /// empty field and Steer with text; Resume for a stopped Agent, Resume with
 /// message when there is text. An unresolved submission shows Retry
 /// instead, resubmitting its saved identity. Each is bound by the window
-/// from the detail on screen. Beside it the ▾ with Add as a note; usage
-/// and context before them. Every command is one bar height.
+/// from the detail on screen. Beside it the ▾ with Add as a note, and
+/// Stop turn while Steer shows; usage and context before them. Every
+/// command is one bar height.
 fn composer_actions(
     input: &ComposerInput,
     draft_blank: bool,
@@ -1152,41 +1153,57 @@ fn composer_actions(
         Primary::Start => start_split(enabled, draft_blank, pending, context),
     };
     // The ▾ beside the action (an open Agent): Add as a note, the text
-    // into the Agent's context at its next safe point without a new turn.
+    // into the Agent's context at its next safe point without a new turn;
+    // while Steer holds the action's place, Stop turn too, so stopping the
+    // running turn stays a command of its own (§9.4).
     let note: Option<View> = match (&input.primary, input.note) {
         (Primary::Start, _) => None,
         (primary, generation) => {
             let ready = enabled && !draft_blank && generation.is_some();
-            let item = if ready {
+            let steering = !draft_blank
+                && matches!(
+                    primary,
+                    Primary::Turn {
+                        running: Some(_),
+                        ..
+                    }
+                );
+            let mut items = vec![if ready {
                 MenuItem::item(NOTE_LABEL, NOTE_LABEL)
             } else {
                 MenuItem::disabled(NOTE_LABEL, NOTE_LABEL)
-            };
+            }];
+            if steering {
+                items.push(if enabled {
+                    MenuItem::item(STOP_TURN_LABEL, STOP_TURN_LABEL)
+                } else {
+                    MenuItem::disabled(STOP_TURN_LABEL, STOP_TURN_LABEL)
+                });
+            }
             // The ▾ takes its action's style: accent beside Send, Steer and
             // Retry.
-            let accent = matches!(
-                primary,
-                Primary::Turn { running: None, .. } | Primary::Retry(_)
-            ) || (matches!(
-                primary,
-                Primary::Turn {
-                    running: Some(_),
-                    ..
-                }
-            ) && !draft_blank);
+            let accent = steering
+                || matches!(
+                    primary,
+                    Primary::Turn { running: None, .. } | Primary::Retry(_)
+                );
             Some(
                 controls::bar_button(accent)
-                    .is_enabled(ready)
-                    .automation_name("More send options: Add as a note")
+                    .is_enabled(ready || (steering && enabled))
+                    .automation_name(if steering {
+                        "More send options: Add as a note, Stop turn"
+                    } else {
+                        "More send options: Add as a note"
+                    })
                     .content(controls::icon(controls::glyph::CHEVRON_DOWN))
                     .menu(Menu::new(
-                        vec![item],
+                        items,
                         // Capture-free: one identity across renders.
                         crate::views::menu_keys(context.callback(|label: String| {
-                            if label == NOTE_LABEL {
-                                Message::Chat(ChatMsg::NoteRequested)
-                            } else {
-                                Message::Menu(MenuMsg::Ignored)
+                            match label.as_str() {
+                                NOTE_LABEL => Message::Chat(ChatMsg::NoteRequested),
+                                STOP_TURN_LABEL => Message::Chat(ChatMsg::StopTurnChosen),
+                                _ => Message::Menu(MenuMsg::Ignored),
                             }
                         })),
                     )),
@@ -1231,8 +1248,9 @@ fn composer_actions(
         .into()
 }
 
-/// The composer menu's one item.
+/// The ▾ menu's items: Add as a note, and Stop turn while Steer shows.
 const NOTE_LABEL: &str = "Add as a note";
+const STOP_TURN_LABEL: &str = "Stop turn";
 /// An open chat's + menu: attach files, or open the Goal dialog.
 const ATTACH_LABEL: &str = "Attach files…";
 const GOAL_LABEL: &str = "Goal…";

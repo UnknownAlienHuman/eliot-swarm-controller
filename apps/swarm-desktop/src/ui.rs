@@ -1037,7 +1037,7 @@ impl Component for DesktopApp {
                 place_epoch: 0,
                 batch: None,
                 project_reads: 0,
-                projects_error: None,
+                projects_failing: false,
             },
             launch: launch_ui::LaunchState {
                 workspace: input

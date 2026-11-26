@@ -159,19 +159,22 @@ pub(super) fn starting_view(text: &str, label: &str) -> View {
         .spacing(tokens::spacing::SM)
         .children((
             // The owner's message as the transcript will show it: the
-            // bubble, and attached files as chips under it.
-            StackPanel::new()
-                .spacing(tokens::spacing::XS)
-                .horizontal_alignment(HorizontalAlignment::Right)
-                .max_width(tokens::layout::READING_WIDTH * tokens::layout::BUBBLE_SHARE)
-                .automation_name(format!("You: {shown}"))
-                .keyed_children(crate::views::slots([
-                    Some(controls::bubble(
-                        controls::body(shown.to_owned()).text_wrapping(TextWrapping::Wrap),
-                        None,
-                    )),
-                    (!files.is_empty()).then(|| views::attached_chips(&files)),
-                ])),
+            // bubble at the right in the owner's star cell (sized to its
+            // text, no fixed width), and attached files as chips under it.
+            views::owner_side(
+                StackPanel::new()
+                    .spacing(tokens::spacing::XS)
+                    .horizontal_alignment(HorizontalAlignment::Right)
+                    .automation_name(format!("You: {shown}"))
+                    .keyed_children(crate::views::slots([
+                        Some(controls::bubble(
+                            controls::body(shown.to_owned()).text_wrapping(TextWrapping::Wrap),
+                            None,
+                        )),
+                        (!files.is_empty()).then(|| views::attached_chips(&files)),
+                    ]))
+                    .into(),
+            ),
             StackPanel::new()
                 .spacing(tokens::spacing::XS)
                 .automation_name(label)

@@ -778,8 +778,10 @@ fn outcome_line(text: &str, end: TurnEnd) -> View {
 
 /// The owner's side of the reading column (§9.1): the message at the
 /// right, as wide as its text up to the bubble's share of the column (a
-/// star cell, not a fixed width), so a short message stays short.
-fn owner_side(message: View) -> View {
+/// star cell, not a fixed width), so a short message stays short. A new
+/// task's first message takes the same place while its launch is
+/// submitted (`starting_view`).
+pub fn owner_side(message: View) -> View {
     Grid::new()
         .columns([
             GridLength::Star(1.0 - tokens::layout::BUBBLE_SHARE),
