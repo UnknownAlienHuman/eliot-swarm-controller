@@ -339,7 +339,7 @@ impl DesktopApp {
             "browse",
             controls::setting_row(
                 "Checkout folder",
-                "Choose a folder to add and save the project.",
+                "",
                 View::from(
                     controls::filled()
                         .automation_name("Browse to add a project")

@@ -32,8 +32,9 @@ impl DesktopApp {
         } else {
             Some(controls::settings_card(history))
         };
+        // Only sections that wait for the daemon's next start are named.
         let restart = if self.settings.restart_required.is_empty() {
-            "Every section applies without a restart.".to_owned()
+            String::new()
         } else {
             format!(
                 "Changes to {} apply at the daemon's next start.",
@@ -49,80 +50,74 @@ impl DesktopApp {
         StackPanel::new()
             .spacing(tokens::spacing::MD)
             .keyed_children(crate::views::slots([
-                Some(controls::settings_card(
-                    vec![
-                        KeyedView::new(
-                            "data",
-                            controls::form_row(
-                                "Settings file",
-                                settings_file,
-                                Some(
-                                    controls::outlined()
-                                        .automation_name("Reload everything")
-                                        .on_click(context.message(Message::Shell(
-                                            ShellMsg::RefreshRequested,
-                                        )))
-                                        .content(controls::label("Reload")).into(),
-                                ),
-                            ),
-                        ),
-                        KeyedView::new(
-                            "data-help",
-                            controls::help(
-                                "Swarm's data folder holds it; every change goes through the daemon's checks.",
-                            ),
-                        ),
-                        KeyedView::new(
-                            "history",
-                            controls::form_row(
-                                "History",
-                                controls::body(format!(
-                                    "{}: who changed which section, and when.",
-                                    eliot_core::count_words(
-                                        self.settings.history.len() as u64,
-                                        "recent change",
-                                        "recent changes"
+                Some(controls::settings_card(vec![
+                    KeyedView::new(
+                        "data",
+                        controls::form_row(
+                            "Settings file",
+                            settings_file,
+                            Some(
+                                controls::outlined()
+                                    .automation_name("Reload everything")
+                                    .on_click(
+                                        context.message(Message::Shell(ShellMsg::RefreshRequested)),
                                     )
-                                ))
-                                .text_trimming(TextTrimming::CharacterEllipsis)
-                                .into(),
-                                Some(
-                                    controls::text_button()
-                                        .automation_name(if open {
-                                            "Hide history"
-                                        } else {
-                                            "Show history"
-                                        })
-                                        .on_click(context.message(Message::Settings(
-                                            SettingsMsg::HistoryToggled,
-                                        )))
-                                        .content(controls::label(if open { "Hide" } else { "Show" })).into(),
-                                ),
+                                    .content(controls::label("Reload"))
+                                    .into(),
                             ),
                         ),
-                    ],
-                )),
-                history_view,
-                Some(controls::settings_card(vec![KeyedView::new("storage", self.storage_row())])),
-                Some(controls::section_heading(
-                    "All settings",
-                    &format!(
-                        "Every section of config.toml as JSON, including daemon, mail, accounts and proxies. {restart}"
                     ),
-                    None,
-                )),
-                Some(controls::field()
-                    .accepts_return(true)
-                    .text_wrapping(TextWrapping::NoWrap)
-                    .min_height(tokens::layout::SOURCE_MIN_HEIGHT)
-                    .max_height(tokens::layout::SOURCE_MAX_HEIGHT)
-                    .automation_name("Settings sections JSON")
-                    .text(self.primed(&self.settings.all))
-                    .is_enabled(!self.settings.busy())
-                    .on_text_changed(
-                        crate::views::text_edits(context.callback(|text| Message::Settings(SettingsMsg::AllDraft(text)))),
-                    ).into()),
+                    KeyedView::new(
+                        "history",
+                        controls::form_row(
+                            "History",
+                            controls::body(eliot_core::count_words(
+                                self.settings.history.len() as u64,
+                                "recent change",
+                                "recent changes",
+                            ))
+                            .text_trimming(TextTrimming::CharacterEllipsis)
+                            .into(),
+                            Some(
+                                controls::text_button()
+                                    .automation_name(if open {
+                                        "Hide history"
+                                    } else {
+                                        "Show history"
+                                    })
+                                    .on_click(
+                                        context.message(Message::Settings(
+                                            SettingsMsg::HistoryToggled,
+                                        )),
+                                    )
+                                    .content(controls::label(if open { "Hide" } else { "Show" }))
+                                    .into(),
+                            ),
+                        ),
+                    ),
+                ])),
+                history_view,
+                Some(controls::settings_card(vec![KeyedView::new(
+                    "storage",
+                    self.storage_row(),
+                )])),
+                Some(controls::section_heading("All settings", &restart, None)),
+                Some(
+                    controls::field()
+                        .accepts_return(true)
+                        .text_wrapping(TextWrapping::NoWrap)
+                        .min_height(tokens::layout::SOURCE_MIN_HEIGHT)
+                        .max_height(tokens::layout::SOURCE_MAX_HEIGHT)
+                        .automation_name("Settings sections JSON")
+                        .text(self.primed(&self.settings.all))
+                        .is_enabled(!self.settings.busy())
+                        .on_text_changed(crate::views::text_edits(
+                            context.callback(|text| Message::Settings(SettingsMsg::AllDraft(text))),
+                        ))
+                        .into(),
+                ),
                 Some(self.save_bar(Page::Advanced, dirty, context)),
-            ])).into()
+            ]))
+            .into()
     }
 }

@@ -420,13 +420,11 @@ impl Component for Autonomy {
                         .column_spacing(tokens::spacing::MD)
                         .keyed_children(stats),
                 ));
+                // Which sources are partial: each says so under Show sources.
                 let complete = if read.incomplete.is_empty() {
-                    format!("Complete for {window}.")
+                    format!("Complete for {window}")
                 } else {
-                    format!(
-                        "Partial for {window}: {} not complete.",
-                        read.incomplete.join(", ")
-                    )
+                    format!("Partial for {window}")
                 };
                 let toggle = input.toggle.clone();
                 parts.push(KeyedView::new(

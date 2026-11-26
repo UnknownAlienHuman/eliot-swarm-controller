@@ -2117,18 +2117,12 @@ impl DesktopApp {
         } else {
             None
         };
-        let freshness = self
+        // Only a failed read shows above the page: Codex shows no read time.
+        let status: Option<View> = self
             .settings
-            .read_at_ms
-            .and_then(crate::monitor::last_read_label);
-        let status: Option<View> = self.settings.error.as_deref().map_or_else(
-            || {
-                // The same text during a background read, so the page never
-                // rewraps or shifts while it refreshes.
-                freshness.map(|label| controls::secondary(label).into())
-            },
-            |error| Some(self.read_error(error, context)),
-        );
+            .error
+            .as_deref()
+            .map(|error| self.read_error(error, context));
         // The page's tree is keyed by page, so its editors are new controls
         // (see `reprime_fields`). The capped column sits in a plain Border,
         // not directly in the ScrollViewer (`views::Column`).
@@ -2395,61 +2389,64 @@ impl DesktopApp {
     fn save_bar(&self, page: Page, dirty: bool, context: &mut ViewContext<Self>) -> View {
         let busy = self.settings.busy();
         let saving = self.settings.saving == Some(page);
-        let note = self.settings.notes.get(&page).cloned().unwrap_or_else(|| {
-            Note::info(if dirty {
-                "Unsaved changes.".to_owned()
-            } else if page == Page::Advanced {
-                // Revisions belong to Advanced only.
-                format!(
-                    "Saved settings, revision {}.",
-                    self.settings
-                        .revision
-                        .as_deref()
-                        .map_or("none yet", |revision| &revision[..revision.len().min(12)])
-                )
+        // The last result, else "Unsaved changes."; a clean page says
+        // nothing (its Save is off).
+        let note = self
+            .settings
+            .notes
+            .get(&page)
+            .cloned()
+            .or_else(|| dirty.then(|| Note::info("Unsaved changes.".to_owned())));
+        let note_text: Option<View> = note.map(|note| {
+            let text = controls::secondary(note.text)
+                .text_wrapping(TextWrapping::Wrap)
+                .is_text_selection_enabled(true);
+            if note.error {
+                text.foreground(ThemeBrush::SystemCritical).into()
             } else {
-                "All changes saved.".to_owned()
-            })
+                text.into()
+            }
         });
-        let note_text = controls::secondary(note.text)
-            .text_wrapping(TextWrapping::Wrap)
-            .is_text_selection_enabled(true);
-        let note_text = if note.error {
-            note_text.foreground(ThemeBrush::SystemCritical)
-        } else {
-            note_text
-        };
         StackPanel::new()
             .spacing(tokens::spacing::SM)
-            .children((
-                StackPanel::new()
-                    .orientation(Orientation::Horizontal)
-                    .spacing(tokens::spacing::SM)
-                    .children((
-                        controls::filled()
-                            .is_enabled(dirty && !busy)
-                            .automation_name(format!("Save {}", page.label()))
-                            .on_click(
-                                context.message(Message::Settings(SettingsMsg::Save(page, false))),
-                            )
-                            .content(controls::label(if saving { "Saving…" } else { "Save" })),
-                        controls::outlined()
-                            .is_enabled(!busy)
-                            .automation_name(format!("Validate {}", page.label()))
-                            .on_click(
-                                context.message(Message::Settings(SettingsMsg::Save(page, true))),
-                            )
-                            .content(controls::label("Validate")),
-                        controls::text_button()
-                            .is_enabled(dirty && !busy)
-                            .automation_name(format!("Discard changes to {}", page.label()))
-                            .on_click(
-                                context.message(Message::Settings(SettingsMsg::Discard(page))),
-                            )
-                            .content(controls::label("Discard")),
-                    )),
+            .keyed_children(crate::views::slots([
+                Some(
+                    StackPanel::new()
+                        .orientation(Orientation::Horizontal)
+                        .spacing(tokens::spacing::SM)
+                        .children((
+                            controls::filled()
+                                .is_enabled(dirty && !busy)
+                                .automation_name(format!("Save {}", page.label()))
+                                .on_click(
+                                    context
+                                        .message(Message::Settings(SettingsMsg::Save(page, false))),
+                                )
+                                .content(controls::label(if saving {
+                                    "Saving…"
+                                } else {
+                                    "Save"
+                                })),
+                            controls::outlined()
+                                .is_enabled(!busy)
+                                .automation_name(format!("Validate {}", page.label()))
+                                .on_click(
+                                    context
+                                        .message(Message::Settings(SettingsMsg::Save(page, true))),
+                                )
+                                .content(controls::label("Validate")),
+                            controls::text_button()
+                                .is_enabled(dirty && !busy)
+                                .automation_name(format!("Discard changes to {}", page.label()))
+                                .on_click(
+                                    context.message(Message::Settings(SettingsMsg::Discard(page))),
+                                )
+                                .content(controls::label("Discard")),
+                        ))
+                        .into(),
+                ),
                 note_text,
-            ))
+            ]))
             .into()
     }
 }

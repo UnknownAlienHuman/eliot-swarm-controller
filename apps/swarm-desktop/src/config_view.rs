@@ -462,8 +462,7 @@ pub fn profiles_screen(data: ProfilesData<'_>, actions: ProfilesActions) -> View
     } else if !data.editable {
         format!("Not editable: {}", data.reason.unwrap_or("not editable"))
     } else {
-        "Running Agents keep the settings they started with; the next task uses the saved ones."
-            .to_owned()
+        String::new()
     };
     let toggle = crate::controls::text_button()
         .horizontal_alignment(HorizontalAlignment::Left)
@@ -505,7 +504,9 @@ pub fn profiles_screen(data: ProfilesData<'_>, actions: ProfilesActions) -> View
     if let Some(new_preset) = new_preset {
         parts.push(KeyedView::new("new-preset", new_preset));
     }
-    parts.push(KeyedView::new("state", small(state)));
+    if !state.is_empty() {
+        parts.push(KeyedView::new("state", small(state)));
+    }
     parts.push(KeyedView::new("toggle", toggle));
     if let Some(source) = source {
         parts.push(KeyedView::new("source", source));
@@ -909,8 +910,9 @@ pub fn scripts_screen(data: ScriptsData<'_>, actions: ScriptsActions) -> View {
             "none",
             crate::controls::form_row(
                 "Script",
-                small("No scripts yet. Put them in the scripts folder of Swarm's data folder, or in a project's .eliot\\scripts folder.")
-                    .into(),
+                small("No scripts yet.").tooltip(
+                    "Put them in the scripts folder of Swarm's data folder, or in a project's .eliot\\scripts folder",
+                ),
                 Some(refresh.into()),
             ),
         ));

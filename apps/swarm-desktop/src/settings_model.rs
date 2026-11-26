@@ -942,7 +942,7 @@ pub fn decision_lines(decision: &RoutingDecision) -> (String, Vec<String>) {
         Some(profile) => {
             let quota = match decision.quota_status {
                 RouteQuotaStatus::Supported => "",
-                RouteQuotaStatus::Unsupported => "; no quota readback",
+                RouteQuotaStatus::Unsupported => "; quota not reported",
                 RouteQuotaStatus::Unknown => "; quota unknown",
             };
             format!("Routing picks {profile}{role}: {}{quota}", decision.reason)
@@ -975,7 +975,11 @@ pub fn launch_error(error: &eliot_core::Error) -> String {
             if !skipped.is_empty() {
                 text.push_str(&format!(" ({})", skipped.join("; ")));
             }
-            text.push_str(". Pick a model in the list, or change Settings › Routing.");
+            // "No model is set" already names Settings › Routing.
+            if decision.profile.is_some() || !decision.skipped.is_empty() {
+                text.push_str(". Pick a model or change Settings › Routing");
+            }
+            text.push('.');
             text
         }
         _ => error.to_string(),

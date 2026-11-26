@@ -376,7 +376,7 @@ impl DesktopApp {
                 "cleanup",
                 controls::setting_row(
                     "Clean up finished work",
-                    "Review what Swarm can remove for finished tasks, by kind, with sizes and reasons. Nothing is removed until you confirm.",
+                    "Nothing is removed until you confirm",
                     View::from(
                         controls::outlined()
                             .automation_name("Review cleanup")

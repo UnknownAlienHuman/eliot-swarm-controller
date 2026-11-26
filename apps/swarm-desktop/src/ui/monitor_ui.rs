@@ -820,7 +820,7 @@ impl DesktopApp {
     }
 
     /// The Agents page (`Agents.dc.html`): search and grouping, the
-    /// summary, the filter chips with counts, the wait classes, the tree
+    /// summary, the filter chips with counts, the tree
     /// (managers and their workers; state mark, task, project, model,
     /// activity, CPU, memory, Stop) and Autonomy. The tree is its own
     /// component ([`monitor_view::MonitorList`]), redrawn only when a
@@ -857,13 +857,12 @@ impl DesktopApp {
                 .filter(|row| filter.keeps(row, incident(row)))
                 .count()
         };
-        // The count, and whether it counts only the loaded rows of a
-        // partial read (its label then says "(loaded)"): one guard for both.
+        // The daemon's total, else the loaded rows, marked "+" when the read
+        // is partial: one guard for the value and its mark.
         let counted = |filter: FleetFilter| match filter.states().and_then(total_of) {
             Some(total) => (total, false),
             None => (loaded(filter), partial),
         };
-        let count = |filter: FleetFilter| counted(filter).0;
         let mut items: Vec<KeyedView> = Vec::new();
 
         // Title row: search and grouping.
@@ -905,61 +904,66 @@ impl DesktopApp {
             ),
         ));
 
-        // The summary.
-        let working = count(FleetFilter::Working);
-        let waiting = count(FleetFilter::Waiting);
+        // The summary: what no chip counts (Working and Waiting are chips).
+        // Holds have no daemon total: counted in the loaded rows.
         let holds = live
             .iter()
             .filter(|row| page_ui::held(row.status_line.as_deref()))
             .count();
         let (tokens_today, reporting) = self.tokens_today();
-        // Holds have no daemon total: counted in the loaded rows.
-        let holds_label = if partial {
-            "On provider hold (loaded)"
-        } else {
-            "On provider hold"
-        };
         items.push(KeyedView::new(
-            format!("stats:{working}:{waiting}:{holds}:{partial}:{tokens_today}:{reporting}"),
+            format!("stats:{holds}:{partial}:{tokens_today}:{reporting}"),
             page_ui::grid(vec![
-                page_ui::stat_panel(page_ui::stat(working.to_string(), "Working", None)),
-                page_ui::stat_panel(page_ui::stat(waiting.to_string(), "Waiting for you", None)),
-                page_ui::stat_panel(
-                    page_ui::stat(
-                        holds.to_string(),
-                        holds_label,
-                        Some("Agents their provider holds (quota, rate limit, sign-in)".to_owned()),
-                    ),
-                ),
-                page_ui::stat_panel(
-                    page_ui::stat(
-                        crate::monitor::group(tokens_today),
-                        "Tokens today",
-                        Some(format!(
-                            "Totals of {reporting} loaded Agents active today; each reports its whole total"
-                        )),
-                    ),
-                ),
+                page_ui::stat_panel(page_ui::stat(
+                    if partial {
+                        format!("{holds}+")
+                    } else {
+                        holds.to_string()
+                    },
+                    "On provider hold",
+                    Some("Quota, rate limit or sign-in".to_owned()),
+                )),
+                page_ui::stat_panel(page_ui::stat(
+                    crate::monitor::group(tokens_today),
+                    "Tokens today",
+                    Some(format!("{reporting} Agents active today")),
+                )),
             ]),
         ));
 
         // The filter chips.
+        // The wait classes, on the Waiting chip's tooltip and help text.
+        let waits = match &self.monitor.liveness {
+            Some(Ok(liveness)) => Some(format!(
+                "Moving {} · Asked {} · Parked {} · Stuck {} · Long {}",
+                liveness.moving, liveness.asked, liveness.parked, liveness.stuck, liveness.long
+            )),
+            _ => None,
+        };
         let chips: Vec<KeyedView> = FleetFilter::ALL
             .into_iter()
             .map(|filter| {
                 let selected = fleet == filter;
                 let (n, loaded_only) = counted(filter);
-                let label = if loaded_only {
-                    format!("{} (loaded)", filter.label())
+                // A partial read counts only its loaded rows: "3+".
+                let (text, count) = if loaded_only {
+                    (format!("{} {n}+", filter.label()), None)
                 } else {
-                    filter.label().to_owned()
+                    (filter.label().to_owned(), Some(n))
                 };
+                let tip = (filter == FleetFilter::Waiting)
+                    .then(|| waits.clone())
+                    .flatten();
                 KeyedView::new(
-                    format!("{label}:{selected}:{n}"),
+                    format!(
+                        "{text}:{selected}:{n}:{}",
+                        tip.as_deref().unwrap_or_default()
+                    ),
                     page_ui::filter_chip(
-                        &label,
-                        Some(n),
+                        &text,
+                        count,
                         selected,
+                        tip,
                         context.message(Message::Monitor(MonitorMsg::FleetChosen(filter))),
                     ),
                 )
@@ -967,19 +971,6 @@ impl DesktopApp {
             .collect();
         items.push(KeyedView::new("filters", page_ui::chip_rows(chips, 6)));
 
-        // The wait classes.
-        let waits = match &self.monitor.liveness {
-            None => "Waits: reading…".to_owned(),
-            Some(Ok(liveness)) => format!(
-                "Waits: Moving {} · Asked {} · Parked {} · Stuck {} · Long {}",
-                liveness.moving, liveness.asked, liveness.parked, liveness.stuck, liveness.long
-            ),
-            Some(Err(error)) => format!("Waits: not read ({error})"),
-        };
-        items.push(KeyedView::new(
-            format!("waits:{waits}"),
-            controls::secondary(waits).text_wrapping(TextWrapping::Wrap),
-        ));
         if data.read_at_ms.is_none() && self.monitor.refreshing && data.errors.is_empty() {
             items.push(KeyedView::new(
                 "reading",
@@ -1082,12 +1073,10 @@ impl DesktopApp {
                 } else {
                     total_of(group.states())
                 };
+                // The read's total; else its loaded rows, "+" when partial.
                 let label = match total {
-                    Some(total) if total > loaded_rows => {
-                        format!("{} · {total} · {loaded_rows} loaded", group.title())
-                    }
                     Some(total) => format!("{} · {total}", group.title()),
-                    None if partial => format!("{} · {loaded_rows} loaded", group.title()),
+                    None if partial => format!("{} · {loaded_rows}+", group.title()),
                     None => format!("{} · {loaded_rows}", group.title()),
                 };
                 if group == FleetGroup::Stopped {
@@ -1113,12 +1102,6 @@ impl DesktopApp {
                     "No Agents to show"
                 }
                 .to_owned(),
-            ));
-        }
-        if partial {
-            items.push(KeyedView::new(
-                "partial",
-                page_ui::quiet("Showing loaded Agents: more are live than this read loaded."),
             ));
         }
         items.push(KeyedView::new(
@@ -1315,21 +1298,19 @@ impl DesktopApp {
                     technical.extend(skipped);
                     headline.replacen("Routing picks", "Routing picked", 1)
                 }
-                None if profile.starts_with("adhoc-") => {
-                    "You chose its app and model when you started it.".to_owned()
-                }
-                None => format!("You started it on the preset {profile}."),
+                None if profile.starts_with("adhoc-") => "You, by app and model".to_owned(),
+                // The summary's Preset line already says it.
+                None => String::new(),
             };
-            summary.push(KeyedView::new(
-                "chosen",
-                page_ui::kv_text("Chosen by", chosen),
-            ));
+            if !chosen.is_empty() {
+                summary.push(KeyedView::new(
+                    "chosen",
+                    page_ui::kv_text("Chosen by", chosen),
+                ));
+            }
         }
         if let Some(generation) = generation {
-            summary.push(KeyedView::new(
-                "generation",
-                page_ui::kv_text("Generation", generation.to_string()),
-            ));
+            technical.push(format!("Run {generation}"));
         }
         let created = detail
             .map(|detail| detail.created_at)
@@ -1505,12 +1486,6 @@ impl DesktopApp {
                 ));
             }
         }
-        work_rows.push(KeyedView::new(
-            "checkpoint",
-            Border::new()
-                .content(page_ui::kv_text("Checkpoint", "\u{2014}"))
-                .tooltip("The daemon keeps checkpoints but the desktop cannot read them yet"),
-        ));
         items.push(KeyedView::new(
             "work",
             self.details_section("work", "Work", work_rows, context),
@@ -1707,18 +1682,16 @@ impl DesktopApp {
         if let Some(rules) = read.and_then(|read| read.agent.owner_rules_delivery.as_ref()) {
             context_rows.push(KeyedView::new(
                 "rules",
-                page_ui::kv_text(
-                    "Owner rules",
-                    format!(
-                        "{} · revision {}",
+                Border::new()
+                    .content(page_ui::kv_text(
+                        "Owner rules",
                         if rules.delivered {
-                            "delivered"
+                            "Delivered"
                         } else {
-                            "not delivered"
+                            "Not delivered"
                         },
-                        rules.revision
-                    ),
-                ),
+                    ))
+                    .tooltip(format!("Revision {}", rules.revision)),
             ));
         }
         if let Some(lines) = detail
@@ -1742,13 +1715,7 @@ impl DesktopApp {
         ));
 
         // Heavy work: only when heavy episodes were recorded.
-        let heavy: Vec<String> = read
-            .map(monitor_view::observe_lines)
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|line| line.starts_with("Heavy work"))
-            .collect();
-        if !heavy.is_empty() {
+        if let Some(heavy) = read.and_then(monitor_view::heavy_work) {
             items.push(KeyedView::new(
                 "heavy",
                 self.details_section(
@@ -1756,7 +1723,7 @@ impl DesktopApp {
                     "Heavy work",
                     vec![KeyedView::new(
                         "lines",
-                        controls::body(heavy.join("\n"))
+                        controls::body(heavy)
                             .text_wrapping(TextWrapping::Wrap)
                             .is_text_selection_enabled(true),
                     )],

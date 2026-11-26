@@ -301,12 +301,11 @@ impl DesktopApp {
             .text_wrapping(TextWrapping::Wrap)
             .is_text_selection_enabled(true)
             .into(),
-            Search::Read(_) if eligible.is_empty() && unread == 0 => controls::secondary(format!(
-                "No other {} is running or ready, so there is none to move it under.",
-                scope.offered()
-            ))
-            .text_wrapping(TextWrapping::Wrap)
-            .into(),
+            Search::Read(_) if eligible.is_empty() && unread == 0 => {
+                controls::secondary(format!("No other {} is running or ready.", scope.offered()))
+                    .text_wrapping(TextWrapping::Wrap)
+                    .into()
+            }
             Search::Read(_) if eligible.is_empty() => {
                 controls::secondary("None of the tasks read can take it.")
                     .text_wrapping(TextWrapping::Wrap)
@@ -382,14 +381,7 @@ impl DesktopApp {
             StackPanel::new()
                 .spacing(tokens::spacing::MD)
                 .keyed_children(crate::views::slots([
-                    Some(
-                        controls::secondary(format!(
-                            "Pick a running or ready {}. Its workers move with it.",
-                            scope.offered()
-                        ))
-                        .text_wrapping(TextWrapping::Wrap)
-                        .into(),
-                    ),
+                    None,
                     Some(
                         controls::field()
                             .text(dialog.query.clone())

@@ -1445,7 +1445,7 @@ impl DesktopApp {
             Target::Agent(agent) if action == Action::Stop => (
                 format!("Stop “{}”?", target.title()),
                 format!(
-                    "Swarm stops Agent {} (run {}) and its session: its work ends now and a running turn is cut off. The worktree and branch stay; Resume starts it again.",
+                    "Agent {} · run {}. A running turn is cut off; the worktree and branch stay.",
                     agent.id, agent.generation
                 ),
                 "Stop Agent",
@@ -1458,7 +1458,7 @@ impl DesktopApp {
                     _ => "Claude Code, Muse and Antigravity keep their own chat history.",
                 };
                 let body = format!(
-                    "Swarm removes this task tree, its records and clean, merged worktrees it created. Project checkouts and Git branches stay on disk. Swarm archives eligible Codex chats and deletes eligible OpenCode chats it created. Attached and observed chats stay with their app. {history}"
+                    "Removes the task tree, its records and the clean, merged worktrees Swarm made. Checkouts and branches stay. Swarm archives its Codex chats and deletes its OpenCode chats; attached chats stay. {history}"
                 );
                 (
                     format!("Delete “{}” and its task tree?", target.title()),

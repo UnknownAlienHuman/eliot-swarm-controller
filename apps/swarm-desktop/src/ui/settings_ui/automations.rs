@@ -289,12 +289,7 @@ impl DesktopApp {
             return page_ui::page("Automations", tokens::page::WIDTH, items);
         }
         let cards = self.automation_cards();
-        let mut left: Vec<KeyedView> = vec![KeyedView::new(
-            "intro",
-            page_ui::quiet(
-                "Each automation starts work for you. Switch one off to stop new work; work already running finishes.",
-            ),
-        )];
+        let mut left: Vec<KeyedView> = Vec::new();
         if !self.automation.read() {
             left.push(KeyedView::new(
                 "reading",
@@ -303,9 +298,7 @@ impl DesktopApp {
         } else if cards.is_empty() {
             left.push(KeyedView::new(
                 "empty",
-                page_ui::quiet(
-                    "No automations yet. A brief queue takes the briefs in a folder one by one and starts a task for each.",
-                ),
+                page_ui::quiet("No automations yet."),
             ));
         }
         for namespace in &self.automation.rules {
@@ -371,7 +364,7 @@ impl DesktopApp {
                     tokens::spacing::SM,
                     vec![KeyedView::new(
                         "hint",
-                        page_ui::quiet("Choose an automation to see and edit it."),
+                        page_ui::quiet("Select an automation"),
                     )],
                 ),
             ));
@@ -445,12 +438,6 @@ impl DesktopApp {
                     ])),
             ));
         }
-        right.push(KeyedView::new(
-            "check",
-            page_ui::quiet(
-                "The project check itself is set in the project's policy: Settings › Projects.",
-            ),
-        ));
         items.push(KeyedView::new(
             "columns",
             page_ui::columns(left, tokens::spacing::SM, right),
@@ -1039,7 +1026,8 @@ impl DesktopApp {
         page_ui::panel(tokens::spacing::SM, parts)
     }
 
-    /// The short form: labelled fields with a line of help each.
+    /// The short form: labelled fields, each one's purpose in its
+    /// placeholder and tooltip (as the reference apps put it).
     fn assignment_form_view(&self, form: &AssignmentForm, context: &mut ViewContext<Self>) -> View {
         let text_row = |context: &mut ViewContext<Self>,
                         field: FormField,
@@ -1049,42 +1037,29 @@ impl DesktopApp {
                         help: &str| {
             KeyedView::new(
                 label.to_owned(),
-                StackPanel::new().children((
-                    controls::form_row(
-                        label,
-                        controls::field()
-                            .is_enabled(!form.saving)
-                            .text(value)
-                            .placeholder_text(hint)
-                            .automation_name(label)
-                            .on_text_changed(crate::views::text_edits(context.callback(
-                                move |text| {
-                                    Message::Automation(AutomationMsg::FormText(field, text))
-                                },
-                            )))
-                            .into(),
-                        None,
-                    ),
-                    controls::help(help),
-                )),
+                controls::form_row(
+                    label,
+                    controls::field()
+                        .is_enabled(!form.saving)
+                        .text(value)
+                        .placeholder_text(hint)
+                        .automation_name(label)
+                        .on_text_changed(crate::views::text_edits(context.callback(move |text| {
+                            Message::Automation(AutomationMsg::FormText(field, text))
+                        })))
+                        .automation_help_text(help)
+                        .tooltip(help),
+                    None,
+                ),
             )
         };
-        let mut rows: Vec<KeyedView> = vec![
-            KeyedView::new(
-                "title",
-                controls::section_title(match &form.editing {
-                    Some(key) => format!("Edit {key}"),
-                    None => "New automation".to_owned(),
-                }),
-            ),
-            KeyedView::new(
-                "about",
-                controls::secondary(
-                    "Swarm takes the .md briefs in a folder in filename order and starts one task for each.",
-                )
-                .text_wrapping(TextWrapping::Wrap),
-            ),
-        ];
+        let mut rows: Vec<KeyedView> = vec![KeyedView::new(
+            "title",
+            controls::section_title(match &form.editing {
+                Some(key) => format!("Edit {key}"),
+                None => "New automation".to_owned(),
+            }),
+        )];
         if form.editing.is_none() {
             rows.push(text_row(
                 context,
@@ -1092,7 +1067,7 @@ impl DesktopApp {
                 "Name",
                 &form.name,
                 "For example backlog",
-                "Letters, digits, - and _. Swarm keeps its place in the folder under this name.",
+                "Letters, digits, - and _. Swarm keeps its place in the folder under this name",
             ));
         }
         rows.push(text_row(
@@ -1101,7 +1076,7 @@ impl DesktopApp {
             "Briefs folder",
             &form.folder,
             "C:\\briefs\\queue",
-            "Each .md file is one task. Name new ones so they sort after the last one started.",
+            "Each .md file is one task, started in filename order",
         ));
         let workspaces = self.assignment_workspaces();
         let workspace_index = workspaces
@@ -1110,77 +1085,68 @@ impl DesktopApp {
         let labels: Vec<String> = workspaces.iter().map(|(_, label)| label.clone()).collect();
         rows.push(KeyedView::new(
             "workspace",
-            StackPanel::new().children((
-                controls::form_row(
-                    "Work in",
-                    Grid::new()
-                        .keyed_children(vec![KeyedView::new(
-                            format!("{}:{workspace_index:?}", labels.join("\u{1f}")),
-                            controls::enum_width(ComboBox::new())
-                                .is_enabled(!form.saving)
-                                .items_source(labels)
-                                .selected_index(workspace_index)
-                                .automation_name("Work in")
-                                .on_selection_changed(context.callback(|index| {
-                                    Message::Automation(AutomationMsg::FormWorkspace(index))
-                                })),
-                        )])
-                        .into(),
-                    None,
-                ),
-                controls::help("The project the tasks start in."),
-            )),
+            controls::form_row(
+                "Work in",
+                Grid::new()
+                    .keyed_children(vec![KeyedView::new(
+                        format!("{}:{workspace_index:?}", labels.join("\u{1f}")),
+                        controls::enum_width(ComboBox::new())
+                            .is_enabled(!form.saving)
+                            .items_source(labels)
+                            .selected_index(workspace_index)
+                            .automation_name("Work in")
+                            .on_selection_changed(context.callback(|index| {
+                                Message::Automation(AutomationMsg::FormWorkspace(index))
+                            })),
+                    )])
+                    .automation_help_text("The project the tasks start in")
+                    .tooltip("The project the tasks start in"),
+                None,
+            ),
         ));
         let roles = self.assignment_roles();
         let role_index = roles.iter().position(|role| *role == form.role);
         rows.push(KeyedView::new(
             "role",
-            StackPanel::new().children((
-                controls::form_row(
-                    "Start as",
-                    Grid::new()
-                        .keyed_children(vec![KeyedView::new(
-                            format!("{}:{role_index:?}", roles.join("\u{1f}")),
-                            controls::enum_width(ComboBox::new())
-                                .is_enabled(!form.saving)
-                                .items_source(roles)
-                                .selected_index(role_index)
-                                .automation_name("Start as")
-                                .on_selection_changed(context.callback(|index| {
-                                    Message::Automation(AutomationMsg::FormRole(index))
-                                })),
-                        )])
-                        .into(),
-                    None,
-                ),
-                controls::help(
-                    "The kind of task. Settings › Routing picks its model for this role.",
-                ),
-            )),
+            controls::form_row(
+                "Start as",
+                Grid::new()
+                    .keyed_children(vec![KeyedView::new(
+                        format!("{}:{role_index:?}", roles.join("\u{1f}")),
+                        controls::enum_width(ComboBox::new())
+                            .is_enabled(!form.saving)
+                            .items_source(roles)
+                            .selected_index(role_index)
+                            .automation_name("Start as")
+                            .on_selection_changed(context.callback(|index| {
+                                Message::Automation(AutomationMsg::FormRole(index))
+                            })),
+                    )])
+                    .automation_help_text("The task's role: Settings › Routing picks its model")
+                    .tooltip("The task's role: Settings › Routing picks its model"),
+                None,
+            ),
         ));
         rows.push(KeyedView::new(
             "busy",
-            StackPanel::new().children((
-                controls::form_row(
-                    "At most at once",
-                    NumberBox::new()
-                        .is_enabled(!form.saving)
-                        .width(tokens::layout::NUMBER_WIDTH)
-                        .horizontal_alignment(HorizontalAlignment::Left)
-                        .minimum(1.0)
-                        .maximum(1000.0)
-                        .value(Some(form.busy as f64))
-                        .automation_name("At most at once")
-                        .on_value_changed(
-                            context.callback(|value| {
-                                Message::Automation(AutomationMsg::FormBusy(value))
-                            }),
-                        )
-                        .into(),
-                    None,
-                ),
-                controls::help("How many of its tasks may run at the same time."),
-            )),
+            controls::form_row(
+                "At most at once",
+                NumberBox::new()
+                    .is_enabled(!form.saving)
+                    .width(tokens::layout::NUMBER_WIDTH)
+                    .horizontal_alignment(HorizontalAlignment::Left)
+                    .minimum(1.0)
+                    .maximum(1000.0)
+                    .value(Some(form.busy as f64))
+                    .automation_name("At most at once")
+                    .on_value_changed(
+                        context
+                            .callback(|value| Message::Automation(AutomationMsg::FormBusy(value))),
+                    )
+                    .automation_help_text("How many of its tasks may run at the same time")
+                    .tooltip("How many of its tasks may run at the same time"),
+                None,
+            ),
         ));
         rows.push(text_row(
             context,
@@ -1188,7 +1154,7 @@ impl DesktopApp {
             "Check every",
             &form.interval,
             "30s",
-            "How often Swarm looks for the next brief: 30s, 5m or 1h.",
+            "How often Swarm looks for the next brief: 30s, 5m or 1h",
         ));
         if let Some(error) = &form.error {
             rows.push(KeyedView::new(

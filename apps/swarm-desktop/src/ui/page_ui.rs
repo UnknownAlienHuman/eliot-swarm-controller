@@ -206,6 +206,7 @@ pub(super) fn filter_chip(
     label: &str,
     count: Option<usize>,
     selected: bool,
+    tip: Option<String>,
     on_click: Callback<()>,
 ) -> View {
     let text = match count {
@@ -213,15 +214,19 @@ pub(super) fn filter_chip(
         None => label.to_owned(),
     };
     let glyph = selected.then_some(controls::glyph::CHECK);
-    controls::segment(selected)
+    let chip = controls::segment(selected)
         .automation_name(if selected {
             format!("{text} (shown)")
         } else {
             format!("Show {text}")
         })
         .on_click(on_click)
-        .content(controls::chip_content(glyph, &text, false))
-        .into()
+        .content(controls::chip_content(glyph, &text, false));
+    // A detail line, read by UI Automation too (a tooltip is not its name).
+    match tip {
+        Some(tip) => chip.automation_help_text(&tip).tooltip(tip),
+        None => chip.into(),
+    }
 }
 
 /// A wrapping row of chips 6 DIPs apart (`.filters`). Reactor 0.100.0 has

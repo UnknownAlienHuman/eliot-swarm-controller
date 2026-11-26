@@ -671,18 +671,14 @@ fn harness_rows(
     }
 }
 
-/// A failed harness read in plain words, with its typed code.
+/// A failed harness read in plain words.
 pub fn failure_text(label: &str, failure: &ModelsCatalogFailure) -> String {
     let why = match failure.code.as_str() {
         "busy" => "Swarm was busy reading other harnesses".to_owned(),
         _ if failure.message.trim().is_empty() => "the read failed".to_owned(),
         _ => failure.message.trim().trim_end_matches('.').to_owned(),
     };
-    format!(
-        "{label} models could not be read: {why} ({}, {}).",
-        failure.code,
-        failure.origin.as_str()
-    )
+    format!("{label} models not read: {why}.")
 }
 
 /// Whether Manage models shows `model`.

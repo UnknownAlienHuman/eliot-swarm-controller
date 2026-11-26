@@ -297,36 +297,25 @@ fn identity_lines_with(read: &DetailRead, words: impl Fn(&str) -> String) -> Vec
     lines
 }
 
-/// Heavy-work and session-growth readback for the Agent Details panel, in
-/// words; empty when neither was recorded (the section is then hidden).
-/// Only committed rollups render: episode rows show the program basename
-/// recorded at commit time, never full commands or paths.
-pub fn observe_lines(read: &DetailRead) -> Vec<String> {
-    let mut lines = Vec::new();
-    if let Some(heavy) = &read.agent.heavy
-        && heavy.episodes > 0
-    {
-        let what = heavy
-            .latest_category
-            .as_deref()
-            .map(|category| format!(", latest {}", category.replace('_', " ")))
-            .unwrap_or_default();
-        lines.push(format!(
-            "Heavy work: {}{what}, {:.1} s of CPU",
-            eliot_core::count_words(heavy.episodes, "episode", "episodes"),
-            heavy.total_cpu_ms as f64 / 1000.0
-        ));
-    }
-    if let Some(growth) = &read.agent.session_growth {
-        lines.push(format!(
-            "The session grows fast: {}",
-            growth
-                .message
-                .as_deref()
-                .unwrap_or("its size crossed the warning threshold")
-        ));
-    }
-    lines
+/// The heavy-work rollup for the Agent Details panel, in words; `None`
+/// when no heavy episode was recorded (the section is then hidden). Only
+/// committed rollups render: never full commands or paths.
+pub fn heavy_work(read: &DetailRead) -> Option<String> {
+    let heavy = read
+        .agent
+        .heavy
+        .as_ref()
+        .filter(|heavy| heavy.episodes > 0)?;
+    let what = heavy
+        .latest_category
+        .as_deref()
+        .map(|category| format!(", latest {}", category.replace('_', " ")))
+        .unwrap_or_default();
+    Some(format!(
+        "{}{what}, {:.1} s of CPU",
+        eliot_core::count_words(heavy.episodes, "episode", "episodes"),
+        heavy.total_cpu_ms as f64 / 1000.0
+    ))
 }
 
 /// Normalized token usage, context fill, and cost for the selected Agent.
@@ -336,15 +325,18 @@ pub fn usage_lines(read: &DetailRead) -> Vec<String> {
         .session_usage
         .as_ref()
         .and_then(eliot_core::SessionUsage::context_tokens);
-    let mut lines = vec![match context {
-        Some((used, window)) => format!(
-            "Context {:.1}% filled · {} of {} tokens",
-            100.0 * used as f64 / window as f64,
-            group(used),
-            group(window)
-        ),
-        None => "Context fill unavailable.".to_owned(),
-    }];
+    // An unknown fill is the Used row's "not reported", not a second line.
+    let mut lines: Vec<String> = context
+        .map(|(used, window)| {
+            format!(
+                "Context {:.1}% filled · {} of {} tokens",
+                100.0 * used as f64 / window as f64,
+                group(used),
+                group(window)
+            )
+        })
+        .into_iter()
+        .collect();
     match &read.usage {
         Ok(usage) => {
             let turns = &usage.turns;
