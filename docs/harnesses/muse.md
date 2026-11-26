@@ -310,7 +310,17 @@ A promptless resume can open another generation without creating a turn.
 Resume preflight compares the newest native turn with the newest retained
 turn on the same Agent, including earlier generations of that session.
 When the Store has no turn, the native readback must prove the session ran
-none. The Owner can inspect the refusal with `swarm why AGENT` and use
+none. When the retained turn is itself `unknown` (for example a turn
+interrupted by daemon death), an exact id match with the newest native turn
+— even though that native turn is the interrupted turn rather than a
+terminal one — resumes the session for new input only: the retained unknown
+turn stays unknown for Owner resolution and the interrupted effect is never
+replayed. Any other native difference still refuses. Late native facts that
+name the retained unknown turn after resume replay expected history: the
+adapter names them as gaps without associating, committing, or replaying
+them, and they never fail readiness, so the resuming generation still opens
+for new input. The Owner can inspect
+the refusal with `swarm why AGENT` and use
 `swarm switch AGENT --generation N` once any unknown work is settled.
 
 [Daemon restart continuation](../spec/configuration.md#agent-restart-policy)

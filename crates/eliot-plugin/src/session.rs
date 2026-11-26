@@ -579,11 +579,15 @@ pub fn split_provider_model(model: &str) -> Option<(&str, &str)> {
 /// plus the retained generation's last turn summary, when it had one. The
 /// request family is new in the resuming generation, so only the
 /// session/turn/message ownership is required of the retained source.
+/// `retained_turn_unknown` records whether that retained turn is itself
+/// unknown (for example a turn interrupted by daemon death): the resuming
+/// generation continues with new input only and never replays it.
 #[derive(Debug)]
 pub struct ResumeSubject {
     pub native_scope: String,
     pub native_ref: String,
     pub retained_turn: Option<String>,
+    pub retained_turn_unknown: bool,
 }
 
 /// Validate the retained resume subject and its generation continuity. The
@@ -697,8 +701,8 @@ pub fn parse_resume_subject(
             format!("{harness} resume readback omitted current_turn"),
         )
     })?;
-    let retained_turn = match current_turn {
-        Value::Null => None,
+    let (retained_turn, retained_turn_unknown) = match current_turn {
+        Value::Null => (None, false),
         Value::Object(turn) => {
             if !["state", "status", "started_at", "completed_at"]
                 .iter()
@@ -725,18 +729,19 @@ pub fn parse_resume_subject(
                     format!("{harness} resume current_turn summary is incomplete"),
                 ));
             }
-            Some(
-                turn.get("turn_id")
-                    .and_then(Value::as_str)
-                    .filter(|value| !value.trim().is_empty())
-                    .ok_or_else(|| {
-                        Error::new(
-                            "unknown",
-                            format!("{harness} resume current_turn omitted its exact turn id"),
-                        )
-                    })?
-                    .to_owned(),
-            )
+            let turn_id = turn
+                .get("turn_id")
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .ok_or_else(|| {
+                    Error::new(
+                        "unknown",
+                        format!("{harness} resume current_turn omitted its exact turn id"),
+                    )
+                })?
+                .to_owned();
+            let unknown = turn.get("state").and_then(Value::as_str) == Some("unknown");
+            (Some(turn_id), unknown)
         }
         _ => {
             return Err(Error::new(
@@ -749,6 +754,7 @@ pub fn parse_resume_subject(
         native_scope,
         native_ref,
         retained_turn,
+        retained_turn_unknown,
     })
 }
 

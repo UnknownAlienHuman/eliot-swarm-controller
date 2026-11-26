@@ -142,6 +142,11 @@ pub(crate) struct EventStatus {
     pub session_id: Option<String>,
     pub active_command_id: Option<String>,
     pub active_turn_id: Option<String>,
+    /// The retained generation's `unknown` turn id, when a resume continues
+    /// it. Its late native facts name expected history: they are gapped,
+    /// never replayed or associated, and never fail readiness. The turn
+    /// itself stays unknown for Owner resolution.
+    pub retained_unknown_turn: Option<String>,
     pub last_turn: Option<TurnFacts>,
     pub provider_model_turn: Option<String>,
     pub model_mismatch: Option<(String, String)>,
@@ -291,6 +296,10 @@ pub(crate) struct EventHandle {
 }
 
 enum Control {
+    RetainUnknownTurn {
+        turn_id: String,
+        reply: oneshot::Sender<()>,
+    },
     ViewReadback {
         session_id: String,
         reason: Option<NativeHistoryNoneReason>,
@@ -476,6 +485,16 @@ fn native_notification_turn_id(params: &Value) -> Option<&str> {
         .and_then(Value::as_str)
         .or_else(|| params.pointer("/item/turnId").and_then(Value::as_str))
         .or_else(|| provider::signal(params).map(|signal| signal.turn_id))
+}
+
+/// The retained generation's `unknown` turn, when a resume continues it:
+/// the daemon died mid-turn, so the resumed native session replays this
+/// turn's late facts. They name expected history for a turn that stays
+/// unknown for Owner resolution — never a replay, association, or
+/// readiness failure.
+fn retained_unknown_exempt(status: &EventStatus, params: &Value) -> bool {
+    native_notification_turn_id(params)
+        .is_some_and(|turn_id| status.retained_unknown_turn.as_deref() == Some(turn_id))
 }
 
 /// Store identities acknowledged during the active turn, independently of
@@ -805,6 +824,17 @@ impl EventHandle {
         let _ = self.actor.call(|reply| Control::Close { reply }).await;
     }
 
+    /// Record the retained generation's `unknown` turn before readiness:
+    /// its late native facts name expected history for a turn that stays
+    /// unknown for Owner resolution. Best effort: a closing queue has no
+    /// frames left to protect.
+    pub async fn retain_unknown_turn(&self, turn_id: String) {
+        let _ = self
+            .actor
+            .call(|reply| Control::RetainUnknownTurn { turn_id, reply })
+            .await;
+    }
+
     pub async fn drain_native(&self) -> Result<()> {
         eliot_plugin::native_lifecycle::wait_for_native_tail(self.actor.watch(), |s| {
             s.native_drained
@@ -909,6 +939,11 @@ impl EventProcessor {
         control: Control,
     ) -> bool {
         match control {
+            Control::RetainUnknownTurn { turn_id, reply } => {
+                self.status.retained_unknown_turn = Some(turn_id);
+                let _ = reply.send(());
+                true
+            }
             Control::ViewReadback {
                 session_id,
                 reason,
@@ -1725,6 +1760,19 @@ impl EventProcessor {
             .session_id
             .as_deref()
             .ok_or_else(|| Error::new("unknown", "Muse request has no owned session"))?;
+        if retained_unknown_exempt(&self.status, &params) {
+            // Re-issued request for the retained unknown turn: receipt it
+            // and drop it as an orphan. Never answered; the turn stays
+            // unknown for Owner resolution.
+            if let Some(native_id) = orphan_request_id(&method, &params) {
+                self.expected_requests.remove(native_id.as_str());
+            }
+            let _ = self
+                .native
+                .reply_server_request(id, json!({}), Instant::now() + EVENT_DEADLINE)
+                .await;
+            return Ok(());
+        }
         let turn_id = self
             .status
             .active_turn_id
@@ -2686,6 +2734,21 @@ impl EventProcessor {
         if native_notification_turn_id(&params)
             .is_some_and(|turn_id| self.uncertain_native_turns.contains(turn_id))
         {
+            return Ok(());
+        }
+        if retained_unknown_exempt(&self.status, &params) {
+            // Expected history for the retained unknown turn: name its
+            // coverage once without declaring a new uncertain outcome. The
+            // turn itself stays unknown for Owner resolution. Never replay
+            // it as a native trigger, never associate or commit it, and
+            // never fail on it — readiness included.
+            if !self.gap_reported {
+                self.record_coverage_gap(
+                    "Muse frame names the retained unknown turn; it stays unknown for Owner resolution",
+                    &["session", "turn", "message", "tool", "request"],
+                )
+                .await?;
+            }
             return Ok(());
         }
         if is_workflow_item_frame(&method, &params) {
@@ -4678,6 +4741,12 @@ impl EventProcessor {
 
     async fn record_gap(&mut self, reason: &str) -> Result<()> {
         self.stream_source().record_gap(reason).await
+    }
+
+    async fn record_coverage_gap(&mut self, reason: &str, families: &[&str]) -> Result<()> {
+        self.stream_source()
+            .record_coverage_gap(reason, families)
+            .await
     }
 
     /// The shared stream-commit half of this processor.

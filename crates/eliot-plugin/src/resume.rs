@@ -4,7 +4,11 @@
 //! proves it is resumable by this new generation: an idle/not-loaded runtime,
 //! no active turn the vendor exposes, and — when the generation retained a
 //! turn — the newest native turn is exactly that retained turn and is
-//! terminal. A retained generation with no turn needs vendor proof that no
+//! terminal, except that an exact match with a retained `unknown` turn (for
+//! example one interrupted by daemon death) also resumes: the resuming
+//! generation continues with new input only, the retained unknown turn stays
+//! unknown for Owner resolution, and the interrupted effect is never replayed.
+//! A retained generation with no turn needs vendor proof that no
 //! native turn ran. Each plugin translates its own readback into
 //! [`ResumePreflight`]; the decision and its diagnostic wording live here.
 //!
@@ -15,6 +19,8 @@
 use eliot_core::{Error, Result};
 
 /// Native evidence one plugin reads back before adopting a retained subject.
+/// Each plugin reports the native fact — the newest native turn id and its
+/// native state string — and the shared verifier below decides.
 pub struct ResumePreflight<'a> {
     /// Vendor display name used in diagnostics (`"Codex"`, `"Muse"`).
     pub vendor: &'static str,
@@ -25,23 +31,40 @@ pub struct ResumePreflight<'a> {
     pub runtime_resumable: bool,
     /// Exact retained turn id, when the generation retained one.
     pub retained_turn: Option<&'a str>,
-    /// Newest native turn as `(turn id, terminal)`, when one is readable.
-    pub newest_turn: Option<(&'a str, bool)>,
+    /// True when the retained turn is itself `unknown` (for example a turn
+    /// interrupted by daemon death). An exact native id match then resumes
+    /// for new input only; the retained turn stays unknown and is never
+    /// replayed.
+    pub retained_unknown: bool,
+    /// Newest native turn as `(turn id, native state)`, when one is readable.
+    pub newest_turn: Option<(&'a str, &'a str)>,
     /// The vendor reported an active turn.
     pub active_turn: bool,
     /// The native readback proves the retained subject ran no native turns.
     pub proves_no_turn: bool,
 }
 
+/// Native terminal states per vendor. Anything else (for example an
+/// in-progress turn) is not terminal.
+fn is_terminal(vendor: &str, state: &str) -> bool {
+    match vendor {
+        "Muse" => matches!(state, "completed" | "failed" | "cancelled"),
+        "Codex" => matches!(state, "completed" | "interrupted" | "failed"),
+        _ => matches!(state, "completed" | "failed" | "cancelled" | "interrupted"),
+    }
+}
+
 impl ResumePreflight<'_> {
     /// Accept only a resumable retained subject with a matching terminal
-    /// turn (or proven no-turn). Every rejection stays `native_readback`.
+    /// turn (or proven no-turn), plus the exact-match retained-`unknown`
+    /// continuation. Every rejection stays `native_readback`.
     pub fn verify(self) -> Result<()> {
         let ResumePreflight {
             vendor,
             subject,
             runtime_resumable,
             retained_turn,
+            retained_unknown,
             newest_turn,
             active_turn,
             proves_no_turn,
@@ -59,7 +82,11 @@ impl ResumePreflight<'_> {
             ));
         }
         match (retained_turn, newest_turn) {
-            (Some(expected), Some((actual, true))) if actual == expected => Ok(()),
+            (Some(expected), Some((actual, state)))
+                if actual == expected && (is_terminal(vendor, state) || retained_unknown) =>
+            {
+                Ok(())
+            }
             (None, None) if proves_no_turn => Ok(()),
             (None, None) => Err(Error::new(
                 "native_readback",
