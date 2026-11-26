@@ -28,6 +28,11 @@ use serde_json::{Value, json};
 use std::sync::{Arc, Weak, atomic::Ordering};
 use tokio::sync::{broadcast, oneshot, watch};
 
+pub(super) enum ObserverAction {
+    Attach,
+    Detach,
+}
+
 pub(super) const CONTROLLED_PLUGIN_SOURCE: &str = "stream";
 
 /// Bounded pre-dispatch re-reads of one admitted command: a transient Store
@@ -2012,60 +2017,28 @@ impl Router {
             .await;
     }
 
-    pub(super) async fn settle_observe_attach(&self, id: &str, snapshot: Value) -> Option<Command> {
+    pub(super) async fn settle_observer(&self, id: &str, outcome: Value, action: ObserverAction) {
         let (result, write_faulted) = {
             let mut store = self.inner.store.lock().await;
-            let result = store.settle_observe_attach(id, snapshot, now_ms());
+            let result = match action {
+                ObserverAction::Attach => store.settle_observe_attach(id, outcome, now_ms()),
+                ObserverAction::Detach => store.settle_observe_detach(id, outcome, now_ms()),
+            };
             if let Ok(change) = &result {
                 self.publish_locked(&change.events);
             }
             (result, store.is_write_faulted())
         };
-        match result {
-            Ok(change) => {
-                let command = change.value;
-                self.signal_progress();
-                Some(command)
-            }
-            Err(_) => {
-                let cause = if write_faulted {
-                    "observe_attach_store_faulted"
-                } else {
-                    "observe_attach_settlement_failed"
-                };
-                self.note_unknown_if_uncertain(id, cause).await;
-                self.signal_progress();
-                None
-            }
+        if result.is_err() {
+            let cause = match (action, write_faulted) {
+                (ObserverAction::Attach, true) => "observe_attach_store_faulted",
+                (ObserverAction::Attach, false) => "observe_attach_settlement_failed",
+                (ObserverAction::Detach, true) => "observe_detach_store_faulted",
+                (ObserverAction::Detach, false) => "observe_detach_settlement_failed",
+            };
+            self.note_unknown_if_uncertain(id, cause).await;
         }
-    }
-
-    pub(super) async fn settle_observe_detach(&self, id: &str, outcome: Value) -> Option<Command> {
-        let (result, write_faulted) = {
-            let mut store = self.inner.store.lock().await;
-            let result = store.settle_observe_detach(id, outcome, now_ms());
-            if let Ok(change) = &result {
-                self.publish_locked(&change.events);
-            }
-            (result, store.is_write_faulted())
-        };
-        match result {
-            Ok(change) => {
-                let command = change.value;
-                self.signal_progress();
-                Some(command)
-            }
-            Err(_) => {
-                let cause = if write_faulted {
-                    "observe_detach_store_faulted"
-                } else {
-                    "observe_detach_settlement_failed"
-                };
-                self.note_unknown_if_uncertain(id, cause).await;
-                self.signal_progress();
-                None
-            }
-        }
+        self.signal_progress();
     }
 
     pub(super) async fn settle_unspawned_start(&self, id: &str, error: &Error) {
