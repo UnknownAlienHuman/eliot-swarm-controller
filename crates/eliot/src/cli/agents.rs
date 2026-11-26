@@ -1,9 +1,9 @@
 //! Agent lifecycle and coordination writes.
 use super::args::{
-    AnswerArgs, ApproveArgs, AttachArgs, ConfigureArgs, DenyArgs, DetachArgs, DigestArgs,
-    DiscoverArgs, GenerationArgs, InjectCliArgs, InterruptArgs, LaunchArgs, LaunchQueueArgs,
-    ModelsArgs, PageArgs, QuotaArgs, ReadGenerationArgs, ResumeArgs, SendArgs, SteerArgs, StopArgs,
-    WaitArgs, WorktreeArgs, WorktreeCommand, WorktreeRemoveArgs,
+    AnswerArgs, ApproveArgs, AttachArgs, CompactArgs, ConfigureArgs, DenyArgs, DetachArgs,
+    DigestArgs, DiscoverArgs, GenerationArgs, InjectCliArgs, InterruptArgs, LaunchArgs,
+    LaunchQueueArgs, ModelsArgs, PageArgs, QuotaArgs, ReadGenerationArgs, ResumeArgs, SendArgs,
+    SteerArgs, StopArgs, WaitArgs, WorktreeArgs, WorktreeCommand, WorktreeRemoveArgs,
 };
 use super::support::read_and_print;
 use super::support::{
@@ -679,6 +679,35 @@ pub(crate) async fn run_interrupt(
     params.expected_generation = generation;
     params.expected_turn_id = turn;
     submit_exact_turn_command(&data_dir, &params, json_output, None).await
+}
+
+pub(crate) async fn run_compact(
+    CompactArgs {
+        agent,
+        generation: GenerationArgs { generation },
+        wait_seconds,
+    }: CompactArgs,
+    data_dir: PathBuf,
+    json_output: bool,
+    id: Option<String>,
+) -> Result<u8, Failure> {
+    let deadline = wait_seconds.map(wait_deadline).transpose()?;
+    let mut params = submit_request(id, Some(agent), "compact", json!({}))?;
+    params.expected_generation = generation;
+    let submitted = submit_command(&data_dir, &params).await?;
+    let submit_exit = response_exit_code(submitted.state);
+    if matches!(submit_exit, 1 | 3 | 4) {
+        print_value(&submit_value(&submitted)?, json_output);
+        return Ok(submit_exit);
+    }
+    let Some(deadline) = deadline else {
+        print_value(&submit_value(&submitted)?, json_output);
+        return Ok(submit_exit);
+    };
+    let completed = wait_for_command(&data_dir, &submitted.command_id, deadline).await?;
+    let exit_code = response_exit_code(completed.state);
+    print_value(&command_value(completed)?, json_output);
+    Ok(exit_code)
 }
 
 pub(crate) async fn run_approve(
