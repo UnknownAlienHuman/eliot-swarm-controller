@@ -3640,7 +3640,9 @@ outcomes leave the release running.
 
 The CLI records the startup evidence and decision in the private data directory
 under the update preparation ID, including a candidate health failure before
-boot evidence exists. A record write failure appears in the update report.
+boot evidence exists. Recording a new decision prunes older
+`update-health-<ULID>.json` files, retaining the newest three. A record write
+failure appears in the update report.
 Rollback reports a candidate with proven surviving process custody as held
 and names its observed admission when available. Read the retained decision
 without a daemon using `swarm daemon update --health-decision PREPARE_ID`.
