@@ -437,27 +437,32 @@ async fn down_inner(path: &Path) -> Result<DownOutcome, Failure> {
     let reg_name = registry_name(&root);
     let located = locate_stand_registration(&root).map_err(Failure::for_read)?;
     ensure_registry_is_external(&root, &located.registry).map_err(Failure::for_read)?;
+    #[cfg(windows)]
+    let _startup = eliot_daemon::operator::lock_stand_removal(&root).map_err(Failure::for_read)?;
     let mut record = located.record.clone();
+    let finish_removed = |record: &StandRegistration| -> Result<DownOutcome, Failure> {
+        remove_stand_registration(&located.registry, &reg_name).map_err(Failure::for_read)?;
+        Ok(DownOutcome {
+            state: "removed",
+            data_dir: display(&root),
+            daemon_pid: record.removing_pid.filter(|pid| *pid != 0),
+            force_blocker: None,
+            external_worktrees: Vec::new(),
+            external_branches: Vec::new(),
+            unusable_records: Vec::new(),
+            former_registration: located.former.then(|| {
+                (
+                    "removed".to_owned(),
+                    located.registry.join(&reg_name).display().to_string(),
+                )
+            }),
+        })
+    };
     match fs::symlink_metadata(&root) {
         Err(error)
             if error.kind() == std::io::ErrorKind::NotFound && record.removing_pid.is_some() =>
         {
-            remove_stand_registration(&located.registry, &reg_name).map_err(Failure::for_read)?;
-            return Ok(DownOutcome {
-                state: "removed",
-                data_dir: display(&root),
-                daemon_pid: record.removing_pid.filter(|pid| *pid != 0),
-                force_blocker: None,
-                external_worktrees: Vec::new(),
-                external_branches: Vec::new(),
-                unusable_records: Vec::new(),
-                former_registration: located.former.then(|| {
-                    (
-                        "removed".to_owned(),
-                        located.registry.join(&reg_name).display().to_string(),
-                    )
-                }),
-            });
+            return finish_removed(&record);
         }
         Err(error) => return Err(io_failure("inspect stand root", error)),
         Ok(_) => {}
@@ -470,6 +475,12 @@ async fn down_inner(path: &Path) -> Result<DownOutcome, Failure> {
         read_stand_registration(&located.registry, &reg_name, &root).map_err(Failure::for_read)?;
     verify_stand_marker(&root, &record).map_err(Failure::for_read)?;
     verify_stand_target(&root, &record).map_err(Failure::for_read)?;
+    #[cfg(windows)]
+    if eliot_daemon::operator::resume_empty_stand_removal(&root, &record)
+        .map_err(Failure::for_read)?
+    {
+        return finish_removed(&record);
+    }
     let read_only_copy = read_only_copy_store(&root)? || record.removing_pid == Some(0);
     if read_only_copy && record.removing_pid.is_some_and(|pid| pid != 0) {
         return Err(Failure::new(

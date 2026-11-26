@@ -3717,7 +3717,11 @@ the CLI requests Force on that same verified daemon and reports the drain
 blocker. Force uses the daemon's owned process custody, and removal still
 requires exact daemon exit and a completed shutdown record. An offline copy
 with no daemon record is removed through the same registry and root checks.
-A retry uses the recorded removal phase. After a crash without
+A retry uses the recorded removal phase. On Windows, the daemon startup fence
+stays held through root disposition. If marker deletion succeeded and the root
+is still present, a retry removes it only when its identity matches the external
+registration and the directory is empty, before reopening any daemon lock.
+After a crash without
 exit proof, start the registered stand again so boot can reconcile custody,
 then retry teardown. [Workspace cancellation recovery](monitoring.md#workspace-preparation)
 settles exact pre-effect cancellations before drain. Stand cleanup still requires

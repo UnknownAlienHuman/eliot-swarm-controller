@@ -126,6 +126,7 @@ mod windows {
                 restored: false,
             };
             guard.visit(&root, String::new(), 0, deadline)?;
+            guard.inventory.sort();
             guard.root_identity = guard
                 .directories
                 .first()
@@ -199,6 +200,21 @@ mod windows {
             self.restore_all()?;
             self.restored = true;
             Ok(())
+        }
+
+        pub(crate) fn require_entry_identity(&self, relative: &str, file: &File) -> Result<()> {
+            let actual = identity(file)?;
+            if let Ok(index) = self
+                .inventory
+                .binary_search_by(|(path, _)| path.as_str().cmp(relative))
+                && self.inventory[index].1 == actual
+            {
+                return Ok(());
+            }
+            Err(Error::new(
+                "identity_changed",
+                "guarded worktree entry changed",
+            ))
         }
 
         /// Keep the live deny ACL until explicit settlement or restart recovery.
@@ -344,9 +360,7 @@ mod windows {
             let mut found = Vec::new();
             walk_inventory(&self.root, String::new(), 0, deadline, &mut found)?;
             found.sort();
-            let mut expected = self.inventory.clone();
-            expected.sort();
-            if found != expected {
+            if found != self.inventory {
                 return Err(Error::new(
                     "unknown",
                     "worktree entries changed while write fencing was installed",

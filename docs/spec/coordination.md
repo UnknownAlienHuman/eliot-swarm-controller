@@ -169,9 +169,11 @@ branch cleanup under `WorktreeWriteGuard` + `OwnedChild`, keeps the stand if any
 external item is kept/unknown, and deletes the offline stand root and external registry
 entry only when external cleanup is complete. On Windows, the parent chain stays open
 while cleanup reopens the stand by name for deletion and checks its artifact identity.
-Cleanup opens descendants relative to held directory handles without following links,
-then deletes through those handles with the stand marker last among the contents.
-Parent stand cleanup reports `unsupported` outside Windows. An
+Cleanup opens descendants and admitted external-worktree scratch files relative to
+held directory handles without following links, then deletes through those handles.
+The stand marker is the last entry removed before the root. Parent stand planning
+and apply report `unsupported` outside Windows. Direct `stand down` and `stand prune`
+on Unix use the verified paths for offline deletion. An
 optional `artifacts` list (at most 64 unique ids, each a safe candidate of that
 plan) attempts only those; the plan's other safe candidates settle
 `skipped(not_selected)` without an attempt fence, so a later plan offers them again.

@@ -164,6 +164,54 @@ impl Directory {
         Ok((self, path))
     }
 
+    #[cfg(windows)]
+    pub(crate) fn remove_empty(self) -> Result<()> {
+        let expected = eliot_plugin::file_identity(self.handle()).map_err(io)?;
+        let (parent, path) = self.into_parent()?;
+        let name = path.file_name().ok_or_else(refused)?;
+        let file = native::open_cleanup(parent.handle(), name, true).map_err(cleanup_open_error)?;
+        check(&file, true)?;
+        if eliot_plugin::file_identity(&file).map_err(io)? != expected {
+            return Err(Error::new(
+                "identity_changed",
+                "directory changed before removal",
+            ));
+        }
+        // Directory disposition fails if any entry is still present.
+        native::delete_handle(&file)
+            .map_err(|error| Error::new("unknown", format!("remove empty directory: {error}")))
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn open_cleanup_file(&self, name: &std::ffi::OsStr) -> Result<Option<File>> {
+        self.open_file_for_cleanup(name, |parent, name| {
+            native::open_cleanup(parent, name, false)
+        })
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn open_guarded_cleanup_file(&self, name: &std::ffi::OsStr) -> Result<Option<File>> {
+        // The worktree write guard retains read handles that share DELETE.
+        self.open_file_for_cleanup(name, native::open_cleanup_alias)
+    }
+
+    #[cfg(windows)]
+    fn open_file_for_cleanup(
+        &self,
+        name: &std::ffi::OsStr,
+        open: impl FnOnce(&File, &std::ffi::OsStr) -> std::io::Result<File>,
+    ) -> Result<Option<File>> {
+        plain(name.to_str().ok_or_else(refused)?)?;
+        let file = match open(self.handle(), name) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(cleanup_open_error(error)),
+        };
+        cleanup_file_size(&file)?;
+        require_single_cleanup_link(&file)?;
+        Ok(Some(file))
+    }
+
     pub(crate) fn direct_child_path(&self, child: &Path) -> std::io::Result<PathBuf> {
         let name = child
             .file_name()
@@ -880,9 +928,9 @@ impl CleanupTree {
             }
             let daemon_lock = depth == 0 && text.eq_ignore_ascii_case("daemon.lock");
             let lock_identity = if daemon_lock {
-                // Transfer the offline lock to an exclusive, delete-capable
-                // handle. A startup winning the gap prevents the open before
-                // any disposition. The caller also holds the operator event.
+                // Save the identity, then close the offline handle before
+                // reopening the file for exclusive DELETE access. The
+                // start/removal event spans this gap and final disposition.
                 stand
                     .as_deref_mut()
                     .and_then(|stand| stand.offline.take())
@@ -1013,6 +1061,30 @@ fn stand_identity_changed() -> Error {
         "identity_changed",
         "stand directory or ownership entry changed",
     )
+}
+
+#[cfg(windows)]
+pub(crate) fn remove_cleanup_file(file: File) -> Result<()> {
+    require_single_cleanup_link(&file)?;
+    native::delete_cleanup_entry(&file)
+        .map_err(|error| Error::new("unknown", format!("remove pinned file: {error}")))
+}
+
+#[cfg(windows)]
+pub(crate) fn remove_guarded_cleanup_file(file: File) -> Result<()> {
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_DISPOSITION_FLAG_DELETE, FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE,
+        FILE_DISPOSITION_FLAG_POSIX_SEMANTICS,
+    };
+    require_single_cleanup_link(&file)?;
+    // Unlink this name on close even while the write guard retains its reader.
+    native::delete_with_flags(
+        &file,
+        FILE_DISPOSITION_FLAG_DELETE
+            | FILE_DISPOSITION_FLAG_POSIX_SEMANTICS
+            | FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE,
+    )
+    .map_err(|error| Error::new("unknown", format!("remove guarded scratch file: {error}")))
 }
 
 #[cfg(windows)]

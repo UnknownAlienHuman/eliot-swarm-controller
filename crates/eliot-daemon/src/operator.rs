@@ -208,6 +208,14 @@ pub fn lock_transition(path: &Path) -> Result<OperatorLock> {
     DataDir::open_existing(path)?.acquire_operator_lock(true)
 }
 
+#[cfg(windows)]
+pub fn lock_stand_removal(path: &Path) -> Result<OperatorLock> {
+    crate::platform::windows::acquire_start_removal_event(path)
+}
+
+#[cfg(windows)]
+pub use crate::stand_cleanup::resume_empty_stand_removal;
+
 pub fn create_stand_root(path: &Path) -> Result<()> {
     crate::platform::data_dir::refuse_unverified_write(path)?;
     #[cfg(windows)]

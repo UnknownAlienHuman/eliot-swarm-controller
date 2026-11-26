@@ -264,9 +264,13 @@ async fn run_with_update(
     // mask. Windows keeps its ACL checks.
     use crate::platform::data_dir::{repair_existing_managed_dir_acl, repair_startup_data_root};
 
+    #[cfg(windows)]
+    let startup = crate::platform::windows::acquire_start_removal_event(&path)?;
     let mut removed = repair_startup_data_root(&path)?;
     let data_dir = DataDir::open(&path)?;
     let daemon_lock = data_dir.acquire_daemon_lock()?;
+    #[cfg(windows)]
+    drop(startup);
     data_dir.initialize_retention_config(&daemon_lock)?;
     if let Some(attempt) = attempt {
         let backup = crate::update_backup::update_backup_path(data_dir.path(), attempt)?;
