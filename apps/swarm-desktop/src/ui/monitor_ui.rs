@@ -1685,10 +1685,8 @@ impl DesktopApp {
         // What went wrong: why and where the Agent last failed, in one line
         // (the full chain lives behind `swarm why`), its recovery (Resume
         // for a lost or failed run, bound to that run) and Copy details.
-        if let Some(line) = read
-            .and_then(|read| read.diagnosis.as_ref().ok())
-            .and_then(monitor::diagnosis_line)
-        {
+        let diagnosis = read.and_then(|read| read.diagnosis.as_ref().ok());
+        if let Some(line) = diagnosis.and_then(monitor::diagnosis_line) {
             let mut actions: Vec<KeyedView> = Vec::new();
             // The run to resume: the open conversation's readback, else
             // the Monitor's row, when it is lost or failed and idle.
@@ -1716,13 +1714,26 @@ impl DesktopApp {
                         .content(controls::label("Resume")),
                 ));
             }
+            // The whole block, as the label promises: every step, code,
+            // where, origin and the Owner's action.
+            let details = diagnosis.map_or_else(
+                || line.clone(),
+                |reply| {
+                    monitor::diagnosis_details(
+                        reply,
+                        resume
+                            .map(|generation| format!("Resume run {generation}"))
+                            .as_deref(),
+                    )
+                },
+            );
             actions.push(KeyedView::new(
                 "copy",
                 controls::text_button()
                     .automation_name("Copy details")
                     .on_click(context.message(Message::Pane(super::pane_ui::PaneMsg::Copy(
                         "the details".to_owned(),
-                        line.clone(),
+                        details,
                     ))))
                     .content(controls::icon_label(controls::glyph::COPY, "Copy details")),
             ));

@@ -442,6 +442,9 @@ pub(super) enum PaneMsg {
     TreeHandoff(String, i64),
     ProcessesLoaded(u64, Option<Box<ProcessesRead>>),
     OpenTerminal,
+    /// Opening Windows Terminal settled off the UI thread: why it failed
+    /// and the folder, if it did.
+    TerminalOpened(Option<(String, String)>),
     /// A Details section's Expander opened (`true`) or closed.
     Section(&'static str, bool),
     /// Details › Task's record read landed (its epoch), or was dropped.
@@ -650,14 +653,27 @@ impl DesktopApp {
                 }
             }
             PaneMsg::OpenTerminal => {
-                // The folder the button showed: the daemon's readback.
-                self.pane.terminal.note = match self.open_workspace() {
-                    Some(folder) => super::reveal::open_terminal(&folder)
-                        .err()
-                        .map(|why| (why, folder)),
-                    None => Some(("This task has no worktree yet.".to_owned(), String::new())),
-                };
+                // The folder the button showed: the daemon's readback, as
+                // recorded (a link or junction that leads elsewhere is
+                // refused), checked and opened off the UI thread.
+                match self.open_workspace() {
+                    Some(folder) => {
+                        self.pane.terminal.note = None;
+                        let _task = context.spawn_background(move |_| {
+                            let opened = super::reveal::recorded_folder(&folder)
+                                .and_then(|path| super::reveal::open_terminal(&path));
+                            Message::Pane(PaneMsg::TerminalOpened(
+                                opened.err().map(|why| (why, folder)),
+                            ))
+                        });
+                    }
+                    None => {
+                        self.pane.terminal.note =
+                            Some(("This task has no worktree yet.".to_owned(), String::new()));
+                    }
+                }
             }
+            PaneMsg::TerminalOpened(note) => self.pane.terminal.note = note,
             PaneMsg::Section(key, open) => {
                 // The Expander reports its own state; a rebuilt one reports
                 // the state it already shows.
