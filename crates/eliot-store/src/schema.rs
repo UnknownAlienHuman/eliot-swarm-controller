@@ -1,6 +1,6 @@
 use super::*;
 
-pub(super) const CURRENT_SCHEMA_VERSION: i64 = FIRST_OWNER_MESSAGE_VERSION;
+pub(super) const CURRENT_SCHEMA_VERSION: i64 = OWNER_INBOX_GOAL_STATUS_VERSION;
 const HARNESS_CHECK_SCHEMA_VERSION: i64 = 112;
 const WORK_TRUTH_VERSION: i64 = 113;
 const WORK_TRUTH_INTENT_VERSION: i64 = 114;
@@ -49,6 +49,7 @@ const ORGANIZATION_CONTENT_SOURCE_VERSION: i64 = 156;
 const HANDOFF_READ_INDEX_VERSION: i64 = 157;
 const DIAGNOSE_READ_INDEX_VERSION: i64 = 158;
 const FIRST_OWNER_MESSAGE_VERSION: i64 = 159;
+const OWNER_INBOX_GOAL_STATUS_VERSION: i64 = 160;
 
 fn has_restart_continuation_brief_column(connection: &Connection) -> Result<bool> {
     connection
@@ -2880,6 +2881,21 @@ impl Store {
                     admission::FIRST_OWNER_MESSAGE_PREDICATE
                 ),
                 Some(FIRST_OWNER_MESSAGE_VERSION),
+            )?;
+        }
+        if current < OWNER_INBOX_GOAL_STATUS_VERSION {
+            // The inbox reads only live goals; without this the projection
+            // scans the whole goal history including settled rows. The reason
+            // literal must match the one the projection interpolates.
+            self.migrate_sql(
+                &format!(
+                    "CREATE INDEX owner_inbox_goal_status ON goals(agent, mode, generation, revision)
+                     WHERE json_extract(state,'$.status') IN ('active','blocked')
+                        OR (json_extract(state,'$.status') = 'paused'
+                            AND json_extract(state,'$.paused_reason') = '{reason}');",
+                    reason = crate::goals::COMPLETION_DEFERRAL_LIMIT_REASON
+                ),
+                Some(OWNER_INBOX_GOAL_STATUS_VERSION),
             )?;
         }
         Ok(())

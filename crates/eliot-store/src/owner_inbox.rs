@@ -412,7 +412,9 @@ fn project_requests(
                 COALESCE((SELECT MAX(e.seq) FROM events e WHERE e.agent=r.agent
                   AND e.generation=r.generation AND e.kind IN ('request.opened','request.resolved','request.closed')
                   AND json_extract(e.data,'$.request_id')=r.request_id),0)
-         FROM pending_requests r JOIN agents a ON a.id=r.agent AND a.generation=r.generation
+         -- The request table stays outside: scanning every visible Agent
+         -- to find no open request costs the whole fleet on each read.
+         FROM pending_requests r CROSS JOIN agents a ON a.id=r.agent AND a.generation=r.generation
          WHERE r.state='pending' AND a.archived=0
            AND a.state NOT IN ('stopped','failed','lost')
            AND json_type(a.profile_snapshot, '$._harness_check') IS NULL
