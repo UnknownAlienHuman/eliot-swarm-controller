@@ -83,7 +83,7 @@ impl DesktopApp {
                     controls::setting_row("Reading limits…", "", None),
                 )],
                 (_, None) => unknown_limits(""),
-                (_, Some(Err(error))) => unknown_limits(&crate::state::plain_error(error)),
+                (_, Some(Err(error))) => unknown_limits(&crate::state::plain_reason(error)),
                 (_, Some(Ok(reply))) => {
                     let windows = crate::quota::windows(reply);
                     if windows.is_empty() {

@@ -191,10 +191,12 @@ impl DesktopApp {
         } else {
             controls::icon(controls::glyph::USAGE)
         };
-        let spoken = if word.is_empty() {
-            "Usage: limits not read yet".to_owned()
-        } else {
-            format!("Usage: {word}")
+        // No line once read: no harness speaks here (nothing runs, and
+        // Auto has no previewed pick).
+        let spoken = match self.usage.read_at {
+            _ if !word.is_empty() => format!("Usage: {word}"),
+            None => "Usage: limits not read yet".to_owned(),
+            Some(_) => "Usage".to_owned(),
         };
         let row = controls::row(open)
             .height(tokens::height::CONTROL)

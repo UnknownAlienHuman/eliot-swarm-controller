@@ -226,6 +226,17 @@ pub fn plain_error(error: &str) -> String {
     }
 }
 
+/// [`plain_error`] without the daemon's code, where a person reads only
+/// the reason (why Settings › Usage knows no quota).
+pub fn plain_reason(error: &str) -> String {
+    match error.split_once(": ") {
+        Some((code, message)) if code != "busy" && !code.contains(' ') => {
+            format!("{}.", message.trim().trim_end_matches('.'))
+        }
+        _ => plain_error(error),
+    }
+}
+
 /// Exact control binding captured at click time. The UI moves these values
 /// into the background submission; whatever the selection becomes afterwards
 /// cannot change them.

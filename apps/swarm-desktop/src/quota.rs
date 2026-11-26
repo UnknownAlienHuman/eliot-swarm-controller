@@ -120,6 +120,13 @@ pub fn status_line(label: &str, reply: &HarnessQuotaResponse) -> String {
         == Some("error");
     if failed {
         if reply.harness == "muse" && !note.is_empty() {
+            // Muse reports some failures as a bare code
+            // (`server_sent_no_usage`): said in words.
+            let note = if note.contains(char::is_whitespace) {
+                note.to_owned()
+            } else {
+                note.replace('_', " ")
+            };
             return format!("{label}: {note}");
         }
         let provider = details
