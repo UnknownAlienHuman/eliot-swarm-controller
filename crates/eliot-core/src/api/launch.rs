@@ -2,6 +2,14 @@ use crate::{Error, Result, RoutingDecision};
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::{Map, Value};
 
+const SELECTOR_FIELDS: [&str; 5] = [
+    "model",
+    "effort",
+    "model_source",
+    "effort_source",
+    "daemon_model",
+];
+
 /// Launch selectors shared by the CLI, Router and Store. The original
 /// envelope remains authoritative for key presence, adapter extensions and
 /// the replay digest. Boundary validators still refuse malformed fields.
@@ -65,13 +73,17 @@ impl LaunchCommandArgs {
         self.model.as_deref().or(self.profile_model.as_deref())
     }
 
-    /// Recover the saved selectors before a child inherits the profile.
+    pub fn has_selection(&self) -> bool {
+        self.selected_model().is_some() || self.effort.is_some()
+    }
+
+    /// Recover the saved bounds for an explicit delegated selection.
     pub fn restore_saved_selectors(snapshot: &mut Value) {
         let Some(snapshot) = snapshot.as_object_mut() else {
             return;
         };
         if let Some(Value::Object(mut saved)) = snapshot.remove("launch_selection") {
-            for key in ["model", "effort", "model_source", "daemon_model"] {
+            for key in SELECTOR_FIELDS {
                 snapshot.remove(key);
                 if let Some(value) = saved.remove(key) {
                     snapshot.insert(key.to_owned(), value);
@@ -80,8 +92,8 @@ impl LaunchCommandArgs {
         }
     }
 
-    pub fn check_delegated_selectors(&self, saved: &Value) -> Result<()> {
-        if let Some(model) = self.selected_model()
+    pub fn check_model_bound(saved: &Value, model: Option<&str>) -> Result<()> {
+        if let Some(model) = model
             && !saved["launch_models"]
                 .as_array()
                 .is_some_and(|models| models.iter().any(|allowed| allowed.as_str() == Some(model)))
@@ -91,6 +103,11 @@ impl LaunchCommandArgs {
                 "requested model is outside the saved profile's launch_models",
             ));
         }
+        Ok(())
+    }
+
+    pub fn check_delegated_selectors(&self, saved: &Value) -> Result<()> {
+        Self::check_model_bound(saved, self.selected_model())?;
         if let Some(effort) = self.effort.as_deref()
             && saved["effort"].as_str() != Some(effort)
         {
@@ -104,13 +121,13 @@ impl LaunchCommandArgs {
 
     /// Freeze the selection while retaining the default selectors for children.
     pub fn freeze_saved_selectors(&self, snapshot: &mut Value) {
-        if self.selected_model().is_none() && self.effort.is_none() {
+        if !self.has_selection() {
             return;
         }
         let Some(snapshot) = snapshot.as_object_mut() else {
             return;
         };
-        let saved = ["model", "effort", "model_source", "daemon_model"]
+        let saved = SELECTOR_FIELDS
             .into_iter()
             .filter_map(|key| {
                 snapshot
@@ -129,6 +146,10 @@ impl LaunchCommandArgs {
         }
         if let Some(effort) = &self.effort {
             snapshot.insert("effort".to_owned(), Value::String(effort.clone()));
+            snapshot.insert(
+                "effort_source".to_owned(),
+                Value::String("launch".to_owned()),
+            );
         }
     }
 

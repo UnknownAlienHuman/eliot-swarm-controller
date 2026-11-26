@@ -1896,10 +1896,11 @@ single model field.
 An authenticated Agent can select a model for its own child within the selected profile's
 frozen `launch_models` list and the existing `child_profiles` and control rules.
 An out-of-bounds request returns `model_outside_launch_bounds`. An Agent may
-specify the saved effort exactly. Implicit inheritance uses the saved selectors
-from the parent's snapshot for the inherited profile. Owner selection requires a
-parentless launch. Route, executable and other native overrides cannot accompany
-a named selection.
+specify the saved effort exactly. A child that reuses its parent's snapshot
+without explicit selectors inherits the frozen model and effort, including
+launch overrides. An explicit child selection starts from the saved profile
+selectors. Owner selection requires a parentless launch. Route, executable and
+other native overrides cannot accompany a named selection.
 
 `swarm show` and `agent.get` report the frozen model and its provenance in
 `profile_snapshot.model` and `profile_snapshot.model_source` (`launch` or `profile`)
@@ -2552,6 +2553,14 @@ workspace/worktree/base overrides still use normal launch validation. The route
 preserves A's project authorization scope for handoff. The new Agent records the
 registration resolved from its workspace. No launch prompt or parent override is accepted.
 
+A switch reusing its source's preset carries each frozen launch override into
+the successor unless the Owner supplies that selector. An explicit Owner switch
+to a different named profile of the same harness also carries the overrides,
+subject to the destination catalogue and route. A routed or delegated switch to
+a different preset uses that preset's selectors. Cross-harness switches use the
+destination harness's selectors. Handoff to an already-created Agent uses its
+existing configuration.
+
 The immediate reply is the retained reservation, not proof of launch or transfer.
 Use `swarm.wait` on the switch ID or retry that same ID for component readback.
 The independent operation reserves launch/Handoff IDs before external preparation,
@@ -2566,7 +2575,7 @@ during drain; it never launches another B or repeats work. See
 [Coordination](coordination.md#agent-switch-implemented) for crash/boundary semantics.
 
 ```text
-swarm [--id ULID] switch A --generation N [--task-command COMMAND] [SEND_ID...] --profile PROFILE
+swarm [--id ULID] switch A --generation N [--task-command COMMAND] [SEND_ID...] --profile PROFILE [--model MODEL] [--effort EFFORT]
 swarm [--id ULID] switch A --generation N [--task-command COMMAND] [SEND_ID...] --harness HARNESS [--model MODEL] [--effort EFFORT] [--auth INTEGRATION] [--cmd PATH]
 ```
 

@@ -1093,6 +1093,8 @@ reuses the parent profile's frozen snapshot or names a
 profile from the parent's captured `child_profiles` allow-list. An explicit profile
 bypasses routing; a `role` selects candidates intersected with that frozen list
 (including the inherited parent profile). A later config edit cannot widen the list.
+Verbatim reuse includes the parent's frozen launch overrides. Explicit Agent
+model or effort selection follows the [launch bounds](configuration.md#launch-model-selection-on-a-saved-route).
 An allow-listed cross-harness profile is an explicit Owner grant of that profile's
 freshly frozen harness, model, permissions and MCP policy. The child gets its own
 credential/selector bindings; parent bindings and native policy names never cross

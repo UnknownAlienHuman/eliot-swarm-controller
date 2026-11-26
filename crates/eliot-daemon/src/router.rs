@@ -4246,8 +4246,17 @@ impl Router {
                 Error::new("invalid", "launch harness must be a non-empty string")
             })?;
             let harness = crate::adhoc::validate_adhoc_harness(harness)?;
+            let profile_name = crate::adhoc::adhoc_profile_name(&harness);
+            let launch = switch::carry_launch_selection(
+                &mut request.args,
+                routing,
+                &harness,
+                &profile_name,
+            )?;
             let model = launch.model;
             let effort = launch.effort;
+            let explicit_model = model.is_some();
+            let explicit_effort = effort.is_some();
             for (field, parsed, message) in [
                 (
                     "auth",
@@ -4277,7 +4286,6 @@ impl Router {
             // otherwise the installed executable is discovered on the
             // blocking pool. Shape is validated with the frozen snapshot
             // below.
-            let profile_name = crate::adhoc::adhoc_profile_name(&harness);
             let install = eliot_plugin::install::discovery_for(&harness)?;
             let (cmd, selected_version) = match explicit_cmd.as_deref() {
                 Some(cmd)
@@ -4314,8 +4322,13 @@ impl Router {
                 )
             })
             .await??;
-            if snapshot.get("model").is_some() {
+            if explicit_model {
                 snapshot["model_source"] = json!("launch");
+            } else if snapshot.get("model").is_some() {
+                snapshot["model_source"] = json!("default");
+            }
+            if explicit_effort {
+                snapshot["effort_source"] = json!("launch");
             }
             crate::config::stamp_cloud_mcp_hostname(&mut snapshot, &self.inner.data_root);
             crate::config::capture_native_store_inputs(
@@ -4360,6 +4373,13 @@ impl Router {
             let deadline = std::time::Instant::now() + crate::adhoc::DISCOVERY_BUDGET;
             self.resolve_launch_default(&harness, &name, &mut snapshot, deadline)
                 .await?;
+            if routing.switch_source.is_some() {
+                let launch =
+                    switch::carry_launch_selection(&mut request.args, routing, &harness, &name)?;
+                self.validate_named_launch_selection(&harness, &name, &snapshot, &launch, deadline)
+                    .await?;
+                launch.freeze_saved_selectors(&mut snapshot);
+            }
             install_frozen_profile(request, &harness, snapshot, true)?;
             let store = self.inner.store.lock().await;
             hierarchy::check_agent_launch_authority(&store, principal, request)?;
@@ -4439,7 +4459,9 @@ impl Router {
                 Some((name.to_owned(), snapshot, harness, command_bound, false))
             } else {
                 let mut snapshot = parent.profile_snapshot.clone();
-                LaunchCommandArgs::restore_saved_selectors(&mut snapshot);
+                if launch.has_selection() {
+                    LaunchCommandArgs::restore_saved_selectors(&mut snapshot);
+                }
                 Some((parent.profile, snapshot, parent.harness, true, true))
             }
         } else {
@@ -4496,6 +4518,11 @@ impl Router {
         if let Some(args) = request.args.as_object_mut() {
             args.insert("profile".to_owned(), Value::String(name.clone()));
         }
+        let launch = if routing.switch_source.is_some() {
+            switch::carry_launch_selection(&mut request.args, routing, &harness, &name)?
+        } else {
+            launch
+        };
         if matches!(principal, Principal::Agent { .. }) {
             launch.check_delegated_selectors(&snapshot)?;
             install_frozen_profile(request, &harness, snapshot.clone(), true)?;

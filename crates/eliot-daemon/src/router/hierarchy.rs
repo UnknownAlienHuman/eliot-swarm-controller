@@ -102,6 +102,7 @@ fn ignored_child_snapshot_key(key: &str) -> bool {
         "model"
             | "effort"
             | "model_source"
+            | "effort_source"
             | "launch_models"
             | "launch_selection"
             | "context_ceiling_tokens"

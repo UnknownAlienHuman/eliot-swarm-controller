@@ -477,9 +477,11 @@ pub(super) fn inherited_launch_snapshot(
     launch: &core::api::LaunchCommandArgs,
 ) -> Result<Value> {
     let mut snapshot = parent.clone();
-    core::api::LaunchCommandArgs::restore_saved_selectors(&mut snapshot);
-    launch.check_delegated_selectors(&snapshot)?;
-    launch.freeze_saved_selectors(&mut snapshot);
+    if launch.has_selection() {
+        core::api::LaunchCommandArgs::restore_saved_selectors(&mut snapshot);
+        launch.check_delegated_selectors(&snapshot)?;
+        launch.freeze_saved_selectors(&mut snapshot);
+    }
     Ok(snapshot)
 }
 

@@ -428,7 +428,10 @@ impl Router {
         }
         if launch.profile_model.is_some() {
             // The compatibility field keeps its original saved-list bound.
-            launch.check_delegated_selectors(snapshot)?;
+            eliot_core::api::LaunchCommandArgs::check_model_bound(
+                snapshot,
+                launch.profile_model.as_deref(),
+            )?;
         }
         if let Some(model) = model {
             if let Some(validate) = capabilities.named_profile.and_then(|mapping| mapping.model) {

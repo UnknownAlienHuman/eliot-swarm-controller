@@ -11,6 +11,8 @@ pub(super) struct LaunchRouting<'a> {
     pub(super) arbitrated: bool,
     pub(super) owner_automation: bool,
     pub(super) provider_source: Option<&'a Value>,
+    pub(super) switch_source: Option<&'a Agent>,
+    pub(super) switch_allows_other_profiles: bool,
     pub(super) growth_switch: bool,
     pub(super) preview: bool,
     pub(super) harness_check_candidate: Option<&'a eliot_core::api::HarnessCandidate>,
@@ -813,9 +815,7 @@ impl Router {
         }
         let inherited_snapshot = parent.is_some_and(|parent| parent.profile == name);
         let mut snapshot = if let Some(parent) = parent.filter(|parent| parent.profile == name) {
-            let mut snapshot = parent.profile_snapshot.clone();
-            LaunchCommandArgs::restore_saved_selectors(&mut snapshot);
-            snapshot
+            parent.profile_snapshot.clone()
         } else {
             match self.resolve_profile_cached(name) {
                 Ok(mut snapshot) => {

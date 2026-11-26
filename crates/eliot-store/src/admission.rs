@@ -899,7 +899,7 @@ fn admit_launch_tx(
             ));
         }
     };
-    let has_selection = launch.selected_model().is_some() || launch.effort.is_some();
+    let has_selection = launch.has_selection();
     if let Some(parent) = parent_link
         .as_ref()
         .filter(|parent| parent.launched_by_agent)
@@ -922,7 +922,7 @@ fn admit_launch_tx(
             launch.check_delegated_selectors(&saved)?;
         }
     }
-    if profile_snapshot.get("launch_selection").is_some()
+    if (has_selection && profile_snapshot.get("launch_selection").is_some())
         || launch.profile_model.is_some()
         || (has_selection
             && parent_link
