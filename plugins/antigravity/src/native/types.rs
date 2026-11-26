@@ -384,9 +384,8 @@ pub(crate) enum AcpUpdate {
         cost_amount: Option<f64>,
         cost_unit: Option<String>,
     },
-    /// Native compaction summary content. It carries no standalone terminal
-    /// receipt, so the event owner binds it to the exact pending prompt and
-    /// waits for that prompt's terminal response before publishing compaction.
+    /// Session-scoped compaction summary content. ACP supplies no prompt or
+    /// turn identity, so this update is never attributed to a pending turn.
     CompactionSummaryChunk,
     /// Known metadata updates this adapter does not model (plan, mode,
     /// config, notices, …): handled without input association.

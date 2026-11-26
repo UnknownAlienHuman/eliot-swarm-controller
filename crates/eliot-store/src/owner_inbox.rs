@@ -2048,7 +2048,8 @@ fn project_goals(
        EXISTS(SELECT 1 FROM goal_markers m WHERE m.agent=g.agent AND m.mode=g.mode
             AND m.generation=g.generation AND m.revision=g.revision AND m.state='unknown'),
        json_extract(g.state,'$.audit_history'),
-       json_extract(g.state,'$.audit_cycle.blocked_reason')
+       COALESCE(json_extract(g.state,'$.audit_cycle.blocked_reason'),
+                json_extract(g.state,'$.audit_retry_reason'))
        FROM goals g JOIN agents a ON a.id=g.agent WHERE (json_extract(g.state,'$.status') IN ('active','blocked')
          OR (json_extract(g.state,'$.status') = 'paused'
              AND json_extract(g.state,'$.paused_reason') = '{deferral_limit_reason}'))

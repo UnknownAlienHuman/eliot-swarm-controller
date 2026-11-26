@@ -183,6 +183,39 @@ fn step_for(store: &Store, row: GoalRow) -> Result<Option<GoalAuditStep>> {
 }
 
 impl Store {
+    /// Report a known refusal once while keeping the blocked revision eligible.
+    pub fn note_goal_audit_retry(
+        &mut self,
+        agent: &str,
+        generation: i64,
+        revision: i64,
+        reason: &str,
+    ) -> Result<bool> {
+        self.ensure_writer_healthy()?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sql_error)?;
+        let agent_num = parse_agent_id(agent)?;
+        let Some(mut row) = load_goal_row(&tx, agent_num, "eliot")? else {
+            return Ok(false);
+        };
+        if row.generation != generation
+            || row.revision != revision
+            || row.state.status != GoalStatus::Blocked
+            || row.state.audit_retry_reason.as_deref() == Some(reason)
+        {
+            return Ok(false);
+        }
+        row.state.audit_retry_reason = Some(core::api::truncate_bytes(reason, 256).0);
+        tx.execute(
+            "UPDATE goals SET state=?1 WHERE agent=?2 AND mode='eliot'",
+            params![encode_json(&row.state)?, agent_num],
+        )
+        .map_err(sql_error)?;
+        commit_transaction(tx, &self.write_faulted)?;
+        Ok(true)
+    }
     /// Bounded page of blocked Goals that may advance an audit cycle.
     pub fn goal_audit_candidates(&self, after: i64) -> Result<(Vec<GoalAuditStep>, Option<i64>)> {
         let mut statement = self.connection.prepare(
@@ -193,6 +226,11 @@ impl Store {
              AND json_extract(state,'$.audit_cycle.switch_command') IS NULL
              AND COALESCE(json_extract(state,'$.audit_cycle.phase'),'launch_pending')
                  IN ('launch_pending','audit_running','audit_complete')
+             AND EXISTS (SELECT 1 FROM agents a
+                         WHERE a.id=goals.agent AND a.generation=goals.generation)
+             AND (json_extract(state,'$.audit_cycle.generation') IS NULL
+                  OR (json_extract(state,'$.audit_cycle.generation')=goals.generation
+                      AND json_extract(state,'$.audit_cycle.revision')=goals.revision))
              ORDER BY agent LIMIT ?2"
         ).map_err(sql_error)?;
         let rows = statement
@@ -242,6 +280,54 @@ impl Store {
             }
         }
         Ok((out, last))
+    }
+
+    /// Release an audit launch reservation only when admission is proven absent.
+    pub fn release_unadmitted_goal_audit(
+        &mut self,
+        agent: &str,
+        generation: i64,
+        revision: i64,
+        launch: &str,
+        now: i64,
+    ) -> Result<()> {
+        self.ensure_writer_healthy()?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sql_error)?;
+        let agent_num = parse_agent_id(agent)?;
+        let Some(mut row) = load_goal_row(&tx, agent_num, "eliot")? else {
+            return Err(Error::new("not_found", "audit source Goal missing"));
+        };
+        let Some(cycle) = row.state.audit_cycle.as_ref() else {
+            return Err(Error::new(
+                "stale_goal",
+                "audit launch claim is no longer current",
+            ));
+        };
+        if row.generation != generation
+            || row.revision != revision
+            || cycle.generation != generation
+            || cycle.revision != revision
+            || cycle.launch_command != launch
+            || cycle.phase != "launch_pending"
+        {
+            return Err(Error::new(
+                "stale_goal",
+                "audit launch claim is no longer current",
+            ));
+        }
+        if load_command(&tx, launch)?.is_some() {
+            return Err(Error::new("bad_state", "audit launch command was admitted"));
+        }
+        row.state.audit_cycle = None;
+        tx.execute(
+            "UPDATE goals SET state=?1,updated_at=?2 WHERE agent=?3 AND mode='eliot' AND generation=?4 AND revision=?5",
+            params![encode_json(&row.state)?, now, agent_num, generation, revision],
+        )
+        .map_err(sql_error)?;
+        tx.commit().map_err(sql_error)
     }
 
     /// Reserve the one audit launch against the exact blocked Goal revision.
@@ -370,11 +456,20 @@ impl Store {
         {
             return Ok(None);
         }
-        let mut statement = self.connection.prepare(
-            "SELECT result FROM writes WHERE method='goal.round' ORDER BY created_at DESC LIMIT 64"
-        ).map_err(sql_error)?;
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT result FROM writes
+             WHERE method='goal.round' AND json_extract(result,'$.request.agent')=?1
+               AND json_extract(result,'$.generation')=?2
+               AND json_extract(result,'$.revision')<=?3
+             ORDER BY created_at DESC,id DESC LIMIT 64",
+            )
+            .map_err(sql_error)?;
         let records = statement
-            .query_map([], |r| r.get::<_, String>(0))
+            .query_map(params![agent, generation, revision], |r| {
+                r.get::<_, String>(0)
+            })
             .map_err(sql_error)?;
         let mut observations = Vec::new();
         let mut digests = Vec::new();
@@ -555,36 +650,38 @@ impl Store {
             && turn.outcome == Some(core::TurnOutcome::Success)
             && turn.final_text.is_some()
         {
-            cycle.auditor = launch.target.clone();
-            cycle.auditor_generation = Some(turn_generation);
-            let audit_text = turn
-                .final_text
-                .ok_or_else(|| Error::new("bad_state", "successful audit has no final text"))?;
-            let audit_text = policy.redact_bounded(&audit_text, MAX_GOAL_OBSERVATION_BYTES);
-            cycle.audit_text = Some(audit_text.clone());
-            let auditor = cycle
-                .auditor
-                .clone()
-                .ok_or_else(|| Error::new("bad_state", "successful audit has no Agent"))?;
-            if !row
-                .state
-                .audit_history
-                .iter()
-                .any(|entry| entry.cycle == cycle.cycle && entry.auditor == auditor)
-            {
-                row.state.audit_history.push(GoalAuditHistoryEntry {
-                    cycle: cycle.cycle,
-                    auditor,
-                    successor: None,
-                    text: audit_text,
-                });
-                if row.state.audit_history.len() > GOAL_AUDIT_HISTORY_LIMIT {
-                    row.state.audit_history.remove(0);
+            if let Some(auditor) = launch.target.clone() {
+                cycle.auditor = Some(auditor.clone());
+                cycle.auditor_generation = Some(turn_generation);
+                let audit_text = turn
+                    .final_text
+                    .ok_or_else(|| Error::new("bad_state", "successful audit has no final text"))?;
+                let audit_text = policy.redact_bounded(&audit_text, MAX_GOAL_OBSERVATION_BYTES);
+                cycle.audit_text = Some(audit_text.clone());
+                if !row
+                    .state
+                    .audit_history
+                    .iter()
+                    .any(|entry| entry.cycle == cycle.cycle && entry.auditor == auditor)
+                {
+                    row.state.audit_history.push(GoalAuditHistoryEntry {
+                        cycle: cycle.cycle,
+                        auditor,
+                        successor: None,
+                        text: audit_text,
+                    });
+                    if row.state.audit_history.len() > GOAL_AUDIT_HISTORY_LIMIT {
+                        row.state.audit_history.remove(0);
+                    }
                 }
+                cycle.stop_command = Some(ulid::Ulid::new().to_string());
+                cycle.phase = "audit_complete".into();
+                cycle.blocked_reason = None;
+            } else {
+                cycle.phase = "held".into();
+                cycle.blocked_reason = Some("audit_success_missing_target".into());
+                row.state.blocked_reason = cycle.blocked_reason.clone();
             }
-            cycle.stop_command = Some(ulid::Ulid::new().to_string());
-            cycle.phase = "audit_complete".into();
-            cycle.blocked_reason = None;
         } else {
             cycle.phase = "audit_failed".into();
             cycle.blocked_reason = Some(match turn.outcome {
@@ -610,13 +707,14 @@ impl Store {
         step_for(self, row)
     }
 
-    /// Retain a terminal refusal for an exact audit cycle so it is not retried.
-    pub fn hold_goal_audit(
+    /// Settle an admitted failure or retain unknown custody on the exact cycle.
+    pub fn end_goal_audit(
         &mut self,
         agent: &str,
         generation: i64,
         revision: i64,
         reason: &str,
+        outcome_unknown: bool,
         now: i64,
     ) -> Result<()> {
         if reason.trim().is_empty() || reason.len() > 256 || reason.chars().any(char::is_control) {
@@ -644,7 +742,12 @@ impl Store {
         {
             return Err(Error::new("stale_goal", "audit cycle changed before hold"));
         }
-        cycle.phase = "held".into();
+        cycle.phase = if outcome_unknown {
+            "held"
+        } else {
+            "audit_failed"
+        }
+        .into();
         cycle.blocked_reason = Some(reason.to_owned());
         row.state.blocked_reason = Some(reason.to_owned());
         tx.execute("UPDATE goals SET state=?1,updated_at=?2 WHERE agent=?3 AND mode='eliot' AND generation=?4 AND revision=?5",
@@ -700,6 +803,7 @@ pub(super) fn advance_goal_audit_tx(
         }
     }
     state.audit_cycle = None;
+    state.audit_retry_reason = None;
     state.counters.rounds = 0;
     state.counters.turns_used = 0;
     state.counters.turns_at_set = count_turns(tx, parse_agent_id(&to.id)?, to.generation)?;

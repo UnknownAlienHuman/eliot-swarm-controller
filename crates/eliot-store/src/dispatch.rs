@@ -65,9 +65,9 @@ fn dispatch_target_tx(tx: &Transaction<'_>, command: &CommandRecord) -> Result<(
         )?;
     }
     if agent.is_goal_auditor()
-        && matches!(
+        && !matches!(
             command.command.verb.as_str(),
-            "send" | "steer" | "inject" | "resume" | "configure"
+            "launch" | "stop" | "interrupt"
         )
     {
         let launch_id = tx.query_row(

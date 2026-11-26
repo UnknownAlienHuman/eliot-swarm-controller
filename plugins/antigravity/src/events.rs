@@ -151,7 +151,6 @@ struct Pending {
     opened_at: u64,
     context: Vec<ContextItem>,
     manual_compaction_requested: bool,
-    compaction_summary_seen: bool,
     associated: bool,
     tool_gap_reported: bool,
     reply: Option<oneshot::Sender<Result<()>>>,
@@ -767,7 +766,6 @@ impl State {
             opened_at: origin.start_time,
             context: Vec::new(),
             manual_compaction_requested: false,
-            compaction_summary_seen: false,
             associated: true,
             tool_gap_reported: false,
             reply: None,
@@ -1191,7 +1189,6 @@ impl State {
             opened_at,
             context: Vec::new(),
             manual_compaction_requested,
-            compaction_summary_seen: false,
             associated: false,
             tool_gap_reported: false,
             reply: Some(reply),
@@ -2104,18 +2101,9 @@ impl State {
                 Ok(())
             }
             AcpUpdate::CompactionSummaryChunk => {
-                if self.pending.is_none() {
-                    return self
-                        .record_coverage_gap(
-                            "Antigravity compaction summary arrived outside a prepared prompt",
-                            &["session"],
-                        )
-                        .await;
-                }
-                self.associate().await?;
-                if let Some(pending) = self.pending.as_mut() {
-                    pending.compaction_summary_seen = true;
-                }
+                // ACP summary chunks are session-scoped and carry no prompt
+                // or Eliot turn identity. Arrival during a pending prompt is
+                // not enough to attribute a compaction fact.
                 Ok(())
             }
             // Bookkeeping: neither input acknowledgement nor assistant output.
@@ -2709,17 +2697,13 @@ impl State {
             .pending
             .as_ref()
             .ok_or_else(|| Error::new("unknown", "Antigravity turn is absent"))?;
-        let (command, turn, manual_compaction_requested, compaction_summary_seen) = (
-            pending.command.clone(),
-            pending.turn.clone(),
-            pending.manual_compaction_requested,
-            pending.compaction_summary_seen,
-        );
-        let (checkpoints, checkpoint_identity_gap) = self
-            .checkpoints
-            .as_mut()
-            .map(|reader| (reader.read_new(), reader.take_identity_gap()))
-            .unwrap_or_default();
+        let turn = pending.turn.clone();
+        let command = pending.command.clone();
+        let manual_compaction_requested = pending.manual_compaction_requested;
+        let checkpoint_identity_gap = self.checkpoints.as_mut().is_some_and(|reader| {
+            reader.read_new();
+            reader.take_identity_gap()
+        });
         if checkpoint_identity_gap {
             self.record_coverage_gap(
                 "Antigravity transcript exceeded the checkpoint identity bound",
@@ -2727,41 +2711,16 @@ impl State {
             )
             .await?;
         }
-        if status == "completed"
-            && manual_compaction_requested
-            && native_status == "end_turn"
-            && (compaction_summary_seen || !checkpoints.is_empty())
-        {
-            // `/compact` is a native slash command that completes the exact
-            // prompt with `end_turn`. A new checkpoint from that prompt (or
-            // its ACP summary chunk) correlates the success; unrelated
-            // checkpoints on other prompts remain ordinary transcript facts.
+        if status == "completed" && native_status == "end_turn" && manual_compaction_requested {
+            // The slash command and its fenced terminal identify this exact
+            // prompt/turn. Session-scoped ACP summaries and transcript
+            // checkpoints cannot establish turn-bound compaction.
             let mut data = json!({"turn_id": turn, "trigger": "manual"});
             if let Some(command_id) = command.as_deref() {
                 data["command_id"] = json!(command_id);
             }
-            let item = if let Some(checkpoint) = checkpoints.last() {
-                data["step_index"] = json!(checkpoint.step_index);
-                format!("compact-checkpoint-{}", checkpoint.identity)
-            } else {
-                "compact-summary".to_owned()
-            };
-            self.commit("session.context.compacted", &turn, &item, data)
+            self.commit("session.context.compacted", &turn, "manual-compact", data)
                 .await?;
-        } else if status == "completed" && !manual_compaction_requested && compaction_summary_seen {
-            // The ACP summary chunk identifies automatic summarization; this
-            // exact successful prompt is its terminal lifecycle boundary.
-            let mut data = json!({"turn_id": turn, "trigger": "auto"});
-            if let Some(command_id) = command.as_deref() {
-                data["command_id"] = json!(command_id);
-            }
-            self.commit(
-                "session.context.compacted",
-                &turn,
-                "automatic-compaction-summary",
-                data,
-            )
-            .await?;
         }
         let failed = status == "failed";
         // Canonical outcome decided here at the plugin boundary from the

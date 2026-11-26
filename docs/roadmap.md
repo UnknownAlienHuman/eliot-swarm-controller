@@ -109,12 +109,21 @@ engine, second scheduler or critic loop.
       zero rounds used. It blocked again at one round (event 459).
       With `max_audits=1`, the inbox showed one cycle with the auditor text,
       `a5` and `a7`. There was one admitted audit launch.
+      Hardened policy readback on a Windows private stand verified the exact
+      OpenCode rules for `a5` on 2026-11-26. Its worktree root read completed
+      (event 256). The dummy sibling `outside-audit.txt` read returned
+      `Permission denied: external_directory` (event 255). An Owner pause
+      admitted STOP for the auditor, and the STOP applied. Swarm SHA-256
+      `62792d61b3a5e21c8f326210b34259736b4499bf8a90d9c782314d558079dda8`.
+      End-to-end continuation on this proof binary remains pending. The
+      OpenCode free provider reached quota, and the OpenRouter free route
+      returned HTTP 429 during a fresh audit and its permitted provider probe.
 - [x] **A11 Default Goal objective (Owner decision 2026-11-26).** With no
       policy or explicit Goal, the first linked input becomes the Goal
       objective, carried in the task card and shown in the chat. The private
       stand's `swarm show a2` identified its first input about the Quartz label
       as the default Goal objective.
-- [x] **A12 Task card after every compaction.** Extends the checked
+- [ ] **A12 Task card after every compaction.** Extends the checked
       "Worktree notes and task cards" item (manual compaction on OpenCode and
       Antigravity): the task card (brief, branch, Goal or first input) reaches
       the Agent after manual and automatic compaction on Codex, Claude Code,
@@ -127,9 +136,12 @@ engine, second scheduler or critic loop.
       before the follow-up input. Committed next-input receipts were Claude
       manual 155, Claude automatic 246–247, OpenCode manual 326 and OpenCode
       automatic 307–308, each in its own stand timeline.
-      Codex, Muse and Antigravity mappings were verified from source and native
-      protocol references only. No live turns or compaction operations ran on
-      those three harnesses for A12. [Compaction facts](spec/plugin-protocol.md#translation-and-normalization)
+      The shared Claude manual completion check was exercised on the hardened
+      proof binary. Its manual boundary committed at sequence 172 and the
+      bound turn completed with no native terminal reason.
+      Live proof remains pending for Codex, Muse and Antigravity. Antigravity
+      also needs native compaction evidence bound to an exact prompt or turn.
+      [Compaction facts](spec/plugin-protocol.md#translation-and-normalization)
 
       A10–A12 passed formatting, locked all-target builds and warnings-denied
       Clippy for all nine changed packages with eight Cargo jobs and a private

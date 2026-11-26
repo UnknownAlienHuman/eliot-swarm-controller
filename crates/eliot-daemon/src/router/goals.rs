@@ -488,7 +488,7 @@ impl Router {
         require_eliot_mode(request.mode)?;
         let view = {
             let mut store = self.inner.store.lock().await;
-            let view = store.goal_pause(
+            let (view, audit_stop) = store.goal_pause(
                 &request.agent,
                 request.mode.as_str(),
                 &request.id,
@@ -496,6 +496,10 @@ impl Router {
                 request.reason.as_deref(),
                 now_ms(),
             )?;
+            if let Some(stop) = audit_stop {
+                self.publish_locked(&stop.events);
+                self.schedule_admission(&stop);
+            }
             if store
                 .goal_get(&request.agent, request.mode.as_str())
                 .is_ok_and(|current| {
@@ -523,13 +527,17 @@ impl Router {
         let view = {
             let mut store = self.inner.store.lock().await;
             super::owner_inbox::check_binding(&store)?;
-            let view = store.goal_clear(
+            let (view, audit_stop) = store.goal_clear(
                 &request.agent,
                 request.mode.as_str(),
                 &request.id,
                 &super::principal_name(principal),
                 now_ms(),
             )?;
+            if let Some(stop) = audit_stop {
+                self.publish_locked(&stop.events);
+                self.schedule_admission(&stop);
+            }
             if store
                 .goal_get(&request.agent, request.mode.as_str())
                 .is_ok_and(|current| {
@@ -1398,12 +1406,7 @@ pub(crate) async fn run_goal_driver(
                 }
             }
             received = events.recv() => match received {
-                Ok(event) if event.kind == "goal.round" => {
-                    if event.data["outcome"] == "blocked" && audits.is_empty() {
-                        let router = router.clone();
-                        audits.spawn(async move { router.drive_goal_audits().await });
-                    }
-                }
+                Ok(event) if event.kind == "goal.round" => {}
                 Ok(event) => {
                     spawn_auto_round(
                         &router,

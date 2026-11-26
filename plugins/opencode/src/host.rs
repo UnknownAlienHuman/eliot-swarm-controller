@@ -292,8 +292,6 @@ struct AgentSession {
     resources_proved_closed: bool,
     stop_end_ack_proved: bool,
     local_provider: Option<LocalProvider>,
-    goal_audit_read_only: bool,
-    audit_turn_started: bool,
     secret_policy: SecretPolicy,
 }
 
@@ -303,8 +301,7 @@ struct AgentSession {
 /// redaction secrets. Exactly one of `auth_selector` and `local_provider`
 /// is set: local providers use environment-backed authentication.
 struct ParsedStart {
-    /// Frozen one-turn Goal audit mode. This is a per-launch restriction,
-    /// not a profile setting; invalid accompanying permissions fail closed.
+    /// Frozen per-launch native permission policy for a Goal auditor.
     goal_audit_read_only: bool,
     params: AgentStartParams,
     /// Frozen native-subagent switch (`allow` or `deny`): `deny` stores a
@@ -1299,8 +1296,6 @@ impl OpenCodePlugin {
             resources_proved_closed: false,
             stop_end_ack_proved: false,
             local_provider: parsed.local_provider.clone(),
-            goal_audit_read_only: parsed.goal_audit_read_only,
-            audit_turn_started: false,
             secret_policy: SecretPolicy::new(&parsed.secrets),
         };
 
@@ -2532,27 +2527,32 @@ impl OpenCodePlugin {
         }]
     }
 
-    /// Deny every native action, then allow only the four non-mutating file
-    /// discovery/read actions. Keep the subagent deny last as a safety pin.
+    /// Deny every native action. OpenCode v2.4.1 evaluates `read` against a
+    /// location-relative resource, while `glob` and `grep` evaluate their
+    /// pattern (not their search path); its path checks are lexical and file
+    /// reads follow symlinks. The sole safe exception is reading `.` itself:
+    /// the server's current directory and session location are both the
+    /// canonical worktree root, so this can expose only the root listing.
+    /// Directory reads use action `read`; v2.4.1 has no separate `list` tool
+    /// action. Keep the subagent deny last as a safety pin.
     fn audit_read_only_permissions() -> Vec<PermissionRule> {
-        let mut rules = vec![PermissionRule {
-            action: "*".to_owned(),
-            resource: "*".to_owned(),
-            effect: "deny".to_owned(),
-        }];
-        for action in ["read", "list", "glob", "grep"] {
-            rules.push(PermissionRule {
-                action: action.to_owned(),
+        vec![
+            PermissionRule {
+                action: "*".to_owned(),
                 resource: "*".to_owned(),
+                effect: "deny".to_owned(),
+            },
+            PermissionRule {
+                action: "read".to_owned(),
+                resource: ".".to_owned(),
                 effect: "allow".to_owned(),
-            });
-        }
-        rules.push(PermissionRule {
-            action: "subagent".to_owned(),
-            resource: "*".to_owned(),
-            effect: "deny".to_owned(),
-        });
-        rules
+            },
+            PermissionRule {
+                action: "subagent".to_owned(),
+                resource: "*".to_owned(),
+                effect: "deny".to_owned(),
+            },
+        ]
     }
 
     async fn readback_audit_read_only(
@@ -3073,12 +3073,6 @@ impl OpenCodePlugin {
 
     async fn send_command(&mut self, params: AgentCommandParams) -> Result<Value> {
         let session = ready_session(&mut self.session, &params)?;
-        if session.goal_audit_read_only && session.audit_turn_started {
-            return Err(Error::new(
-                "unsupported",
-                "OpenCode Goal audit permits exactly one model turn",
-            ));
-        }
         let text = Self::admit_send_command(session, &params).await?;
         let command_id = params.command_id;
         // One deadline for admission plus association: the HTTP 200 only
@@ -3091,12 +3085,7 @@ impl OpenCodePlugin {
             .ok_or_else(|| Error::new("unknown", "OpenCode session identity is unresolved"))?;
         let inbox = match Self::prompt_session(session, &session_id, &text, deadline).await? {
             PromptAdmission::Rejected(value) => return Ok(value),
-            PromptAdmission::Admitted(inbox) => {
-                if session.goal_audit_read_only {
-                    session.audit_turn_started = true;
-                }
-                inbox
-            }
+            PromptAdmission::Admitted(inbox) => inbox,
         };
         Self::associate_prompt_turn(
             session,

@@ -954,15 +954,10 @@ compaction start. The terminal must echo the provider's usage figures and bind
 to the current turn or an exact dispatched idle compaction command. This applies
 to both automatic and manual compaction. The source history stays incomplete
 at the recorded gap. Other unverified gaps fence the stream.
-Antigravity transcript `SYSTEM/CHECKPOINT/DONE` rows are not compaction proof by
-themselves. Installed Antigravity CLI 1.5.16 changelog documents `/compact` as a
-manual command that summarizes the conversation and ends its prompt turn. The adapter maps it
-only when the exact submitted prompt starts with `/compact`, that fenced
-`session/prompt` ends with `end_turn`, and the prompt produces a new checkpoint
-or ACP `compaction_summary_chunk`. Generic checkpoints on other prompts remain
-checkpoint facts. An ACP summary chunk paired with the exact successful prompt
-terminal also maps automatic compaction; `compaction_update` alone is not
-terminal evidence. The isolated root supplies the transcript path for private
+Antigravity transcript `SYSTEM/CHECKPOINT/DONE` rows and ACP compaction
+updates identify a session. Antigravity needs an exact native prompt or turn
+binding before it can emit a normalized compaction fact. The isolated root
+supplies the transcript path for private
 profiles. Inherited profiles can bind it from an authenticated `PreInvocation`
 callback that names the exact conversation transcript under the profile root.
 ACP prompt settlement reads complete rows forward from the retained byte offset.
@@ -980,8 +975,8 @@ Every confirmed compaction fact, manual or automatic, active or idle, queues one
 [task card](automation.md#inject-context-at-the-safe-point) carrying the Goal, or
 the first input when no Goal is set: in the active turn when the fact binds one,
 else for the next input. Codex `contextCompaction` item completion, Claude
-`compact_boundary`, OpenCode `session.compaction.ended`, Muse terminal compaction
-items, and Antigravity's correlated manual/automatic evidence produce this fact.
+`compact_boundary`, OpenCode `session.compaction.ended`, and Muse terminal
+compaction items produce this fact.
 Each uses exact native identity when available and the active turn only when
 bound. Claude exposes the `manual` or `auto` trigger in its boundary metadata
 when supplied. Swarm sends a native Claude `/compact` as input to the session

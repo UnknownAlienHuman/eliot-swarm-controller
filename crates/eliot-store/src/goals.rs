@@ -694,6 +694,8 @@ struct GoalStatePersist {
     stop_paused: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     audit_cycle: Option<audit::GoalAuditCycle>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    audit_retry_reason: Option<String>,
     #[serde(default)]
     audit_history: Vec<audit::GoalAuditHistoryEntry>,
 }
@@ -702,6 +704,44 @@ enum GoalStateChange<'a> {
     Pause(Option<&'a str>),
     Clear,
     Resume,
+}
+
+/// A pause or clear fences the linked input and admits an ordinary STOP
+/// for an already-starting auditor, in the same writer transaction.
+fn audit_stop_request(
+    tx: &Transaction<'_>,
+    cycle: Option<&audit::GoalAuditCycle>,
+) -> Result<Option<SubmitCommand>> {
+    let Some(cycle) = cycle else { return Ok(None) };
+    if let Some(stop) = cycle.stop_command.as_deref()
+        && load_command(tx, stop)?.is_some()
+    {
+        return Ok(None);
+    }
+    let Some(launch) = load_command(tx, &cycle.launch_command)? else {
+        return Ok(None);
+    };
+    let Some(target) = launch.target.as_deref() else {
+        return Ok(None);
+    };
+    let Some(auditor) = load_agent_by_num(tx, parse_agent_id(target)?)? else {
+        return Ok(None);
+    };
+    if auditor.generation == 0
+        || launch.generation != Some(auditor.generation)
+        || !auditor.is_goal_auditor()
+        || auditor.is_terminal()
+    {
+        return Ok(None);
+    }
+    let id = cycle
+        .stop_command
+        .clone()
+        .unwrap_or_else(|| Ulid::new().to_string());
+    let mut stop = SubmitCommand::new(id, "stop");
+    stop.target = Some(auditor.id);
+    stop.expected_generation = Some(auditor.generation);
+    Ok(Some(stop))
 }
 
 struct GoalRow {
@@ -1543,7 +1583,7 @@ impl Store {
         principal: &str,
         reason: Option<&str>,
         now: i64,
-    ) -> Result<GoalView> {
+    ) -> Result<(GoalView, Option<Admission>)> {
         self.goal_state_change(
             agent,
             mode,
@@ -1561,7 +1601,7 @@ impl Store {
         id: &str,
         principal: &str,
         now: i64,
-    ) -> Result<GoalView> {
+    ) -> Result<(GoalView, Option<Admission>)> {
         self.goal_state_change(agent, mode, id, principal, GoalStateChange::Clear, now)
     }
 
@@ -1574,6 +1614,7 @@ impl Store {
         now: i64,
     ) -> Result<GoalView> {
         self.goal_state_change(agent, mode, id, principal, GoalStateChange::Resume, now)
+            .map(|(view, _)| view)
     }
 
     /// Whether an active native-mode Goal owns the Agent. The automatic
@@ -2308,6 +2349,7 @@ impl Store {
                 cost_base: cost_base.clone(),
                 stop_paused,
                 audit_cycle: None,
+                audit_retry_reason: None,
                 audit_history: Vec::new(),
             };
             db!(tx.execute(
@@ -2367,6 +2409,7 @@ impl Store {
             cost_base: cost_base.clone(),
             stop_paused,
             audit_cycle: None,
+            audit_retry_reason: None,
             audit_history: Vec::new(),
         };
         db!(tx.execute(
@@ -2455,7 +2498,7 @@ impl Store {
         principal: &str,
         change: GoalStateChange<'_>,
         now: i64,
-    ) -> Result<GoalView> {
+    ) -> Result<(GoalView, Option<Admission>)> {
         self.ensure_writer_healthy()?;
         let result = self.goal_state_change_inner(agent, mode, id, principal, change, now);
         self.fault_on_persistence_error(&result);
@@ -2470,7 +2513,7 @@ impl Store {
         principal: &str,
         change: GoalStateChange<'_>,
         now: i64,
-    ) -> Result<GoalView> {
+    ) -> Result<(GoalView, Option<Admission>)> {
         require_eliot_mode(mode)?;
         let (method, verb, payload) = match change {
             GoalStateChange::Pause(reason) => {
@@ -2499,18 +2542,26 @@ impl Store {
         };
         let payload_digest = canonical::digest(&payload)?;
         let goal_holder = self.goal_holder.clone();
+        let limits = self.hierarchy_limits;
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(sql_error)?;
         if let Some(view) = replay_goal_write(&tx, id, principal, method, &payload_digest)? {
             commit_transaction(tx, &self.write_faulted)?;
-            return Ok(view);
+            return Ok((view, None));
         }
         validate_id_age(id, now)?;
         let agent_num = parse_agent_id(agent)?;
         let Some(mut row) = load_goal_row(&tx, agent_num, mode)? else {
             return Err(Error::new("not_found", "goal was not found"));
+        };
+        let audit_stop = if principal == "owner"
+            && matches!(change, GoalStateChange::Pause(_) | GoalStateChange::Clear)
+        {
+            audit_stop_request(&tx, row.state.audit_cycle.as_ref())?
+        } else {
+            None
         };
         let changed = match change {
             GoalStateChange::Pause(reason) => {
@@ -2532,6 +2583,7 @@ impl Store {
                     state.paused_reason = reason.map(ToOwned::to_owned);
                     state.stop_paused = false;
                     state.audit_cycle = None;
+                    state.audit_retry_reason = None;
                     true
                 }
             }
@@ -2555,6 +2607,7 @@ impl Store {
                     state.last_continuation_command_id = None;
                     state.stop_paused = false;
                     state.audit_cycle = None;
+                    state.audit_retry_reason = None;
                     true
                 }
             }
@@ -2618,9 +2671,13 @@ impl Store {
                 .ok_or_else(|| Error::new("internal", format!("goal disappeared after {verb}")))?;
         }
         let view = goal_view_on(&tx, &goal_holder, row)?;
+        let audit_stop = audit_stop
+            .filter(|_| changed)
+            .map(|stop| admission::submit_tx(&tx, principal, stop, None, now, false, limits, None))
+            .transpose()?;
         retain_goal_result(&tx, id, principal, method, &payload_digest, &view, now)?;
         commit_transaction(tx, &self.write_faulted)?;
-        Ok(view)
+        Ok((view, audit_stop))
     }
 
     fn pause_goal_tx(
@@ -2652,6 +2709,7 @@ impl Store {
             cost_base: row.state.cost_base.clone(),
             stop_paused: false,
             audit_cycle: row.state.audit_cycle.clone(),
+            audit_retry_reason: row.state.audit_retry_reason.clone(),
             audit_history: row.state.audit_history.clone(),
         };
         update_goal_state_tx(&tx, agent_num, &row.mode, row.revision, &state, now)?;
@@ -2719,6 +2777,7 @@ impl Store {
                     cost_base: row.state.cost_base.clone(),
                     stop_paused: false,
                     audit_cycle: row.state.audit_cycle.clone(),
+                    audit_retry_reason: row.state.audit_retry_reason.clone(),
                     audit_history: row.state.audit_history.clone(),
                 };
                 update_goal_state_tx(&tx, agent_num, mode, row.revision, &state, now)?;
@@ -4858,6 +4917,7 @@ pub(super) fn install_assignment_goal_tx(
             .map(|_| GoalCostBase::default()),
         stop_paused: false,
         audit_cycle: None,
+        audit_retry_reason: None,
         audit_history: Vec::new(),
     };
     db!(tx.execute(

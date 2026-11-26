@@ -53,9 +53,7 @@ pub fn terminal_outcome_with_manual_compaction(
     native_success: bool,
     exact_manual_compaction: bool,
 ) -> TurnOutcome {
-    let reported = if reported == TurnOutcome::Unknown
-        && native_success
-        && exact_manual_compaction
+    let reported = if reported == TurnOutcome::Unknown && native_success && exact_manual_compaction
     {
         TurnOutcome::Success
     } else {
