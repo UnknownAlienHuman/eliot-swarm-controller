@@ -1351,23 +1351,19 @@ impl Store {
         result
     }
 
-    /// The newest handoff fact for this exact generation.
+    /// The newest handoff fact for this exact generation, using the partial
+    /// index so an absent handoff needs no scan of the Agent's wider journal.
     pub fn latest_handoff_event(&self, agent: &str, generation: i64) -> Result<Option<Event>> {
         self.ensure_committed_reads()?;
         let row = self
             .connection
             .query_row(
                 "SELECT seq, ts, kind, agent, generation, source, native_id, data, subject, cause
-                 FROM events INDEXED BY events_agent
-                 WHERE agent = ?1 AND generation = ?2 AND kind IN (?3, ?4, ?5)
+                 FROM events INDEXED BY events_handoff_generation
+                 WHERE agent = ?1 AND generation = ?2
+                   AND kind IN ('handoff.queued', 'handoff.settled', 'handoff.waiting')
                  ORDER BY seq DESC LIMIT 1",
-                params![
-                    parse_agent_id(agent)?,
-                    generation,
-                    HANDOFF_QUEUED,
-                    HANDOFF_SETTLED,
-                    HANDOFF_WAITING
-                ],
+                params![parse_agent_id(agent)?, generation],
                 event_record_from_row,
             )
             .optional()

@@ -1,6 +1,6 @@
 use super::*;
 
-pub(super) const CURRENT_SCHEMA_VERSION: i64 = ORGANIZATION_CONTENT_SOURCE_VERSION;
+pub(super) const CURRENT_SCHEMA_VERSION: i64 = HANDOFF_READ_INDEX_VERSION;
 const HARNESS_CHECK_SCHEMA_VERSION: i64 = 112;
 const WORK_TRUTH_VERSION: i64 = 113;
 const WORK_TRUTH_INTENT_VERSION: i64 = 114;
@@ -46,6 +46,7 @@ const REMOTE_MANAGERS_VERSION: i64 = 153;
 const AUTONOMY_OUTCOMES_VERSION: i64 = 154;
 const CLEANUP_PATH_CUSTODY_VERSION: i64 = 155;
 const ORGANIZATION_CONTENT_SOURCE_VERSION: i64 = 156;
+const HANDOFF_READ_INDEX_VERSION: i64 = 157;
 
 fn has_restart_continuation_brief_column(connection: &Connection) -> Result<bool> {
     connection
@@ -2841,6 +2842,13 @@ impl Store {
             self.migrate_sql(
                 "ALTER TABLE chat_organization ADD COLUMN content_source TEXT;",
                 Some(ORGANIZATION_CONTENT_SOURCE_VERSION),
+            )?;
+        }
+        if current < HANDOFF_READ_INDEX_VERSION {
+            self.migrate_sql(
+                "CREATE INDEX events_handoff_generation ON events(agent, generation, seq)
+                 WHERE kind IN ('handoff.queued', 'handoff.settled', 'handoff.waiting');",
+                Some(HANDOFF_READ_INDEX_VERSION),
             )?;
         }
         Ok(())
