@@ -3116,6 +3116,15 @@ impl Router {
         let deadline = Instant::now() + Duration::from_secs(10);
         // Check both the retained workspace and the candidate's actual containing
         // repository. Another checkout's tracked descendants are protected too.
+        // Both locations are checked with their own rev-parse identity and
+        // root-protection verdict at decision time. Only the `ls-files`
+        // tracked-content listing is reused: for one repository and one
+        // absolute pathspec its emptiness (the only verdict the caller reads,
+        // alongside the exit code) cannot depend on which directory of that
+        // repository the query runs in, so a second location under an
+        // already-checked top reuses that listing instead of spawning the
+        // same query again.
+        let mut prior_ls_files: Option<(PathBuf, i32, Vec<u8>)> = None;
         for (location, required) in workspace
             .as_deref()
             .map(|root| (Path::new(root), !agent.chat))
@@ -3151,16 +3160,25 @@ impl Router {
             }
             if path.starts_with(&top) {
                 let argument = crate::git_monitor::git_path_argument(path)?;
-                let files = probe
-                    .workspace_command(location, &["ls-files", "-z", "--", &argument], deadline)
-                    .await?;
-                if files.code != 0 {
+                let (code, stdout) = if let Some((prior_top, code, stdout)) =
+                    prior_ls_files.as_ref()
+                    && *prior_top == top
+                {
+                    (*code, stdout.clone())
+                } else {
+                    let files = probe
+                        .workspace_command(location, &["ls-files", "-z", "--", &argument], deadline)
+                        .await?;
+                    prior_ls_files = Some((top.clone(), files.code, files.stdout.clone()));
+                    (files.code, files.stdout)
+                };
+                if code != 0 {
                     return Err(Error::new(
                         "unavailable",
                         "tracked content check unavailable",
                     ));
                 }
-                if !files.stdout.is_empty() {
+                if !stdout.is_empty() {
                     return Err(Error::new(
                         "tracked_content",
                         "artifact contains tracked source",
