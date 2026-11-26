@@ -275,6 +275,9 @@ bytes.
 
 `agent.delete` runs the same guarded effects for the selected task tree's
 eligible native sessions and managed worktrees before retiring the task records.
+Delete verifies the native generation's daemon binding before recording or
+advancing its session artifact. A foreign binding keeps the session and its
+retained artifact unchanged. A released or removed session needs no effect.
 It records cleanup outcomes before retiring ownership and keeps the task records
 if an attempted effect is refused or uncertain. Session cleanup runs first.
 After cleanup, the rule worker can consume its events before Delete retires the

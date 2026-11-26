@@ -1,6 +1,26 @@
 use super::*;
 use crate::workspaces::require_managed_cleanup_path;
 
+pub(super) fn require_native_cleanup_ownership(
+    store: &eliot_store::Store,
+    artifact: &ArtifactView,
+) -> Result<()> {
+    if store
+        .generation_custody_namespace(&artifact.agent, artifact.generation)?
+        .as_deref()
+        != Some(store.custody_namespace()?.as_str())
+    {
+        return Err(Error::new(
+            "native_session_foreign",
+            format!(
+                "{} generation {} has foreign native custody; retry from the daemon that owns this generation",
+                artifact.agent, artifact.generation
+            ),
+        ));
+    }
+    Ok(())
+}
+
 impl Router {
     pub(super) async fn require_cleanup_ownership(
         &self,
@@ -22,16 +42,7 @@ impl Router {
             }
             ArtifactKind::NativeSession => {
                 let store = self.inner.store.lock().await;
-                if store
-                    .generation_custody_namespace(&artifact.agent, artifact.generation)?
-                    .as_deref()
-                    != Some(store.custody_namespace()?.as_str())
-                {
-                    return Err(Error::new(
-                        "native_session_foreign",
-                        "native session belongs to another daemon binding",
-                    ));
-                }
+                require_native_cleanup_ownership(&store, artifact)?;
                 return Ok(None);
             }
             ArtifactKind::ProjectRegistration => return Ok(None),
