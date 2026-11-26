@@ -186,15 +186,8 @@ enum StartPhase {
     ResumeRefused,
 }
 
-/// Startup refusals remain uncertain when a preceding operation or
-/// owned-server exit could not be confirmed.
-fn start_point_for_phase(
-    phase: StartPhase,
-    code: &str,
-) -> eliot_plugin::start_classification::StartPoint {
-    if code == "unknown" {
-        return StartPoint::TransportLost;
-    }
+/// Classify a refusal after any owned server exit has been confirmed.
+fn start_point_for_phase(phase: StartPhase) -> StartPoint {
     match phase {
         StartPhase::Admission => StartPoint::BeforeSpawn,
         StartPhase::Spawn => StartPoint::SpawnRefused,
@@ -207,16 +200,10 @@ fn start_point_for_phase(
     }
 }
 
-fn start_failure_is_proven_no_effect(phase: StartPhase, code: &str) -> bool {
-    eliot_plugin::start_classification::is_proven_no_effect(start_point_for_phase(phase, code))
-}
-
-/// One pre-session failure: where it happened and the triggering error. The
-/// caller converts this into the authoritative proven-no-effect failed start
-/// instead of an error, so the daemon settles the launch failed and retires
-/// the plugin instead of pinning an unknown Agent.
+/// Failure facts from launch before the event stream is bound.
 struct PhaseFailure {
     phase: StartPhase,
+    point: StartPoint,
     error: Box<Error>,
 }
 
@@ -1003,10 +990,7 @@ impl OpenCodePlugin {
         params: &AgentStartParams,
         failure: PhaseFailure,
     ) -> Value {
-        debug_assert!(start_failure_is_proven_no_effect(
-            failure.phase,
-            &failure.error.code
-        ));
+        debug_assert!(is_proven_no_effect(failure.point));
         let reason = presession_reason(failure.phase, &failure.error.code);
         self.retain_proven_no_effect_start(
             params,
@@ -1044,7 +1028,7 @@ impl OpenCodePlugin {
         let session = match Self::launch_start_session(peer, &parsed, envelope).await {
             Ok(session) => session,
             Err(failure) => {
-                if start_failure_is_proven_no_effect(failure.phase, &failure.error.code) {
+                if is_proven_no_effect(failure.point) {
                     return Ok(self.proven_no_effect_start(&parsed.params, failure));
                 }
                 return Err(self.retain_failed_start(*failure.error));
@@ -1299,8 +1283,16 @@ impl OpenCodePlugin {
         {
             Ok(server) => server,
             Err(error) => {
+                // Only spawn can have an uncertain credential import.
+                // OwnedServer also reports unconfirmed exit as unknown.
+                let point = if error.code == "unknown" {
+                    StartPoint::TransportLost
+                } else {
+                    StartPoint::SpawnRefused
+                };
                 return Err(PhaseFailure {
                     phase: StartPhase::Spawn,
+                    point,
                     error: Box::new(error),
                 });
             }
@@ -1312,15 +1304,19 @@ impl OpenCodePlugin {
         let (frames, stream) = match http.subscribe(phase_deadline(envelope, RPC_TIMEOUT)).await {
             Ok(subscribed) => subscribed,
             Err(error) => {
-                let error = match server
+                let (point, error) = match server
                     .terminate(true, phase_deadline(envelope, START_CLEANUP_BUDGET))
                     .await
                 {
-                    Ok(()) => error,
-                    Err(cleanup) => unconfirmed_server_exit(error, cleanup),
+                    Ok(()) => (start_point_for_phase(StartPhase::Subscribe), error),
+                    Err(cleanup) => (
+                        StartPoint::TransportLost,
+                        unconfirmed_server_exit(error, cleanup),
+                    ),
                 };
                 return Err(PhaseFailure {
                     phase: StartPhase::Subscribe,
+                    point,
                     error: Box::new(server.diagnostic_error(error)),
                 });
             }
@@ -2677,12 +2673,17 @@ impl OpenCodePlugin {
         envelope: Instant,
     ) -> Result<Value> {
         let deadline = phase_deadline(envelope, START_CLEANUP_BUDGET);
-        let error = match close_start_server(&mut session, deadline).await {
-            Ok(()) => error,
-            Err(cleanup) => unconfirmed_server_exit(error, cleanup),
+        let (point, error) = match close_start_server(&mut session, deadline).await {
+            Ok(()) if phase == StartPhase::Register && error.code == "unknown" => {
+                (StartPoint::TransportLost, error)
+            }
+            Ok(()) => (start_point_for_phase(phase), error),
+            Err(cleanup) => (
+                StartPoint::TransportLost,
+                unconfirmed_server_exit(error, cleanup),
+            ),
         };
         let error = session.server.diagnostic_error(error);
-        let point = start_point_for_phase(phase, &error.code);
         let result = start_failure(
             params,
             "opencode",

@@ -978,7 +978,9 @@ pub async fn register_native_process(
                 "{harness} {process_noun} process registration failed ({})",
                 error.code
             );
-            let code = if error.code == "timeout" {
+            // These start paths retain the uncertain registration after
+            // attempting to terminate the owned process.
+            let code = if matches!(harness, "Muse" | "OpenCode") && error.code == "timeout" {
                 "unknown"
             } else {
                 "process_registration"

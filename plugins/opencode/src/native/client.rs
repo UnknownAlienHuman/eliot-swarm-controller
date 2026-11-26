@@ -250,6 +250,9 @@ impl OpenCodeHttp {
         // OpenCode v2.4.1 performs schema decoding and authorization before
         // the handler. Session.create checks the parent before publishing
         // SessionEvent.Created and treats failed post-create readback as a defect.
+        // https://github.com/anomalyco/opencode/blob/v2.4.1/packages/protocol/src/groups/session.ts#L167-L184
+        // https://github.com/anomalyco/opencode/blob/v2.4.1/packages/server/src/middleware/authorization.ts#L102-L107
+        // https://github.com/anomalyco/opencode/blob/v2.4.1/packages/core/src/session.ts#L292-L342
         Err(map_write_error("session/create", &response))
     }
 

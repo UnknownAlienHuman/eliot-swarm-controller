@@ -1001,24 +1001,21 @@ impl OwnedServer {
                 return Ok(());
             }
         }
-        if let Err(error) = timeout_at(deadline, self.child.kill()).await {
-            // Kill outcome is ambiguous without the wait proof below.
-            if !matches!(timeout_at(deadline, self.child.wait()).await, Ok(Ok(_))) {
-                return Err(Error::new(
-                    "unknown",
-                    "OpenCode serve termination outcome is unknown",
-                ));
-            }
-            let _ = error;
+        let kill_timed_out = timeout_at(deadline, self.child.kill()).await.is_err();
+        // Recheck the process handle even if the cleanup deadline elapsed.
+        if matches!(timeout_at(deadline, self.child.wait()).await, Ok(Ok(_)))
+            || self.child.try_wait().is_ok_and(|status| status.is_some())
+        {
             return Ok(());
         }
-        if !matches!(timeout_at(deadline, self.child.wait()).await, Ok(Ok(_))) {
-            return Err(Error::new(
-                "unknown",
-                "OpenCode serve exit proof is unknown",
-            ));
-        }
-        Ok(())
+        Err(Error::new(
+            "unknown",
+            if kill_timed_out {
+                "OpenCode serve termination outcome is unknown"
+            } else {
+                "OpenCode serve exit proof is unknown"
+            },
+        ))
     }
 
     pub(crate) async fn finish_diagnostics(&mut self, deadline: Instant) {
