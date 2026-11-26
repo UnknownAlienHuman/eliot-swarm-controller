@@ -395,32 +395,40 @@ impl Store {
         })
     }
 
-    /// Count the same visible, unsnoozed inbox projection without retaining
-    /// and sorting every item. The snooze and source reads share one snapshot.
-    pub fn read_owner_inbox_counts(
-        path: &Path,
+    /// Count the same visible, unsnoozed inbox projection inside the caller's
+    /// read-only snapshot. Pooled sidebar polls reuse the warm reader
+    /// connection instead of opening a fresh one per call; the projection,
+    /// confirmation and snooze rules are unchanged.
+    pub fn owner_inbox_counts_from_snapshot(
+        &self,
         now: i64,
         confirmed: &StuckStates,
     ) -> Result<BTreeMap<OwnerInboxKind, usize>> {
-        read_inbox_snapshot(path, |connection| {
-            let snoozes = inbox_snoozes(connection)?;
-            let snoozed = snoozes
-                .iter()
-                .map(|row| (row.kind, row.subject.as_str(), row.revision.as_str()))
-                .collect();
-            let mut sink = OwnerInboxCountSink {
-                counts: OwnerInboxKind::ALL
-                    .into_iter()
-                    .map(|kind| (kind, 0))
-                    .collect(),
-                groups: HashSet::new(),
-                snoozed,
-                confirmed,
-                now,
-            };
-            super::owner_inbox::project_into(connection, now, &mut sink)?;
-            Ok(sink.counts)
-        })
+        Self::owner_inbox_counts(&self.connection, now, confirmed)
+    }
+
+    fn owner_inbox_counts(
+        connection: &Connection,
+        now: i64,
+        confirmed: &StuckStates,
+    ) -> Result<BTreeMap<OwnerInboxKind, usize>> {
+        let snoozes = inbox_snoozes(connection)?;
+        let snoozed = snoozes
+            .iter()
+            .map(|row| (row.kind, row.subject.as_str(), row.revision.as_str()))
+            .collect();
+        let mut sink = OwnerInboxCountSink {
+            counts: OwnerInboxKind::ALL
+                .into_iter()
+                .map(|kind| (kind, 0))
+                .collect(),
+            groups: HashSet::new(),
+            snoozed,
+            confirmed,
+            now,
+        };
+        super::owner_inbox::project_into(connection, now, &mut sink)?;
+        Ok(sink.counts)
     }
 
     pub fn read_owner_inbox_sweep(path: &Path, now: i64) -> Result<OwnerInboxSweep> {
