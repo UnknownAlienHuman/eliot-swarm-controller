@@ -1349,7 +1349,7 @@ impl Store {
                 "artifact custody changed during readback",
             ));
         }
-        if request.release_custody.is_none() && !self.cleanup_agent_quiescent(&artifact)? {
+        if !self.cleanup_agent_quiescent(&artifact)? {
             return Err(Error::new(
                 "agent_not_quiescent",
                 "artifact Agent custody is still active",
@@ -1730,7 +1730,7 @@ impl Store {
     /// before any preflight; the apply-time recheck stays as the second
     /// gate.
     pub fn retirement_plan_gate(&self, artifact: &ArtifactView) -> Result<Option<&'static str>> {
-        if artifact.reconciliation.is_some() {
+        if artifact.state == "unknown" {
             return Ok(Some("owner_review_required"));
         }
         if !self.cleanup_agent_quiescent(artifact)? {

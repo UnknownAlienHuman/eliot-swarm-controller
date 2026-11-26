@@ -1296,7 +1296,7 @@ impl Router {
         now: i64,
         allow_fenced_root: bool,
     ) -> Result<Option<String>> {
-        if artifact.reconciliation.is_some() {
+        if artifact.state == "unknown" {
             return Ok(Some("owner_review_required".to_owned()));
         }
         let cargo_cache = is_cargo_target_artifact(artifact);

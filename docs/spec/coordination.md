@@ -198,7 +198,7 @@ Legacy `failed` rows with unresolved effect evidence retain the same fence.
 The Owner can run `swarm artifact reconcile ARTIFACT_ID` to re-read an unknown
 directory using its retained path, ownership and filesystem identity. If the
 same directory survives and passes cleanup preflight, reconciliation restores
-`registered` custody and a manual cleanup plan can offer it for removal.
+`registered` custody and cleanup can plan its removal under the ordinary gates.
 Two absence checks across the ordinary grace interval settle it as `removed`
 with the reconciliation write as evidence and zero bytes claimed. A changed
 identity or unreadable path leaves the fence in place. Cleanup apply rechecks
@@ -210,10 +210,11 @@ responsibility for the retained object. This records `released`, the mutation
 ID and the Owner's reason. It performs no vendor, Git or filesystem mutation
 and records no claim of removal. In particular, a Codex archive with an unknown
 acknowledgement can be released while preserving whatever session the vendor
-retains. Reconciliation waits for existing cleanup attempts to settle or for
-their daemon to exit. The original cleanup receipt remains readable within
-retention. Worktrees, branches and internal generation roots have separate
-custody checks and are outside this Owner operation.
+retains. Both forms require quiescent Agent custody, rechecked at commit.
+Reconciliation returns `busy` while an existing cleanup attempt is running.
+Retry after the attempt settles or its daemon exits. The original cleanup
+receipt remains readable within retention. Worktrees, branches and internal
+generation roots have separate custody checks and are outside this Owner operation.
 
 Uncertain attempts fence
 resume at admission and dispatch. Windows

@@ -25,7 +25,14 @@ impl Router {
                 return encoded(replay);
             }
             self.check_cleanup_admission()?;
-            store.unknown_cleanup_artifact(&request.artifact)?
+            let artifact = store.unknown_cleanup_artifact(&request.artifact)?;
+            if !store.cleanup_agent_quiescent(&artifact)? {
+                return Err(Error::new(
+                    "agent_not_quiescent",
+                    "artifact Agent custody is still active",
+                ));
+            }
+            artifact
         };
         if matches!(
             artifact.kind,
@@ -44,18 +51,6 @@ impl Router {
                 return Err(Error::new(
                     "readback_unavailable",
                     "use --release-custody to keep the native session outside Swarm's cleanup custody",
-                ));
-            }
-            if !self
-                .inner
-                .store
-                .lock()
-                .await
-                .cleanup_agent_quiescent(&artifact)?
-            {
-                return Err(Error::new(
-                    "agent_not_quiescent",
-                    "artifact Agent custody is still active",
                 ));
             }
             let (_, absent) = self
