@@ -139,11 +139,15 @@ impl DesktopApp {
                     self.chat
                         .detail
                         .as_ref()
+                        .filter(|detail| detail.agent == id)
                         .map(|detail| detail.harness.clone())
                 })
         });
         let place = match (self.main, &open) {
             (Main::Conversation, Some(harness)) => UsagePlace::Agent(harness),
+            // An open chat speaks only for its own Agent: until its harness
+            // is known, no number (never the fleet's).
+            (Main::Conversation, None) if self.selected_agent_id().is_some() => return None,
             (Main::Project, _) => UsagePlace::Project(&self.project.key),
             _ => UsagePlace::Fleet,
         };
@@ -346,9 +350,12 @@ impl DesktopApp {
         if let Some(Err(error)) = &self.usage.holds {
             blocks.push(KeyedView::new(
                 format!("holds-error:{error}"),
-                controls::secondary(format!("Holds not read: {error}"))
-                    .foreground(ThemeBrush::SystemCritical)
-                    .text_wrapping(TextWrapping::Wrap),
+                controls::secondary(format!(
+                    "Holds not read: {}",
+                    crate::state::plain_reason(error)
+                ))
+                .foreground(ThemeBrush::SystemCritical)
+                .text_wrapping(TextWrapping::Wrap),
             ));
         }
         let header = Grid::new()

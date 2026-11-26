@@ -160,9 +160,12 @@ impl DesktopApp {
         if let Some(Err(error)) = &self.usage.holds {
             limits.push(KeyedView::new(
                 format!("holds-error:{error}"),
-                controls::secondary(format!("Holds not read: {error}"))
-                    .foreground(ThemeBrush::SystemCritical)
-                    .text_wrapping(TextWrapping::Wrap),
+                controls::secondary(format!(
+                    "Holds not read: {}",
+                    crate::state::plain_reason(error)
+                ))
+                .foreground(ThemeBrush::SystemCritical)
+                .text_wrapping(TextWrapping::Wrap),
             ));
         }
         let loaded = self.nav.agents.len();
@@ -170,10 +173,10 @@ impl DesktopApp {
         let fleet = self.settings.fleet.as_ref();
         let total = fleet.and_then(|fleet| fleet.as_ref().ok().map(|fleet| fleet.agents));
         let (running_value, running_note) = match fleet {
-            None => ("…".to_owned(), String::new()),
+            None => ("…".to_owned(), "Counting…".to_owned()),
             Some(Ok(fleet)) => (
                 format!("{} of {}", fleet.running, fleet.agents),
-                String::new(),
+                "Working or starting".to_owned(),
             ),
             Some(Err(error)) => (
                 "—".to_owned(),
@@ -253,13 +256,9 @@ fn unknown_limits(note: &str) -> Vec<KeyedView> {
 /// When a window resets, exactly and from now: "Resets Fri 09:00 · in 3
 /// days"; or that the time is not reported.
 fn resets_detail(window: &crate::quota::Window, now: i64) -> String {
-    match window.resets_at_ms {
-        Some(at) => format!(
-            "Resets {} · {}",
-            usage_ui::clock(at, now),
-            window.resets_in(now).trim_start_matches("resets ")
-        ),
-        None => crate::quota::sentence(&window.resets_in(now)),
+    match (window.resets_at_ms, window.until_reset(now)) {
+        (Some(at), Some(until)) => format!("Resets {} · {until}", usage_ui::clock(at, now)),
+        _ => crate::quota::sentence(&window.resets_in(now)),
     }
 }
 

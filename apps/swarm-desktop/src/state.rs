@@ -231,7 +231,12 @@ pub fn plain_error(error: &str) -> String {
 pub fn plain_reason(error: &str) -> String {
     match error.split_once(": ") {
         Some((code, message)) if code != "busy" && !code.contains(' ') => {
-            format!("{}.", message.trim().trim_end_matches('.'))
+            let message = message.trim().trim_end_matches('.');
+            if message.is_empty() {
+                format!("{}.", eliot_core::reason_words(code))
+            } else {
+                format!("{message}.")
+            }
         }
         _ => plain_error(error),
     }
