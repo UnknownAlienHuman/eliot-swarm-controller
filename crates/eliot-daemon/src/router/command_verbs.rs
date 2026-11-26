@@ -3,7 +3,7 @@
 use super::{
     Router,
     command::{
-        RunWorkerStart, classify_start_result, coordination_commit_error_state,
+        ObserverAction, RunWorkerStart, classify_start_result, coordination_commit_error_state,
         validate_observer_command_result,
     },
     plugin_host::{OWNER_INTERRUPT_TIMEOUT, PendingCommand},
@@ -429,7 +429,8 @@ impl Router {
                                 .observer_unavailable(agent, "observer_start_failed", true)
                                 .await;
                         } else {
-                            let _ = self.settle_observe_attach(id, snapshot.clone()).await;
+                            self.settle_observer(id, snapshot, ObserverAction::Attach)
+                                .await;
                         }
                     }
                     Err(error) => {
@@ -1425,7 +1426,8 @@ impl Router {
             Ok(value) => {
                 match validate_observer_command_result(value, agent, &dispatched, "detached") {
                     Ok(outcome) => {
-                        let _ = self.settle_observe_detach(id, outcome.clone()).await;
+                        self.settle_observer(id, outcome, ObserverAction::Detach)
+                            .await;
                     }
                     Err(error) => {
                         self.settle_plugin_error(id, &error).await;
