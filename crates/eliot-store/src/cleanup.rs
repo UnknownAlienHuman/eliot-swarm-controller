@@ -1642,8 +1642,25 @@ impl Store {
             && agent.archived
             && agent.state == AgentState::Idle
             && artifact.kind == ArtifactKind::Build;
+        // The workspace row is the live custody binding for a managed
+        // worktree: resume, restart-resume and switch advance the agent
+        // generation (and re-bind the workspace) without rolling the
+        // creation-time artifact fence forward. A fence from an older
+        // generation of the same agent and path is stale metadata, not a
+        // live generation the owner must still resolve.
+        let workspace_bound = artifact.kind == ArtifactKind::Worktree
+            && workspace::load_workspace_by_path(&self.connection, &artifact.path)?.is_some_and(
+                |workspace| {
+                    workspace.agent == artifact.agent
+                        && workspace.target_generation == agent.generation
+                        && matches!(
+                            workspace.phase,
+                            core::WorkspacePhase::Ready | core::WorkspacePhase::Failed
+                        )
+                },
+            );
         if artifact.generation > agent.generation
-            || (agent.generation != artifact.generation && !owned_child)
+            || (agent.generation != artifact.generation && !owned_child && !workspace_bound)
             || !(cleanup_terminal(agent.state)
                 || archived_idle_cargo
                 || ((probe || (owned_child && agent.archived)) && agent.state == AgentState::Lost))
@@ -1763,11 +1780,18 @@ impl Store {
                 .git
                 .as_ref()
                 .ok_or_else(|| Error::new("source_integrity", "worktree Git binding absent"))?;
-            let current: Option<(String, String)> = tx.query_row(
-                "SELECT phase, outcome FROM workspaces WHERE agent=?1 AND target_generation=?2 AND worktree_path=?3",
-                params![parse_agent_id(&artifact.agent)?, artifact.generation, artifact.path],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            ).optional().map_err(sql_error)?;
+            // The workspace row is keyed by agent; its target generation
+            // advances past the artifact's creation-time fence on resume,
+            // restart-resume and switch, so the live row is found by
+            // agent and path, not by the stale fence generation.
+            let current: Option<(String, String)> = tx
+                .query_row(
+                    "SELECT phase, outcome FROM workspaces WHERE agent=?1 AND worktree_path=?2",
+                    params![parse_agent_id(&artifact.agent)?, artifact.path],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()
+                .map_err(sql_error)?;
             let settled = current.is_some_and(|(phase, outcome)| {
                 phase == "removed"
                     && serde_json::from_str::<Value>(&outcome)
