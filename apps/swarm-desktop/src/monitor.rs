@@ -368,7 +368,7 @@ pub enum Obs {
 }
 
 impl Obs {
-    fn from_view(view: Option<&ObservationView>) -> Self {
+    pub fn from_view(view: Option<&ObservationView>) -> Self {
         match view {
             None => Self::Unavailable("missing from the reply".to_owned()),
             Some(ObservationView::Unavailable { error_code, .. }) => {
@@ -568,6 +568,42 @@ pub fn diagnosis_line(reply: &DiagnoseResponse) -> Option<String> {
         eliot_core::origin_words(origin),
         step.user_message()
     ))
+}
+
+/// The whole "What went wrong" block as text for Copy details: the
+/// summary, every step with its code, message, where, origin and evidence,
+/// exit code, NTSTATUS and time, and the Owner's action when one applies.
+pub fn diagnosis_details(reply: &DiagnoseResponse, owner_action: Option<&str>) -> String {
+    let mut lines = vec![reply.summary.clone()];
+    if let Some(preceded) = reply.preceded_by.as_deref() {
+        lines.push(format!("Preceded by: {preceded}"));
+    }
+    for step in &reply.steps {
+        let mut parts = vec![step.kind.clone()];
+        parts.extend(step.code.as_ref().map(|code| format!("code {code}")));
+        parts.extend(step.message.clone());
+        parts.extend(step.failure_where.as_ref().map(|at| format!("where {at}")));
+        parts.extend(
+            step.origin
+                .as_ref()
+                .map(|origin| match &step.origin_evidence {
+                    Some(evidence) => format!("origin {origin} ({evidence})"),
+                    None => format!("origin {origin}"),
+                }),
+        );
+        parts.extend(step.exit_code.map(|code| format!("exit {code}")));
+        parts.extend(
+            step.ntstatus
+                .as_ref()
+                .map(|status| format!("NTSTATUS {status}")),
+        );
+        parts.extend(step.at.map(clock));
+        lines.push(format!("- {}", parts.join(" · ")));
+    }
+    if let Some(action) = owner_action {
+        lines.push(format!("Owner action: {action}"));
+    }
+    lines.join("\n")
 }
 
 pub fn bytes_label(bytes: Option<u64>) -> String {
@@ -1694,6 +1730,14 @@ impl Monitor {
             }
         };
         let identity = &read.agent.agent;
+        // Its samples feed the same history as a fleet row's, so Details ›
+        // Activity & resources has them without the Agents page.
+        if let ObservationView::Data(data) = &read.agent.observation {
+            self.series
+                .entry(identity.id.clone())
+                .or_default()
+                .observe(&data.stats, &data.processes);
+        }
         let previous = self.detail.take().filter(|last| {
             last.read.agent.agent.id == identity.id
                 && last.read.agent.agent.generation == identity.generation

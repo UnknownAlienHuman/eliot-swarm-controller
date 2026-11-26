@@ -511,7 +511,7 @@ Selection mode включается явным действием. Панель 
 
 ## 11. Changes, Agents, Details, Terminal
 
-В каждый момент виден один раздел. Его выбирают toggle-кнопки шапки беседы (§9.1) и их сочетания клавиш (§19.1); повторное нажатие закрывает pane. Панель имеет заголовок — имя раздела, toggle Wide (ширина 720 и обратно к прежней одним действием; только там, где широкая pane помещается рядом), toggle Full view там, где pane может стоять рядом, и Close в конце строки; все три — стандартные команды одного размера. Ширину также задают ручка края и Settings › Panel widths; с шириной 720 содержимое переходит к широкой раскладке, как в Full view. На узком окне те же представления открываются в Main, и Close возвращает к беседе; отдельная мобильная версия поведения не нужна. Раскрываемые части (секции Details, ветви Agents) используют одну пару иконок: chevron вправо — свёрнуто, вниз — раскрыто.
+В каждый момент виден один раздел. Его выбирают toggle-кнопки шапки беседы (§9.1) и их сочетания клавиш (§19.1); повторное нажатие закрывает pane. Панель имеет заголовок — имя раздела, toggle Wide (ширина 720 и обратно к прежней одним действием; только там, где широкая pane помещается рядом), toggle Full view там, где pane может стоять рядом, и Close в конце строки; все три — стандартные команды одного размера. Ширину также задают ручка края и Settings › Panel widths; с шириной 720 содержимое переходит к широкой раскладке, как в Full view. На узком окне те же представления открываются в Main, и Close возвращает к беседе; отдельная мобильная версия поведения не нужна. Ветви Agents раскрываются одной парой иконок: chevron вправо — свёрнуто, вниз — раскрыто; секции Details — native Expander со стандартным индикатором этого control (§11.3).
 
 ### 11.1. Changes
 
@@ -548,9 +548,9 @@ Scoped tree показывает manager, children и наблюдаемые nat
 | Раздел | Содержание и границы |
 |---|---|
 | Summary | Project, workspace, branch, profile/model, state, started/last activity; Copy paths/IDs отдельно. |
-| Task | Доступный prompt/brief preview и связанные данные. Backend `task.list/get` существует, desktop caller/browser пока не найден; не подменять Task record реконструкцией из transcript. [C31], [C32], [C41] |
+| Task | Доступный prompt/brief preview и связанные данные: newest task record прогона через `task.list`, затем его `manifest` и первая страница `task.md` на той же Git revision; coverage из manifest. Browser всех records и `source:N` не построен; не подменять Task record реконструкцией из transcript. [C31], [C32], [C41] |
 | Goal | Текущие Goal get/set/status UI; шапка и диалог Goal показывают default objective (A11, `default_goal_objective`), шапка, Resolve card и Inbox — audit cycles (A10, `audit_history`); task card after compaction (A12) остаётся требованием roadmap. [C36], [C37] |
-| Work | Git base/head, worktree ownership, claims и интеграция. Backend/CLI предоставляет `checkpoint.list/get/restore`; desktop caller/browser пока не найден. [C33], [C34] |
+| Work | Git base/head, worktree ownership, claims и интеграция. Последний checkpoint прогона и их число — `checkpoint.list`, затем `checkpoint.get` по его exact ref/OID; claims — `claim.list`. [C33], [C34] |
 | Mail | Read-only просмотр адресованной агенту координации и доставки; явная Send note/Broadcast action. Просмотр владельцем не подтверждает чтение от имени агента. |
 | What went wrong | Последние релевантные failure/refusal/unknown facts, recovery action и Copy details. Один и тот же сбой не размножается в три красных карточки. |
 | Activity & resources | Native process/CPU/RAM/counters с timestamp и coverage; раскрываются и обновляются только когда нужны. |
@@ -558,7 +558,7 @@ Scoped tree показывает manager, children и наблюдаемые nat
 | Heavy work / coordination | Только существующие применимые grants/limits/claims. Инфраструктурная переменная не превращается в editable настройку без owning API. |
 | Technical | Agent ID, generation, session/profile/correlation identifiers, источники и timestamps; Copy diagnostic details без секретов. |
 
-Backend и CLI поддерживают `checkpoint.list`, `checkpoint.get` и guarded `checkpoint.restore`; desktop пока не вызывает эти методы и не предоставляет browser или restore flow. Если добавляется desktop UI, он должен использовать exact Agent/generation и pinned checkpoint reference/OID из этих API. `var.get/set` не означает наличие `var.list`: общий браузер всех shared variables в текущем API не подтверждён. [R5], [R6], [C11], [C33], [C34]
+Backend и CLI поддерживают `checkpoint.list`, `checkpoint.get` и guarded `checkpoint.restore`. Details › Work читает list/get по exact Agent/generation и pinned checkpoint reference/OID из этих API; desktop restore flow пока не подключён, restore выполняет `swarm checkpoint restore`. `var.list` пагинирует ключи и версии одной читаемой области; общий браузер всех shared variables в Details не строится. [R5], [R6], [C11], [C33], [C34]
 
 ### 11.4. Terminal
 
@@ -939,11 +939,11 @@ Display names, favorites/recent и имеющиеся preferences использ
 | Fleet/resources/diagnostics | Backend и monitor UI | Сохранить freshness/coverage, bounded reads и понятные колонки. |
 | Native subagents | Observe-only evidence для поддерживаемых harness | Отдельный тип строки, без недоступных Agent controls. |
 | Goals | Backend, Goal dialog/status, Goal новой задачи, default objective и audit history (A10, A11); task card after compaction (A12) — roadmap work | Не считать A12 реализованным по наличию Goal UI; сохранять актуальные actions/status без выдуманной истории. [C36], [C37] |
-| Task record browser | Backend `task.list`/`task.get` есть; desktop caller/browser пока не найден | Подключать только pinned, bounded reader с manifest/source coverage; не восстанавливать записи из ленты. [C31], [C32], [C41] |
-| Checkpoints | Backend/CLI `checkpoint.list/get/restore` реализованы; desktop caller/browser не найден | Подключить точные pinned reads и guarded restore в desktop; до этого не обещать checkpoint history/restore в UI. [C33], [C34], [C41] |
+| Task record browser | Backend `task.list`/`task.get`; Details › Task читает newest record прогона (manifest и первая страница `task.md` на одной revision); browser всех records не построен | Подключать только pinned, bounded reader с manifest/source coverage; не восстанавливать записи из ленты. [C31], [C32], [C41] |
+| Checkpoints | Backend/CLI `checkpoint.list/get/restore` реализованы; Details › Work читает list и get последнего checkpoint по exact ref/OID; desktop restore не подключён | Подключить guarded restore в desktop; до этого не обещать restore в UI. [C33], [C34], [C41] |
 | Mail | Backend queue/read/delivery/ack и client helpers | Details/team communication; owner просмотр не agent ack. Отдельный mail client не требуется. |
-| Claims | `claim.set/list/release` есть; dedicated UI не подтверждён | Read-only coordination view по API при необходимости; Git attribution и claims подписывать отдельно. |
-| Shared variables | `var.get/set`, без `var.list` | По известному key в technical/automation context; общий browser не обещать. |
+| Claims | `claim.set/list/release` есть; Details › Work показывает claims Agent через `claim.list` | Read-only coordination view по API при необходимости; Git attribution и claims подписывать отдельно. |
+| Shared variables | `var.get/set`; `var.list` — ключи и версии одной области | По известному key в technical/automation context; общий browser не обещать. |
 | Rules/timers/assignments | Backend, cards и settings/editor paths | Доработать единый typed editor; latest outcome не выдавать за full history. |
 | Scripts | List/read/save/validation/editor и запуск через daemon | Сохранить, оформить, revision conflict и pagination. |
 | Models/presets/routing/quota | Backend и Settings/UI | Native selectors, capability-dependent fields, honest unknown/stale. |

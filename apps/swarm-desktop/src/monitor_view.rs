@@ -6,12 +6,13 @@
 
 use eliot_core::api::{
     AgentGetResponse, InstructionFileStatus, InstructionReadStatus, InstructionSourceStatus,
+    ObservationView,
 };
 use std::fmt::Write as _;
 use windows_reactor::*;
 
 use crate::monitor::{
-    self, DetailRead, GRAPH_BARS, Monitor, MonitorRow, bytes_label, cpu_time_label, group,
+    self, DetailRead, GRAPH_BARS, Monitor, MonitorRow, Obs, bytes_label, cpu_time_label, group,
     state_words, tokens_label,
 };
 use crate::ui::tokens;
@@ -428,8 +429,14 @@ pub fn usage_lines(read: &DetailRead) -> Vec<String> {
     lines
 }
 
-/// The CPU and memory charts of `id`, with the sampling note.
-pub fn resource_views(monitor: &Monitor, id: &str) -> Vec<KeyedView> {
+/// The CPU and memory charts of `id`, with the sampling note. Without a
+/// fleet row, `observed` (its Details read's observation) gives the CPU
+/// time and when it was sampled.
+pub fn resource_views(
+    monitor: &Monitor,
+    id: &str,
+    observed: Option<&ObservationView>,
+) -> Vec<KeyedView> {
     let mut views: Vec<KeyedView> = Vec::new();
     let row = monitor.row(id);
     // An Agent that ended with every process exited has nothing to sample:
@@ -437,6 +444,15 @@ pub fn resource_views(monitor: &Monitor, id: &str) -> Vec<KeyedView> {
     if row.is_some_and(|row| row.ended() && row.obs.live_processes() == 0) {
         views.push(KeyedView::new("ended", small("No live process.")));
         return views;
+    }
+    let read_obs = observed
+        .filter(|_| row.is_none())
+        .map(|view| Obs::from_view(Some(view)));
+    if let Some(obs) = &read_obs {
+        if let Some(ns) = obs.cpu_time_ns() {
+            views.push(KeyedView::new("now", small(cpu_time_label(Some(ns)))));
+        }
+        views.push(KeyedView::new("fresh", small(obs.freshness())));
     }
     if let Some(row) = row {
         // What the list row leaves out: what it does now, its tokens and
@@ -512,7 +528,7 @@ pub fn resource_views(monitor: &Monitor, id: &str) -> Vec<KeyedView> {
             ));
         }
         // The freshness line already says nothing was sampled.
-        _ if row.is_some() => {}
+        _ if row.is_some() || read_obs.is_some() => {}
         _ => views.push(KeyedView::new(
             "no-series",
             small("No process samples yet."),

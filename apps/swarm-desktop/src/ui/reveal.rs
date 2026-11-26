@@ -328,6 +328,24 @@ fn open_program(extension: &str) -> Option<String> {
         .map(|name| name.to_string_lossy().to_ascii_lowercase())
 }
 
+/// `folder` as recorded, existing and itself: a folder whose canonical
+/// target is another place (a link or junction) is refused, so nothing
+/// opens somewhere the daemon did not record. Runs file system calls: call
+/// it off the UI thread.
+pub(super) fn recorded_folder(folder: &str) -> Result<String, String> {
+    let Target::Folder(shown) = target(folder)? else {
+        return Err(format!("{} is not a folder.", nav::display_path(folder)));
+    };
+    if nav::path_key(&shown) == nav::path_key(folder) {
+        Ok(shown)
+    } else {
+        Err(format!(
+            "{} leads to another folder ({shown}), so it is not opened.",
+            nav::display_path(folder)
+        ))
+    }
+}
+
 /// Open `folder` in Windows Terminal (`wt.exe -d <folder>`): the app
 /// execution alias under `%LOCALAPPDATA%\Microsoft\WindowsApps`, by
 /// absolute path with explicit argv and no shell. The terminal is the
@@ -367,7 +385,7 @@ pub(super) fn open_terminal(folder: &str) -> Result<(), String> {
 /// Windows Terminal's command without Swarm's variables (but `ELIOT_HOME`).
 #[expect(
     clippy::disallowed_types,
-    reason = "This helper returns the Windows Terminal command Open in Windows Terminal starts."
+    reason = "This helper returns the Windows Terminal command Open Windows Terminal starts."
 )]
 fn terminal_command(wt: &Path) -> std::process::Command {
     #[expect(
