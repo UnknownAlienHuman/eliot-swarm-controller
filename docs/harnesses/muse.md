@@ -308,6 +308,19 @@ When the Store has no turn, the native readback must prove the session ran
 none. The Owner can inspect the refusal with `swarm why AGENT` and use
 `swarm switch AGENT --generation N` once any unknown work is settled.
 
+[Daemon restart continuation](../spec/configuration.md#agent-restart-policy)
+uses this same native path and the retained session ID. On Windows with
+Muse 1.4.25-R9361.1, a same-build daemon update reopened both an idle session
+with a completed turn and a session that had run no turns. Both kept their
+native session IDs. Muse can reclaim sessions containing only start records
+during later host startup. See the vendor's
+[session retention rules](https://meta-models.github.io/muse-code-sdk/1.4/guides/host-operations/#retention).
+A [model mismatch hold](../spec/monitoring.md#provider-holds) blocks Resume
+before native dispatch even for an idle Agent without new input. Check
+`swarm why AGENT` for the retained refusal. A definite native Resume refusal
+can enter [automatic handoff](../spec/configuration.md#automatic-handoff-918)
+when the Agent still owes work and a successor is eligible.
+
 Profile, skill, catalogue, process-registration and resume-preflight refusals
 settle failed once the owned host is closed. The same applies when the stdio
 writer proves non-dispatch or Muse proves pre-admission refusal. A lost

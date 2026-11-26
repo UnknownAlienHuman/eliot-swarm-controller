@@ -905,20 +905,12 @@ fn loss_step(event: &Event, at: Option<i64>) -> DiagnoseStep {
             .and_then(Value::as_str)
             .map(|value| bound_chars(value, limit))
     };
-    let message = if matches!(reason, Some("daemon_restart" | "owned_exit_before_restart")) {
-        let agent = event
-            .data
-            .get("agent_id")
-            .and_then(Value::as_str)
-            .unwrap_or("<agent>");
-        Some(bound_chars(
-            &format!(
-                "Swarm restarted. Automatic continuation requires interrupted work or undelivered input at restart. An idle Agent without either stays closed until a send. Archived and Owner-stopped Agents stay closed on restart. Once the retained-work gates are clear, run `swarm send {agent} \"<text>\"` for new input."
-            ),
-            1024,
-        ))
-    } else {
-        reason.map(|reason| bound_chars(reason, 1024))
+    let message = match reason {
+        Some("daemon_restart") => Some("Swarm marked this generation lost during restart.".into()),
+        Some("owned_exit_before_restart") => {
+            Some("Swarm confirmed this generation's owned processes exited before restart.".into())
+        }
+        reason => reason.map(|reason| bound_chars(reason, 1024)),
     };
     DiagnoseStep {
         kind: "process".to_owned(),
