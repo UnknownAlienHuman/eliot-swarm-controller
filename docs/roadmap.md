@@ -742,6 +742,10 @@ templates and compatibility layers are outside current work.
       tokens and freshness in the tooltip.
   - [ ] **M3 Context and projects.** Real diff, Agents, Details and Terminal,
     project assignment and transfer, fleet and Inbox.
+    Connect the existing `agent.diff` API to the native Changes view; the
+    backend already supplies bounded text. Follow the [donor boundary](reference/donors.md#current-orchestration-comparison-2026-11-26)
+    and the [Changes contract](design/fluent-design-system.md#111-changes),
+    including the current-patch meaning of `Last turn`.
   - [ ] **M4 Management.** Settings, model, routing and auth, Automations and
     Scripts, Usage, Archive, cleanup and recovery. Usage follows the open
     Agent's harness, the project's active/recent harness, or the fleet/composer
