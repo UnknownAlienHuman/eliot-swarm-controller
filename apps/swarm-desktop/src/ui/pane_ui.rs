@@ -361,8 +361,9 @@ impl<T> SectionRead<T> {
 }
 
 /// Details sections closed until the owner opens them: Task, and the
-/// technical blocks (§11.3: Summary open, technical blocks closed).
-const CLOSED_AT_FIRST: [&str; 5] = ["task", "resources", "context", "heavy", "technical"];
+/// technical blocks (§11.3: Summary open, technical blocks closed). Context
+/// stays open: the composer's Context leads to it (§9.5).
+const CLOSED_AT_FIRST: [&str; 4] = ["task", "resources", "heavy", "technical"];
 
 /// Full view, the panels' reads and the owner's choices in them.
 #[derive(Default)]
