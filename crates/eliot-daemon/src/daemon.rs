@@ -35,7 +35,7 @@ use tokio::{
     task::JoinSet,
     time::{Instant, sleep_until, timeout, timeout_at},
 };
-use tokio_util::codec::{Framed, LinesCodec};
+use tokio_util::codec::{Framed, LinesCodec, LinesCodecError};
 use tokio_util::sync::CancellationToken;
 use ulid::Ulid;
 
@@ -2214,6 +2214,20 @@ async fn reply_overloaded(stream: IpcStream) {
     send_response_frame(&mut framed, frame, RESPONSE_WRITE_TIMEOUT).await;
 }
 
+/// Resolve when the peer that sent this request goes away. A connection
+/// carries exactly one request, so after the first frame the read half only
+/// ever reports connection state: EOF or a transport error means the client
+/// is gone. Unexpected pipelined bytes are ignored while waiting for that.
+async fn peer_disconnected(framed: &mut Framed<IpcStream, LinesCodec>) {
+    loop {
+        match framed.next().await {
+            None => return,
+            Some(Err(LinesCodecError::Io(_))) => return,
+            Some(_) => {}
+        }
+    }
+}
+
 /// Bound one server-side response write. A peer that stops reading must not
 /// hold its connection task past `write_timeout`; the caller ends the task and
 /// finishes response bookkeeping instead of retrying the effect.
@@ -2260,10 +2274,24 @@ async fn serve_connection_with_write_timeout(
                             request.params.get("mode").and_then(Value::as_str),
                             Some("prepare_restart" | "cancel_restart")
                         );
-                    let ((result, context), waited) = crate::rpc_latency::measure_store_wait(
+                    // Box the handler: its inline dispatch tree already
+                    // nears the worker stack, and the disconnect select
+                    // below must not grow this task's future further.
+                    let handler = Box::pin(crate::rpc_latency::measure_store_wait(
                         router.handle_rpc_with_log_context(&request, peer),
-                    )
-                    .await;
+                    ));
+                    // One connection carries one request. A preview watch
+                    // long-poll holds a bounded slot for up to 20 seconds; if
+                    // the peer goes away first, drop the handler so its
+                    // PreviewWatch releases instead of lingering to timeout.
+                    let ((result, context), waited) = if request.method == "turn.preview.watch" {
+                        tokio::select! {
+                            output = handler => output,
+                            () = peer_disconnected(&mut framed) => return,
+                        }
+                    } else {
+                        handler.await
+                    };
                     store_wait = waited;
                     let response = match result {
                         Ok(result) => {
