@@ -965,6 +965,7 @@ impl Router {
                     .await
             }
             "artifact.register" => self.artifact_register(&params, &principal).await,
+            "artifact.reconcile" => self.artifact_reconcile(&params, &principal).await,
             "cleanup.plan" => self.cleanup_plan(&params, &principal).await,
             "cleanup.apply" => self.cleanup_apply(&params, &principal).await,
             "cleanup.apply_all" => self.cleanup_apply_all(&params, &principal).await,

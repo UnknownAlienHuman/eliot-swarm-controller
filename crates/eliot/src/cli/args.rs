@@ -302,6 +302,13 @@ pub(crate) struct ArtifactArgs {
 }
 #[derive(Subcommand)]
 pub(crate) enum ArtifactCommand {
+    /// Re-read an unknown artifact as Owner without performing cleanup.
+    Reconcile {
+        artifact: String,
+        /// Relinquish custody with this reason, without asserting removal.
+        #[arg(long, value_name = "REASON")]
+        release_custody: Option<String>,
+    },
     Register {
         path: String,
         #[arg(long,value_parser=["build","data_dir","temp","other"])]

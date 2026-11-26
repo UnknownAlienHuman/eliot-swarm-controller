@@ -109,6 +109,7 @@ use std::{
     cell::{Cell, RefCell},
     collections::{BTreeMap, HashSet},
     path::Path,
+    sync::Arc,
     time::Duration,
 };
 use ulid::Ulid;
@@ -515,6 +516,9 @@ pub struct Store {
     connection: Connection,
     has_first_owner_message: bool,
     write_faulted: Cell<bool>,
+    // Each admitted apply holds a clone until its effects and settlement end.
+    // Reconciliation can only replace a fence with no live apply holder.
+    cleanup_attempts: Arc<()>,
     /// One exact autonomy response for this pooled connection. SQLite's
     /// connection-local data_version invalidates it; no TTL is involved.
     autonomy_cache: RefCell<Option<autonomy::AutonomyCache>>,
@@ -605,6 +609,7 @@ impl Store {
             connection,
             has_first_owner_message,
             write_faulted: Cell::new(false),
+            cleanup_attempts: Arc::new(()),
             autonomy_cache: RefCell::new(None),
             fleet_summaries: RefCell::new(None),
             snapshot_agent: RefCell::new(None),
@@ -694,6 +699,7 @@ impl Store {
             connection,
             has_first_owner_message: true,
             write_faulted: Cell::new(false),
+            cleanup_attempts: Arc::new(()),
             autonomy_cache: RefCell::new(None),
             fleet_summaries: RefCell::new(None),
             snapshot_agent: RefCell::new(None),

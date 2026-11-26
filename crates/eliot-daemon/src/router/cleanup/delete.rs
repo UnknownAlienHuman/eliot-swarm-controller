@@ -34,7 +34,7 @@ impl Router {
             store
                 .retain_cleanup_plan("owner", &plan, now_ms())
                 .and_then(|()| store.begin_cleanup_apply("owner", &apply, now_ms(), false))
-                .map(|(_, response, _)| Some(response))
+                .map(|(_, response, attempt)| Some((response, attempt)))
         };
         drop(store);
 
@@ -43,7 +43,7 @@ impl Router {
         let router = self.clone();
         let outcome = tokio::spawn(async move {
             let result = async {
-                if let Some(mut response) = started? {
+                if let Some((mut response, _attempt)) = started? {
                     router
                         .apply_cleanup_artifacts(
                             "owner",
@@ -201,7 +201,7 @@ impl Router {
         let artifact = store
             .known_native_session_artifact(&agent.id, &path)?
             .ok_or_else(|| Error::new("source_integrity", "native session custody is absent"))?;
-        if artifact.state == "removed" {
+        if matches!(artifact.state.as_str(), "removed" | "released") {
             return Ok(None);
         }
         frozen_archive_profile(agent, &artifact)?;
@@ -257,7 +257,7 @@ impl Router {
 }
 
 fn require_agent_delete_cleanup(plan: &CleanupPlan, response: &CleanupApplyResponse) -> Result<()> {
-    if let Some((item, _)) = plan
+    if let Some((item, outcome)) = plan
         .items
         .iter()
         .zip(&response.items)
@@ -266,8 +266,10 @@ fn require_agent_delete_cleanup(plan: &CleanupPlan, response: &CleanupApplyRespo
         return Err(Error::new(
             "unknown",
             format!(
-                "{} cleanup is uncertain. Swarm kept the task.",
-                item.artifact.agent
+                "{} cleanup is uncertain for artifact {} ({}). Swarm kept the task.",
+                item.artifact.agent,
+                item.artifact.id,
+                outcome.reason.as_deref().unwrap_or("unknown"),
             ),
         ));
     }

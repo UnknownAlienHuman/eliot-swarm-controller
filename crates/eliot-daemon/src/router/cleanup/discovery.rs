@@ -487,6 +487,7 @@ impl OwnedRootWalk {
             directory.pop_entry_directory();
             if let Some((kind, purpose, created_at, expires_at)) = class {
                 candidates.push(ArtifactView {
+                    reconciliation: None,
                     id: ulid::Ulid::new().to_string(),
                     agent: root.agent.clone(),
                     generation: root.generation,
