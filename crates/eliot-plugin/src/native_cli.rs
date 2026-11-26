@@ -24,6 +24,19 @@ use tokio::{io::AsyncReadExt, time::Instant};
 
 use crate::{harness_diagnostic, native_lifecycle::kill_and_reap, spawn_stderr};
 
+/// Start a child with redirected standard streams without allocating a Windows console.
+#[cfg(windows)]
+#[expect(
+    clippy::disallowed_types,
+    reason = "This helper configures console creation for the caller's owned process."
+)]
+pub fn detach_from_console(command: &mut Command) {
+    use std::os::windows::process::CommandExt;
+    command
+        .as_std_mut()
+        .creation_flags(windows_sys::Win32::System::Threading::DETACHED_PROCESS);
+}
+
 /// Enable controller-owned HTTP only when the exact Agent credential is
 /// already in the native environment and no proxy can carry it elsewhere.
 pub fn shared_agent_mcp_url<'a>(

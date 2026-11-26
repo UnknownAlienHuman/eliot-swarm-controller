@@ -991,10 +991,7 @@ impl NativeChild {
 
         #[cfg(windows)]
         if labels.windows_detached_stdio {
-            use std::os::windows::process::CommandExt;
-            command
-                .as_std_mut()
-                .creation_flags(windows_sys::Win32::System::Threading::DETACHED_PROCESS);
+            crate::native_cli::detach_from_console(&mut command);
         }
 
         let mut child = command.spawn().map_err(|error| {
