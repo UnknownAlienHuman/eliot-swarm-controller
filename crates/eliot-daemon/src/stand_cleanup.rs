@@ -6,7 +6,7 @@ use crate::operator::{
     DaemonLock, create_stand_root, daemon_alive, daemon_info, lock_offline, lock_transition,
     validate_stand_directory, write_stand_record,
 };
-use crate::platform::script_file::directory_identity;
+use crate::platform::script_file::{CleanupPath, directory_identity};
 use crate::platform::{OwnedChild, is_reparse_point, worktree_guard::WorktreeWriteGuard};
 use crate::workspace_git::{RemovalBranch, WorkspaceGit, containment::branch_rev_parse};
 use eliot_core::api::{CleanupGitBinding, MAX_ARTIFACT_TTL_MS};
@@ -1354,7 +1354,11 @@ pub fn check_nested_roots(root: &Path) -> Result<()> {
 
 pub fn remove_offline_stand_root(root: &Path, offline: DaemonLock) -> Result<()> {
     let registration = locate_stand_registration(root)?.record;
-    let pinned = pinned_stand_root(root, &registration)?;
+    remove_pinned_offline_stand_root(pinned_stand_root(root, &registration)?, offline)
+}
+
+fn remove_pinned_offline_stand_root(pinned: PinnedStandRoot, offline: DaemonLock) -> Result<()> {
+    let root = &pinned.root;
     let io_fail = |error| {
         Error::new(
             "platform_io",
@@ -1390,8 +1394,13 @@ pub fn remove_offline_stand_root(root: &Path, offline: DaemonLock) -> Result<()>
             Err(error) => return Err(io_fail(error)),
         }
     }
-    drop(pinned);
-    fs::remove_dir(root).map_err(io_fail)
+    #[cfg(windows)]
+    return pinned.dir.remove_empty();
+    #[cfg(not(windows))]
+    {
+        drop(pinned.dir);
+        fs::remove_dir(root).map_err(io_fail)
+    }
 }
 
 /// Bounded offline tree walk for stand size calculation and link/nested-root
@@ -2507,15 +2516,10 @@ pub(crate) async fn plan_stand_artifact(
 
 pub(crate) async fn apply_stand_artifact(
     daemon_data_root: &Path,
-    stand_root: &Path,
+    owned_path: CleanupPath,
     expected_identity: &str,
 ) -> Result<u64> {
-    if directory_identity(stand_root)? != expected_identity {
-        return Err(Error::new(
-            "identity_changed",
-            "stand directory identity changed",
-        ));
-    }
+    let stand_root = owned_path.path();
     check_directory_chain(stand_root)?;
     check_nested_roots(stand_root)?;
     let registry = stand_registry(false)?;
@@ -2571,7 +2575,9 @@ pub(crate) async fn apply_stand_artifact(
     }
     registration.removing_pid = Some(pid);
     write_stand_registration(&registry, &reg_name, &registration)?;
-    remove_offline_stand_root(stand_root, offline)?;
+    let pinned = pinned_stand_root(stand_root, &registration)?;
+    drop(owned_path);
+    remove_pinned_offline_stand_root(pinned, offline)?;
     remove_stand_registration(&registry, &reg_name)?;
     Ok(bytes)
 }

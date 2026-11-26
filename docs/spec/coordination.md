@@ -167,7 +167,9 @@ For an
 expired stand candidate, apply performs `#885` two-pass external worktree and detached
 branch cleanup under `WorktreeWriteGuard` + `OwnedChild`, keeps the stand if any
 external item is kept/unknown, and deletes the offline stand root and external registry
-entry only when external cleanup is complete. An
+entry only when external cleanup is complete. Parent cleanup uses Windows directory
+handles to retain the stand's identity through removal and reports `unsupported` on
+platforms without this deletion path. An
 optional `artifacts` list (at most 64 unique ids, each a safe candidate of that
 plan) attempts only those; the plan's other safe candidates settle
 `skipped(not_selected)` without an attempt fence, so a later plan offers them again.

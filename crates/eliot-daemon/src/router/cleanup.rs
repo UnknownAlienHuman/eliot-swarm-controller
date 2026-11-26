@@ -2538,10 +2538,15 @@ impl Router {
         self.cleanup_check_git(&agent, &path, artifact.is_owned_cleanup_child())
             .await?;
         if is_stand_artifact(artifact) {
-            let (_parent, path) = owned_path.into_parent()?;
+            if !cfg!(windows) {
+                return Err(Error::new(
+                    "unsupported",
+                    "handle deletion is unavailable on this platform",
+                ));
+            }
             return crate::stand_cleanup::plan_stand_artifact(
                 &self.inner.data_root,
-                &path,
+                owned_path.path(),
                 &artifact.identity,
             )
             .await
@@ -2552,6 +2557,8 @@ impl Router {
             let tree =
                 open_cleanup_tree(owned_path, scan_budget, is_cargo_target_artifact(artifact))
                     .await?;
+            // The leaf was reopened by name under the held parent. Verify
+            // the reopened directory against the retained artifact identity.
             if tree.identity != artifact.identity {
                 return Err(Error::new(
                     "identity_changed",
@@ -2965,6 +2972,18 @@ impl Router {
                 "artifact directory reappeared after planning",
             ));
         }
+        if is_stand_artifact(artifact) {
+            if !cfg!(windows) {
+                return Err(Error::new(
+                    "unsupported",
+                    "handle deletion is unavailable on this platform",
+                ));
+            }
+            owned_path
+                .as_ref()
+                .ok_or_else(|| Error::new("identity_changed", "stand directory is no longer held"))?
+                .require_identity(&artifact.identity)?;
+        }
         let agent = self
             .inner
             .store
@@ -2979,7 +2998,6 @@ impl Router {
         self.cleanup_check_git(&agent, &path, artifact.is_owned_cleanup_child())
             .await?;
         if is_stand_artifact(artifact) {
-            let (_parent, path) = owned_path.into_parent()?;
             Self::cleanup_check_daemon_lock(Path::new(&artifact.path))?;
             {
                 let store = self.inner.store.lock().await;
@@ -2995,7 +3013,7 @@ impl Router {
             }
             return crate::stand_cleanup::apply_stand_artifact(
                 &self.inner.data_root,
-                &path,
+                owned_path,
                 &artifact.identity,
             )
             .await

@@ -72,7 +72,12 @@ impl CleanupPath {
                         directory = canonical;
                     }
                     let suffix = path.strip_prefix(prefix).map_err(|_| refused())?;
-                    let path = resolved.join(suffix);
+                    // Joining an empty suffix adds a separator to the registry key.
+                    let path = if suffix.as_os_str().is_empty() {
+                        resolved.clone()
+                    } else {
+                        resolved.join(suffix)
+                    };
                     directory.path = resolved;
                     return Ok(Self { path, directory });
                 }
@@ -88,32 +93,49 @@ impl CleanupPath {
     }
 
     pub(crate) fn in_root(&self, root: &Path) -> Result<bool> {
-        if self.path != root && self.directory.path.starts_with(root) {
-            // The no-follow walk has already pinned and normalized this ancestor.
-            return Ok(true);
-        }
-        cleanup_canonical_path_in_root(&self.path, root)
+        let Some(root) = open_cleanup_root(root)? else {
+            return Ok(false);
+        };
+        // A present leaf is not its own ancestor. For a missing suffix, the
+        // last held directory is still an ancestor of the requested path.
+        let ancestors = self.directory.chain.len() - usize::from(self.path == self.directory.path);
+        let Some(held) = self.directory.chain[..ancestors].get(root.chain.len() - 1) else {
+            return Ok(false);
+        };
+        Ok(eliot_plugin::file_identity(held).map_err(io)?
+            == eliot_plugin::file_identity(root.handle()).map_err(io)?)
     }
 
-    pub(crate) fn into_parent(mut self) -> Result<(Directory, PathBuf)> {
-        if self.directory.path != self.path || self.directory.chain.len() < 2 {
+    pub(crate) fn require_identity(&self, expected: &str) -> Result<()> {
+        if self.directory.path != self.path || self.directory.identity()? != expected {
+            return Err(Error::new("identity_changed", "artifact directory changed"));
+        }
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn into_parent(self) -> Result<(Directory, PathBuf)> {
+        if self.directory.path != self.path {
             return Err(refused());
         }
-        // Release only the leaf read handle so the relative delete open can
-        // request DELETE access. Every ancestor remains pinned.
-        self.directory.chain.pop();
-        self.directory.path.pop();
-        Ok((self.directory, self.path))
+        self.directory.into_parent()
     }
 }
 
 pub(crate) fn cleanup_canonical_path_in_root(path: &Path, root: &Path) -> Result<bool> {
+    let Some(root) = open_cleanup_root(root)? else {
+        return Ok(false);
+    };
+    Ok(path != root.path && path.starts_with(root.path))
+}
+
+fn open_cleanup_root(root: &Path) -> Result<Option<Directory>> {
     match std::fs::symlink_metadata(root) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(_) => return Err(refused()),
         Ok(_) => {}
     }
-    let directory = Directory::open(root).map_err(|_| unsafe_cleanup_root())?;
+    let mut directory = Directory::open(root).map_err(|_| unsafe_cleanup_root())?;
     let canonical = directory
         .canonical_path()
         .map_err(|_| unsafe_cleanup_root())?;
@@ -122,7 +144,8 @@ pub(crate) fn cleanup_canonical_path_in_root(path: &Path, root: &Path) -> Result
     {
         return Err(unsafe_cleanup_root());
     }
-    Ok(path != canonical && path.starts_with(canonical))
+    directory.path = canonical;
+    Ok(Some(directory))
 }
 
 fn unsafe_cleanup_root() -> Error {
@@ -143,6 +166,44 @@ struct StagedFile {
 }
 
 impl Directory {
+    #[cfg(windows)]
+    fn into_parent(mut self) -> Result<(Self, PathBuf)> {
+        if self.chain.len() < 2 {
+            return Err(refused());
+        }
+        let path = self.path.clone();
+        // Release only the leaf read handle to permit the relative DELETE open.
+        self.chain.pop();
+        self.path.pop();
+        Ok((self, path))
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn remove_empty(self) -> Result<()> {
+        let expected = eliot_plugin::file_identity(self.handle()).map_err(io)?;
+        let (parent, path) = self.into_parent()?;
+        let name = path.file_name().ok_or_else(refused)?;
+        let leaf = native::open_cleanup(parent.handle(), name, true).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                Error::new(
+                    "identity_changed",
+                    "stand directory disappeared before removal",
+                )
+            } else {
+                cleanup_open_error(error)
+            }
+        })?;
+        check(&leaf, true)?;
+        if eliot_plugin::file_identity(&leaf).map_err(io)? != expected {
+            return Err(Error::new(
+                "identity_changed",
+                "stand directory changed before removal",
+            ));
+        }
+        native::delete_handle(&leaf)
+            .map_err(|error| Error::new("platform_io", format!("remove empty stand: {error}")))
+    }
+
     pub(crate) fn direct_child_path(&self, child: &Path) -> std::io::Result<PathBuf> {
         let name = child
             .file_name()
