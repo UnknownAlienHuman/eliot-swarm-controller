@@ -19,7 +19,7 @@ impl DesktopApp {
                 KeyedView::new(
                     format!("history:{}", entry.revision),
                     Border::new()
-                        .height(tokens::height::CONTROL)
+                        .min_height(tokens::height::CONTROL)
                         .automation_name(format!("{headline}, {supporting}"))
                         .content(controls::row_content(None, &headline, &supporting, None)),
                 )

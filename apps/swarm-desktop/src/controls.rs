@@ -523,35 +523,44 @@ pub fn row_content(
     trailing: impl Into<Option<View>>,
 ) -> View {
     let title = trimmed(title, style::BODY);
-    // A note is a second text: its own star cell (a third of the room),
-    // at the right beside the trailing mark.
+    // A note stands under the title, as the model picker's provider does
+    // under a model name: each line takes the row's whole width, so a short
+    // name ("repo") leaves its room to a long note (its path), and either
+    // trims only when the row is too narrow for it.
     let text: View = if note.is_empty() {
         title.into()
     } else {
-        Grid::new()
-            .columns([GridLength::Star(2.0), GridLength::STAR])
-            .column_spacing(spacing::ROW)
+        StackPanel::new()
+            .vertical_alignment(VerticalAlignment::Center)
             .children((
                 title,
-                secondary(note.to_owned())
-                    .grid_column(1)
-                    .horizontal_alignment(HorizontalAlignment::Right)
-                    .vertical_alignment(VerticalAlignment::Center)
-                    .text_trimming(TextTrimming::CharacterEllipsis),
+                secondary(note.to_owned()).text_trimming(TextTrimming::CharacterEllipsis),
             ))
             .into()
     };
     row_grid(glyph.map(icon), text, trailing.into(), spacing::ROW)
 }
 
-/// A nav row's content: its icon, its label and a trailing caption
-/// ("Ctrl+N", "1 working · 1 needs attention"). The label is the row's
-/// name and keeps its width; the caption takes the star cell at the right
-/// and is the text that trims when the row runs out of room.
-pub fn nav_content(glyph: &str, label: &str, hint: &str) -> View {
-    if hint.is_empty() {
+/// A nav row's content: its icon, its label and its trailing status, one
+/// part per line ("1 working" over "1 needs attention"), as the Codex
+/// sidebar shows one status per row rather than a sentence. The label is
+/// the row's name and keeps its width; the parts take the star cell at the
+/// right and trim only when the sidebar is too narrow for one of them.
+pub fn nav_content(glyph: &str, label: &str, parts: &[String]) -> View {
+    if parts.is_empty() {
         return row_content(Some(glyph), label, "", None);
     }
+    let lines: Vec<KeyedView> = parts
+        .iter()
+        .map(|part| {
+            KeyedView::new(
+                part.clone(),
+                secondary(part.clone())
+                    .horizontal_alignment(HorizontalAlignment::Right)
+                    .text_trimming(TextTrimming::CharacterEllipsis),
+            )
+        })
+        .collect();
     Grid::new()
         .columns([GridLength::Auto, GridLength::Auto, GridLength::STAR])
         .column_spacing(spacing::ROW)
@@ -560,11 +569,10 @@ pub fn nav_content(glyph: &str, label: &str, hint: &str) -> View {
             text(label.to_owned(), style::BODY)
                 .grid_column(1)
                 .vertical_alignment(VerticalAlignment::Center),
-            secondary(hint.to_owned())
+            StackPanel::new()
                 .grid_column(2)
-                .horizontal_alignment(HorizontalAlignment::Right)
                 .vertical_alignment(VerticalAlignment::Center)
-                .text_trimming(TextTrimming::CharacterEllipsis),
+                .keyed_children(lines),
         ))
         .into()
 }

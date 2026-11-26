@@ -294,9 +294,10 @@ impl DesktopApp {
                             .spacing(tokens::spacing::XS)
                             .vertical_alignment(VerticalAlignment::Center)
                             .children((
+                                // Wraps as a dialog's title does.
                                 controls::section_title(format!("Force stop {title}?"))
                                     .foreground(ThemeBrush::SystemCritical)
-                                    .text_trimming(TextTrimming::CharacterEllipsis),
+                                    .text_wrapping(TextWrapping::Wrap),
                                 controls::text(
                                     format!(
                                         "Ends Agent {} run {} at once; a running turn is cut off.",

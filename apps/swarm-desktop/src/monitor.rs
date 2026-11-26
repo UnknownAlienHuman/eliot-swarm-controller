@@ -464,6 +464,12 @@ fn seconds(ms: i64) -> String {
 /// What is live, in words: "2 working · 1 needs attention · 3 idle", each
 /// part only when it has Agents; "All quiet" when nothing is live.
 pub fn live_words(working: usize, attention: usize, idle: usize) -> String {
+    live_parts(working, attention, idle).join(" · ")
+}
+
+/// The parts of [`live_words`], one count each ("2 working", "1 needs
+/// attention"); just "All quiet" when nothing is live.
+pub fn live_parts(working: usize, attention: usize, idle: usize) -> Vec<String> {
     let mut parts = Vec::new();
     if working > 0 {
         parts.push(format!("{working} working"));
@@ -482,10 +488,9 @@ pub fn live_words(working: usize, attention: usize, idle: usize) -> String {
         parts.push(format!("{idle} idle"));
     }
     if parts.is_empty() {
-        "All quiet".to_owned()
-    } else {
-        parts.join(" · ")
+        parts.push("All quiet".to_owned());
     }
+    parts
 }
 
 /// How long ago, compactly: "12 s", "4 min", "3 h", "2 d".

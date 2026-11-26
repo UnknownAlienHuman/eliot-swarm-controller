@@ -970,7 +970,9 @@ impl DesktopApp {
                 )
             })
             .collect();
-        items.push(KeyedView::new("filters", page_ui::chip_rows(chips, 6)));
+        // Three to a row: six in one row ran past the page's edge at 900
+        // DIPs and hid the last chips (no wrap panel to break the row).
+        items.push(KeyedView::new("filters", page_ui::chip_rows(chips, 3)));
 
         if data.read_at_ms.is_none() && self.monitor.refreshing && data.errors.is_empty() {
             items.push(KeyedView::new(
