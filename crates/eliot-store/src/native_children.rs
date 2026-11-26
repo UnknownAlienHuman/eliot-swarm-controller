@@ -616,6 +616,9 @@ impl Store {
         now: i64,
         events: &mut Vec<Event>,
     ) -> Result<()> {
+        // Startup holds the daemon's exclusive data-directory lock. The old
+        // private producer connections cannot publish into this daemon, even
+        // if the native process family's exit has yet to be proven.
         let keys = {
             let mut statement = tx.prepare("SELECT DISTINCT producer, producer_generation FROM native_child_registrations ORDER BY producer, producer_generation").map_err(sql_error)?;
             let rows = statement
@@ -642,7 +645,7 @@ impl Store {
                     (&producer, producer_generation),
                     (child_num, &ack),
                     "daemon_restart",
-                    false,
+                    true,
                     now,
                     events,
                 )?;
@@ -655,10 +658,9 @@ impl Store {
 /// The typed reason a native child settles with when its producer generation ends.
 pub const ENDED_WITH_PARENT: &str = "ended_with_parent";
 
-/// Settle an observed native child only when its exact producer generation has
-/// ended and the registered child generation has a committed completed turn
-/// with no unresolved turns. Running turns become `unknown`; a child without
-/// such terminal evidence remains `unknown`. Source rows are untouched here.
+/// End a child's observation when its exact producer generation ends.
+/// Running turns become `unknown`; the child lifecycle records only the end
+/// of observation. The producer's reader retirement closes its source rows.
 /// `producer` narrows the sweep to one producer generation; `None` sweeps every
 /// retained registration (restart recovery).
 pub(crate) fn end_native_children_with_parent_tx(
@@ -758,32 +760,9 @@ pub(crate) fn end_native_children_with_parent_tx(
                 json!({"turn_id": turn_id, "reason": ENDED_WITH_PARENT}),
             )?);
         }
-        let completed_turn: Option<String> = tx
-            .query_row(
-                "SELECT turn_id FROM turns
-                 WHERE agent = ?1 AND generation = ?2 AND state = 'completed'
-                   AND EXISTS (
-                       SELECT 1 FROM agents
-                       WHERE id = ?1 AND generation = ?2 AND active_turn IS NULL
-                   )
-                   AND NOT EXISTS (
-                       SELECT 1 FROM turns
-                       WHERE agent = ?1 AND generation = ?2
-                         AND state IN ('running', 'unknown')
-                   )
-                 ORDER BY COALESCE(completed_at, started_at, 0) DESC, rowid DESC
-                 LIMIT 1",
-                params![child, generation],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(sql_error)?;
-        if completed_turn.is_none() {
-            continue;
-        }
         let changed = db!(tx.execute(
-            "UPDATE agents SET state = 'stopped', pending = '[]', updated_at = ?1
-             WHERE id = ?2 AND generation = ?3 AND state = 'unknown' AND active_turn IS NULL",
+            "UPDATE agents SET state = 'stopped', active_turn = NULL, pending = '[]', updated_at = ?1
+             WHERE id = ?2 AND generation = ?3 AND state = 'unknown'",
             params![now, child, generation],
         ));
         if changed != 1 {
