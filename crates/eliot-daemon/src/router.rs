@@ -5863,8 +5863,12 @@ impl Router {
             first_owner_message,
         };
         display_agent_get_response(&mut response);
-        serde_json::to_value(response)
-            .map_err(|_| Error::new("internal", "Agent view could not be encoded"))
+        let mut value = serde_json::to_value(response)
+            .map_err(|_| Error::new("internal", "Agent view could not be encoded"))?;
+        if let Some(message) = value.get_mut("first_owner_message") {
+            self.redact_native_value(message);
+        }
+        Ok(value)
     }
 
     async fn session_usage(&self, agent: &Agent) -> Result<Option<SessionUsage>> {

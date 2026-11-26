@@ -1165,9 +1165,12 @@ work. Keep the first Owner message for each Agent tree root and chat, including 
 command row and stored input. Pin the launch with text, or the first admitted Owner
 SEND when there is no such launch, in the same transaction as admission. The pin
 survives generation changes and archival. Upgrades pin the oldest eligible message
-still retained. `agent.get` and `swarm show` expose the text under the existing command
-read scope, and the desktop header uses the pinned message for its preview.
-Other terminal commands follow the ordinary retention rules.
+still retained. When only the first-message pin remains, detach the pinned rows and
+prune the other members in the same transaction. A surviving parent whose expansion
+expired reports `history_gap` for `command.children`.
+`agent.get` and `swarm show` expose the full message under the existing command read
+scope with the same native-value redaction as observation pages. The bounded preview
+used by the desktop header follows Agent list scope.
 Each pass resumes a persistent keyset cursor past the last examined expired
 root (wrapping only once the eligible set is exhausted) instead of restarting at
 the oldest root, and examines at most a bounded number of candidates per pass;

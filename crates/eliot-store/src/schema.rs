@@ -2866,31 +2866,19 @@ impl Store {
         }
         if current < FIRST_OWNER_MESSAGE_VERSION {
             self.migrate_sql(
-                "ALTER TABLE agents ADD COLUMN first_owner_command TEXT
+                &format!(
+                    "ALTER TABLE commands ADD COLUMN children_pruned INTEGER NOT NULL DEFAULT 0;
+                     ALTER TABLE agents ADD COLUMN first_owner_command TEXT
                     REFERENCES commands(id) ON DELETE SET NULL;
                  UPDATE agents AS a SET first_owner_command = (
                      SELECT c.id FROM commands c INDEXED BY commands_target
-                     WHERE c.target = a.id AND c.principal = 'owner'
-                       AND c.state <> 'rejected'
-                       AND json_type(c.args, '$.text') = 'text'
-                       AND json_extract(c.cause, '$.rule') IS NULL
-                       AND (
-                           (c.verb = 'launch' AND json_type(c.args, '$._provider_probe') IS NULL)
-                           OR (c.verb = 'send' AND json_type(c.args, '$.notice_kind') IS NULL
-                               AND (c.parent_command IS NULL OR c.link_kind = 'selector'
-                                    OR (c.link_kind = 'send' AND EXISTS (
-                                        SELECT 1 FROM commands p WHERE p.id = c.parent_command
-                                          AND p.verb = 'resume'
-                                          AND json_type(p.args, '$.continue_from_stop') IS NULL
-                                          AND NOT EXISTS (
-                                              SELECT 1 FROM restart_resume_intents r
-                                              WHERE r.command_id = p.id))))
-                           )
-                       )
+                     WHERE c.target = a.id AND {}
                      ORDER BY c.created_at, c.rowid LIMIT 1
                  ) WHERE a.parent IS NULL OR a.chat = 1;
                  CREATE INDEX agents_first_owner_command ON agents(first_owner_command)
                      WHERE first_owner_command IS NOT NULL;",
+                    admission::FIRST_OWNER_MESSAGE_PREDICATE
+                ),
                 Some(FIRST_OWNER_MESSAGE_VERSION),
             )?;
         }

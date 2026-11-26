@@ -471,7 +471,7 @@ impl Store {
         // batches and walks one bounded subtree per candidate. Kept or
         // oversize sets are skipped in place so they never starve later
         // eligible roots, and the pass stops at the root/row/examination
-        // budgets with whole sets still deleting atomically. No pass
+        // budgets with each set pruned atomically. No pass
         // materializes every expired command tree: each candidate costs one
         // bounded subtree walk, and the sweep stops early once the root
         // budget is doomed or the examination bound is reached.
@@ -523,10 +523,12 @@ impl Store {
                 // a budget stop resumes at the first unexamined root instead
                 // of skipping the rest of this batch on the next pass.
                 let previous_cursor = cursor.replace((*root_created, root.clone()));
-                let Some(members) = bounded_command_set(&self.connection, root)? else {
+                let Some(members) = bounded_command_set(&self.connection, root, true)? else {
                     continue;
                 };
-                if command_set_protection(&members, cutoff).is_some() {
+                if command_set_protection(&members, cutoff).is_some()
+                    || members.iter().all(|member| member.first_owner_message_ref)
+                {
                     continue;
                 }
                 if members.len() + doomed.len() > MAX_SET_MEMBERS {
@@ -555,8 +557,15 @@ impl Store {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(sql_error)?;
-        let deleted = delete_commands_tx(&tx, doomed.iter().map(|member| member.id.as_str()))
-            .map_err(sql_error)?;
+        detach_first_messages_tx(&tx, &doomed).map_err(sql_error)?;
+        let deleted = delete_commands_tx(
+            &tx,
+            doomed
+                .iter()
+                .filter(|member| !member.first_owner_message_ref)
+                .map(|member| member.id.as_str()),
+        )
+        .map_err(sql_error)?;
         let writes = prune_writes_tx(&tx, cutoff)?;
         commit_transaction(tx, &self.write_faulted)?;
         Ok((deleted, writes))
@@ -791,8 +800,12 @@ fn legacy_advisory_retention_candidates(bounded: bool) -> String {
     )
 }
 
-fn bounded_command_set(connection: &Connection, root: &str) -> Result<Option<Vec<SubtreeMember>>> {
-    match subtree_members_tx(connection, root) {
+fn bounded_command_set(
+    connection: &Connection,
+    root: &str,
+    has_first_owner_message: bool,
+) -> Result<Option<Vec<SubtreeMember>>> {
+    match subtree_members_tx(connection, root, has_first_owner_message) {
         Ok((members, false)) => Ok(Some(members)),
         Ok((_, true)) => Ok(None),
         // Preserve a set past the traversal bound without failing the pass.
@@ -809,8 +822,6 @@ fn command_set_protection(members: &[SubtreeMember], cutoff: i64) -> Option<&'st
         Some("unknown_outcome")
     } else if members.iter().any(|m| m.workspace_ref || m.probe_ref) {
         Some("custody")
-    } else if members.iter().any(|m| m.first_owner_message_ref) {
-        Some("first_owner_message")
     } else if members
         .iter()
         .any(|m| m.is_open() || m.turn_state.is_some() || m.goal_ref || m.config_ref)
@@ -998,7 +1009,11 @@ pub(crate) fn coverage_pruned_through(connection: &Connection) -> Result<i64> {
 /// oversize tree never materializes a recursive result into an automatic
 /// index before the outer `LIMIT` applies; the detail fetch below then runs
 /// over at most `MAX_SET_MEMBERS + 1` ids.
-fn subtree_members_tx(connection: &Connection, root: &str) -> Result<(Vec<SubtreeMember>, bool)> {
+fn subtree_members_tx(
+    connection: &Connection,
+    root: &str,
+    has_first_owner_message: bool,
+) -> Result<(Vec<SubtreeMember>, bool)> {
     use std::collections::{HashMap, HashSet, VecDeque};
     let cap = MAX_SET_MEMBERS + 1;
     let mut visited: HashSet<String> = HashSet::new();
@@ -1059,6 +1074,11 @@ fn subtree_members_tx(connection: &Connection, root: &str) -> Result<(Vec<Subtre
         return Ok((Vec::new(), false));
     }
     let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+    let first_message = if has_first_owner_message {
+        "EXISTS(SELECT 1 FROM agents a WHERE a.first_owner_command = c.id)"
+    } else {
+        "0"
+    };
     let sql = format!(
         "SELECT c.id, 0, c.state, c.created_at,
                 (
@@ -1087,7 +1107,7 @@ fn subtree_members_tx(connection: &Connection, root: &str) -> Result<(Vec<Subtre
                       AND json_extract(g.state, '$.last_continuation_command_id') = c.id
                 ),
                 EXISTS(SELECT 1 FROM agent_config a WHERE a.command_id = c.id),
-                EXISTS(SELECT 1 FROM agents a WHERE a.first_owner_command = c.id)
+                {first_message}
          FROM commands c WHERE c.id IN ({placeholders})"
     );
     let mut statement = connection.prepare(&sql).map_err(sql_error)?;
@@ -1123,6 +1143,36 @@ fn subtree_members_tx(connection: &Connection, root: &str) -> Result<(Vec<Subtre
         ));
     }
     Ok((members, false))
+}
+
+/// Preserve the input rows and retire the expansion before deleting its other members.
+fn detach_first_messages_tx(
+    tx: &Transaction<'_>,
+    members: &[SubtreeMember],
+) -> rusqlite::Result<()> {
+    let mut pinned = members
+        .iter()
+        .filter(|member| member.first_owner_message_ref)
+        .peekable();
+    if pinned.peek().is_none() {
+        return Ok(());
+    }
+    let mut mark = tx.prepare(
+        "UPDATE commands SET children_pruned = 1 WHERE id = ?1
+           AND EXISTS (SELECT 1 FROM commands child WHERE child.parent_command = ?1)",
+    )?;
+    let mut detach = tx.prepare(
+        "UPDATE commands SET parent_command = NULL, link_kind = NULL, ordinal = NULL
+         WHERE id = ?1 AND parent_command IS NOT NULL",
+    )?;
+    // Mark every surviving parent before detaching any of its children.
+    for member in pinned.clone() {
+        mark.execute([&member.id])?;
+    }
+    for member in pinned {
+        detach.execute([&member.id])?;
+    }
+    Ok(())
 }
 
 /// The shared leaf-first physical command cleanup for retention and explicit Agent deletion.

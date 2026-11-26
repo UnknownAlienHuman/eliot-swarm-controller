@@ -2585,17 +2585,12 @@ fn submit_tx_mode(
     })?;
     if principal == "owner" && !derived_rule && !restart_resume {
         let first_message = match request.kind() {
-            Launch if request.args.get(core::PROVIDER_PROBE_LAUNCH_ARG).is_none() => Some(&command),
-            Send if request.args.get("notice_kind").is_none() => Some(&command),
-            Resume if continuation_text.is_none() => linked_command.as_ref(),
+            Launch | Send => Some(&command),
+            Resume => linked_command.as_ref(),
             _ => None,
         };
-        if let Some(input) = first_message
-            && input.state != CommandState::Rejected
-            && input_before_owner_rules(input).is_some_and(|text| !text.trim().is_empty())
-            && let Some(agent) = input.target.as_deref()
-        {
-            pin_first_owner_message_tx(tx, parse_agent_id(agent)?, &input.id)?;
+        if let Some(input) = first_message {
+            pin_first_owner_message_tx(tx, &input.id)?;
         }
     }
     Ok(Admission {
@@ -2606,16 +2601,40 @@ fn submit_tx_mode(
     })
 }
 
-/// Pin the first Owner input when its command is admitted, in the same transaction.
-pub(super) fn pin_first_owner_message_tx(
-    tx: &Transaction<'_>,
-    agent: i64,
-    command: &str,
-) -> Result<()> {
+/// Candidate `c` is an admitted launch or user SEND, including an explicit
+/// Resume's linked input. Use the same predicate for admission and backfill.
+/// The trim set is Unicode White_Space, matching Rust's command validation.
+pub(super) const FIRST_OWNER_MESSAGE_PREDICATE: &str = "
+    c.principal = 'owner'
+    AND c.state <> 'rejected'
+    AND json_extract(c.cause, '$.rule') IS NULL
+    AND c.verb IN ('launch', 'send')
+    AND json_type(c.args, '$.text') = 'text'
+    AND trim(json_extract(c.args, '$.text'),
+             char(9,10,11,12,13,32,133,160,5760,8192,8193,8194,8195,8196,
+                  8197,8198,8199,8200,8201,8202,8232,8233,8239,8287,12288)) <> ''
+    AND (c.verb = 'launch' AND json_type(c.args, '$._provider_probe') IS NULL
+         OR c.verb = 'send' AND json_type(c.args, '$.notice_kind') IS NULL
+         AND (c.parent_command IS NULL OR c.link_kind = 'selector'
+              OR c.link_kind = 'send' AND EXISTS (
+                  SELECT 1 FROM commands p WHERE p.id = c.parent_command
+                    AND p.verb = 'resume'
+                    AND json_type(p.args, '$.continue_from_stop') IS NULL
+                    AND NOT EXISTS (SELECT 1 FROM restart_resume_intents r
+                                    WHERE r.command_id = p.id))))
+";
+
+/// Pin the first Owner input once its command and links have been admitted.
+pub(super) fn pin_first_owner_message_tx(tx: &Transaction<'_>, command: &str) -> Result<()> {
     db!(tx.execute(
-        "UPDATE agents SET first_owner_command = ?2
-         WHERE id = ?1 AND first_owner_command IS NULL AND (parent IS NULL OR chat = 1)",
-        params![agent, command],
+        &format!(
+            "UPDATE agents SET first_owner_command = ?1
+             WHERE id = (SELECT target FROM commands WHERE id = ?1)
+               AND first_owner_command IS NULL AND (parent IS NULL OR chat = 1)
+               AND EXISTS (SELECT 1 FROM commands c WHERE c.id = ?1
+                           AND {FIRST_OWNER_MESSAGE_PREDICATE})"
+        ),
+        [command],
     ));
     Ok(())
 }

@@ -1967,8 +1967,9 @@ the admitted `children` plus a bounded `skipped` list naming each skipped
 observe-only member as `{"agent": AGENT, "reason": "observe_only"}`; their
 lifecycle stays with their manager/native harness. Parent applied means expansion only.
 `command.children` pages that fixed set; a child created after admission is never
-part of it. Retention and explicit Agent deletion remove selector parents and
-their member commands atomically. Ordered rule actions reuse the
+part of it. Retention removes selector parents and expired members atomically,
+detaching any [pinned first messages](core.md#retention). Explicit Agent deletion
+removes the selector parent and its member commands atomically. Ordered rule actions reuse the
 same representation with a distinct link kind, not selector execution semantics.
 
 `command.children` is implemented for retained expansions through Core

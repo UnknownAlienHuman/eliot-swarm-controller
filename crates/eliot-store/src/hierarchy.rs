@@ -549,24 +549,15 @@ pub(super) fn admit_selector_expansion(
             member_request.args.clone(),
         )?)?;
         match request.verb.as_str() {
-            "send" => {
-                admission::admit_send_member(
-                    tx,
-                    principal,
-                    &member_request,
-                    &member_digest,
-                    member,
-                    now,
-                    &mut events,
-                )?;
-                if principal == "owner" && request.args.get("notice_kind").is_none() {
-                    admission::pin_first_owner_message_tx(
-                        tx,
-                        parse_agent_id(&member.id)?,
-                        &child_id,
-                    )?;
-                }
-            }
+            "send" => admission::admit_send_member(
+                tx,
+                principal,
+                &member_request,
+                &member_digest,
+                member,
+                now,
+                &mut events,
+            )?,
             "stop" => admission::admit_stop_member(
                 tx,
                 principal,
@@ -631,6 +622,9 @@ pub(super) fn admit_selector_expansion(
                 "source_integrity",
                 "new selector child could not be bound to its parent",
             ));
+        }
+        if principal == "owner" && request.verb == "send" {
+            admission::pin_first_owner_message_tx(tx, child_id)?;
         }
     }
     let command = load_command(tx, &request.id)?.ok_or_else(|| {
