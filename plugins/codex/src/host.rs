@@ -31,7 +31,10 @@ use eliot_plugin::{
     AgentCommandParams, AgentCommandVerb, AgentSnapshotParams, AgentStartParams, AgentStopParams,
     DiscoverParams, InitializeParams, MAX_EVENT_BYTES, MAX_TEXT_BYTES, ObserverAttachParams,
     ObserverDetachParams, ObserverSnapshotParams, Peer, PeerClient, PluginManifest, RpcRequest,
-    protocol::{AgentStartBlocker, ArchivedResumeBinding, ProfileStoreParams, stream_sources},
+    protocol::{
+        AgentStartBlocker, ArchivedResumeBinding, NativeArchiveParams, ProfileStoreParams,
+        stream_sources,
+    },
     resume::ResumePreflight,
     session::{
         ModelSelection, attach_reply_diagnostics, begin_stop, decode, ensure_dedicated_reader,
@@ -750,23 +753,11 @@ impl CodexPlugin {
             "Codex",
             "native.archive",
         )?;
-        let profile = raw.get("profile").unwrap_or(raw);
+        let params: NativeArchiveParams = decode(raw, "Codex native.archive params are invalid")?;
+        let profile = &params.profile;
         ensure_reader_harness(profile, "codex", "Codex", "native.archive")?;
-        let native_ref = raw
-            .get("native_ref")
-            .and_then(Value::as_str)
-            .filter(|reference| {
-                !reference.is_empty()
-                    && reference.len() <= 512
-                    && !reference.chars().any(char::is_control)
-            })
-            .ok_or_else(|| {
-                Error::new(
-                    "invalid",
-                    "Codex native.archive needs a native session reference",
-                )
-            })?;
-        let (launch, secrets, metadata_secrets) = self.reader_launch(profile, &json!({}))?;
+        let environment = params.target_environment.unwrap_or_else(|| json!({}));
+        let (launch, secrets, metadata_secrets) = self.reader_launch(profile, &environment)?;
         let binding =
             frozen_store_binding(profile.as_object().ok_or_else(|| {
                 Error::new("profile_error", "archive requires a frozen profile")
@@ -774,7 +765,7 @@ impl CodexPlugin {
         crate::discovery::archive_thread(
             launch,
             &binding,
-            native_ref.to_owned(),
+            params.native_ref,
             &metadata_secrets,
             &secrets,
             tokio::time::Instant::now() + crate::discovery::READ_TIMEOUT,

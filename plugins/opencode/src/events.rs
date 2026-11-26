@@ -213,6 +213,7 @@ pub(crate) struct TurnInput {
     pub command_id: String,
     pub turn_id: String,
     pub inbox_id: String,
+    joined_inputs: HashSet<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -1434,6 +1435,7 @@ impl EventProcessor {
             command_id: command_id.clone(),
             turn_id: turn_id.clone(),
             inbox_id: inbox_id.clone(),
+            joined_inputs: HashSet::new(),
         });
         self.status.active_command_id = Some(command_id.clone());
         self.status.active_turn_id = Some(turn_id.clone());
@@ -2231,6 +2233,12 @@ impl EventProcessor {
             // with no active turn belongs to future work, never to a
             // fenced one.
             if let Some(active) = self.status.active_turn_id.clone() {
+                if let Some(input) = self.status.turn_input.as_mut()
+                    && input.turn_id == active
+                    && inbox.inbox_id != input.inbox_id
+                {
+                    input.joined_inputs.insert(inbox.inbox_id.clone());
+                }
                 self.delivered_turn.insert(inbox.inbox_id.clone(), active);
             }
             self.settle_delivered_steers(&inbox.inbox_id);
@@ -2774,7 +2782,7 @@ impl EventProcessor {
             read_turn_messages(
                 &self.http,
                 &terminal.session_id,
-                &input.inbox_id,
+                input,
                 Instant::now() + EVENT_DEADLINE,
             )
             .await,
@@ -3806,28 +3814,36 @@ fn current_unix_time_ms() -> Option<i64> {
 pub(crate) async fn read_turn_messages(
     http: &OpenCodeHttp,
     session_id: &str,
-    inbox_id: &str,
+    input: &TurnInput,
     deadline: Instant,
 ) -> Result<TurnReadback> {
-    let history = read_turn_history("OpenCode", inbox_id, |cursor: Option<String>| async move {
-        let page = http
-            .list_messages(session_id, cursor.as_deref(), deadline)
-            .await?;
-        let messages = page
-            .data
-            .into_iter()
-            .map(|message| match message {
-                Message::User(user) => HistoryMessage::Input(user.id),
-                Message::Assistant(assistant) => HistoryMessage::Assistant(assistant),
-                Message::Idle(idle) => HistoryMessage::Terminal(idle),
-                _ => HistoryMessage::Other,
+    let history = read_turn_history(
+        "OpenCode",
+        &input.inbox_id,
+        |cursor: Option<String>| async move {
+            let page = http
+                .list_messages(session_id, cursor.as_deref(), deadline)
+                .await?;
+            let messages = page
+                .data
+                .into_iter()
+                .map(|message| match message {
+                    // Native steer is stored as a user message within this execution.
+                    Message::User(user) if input.joined_inputs.contains(&user.id) => {
+                        HistoryMessage::Other
+                    }
+                    Message::User(user) => HistoryMessage::Input(user.id),
+                    Message::Assistant(assistant) => HistoryMessage::Assistant(assistant),
+                    Message::Idle(idle) => HistoryMessage::Terminal(idle),
+                    _ => HistoryMessage::Other,
+                })
+                .collect();
+            Ok(HistoryPage {
+                messages,
+                next: page.cursor.next,
             })
-            .collect();
-        Ok(HistoryPage {
-            messages,
-            next: page.cursor.next,
-        })
-    })
+        },
+    )
     .await?;
     let TurnHistory::Terminal(history) = history else {
         return Ok(TurnReadback::Running);
