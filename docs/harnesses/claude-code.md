@@ -225,6 +225,13 @@ the next input directly. The installed Claude Code 2.1.278 help advertises
 `--autocompact`; that launch option does not change Eliot's native compact
 capability.
 
+Claude Code 2.1.330 supplies `manual` or `auto` in the compact boundary
+metadata. A manual boundary bound to the active turn can be followed by a
+successful `result` with an empty `terminal_reason`. The adapter accepts that
+result only for the owned native session and the exact already-bound turn,
+with the native success subtype and `is_error: false`. The completed turn
+leaves the next input eligible to receive the task card.
+
 The stream decoder ignores additive fields. Unknown top-level record types,
 unconnected `control_request` subtypes, unknown `command_lifecycle.state`
 values, and unrecognized terminal reasons are recorded as neutral

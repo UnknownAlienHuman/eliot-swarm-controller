@@ -980,12 +980,11 @@ else for the next input. Codex `contextCompaction` item completion, Claude
 `compact_boundary`, OpenCode `session.compaction.ended`, Muse terminal compaction
 items, and Antigravity's correlated manual/automatic evidence produce this fact.
 Each uses exact native identity when available and the active turn only when
-bound. Claude's boundary does not distinguish manual from automatic compaction
-in its payload, and Claude's adapter does not advertise the compact capability;
-manual native compaction is observed from `compact_boundary`, then the card is
-queued at the active turn's soonest supported point or the next input when
-idle. Its CLI `--autocompact` option does not make Eliot's compact verb
-available.
+bound. Claude exposes the `manual` or `auto` trigger in its boundary metadata
+when supplied. Swarm sends a native Claude `/compact` as input to the session
+and observes its exact `compact_boundary`. The adapter keeps Eliot's
+`compact` capability false. Its CLI `--autocompact` option only changes native
+automatic compaction behavior. [Claude Code compaction](../harnesses/claude-code.md)
 An exactly associated OpenCode SSE execution terminal proves its status even when
 HTTP transcript enrichment is unavailable, including after the native server exits.
 Commit that status without final text or usage; unavailable enrichment is not a

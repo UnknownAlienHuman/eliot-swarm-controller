@@ -99,19 +99,51 @@ engine, second scheduler or critic loop.
       scope until `--resume`; `agent.patch_digest` (files, packages, new
       dependencies, public interface, checker/lint changes, new suppressions)
       focuses the independent review.
-- [ ] **A10 Goal audit and continuation (Owner decision 2026-11-26).** A blocked
+- [x] **A10 Goal audit and continuation (Owner decision 2026-11-26).** A blocked
       Goal (`round_budget`, `turn_limit`, `no_progress`, `escalation_refused`)
       gets a read-only audit turn on the `[routing]` role `audit`, then a handoff
       in the same worktree with the audit text and a fresh budget, up to
-      `policy.budget.max_audits` cycles; scope findings stay Owner stops.
-- [ ] **A11 Default Goal objective (Owner decision 2026-11-26).** With no
+      `policy.budget.max_audits` cycles. Scope findings stay Owner stops.
+      Windows private stand 2026-11-26, Owner principal. Haiku `a4` blocked as
+      `round_budget` with `max_rounds=1` (event 193). OpenCode `a5` used
+      `opencode/deepseek-v4.1-flash-free` with verified read-only permissions.
+      Haiku `a7` took over in the same worktree (event 381) at revision 3 with
+      zero rounds used. It blocked again at one round (event 459).
+      With `max_audits=1`, the inbox showed one cycle with the auditor text,
+      `a5` and `a7`. There was one admitted audit launch.
+- [x] **A11 Default Goal objective (Owner decision 2026-11-26).** With no
       policy or explicit Goal, the first linked input becomes the Goal
-      objective, carried in the task card and shown in the chat.
-- [ ] **A12 Task card after every compaction.** Extends the checked
+      objective, carried in the task card and shown in the chat. The private
+      stand's `swarm show a2` identified its first input about the Quartz label
+      as the default Goal objective.
+- [x] **A12 Task card after every compaction.** Extends the checked
       "Worktree notes and task cards" item (manual compaction on OpenCode and
       Antigravity): the task card (brief, branch, Goal or first input) reaches
       the Agent after manual and automatic compaction on Codex, Claude Code,
-      OpenCode, Muse and Antigravity.
+      OpenCode, Muse and Antigravity. On Windows private stands, Claude Code
+      2.1.330 with `claude-haiku-5-5` and OpenCode 2.4.1 with
+      `opencode/deepseek-v4.1-flash-free` each confirmed the original Goal line
+      after manual and automatic compaction. Claude used native `/compact` and
+      a lowered automatic threshold. OpenCode used the compact command and an
+      isolated project compaction buffer, restored to a larger working window
+      before the follow-up input. Committed next-input receipts were Claude
+      manual 155, Claude automatic 246–247, OpenCode manual 326 and OpenCode
+      automatic 307–308, each in its own stand timeline.
+      Codex, Muse and Antigravity mappings were verified from source and native
+      protocol references only. No live turns or compaction operations ran on
+      those three harnesses for A12. [Compaction facts](spec/plugin-protocol.md#translation-and-normalization)
+
+      A10–A12 passed formatting, locked all-target builds and warnings-denied
+      Clippy for all nine changed packages with eight Cargo jobs and a private
+      target. The Swarm proof SHA-256 values were
+      `99a82eb2347a0ce5d665e072393b66368e6c4db2f8c1ab70c08941f218cf698a`
+      for A10, A11 and OpenCode manual, and
+      `8f01bb7d49a704ed76bfd5d2c05bf77415f65ad2c00d76b016a2bf326e4c9647`
+      for Claude manual and automatic and OpenCode automatic. The native
+      executables were Claude
+      `fa797c1bc7d4a3511da42622bae53a2b7f1276ae328c668f2bfef44635301caa`
+      and OpenCode
+      `f3da11bf51ace25b86f52e20368d415451d200d6b48101d9f4e5d721b1d2020e`.
 - [x] **Project formatting and checks (#833, #811).** Swarm applies the project
       formatter in the managed worktree and delivers a failed fast check in the
       same OpenCode turn. The routing role installs the bounded project Goal.
