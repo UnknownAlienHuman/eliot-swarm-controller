@@ -660,6 +660,8 @@ unclaimed `steer` settles `rejected`.
 ## Commands and narrow gates
 
 The [`Command`](../../crates/eliot-core/src/lib.rs) DTO owns the command field catalog.
+
+```text
 state = accepted -> [queued ->] dispatched -> applied|rejected|failed|unknown
         accepted|queued -> cancelled
 ```

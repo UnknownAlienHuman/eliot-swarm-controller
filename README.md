@@ -52,13 +52,16 @@ Native filesystem invalidation reports `filesystem_invalidation.state`; degraded
 unavailable watching retains polling. Neither a notification nor watcher health
 establishes Git freshness or model progress.
 
-Managed worktrees are opt-in: `launch --worktree BRANCH [--base REF]` uses a new branch
-and freezes the local commit OID before creation. Explicit profile setup uses verified
+Top-level launches in registered projects default to managed worktrees; `workspace = "shared"` selects the
+registered checkout. `launch --worktree BRANCH [--base REF]` explicitly selects a new
+branch and freezes the local commit OID before creation. Explicit profile setup uses verified
 file references and runs before native dispatch; an unknown setup result is never
 repeated automatically. Resume retains the checkout, completed setup and legitimate
 commits. `worktree remove AGENT` requires a terminal Agent and no borrowers or retained
 source dependencies; it removes only clean worktrees plus permitted scratch and keeps
-the branch. Existing-workspace launches remain the default.
+the branch. Children share their parent's workspace by default and can explicitly
+request a managed child worktree; see
+[project registration](docs/spec/configuration.md#project-registration-and-rule-authority).
 
 `status.workspace_custody` reports the current host capability. Supported Linux workspace
 custody is degraded and may leave escaped descendants unobserved.
@@ -75,9 +78,15 @@ API covering profiles, routing, projects, daemon, automation, mail, cloud MCP an
 sections (see [unified settings](docs/spec/configuration.md#unified-settings)).
 
 Queue assignment keeps a configured number of Agents busy on a brief queue: each timer
-firing emits one routing-aware launch for the next `.md` brief, with a completion rule
-retiring the Agent after its terminal turn. It runs on the existing rules and timers,
+firing emits one routing-aware launch for the next `.md` brief. A one-turn assignment
+retires after its terminal turn; Goal-owned work retires when its Goal completes or
+blocks, not after the first turn. It runs on the existing rules and timers,
 not a task engine (see [queue assignment](docs/spec/automation.md#targetless-launch)).
+
+The optional Windows desktop uses native Fluent controls through WinUI 3 and Reactor.
+[The Fluent design contract](docs/design/fluent-design-system.md) owns its UI;
+[roadmap D12](docs/roadmap.md#desktop-companion-optional-winui-3-client) owns current work.
+Material is frozen until full native support and an explicit Owner decision reopen it.
 
 ## Quick start
 
