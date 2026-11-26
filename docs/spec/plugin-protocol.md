@@ -216,6 +216,9 @@ The controller and offline desktop settings editor register the same profile
 capabilities from the built-in adapters before using them. Store entry points
 return an error when registration is missing. Adapter declarations identify
 adopted proxy support, catalogue route labels, and the native approval field.
+OpenCode declares its `local_provider` payload decoder and validation through the
+profile capability. The adapter applies the same package grammar and payload
+contract when it reads a retained profile before native startup.
 Claude `AGENTS.md` is `unknown` at prelaunch because the adapter cannot establish
 which project instructions the native loader will select. Swarm's normal project
 source delivery applies, and any installed version is provenance.

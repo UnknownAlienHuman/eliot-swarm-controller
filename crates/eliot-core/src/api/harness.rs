@@ -397,7 +397,7 @@ pub struct ProfileCapabilities {
     pub latest_cmd: bool,
     pub script_wrapper_cmd: bool,
     pub command_refusal: Option<fn(&str) -> Option<&'static str>>,
-    pub local_provider: Option<LocalProviderValidator>,
+    pub local_provider: Option<LocalProviderProfile>,
     pub launch_model_scope: LaunchModelScope,
     pub project_doc_max_bytes: bool,
     /// Native approval selector in profile summaries. The default field is `approval_policy`.
@@ -405,8 +405,12 @@ pub struct ProfileCapabilities {
     pub native_subagents_policy: Option<super::native_profile::NativeSubagentsPolicy>,
 }
 
-type LocalProviderValidator =
-    fn(&crate::local_provider::LocalProvider, &[String]) -> std::result::Result<(), String>;
+/// The adapter's schema and safety checks for the opaque local provider payload.
+#[derive(Clone, Copy, Debug)]
+pub struct LocalProviderProfile {
+    pub check_shape: fn(&serde_json::Value) -> std::result::Result<(), serde_json::Error>,
+    pub validate: fn(&serde_json::Value, &[String]) -> std::result::Result<(), String>,
+}
 
 /// Adapter proof that a model selected from an Owner profile stays on its route.
 #[derive(Clone, Copy, Debug, Default)]
@@ -416,7 +420,7 @@ pub enum LaunchModelScope {
     /// The native model selector cannot change the profile's frozen route.
     FixedRoute,
     /// The native model identifier also encodes provider authority.
-    Check(fn(&super::native_profile::NativeProfileInput<'_>, &str) -> bool),
+    Check(fn(&super::native_profile::NativeProfileInput<'_>, &str) -> Result<bool>),
 }
 
 impl ProfileCapabilities {

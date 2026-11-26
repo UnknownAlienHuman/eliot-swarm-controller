@@ -659,10 +659,12 @@ models = [{ id = "test-model", context_limit = 32768, output_limit = 4096 }]
 segments). Swarm generates the isolated
 OpenCode provider entry from `local_provider`: `base_url` becomes
 `settings.baseURL`, `api_key_env` becomes a `{env:NAME}` runtime reference,
-and each model record supplies its native model limits. The typed shape is
-validated at freeze, retained admission, and before every write; unknown
-fields, literal credentials, URL userinfo/query/fragment components, and
-substitutions are refused. `api_key_env` must be listed in `pass_env`, and
+and each model record supplies its native model limits. OpenCode's registered
+profile capability decodes and validates the payload, including the npm package
+name, at save and launch admission. Retained startup uses the same adapter-owned
+contract and checks the provider before each isolated config write. It refuses
+unknown fields, literal credentials, URL userinfo/query/fragment components, and
+substitutions. `api_key_env` must be listed in `pass_env`, and
 `auth_integration` must be absent, so no unrelated canonical credential is
 imported. The adapter sets `OPENCODE_CONFIG_PROJECT_DISABLE` and strips
 `OPENCODE_CONFIG`, `OPENCODE_CONFIG_CONTENT`, and `OPENCODE_CONFIG_DIR` for the

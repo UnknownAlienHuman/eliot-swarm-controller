@@ -72,7 +72,7 @@ pub fn declaration() -> HarnessCapabilities {
                 ..Default::default()
             },
             route_scope_secret_names: &["OPENCODE_CONFIG_CONTENT"],
-            local_provider: Some(crate::local_provider::validate),
+            local_provider: Some(crate::local_provider::PROFILE),
             native_subagents_policy: Some(NativeSubagentsPolicy::deny_by_default()),
             ..ProfileCapabilities::default()
         },
