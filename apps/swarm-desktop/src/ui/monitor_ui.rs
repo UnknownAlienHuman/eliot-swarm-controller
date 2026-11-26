@@ -289,10 +289,11 @@ impl DesktopApp {
                     .find(|agent| agent.id == id)
                     .cloned()
                     .or_else(|| {
-                        self.monitor
-                            .data
-                            .rows
+                        // A live row, or a Recently stopped one.
+                        let data = &self.monitor.data;
+                        data.rows
                             .iter()
+                            .chain(&data.stopped)
                             .find(|row| row.id == id)
                             .map(row_agent)
                     });
