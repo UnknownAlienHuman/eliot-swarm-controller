@@ -1643,11 +1643,23 @@ older rejected switches.
 Applied means the H2 Store transfer committed, not that the brief/task succeeded.
 A lost or failed source qualifies once
 [custody proves its process tree exited](monitoring.md#work-recorded-in-git). Its unknown
-commands and turns stay unknown, keep their Owner inbox items and are named in the
+commands and turns stay unknown, retain their inbox items for unarchived sources and are named in the
 brief. Input its end cancelled, or a hold refused at dispatch, had no native effect and
 transfers to B. When the last turn may have left partial effects, the brief tells B not
 to repeat its steps before checking them, and the Owner inbox gets a `handoff` item.
 Swarm never replays that turn.
+The inbox omits an applied handoff notice after the source is archived or
+the linked source turn settles. It shows the exact linked unknown command
+or turn once. An uncertain handoff with no recorded task binding stays
+visible while the source is unarchived. A failed or interrupted turn with
+possible partial effects can still need review.
+
+A session-loss wait records its unfinished turn when known. It closes on
+exact settlement when no other turn, queued input or active Goal still
+needs that generation. A first-generation launch that failed before spawn,
+with no turns, input other than SENDs cancelled by that launch failure, or
+active or blocked Goal, also leaves no session-loss handoff decision.
+
 [Automatic handoff](configuration.md#automatic-handoff-918) reserves this same operation.
 An opt-in [provider switch](configuration.md#routing-policy-s3) reserves the same
 operation in the exact failed turn's transaction. It rechecks the source again

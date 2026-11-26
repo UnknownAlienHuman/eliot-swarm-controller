@@ -48,8 +48,8 @@ const SEND_TIMEOUT: Duration = Duration::from_secs(25);
 fn admit_cancel(state: &events::State, turn_id: &str) -> Result<()> {
     if state.active_turn() != Some(turn_id) || state.source_unknown || state.batch_unknown {
         return Err(Error::new(
-            "stale_turn",
-            "cancel does not match a healthy exact native turn",
+            "native_not_dispatched",
+            crate::capabilities::CANCEL_TURN_REFUSAL,
         ));
     }
     Ok(())
@@ -542,7 +542,7 @@ impl Session {
             .filter(|value| !value.trim().is_empty())
             .ok_or_else(|| {
                 Error::new(
-                    "stale_turn",
+                    "native_not_dispatched",
                     "Antigravity request reply needs its captured turn id",
                 )
             })?;
@@ -552,7 +552,7 @@ impl Session {
             .filter(|value| !value.trim().is_empty())
             .ok_or_else(|| {
                 Error::new(
-                    "not_found",
+                    "native_not_dispatched",
                     "Antigravity request reply needs its captured request id",
                 )
             })?;
@@ -849,7 +849,10 @@ impl Session {
             .as_deref()
             .filter(|turn| !turn.trim().is_empty())
             .ok_or_else(|| {
-                Error::new("stale_turn", "Antigravity steer requires a captured turn")
+                Error::new(
+                    "native_not_dispatched",
+                    "Antigravity steer requires a captured turn",
+                )
             })?;
         let text = params
             .input_text()
@@ -1039,9 +1042,7 @@ impl Session {
                 }
                 Ok(outcome)
             }
-            // The locked re-check refused before native I/O. Preserve that
-            // refusal and leave private history available for the next command.
-            Err(error) if error.code == "stale_turn" => Err(error),
+            Err(error) if error.code == "native_not_dispatched" => Err(error),
             Err(error) if native_no_write(&error.code) => Ok(
                 json!({"state": "rejected", "reason": "Antigravity interrupt was not dispatched"}),
             ),

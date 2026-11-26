@@ -1286,6 +1286,8 @@ impl Router {
         if self.execute_control_command(&id, agent, response).await {
             self.signal_progress();
         }
+        // A pre-dispatch refusal sent no interrupt. Stop can proceed directly
+        // to session closure without waiting for an interrupt-driven terminal.
         if !refused && let Some(turn_id) = turn_id.as_deref() {
             let _ = self.wait_for_stop_turn(agent, turn_id, events).await;
         }

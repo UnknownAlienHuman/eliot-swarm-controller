@@ -18,6 +18,7 @@ enum CommandEvidence<'a> {
     NativeCommandReceipt { seq: i64 },
     ResumeSessionReady { seq: i64 },
     SendTurnStarted { seq: i64 },
+    NativeControlRefusedBeforeWrite,
     OwnedExitAndReaderDrain,
     RemovalNeverDispatched,
     RemovalAbsenceVerified,
@@ -40,6 +41,9 @@ impl CommandEvidence<'_> {
             }
             Self::SendTurnStarted { .. } => {
                 "The exact send was bound to a committed native turn start."
+            }
+            Self::NativeControlRefusedBeforeWrite => {
+                "The adapter refused the exact turn control before a native write."
             }
             Self::OwnedExitAndReaderDrain => {
                 "Owned processes exited and the native reader drained for the exact Stop generation."
@@ -72,7 +76,9 @@ impl Store {
                 {
                     let mut stmt = tx.prepare(
                     "SELECT id FROM commands WHERE state='unknown' AND method='command.submit'
-                        AND verb IN ('resume','stop','attention.emit','inject','send')
+                        AND (verb IN ('resume','stop','attention.emit','inject','send')
+                            OR (verb IN ('interrupt','steer')
+                                AND json_extract(outcome,'$.code')='stale_turn'))
                         AND id > COALESCE(?1,'') ORDER BY id LIMIT ?2",
                 ).map_err(sql_error)?;
                     stmt.query_map(params![after, EVIDENCE_PAGE as i64 + 1], |r| {
@@ -184,6 +190,29 @@ fn reconcile_command_tx(
         return Ok(());
     };
     if generation > agent.generation {
+        return Ok(());
+    }
+    if command
+        .turn_id
+        .as_ref()
+        .is_some_and(|turn| !turn.is_empty())
+        && outcome["code"] == "stale_turn"
+        && outcome["where"] == "plugin.command.unknown"
+        && outcome["cause"] == "plugin_outcome_unknown"
+        && outcome["message"].as_str().is_some_and(|message| {
+            eliot_core::api::HarnessCapabilities::of(&agent.harness)
+                .legacy_stale_turn_refusals
+                .contains(&(command.kind(), message))
+        })
+    {
+        events.push(settle_evidence_tx(
+            tx,
+            record,
+            CommandState::Rejected,
+            outcome.clone(),
+            &CommandEvidence::NativeControlRefusedBeforeWrite,
+            now,
+        )?);
         return Ok(());
     }
     if command.verb == "resume"

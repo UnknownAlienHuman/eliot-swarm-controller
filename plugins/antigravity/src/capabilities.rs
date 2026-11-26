@@ -6,12 +6,20 @@ use eliot_core::api::harness::{
 };
 use eliot_core::api::native_profile::NativeSubagentsPolicy;
 use eliot_core::api::{ConfigureSessionMode, HarnessCapabilities, OwnerRulesDeliveryMethod};
-use eliot_core::{InjectPoint, McpPolicy};
+use eliot_core::{CommandVerb, InjectPoint, McpPolicy};
 use eliot_plugin::capabilities::{adhoc_launch, quota_readback};
 use serde_json::Value;
 
+pub(crate) const CANCEL_TURN_REFUSAL: &str = "cancel does not match a healthy exact native turn";
+pub(crate) const STEER_TURN_REFUSAL: &str =
+    "Antigravity steer does not match the exact active prompt";
+
 pub fn declaration() -> HarnessCapabilities {
     HarnessCapabilities {
+        legacy_stale_turn_refusals: &[
+            (CommandVerb::Interrupt, CANCEL_TURN_REFUSAL),
+            (CommandVerb::Steer, STEER_TURN_REFUSAL),
+        ],
         oversized_frame_prefixes: &[
             "Antigravity stream ended on an oversized frame (frame_oversized ",
             "Antigravity stream contained an invalid frame (frame_oversized ",
