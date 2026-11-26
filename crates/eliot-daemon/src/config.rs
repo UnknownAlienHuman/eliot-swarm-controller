@@ -707,8 +707,9 @@ struct DesktopWindow {
 }
 
 /// `[desktop] window` bounds: the client size in DIPs and the outer
-/// top-left in physical screen pixels.
-const DESKTOP_WINDOW_MIN: (u32, u32) = (640, 480);
+/// top-left in physical screen pixels. The minimum is also the smallest
+/// client size the desktop window can be resized to.
+pub const DESKTOP_WINDOW_MIN: (u32, u32) = (640, 480);
 const DESKTOP_WINDOW_MAX_SIZE: u32 = 32_768;
 const DESKTOP_WINDOW_MAX_COORDINATE: u32 = 32_768;
 

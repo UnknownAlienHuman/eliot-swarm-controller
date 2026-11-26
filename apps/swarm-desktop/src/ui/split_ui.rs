@@ -106,6 +106,17 @@ impl PanelWidths {
         })
     }
 
+    /// `edge`'s width set to `width`: whole DIPs within its bounds. A
+    /// handle and Settings › Panel widths both set a width this way.
+    pub(super) fn with(mut self, edge: Edge, width: f64) -> Self {
+        let width = width.round();
+        match edge {
+            Edge::Sidebar => self.sidebar = width.clamp(SIDEBAR_MIN_WIDTH, SIDEBAR_MAX_WIDTH),
+            Edge::Pane => self.pane = width.clamp(PANEL_MIN_WIDTH, PANEL_MAX_WIDTH),
+        }
+        self
+    }
+
     pub(super) fn saved(self) -> crate::settings::Panels {
         crate::settings::Panels {
             sidebar: self.sidebar as u32,
@@ -270,8 +281,8 @@ impl SplitShell {
         }
     }
 
-    /// `edge`'s width moved to `width`: whole DIPs, within its bounds and
-    /// keeping the main area at its required width beside the other panel
+    /// `edge`'s width moved to `width` ([`PanelWidths::with`]), keeping the
+    /// main area at its required width beside the other panel
     /// ([`spare`]). In a room already below that, the width cannot grow
     /// but can still narrow. Nothing moves before the first size
     /// observation.
@@ -288,13 +299,7 @@ impl SplitShell {
         let most = (current + spare(window, self.sidebar_beside(), pane))
             .floor()
             .max(current);
-        let width = width.round().min(most);
-        match edge {
-            Edge::Sidebar => {
-                self.widths.sidebar = width.clamp(SIDEBAR_MIN_WIDTH, SIDEBAR_MAX_WIDTH);
-            }
-            Edge::Pane => self.widths.pane = width.clamp(PANEL_MIN_WIDTH, PANEL_MAX_WIDTH),
-        }
+        self.widths = self.widths.with(edge, width.round().min(most));
         self.post_layout();
     }
 
