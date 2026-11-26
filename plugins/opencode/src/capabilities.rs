@@ -72,7 +72,7 @@ pub fn declaration() -> HarnessCapabilities {
                 ..Default::default()
             },
             route_scope_secret_names: &["OPENCODE_CONFIG_CONTENT"],
-            local_provider: Some(crate::local_provider::validate),
+            local_provider: Some(crate::local_provider::PROFILE),
             native_subagents_policy: Some(NativeSubagentsPolicy::deny_by_default()),
             ..ProfileCapabilities::default()
         },
@@ -118,6 +118,7 @@ pub fn declaration() -> HarnessCapabilities {
         manifest_extra_verbs: &["models"],
         compact: true,
         compaction_gap_recovery: true,
+        goal_audit_read_only: true,
         models_workspace_preview: true,
         models_preview_auth_integrations: true,
         initial_model_refusal_cleanup: true,

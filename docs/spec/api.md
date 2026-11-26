@@ -872,6 +872,13 @@ the daemon keeps the work queued. The desktop claims the exact harness and revis
 runs the vendor's native interactive flow in the Owner's desktop session, and reports
 the result through the bounded desktop sign-in DTOs. The CLI request itself never
 opens a headless vendor process or asserts that the desktop action completed.
+On Windows, `auth.desktop.poll`, `auth.desktop.claim` and `auth.desktop.report`
+require the interactive Swarm desktop: the peer basename must be
+`swarm-desktop.exe` in the active session. When the peer handle cannot be
+opened, the basename comes from a handle-free Toolhelp snapshot. A refusal
+keeps the wire-stable `not_allowed` message and logs once per peer pid with a
+15-minute re-log cap (`peer_pid`, plus `suppressed_refusals` when nonzero);
+the per-call `rpc.error` line is suppressed for these refusals. The desktop stops `auth.desktop.poll` for that data directory after a `not_allowed` refusal and asks again after the daemon restarts or the data directory changes.
 
 The daemon dispatches one automatic console per harness outage. The grant expires
 after 15 seconds. Store retains the claim across daemon restarts. An explicit request
@@ -1155,14 +1162,23 @@ The OS sets no fixed delivery deadline for the notification itself.
 Before publication, monitoring
 checks the registered checkout HEAD and index stamps on both sides of the
 Git read. Git configuration and checkout inventory changes depend on watcher
-coverage. Legacy callers get a bounded live Git read on a cache miss. Callers
+coverage. Worktree membership and pointer changes invalidate the read and
+refresh the watch set. Ordinary directory modifications are content changes
+where they affect the inventory. Backend errors, rescan notices, replacement
+of a required watch root and failures to arm checkout bindings trigger one
+rebuild. Repeated loss reports unavailable. Legacy callers
+get a bounded live Git read on a cache miss. Callers
 that send `include_git_state: true` receive `git_refreshing: true` without
 origin or checkout details while a watched observation is pending. They can
 poll again on their normal refresh cadence. When monitoring cannot cover or
 verify a repository, the daemon uses the bounded live Git read and includes
 `git_watch_unsupported: true` for opted-in callers. This fallback also
 starts after three consecutive attempts invalidated by a moving revision.
-A new verified observation restores the cached path.
+It reports one warning per repository per burst with the invalidated attempt
+count at entry. The fallback remains visible until the same watcher revision,
+registered checkout stamps and bindings verify for ten seconds. Recovery
+restores the cached path and records the total invalidated attempts at debug
+log level.
 Malformed and pathless remotes produce no name, and the origin URL itself
 never leaves the daemon.
 
@@ -1295,10 +1311,14 @@ optional members are omitted when requests are serialized.
 
 `agent.archive {id, agent:"aN", archived:bool}` is Owner-only and atomically
 archives or unarchives the selected Agent and all current descendants. Every
-member must be idle, ended (stopped, failed or lost), an external observer in
-`unknown` state, or an ended native observation (a stopped observed
-child keeping its `unknown` turn as retained ended-observation evidence), with no
-active turn, no other uncertain turn, no pending request and no blocking command.
+member must be idle, ended (stopped, failed or lost), or an external observer in
+`unknown` state, with no active turn, no pending request and no blocking command.
+Native observed children use the same committed activity as the fleet.
+`idle` or `interrupted` activity with no open turn qualifies as idle and keeps
+the observation source open. A subsequent open child turn clears that child's
+archive flag in the same transaction as the new turn fact. An ended native
+observation keeps its `unknown` turn as retained ended-observation evidence.
+Other uncertain turns block archive unless their ended generation has drained.
 An accepted or queued `swarm_note:*` context injection has no native claim.
 Archive cancels it in the same transaction as the flag change and records
 `delivery: "withdrawn"` and `reason: "agent_archived"` on the command.
@@ -1311,8 +1331,10 @@ observers may stay open). Archiving an external observer in `unknown` state
 also requires resolved custody, so an open `observe` source blocks it.
 A failed guard returns typed `busy` and names the blocking Agent and its state,
 request, command, turn, process, source or artifact. Archive stops nothing and
-preserves retained unknown evidence. An unknown artifact names its exact ledger
-ID. The Owner can use [artifact reconciliation](coordination.md#registered-artifacts-and-cleanup-k69)
+preserves retained unknown evidence. For a native observation with uncertain
+activity and a current producer, both the refusal and `swarm why` name the
+generation-bound Owner Stop command for that producer. An unknown artifact names
+its exact ledger ID. The Owner can use [artifact reconciliation](coordination.md#registered-artifacts-and-cleanup-k69)
 before retrying Archive or Delete.
 The desktop offers Archive and Unarchive in the task row and header menus.
 Show archived in the sidebar includes archived tasks in the list.
@@ -2064,7 +2086,13 @@ NTSTATUS and the redacted stderr tail (a loss to a daemon restart is `swarm` at
 `agent.lost.stderr_tail` keeps the bounded, redacted capture verbatim, including
 any raw panic marker lines. The process step can carry the startup panic marker
 summary in `origin_evidence`. Diagnosis also includes the previous-run crash
-marker when the terminal failure is unclassified.
+marker when the terminal failure is unclassified. For an Agent, the chain also
+carries the current provider hold as a `provider_hold` step (origin `provider`)
+when the Store marks it as the wait reason for the active turn, and any
+automatic-restart fence as a `restart` step (origin `swarm`) with the exact
+`swarm resume` retry; neither step shadows a classified command, turn or loss
+origin. A blocked goal outranks the generic command and turn fallbacks as the
+reason.
 For a queued SEND, `swarm why COMMAND_ID` reports the retained command or turn
 that closes its send gate, including an unknown compaction's command ID and
 verb. The corresponding Owner inbox item identifies the queued inputs waiting
@@ -2091,8 +2119,11 @@ When a failure exists, the one-line `summary` starts with its origin
 waiting or stopped Agent with no failure in the bounded recent generation read
 says that nothing has failed in that recent history; it carries no unrelated
 previous-crash marker. Unknown origin remains for unexplained failures or
-unknown outcomes. A terminal's typed `native_error.code` (for example
-`quota_exhausted`) and native quota reset hint are included in its turn step.
+unknown outcomes. A stored command or turn outcome with a native adapter code
+(`native_*`) but no recorded origin reports the harness origin instead, per the
+core rule that unmapped native errors stay harness. A terminal's typed
+`native_error.code` (for example `quota_exhausted`) and native quota reset hint
+are included in its turn step.
 For an Agent in any lifecycle state, diagnosis also lists retained unknown commands
 and turns from any generation, appending `; retained ...` to the usual summary
 within its length bound. The summary keeps its origin-first explanation. The
@@ -3142,10 +3173,19 @@ Event requests, responses and `EventsFilter` are defined in the canonical Core A
 
 `events.bounds` accepts `EventsBoundsRequest` and returns `EventsBoundsResponse`
 ([Core DTOs](../../crates/eliot-core/src/api.rs)). Its optional `filter` has the same
-grammar and caller-scope checks as replay. The numeric bounds describe the journal,
-as does replay's `high_water`: `pruned_through` is the exclusive pruning floor and
-`hi` is the allocated sequence high-water mark, including when every event row has
-been pruned. This bounded metadata query reads no event page and requires no cursor.
+grammar and caller-scope checks as replay. `hi` is the journal's allocated sequence
+high-water mark, including when every event row has been pruned. Unfiltered reads
+use the journal's exclusive pruning floor. For a filter, `pruned_through` is the
+highest removed sequence matching the effective authorized filter, or zero when
+no matching events were removed. `events.read` and `events.subscribe` use that
+same floor to check their exclusive cursor.
+
+Stores upgraded from journal-wide coverage have no filter keys for prior deletions.
+A surviving Agent with its creation event has no legacy gap. For a surviving Agent
+whose creation is missing, the legacy floor is capped at the cursor immediately
+before its first surviving event, if one exists. The legacy journal watermark
+also covers kind/source-only filters, Agents already deleted before upgrade, and
+variable events included by an Agent's authorization scope.
 
 CLI `watch [AGENT]` reads these bounds once and starts at `hi`, delivering new events.
 `watch [AGENT] --after SEQ` instead uses that exact exclusive replay cursor. A lost
@@ -3887,7 +3927,8 @@ Daemon RPC commands accept `--json` and `--data-dir`, and RPC mutations accept
 `--id`. The local update and stand commands use individual IDs for their
 internal writes. Stand commands take the stand path directly. CLI Agent targets
 are positional; `--to` remains the named-recipient selector for `msg send` and
-`digest`. Pagination uses `--after` and `--limit`; `--data-dir`, `--json`,
+`digest`. Pagination uses `--after` and `--limit`; `task list`, `var list`
+and checkpoint pages use `--cursor`. `--data-dir`, `--json`,
 `--generation`, and `--project` keep one spelling across command families.
 For one compatibility release, the former pagination flags remain aliases:
 `events --since`, `discover --cursor`, `history --cursor`,
@@ -3908,7 +3949,7 @@ The synopsis is target grammar; later-layer forms are not an inventory of curren
 swarm daemon [--foreground]
 swarm daemon install [--dry-run] | uninstall [--dry-run]
 swarm daemon stop [--drain|--force]
-swarm daemon update <RELEASE> [--wait-seconds N] [--interrupt-on-deadline]
+swarm daemon update [RELEASE] [--wait-seconds N] [--interrupt-on-deadline]
 swarm daemon update --cancel PREPARE_ID
 swarm daemon update --health-decision PREPARE_ID
 swarm stand up [--root PATH] [--settings FILE] [--profile NAME]... [--binary PATH] [--ttl DURATION]
@@ -3919,15 +3960,15 @@ swarm stand prune
 swarm status
 swarm auth login --harness H [--json]
 swarm autonomy [--since TIME] [--json]
-swarm store compact
-swarm maintenance compact
-swarm cleanup plan [--after TOKEN]
+swarm store compact | retention-preview [--commands-days N] [--events-days N] [--events-seconds N] [--mail-days N] [--processes-seconds N]
+swarm maintenance compact | run | purge-legacy-attention-advisories [--apply --expected-count N]
+swarm cleanup plan [--scope self_tree|project|all] [--project PROJECT] [--older-than UNIX_MS] [--after TOKEN]
 swarm cleanup apply <PLAN_ID> [--artifact ID]... [--delete-remote]
 swarm cleanup apply-all [--scope all|project] [--project PROJECT] [--older-than TIMESTAMP]
 swarm cleanup status <ID>
 swarm artifact register <PATH> --kind build|data_dir|temp|other --purpose TEXT [--ttl DURATION]
 swarm artifact reconcile <ARTIFACT_ID> [--release-custody REASON]
-swarm launch [--profile P | --role R | --harness H] [--model M] [--effort E] --workspace PATH [--worktree BRANCH [--base REF]] [--parent AGENT] [--source PATH]... [--no-policy REASON] [--goal-json JSON_OBJECT] [PROMPT] [--queue] [--wait] [--timeout-seconds N]
+swarm launch [--profile P | --role R | --harness H] [--model M] [--effort E] [--auth INTEGRATION] [--access ask|auto|full] [--cmd PATH] --workspace PATH [--worktree [BRANCH] [--base REF]] [--parent AGENT] [--source PATH]... [--no-policy REASON] [--goal-json JSON_OBJECT] [PROMPT] [--queue] [--owner-override] [--wait] [--timeout-seconds N]
 swarm launch [--workspace PATH | --chat] [--parent AGENT] [--no-policy REASON] [--goal-json JSON_OBJECT] [PROMPT] [--queue] [--wait] [--timeout-seconds N]
 swarm settings read
 swarm settings save FILE [--dry-run]
@@ -3949,46 +3990,49 @@ swarm git-status A [--generation N]
 swarm patch-digest A [--generation N]
 swarm diff A [--generation N] [--source uncommitted|branch|last-turn] [--path P]
 swarm edits A [--generation N] [--after PATH] [--limit N]
-swarm send A TEXT [--probe] [--wait [--timeout-seconds N] | --wait-seconds N] [--generation N]
+swarm send A TEXT [--probe] [--source PATH]... [--wait [--timeout-seconds N] | --wait-seconds N] [--generation N]
 swarm steer A TEXT [--generation N] [--turn ID]
 swarm inject A TEXT --point soonest|next_input|turn_safe_point|active_turn [--generation N] [--turn ID] [--expires-at-ms MS] [--wait]
 swarm project broadcast PROJECT TEXT
 swarm interrupt|abort A [--generation N] [--turn ID]
 swarm stop A [--force] [--tree | --generation N]
-swarm resume A [PROMPT] [--wait] [--timeout-seconds N]
+swarm resume A [PROMPT] [--generation N] [--wait] [--timeout-seconds N]
 swarm result A [--generation N] [--turn-id ID] [--wait [--timeout-seconds N]]
-swarm wait --all|--any --timeout-seconds N ID...
-swarm wait --all|--any [--command ID]... [--turn AGENT/GENERATION/TURN_ID]...
+swarm wait [--all|--any] [--mail] [--timeout-seconds N] ID...
+swarm wait [--all|--any] [--mail] [--command ID]... [--turn AGENT/GENERATION/TURN_ID]...
 swarm result A [--generation N] [--before CURSOR_JSON | --turn-id TURN] [--limit N] [--metadata]
-swarm turn resolve A --generation N --turn ID --status completed|failed|interrupted --reason TEXT
-swarm approve|deny A [--request R] [--choice ID] [--feedback TEXT] | answer ... [--request R]
+swarm turn resolve A --generation N --turn-id TURN --status completed|failed|interrupted --reason TEXT
+swarm approve|deny A [--generation N] [--request R] [--choice ID] [--feedback TEXT] | answer A --answers-file PATH [--generation N] [--request R]
 swarm configure A [--model MODEL] [--effort EFFORT] [--generation N]
-swarm compact|fork|background ...
+swarm compact A [--generation N] [--wait-seconds N]
+swarm fork|background ...
 swarm cmd show|children|cancel|resolve|settle-stopped ...
 swarm cmd resolve ID --status completed|failed|rejected --reason TEXT
 swarm cmd resolve-custody A --generation N --reason TEXT
 swarm why CMD|AGENT|AGENT:TURN
 swarm events [--after SEQ] [--limit N]
-swarm msg send --to RECIPIENT... TEXT | msg show DELIVERY [AGENT] | msg ack [AGENT] --delivery DELIVERY...
-swarm inbox [AGENT] [--wait SECS] | inbox decide ITEM CHOICE | inbox snooze ITEM | inbox apply (--kind KIND [--yes] | --item REF...)
+swarm msg send --to RECIPIENT... [--mode queue|send|steer|inject] [--thread LABEL] [--reply-to DELIVERY] [--no-wake] TEXT | msg inbox [AGENT] [--after A] [--limit N] [--wait SECS] | msg show DELIVERY [AGENT] | msg ack [AGENT] --delivery DELIVERY...
+swarm inbox [AGENT] [--after A] [--limit N] [--thread LABEL] [--reply-to DELIVERY] [--wait SECS] [--aged] | inbox decide ITEM CHOICE [--arg KEY=VALUE]... | inbox snooze ITEM | inbox apply (--kind KIND [--yes] | --item REF...)
 swarm var set KEY [VALUE | --value-file PATH] [--as-json] [...] | var get ... | var list ... | who [--project P] [--history]
 swarm claim set GLOB [AGENT] [--note TEXT] [--ttl-secs N] | claim list [AGENT] [--project P] | claim release GLOB [AGENT]
-swarm project list | show ID
+swarm project list | show ID | overview [--project P] [--after C]
+swarm project assignment get PROJECT | usage PROJECT [--epoch E] [--after A] | release PROJECT --epoch E
+swarm project budget PROJECT --revision REV [...] | transfer PROJECT --revision REV (begin|launch|commit|cancel) ...
 swarm rule list [--project PROJECT] [--after ID] [--limit N]
 swarm rule show ID [--project PROJECT]
 swarm rule read NAME.toml [--project PROJECT]
 swarm rule save NAME.toml --file FILE [--expected-revision SHA256] [--project PROJECT]
 swarm rule delete NAME.toml --expected-revision SHA256 [--project PROJECT]
 swarm rule catch-up ID --after SEQ [--through SEQ] [--project PROJECT]
-swarm timer show ID [--project PROJECT] | run ID [--project PROJECT | --include NAME]
+swarm timer show ID [--project PROJECT] | run ID [--project PROJECT] [--include NAME]
 swarm timer list [--project PROJECT] [--after ID] [--limit N]
-swarm goal set A --text TEXT --check CMD [ARGS...] [--mode eliot|native] [--check-cwd PATH] [--check-timeout-ms MS] [--max-turns N] [--max-rounds N] [--max-without-progress N] [--cadence-ms MS] [--scope GLOB]... [--check-input GLOB]... [--max-cost AMOUNT --cost-unit UNIT] [--escalate-model M] [--escalate-effort E] [--escalate-reason TEXT]
+swarm goal set A --text TEXT [--check CMD [ARGS...]] [--mode eliot|native] [--check-cwd PATH] [--check-timeout-ms MS] [--check-timeout-retry-safe] [--max-turns N] [--max-rounds N] [--max-without-progress N] [--cadence-ms MS] [--scope GLOB]... [--check-input GLOB]... [--max-cost AMOUNT --cost-unit UNIT] [--escalate-model M] [--escalate-effort E] [--escalate-reason TEXT]
 swarm goal show|pause|clear|resume A [--mode eliot|native] [--reason R]
-swarm goal round A (--idle-seq SEQ | --slot N) [--mode eliot|native]
+swarm goal round [A] (--idle-seq SEQ | --slot N) [--mode eliot|native]
 swarm goal round close A --round KEY [--generation N] [--revision N]
 swarm discover --profile P [--harness H] [--scope S] [--after C] [--archived] [--limit N]
 swarm attach --profile P --harness H --scope S --ref R [--project LABEL]
-swarm history A --view subject|turns|items [--source native|rollout] [--turn-id ID] [--after C] [--limit N]
+swarm history A [--generation N] --view subject|turns|items [--source native|rollout] [--turn-id ID] [--after C] [--limit N]
 swarm detach A [--generation N]
 swarm chat organization [--project P] [--after P] [--archived]
 swarm chat attach CHAT... --project P
@@ -3997,10 +4041,20 @@ swarm chat tag AGENT... [--tag TAG]... [--revision REV]...
 swarm chat group AGENT --generation N --turn-id ID --revision REV --rule TAG=LITERAL [--rule TAG=LITERAL ...] [--replace-manual-tags]
 swarm provider holds [--after SCOPE] [--limit N]
 swarm provider clear-hold SCOPE --corrective-evidence credentials_updated|configuration_updated|owner_verified [--expected-probe-command ID]
-swarm project assignment claim PROJECT [AGENT --generation N --revision REVISION]
+swarm project assignment claim PROJECT [AGENT] [--generation N] [--revision REVISION] [--remote INSTANCE --grant-revision REV]
 swarm project assignment launch PROJECT --profile P [--adopt-worktree PATH] [--no-policy REASON] [--goal-json JSON_OBJECT]
 swarm plugin NAME | plugin-test ... | hook ... | mcp
+swarm harnesses | doctor | quota --harness H [--profile P] | identity
+swarm launch-queue [INTENT] [--project P] [--after A]
+swarm archive A | unarchive A | delete A
+swarm digest --to AGENT [--all|--any] [--command ID]... [--turn AGENT/GENERATION/TURN_ID]... [ID]...
+swarm reparent [AGENT] --parent M --generation N --parent-generation N [--children-of M]
+swarm handoff FROM --to AGENT --generation N --to-generation N --task-command CMD [COMMANDS]... [--no-wait] [--timeout-seconds N]
+swarm switch FROM --generation N [--task-command CMD] [COMMANDS]... [--profile P | --role R | --harness H] [--project PROJECT] [--no-wait]
+swarm rule install-review --project PROJECT --author PROFILE --workspace PATH [--expected-revision SHA256] [--reviewer R]
 ```
+
+The CLI does not expose `fork`, `background`, `plugin-test` or `hook` yet.
 
 `cmd cancel` implements only undispatched handoff-input withdrawal. `cmd show`,
 `cmd children`, `cmd resolve`, and `turn resolve` are available; `turn show`
@@ -4027,7 +4081,7 @@ the client error preserves the current path/SID/rights diagnosis and names the
 Owner-only retry command `swarm --data-dir '<path>' daemon`. The path is escaped for
 PowerShell by doubling embedded single quotes. The local Owner startup path performs
 that repair; Agent and Run callers keep their inherited identity and do not use their
-credentials to probe Owner-only status or start the daemon.
+credentials to probe Owner-only status or start the daemon. Warm CLI commands check daemon liveness with a connect-only endpoint probe instead of a `daemon.status` RPC; the dispatched call still performs full owner-token authentication and peer verification.
 
 `swarm status` and the start output include the resolved data directory, so
 `--data-dir`, `ELIOT_HOME` and default-location differences are visible. Local

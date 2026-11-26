@@ -5,6 +5,15 @@ Call the inherited `swarm` MCP tool as `{"method":"...","params":{...}}`. Use ca
 Use `swarm show AGENT --json` and `swarm result AGENT --json` for machine
 readback. Add `--metadata` to result when you need the current Agent metadata.
 
+## Call shapes
+
+Pass only documented fields; anything else is rejected. Minimal shapes:
+`agent.get` takes only `id`; `api.help` takes `method`. A `mail.send` needs
+`to` (canonical `a<number>` ids) and `text`; a `child.run` launch needs `text`.
+New mutations omit `id` on MCP and reuse the minted value for retries; a
+`child.run` continuation passes that `id` with `wait_ms`. Use `api.help` for
+the full DTO before guessing a field.
+
 ## Delegation
 
 `child.run` inherits the caller's workspace and profile. The initial request is

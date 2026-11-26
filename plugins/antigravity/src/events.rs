@@ -150,6 +150,7 @@ struct Pending {
     turn: String,
     opened_at: u64,
     context: Vec<ContextItem>,
+    manual_compaction_requested: bool,
     associated: bool,
     tool_gap_reported: bool,
     reply: Option<oneshot::Sender<Result<()>>>,
@@ -764,6 +765,7 @@ impl State {
             turn: turn.clone(),
             opened_at: origin.start_time,
             context: Vec::new(),
+            manual_compaction_requested: false,
             associated: true,
             tool_gap_reported: false,
             reply: None,
@@ -1162,6 +1164,7 @@ impl State {
         &mut self,
         command: String,
         turn: String,
+        manual_compaction_requested: bool,
     ) -> Result<oneshot::Receiver<Result<()>>> {
         if self.source_unknown || self.failure.is_some() {
             return Err(Error::new("unknown", "Antigravity stream is unresolved"));
@@ -1185,6 +1188,7 @@ impl State {
             turn,
             opened_at,
             context: Vec::new(),
+            manual_compaction_requested,
             associated: false,
             tool_gap_reported: false,
             reply: Some(reply),
@@ -2056,7 +2060,10 @@ impl State {
         }
         if matches!(
             &update,
-            AcpUpdate::MessageChunk { .. } | AcpUpdate::ThoughtChunk | AcpUpdate::ToolCall { .. }
+            AcpUpdate::MessageChunk { .. }
+                | AcpUpdate::ThoughtChunk
+                | AcpUpdate::ToolCall { .. }
+                | AcpUpdate::CompactionSummaryChunk
         ) || matches!(&update, AcpUpdate::ToolCallUpdate { tool_call_id, .. } if self.tools.contains_key(tool_call_id))
         {
             self.refresh_native_terminal_deadline();
@@ -2091,6 +2098,12 @@ impl State {
             AcpUpdate::MessageChunk { text } => {
                 self.associate().await?;
                 self.append_assistant_text(&text);
+                Ok(())
+            }
+            AcpUpdate::CompactionSummaryChunk => {
+                // ACP summary chunks are session-scoped and carry no prompt
+                // or Eliot turn identity. Arrival during a pending prompt is
+                // not enough to attribute a compaction fact.
                 Ok(())
             }
             // Bookkeeping: neither input acknowledgement nor assistant output.
@@ -2684,27 +2697,30 @@ impl State {
             .pending
             .as_ref()
             .ok_or_else(|| Error::new("unknown", "Antigravity turn is absent"))?;
-        let (command, turn) = (pending.command.clone(), pending.turn.clone());
-        if let Some(checkpoints) = &mut self.checkpoints {
-            let records = checkpoints.read_new();
-            if checkpoints.take_identity_gap() {
-                self.record_coverage_gap(
-                    "Antigravity transcript exceeded the checkpoint identity bound",
-                    &["session"],
-                )
-                .await?;
+        let turn = pending.turn.clone();
+        let command = pending.command.clone();
+        let manual_compaction_requested = pending.manual_compaction_requested;
+        let checkpoint_identity_gap = self.checkpoints.as_mut().is_some_and(|reader| {
+            reader.read_new();
+            reader.take_identity_gap()
+        });
+        if checkpoint_identity_gap {
+            self.record_coverage_gap(
+                "Antigravity transcript exceeded the checkpoint identity bound",
+                &["session"],
+            )
+            .await?;
+        }
+        if status == "completed" && native_status == "end_turn" && manual_compaction_requested {
+            // The slash command and its fenced terminal identify this exact
+            // prompt/turn. Session-scoped ACP summaries and transcript
+            // checkpoints cannot establish turn-bound compaction.
+            let mut data = json!({"turn_id": turn, "trigger": "manual"});
+            if let Some(command_id) = command.as_deref() {
+                data["command_id"] = json!(command_id);
             }
-            for checkpoint in records {
-                // The transcript proves a session checkpoint, even if its
-                // write reached disk after an earlier prompt settled.
-                self.commit(
-                    "session.context.compacted",
-                    "session",
-                    &format!("checkpoint-{}", checkpoint.identity),
-                    json!({"step_index": checkpoint.step_index}),
-                )
+            self.commit("session.context.compacted", &turn, "manual-compact", data)
                 .await?;
-            }
         }
         let failed = status == "failed";
         // Canonical outcome decided here at the plugin boundary from the

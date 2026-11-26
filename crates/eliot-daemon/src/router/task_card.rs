@@ -47,10 +47,8 @@ pub(super) fn read_task_card(
     } else {
         None
     };
-    let goal = store
-        .goal_get(agent, "eliot")?
-        .filter(|goal| goal.generation == generation)
-        .map(|goal| goal.definition);
+    let (goal, default_objective) = goal_projection(store, &current)?;
+    let goal = goal.map(|goal| goal.definition);
     let branch = current
         .workspace
         .as_deref()
@@ -63,8 +61,38 @@ pub(super) fn read_task_card(
         text.as_deref(),
         branch.as_deref(),
         goal.as_ref(),
+        default_objective.as_deref(),
         policy,
     ))
+}
+
+/// The default Goal projection shared by `agent.get` and task cards. The
+/// first retained launch's linked input is the objective for every admitted
+/// launch, except the internal A10 audit turn. A real Goal always wins.
+pub(super) fn goal_projection(
+    store: &Store,
+    agent: &eliot_core::Agent,
+) -> Result<(Option<eliot_core::api::GoalView>, Option<String>)> {
+    let goal = store
+        .goal_get(&agent.id, "eliot")?
+        .filter(|goal| goal.generation == agent.generation);
+    if goal.is_some() || agent.is_goal_auditor() {
+        return Ok((goal, None));
+    }
+    let Some(launch) = store.generation_start_command(&agent.id, 1)? else {
+        return Ok((None, None));
+    };
+    let Some(send) = store.get_linked_send(&launch.id)? else {
+        return Ok((None, None));
+    };
+    let Some(text) = eliot_store::input_before_owner_rules(&send) else {
+        return Ok((None, None));
+    };
+    let mut end = text.len().min(eliot_core::api::MAX_GOAL_TEXT_BYTES);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    Ok((None, Some(text[..end].to_owned())))
 }
 
 fn brief_field<'a>(brief: Option<&'a str>, labels: &[&str]) -> Option<&'a str> {
@@ -82,11 +110,12 @@ fn render_task_card(
     launch_brief: Option<&str>,
     branch: Option<&str>,
     goal: Option<&GoalDefinition>,
+    default_objective: Option<&str>,
     policy: &SecretPolicy,
 ) -> Option<String> {
     let launch_brief = launch_brief.map(without_source_block);
     let launch_brief = launch_brief.filter(|text| !text.trim().is_empty());
-    if launch_brief.is_none() && goal.is_none() {
+    if launch_brief.is_none() && goal.is_none() && default_objective.is_none() {
         return None;
     }
 
@@ -95,6 +124,7 @@ fn render_task_card(
         .unwrap_or_else(|| "not retained".to_owned());
     let goal_text = goal
         .map(|goal| bounded_field(&goal.text, GOAL_BYTES, policy))
+        .or_else(|| default_objective.map(|text| bounded_field(text, GOAL_BYTES, policy)))
         .or_else(|| {
             brief_field(launch_brief, &["goal", "result"])
                 .map(|text| bounded_field(text, GOAL_BYTES, policy))

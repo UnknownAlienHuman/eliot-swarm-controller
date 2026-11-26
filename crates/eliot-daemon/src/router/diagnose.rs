@@ -7,6 +7,7 @@
 //! with the failure origin when a failure was observed.
 
 use super::{Principal, Router, require_owner};
+use crate::common::now_ms;
 use eliot_core::{
     Command, Error, Event, Result, Turn,
     api::{
@@ -252,14 +253,23 @@ impl Router {
             .effective
             .as_ref()
             .and_then(|effective| effective["model_mismatch"].as_str());
+        let native_activity = row.activity.as_ref();
+        let native_blocker = store.native_child_archive_blocker(&row)?;
         let mut steps = vec![DiagnoseStep {
             kind: "agent".to_owned(),
             code: Some(if model_mismatch.is_some() {
                 "model_mismatch".to_owned()
             } else {
-                eliot_core::api::agent_state_name(row.state).to_owned()
+                native_activity
+                    .map_or_else(
+                        || eliot_core::api::agent_state_name(row.state),
+                        |activity| eliot_core::api::activity_state_name(activity.state),
+                    )
+                    .to_owned()
             }),
-            message: model_mismatch.map(|message| bound_chars(message, 1024)),
+            message: model_mismatch
+                .map(|message| bound_chars(message, 1024))
+                .or(native_blocker),
             failure_where: None,
             origin: model_mismatch.map(|_| "harness".to_owned()),
             origin_evidence: None,
@@ -306,6 +316,7 @@ impl Router {
         let mut preceded_by = None;
         let mut commands = std::collections::HashSet::new();
         let mut unresolved = Vec::new();
+        let mut restart_fences = Vec::new();
         if let Some(goal) = store.goal_get(agent, "eliot")?
             && (goal.status != eliot_core::api::GoalStatus::Cleared || goal.round_marker.is_some())
         {
@@ -356,11 +367,13 @@ impl Router {
             && let Some(message) = blocked.get("message").and_then(Value::as_str)
         {
             unresolved.push(message.to_owned());
+            restart_fences.push((message.to_owned(), "resume_blocked"));
         }
         if row.is_terminal()
             && let Some(reason) = store.restart_goal_custody_blocker(agent, generation)?
         {
-            unresolved.push(reason);
+            unresolved.push(reason.clone());
+            restart_fences.push((reason, "goal_custody_blocked"));
         }
         if let Some(choice) = row.profile_choice.as_ref()
             && (!choice.skipped.is_empty() || choice.provider_failover.is_some())
@@ -417,8 +430,13 @@ impl Router {
             let reason = step.message.as_deref().map_or_else(String::new, |message| {
                 format!("; {}", bound_chars(message, 256))
             });
+            let action = if native_activity.is_some() {
+                ""
+            } else {
+                "; resolve with swarm turn resolve using an exact Owner assertion"
+            };
             unresolved.push(format!(
-                "unknown turn {} (generation {}){reason}; resolve with swarm turn resolve using an exact Owner assertion",
+                "unknown turn {} (generation {}){reason}{action}",
                 turn.turn_id, turn.generation
             ));
             step.message = unresolved.last().cloned();
@@ -476,6 +494,22 @@ impl Router {
             }
         }
         steps.extend(loss_steps(&store, agent, generation)?);
+        // Restart fences carry the Owner resume action. They join the chain
+        // after command, turn and loss evidence: process evidence keeps
+        // precedence, and a fence only fills an unclassified gap.
+        for (message, code) in restart_fences {
+            steps.push(DiagnoseStep {
+                kind: "restart".to_owned(),
+                code: Some(code.to_owned()),
+                message: Some(bound_chars(&message, 1024)),
+                failure_where: Some("daemon.restart.resume".to_owned()),
+                origin: Some("swarm".to_owned()),
+                origin_evidence: None,
+                exit_code: None,
+                ntstatus: None,
+                at: (row.updated_at >= 0).then_some(row.updated_at),
+            });
+        }
         if row.is_terminal()
             && let Some(workspace) = store.get_workspace(agent)?
             && workspace.target_generation == generation
@@ -483,6 +517,32 @@ impl Router {
                 worktree_removal_problem(workspace.outcome.as_ref(), workspace.updated_at)
         {
             steps.push(step);
+        }
+        // A provider hold is only the current reason when the Store marks it
+        // as the wait reason for the active turn; a retained hold on a
+        // terminal Agent is history and stays out of the reason chain.
+        if let (Some(hold), native_notice) = store.agent_status_projection(&row)?
+            && hold.waiting_for_active_turn
+        {
+            let mut message = eliot_core::api::agent_status_line(
+                row.active_turn.as_deref(),
+                Some(&hold),
+                native_notice.as_ref(),
+                now_ms(),
+            )
+            .unwrap_or_else(|| format!("Provider hold: {}", hold.kind.as_str()));
+            message.push_str("; inspect with swarm provider holds");
+            steps.push(DiagnoseStep {
+                kind: "provider_hold".to_owned(),
+                code: Some(hold.kind.as_str().to_owned()),
+                message: Some(bound_chars(&message, 1024)),
+                failure_where: None,
+                origin: Some("provider".to_owned()),
+                origin_evidence: None,
+                exit_code: None,
+                ntstatus: None,
+                at: (hold.updated_at >= 0).then_some(hold.updated_at),
+            });
         }
         let attention_steps = store.recent_attention_steps(agent, None)?;
         drop(store);
@@ -744,10 +804,39 @@ fn worktree_removal_problem(outcome: Option<&Value>, at: i64) -> Option<Diagnose
     Some(step)
 }
 
+/// Core policy for the `why` projection: unmapped native errors stay
+/// `harness`. A stored outcome with a native adapter code but no recorded
+/// origin keeps the harness origin instead of reporting `unknown`. A recorded
+/// origin always wins; nothing is invented for non-native codes.
+fn native_outcome_origin(code: Option<&str>, stored: Option<&str>) -> Option<String> {
+    if stored.is_some_and(|origin| !origin.is_empty() && origin != "unknown") {
+        return stored.map(|origin| bound_chars(origin, 32));
+    }
+    code.filter(|code| code.starts_with("native_"))
+        .map(|_| "harness".to_owned())
+}
+
 fn command_outcome_step(outcome: Option<&Value>, at: i64) -> DiagnoseStep {
+    let code = outcome.and_then(outcome_code);
+    let stored_origin = outcome
+        .and_then(|outcome| outcome.get("origin"))
+        .and_then(Value::as_str);
+    let origin = native_outcome_origin(code.as_deref(), stored_origin);
+    let mut origin_evidence = outcome.and_then(|outcome| {
+        outcome
+            .get("origin_evidence")
+            .and_then(Value::as_str)
+            .map(|evidence| bound_chars(evidence, 512))
+    });
+    if origin_evidence.is_none()
+        && origin.as_deref() == Some("harness")
+        && stored_origin.is_none_or(|stored| stored == "unknown")
+    {
+        origin_evidence = Some("unmapped native error keeps the harness origin".to_owned());
+    }
     DiagnoseStep {
         kind: "command".to_owned(),
-        code: outcome.and_then(outcome_code),
+        code,
         message: outcome.and_then(|outcome| {
             outcome
                 .get("message")
@@ -760,18 +849,8 @@ fn command_outcome_step(outcome: Option<&Value>, at: i64) -> DiagnoseStep {
                 .and_then(Value::as_str)
                 .map(|where_| bound_chars(where_, 128))
         }),
-        origin: outcome.and_then(|outcome| {
-            outcome
-                .get("origin")
-                .and_then(Value::as_str)
-                .map(|origin| bound_chars(origin, 32))
-        }),
-        origin_evidence: outcome.and_then(|outcome| {
-            outcome
-                .get("origin_evidence")
-                .and_then(Value::as_str)
-                .map(|evidence| bound_chars(evidence, 512))
-        }),
+        origin,
+        origin_evidence,
         exit_code: outcome
             .and_then(|outcome| outcome.get("exit_code"))
             .and_then(Value::as_i64),
@@ -827,28 +906,40 @@ fn turn_step(turn: &Turn, terminal: Option<&Event>) -> DiagnoseStep {
             1024,
         ));
     }
+    let code = terminal
+        .and_then(|event| event.data.get("native_error")?.get("code")?.as_str())
+        .map(|code| bound_chars(code, 128))
+        .or_else(|| {
+            if turn.state == eliot_core::TurnState::Unknown {
+                Some("unknown".to_owned())
+            } else {
+                turn.outcome.map(|outcome| outcome.as_str().to_owned())
+            }
+        });
+    let stored_origin = terminal
+        .and_then(|event| event.data.get("origin")?.as_str())
+        .map(|text| bound_chars(text, 32));
+    let origin = native_outcome_origin(code.as_deref(), stored_origin.as_deref());
+    let mut origin_evidence = terminal
+        .and_then(|event| event.data.get("origin_evidence")?.as_str())
+        .map(|text| bound_chars(text, 512));
+    if origin_evidence.is_none()
+        && origin.as_deref() == Some("harness")
+        && stored_origin
+            .as_deref()
+            .is_none_or(|stored| stored == "unknown")
+    {
+        origin_evidence = Some("unmapped native error keeps the harness origin".to_owned());
+    }
     DiagnoseStep {
         kind: "turn".to_owned(),
-        code: terminal
-            .and_then(|event| event.data.get("native_error")?.get("code")?.as_str())
-            .map(|code| bound_chars(code, 128))
-            .or_else(|| {
-                if turn.state == eliot_core::TurnState::Unknown {
-                    Some("unknown".to_owned())
-                } else {
-                    turn.outcome.map(|outcome| outcome.as_str().to_owned())
-                }
-            }),
+        code,
         message,
         failure_where: terminal
             .and_then(|event| event.data.get("where")?.as_str())
             .map(|text| bound_chars(text, 128)),
-        origin: terminal
-            .and_then(|event| event.data.get("origin")?.as_str())
-            .map(|text| bound_chars(text, 32)),
-        origin_evidence: terminal
-            .and_then(|event| event.data.get("origin_evidence")?.as_str())
-            .map(|text| bound_chars(text, 512)),
+        origin,
+        origin_evidence,
         exit_code: None,
         ntstatus: None,
         at: turn.completed_at.filter(|at| *at >= 0),

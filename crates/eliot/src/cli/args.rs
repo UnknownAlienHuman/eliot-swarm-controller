@@ -134,6 +134,8 @@ pub(crate) enum CliCommand {
     /// Interrupt the controlled session or bind to a specific turn. `abort` is an alias.
     #[command(alias = "abort")]
     Interrupt(InterruptArgs),
+    /// Compact an Agent's context at an idle boundary.
+    Compact(CompactArgs),
     /// Approve a pending native request.
     Approve(ApproveArgs),
     /// Deny a pending native request.
@@ -654,6 +656,17 @@ pub(crate) struct InterruptArgs {
     pub(crate) generation: GenerationArgs,
     #[arg(long, value_name = "TURN")]
     pub(crate) turn: Option<String>,
+}
+
+#[derive(Args)]
+pub(crate) struct CompactArgs {
+    #[arg(value_name = "AGENT")]
+    pub(crate) agent: String,
+    #[command(flatten)]
+    pub(crate) generation: GenerationArgs,
+    /// Wait this many seconds for the compaction command to settle.
+    #[arg(long, value_name = "SECONDS")]
+    pub(crate) wait_seconds: Option<u64>,
 }
 
 #[derive(Args)]

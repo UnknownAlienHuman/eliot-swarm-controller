@@ -43,6 +43,25 @@ pub fn terminal_outcome(
     }
 }
 
+/// Classify Claude's successful manual `/compact` result when its native
+/// result omits `terminal_reason`. The adapter supplies true only for the
+/// exact active turn with a committed manual compaction boundary and a
+/// successful native result. No other missing or unknown result is promoted.
+pub fn terminal_outcome_with_manual_compaction(
+    reported: TurnOutcome,
+    restriction: Option<ProviderRestrictionKind>,
+    native_success: bool,
+    exact_manual_compaction: bool,
+) -> TurnOutcome {
+    let reported = if reported == TurnOutcome::Unknown && native_success && exact_manual_compaction
+    {
+        TurnOutcome::Success
+    } else {
+        reported
+    };
+    terminal_outcome(reported, restriction)
+}
+
 /// One settled unknown outcome for an input whose consumption is unproven.
 pub struct UnprovenInputSettlement {
     /// Whether the session must latch unknown because the input was not

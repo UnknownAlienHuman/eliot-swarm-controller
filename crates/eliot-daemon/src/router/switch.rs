@@ -2,7 +2,7 @@
 use super::routing::HandoffRoute;
 use super::*;
 use eliot_core::api::{
-    HandoffReason, SWITCH_BLANK_SCOPE_ARG, SWITCH_PROJECT_REVISION_ARG, SwitchRequest,
+    HandoffReason, SWITCH_BLANK_SCOPE_ARG, SWITCH_PROJECT_REVISION_ARG, SwitchLaunch, SwitchRequest,
 };
 use eliot_store::{SwitchLaunchCheckout, SwitchLiveCheckout, SwitchReservation};
 
@@ -182,12 +182,62 @@ impl Router {
         }
     }
 
+    /// Reserve an ordinary routed switch to continue a completed Goal audit.
+    /// The Store binds the cycle and this command ID before any preparation.
+    pub(crate) async fn reserve_goal_audit_switch(
+        &self,
+        source: &Agent,
+        revision: i64,
+    ) -> Result<()> {
+        let source = self
+            .inner
+            .store
+            .lock()
+            .await
+            .get_agent(&source.id)?
+            .filter(|current| current.generation == source.generation)
+            .ok_or_else(|| Error::new("stale_generation", "audit source generation moved"))?;
+        let role = source
+            .profile_choice
+            .as_ref()
+            .map(|choice| choice.role.clone())
+            .unwrap_or_else(|| "default".to_owned());
+        let request = SwitchRequest {
+            id: ulid::Ulid::new().to_string(),
+            from: source.id.clone(),
+            from_generation: source.generation,
+            task_command: String::new(),
+            commands: Vec::new(),
+            launch: SwitchLaunch {
+                role: Some(role),
+                ..SwitchLaunch::default()
+            },
+        };
+        let params = serde_json::to_value(request)
+            .map_err(|_| Error::new("internal", "cannot encode Goal audit switch"))?;
+        self.swarm_switch_inner(&params, &Principal::Owner, None, None, Some(revision))
+            .await?;
+        Ok(())
+    }
+
     pub(super) async fn swarm_switch(
         &self,
         params: &Value,
         principal: &Principal,
         owner_process: Option<&OwnerProcess>,
         profile_authority: Option<[u8; 32]>,
+    ) -> Result<Value> {
+        self.swarm_switch_inner(params, principal, owner_process, profile_authority, None)
+            .await
+    }
+
+    async fn swarm_switch_inner(
+        &self,
+        params: &Value,
+        principal: &Principal,
+        owner_process: Option<&OwnerProcess>,
+        profile_authority: Option<[u8; 32]>,
+        audit_revision: Option<i64>,
     ) -> Result<Value> {
         if !matches!(principal, Principal::Owner | Principal::Agent { .. }) {
             return Err(Error::new(
@@ -237,6 +287,7 @@ impl Router {
                     SwitchReservation {
                         owner_process,
                         profile_authority,
+                        audit_revision,
                         source_checkout: source_identity
                             .as_ref()
                             .map(|(root, key)| (root.as_str(), key.as_str())),

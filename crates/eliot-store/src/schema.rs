@@ -1,6 +1,6 @@
 use super::*;
 
-pub(super) const CURRENT_SCHEMA_VERSION: i64 = OWNER_INBOX_GOAL_STATUS_VERSION;
+pub(super) const CURRENT_SCHEMA_VERSION: i64 = EVENT_PRUNE_COVERAGE_VERSION;
 const HARNESS_CHECK_SCHEMA_VERSION: i64 = 112;
 const WORK_TRUTH_VERSION: i64 = 113;
 const WORK_TRUTH_INTENT_VERSION: i64 = 114;
@@ -50,6 +50,7 @@ const HANDOFF_READ_INDEX_VERSION: i64 = 157;
 const DIAGNOSE_READ_INDEX_VERSION: i64 = 158;
 const FIRST_OWNER_MESSAGE_VERSION: i64 = 159;
 const OWNER_INBOX_GOAL_STATUS_VERSION: i64 = 160;
+const EVENT_PRUNE_COVERAGE_VERSION: i64 = 161;
 
 fn has_restart_continuation_brief_column(connection: &Connection) -> Result<bool> {
     connection
@@ -2896,6 +2897,30 @@ impl Store {
                     reason = crate::goals::COMPLETION_DEFERRAL_LIMIT_REASON
                 ),
                 Some(OWNER_INBOX_GOAL_STATUS_VERSION),
+            )?;
+        }
+        if current < EVENT_PRUNE_COVERAGE_VERSION {
+            self.migrate_sql(
+                &format!(
+                    "CREATE TABLE event_prune_coverage (
+                         agent INTEGER NOT NULL,
+                         kind TEXT NOT NULL,
+                         source TEXT NOT NULL,
+                         var_scope TEXT NOT NULL,
+                         seq INTEGER NOT NULL CHECK (seq > 0),
+                         legacy_agent_hi INTEGER NOT NULL DEFAULT 0,
+                         PRIMARY KEY (agent, kind, source, var_scope)
+                     ) WITHOUT ROWID;
+                     INSERT INTO event_prune_coverage
+                     SELECT 0, '', '', '', pruned_through,
+                         COALESCE((SELECT seq FROM sqlite_sequence WHERE name = 'agents'), 0)
+                     FROM rule_history_coverage
+                     WHERE singleton = 1 AND pruned_through > 0
+                     UNION ALL
+                     SELECT id, '', '', '', floor, 0 FROM ({legacy_agents}) WHERE floor > 0;",
+                    legacy_agents = event_coverage::LEGACY_AGENT_EVENT_FLOORS,
+                ),
+                Some(EVENT_PRUNE_COVERAGE_VERSION),
             )?;
         }
         Ok(())

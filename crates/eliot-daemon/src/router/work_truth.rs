@@ -104,6 +104,7 @@ fn records_work(agent: &Agent) -> bool {
         && !agent.project.is_empty()
         && agent.workspace.is_some()
         && !agent.is_automatic_provider_probe()
+        && !agent.is_goal_auditor()
 }
 
 fn journal_entries(

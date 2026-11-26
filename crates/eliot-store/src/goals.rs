@@ -1,6 +1,63 @@
 //! Durable Eliot-mode Goals: revisioned definitions on one Agent
 //! generation plus the stale-round-safe conditional round commit.
 
+mod audit;
+pub use audit::{
+    GOAL_AUDIT_HISTORY_LIMIT, GoalAuditEvidence, GoalAuditHistoryEntry, GoalAuditStep,
+};
+pub(super) use audit::{
+    bind_goal_audit_switch_tx, goal_audit_switch_text, settle_goal_audit_switch_tx,
+};
+
+/// Only the exact read-only launch bound to the blocked Goal can share its
+/// checkout. The active switch fence applies separately to all launches.
+pub(super) fn audit_launch_checkout_owner_tx(
+    tx: &Transaction<'_>,
+    args: &Value,
+    launch_id: &str,
+    workspace: Option<&str>,
+) -> Result<Option<i64>> {
+    let Some(binding) = args.get("goal_audit_source") else {
+        return Ok(None);
+    };
+    let source_num = parse_agent_id(binding["agent"].as_str().unwrap_or_default())?;
+    let current = load_agent_by_num(tx, source_num)?;
+    let goal = load_goal_row(tx, source_num, "eliot")?;
+    let matches = current
+        .as_ref()
+        .zip(goal.as_ref())
+        .is_some_and(|(source, goal)| {
+            let same_workspace =
+                source
+                    .workspace
+                    .as_deref()
+                    .zip(workspace)
+                    .is_some_and(|(left, right)| {
+                        core::workspace_path_key(left) == core::workspace_path_key(right)
+                    });
+            same_workspace
+                && Some(source.generation) == binding["generation"].as_i64()
+                && goal.generation == source.generation
+                && Some(goal.revision) == binding["revision"].as_i64()
+                && goal.state.status == GoalStatus::Blocked
+                && goal.state.audit_cycle.as_ref().is_some_and(|cycle| {
+                    cycle.launch_command == launch_id
+                        && cycle.revision == goal.revision
+                        && cycle.generation == goal.generation
+                        && matches!(cycle.phase.as_str(), "launch_pending" | "audit_running")
+                })
+        });
+    if !matches
+        || args.pointer("/profile_snapshot/goal_audit_read_only") != Some(&Value::Bool(true))
+    {
+        return Err(Error::new(
+            "stale_goal",
+            "read-only audit launch no longer matches the blocked Goal checkout",
+        ));
+    }
+    Ok(Some(source_num))
+}
+
 use super::*;
 use eliot_core::api::{
     CHECK_SPAWN_RETRYABLE, CommandSubmitResponse, GoalContinuationStage, GoalCounters,
@@ -13,6 +70,12 @@ use serde::{Deserialize, Serialize};
 const MAX_GOAL_CHECK_HISTORY_ROWS: i64 = 8_192;
 const NATIVE_FOLLOWUP_WINDOW_MS: i64 = 5 * 60 * 1_000;
 const COST_BASE_PENDING: &str = "awaiting the active turn's session usage boundary";
+const GOAL_CHECK_CUSTODY_CLOSED: &str = "goal.check_custody_closed";
+const GOAL_ROUND_BOOKKEEPING: [&str; 3] = [
+    super::work_truth::GIT_CHECKPOINT,
+    GOAL_CHECK_CUSTODY_CLOSED,
+    core::api::ATTENTION_EVENT_KIND,
+];
 
 /// A Swarm note: an `inject` from a Swarm principal. An inject from the Owner
 /// or a manager is never one, whatever its delivery state.
@@ -629,12 +692,56 @@ struct GoalStatePersist {
     /// that Agent continues it. Any manual pause, set, clear or other pause clears it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     stop_paused: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    audit_cycle: Option<audit::GoalAuditCycle>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    audit_retry_reason: Option<String>,
+    #[serde(default)]
+    audit_history: Vec<audit::GoalAuditHistoryEntry>,
 }
 
 enum GoalStateChange<'a> {
     Pause(Option<&'a str>),
     Clear,
     Resume,
+}
+
+/// A pause or clear fences the linked input and admits an ordinary STOP
+/// for an already-starting auditor, in the same writer transaction.
+fn audit_stop_request(
+    tx: &Transaction<'_>,
+    cycle: Option<&audit::GoalAuditCycle>,
+) -> Result<Option<SubmitCommand>> {
+    let Some(cycle) = cycle else { return Ok(None) };
+    if let Some(stop) = cycle.stop_command.as_deref()
+        && load_command(tx, stop)?.is_some()
+    {
+        return Ok(None);
+    }
+    let Some(launch) = load_command(tx, &cycle.launch_command)? else {
+        return Ok(None);
+    };
+    let Some(target) = launch.target.as_deref() else {
+        return Ok(None);
+    };
+    let Some(auditor) = load_agent_by_num(tx, parse_agent_id(target)?)? else {
+        return Ok(None);
+    };
+    if auditor.generation == 0
+        || launch.generation != Some(auditor.generation)
+        || !auditor.is_goal_auditor()
+        || auditor.is_terminal()
+    {
+        return Ok(None);
+    }
+    let id = cycle
+        .stop_command
+        .clone()
+        .unwrap_or_else(|| Ulid::new().to_string());
+    let mut stop = SubmitCommand::new(id, "stop");
+    stop.target = Some(auditor.id);
+    stop.expected_generation = Some(auditor.generation);
+    Ok(Some(stop))
 }
 
 struct GoalRow {
@@ -1024,7 +1131,14 @@ fn transferable_source_goal(
     ) {
         return Ok(None);
     }
-    if source.state.status == GoalStatus::Blocked {
+    if source.state.status == GoalStatus::Blocked
+        && !source.state.audit_cycle.as_ref().is_some_and(|cycle| {
+            cycle.phase == "audit_complete"
+                && cycle.switch_command.is_some()
+                && cycle.generation == source.generation
+                && cycle.revision == source.revision
+        })
+    {
         return Err(Error::new(
             "bad_state",
             "blocked source Goal requires an explicit set or clear before handoff",
@@ -1061,7 +1175,7 @@ fn transferable_source_goal(
     Ok(Some(source))
 }
 
-/// Keep definition/counters, clear A, and install B paused with a fresh turn baseline.
+/// Transfer a Goal through the existing handoff transaction.
 pub(super) fn transfer_goal_tx(
     tx: &Transaction<'_>,
     from: &Agent,
@@ -1071,13 +1185,86 @@ pub(super) fn transfer_goal_tx(
     now: i64,
     events: &mut Vec<Event>,
 ) -> Result<Option<i64>> {
+    transfer_goal_inner_tx(
+        tx,
+        from,
+        to,
+        policy,
+        GoalTransferOptions {
+            continuation,
+            audit_binding: None,
+        },
+        now,
+        events,
+    )
+}
+
+pub(super) fn transfer_goal_audit_switch_tx(
+    tx: &Transaction<'_>,
+    from: &Agent,
+    to: &Agent,
+    policy: &core::SecretPolicy,
+    audit_binding: (&str, &str),
+    now: i64,
+    events: &mut Vec<Event>,
+) -> Result<Option<i64>> {
+    validate_ulid(audit_binding.0)?;
+    transfer_goal_inner_tx(
+        tx,
+        from,
+        to,
+        policy,
+        GoalTransferOptions {
+            continuation: true,
+            audit_binding: Some(audit_binding),
+        },
+        now,
+        events,
+    )
+}
+
+struct GoalTransferOptions<'a> {
+    continuation: bool,
+    audit_binding: Option<(&'a str, &'a str)>,
+}
+
+fn transfer_goal_inner_tx(
+    tx: &Transaction<'_>,
+    from: &Agent,
+    to: &Agent,
+    policy: &core::SecretPolicy,
+    options: GoalTransferOptions<'_>,
+    now: i64,
+    events: &mut Vec<Event>,
+) -> Result<Option<i64>> {
     let from_num = parse_agent_id(&from.id)?;
     let to_num = parse_agent_id(&to.id)?;
-    require_handoff_round(tx, from, continuation)?;
+    require_handoff_round(tx, from, options.continuation)?;
     require_settled_handoff_round(tx, to_num)?;
     let Some(mut source) = transferable_source_goal(tx, from, policy)? else {
         return Ok(None);
     };
+    let audit_cycle = options.audit_binding.and_then(|(switch_id, text)| {
+        source.state.audit_cycle.clone().filter(|cycle| {
+            cycle.phase == "audit_complete"
+                && cycle.switch_command.as_deref() == Some(switch_id)
+                && cycle.audit_text.as_deref() == Some(text)
+                && cycle.generation == source.generation
+                && cycle.revision == source.revision
+        })
+    });
+    if options.audit_binding.is_some() && audit_cycle.is_none() {
+        return Err(Error::new(
+            "stale_goal",
+            "audit Goal or switch binding changed before transfer",
+        ));
+    }
+    if source.state.status == GoalStatus::Blocked && audit_cycle.is_none() {
+        return Err(Error::new(
+            "bad_state",
+            "blocked Goal transfer requires its exact bound audit switch and text",
+        ));
+    }
     let destination = load_goal_row(tx, to_num, "eliot")?;
     if let Some(row) = &destination
         && row.state.status != GoalStatus::Cleared
@@ -1106,14 +1293,22 @@ pub(super) fn transfer_goal_tx(
     cleared.paused_reason = None;
     cleared.stop_paused = false;
     cleared.last_continuation_command_id = None;
+    cleared.audit_cycle = None;
     tx.execute("UPDATE goals SET revision=?1,state=?2,last_round_key=NULL,updated_at=?3 WHERE agent=?4 AND mode='eliot'",
         params![source.revision.checked_add(1).ok_or_else(||Error::new("bad_state","Goal revision overflow"))?,encode_json(&cleared)?,now,from_num]).map_err(sql_error)?;
-    let revision = destination
-        .map_or(Some(1), |row| row.revision.checked_add(1))
-        .ok_or_else(|| Error::new("bad_state", "Goal revision overflow"))?;
+    let revision = if audit_cycle.is_some() {
+        destination
+            .as_ref()
+            .map_or(source.revision, |row| row.revision.max(source.revision))
+            .checked_add(1)
+    } else {
+        destination.map_or(Some(1), |row| row.revision.checked_add(1))
+    }
+    .ok_or_else(|| Error::new("bad_state", "Goal revision overflow"))?;
     // A continuing successor keeps the Goal running: its first round waits
     // for the brief's turn. Any other transfer needs an explicit resume.
-    let keep_active = continuation && source.state.status == GoalStatus::Active;
+    let keep_active = audit_cycle.is_some()
+        || (options.continuation && source.state.status == GoalStatus::Active);
     source.state.status = if keep_active {
         GoalStatus::Active
     } else {
@@ -1128,7 +1323,7 @@ pub(super) fn transfer_goal_tx(
     // A cost baseline belongs to the source Agent's native session: the
     // destination's spend cannot be measured against it, so its next failed
     // round reports `cost_unverified` until the Owner sets the Goal again.
-    if source.state.cost_base.take().is_some() {
+    if source.state.cost_base.take().is_some() && audit_cycle.is_none() {
         source.state.counters.cost_spent_micros = None;
         source.state.counters.cost_unverified =
             Some("the Goal moved by handoff; set it again to budget this session".to_owned());
@@ -1140,12 +1335,39 @@ pub(super) fn transfer_goal_tx(
         .as_deref()
         .map(|text| policy.redact_text(text));
     source.state.paused_reason = (!keep_active).then(|| "handoff_requires_explicit_resume".into());
-    source.state.transferred_turns = total_used;
+    source.state.transferred_turns = if audit_cycle.is_some() { 0 } else { total_used };
     source.state.counters.turns_at_set = count_turns(tx, to_num, to.generation)?;
     source.state.last_committed_slot = None;
     source.state.last_continuation_command_id = None;
     source.state.round_reset_revision = None;
     source.state.cadence_anchor_ms = source.definition.cadence_ms.map(|_| now);
+    if let Some(cycle) = audit_cycle {
+        let switch_id = cycle
+            .switch_command
+            .as_deref()
+            .ok_or_else(|| Error::new("bad_state", "audit switch binding missing"))?;
+        audit::advance_goal_audit_tx(tx, from, to, source.revision, switch_id, &mut source.state)?;
+        source.state.blocked_reason = None;
+        source.state.unverified_completion_rounds = 0;
+        let destination_agent = load_agent_by_num(tx, to_num)?
+            .ok_or_else(|| Error::new("not_found", "audit successor Agent missing"))?;
+        source.state.cost_base = goal_cost_base_tx(
+            tx,
+            to_num,
+            to.generation,
+            &source.definition,
+            count_turns(tx, to_num, to.generation)?,
+            &destination_agent,
+        )?;
+        source.state.counters.cost_spent_micros = source
+            .definition
+            .max_cost
+            .as_ref()
+            .filter(|_| !cost_base_pending(source.state.cost_base.as_ref()))
+            .map(|_| 0);
+        source.state.counters.cost_unverified = cost_base_pending(source.state.cost_base.as_ref())
+            .then(|| COST_BASE_PENDING.to_owned());
+    }
     tx.execute("INSERT INTO goals(agent,mode,generation,revision,definition,state,last_round_key,updated_at)
         VALUES (?1,'eliot',?2,?3,?4,?5,NULL,?6) ON CONFLICT(agent,mode) DO UPDATE SET
         generation=excluded.generation,revision=excluded.revision,definition=excluded.definition,state=excluded.state,last_round_key=NULL,updated_at=excluded.updated_at",
@@ -1361,7 +1583,7 @@ impl Store {
         principal: &str,
         reason: Option<&str>,
         now: i64,
-    ) -> Result<GoalView> {
+    ) -> Result<(GoalView, Option<Admission>)> {
         self.goal_state_change(
             agent,
             mode,
@@ -1379,7 +1601,7 @@ impl Store {
         id: &str,
         principal: &str,
         now: i64,
-    ) -> Result<GoalView> {
+    ) -> Result<(GoalView, Option<Admission>)> {
         self.goal_state_change(agent, mode, id, principal, GoalStateChange::Clear, now)
     }
 
@@ -1392,6 +1614,7 @@ impl Store {
         now: i64,
     ) -> Result<GoalView> {
         self.goal_state_change(agent, mode, id, principal, GoalStateChange::Resume, now)
+            .map(|(view, _)| view)
     }
 
     /// Whether an active native-mode Goal owns the Agent. The automatic
@@ -1496,6 +1719,12 @@ impl Store {
         }
         Ok(latest_idle_key(&self.connection, &goal, &self.goal_holder)?
             .and_then(|(seq, consumed)| (!consumed).then_some(seq)))
+    }
+
+    /// Checkpoint receipts, checker closure and advisory attention neither
+    /// open an idle point nor invalidate a running check.
+    pub fn goal_event_is_round_bookkeeping(kind: &str) -> bool {
+        GOAL_ROUND_BOOKKEEPING.contains(&kind)
     }
 
     /// Whether this committed event belongs to a Swarm note's lifecycle.
@@ -1945,7 +2174,7 @@ impl Store {
                     events.push(insert_daemon_event(
                         &tx,
                         now,
-                        "goal.check_custody_closed",
+                        GOAL_CHECK_CUSTODY_CLOSED,
                         "goal",
                         Some(parse_agent_id(&request.agent)?),
                         Some(record.generation),
@@ -2119,6 +2348,9 @@ impl Store {
                 scope_base: scope_base.clone(),
                 cost_base: cost_base.clone(),
                 stop_paused,
+                audit_cycle: None,
+                audit_retry_reason: None,
+                audit_history: Vec::new(),
             };
             db!(tx.execute(
                 "UPDATE goals SET generation = ?1, revision = ?2, definition = ?3,
@@ -2176,6 +2408,9 @@ impl Store {
             scope_base: scope_base.clone(),
             cost_base: cost_base.clone(),
             stop_paused,
+            audit_cycle: None,
+            audit_retry_reason: None,
+            audit_history: Vec::new(),
         };
         db!(tx.execute(
             "INSERT INTO goals(agent, mode, generation, revision, definition,
@@ -2263,7 +2498,7 @@ impl Store {
         principal: &str,
         change: GoalStateChange<'_>,
         now: i64,
-    ) -> Result<GoalView> {
+    ) -> Result<(GoalView, Option<Admission>)> {
         self.ensure_writer_healthy()?;
         let result = self.goal_state_change_inner(agent, mode, id, principal, change, now);
         self.fault_on_persistence_error(&result);
@@ -2278,7 +2513,7 @@ impl Store {
         principal: &str,
         change: GoalStateChange<'_>,
         now: i64,
-    ) -> Result<GoalView> {
+    ) -> Result<(GoalView, Option<Admission>)> {
         require_eliot_mode(mode)?;
         let (method, verb, payload) = match change {
             GoalStateChange::Pause(reason) => {
@@ -2307,23 +2542,33 @@ impl Store {
         };
         let payload_digest = canonical::digest(&payload)?;
         let goal_holder = self.goal_holder.clone();
+        let limits = self.hierarchy_limits;
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(sql_error)?;
         if let Some(view) = replay_goal_write(&tx, id, principal, method, &payload_digest)? {
             commit_transaction(tx, &self.write_faulted)?;
-            return Ok(view);
+            return Ok((view, None));
         }
         validate_id_age(id, now)?;
         let agent_num = parse_agent_id(agent)?;
         let Some(mut row) = load_goal_row(&tx, agent_num, mode)? else {
             return Err(Error::new("not_found", "goal was not found"));
         };
+        let audit_stop = if principal == "owner"
+            && matches!(change, GoalStateChange::Pause(_) | GoalStateChange::Clear)
+        {
+            audit_stop_request(&tx, row.state.audit_cycle.as_ref())?
+        } else {
+            None
+        };
         let changed = match change {
             GoalStateChange::Pause(reason) => {
-                if row.state.status != GoalStatus::Paused && row.state.status != GoalStatus::Active
-                {
+                if !matches!(
+                    row.state.status,
+                    GoalStatus::Paused | GoalStatus::Active | GoalStatus::Blocked
+                ) {
                     return Err(Error::new(
                         "bad_state",
                         format!("goal is {} and cannot pause", row.state.status.as_str()),
@@ -2337,6 +2582,8 @@ impl Store {
                     state.status = GoalStatus::Paused;
                     state.paused_reason = reason.map(ToOwned::to_owned);
                     state.stop_paused = false;
+                    state.audit_cycle = None;
+                    state.audit_retry_reason = None;
                     true
                 }
             }
@@ -2359,6 +2606,8 @@ impl Store {
                     state.round_reset_revision = Some(row.revision);
                     state.last_continuation_command_id = None;
                     state.stop_paused = false;
+                    state.audit_cycle = None;
+                    state.audit_retry_reason = None;
                     true
                 }
             }
@@ -2422,9 +2671,13 @@ impl Store {
                 .ok_or_else(|| Error::new("internal", format!("goal disappeared after {verb}")))?;
         }
         let view = goal_view_on(&tx, &goal_holder, row)?;
+        let audit_stop = audit_stop
+            .filter(|_| changed)
+            .map(|stop| admission::submit_tx(&tx, principal, stop, None, now, false, limits, None))
+            .transpose()?;
         retain_goal_result(&tx, id, principal, method, &payload_digest, &view, now)?;
         commit_transaction(tx, &self.write_faulted)?;
-        Ok(view)
+        Ok((view, audit_stop))
     }
 
     fn pause_goal_tx(
@@ -2455,6 +2708,9 @@ impl Store {
             scope_base: row.state.scope_base.clone(),
             cost_base: row.state.cost_base.clone(),
             stop_paused: false,
+            audit_cycle: row.state.audit_cycle.clone(),
+            audit_retry_reason: row.state.audit_retry_reason.clone(),
+            audit_history: row.state.audit_history.clone(),
         };
         update_goal_state_tx(&tx, agent_num, &row.mode, row.revision, &state, now)?;
         commit_transaction(tx, &self.write_faulted)?;
@@ -2520,6 +2776,9 @@ impl Store {
                     scope_base: row.state.scope_base.clone(),
                     cost_base: row.state.cost_base.clone(),
                     stop_paused: false,
+                    audit_cycle: row.state.audit_cycle.clone(),
+                    audit_retry_reason: row.state.audit_retry_reason.clone(),
+                    audit_history: row.state.audit_history.clone(),
                 };
                 update_goal_state_tx(&tx, agent_num, mode, row.revision, &state, now)?;
                 commit_transaction(tx, &self.write_faulted)?;
@@ -4457,11 +4716,24 @@ fn count_turns(connection: &Connection, agent_num: i64, generation: i64) -> Resu
 }
 
 fn max_agent_seq(connection: &Connection, goal: &GoalRow) -> Result<i64> {
+    // Older versions could use bookkeeping events as round keys. Keep those
+    // spent keys as fences so an upgrade cannot roll back to an older idle
+    // event and run its check again.
+    let committed_idle_seq = goal
+        .last_round_key
+        .as_deref()
+        .and_then(|key| key.strip_prefix("idle:"))
+        .and_then(|seq| seq.parse::<i64>().ok());
     let sql = format!(
         "SELECT COALESCE((
              SELECT seq FROM events INDEXED BY events_agent
              WHERE agent = ?1 AND generation = ?2
                AND NOT {SWARM_NOTE_EVENT_SQL}
+               AND (kind NOT IN (?5, ?6, ?7) OR seq IS ?8 OR EXISTS (
+                    SELECT 1 FROM goal_markers marker
+                    WHERE marker.agent = ?1 AND marker.generation = ?2 AND marker.mode = ?3
+                      AND marker.round_key_kind = 'idle' AND marker.round_key = events.seq
+               ))
                AND NOT (kind = 'goal.round'
                         AND json_extract(data, '$.outcome') = 'unknown'
                         AND (
@@ -4479,7 +4751,11 @@ fn max_agent_seq(connection: &Connection, goal: &GoalRow) -> Result<i64> {
                 goal.agent_num,
                 goal.generation,
                 goal.mode,
-                goal.state.round_reset_revision
+                goal.state.round_reset_revision,
+                GOAL_ROUND_BOOKKEEPING[0],
+                GOAL_ROUND_BOOKKEEPING[1],
+                GOAL_ROUND_BOOKKEEPING[2],
+                committed_idle_seq,
             ],
             |row| row.get(0),
         )
@@ -4640,6 +4916,9 @@ pub(super) fn install_assignment_goal_tx(
             .as_ref()
             .map(|_| GoalCostBase::default()),
         stop_paused: false,
+        audit_cycle: None,
+        audit_retry_reason: None,
+        audit_history: Vec::new(),
     };
     db!(tx.execute(
         "INSERT INTO goals(agent, mode, generation, revision, definition,

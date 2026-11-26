@@ -153,6 +153,13 @@ fn claude_short(rest: &str) -> String {
         }
         version = number;
     }
+    // An older id puts its version first (`3-5-sonnet`): the family leads.
+    if words.len() > 1
+        && words[0].starts_with(|c: char| c.is_ascii_digit())
+        && words[1].chars().all(|c| c.is_ascii_alphabetic())
+    {
+        words.swap(0, 1);
+    }
     let mut short = words.join(" ");
     short.push_str(suffix);
     short

@@ -1163,9 +1163,19 @@ automation for Owner review. Maintenance also pauses a task-bearing launch's exa
 unresolved probe once the bound generation ends and its native custody drains, or
 after the Owner resolves the exact inactive turn. It preserves the Agent, turn and
 workspace. An uncertain probe is never replayed.
-An unknown cleanup artifact keeps deletion fenced. Probe recovery reports the
-Agent and artifact once process and source custody have drained. A live
-custody blocker takes priority and is eligible for the bounded drain wait.
+An unknown cleanup artifact keeps deletion fenced. Probe recovery attempts
+each ended probe once per start and logs one
+`daemon.provider_probe_recovery_failed` line per blocked artifact once
+process and source custody have drained. A live custody blocker takes
+priority and is eligible for the bounded drain wait. The same blocked
+artifact also appears in the Owner inbox as a `stuck` item with subject
+`artifact:<id>`, reason `provider_probe_artifact_unknown`, the exact
+`swarm artifact reconcile <id>` command (`--release-custody "<reason>"`
+for a native session), and a structured `artifact.reconcile` choice;
+recovery never settles the uncertain effect itself. The startup recovery
+attempt already establishes the wait, so the item is exempt from the
+second liveness sample other `stuck` items need. After the Owner
+reconciles the artifact, the next recovery run deletes the ended probe.
 If a minimal request cannot be prepared safely for the frozen profile, the daemon
 paces background preparation with a five-minute defer. The persisted deadline
 for a fresh launch and the admission budget stay available. A maintenance probe

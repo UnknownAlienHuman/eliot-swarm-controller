@@ -782,6 +782,7 @@ impl Session {
             )
             .with_where("plugin.antigravity.send.prepare"));
         }
+        let manual_compaction_requested = text.split_whitespace().next() == Some("/compact");
         let combined = with_claimed_context(text, &params.context, "Antigravity")
             .map_err(send_preparation_error)?;
         let turn = format!("agy-{}", ulid::Ulid::new());
@@ -804,7 +805,11 @@ impl Session {
                 .with_where("plugin.antigravity.send.prepare")
             })?;
             let association = state
-                .prepare(params.command_id.clone(), turn.clone())
+                .prepare(
+                    params.command_id.clone(),
+                    turn.clone(),
+                    manual_compaction_requested,
+                )
                 .map_err(send_preparation_error)?;
             state.attach_context(&params.command_id, params.context.clone())?;
             // Transfer the fence before I/O. A slow event commit must not

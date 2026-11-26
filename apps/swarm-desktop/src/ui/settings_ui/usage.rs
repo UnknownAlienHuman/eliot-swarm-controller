@@ -289,11 +289,13 @@ fn hold_row(hold: &eliot_core::ProviderHold, title: &str, now: i64) -> KeyedView
 /// under [`controls::QUOTA_LOW`]; the words say the share, so no mark
 /// beside them.
 fn limit_value(remaining: i64) -> View {
-    let value = controls::body(format!("{remaining}% left"));
+    // A low share says so in words too, never by colour alone (§4.2).
     if (remaining as f64) < controls::QUOTA_LOW {
-        value.foreground(ThemeBrush::SystemCritical).into()
+        controls::body(format!("{remaining}% left · low"))
+            .foreground(ThemeBrush::SystemCritical)
+            .into()
     } else {
-        value.into()
+        controls::body(format!("{remaining}% left")).into()
     }
 }
 

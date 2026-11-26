@@ -1,9 +1,11 @@
 //! Named profile settings for this adapter.
 
+use crate::local_provider::LocalProvider;
 use eliot_core::api::native_profile::{
     NativeProfileInput, NativeProfileMapping, NativeProfileRefusal, NativeProfileResult,
     ProfileEffort,
 };
+use eliot_core::{Error, Result};
 use eliot_plugin::capabilities::reject_unmapped_native_fields;
 use serde_json::{Map as JsonMap, Value};
 
@@ -68,10 +70,10 @@ fn route(
     pass_env: &[String],
     snapshot: &mut JsonMap<String, Value>,
 ) -> NativeProfileResult<()> {
-    if let Some(provider) = entry.local_provider {
+    if let Some(payload) = entry.local_provider {
         let field_error =
             |field, message: &str| NativeProfileRefusal::new(field, message, "profile_error");
-        crate::local_provider::validate(provider, pass_env)
+        let provider = crate::local_provider::decode_and_validate(payload, pass_env)
             .map_err(|message| field_error("local_provider", &message))?;
         if !entry
             .model
@@ -112,15 +114,23 @@ fn validate_model(model: &str) -> NativeProfileResult<()> {
     Ok(())
 }
 
-pub(super) fn launch_model_stays_on_route(entry: &NativeProfileInput<'_>, selected: &str) -> bool {
+pub(super) fn launch_model_stays_on_route(
+    entry: &NativeProfileInput<'_>,
+    selected: &str,
+) -> Result<bool> {
+    let local = entry
+        .local_provider
+        .map(LocalProvider::decode)
+        .transpose()
+        .map_err(|_| Error::new("profile_error", "invalid frozen local provider"))?;
     let Some((provider, model)) = split_provider_model(selected) else {
-        return false;
+        return Ok(false);
     };
-    if let Some(local) = entry.local_provider {
-        return local.contains_model(provider, model);
+    if let Some(local) = local {
+        return Ok(local.contains_model(provider, model));
     }
-    entry
+    Ok(entry
         .model
         .and_then(split_provider_model)
-        .is_some_and(|(configured, _)| configured == provider)
+        .is_some_and(|(configured, _)| configured == provider))
 }

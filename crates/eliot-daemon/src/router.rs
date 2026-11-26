@@ -3,6 +3,7 @@ mod attention;
 mod attribution;
 mod auth;
 mod auth_login;
+pub(crate) use auth_login::is_interactive_desktop_refusal;
 mod background_wake;
 mod catalog;
 mod checkpoint_reads;
@@ -18,6 +19,7 @@ mod diagnose;
 mod digests;
 pub(crate) mod discovery;
 mod disk_usage;
+mod goal_audit;
 mod goal_scope;
 mod goals;
 mod handoff;
@@ -103,21 +105,21 @@ use eliot_core::{
         AgentSummary, CommandChildrenRequest, CommandChildrenResponse, CommandGetRequest,
         CommandSubmitRequest, CommandSubmitResponse, CrashMarker, DaemonShutdownRequest,
         DaemonShutdownResponse, DaemonStatusRequest, DiscoverPage, DoctorHarnessEntry,
-        EventsBoundsRequest, EventsFilter, EventsReadRequest, EventsReadResponse,
-        EventsSubscribeRequest, EventsSubscribeResponse, FrozenGitPublish, GitFetchDefinitionArgs,
-        GitPublishTrigger, GitView, HarnessCheckOutcome, HarnessDoctorRequest,
-        HarnessDoctorResponse, HeavyAgentTotals, HeavyEpisodeView, HeavySummaryView,
-        LaunchCommandArgs, MAX_OBSERVATION_PAGE_BYTES, MAX_SWARM_WAIT_MS, MAX_SWARM_WAIT_TARGETS,
-        MAX_WAIT_FINAL_TEXT_BYTES, MAX_WAIT_FRAME_BYTES, MaintenancePurgeLegacyAttentionRequest,
-        MaintenancePurgeLegacyAttentionResponse, MaintenanceRunRequest, MaintenanceRunResponse,
-        ObservationPage, ObservationQuery, ObservationView, ObserveHeavyRequest,
-        ObserveHeavyResponse, ProcessPageCursor, ProjectCheckConfiguration, ProjectCheckPassed,
-        ProjectDiscoverRequest, ProjectRegistrationView, ProviderClearHoldRequest,
-        ProviderHoldsRequest, RuleGetRequest, RuleStateView, SWITCH_BLANK_SCOPE_ARG,
-        SWITCH_PROJECT_REVISION_ARG, SessionGrowthView, ShutdownMode, SourceState,
-        SwarmWaitRequest, SwarmWaitResponse, TimerGetRequest, TimerStateView, TurnGetRequest,
-        UsageScopeView, UsageSummaryRequest, UsageSummaryResponse, WaitEntryResult,
-        WorkSummaryView, WorkerTaskHealth, WorkerTaskStatus, fair_excerpt_cap,
+        EventsBoundsRequest, EventsBoundsResponse, EventsFilter, EventsReadRequest,
+        EventsReadResponse, EventsSubscribeRequest, EventsSubscribeResponse, FrozenGitPublish,
+        GitFetchDefinitionArgs, GitPublishTrigger, GitView, HarnessCheckOutcome,
+        HarnessDoctorRequest, HarnessDoctorResponse, HeavyAgentTotals, HeavyEpisodeView,
+        HeavySummaryView, LaunchCommandArgs, MAX_OBSERVATION_PAGE_BYTES, MAX_SWARM_WAIT_MS,
+        MAX_SWARM_WAIT_TARGETS, MAX_WAIT_FINAL_TEXT_BYTES, MAX_WAIT_FRAME_BYTES,
+        MaintenancePurgeLegacyAttentionRequest, MaintenancePurgeLegacyAttentionResponse,
+        MaintenanceRunRequest, MaintenanceRunResponse, ObservationPage, ObservationQuery,
+        ObservationView, ObserveHeavyRequest, ObserveHeavyResponse, ProcessPageCursor,
+        ProjectCheckConfiguration, ProjectCheckPassed, ProjectDiscoverRequest,
+        ProjectRegistrationView, ProviderClearHoldRequest, ProviderHoldsRequest, RuleGetRequest,
+        RuleStateView, SWITCH_BLANK_SCOPE_ARG, SWITCH_PROJECT_REVISION_ARG, SessionGrowthView,
+        ShutdownMode, SourceState, SwarmWaitRequest, SwarmWaitResponse, TimerGetRequest,
+        TimerStateView, TurnGetRequest, UsageScopeView, UsageSummaryRequest, UsageSummaryResponse,
+        WaitEntryResult, WorkSummaryView, WorkerTaskHealth, WorkerTaskStatus, fair_excerpt_cap,
         is_supported_harness,
     },
 };
@@ -3966,6 +3968,12 @@ impl Router {
         let profile = LaunchCommandArgs::required_text(launch.profile.as_deref(), "profile")?;
         self.refresh_model_hold(profile, &request.args["profile_snapshot"])
             .await;
+        if let Some(source) = routing.audit_source {
+            // The auditor uses the already prepared checkout of this Goal.
+            // It gets a single linked input and no project Goal or setup.
+            request.args["registered_project"] = json!(source.project);
+            return Ok(None);
+        }
         // A switch that requests neither a workspace nor a branch keeps its
         // source checkout: reuse was selected before preparation, so no
         // worktree is minted even under the automatic policy.
@@ -5731,6 +5739,7 @@ impl Router {
             last_control_failure,
             last_resume_failure,
             first_owner_message,
+            default_goal_objective,
         ) = {
             let store = self.inner.store.lock().await;
             hierarchy::authorize_agent_read(&store, principal, id, None)?;
@@ -5773,6 +5782,7 @@ impl Router {
                 }
                 None => None,
             };
+            let (_, default_goal_objective) = task_card::goal_projection(&store, &agent)?;
             let (provider_hold, native_notice) = store.agent_status_projection(&agent)?;
             let instruction_delivery = store.get_agent_instruction_delivery(id)?;
             let owner_rules_delivery = store.get_agent_owner_rules_delivery(id)?;
@@ -5795,6 +5805,7 @@ impl Router {
                 last_control_failure,
                 last_resume_failure,
                 first_owner_message,
+                default_goal_objective,
             )
         };
         let live_presence = if agent.observe_only {
@@ -5888,6 +5899,7 @@ impl Router {
             last_resume_failure,
             work_truth,
             first_owner_message,
+            default_goal_objective,
         };
         display_agent_get_response(&mut response);
         let mut value = serde_json::to_value(response)
@@ -6650,8 +6662,13 @@ impl Router {
         let request: EventsBoundsRequest =
             eliot_core::api::discovery::decode_params(params.clone())?;
         request.validate()?;
-        authorize_event_filter(request.filter, principal)?;
-        let bounds = self.inner.store.lock().await.event_bounds()?;
+        let mut filter = authorize_event_filter(request.filter, principal)?;
+        filter.var_scopes = self.readable_var_scopes(principal).await?;
+        let store = self.inner.store.lock().await;
+        let bounds = EventsBoundsResponse {
+            pruned_through: filter.replay_floor(&store)?,
+            hi: store.high_water()?,
+        };
         bounds.validate()?;
         serde_json::to_value(bounds)
             .map_err(|_| Error::new("internal", "event bounds could not be encoded"))
@@ -7266,6 +7283,7 @@ impl Router {
                     "event cursor is above the high-water mark",
                 ));
             }
+            filter.require_replay_cursor(&store, after)?;
             let mut cursor = after;
             let mut scanned = 0;
             let mut events = Vec::new();
@@ -7318,7 +7336,7 @@ impl Router {
                 && scanned < EVENT_SCAN_MAX
             {
                 let page_limit = (EVENT_SCAN_MAX - scanned).clamp(1, 256);
-                let page = store.read_events(cursor, page_limit, Some(high_water))?;
+                let page = store.read_retained_events(cursor, page_limit, Some(high_water))?;
                 if page.is_empty() {
                     cursor = high_water;
                     break;
@@ -8231,6 +8249,36 @@ impl Router {
 }
 
 impl EventFilter {
+    fn replay_floor(&self, store: &eliot_store::Store) -> Result<i64> {
+        let agents: Vec<i64> = self
+            .agents
+            .iter()
+            .filter_map(|agent| eliot_core::parse_agent_id(agent).ok())
+            .collect();
+        let kinds: Vec<&str> = self.kinds.iter().map(String::as_str).collect();
+        let sources: Vec<&str> = self.sources.iter().map(String::as_str).collect();
+        let var_scopes: Vec<&str> = self.var_scopes.iter().map(String::as_str).collect();
+        store.event_replay_floor(
+            (!self.agents.is_empty()).then_some(agents.as_slice()),
+            &kinds,
+            &sources,
+            &var_scopes,
+        )
+    }
+
+    fn require_replay_cursor(&self, store: &eliot_store::Store, after: i64) -> Result<()> {
+        let floor = self.replay_floor(store)?;
+        if after < floor {
+            return Err(Error::new(
+                "history_gap",
+                format!(
+                    "requested event history is no longer fully retained. Earliest resume cursor is {floor}."
+                ),
+            ));
+        }
+        Ok(())
+    }
+
     fn matches(&self, event: &Event) -> bool {
         (self.agents.is_empty()
             || event
@@ -9834,6 +9882,7 @@ fn reject_launch_derived_keys(args: &Value) -> Result<()> {
         "project_assignment_launch",
         "project_transfer_launch",
         "profile_choice",
+        "goal_audit_source",
         "instruction_sources",
         sources::RETAINED_SOURCE_SNAPSHOT,
         sources::LAUNCH_OWNER_RULES,

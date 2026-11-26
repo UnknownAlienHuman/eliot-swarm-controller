@@ -488,7 +488,7 @@ impl Router {
         require_eliot_mode(request.mode)?;
         let view = {
             let mut store = self.inner.store.lock().await;
-            let view = store.goal_pause(
+            let (view, audit_stop) = store.goal_pause(
                 &request.agent,
                 request.mode.as_str(),
                 &request.id,
@@ -496,6 +496,10 @@ impl Router {
                 request.reason.as_deref(),
                 now_ms(),
             )?;
+            if let Some(stop) = audit_stop {
+                self.publish_locked(&stop.events);
+                self.schedule_admission(&stop);
+            }
             if store
                 .goal_get(&request.agent, request.mode.as_str())
                 .is_ok_and(|current| {
@@ -523,13 +527,17 @@ impl Router {
         let view = {
             let mut store = self.inner.store.lock().await;
             super::owner_inbox::check_binding(&store)?;
-            let view = store.goal_clear(
+            let (view, audit_stop) = store.goal_clear(
                 &request.agent,
                 request.mode.as_str(),
                 &request.id,
                 &super::principal_name(principal),
                 now_ms(),
             )?;
+            if let Some(stop) = audit_stop {
+                self.publish_locked(&stop.events);
+                self.schedule_admission(&stop);
+            }
             if store
                 .goal_get(&request.agent, request.mode.as_str())
                 .is_ok_and(|current| {
@@ -1350,6 +1358,7 @@ pub(crate) async fn run_goal_driver(
     let mut followup_tick = tokio::time::interval(std::time::Duration::from_secs(30));
     followup_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut rounds: JoinSet<(String, i64)> = JoinSet::new();
+    let mut audits = JoinSet::new();
     let mut in_flight: HashMap<String, InFlightAutoRound> = HashMap::new();
     // Newest event per Goal with a round in flight, driven as a follow-up
     // when that round resolves. Never filled past shutdown: the drain
@@ -1376,6 +1385,15 @@ pub(crate) async fn run_goal_driver(
                 let expired = router.inner.store.lock().await.expire_goal_native_followups(now_ms())?;
                 if expired {
                     router.notify_goal_reconcile();
+                }
+                if audits.is_empty() {
+                    let router = router.clone();
+                    audits.spawn(async move { router.drive_goal_audits().await });
+                }
+            }
+            Some(joined) = audits.join_next(), if !audits.is_empty() => {
+                if let Ok(Err(error)) = joined {
+                    crate::logging::record(&router.secret_policy_snapshot(), "daemon.goal_audit_read_failed", &[], Some(&error));
                 }
             }
             changed = shutdown.changed() => {
@@ -1539,6 +1557,9 @@ async fn spawn_auto_round(
         tokio::spawn(async move {
             mail_router.reoffer_mail_notice(&mail_agent).await;
         });
+    }
+    if eliot_store::Store::goal_event_is_round_bookkeeping(&event.kind) {
+        return;
     }
     if !idle_goal_is_eligible(router, &agent, event.generation).await {
         return;

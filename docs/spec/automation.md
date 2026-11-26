@@ -1974,7 +1974,7 @@ toward no-progress only when both streams were captured in full. A continuation
 presents the observation in a quoted data fence with its capture summary outside
 the fence. The Goal and check policy govern the next action. The commit then
 applies **all** results in one transaction only if generation, revision and
-round still match — the key unconsumed, no newer Agent event (past an idle
+round still match — the key unconsumed, no newer round-relevant event (past an idle
 key, or since the claim for a slot), sources still healthy, no open or
 unknown command, no active turn, no pending request — together with an
 optional ordinary `send` continuation admitted by the same transaction:
@@ -2203,12 +2203,16 @@ audit cycle instead of waiting for the Owner:
    `max_audits = 0`, the Goal stays blocked for the Owner as before. The Owner
    inbox then lists the audit history with each auditor's text.
 
-The audit only reads: it never writes, reverts or deletes. Scope findings
+Audits use read-only worktree evidence. OpenCode permits reading the worktree's
+root directory listing and denies other native tools, including arbitrary file
+reads and searches. Its session readback must match that exact policy before
+the adapter reports readiness. Scope findings
 (`scope_violation`, `check_input_changed`, `scope_unverified`) are safety stops and
 still wait for the Owner. `check_unrunnable` waits for a corrected check. An unknown
-audit or handoff outcome holds the cycle and is never replayed. A missing `audit`
-role, or a successor that routing cannot admit, leaves the Goal blocked with that
-reason. An Owner pause or clear ends the cycle.
+audit or handoff outcome holds the cycle and is never replayed. The 30-second
+Goal driver tick retries a proven pre-admission refusal and retains its reason
+for the Owner. An admitted failure ends that cycle. An Owner pause or clear
+fences the cycle and requests STOP for an already-starting or running auditor.
 
 ### Default Goal objective
 
@@ -2250,7 +2254,10 @@ skips cadenced Goals (slot-keyed), paused or terminal Goals, drifted
 generations, and anything while automation is draining; it waits while an
 active native Goal drives. The driver starts each automatic round in its own task
 and runs up to four across Goals. Automatic and explicit rounds share the same
-per-Goal single-flight marker. A Swarm note's admission and dispatch schedule no
+per-Goal single-flight marker. Git checkpoint receipts, advisory attention and
+automatic checker custody-closure receipts leave Goal round freshness unchanged
+and supply no new idle key. Retained spent keys from older versions still fence
+their idle points. A Swarm note's admission and dispatch schedule no
 round; its settlement re-offers the latest unspent idle key. After
 `stale_round`, the driver moves to the latest unspent idle key if it is strictly
 newer and sends it through the same gates, so no idle point runs twice and each
@@ -2268,7 +2275,7 @@ the rounds to settle their markers.
 Setting or resuming an enabled idle-keyed Goal also reconciles the
 retained exact-generation idle subject: the set/resume wakes the driver,
 which sweeps every active non-cadenced Goal bound to its Agent's current
-generation and reserves a round on the latest event only when that row
+generation and reserves a round only when the latest round-relevant event
 still names an idle event of that generation. The sweep uses the same
 reservation as a bus event — same scope, enablement and single-flight —
 without re-offering mail, and waits for a real event when the

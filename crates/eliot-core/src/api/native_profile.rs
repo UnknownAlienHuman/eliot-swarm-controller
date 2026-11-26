@@ -19,7 +19,7 @@ pub struct NativeProfileInput<'a> {
     pub auth_integration: Option<&'a str>,
     pub mode: Option<&'a str>,
     pub dangerously_skip_permissions: Option<bool>,
-    pub local_provider: Option<&'a crate::local_provider::LocalProvider>,
+    pub local_provider: Option<&'a Value>,
 }
 
 pub struct NativeProfileRefusal {

@@ -536,19 +536,24 @@ impl Component for Header {
         // Goal: always where the owner looks first; its words are the
         // goal's state once one is set.
         let goal: Option<View> = (input.goal_offered || input.goal.is_some()).then(|| {
-            let words = input.goal.clone().unwrap_or_else(|| "Goal".to_owned());
-            let (name, tooltip) = match (&input.goal, input.goal_unknown) {
-                (Some(_), _) => (words.clone(), "Edit, pause or clear this task's goal"),
+            // An unknown state is said on the button itself, not only in
+            // its name (§4.2: never hidden, never colour alone).
+            let (words, tooltip) = match (&input.goal, input.goal_unknown) {
+                (Some(goal), _) => (goal.clone(), "Edit, pause or clear this task's goal"),
                 (None, Some(GoalUnknown::NotRead)) => (
-                    format!("{words} (not read yet)"),
+                    "Goal · not read yet".to_owned(),
                     "This task's goal is not read yet: open Goal to read it",
                 ),
                 (None, Some(GoalUnknown::Failed)) => (
-                    format!("{words} (could not be read)"),
+                    "Goal · not readable".to_owned(),
                     "This task's goal could not be read: open Goal to try again",
                 ),
-                (None, None) => (words.clone(), "Set a goal this task keeps working toward"),
+                (None, None) => (
+                    "Goal".to_owned(),
+                    "Set a goal this task keeps working toward",
+                ),
             };
+            let name = words.clone();
             controls::bar_button(false)
                 .automation_name(name)
                 .on_click(context.message(Message::Chat(ChatMsg::AgentMenu(Action::Goal))))

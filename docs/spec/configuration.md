@@ -122,7 +122,9 @@ each path every second until a failure or a recurring grant raises that path's
 retry delay, starting at two seconds and doubling up to 30 seconds. Log rotation requires a validated
 `logs/` ACL. Managed plugin homes and worktrees are repaired only when exact daemon
 creation or retained provenance identifies the path and a safe lifecycle check permits
-repair. Adopted workspaces and active worktree fences are outside this scope. Existing
+repair. New daemon-owned managed directories are created with the protected DACL,
+so ordinary creation reports no repair; the lifecycle check stays the safety net
+for later changes. Adopted workspaces and active worktree fences are outside this scope. Existing
 descendants change only at their owned lifecycle checks or through normal NTFS
 inheritance; the daemon does not recursively rewrite them. Eliot private files are
 validated under the file rules above; ordinary worktree files are not treated as
@@ -659,10 +661,12 @@ models = [{ id = "test-model", context_limit = 32768, output_limit = 4096 }]
 segments). Swarm generates the isolated
 OpenCode provider entry from `local_provider`: `base_url` becomes
 `settings.baseURL`, `api_key_env` becomes a `{env:NAME}` runtime reference,
-and each model record supplies its native model limits. The typed shape is
-validated at freeze, retained admission, and before every write; unknown
-fields, literal credentials, URL userinfo/query/fragment components, and
-substitutions are refused. `api_key_env` must be listed in `pass_env`, and
+and each model record supplies its native model limits. OpenCode's registered
+profile capability decodes and validates the payload, including the npm package
+name, at save and launch admission. Retained startup uses the same adapter-owned
+contract and checks the provider before each isolated config write. It refuses
+unknown fields, literal credentials, URL userinfo/query/fragment components, and
+substitutions. `api_key_env` must be listed in `pass_env`, and
 `auth_integration` must be absent, so no unrelated canonical credential is
 imported. The adapter sets `OPENCODE_CONFIG_PROJECT_DISABLE` and strips
 `OPENCODE_CONFIG`, `OPENCODE_CONFIG_CONTENT`, and `OPENCODE_CONFIG_DIR` for the

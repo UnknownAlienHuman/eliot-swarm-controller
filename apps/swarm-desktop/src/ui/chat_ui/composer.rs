@@ -581,7 +581,12 @@ impl DesktopApp {
         let content: View = if applies {
             controls::command_content(
                 controls::glyph::USAGE,
-                &format!("{}% left", window.remaining),
+                &if remaining < crate::controls::QUOTA_LOW {
+                    // Low in words too, never by colour alone (§4.2).
+                    format!("{}% left · low", window.remaining)
+                } else {
+                    format!("{}% left", window.remaining)
+                },
                 false,
             )
         } else {

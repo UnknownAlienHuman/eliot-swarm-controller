@@ -50,6 +50,21 @@ commits `session.native_unclassified` with only a static site and the sanitized 
 method tag; it does not persist the vendor payload, infer a lifecycle fact, or stop the
 stream. Notifications explicitly naming another session are ignored.
 
+Observed 2026-11-26 against installed Muse Code `1.4.25-R9361.1`, the self-updating
+host emits streaming notifications the 1.4.0-era mapping never modeled. Two carry no
+committable lifecycle state and are explicitly ignored: `item/delta` (stable-surface
+streaming deltas; deltas never bump the item revision and the authoritative terminal
+`item/completed` carries every committed tool fact) and `turn/toolBatchSubmitted`
+(experimental-surface scheduling signal; the submitted calls arrive as `item/started`).
+Session snapshots without a
+bus fact — `session/todoListChanged`, `session/statusChanged`, `session/branchChanged`
+— and the corroborating `turn/foregroundCompleted` terminal keep the
+`session.native_unclassified` record above: unknown-safe, no lifecycle folded, with
+the method tag preserved for a future mapping. A normalization failure names the
+method and the error code (`Muse {method} notification could not be normalized
+({code})`, buffered frames likewise), so the rejection diagnostics and the retained
+failure snapshot name the failing frame instead of an empty snapshot.
+
 On live events, unknown `health`, `noneReason`, `turn/completed.terminal`, and
 workflow-child terminal values decode as `Other` and produce the same neutral diagnostic
 with the native schema tag. An unknown health value does not change source health.
@@ -106,6 +121,17 @@ native refusal alone does not prove a contract mismatch or an upstream failure.
 | configure | `session/setModel` carries the catalogue's provider and profile between turns. Its exact acknowledgment and `session/read` prove selector admission before the overlay commits. Effort travels in per-turn `reasoningEffort` in `turn/start`. An effort-only revision keeps the last selector. |
 | goal | native set/edit/pause/resume/clear where installed schema supports them |
 | compact/fork/background | native-only, advertised after implementation |
+
+Muse 1.4.25's offline `muse schema generate-json-schema` export defines
+`session/compact` as manual compaction with an admission-only acknowledgment;
+the durable result is an `item/completed` notification for kind `compaction`.
+Its stable `itemId`, terminal `outcome`, `trigger` (`manual` or `auto`), and
+optional owning `turnId` provide the correlation. The adapter emits
+`session.context.compacted` only for `outcome=compacted`, using that exact item
+identity. A `noop`, failed or cancelled outcome emits no compaction fact. A
+manual result for the latest completed turn queues the task card for the next
+input; an exact active-turn result remains bound to that turn. Context usage
+changes alone are never treated as compaction.
 
 The Muse 1.4.25 MSP schema documents that an omitted `session/setModel`
 `profileId` means no profile. In #949, the retained Contributor selector
@@ -310,7 +336,17 @@ A promptless resume can open another generation without creating a turn.
 Resume preflight compares the newest native turn with the newest retained
 turn on the same Agent, including earlier generations of that session.
 When the Store has no turn, the native readback must prove the session ran
-none. The Owner can inspect the refusal with `swarm why AGENT` and use
+none. When the retained turn is itself `unknown` (for example a turn
+interrupted by daemon death), an exact id match with the newest native turn
+— even though that native turn is the interrupted turn rather than a
+terminal one — resumes the session for new input only: the retained unknown
+turn stays unknown for Owner resolution and the interrupted effect is never
+replayed. Any other native difference still refuses. Late native facts that
+name the retained unknown turn after resume replay expected history: the
+adapter names them as gaps without associating, committing, or replaying
+them, and they never fail readiness, so the resuming generation still opens
+for new input. The Owner can inspect
+the refusal with `swarm why AGENT` and use
 `swarm switch AGENT --generation N` once any unknown work is settled.
 
 [Daemon restart continuation](../spec/configuration.md#agent-restart-policy)
@@ -471,9 +507,15 @@ with the Codex adapter's DTO fields (`command_id`, `turn_id`, `item_id`,
 session/turn while the turn runs ([`NativeItem`](../../plugins/muse/src/native/types.rs)).
 `callId`, `args` and result payloads are never persisted. `item/updated`
 folds no per-delta events; the authoritative terminal `item/completed` carries
-every committed tool fact. Turn-less `userShell` (the one kind outside any
-turn) stays unmapped, as do `agentMessage` (already `message.completed`),
-`workflow` (the workflow-child observer above) and unknown future kinds.
+every committed tool fact. An update bound to another turn (stale replay, batch
+race on the self-updating 1.4.25 host) therefore carries no committable state
+and is explicitly ignored instead of gapping the source; only the exact active
+turn falls through, and a foreign session still gaps. This is the 2026-11-26
+production lesson: one such misbound `item/updated` latched the source unknown,
+rejected every later send, and left an empty diagnostic snapshot. Turn-less
+`userShell` (the one kind outside any turn) stays unmapped, as do `agentMessage`
+(already `message.completed`), `workflow` (the workflow-child observer above)
+and unknown future kinds.
 These committed facts advance liveness model progress like Codex tool events;
 CPU alone still never counts.
 

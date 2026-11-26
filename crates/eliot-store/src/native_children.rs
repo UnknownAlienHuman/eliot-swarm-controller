@@ -168,6 +168,39 @@ pub(super) fn activity_from_facts(
     })
 }
 
+pub(super) fn archive_blocker(connection: &Connection, agent: &Agent) -> Result<Option<String>> {
+    use NativeChildActivityState::{Lost, Running, Unknown};
+    let Some(state) = agent.activity.as_ref().map(|activity| activity.state) else {
+        return Ok(None);
+    };
+    let detail = match state {
+        Running => "has an open native turn. Wait for it to finish",
+        Lost => "has an open native turn whose source is unavailable",
+        Unknown => "has no confirmed native turn completion",
+        _ => return Ok(None),
+    };
+    let mut message = format!("{} generation {} {detail}", agent.id, agent.generation);
+    if matches!(state, Lost | Unknown) {
+        let producer: Option<(i64, i64)> = connection
+            .query_row(
+                "SELECT r.producer, r.producer_generation FROM native_child_registrations r
+                 JOIN agents p ON p.id = r.producer AND p.generation = r.producer_generation
+                 WHERE r.child = ?1 AND p.state NOT IN ('stopped', 'failed', 'lost')",
+                [parse_agent_id(&agent.id)?],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(sql_error)?;
+        if let Some((producer, generation)) = producer {
+            message.push_str(&format!(
+                ". To end the observation, run swarm stop {} --generation {generation}",
+                format_agent_id(producer)
+            ));
+        }
+    }
+    Ok(Some(message))
+}
+
 fn source_healthy(connection: &Connection, agent: i64, generation: i64) -> Result<bool> {
     connection
         .query_row(
@@ -218,6 +251,10 @@ pub(super) fn native_progress_for_page(
 }
 
 impl Store {
+    pub fn native_child_archive_blocker(&self, agent: &Agent) -> Result<Option<String>> {
+        archive_blocker(&self.connection, agent)
+    }
+
     /// A constant-time stamp for all committed activity changes in this cohort.
     pub fn native_children_revision(&self, manager: &str, generation: i64) -> Result<Option<i64>> {
         self.connection.query_row(
