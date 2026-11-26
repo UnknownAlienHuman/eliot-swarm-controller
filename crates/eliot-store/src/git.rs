@@ -1,6 +1,107 @@
 use super::*;
 use std::collections::BTreeSet;
 
+pub(super) fn recover_ended_git_sources_tx(
+    tx: &Transaction<'_>,
+    now: i64,
+    events: &mut Vec<Event>,
+) -> Result<()> {
+    let mut statement = tx
+        .prepare(
+            "SELECT s.agent, s.generation FROM source_state s JOIN agents a ON a.id=s.agent
+             WHERE s.source='git' AND s.state='open' AND a.observe_only=0 AND s.generation>0
+               AND (s.generation<a.generation OR
+                    (s.generation=a.generation AND a.state IN ('stopped','lost','failed')))
+               AND (s.agent,s.generation)>(?1,?2)
+             ORDER BY s.agent,s.generation LIMIT ?3",
+        )
+        .map_err(sql_error)?;
+    let mut after = (0, 0);
+    loop {
+        let page = statement
+            .query_map(params![after.0, after.1, MAX_PAGE_ENTRIES as i64], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .map_err(sql_error)?
+            .collect::<rusqlite::Result<Vec<(i64, i64)>>>()
+            .map_err(sql_error)?;
+        let Some(last) = page.last() else {
+            return Ok(());
+        };
+        after = *last;
+        for (agent, generation) in page {
+            if capacity::has_exact_restart_custody_tx(tx, agent, generation)?
+                || capacity::owned_exit_proof_tx(tx, agent, generation)?.is_complete()
+            {
+                events.extend(close_ended_git_source_tx(tx, agent, generation, now)?);
+            }
+        }
+    }
+}
+
+/// Call only with exact exit evidence for an ended generation. Preserve the
+/// committed coverage and any gap. A retained hint still needs the ordinary
+/// readback or an explicit unavailable interval before it can be acknowledged.
+pub(super) fn close_ended_git_source_tx(
+    tx: &Transaction<'_>,
+    agent: i64,
+    generation: i64,
+    now: i64,
+) -> Result<Option<Event>> {
+    let Some(source) = load_source_state(tx, agent, generation, GIT_SOURCE)? else {
+        return Ok(None);
+    };
+    if source.state != "open" {
+        return Ok(None);
+    }
+    let source = match require_git_source(tx, agent, generation) {
+        Ok(source) => source,
+        Err(error) if error.code == "source_integrity" => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let Ok(cursor) = git_source_cursor(&source) else {
+        return Ok(None);
+    };
+    if pending_git_hints(tx, agent, generation, cursor)? {
+        return Ok(None);
+    }
+    write_git_source_status_tx(tx, agent, generation, &source, "stale", true, now)
+}
+
+pub(super) fn write_git_source_status_tx(
+    tx: &Transaction<'_>,
+    agent: i64,
+    generation: i64,
+    source: &SourceStateRecord,
+    health: &str,
+    closed: bool,
+    now: i64,
+) -> Result<Option<Event>> {
+    let state = if closed { "closed" } else { &source.state };
+    if state == source.state && health == source.health {
+        return Ok(None);
+    }
+    db!(tx.execute(
+        "UPDATE source_state SET state = ?1, health = ?2, updated_at = ?3
+         WHERE agent = ?4 AND generation = ?5 AND source = 'git'",
+        params![state, health, now, agent, generation],
+    ));
+    insert_daemon_event(
+        tx,
+        now,
+        if state != source.state {
+            "source.closed"
+        } else {
+            "source.health"
+        },
+        "source",
+        Some(agent),
+        Some(generation),
+        json!({"source": GIT_SOURCE, "state": state, "health": health}),
+    )
+    .map(Some)
+}
+
 impl Store {
     pub fn git_base_notice_sent(&self, thread: &str) -> Result<bool> {
         self.connection

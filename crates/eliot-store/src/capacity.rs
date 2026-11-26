@@ -799,6 +799,11 @@ impl Store {
                     }),
                 )?);
             }
+            if !orphan_possible {
+                events.extend(git::close_ended_git_source_tx(
+                    &tx, agent_num, generation, now,
+                )?);
+            }
             commit_transaction(tx, &self.write_faulted).map(|()| events)
         })();
         self.fault_on_persistence_error(&result);
@@ -1540,15 +1545,29 @@ fn has_native_source_drain_tx(
     }
     // Exact restart reconciliation revokes the old publisher and commits the
     // same closed-source fact. Degraded restart evidence cannot supply it.
+    let owned_drain: bool = connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM owned_exits WHERE agent = ?1 AND generation = ?2)",
+            params![agent, generation],
+            |row| row.get(0),
+        )
+        .map_err(sql_error)?;
+    Ok(owned_drain || has_exact_restart_custody_tx(connection, agent, generation)?)
+}
+
+pub(super) fn has_exact_restart_custody_tx(
+    connection: &Connection,
+    agent: i64,
+    generation: i64,
+) -> Result<bool> {
     connection
         .query_row(
-            "SELECT CASE WHEN EXISTS(SELECT 1 FROM owned_exits WHERE agent = ?1 AND generation = ?2)
-              THEN 1 ELSE EXISTS(
-                  SELECT 1 FROM events INDEXED BY events_generation_custody
-                  WHERE agent=?1 AND generation=?2 AND kind='capacity.released'
+            "SELECT EXISTS(
+                SELECT 1 FROM events INDEXED BY events_generation_custody
+                WHERE agent=?1 AND generation=?2 AND kind='capacity.released'
                   AND json_extract(data,'$.reason')='restart_custody_closed'
                   AND json_extract(data,'$.orphan_possible')=0
-              ) END",
+            )",
             params![agent, generation],
             |row| row.get(0),
         )
