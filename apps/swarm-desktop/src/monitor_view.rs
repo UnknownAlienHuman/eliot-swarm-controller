@@ -680,9 +680,12 @@ fn head_row(narrow: bool) -> View {
                 .keyed_children(crate::views::slots([
                     None,
                     Some(
+                        // Inset as a row's content is inside its stock button
+                        // (border 1 + padding 11), so each name stands over
+                        // its column.
                         Grid::new()
                             .grid_column(1)
-                            .margin(Thickness::xy(tokens::spacing::ROW, 0.0))
+                            .margin(Thickness::xy(tokens::spacing::INSET, 0.0))
                             .columns(row_columns(narrow))
                             .column_spacing(tokens::spacing::SM)
                             .keyed_children(crate::views::slots([
