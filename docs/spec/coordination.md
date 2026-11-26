@@ -697,7 +697,7 @@ claimed when real input dispatches. Pending notes do not count as work in the
 sidebar or Owner attention. Background fact-note admission skips archived Agents.
 [Archive and Delete](api.md#agent-and-daemon-read-views) withdraw undispatched
 Swarm notes atomically.
-After unarchive, Resume can queue a fresh task card for its new generation.
+Resume can queue a fresh task card for its new generation.
 
 ## Mailbox
 
@@ -1427,9 +1427,13 @@ definition/budgets/counters on B's generation with a new revision and no
 inherited idle/round key. It arrives paused, except that a
 [switch](#agent-switch-implemented) keeps an active Goal active and its first round
 waits for the turn of the brief. A cleared destination Goal row may supply the next revision;
-another destination Goal refuses. Completed/cleared source Goals stay historical; a
-blocked source Goal refuses until explicitly reset or cleared, so handoff cannot
-bypass its block. Without a transferable source Goal, B keeps its own Goal unchanged.
+another destination Goal refuses. Completed/cleared source Goals stay historical. A
+blocked source Goal moves only through its
+[audit continuation](automation.md#goal-audit-and-continuation): that handoff installs
+the same definition on B at a new revision with a fresh budget, active, with the
+auditor's text in the brief. A Goal blocked by a scope finding or `check_unrunnable`,
+or one whose audit cycles are spent, waits for the Owner's new `set` or clear; no
+other handoff moves a blocked Goal. Without a transferable source Goal, B keeps its own Goal unchanged.
 An Agent handoff transfers no Goal: both Goals stay put. A private additive used-turn
 baseline preserves consumed turns and charges each subsequent B turn immediately,
 including across another handoff. Cadence re-anchors at handoff; reserved continuations

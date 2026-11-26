@@ -58,10 +58,15 @@ impl Router {
     pub(super) async fn read_owner_inbox_counts(
         &self,
     ) -> Result<std::collections::BTreeMap<OwnerInboxKind, usize>> {
-        let path = self.inner.data_root.join("eliot.db");
+        // The desktop polls this constantly: reuse the warm pooled reader
+        // (prepared statements and page cache) instead of opening a fresh
+        // read-only connection per call. Same snapshot projection,
+        // confirmation and snooze rules as before.
+        let readers = Arc::clone(&self.inner.projection_readers);
         let confirmed = self.confirmed_stuck();
         tokio::task::spawn_blocking(move || {
-            Store::read_owner_inbox_counts(&path, super::now_ms(), &confirmed)
+            readers
+                .read(|store| store.owner_inbox_counts_from_snapshot(super::now_ms(), &confirmed))
         })
         .await
         .map_err(|_| Error::new("internal", "owner inbox count reader failed"))?

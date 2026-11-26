@@ -913,8 +913,9 @@ snake_case kind, subject, subject revision,
 age in milliseconds, one-line reason, optional recommended action and offered
 choices. An action names the existing method and JSON arguments that implement
 the choice. The projection includes harness requests, unknown command/turn
-outcomes, owner-required holds, blocked Goals,
-launch items waiting for the owner, #871 stuck objects, handoffs after a turn with
+outcomes, owner-required holds, blocked Goals (with their
+[audit history](automation.md#goal-audit-and-continuation): each cycle's audit and
+successor Agents and the auditor's text, bounded), launch items waiting for the owner, #871 stuck objects, handoffs after a turn with
 uncertain effects (`handoff`) and [work not recorded in Git](monitoring.md#work-recorded-in-git)
 (`work_not_in_git`). For a stuck Goal
 (`active_goal_without_round_or_timer`, #871, #904), the item offers a ready
@@ -1316,10 +1317,11 @@ before retrying Archive or Delete.
 The desktop offers Archive and Unarchive in the task row and header menus.
 Show archived in the sidebar includes archived tasks in the list.
 Unarchive applies the same state, turn, request and command guards and skips
-the custody check and note withdrawal. The flag is durable. Unarchive an Agent
-before sending input or resuming it. Admission of steer or explicit inject
-clears the flag for its target. Reattaching an archived observer opens a new
-`observe` source and clears the flag, so a live reader is never hidden.
+the custody check. The flag is durable. An explicit Owner Resume, or admission of
+steer or inject, atomically unarchives its target, including selector members,
+so new activity appears in the default list. Send and other Resume paths require
+an unarchived target. Reattaching an archived observer opens a new `observe` source and
+clears the flag, so a live reader is never hidden.
 `agent.list` accepts `archived:"exclude"` (default), `"only"` or `"include"`;
 totals and cursors use the same filter. The default also lists an archived ended
 (stopped, failed or lost) Agent while its custody is unresolved, as when an archived

@@ -961,6 +961,11 @@ the native checkpoint index, and the task card waits for the next input.
 When the transcript is replaced, Swarm resets the offset and step watermark
 and uses the completed record digest to avoid replaying retained checkpoints.
 The transcript summary stays in the native store.
+Every compaction fact, manual or automatic, active or idle, on every harness, queues
+one [task card](automation.md#inject-context-at-the-safe-point) carrying the Goal, or the first
+input when no Goal is set: in the active turn when the fact binds one, else for the
+next input. A harness that does not yet report its compaction (Claude Code and Muse
+automatic compaction) is a gap tracked by roadmap item A12, not an exception.
 An exactly associated OpenCode SSE execution terminal proves its status even when
 HTTP transcript enrichment is unavailable, including after the native server exits.
 Commit that status without final text or usage; unavailable enrichment is not a
