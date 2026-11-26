@@ -37,7 +37,7 @@
 //! function on the caller's runtime, bounded owned children, no spawned
 //! tasks, no import retry.
 
-use std::{ffi::OsStr, ffi::OsString, path::Path};
+use std::{ffi::OsStr, ffi::OsString, path::Path, time::Duration};
 
 use eliot_core::{Error, Result};
 use eliot_plugin::native_cli::{BoundedReadError, BoundedReadLabels, run_bounded};
@@ -49,8 +49,8 @@ use serde::Deserialize;
 )]
 use tokio::process::Command;
 use tokio::{
-    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
-    time::{Instant, timeout_at},
+    io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
+    time::{Instant, timeout, timeout_at},
 };
 
 /// Largest accepted export document. One integration's credential is small;
@@ -63,6 +63,8 @@ const MAX_LIST_BYTES: usize = 64 * 1024;
 
 /// Longest accepted integration selector, in bytes.
 const MAX_SELECTOR_BYTES: usize = 128;
+
+const CANONICAL_EXIT_GRACE: Duration = Duration::from_secs(2);
 
 /// One explicitly selected native integration (ID or name), validated but
 /// never defaulted. Deliberately without `Debug`: a caller bug must not be
@@ -202,46 +204,66 @@ pub async fn transfer_selected_integration(
             "OpenCode canonical auth server could not start",
         )
     })?;
-    let exported = match canonical_endpoint(&mut server, deadline).await {
-        Ok(url) => canonical_export(transfer, &url, &password, deadline).await,
-        Err(error) => Err(error),
-    };
-    // Both canonical readers have finished. Tokio's wait closes the stdin
-    // lease so OpenCode can shut down while the separate isolated import runs.
-    let retirement = async {
-        if matches!(timeout_at(deadline, server.wait()).await, Ok(Ok(status)) if status.success()) {
-            return Ok(());
-        }
-        let _ = kill_and_reap(&mut server).await;
-        Err(Error::new(
+    let stdout = server.stdout.take().ok_or_else(|| {
+        Error::new(
             "native_readback",
-            "OpenCode canonical auth server exit could not be confirmed cleanly",
-        ))
-    };
-    match exported {
-        Ok(secret) => {
-            let (imported, retired) = tokio::join!(
-                import_with_reconcile(transfer, &secret, deadline),
-                retirement
-            );
-            imported?;
-            retired
+            "OpenCode canonical auth server stdout was unavailable",
+        )
+    })?;
+    let mut output = BufReader::new(stdout);
+    let endpoint = canonical_endpoint(&mut output, deadline).await;
+    let complete_transfer = async {
+        let exported = match endpoint {
+            Ok(url) => canonical_export(transfer, &url, &password, deadline).await,
+            Err(error) => Err(error),
+        };
+        // Both readers are done. Tokio's wait closes the stdin lease while
+        // the isolated import runs. Any confirmed exit ends the lease.
+        let retirement = async {
+            if timeout(CANONICAL_EXIT_GRACE, server.wait())
+                .await
+                .is_ok_and(|result| result.is_ok())
+                || kill_and_reap(&mut server).await
+            {
+                return Ok(());
+            }
+            Err(Error::new(
+                "native_readback",
+                "OpenCode canonical auth server exit could not be confirmed",
+            ))
+        };
+        match exported {
+            Ok(secret) => {
+                let (imported, retired) = tokio::join!(
+                    import_with_reconcile(transfer, &secret, deadline),
+                    retirement
+                );
+                imported?;
+                retired
+            }
+            Err(error) => {
+                let _ = retirement.await;
+                Err(error)
+            }
         }
-        Err(error) => {
-            let _ = retirement.await;
-            Err(error)
+    };
+    // Discard later output throughout the lease so writes cannot block exit.
+    tokio::pin!(complete_transfer);
+    let mut sink = tokio::io::sink();
+    tokio::select! {
+        result = &mut complete_transfer => result,
+        _ = tokio::io::copy(&mut output, &mut sink) => {
+            drop(output);
+            complete_transfer.await
         }
     }
 }
 
-/// OpenCode 2.2.7+ uses a one-line JSON endpoint and an stdin EOF lease for
-/// its own standalone commands (packages/cli/src/services/standalone.ts).
-///
-/// Borrow stdout from the owned child so the pipe stays open after reading
-/// the bounded readiness line. The CLI readers authenticate separately
-/// before sending either credential request.
+/// OpenCode 2.4.1 emits one JSON readiness line and ends the lease at stdin EOF.
+/// Readiness: https://github.com/anomalyco/opencode/blob/v2.4.1/packages/cli/src/server-process.ts#L213-L220
+/// EOF: https://github.com/anomalyco/opencode/blob/v2.4.1/packages/cli/src/server-process.ts#L239-L246
 async fn canonical_endpoint(
-    server: &mut tokio::process::Child,
+    output: &mut (impl AsyncBufRead + Unpin),
     deadline: Instant,
 ) -> Result<String> {
     let _timing = super::startup::Step::new("auth_canonical_ready");
@@ -255,9 +277,8 @@ async fn canonical_endpoint(
             "OpenCode canonical auth server endpoint was unreadable",
         )
     };
-    let mut output = BufReader::new(server.stdout.as_mut().ok_or_else(unreadable)?.take(4096));
     let mut line = Vec::new();
-    timeout_at(deadline, output.read_until(b'\n', &mut line))
+    timeout_at(deadline, output.take(4096).read_until(b'\n', &mut line))
         .await
         .map_err(|_| {
             Error::new(

@@ -50,9 +50,11 @@ the selected integration. Canonical list and export run concurrently
 against one password-protected loopback `serve --stdio --port 0` in the
 generation Job. The [native standalone implementation](https://github.com/anomalyco/opencode/blob/v2.4.1/packages/cli/src/services/standalone.ts)
 uses this server mode and its JSON endpoint line for readiness. Swarm
-closes its stdin lease after both readers finish. The canonical server
-shuts down while the isolated import runs, and its exit is confirmed before
-the Agent server starts. There is no cross-launch credential cache.
+drains stdout after readiness and closes the stdin lease after both readers
+finish. The canonical server gets a two-second exit grace while the isolated
+import runs. If needed, Swarm kills and reaps it before the Agent server
+starts. A confirmed exit preserves the import outcome regardless of the
+lease server's exit status. There is no cross-launch credential cache.
 The selected document moves opaquely, in memory only, from canonical
 `auth export <selector> --server <loopback-url>` into isolated
 `auth import --standalone` under the
