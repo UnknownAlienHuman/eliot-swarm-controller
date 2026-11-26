@@ -888,15 +888,14 @@ fn prepare_delete_tree_tx(tx: &Transaction<'_>, members: &[i64]) -> Result<Vec<S
     ));
     if command_count <= MAX_DELETE_COMMANDS {
         // Include targetless admission ancestors, including a handoff nested
-        // inside a switch. Every command in the resulting set still has to
-        // pass the link check below.
+        // inside a switch. Shared ancestors are removed from this selection below.
         command_count += delete_db!(tx.execute(
             "WITH RECURSIVE selected(id) AS (
                  SELECT id FROM deleted_commands
                  UNION
                  SELECT p.id FROM selected s
                  JOIN commands c ON c.id=s.id JOIN commands p ON p.id=c.parent_command
-                 WHERE p.target IS NULL AND p.state='applied'
+                 WHERE p.target IS NULL AND p.state IN ('applied','failed','rejected','cancelled')
                    AND ((p.parent_command IS NULL AND (
                             (c.link_kind=?1 AND p.selector IS NOT NULL)
                          OR (c.link_kind='rule_action' AND p.verb IN ('rule','timer.run','rule.catch_up'))
@@ -918,42 +917,77 @@ fn prepare_delete_tree_tx(tx: &Transaction<'_>, members: &[i64]) -> Result<Vec<S
             "Agent command tree exceeds deletion bound",
         ));
     }
-    let crossing: bool = delete_db!(tx.query_row(
-        "SELECT EXISTS(
-             SELECT 1 FROM deleted_commands d JOIN commands c ON c.id=d.id
-             WHERE c.parent_command IS NOT NULL
-               AND c.parent_command NOT IN (SELECT id FROM deleted_commands)
-         ) OR EXISTS(
-             SELECT 1 FROM deleted_commands d JOIN commands c ON c.parent_command=d.id
-             WHERE c.id NOT IN (SELECT id FROM deleted_commands)
-         )",
+    command_count -= delete_db!(tx.execute(
+        "WITH RECURSIVE shared(id) AS (
+             SELECT p.id FROM deleted_commands d JOIN commands p ON p.id=d.id
+             WHERE p.target IS NULL AND EXISTS (
+                 SELECT 1 FROM commands c WHERE c.parent_command=p.id
+                   AND c.id NOT IN (SELECT id FROM deleted_commands))
+             UNION
+             SELECT p.id FROM shared s JOIN commands c ON c.id=s.id
+             JOIN commands p ON p.id=c.parent_command JOIN deleted_commands d ON d.id=p.id
+             WHERE p.target IS NULL
+         ) DELETE FROM deleted_commands WHERE id IN (SELECT id FROM shared)",
         [],
-        |r| r.get(0),
     ));
-    if crossing {
+    let crossing: Option<String> = delete_db!(
+        tx.query_row(
+            "SELECT p.id FROM deleted_commands d JOIN commands p ON p.id=d.id
+         WHERE EXISTS (SELECT 1 FROM commands c WHERE c.parent_command=p.id
+                       AND c.id NOT IN (SELECT id FROM deleted_commands))
+            OR EXISTS (SELECT 1 FROM switch_checkout_owners f
+                       WHERE f.switch_command IN (p.id,p.parent_command))
+         UNION ALL
+         SELECT p.id FROM deleted_commands d JOIN commands c ON c.id=d.id
+         JOIN commands p ON p.id=c.parent_command
+         WHERE p.id NOT IN (SELECT id FROM deleted_commands)
+           AND (p.state NOT IN ('applied','failed','rejected','cancelled')
+             OR p.target IS NOT NULL
+             OR EXISTS (SELECT 1 FROM switch_checkout_owners f
+                        WHERE f.switch_command IN (p.id,p.parent_command)))
+         LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+        .optional()
+    );
+    if let Some(command) = crossing {
         return Err(Error::new(
             "busy",
-            "command tree crosses the selected Agent tree",
+            format!(
+                "command {command} crosses the selected Agent tree and still needs its linked history"
+            ),
         ));
     }
     let latest: i64=tx.query_row("SELECT COALESCE(MAX(seq),0) FROM events WHERE agent IN (SELECT id FROM deleted_agents)",[],|r|r.get(0)).map_err(delete_sql_error)?;
     // Rules traverse the global log. Per-Agent sources consume only their own
     // generation's history; the stopped-and-drained guard already excludes
     // every live source in the selected tree.
-    let pinned: bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM rule_state WHERE enabled=1 AND (current_cursor<?1 OR retiring_cursor<?1))",[latest],|r|r.get(0)).map_err(delete_sql_error)?;
-    if pinned {
+    let pin: Option<(String, String)> = delete_db!(
+        tx.query_row(
+            "SELECT principal,rule FROM rule_state WHERE enabled=1
+         AND (current_cursor<?1 OR (retiring_cursor<?1 AND retiring_cursor<retire_through))
+         ORDER BY principal,rule LIMIT 1",
+            [latest],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()
+    );
+    if let Some((principal, rule)) = pin {
         return Err(Error::new(
             "busy",
-            "retained history is pinned by a live rule cursor",
-        ));
+            format!("retained history is pinned by a live rule cursor ({principal}/{rule}); retry after it catches up or remove the obsolete rule"),
+        ).with_where(AGENT_DELETE_RULE_CURSOR));
     }
     let ids: Vec<String> = tx
         .prepare(
             "WITH RECURSIVE tree(id,depth) AS (
                  SELECT c.id,0 FROM deleted_commands d JOIN commands c ON c.id=d.id
                  WHERE c.parent_command IS NULL
+                    OR c.parent_command NOT IN (SELECT id FROM deleted_commands)
                  UNION ALL
                  SELECT c.id,t.depth+1 FROM commands c JOIN tree t ON c.parent_command=t.id
+                 JOIN deleted_commands d ON d.id=c.id
                  WHERE t.depth<1000
              ) SELECT id FROM tree ORDER BY depth DESC",
         )
@@ -970,6 +1004,8 @@ fn prepare_delete_tree_tx(tx: &Transaction<'_>, members: &[i64]) -> Result<Vec<S
     }
     Ok(ids)
 }
+
+pub const AGENT_DELETE_RULE_CURSOR: &str = "store.agent_delete.rule_cursor";
 
 fn delete_tree_tx(tx: &Transaction<'_>, members: &[i64], now: i64) -> Result<()> {
     let ids = prepare_delete_tree_tx(tx, members)?;
@@ -1050,6 +1086,14 @@ fn delete_tree_tx(tx: &Transaction<'_>, members: &[i64], now: i64) -> Result<()>
     delete_db!(tx.execute(
         "DELETE FROM events WHERE agent IN (SELECT id FROM deleted_agents)",
         []
+    ));
+    // Keep every surviving child and its original ordinal. Readback must
+    // report a gap for the parent whose admitted expansion is now incomplete.
+    delete_db!(tx.execute(
+        "UPDATE commands SET children_pruned=1 WHERE id IN (
+             SELECT c.parent_command FROM deleted_commands d JOIN commands c ON c.id=d.id
+             WHERE c.parent_command NOT IN (SELECT id FROM deleted_commands))",
+        [],
     ));
     delete_db!(retention::delete_commands_tx(
         tx,

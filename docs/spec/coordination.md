@@ -277,6 +277,9 @@ bytes.
 eligible native sessions and managed worktrees before retiring the task records.
 It records cleanup outcomes before retiring ownership and keeps the task records
 if an attempted effect is refused or uncertain. Session cleanup runs first.
+After cleanup, the rule worker can consume its events before Delete retires the
+records. A settled switch or handoff shared with another tree keeps its parent
+receipt and surviving child links under the [Core retention contract](core.md#retention).
 If a selected session is kept or uncertain, pending worktrees in that task
 tree settle as `skipped(native_session_kept)`. This also applies to a
 `cleanup.apply` selection that includes both effects.

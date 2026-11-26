@@ -55,12 +55,7 @@ impl Router {
                         .await?;
                     require_agent_delete_cleanup(&plan, &response)?;
                 }
-                router.inner.store.lock().await.finish_agent_delete(
-                    &request.id,
-                    &request.agent,
-                    &agents,
-                    now_ms(),
-                )
+                router.finish_agent_deletion(&request, &agents).await
             }
             .await;
             if let Err(error) = &result
@@ -82,6 +77,38 @@ impl Router {
         .await
         .map_err(|_| Error::new("unknown", "Agent deletion did not report a settlement"))??;
         encoded(outcome)
+    }
+
+    async fn finish_agent_deletion(
+        &self,
+        request: &AgentDeleteRequest,
+        agents: &[Agent],
+    ) -> Result<AgentTreeResponse> {
+        let mut progress = self.progress_receiver();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let result = self.inner.store.lock().await.finish_agent_delete(
+                &request.id,
+                &request.agent,
+                agents,
+                now_ms(),
+            );
+            if Instant::now() >= deadline
+                || !result.as_ref().is_err_and(|error| {
+                    error.failure_where.as_deref() == Some(eliot_store::AGENT_DELETE_RULE_CURSOR)
+                })
+            {
+                return result;
+            }
+            // Recheck once at the deadline too, in case progress committed
+            // without a wake or arrived concurrently with the timeout.
+            if matches!(
+                tokio::time::timeout_at(deadline, progress.changed()).await,
+                Ok(Err(_))
+            ) {
+                return result;
+            }
+        }
     }
 
     async fn plan_agent_deletion(&self, agents: &[Agent]) -> Result<CleanupPlan> {

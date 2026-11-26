@@ -1273,12 +1273,15 @@ retains all history.
 
 Deletion requires every descendant stopped or failed, a detached external observer, or
 an ended native observation, all drained, and shares retention's leaf-first command row
-cleanup. Archive preserves retained unknown evidence; delete removes the tree's turns
+cleanup. Shared settled targetless parents keep the retained children and original
+ordinals. Removing any of their direct children marks their expansion incomplete in
+the same transaction. Archive preserves retained unknown evidence; delete removes the tree's turns
 and events without resolving them: no resolution is recorded and no `turn.resolved`
 event is emitted. The Store still removes dependent records in one transaction and
 retains mutation replies plus deleted command identities through the retry window. It advances
 the conservative retained-history floor before removing event rows, refusing a live rule
-cursor pin or an active or uncertain cleanup attempt. An unapplied cleanup review's
+cursor pin or an active or uncertain cleanup attempt. Rules can consume events
+committed by cleanup while Delete waits briefly to settle its reservation. An unapplied cleanup review's
 items for the deleted tree are superseded. Other Agents' Git/stream sources
 cannot pin the selected tree's events. An attached observer with an open source still
 prevents deletion under the drained-custody guard.

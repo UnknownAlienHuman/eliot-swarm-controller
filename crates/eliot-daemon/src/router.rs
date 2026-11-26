@@ -5133,8 +5133,8 @@ impl Router {
         };
         if !change.events.is_empty() {
             self.note_rule_refusals(principal, &change.events);
-            self.signal_progress();
         }
+        self.signal_progress();
         Ok(change.value)
     }
 

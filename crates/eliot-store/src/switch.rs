@@ -3012,9 +3012,21 @@ fn result_on(connection: &Connection, id: &str) -> Result<SwitchResponse> {
         );
     }
     if let Some(disposal_id) = &result.disposal_command {
-        let disposal = component(connection, id, disposal_id, 2)?.ok_or_else(|| {
-            Error::new("source_integrity", "switch successor stop is not retained")
-        })?;
+        let Some(disposal) = component(connection, id, disposal_id, 2)? else {
+            let pruned: bool = connection
+                .query_row(
+                    "SELECT children_pruned AND NOT EXISTS (SELECT 1 FROM commands WHERE id=?2)
+                 FROM commands WHERE id=?1",
+                    params![id, disposal_id],
+                    |row| row.get(0),
+                )
+                .map_err(sql_error)?;
+            return Err(if pruned {
+                Error::new("history_gap", "the switch successor stop was deleted")
+            } else {
+                Error::new("source_integrity", "switch successor stop is not retained")
+            });
+        };
         if disposal.verb != "stop"
             || result.created.as_ref().is_none_or(|agent| {
                 disposal.target.as_deref() != Some(&agent.agent)
