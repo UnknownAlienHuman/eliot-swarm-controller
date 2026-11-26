@@ -13,6 +13,12 @@ use serde::{Deserialize, Serialize};
 const MAX_GOAL_CHECK_HISTORY_ROWS: i64 = 8_192;
 const NATIVE_FOLLOWUP_WINDOW_MS: i64 = 5 * 60 * 1_000;
 const COST_BASE_PENDING: &str = "awaiting the active turn's session usage boundary";
+const GOAL_CHECK_CUSTODY_CLOSED: &str = "goal.check_custody_closed";
+const GOAL_ROUND_BOOKKEEPING: [&str; 3] = [
+    super::work_truth::GIT_CHECKPOINT,
+    GOAL_CHECK_CUSTODY_CLOSED,
+    core::api::ATTENTION_EVENT_KIND,
+];
 
 /// A Swarm note: an `inject` from a Swarm principal. An inject from the Owner
 /// or a manager is never one, whatever its delivery state.
@@ -1498,6 +1504,12 @@ impl Store {
             .and_then(|(seq, consumed)| (!consumed).then_some(seq)))
     }
 
+    /// Checkpoint receipts, checker closure and advisory attention neither
+    /// open an idle point nor invalidate a running check.
+    pub fn goal_event_is_round_bookkeeping(kind: &str) -> bool {
+        GOAL_ROUND_BOOKKEEPING.contains(&kind)
+    }
+
     /// Whether this committed event belongs to a Swarm note's lifecycle.
     pub fn goal_event_is_swarm_note(&self, seq: i64) -> Result<bool> {
         self.ensure_committed_reads()?;
@@ -1945,7 +1957,7 @@ impl Store {
                     events.push(insert_daemon_event(
                         &tx,
                         now,
-                        "goal.check_custody_closed",
+                        GOAL_CHECK_CUSTODY_CLOSED,
                         "goal",
                         Some(parse_agent_id(&request.agent)?),
                         Some(record.generation),
@@ -4457,11 +4469,24 @@ fn count_turns(connection: &Connection, agent_num: i64, generation: i64) -> Resu
 }
 
 fn max_agent_seq(connection: &Connection, goal: &GoalRow) -> Result<i64> {
+    // Older versions could use bookkeeping events as round keys. Keep those
+    // spent keys as fences so an upgrade cannot roll back to an older idle
+    // event and run its check again.
+    let committed_idle_seq = goal
+        .last_round_key
+        .as_deref()
+        .and_then(|key| key.strip_prefix("idle:"))
+        .and_then(|seq| seq.parse::<i64>().ok());
     let sql = format!(
         "SELECT COALESCE((
              SELECT seq FROM events INDEXED BY events_agent
              WHERE agent = ?1 AND generation = ?2
                AND NOT {SWARM_NOTE_EVENT_SQL}
+               AND (kind NOT IN (?5, ?6, ?7) OR seq IS ?8 OR EXISTS (
+                    SELECT 1 FROM goal_markers marker
+                    WHERE marker.agent = ?1 AND marker.generation = ?2 AND marker.mode = ?3
+                      AND marker.round_key_kind = 'idle' AND marker.round_key = events.seq
+               ))
                AND NOT (kind = 'goal.round'
                         AND json_extract(data, '$.outcome') = 'unknown'
                         AND (
@@ -4479,7 +4504,11 @@ fn max_agent_seq(connection: &Connection, goal: &GoalRow) -> Result<i64> {
                 goal.agent_num,
                 goal.generation,
                 goal.mode,
-                goal.state.round_reset_revision
+                goal.state.round_reset_revision,
+                GOAL_ROUND_BOOKKEEPING[0],
+                GOAL_ROUND_BOOKKEEPING[1],
+                GOAL_ROUND_BOOKKEEPING[2],
+                committed_idle_seq,
             ],
             |row| row.get(0),
         )
