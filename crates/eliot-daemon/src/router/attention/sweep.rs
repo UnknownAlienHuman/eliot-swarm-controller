@@ -46,8 +46,13 @@ pub(super) fn launch_sweep(
     tasks.spawn(async move {
         let _reset = SweepReset(running);
         let started = Instant::now();
-        if let Err(error) =
-            scan_attention_agents(&router, Arc::clone(&state), suspicion_window).await
+        if let Err(error) = scan_agents(
+            &router,
+            Arc::clone(&state),
+            suspicion_window,
+            ScanScope::Attention,
+        )
+        .await
         {
             crate::logging::record(
                 &eliot_core::SecretPolicy::default(),
@@ -461,17 +466,27 @@ impl Drop for IncidentReservation {
     }
 }
 
-async fn scan_attention_agents(
+#[derive(Clone, Copy)]
+enum ScanScope {
+    Attention,
+    All,
+}
+
+async fn scan_agents(
     router: &Router,
     state: Arc<Mutex<AttentionState>>,
     suspicion_window: Duration,
+    scope: ScanScope,
 ) -> Result<()> {
     let mut after: Option<String> = None;
     let mut checks = JoinSet::new();
     loop {
         let page = {
             let store = router.inner.store.lock().await;
-            store.list_attention_agents(after.as_deref(), PAGE_SIZE)?
+            match scope {
+                ScanScope::Attention => store.list_attention_agents(after.as_deref(), PAGE_SIZE)?,
+                ScanScope::All => store.list_agents(after.as_deref(), PAGE_SIZE)?.0,
+            }
         };
         if page.is_empty() {
             break;
@@ -482,7 +497,7 @@ async fn scan_attention_agents(
                 let _ = checks.join_next().await;
             }
             let key = AgentKey {
-                agent: agent.id.clone(),
+                agent: agent.id,
                 generation: agent.generation,
             };
             if has_queued_loss(&state, &key) {
@@ -503,7 +518,7 @@ async fn scan_attention_agents(
                 Trigger::Sweep,
             ));
         }
-        if after.is_none() || checks.len() >= MAX_SWEEP_CHECKS {
+        if matches!(scope, ScanScope::All) || after.is_none() || checks.len() >= MAX_SWEEP_CHECKS {
             tokio::task::yield_now().await;
         }
     }
@@ -541,7 +556,7 @@ async fn reconcile_attention_state(
         promote_pending_losses(&state);
     }
     if reconcile_all {
-        scan_all_agents(router, Arc::clone(&state), suspicion_window).await?;
+        scan_agents(router, Arc::clone(&state), suspicion_window, ScanScope::All).await?;
     }
 
     let pending = reserve_pending_checks(&state, MAX_SWEEP_CHECKS);
@@ -687,54 +702,6 @@ async fn retry_pending_deliveries(router: &Router, state: Arc<Mutex<AttentionSta
         });
     }
     while tasks.join_next().await.is_some() {}
-}
-
-async fn scan_all_agents(
-    router: &Router,
-    state: Arc<Mutex<AttentionState>>,
-    suspicion_window: Duration,
-) -> Result<()> {
-    let mut after: Option<String> = None;
-    let mut checks = JoinSet::new();
-    loop {
-        let page = {
-            let store = router.inner.store.lock().await;
-            store.list_agents(after.as_deref(), PAGE_SIZE)?.0
-        };
-        if page.is_empty() {
-            break;
-        }
-        after = page.last().map(|agent| agent.id.clone());
-        for agent in page {
-            while checks.len() >= MAX_SWEEP_CHECKS {
-                let _ = checks.join_next().await;
-            }
-            let key = AgentKey {
-                agent: agent.id,
-                generation: agent.generation,
-            };
-            if has_queued_loss(&state, &key) {
-                // Retained loss evidence is already queued (or re-paged
-                // above) with its exact identity; only `AgentLost`
-                // handling may report it.
-                continue;
-            }
-            if reserve_check(&state, &key) {
-                checks.spawn(run_check(
-                    router.clone(),
-                    Arc::clone(&state),
-                    key,
-                    suspicion_window,
-                    Trigger::Sweep,
-                ));
-            } else {
-                queue_check(&state, key, Trigger::Sweep);
-            }
-        }
-        tokio::task::yield_now().await;
-    }
-    while checks.join_next().await.is_some() {}
-    Ok(())
 }
 
 pub(super) fn reserve_incident(
