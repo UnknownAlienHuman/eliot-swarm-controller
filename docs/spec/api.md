@@ -1302,7 +1302,8 @@ An accepted or queued `swarm_note:*` context injection has no native claim.
 Archive cancels it in the same transaction as the flag change and records
 `delivery: "withdrawn"` and `reason: "agent_archived"` on the command.
 Ordinary accepted or queued Owner and Agent input still blocks archive.
-Dispatched input with an unsettled or unknown outcome also blocks archive.
+Dispatched input blocks archive while it is unsettled. Archive can preserve
+an ended Agent's unknown outcomes once the affected generations have drained.
 Archiving an ended member also needs its custody resolved: no unexited owned process,
 `unknown` artifact or open native source (Eliot's `os`/`git`/`workspace_process`
 observers may stay open). Archiving an external observer in `unknown` state

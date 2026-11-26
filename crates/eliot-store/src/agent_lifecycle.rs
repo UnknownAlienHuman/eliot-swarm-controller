@@ -126,8 +126,7 @@ fn current_agent_tree_tx(
     };
     let blocking_command_sql = format!(
         "SELECT c.id,c.state,c.generation FROM commands c WHERE c.target=?1
-           AND (c.state IN ('accepted','queued','dispatched') OR (c.state='unknown' AND
-               (NOT ?2 OR (?6 AND c.verb IN ('send','steer','inject','answer','approve','deny')))))
+           AND (c.state IN ('accepted','queued','dispatched') OR (c.state='unknown' AND NOT ?2))
            AND NOT {UNDISPATCHED_SWARM_NOTE_SQL}
            AND NOT (?3 AND c.state='unknown' AND (c.verb IN ('launch','stop') OR (c.verb='send' AND c.probe=1)))
            AND NOT (?4 AND c.generation<=?5 AND c.verb='send' AND c.turn_id IS NULL
@@ -225,8 +224,7 @@ fn current_agent_tree_tx(
                     allow_drained_unknowns,
                     probe_cleanup,
                     archived == Some(true),
-                    row.generation,
-                    archived.is_some()
+                    row.generation
                 ],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
