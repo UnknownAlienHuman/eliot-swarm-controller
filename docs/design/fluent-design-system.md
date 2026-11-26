@@ -169,7 +169,7 @@
 | Неизвестный исход | Предупреждение и явный текст | Outcome unknown |
 | Очередь | Нейтральный значок ожидания + причина | Waiting for a free slot |
 | Удержание провайдера | Предупреждение с provider и условием снятия | Limit reached · resets at 14:20 |
-| Нет данных | `—` с доступным объяснением | Context unavailable |
+| Нет данных | `—` либо одно название величины с доступным объяснением | Not reported by this harness |
 | Данные устарели | Возраст/состояние связи | Last read 3 min ago |
 
 Цвет не является единственным носителем смысла. CPU activity не означает прогресс модели; отсутствие событий не означает завершение. Числа `0`, `100%` и `No changes` показываются только при соответствующем подтверждённом значении. [R8]
@@ -475,7 +475,7 @@ Stop turn означает interrupt текущего turn. Stop Agent озна�
 
 Model/Effort используют общий picker из §8.3. Если выбранный harness допускает смену конфигурации только в idle, во время работы показывать причину недоступности и доступный handoff. Access запущенной сессии не меняется косметическим toggle: изменение полномочий проходит через поддерживаемый lifecycle/handoff.
 
-Context — небольшой текст `Context 54%` или значение tokens с tooltip о scope и свежести. ProgressBar допустим только при известном denominator. При отсутствии надёжных данных — `Context unavailable`, а не 0%. Compaction отображается по native evidence. Provider quota сюда не помещать. [R8]
+Context — небольшой текст `Context 54%` при известном окне, иначе число tokens (`Context 54k tokens`), с tooltip о tokens и свежести. ProgressBar допустим только при известном denominator. Пока harness не сообщает tokens — просто `Context` с tooltip `Not reported`, а не 0%; кнопка по-прежнему ведёт в Details. Compaction отображается по native evidence. Provider quota сюда не помещать. [R8]
 
 ## 10. Решения и Inbox
 
