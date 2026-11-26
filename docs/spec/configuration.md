@@ -919,6 +919,8 @@ and exited-child process windows are positive integers. `interval_seconds` allow
 enable pruning of closed command trees and expired acknowledged or legacy
 advisory mail, respectively.
 The [Core retention contract](core.md#retention) defines the protected records.
+The commands window leaves the first Owner message of each Agent tree root
+and chat available, including the original command and its input text.
 Command and write
 bindings always outlive the 24-hour retry window plus the 5-minute allowed
 clock-skew margin regardless of `commands_days`, so a pruned id resubmits as

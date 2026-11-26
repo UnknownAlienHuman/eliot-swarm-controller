@@ -1161,7 +1161,17 @@ gap and handoff ACK even when ordinary event rows expire.
 Retain parent/child command sets while required by open work or the supported history
 window; prune the set transactionally, children before parent, so callers never see a
 partly pruned expansion. Keep any set containing accepted, queued, dispatched or unknown
-work. Each pass resumes a persistent keyset cursor past the last examined expired
+work. Keep the first Owner message for each Agent tree root and chat, including its
+command row and stored input. Pin the launch with text, or the first admitted Owner
+SEND when there is no such launch, in the same transaction as admission. The pin
+survives generation changes and archival. Upgrades pin the oldest eligible message
+still retained. When only the first-message pin remains, detach the pinned rows and
+prune the other members in the same transaction. A surviving parent whose expansion
+expired reports `history_gap` for `command.children`.
+`agent.get` and `swarm show` expose the full message under the existing command read
+scope with the same native-value redaction as observation pages. The bounded preview
+used by the desktop header follows Agent list scope.
+Each pass resumes a persistent keyset cursor past the last examined expired
 root (wrapping only once the eligible set is exhausted) instead of restarting at
 the oldest root, and examines at most a bounded number of candidates per pass;
 each candidate walks one bounded breadth-first subtree over the

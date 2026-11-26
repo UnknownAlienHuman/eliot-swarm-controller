@@ -33,7 +33,7 @@ impl Store {
         let mut rows = vec![
             events,
             processes(db, cutoffs.processes)?,
-            commands(db, cutoffs.commands)?,
+            commands(db, cutoffs.commands, self.has_first_owner_message)?,
         ];
         let plan_cutoff = cleanup_metadata_cutoff(now);
         let expiring_plans = format!(
@@ -326,7 +326,11 @@ fn processes(db: &Connection, cutoff: Option<i64>) -> Result<RetentionPreviewRow
     Ok(result)
 }
 
-fn commands(db: &Connection, cutoff: Option<i64>) -> Result<RetentionPreviewRow> {
+fn commands(
+    db: &Connection,
+    cutoff: Option<i64>,
+    has_first_owner_message: bool,
+) -> Result<RetentionPreviewRow> {
     let Some(cutoff) = cutoff else {
         return summary(
             db,
@@ -345,11 +349,17 @@ fn commands(db: &Connection, cutoff: Option<i64>) -> Result<RetentionPreviewRow>
     let mut roots = select.query(params![cutoff, ALL_ROWS]).map_err(sql_error)?;
     while let Some(root) = roots.next().map_err(sql_error)? {
         let root: String = root.get(0).map_err(sql_error)?;
-        if let Some(members) = bounded_command_set(db, &root)? {
+        if let Some(members) = bounded_command_set(db, &root, has_first_owner_message)? {
             if let Some(reason) = command_set_protection(&members, cutoff) {
                 *kept.entry(reason.to_owned()).or_insert(0) += members.len() as i64;
             } else {
-                deleted.extend(members.into_iter().map(|m| m.id));
+                for member in members {
+                    if member.first_owner_message_ref {
+                        *kept.entry("first_owner_message".to_owned()).or_insert(0) += 1;
+                    } else {
+                        deleted.insert(member.id);
+                    }
+                }
             }
         } else {
             let members = count(

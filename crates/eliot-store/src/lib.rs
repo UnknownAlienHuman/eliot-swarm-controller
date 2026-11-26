@@ -513,6 +513,7 @@ struct SnapshotAgentCache {
 
 pub struct Store {
     connection: Connection,
+    has_first_owner_message: bool,
     write_faulted: Cell<bool>,
     /// One exact autonomy response for this pooled connection. SQLite's
     /// connection-local data_version invalidates it; no TTL is involved.
@@ -591,8 +592,18 @@ impl Store {
         connection
             .execute_batch("PRAGMA query_only = ON; BEGIN DEFERRED;")
             .map_err(sql_error)?;
+        // A read-only stand can contain an older Store, which it cannot migrate.
+        let has_first_owner_message = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('agents')
+                               WHERE name = 'first_owner_command')",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(sql_error)?;
         Ok(Self {
             connection,
+            has_first_owner_message,
             write_faulted: Cell::new(false),
             autonomy_cache: RefCell::new(None),
             fleet_summaries: RefCell::new(None),
@@ -681,6 +692,7 @@ impl Store {
 
         let mut store = Self {
             connection,
+            has_first_owner_message: true,
             write_faulted: Cell::new(false),
             autonomy_cache: RefCell::new(None),
             fleet_summaries: RefCell::new(None),
@@ -2421,6 +2433,28 @@ impl Store {
     /// Read the retained SEND expansion of a start command.
     pub fn get_linked_send(&self, parent: &str) -> Result<Option<Command>> {
         load_linked_command(&self.connection, parent)
+    }
+
+    /// Original Owner input pinned by a root or chat, across generations.
+    pub fn first_owner_message_command(&self, agent: &str) -> Result<Option<Command>> {
+        self.ensure_committed_reads()?;
+        if !self.has_first_owner_message {
+            return Ok(None);
+        }
+        let id: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT first_owner_command FROM agents WHERE id = ?1",
+                [parse_agent_id(agent)?],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(sql_error)?
+            .flatten();
+        match id {
+            Some(id) => load_command(&self.connection, &id),
+            None => Ok(None),
+        }
     }
 
     /// Exact current-generation start, including a failed launch with no turn.

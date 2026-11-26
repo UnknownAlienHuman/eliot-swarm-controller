@@ -623,6 +623,9 @@ pub(super) fn admit_selector_expansion(
                 "new selector child could not be bound to its parent",
             ));
         }
+        if principal == "owner" && request.verb == "send" {
+            admission::pin_first_owner_message_tx(tx, child_id)?;
+        }
     }
     let command = load_command(tx, &request.id)?.ok_or_else(|| {
         Error::new(

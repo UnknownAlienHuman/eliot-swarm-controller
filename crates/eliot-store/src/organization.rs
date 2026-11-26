@@ -387,6 +387,7 @@ struct GroupRead<'a> {
     now: i64,
     /// The search (`chat.organization` `query`), or `None`.
     query: Option<&'a str>,
+    has_first_owner_message: bool,
 }
 
 impl GroupRead<'_> {
@@ -402,7 +403,11 @@ impl GroupRead<'_> {
         }
         format!(
             " AND {}",
-            fleet::agent_search_predicate("a", (first..first + words).map(|n| format!("?{n}")))
+            fleet::agent_search_predicate(
+                "a",
+                (first..first + words).map(|n| format!("?{n}")),
+                self.has_first_owner_message,
+            )
         )
     }
 
@@ -597,6 +602,7 @@ impl Store {
             watermark,
             now,
             query: request.query.as_deref(),
+            has_first_owner_message: self.has_first_owner_message,
         };
         if let Some(project) = request.project.as_deref() {
             return self.single_project_organization(

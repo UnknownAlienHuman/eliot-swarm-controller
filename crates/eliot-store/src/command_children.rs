@@ -1,8 +1,8 @@
 //! Bounded child-set readback for retained command expansions.
 //!
 //! Owning contract: `command.children` in docs/spec/api.md. Retention prunes
-//! whole parent/child sets, children before parent (docs/spec/core.md#retention),
-//! so a retained parent always pages its complete fixed set in ordinal order.
+//! parent/child sets atomically (docs/spec/core.md#retention). A first-message
+//! parent whose expansion expired reports a gap.
 //! The caller loads the parent and authorizes it (same as `command.get`)
 //! before paging, so cursor membership is never checked for an unauthorized
 //! caller. An absent parent id whose ULID time is older than the retry window
@@ -47,11 +47,21 @@ impl Store {
         if after.is_some_and(|cursor| cursor.trim().is_empty()) {
             return Err(Error::new("invalid", "child cursor must be a non-empty id"));
         }
-        if load_command_record(&self.connection, &parent.id)?.is_none() {
-            return Err(Error::new(
-                "not_found",
-                format!("command {} was not found", parent.id),
-            ));
+        let children_pruned = if self.has_first_owner_message {
+            "SELECT children_pruned FROM commands WHERE id = ?1"
+        } else {
+            "SELECT 0 FROM commands WHERE id = ?1"
+        };
+        let children_pruned: bool = self
+            .connection
+            .query_row(children_pruned, [&parent.id], |row| row.get(0))
+            .optional()
+            .map_err(sql_error)?
+            .ok_or_else(|| {
+                Error::new("not_found", format!("command {} was not found", parent.id))
+            })?;
+        if children_pruned {
+            return Err(Error::new("history_gap", "the command expansion expired"));
         }
         let mut children = Vec::new();
         match after {
