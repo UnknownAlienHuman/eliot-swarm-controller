@@ -6,9 +6,9 @@ use super::args::{
     RuleCatchUpArgs, RuleCommand, RuleFileArgs, RuleShowArgs, TimerArgs, TimerCommand,
     TimerListArgs, TimerRunArgs, TimerShowArgs,
 };
-use super::support::read_and_print;
 use super::support::{
-    Failure, command_value, mutation_id, print_value, print_value_or_human, response_exit_code,
+    Failure, command_value, mutate_and_print, mutation_id, print_value, print_value_or_human,
+    read_and_print, response_exit_code,
 };
 use eliot_core::Command as CoreCommand;
 use eliot_core::api::{
@@ -183,18 +183,13 @@ pub(crate) async fn run_provider(
                 corrective_evidence,
                 expected_probe_command,
             };
-            request.validate().map_err(Failure::for_mutation)?;
-            let response: ProviderClearHoldResponse =
-                eliot_daemon::client_call_typed(&data_dir, "provider.clear_hold", &request)
-                    .await
-                    .map_err(Failure::for_mutation)?;
-            request
-                .validate_response(&response)
-                .map_err(Failure::invalid_response)?;
-            let value = serde_json::to_value(response)
-                .map_err(|_| Failure::new(4, "provider.clear_hold response is invalid"))?;
-            print_value(&value, json_output);
-            Ok(0)
+            mutate_and_print!(
+                &data_dir,
+                json_output,
+                "provider.clear_hold",
+                request,
+                ProviderClearHoldResponse
+            )
         }
     }
 }

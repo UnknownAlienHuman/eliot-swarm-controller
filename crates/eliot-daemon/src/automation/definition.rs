@@ -1356,14 +1356,21 @@ fn render_event_binding(
     Ok(event_turn_id.to_owned())
 }
 
-fn submit_run_command(definition: &RunDefinitionArgs) -> Result<SubmitCommand, Error> {
-    definition.validate()?;
-    let args = serde_json::to_value(definition)
-        .map_err(|_| Error::new("invalid", "run definition cannot be encoded"))?;
-    let mut command = CommandSubmitRequest::new(String::new(), "run");
+fn targetless_command<T: Serialize>(
+    verb: &str,
+    definition: &T,
+    encode_error: &str,
+) -> Result<SubmitCommand, Error> {
+    let args = serde_json::to_value(definition).map_err(|_| Error::new("invalid", encode_error))?;
+    let mut command = CommandSubmitRequest::new(String::new(), verb);
     command.args = args;
     command.validate()?;
     Ok(command)
+}
+
+fn submit_run_command(definition: &RunDefinitionArgs) -> Result<SubmitCommand, Error> {
+    definition.validate()?;
+    targetless_command("run", definition, "run definition cannot be encoded")
 }
 
 fn validate_git_fetch_definition(definition: &GitFetchDefinitionArgs) -> Result<(), Error> {
@@ -1407,22 +1414,12 @@ fn validate_git_publish_definition(definition: &GitPublishDefinitionArgs) -> Res
 
 fn submit_notify_command(definition: &NotifyDefinitionArgs) -> Result<SubmitCommand, Error> {
     definition.validate()?;
-    let args = serde_json::to_value(definition)
-        .map_err(|_| Error::new("invalid", "notify definition cannot be encoded"))?;
-    let mut command = CommandSubmitRequest::new(String::new(), "notify");
-    command.args = args;
-    command.validate()?;
-    Ok(command)
+    targetless_command("notify", definition, "notify definition cannot be encoded")
 }
 
 fn submit_emit_command(definition: &EmitDefinitionArgs) -> Result<SubmitCommand, Error> {
     definition.validate()?;
-    let args = serde_json::to_value(definition)
-        .map_err(|_| Error::new("invalid", "emit definition cannot be encoded"))?;
-    let mut command = CommandSubmitRequest::new(String::new(), "emit");
-    command.args = args;
-    command.validate()?;
-    Ok(command)
+    targetless_command("emit", definition, "emit definition cannot be encoded")
 }
 
 fn submit_mail_command(definition: &MailDefinitionArgs) -> Result<SubmitCommand, Error> {
@@ -1432,12 +1429,11 @@ fn submit_mail_command(definition: &MailDefinitionArgs) -> Result<SubmitCommand,
             format!("mail.send definition invalid: {}", error.message),
         )
     })?;
-    let args = serde_json::to_value(definition)
-        .map_err(|_| Error::new("invalid", "mail.send definition cannot be encoded"))?;
-    let mut command = CommandSubmitRequest::new(String::new(), "mail.send");
-    command.args = args;
-    command.validate()?;
-    Ok(command)
+    targetless_command(
+        "mail.send",
+        definition,
+        "mail.send definition cannot be encoded",
+    )
 }
 
 fn submit_var_command(definition: &VarDefinitionArgs) -> Result<SubmitCommand, Error> {
@@ -1447,12 +1443,11 @@ fn submit_var_command(definition: &VarDefinitionArgs) -> Result<SubmitCommand, E
             format!("var.set definition invalid: {}", error.message),
         )
     })?;
-    let args = serde_json::to_value(definition)
-        .map_err(|_| Error::new("invalid", "var.set definition cannot be encoded"))?;
-    let mut command = CommandSubmitRequest::new(String::new(), "var.set");
-    command.args = args;
-    command.validate()?;
-    Ok(command)
+    targetless_command(
+        "var.set",
+        definition,
+        "var.set definition cannot be encoded",
+    )
 }
 
 fn validate_inject_action(definition: &InjectActionDefinition) -> Result<(), Error> {
@@ -1567,24 +1562,22 @@ fn submit_inject_event_command(
 
 fn submit_git_fetch_command(definition: &GitFetchDefinitionArgs) -> Result<SubmitCommand, Error> {
     validate_git_fetch_definition(definition)?;
-    let args = serde_json::to_value(definition)
-        .map_err(|_| Error::new("invalid", "git.fetch arguments cannot be encoded"))?;
-    let mut command = CommandSubmitRequest::new(String::new(), "git.fetch");
-    command.args = args;
-    command.validate()?;
-    Ok(command)
+    targetless_command(
+        "git.fetch",
+        definition,
+        "git.fetch arguments cannot be encoded",
+    )
 }
 
 fn submit_git_integrate_command(
     definition: &GitIntegrateDefinitionArgs,
 ) -> Result<SubmitCommand, Error> {
     validate_git_integrate_definition(definition)?;
-    let args = serde_json::to_value(definition)
-        .map_err(|_| Error::new("invalid", "git.integrate arguments cannot be encoded"))?;
-    let mut command = CommandSubmitRequest::new(String::new(), "git.integrate");
-    command.args = args;
-    command.validate()?;
-    Ok(command)
+    targetless_command(
+        "git.integrate",
+        definition,
+        "git.integrate arguments cannot be encoded",
+    )
 }
 fn submit_git_publish_command(
     definition: &GitPublishDefinitionArgs,
