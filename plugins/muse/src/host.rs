@@ -436,56 +436,53 @@ impl MusePlugin {
         Ok(serde_json::json!({"validated": true}))
     }
 
-    async fn fail_session_start(
+    fn fail_session_start(
         &mut self,
         params: &AgentStartParams,
-        mut session: AgentSession,
+        session: AgentSession,
         point: StartPoint,
         phase: &str,
         error: Error,
     ) -> Result<Value> {
         self.failed_start = Some(FailedStart);
-        let (point, error) = if is_proven_no_effect(point) {
-            discard_unstarted(&mut session).await;
-            if session.phase != SessionPhase::Stopped {
-                let message = format!("{}; owned host exit is unconfirmed", error.message);
-                (StartPoint::TransportLost, error.with_message(message))
-            } else if error.code == "unknown" {
-                (StartPoint::TransportLost, error)
-            } else {
-                (point, error)
-            }
+        let native_ref = if is_proven_no_effect(point) {
+            None
         } else {
-            (point, error)
-        };
-        let error = session.native_client.diagnostic_error(error);
-        if !is_proven_no_effect(point) {
-            session.session_id = session
+            session
                 .session_id
-                .or_else(|| session.events.status().session_id);
-        }
-        let result = start_failure(
+                .clone()
+                .or_else(|| session.events.status().session_id)
+        };
+        start_failure(
             params,
             "muse",
             phase,
             point,
-            error,
-            session.session_id.as_deref(),
-        );
-        if result.is_err() {
-            self.session = Some(session);
-        }
-        result
+            session.native_client.diagnostic_error(error),
+            native_ref
+                .as_deref()
+                .map(|reference| (session.native_scope.as_str(), reference)),
+            session.native.pid(),
+        )
     }
 
-    fn fail_start_preparation(&mut self, params: &AgentStartParams, error: Error) -> Result<Value> {
+    fn fail_start_preparation(
+        &mut self,
+        params: &AgentStartParams,
+        phase: &str,
+        error: Error,
+        native_pid: Option<u32>,
+    ) -> Result<Value> {
         self.failed_start = Some(FailedStart);
-        let point = if error.code == "unknown" {
-            StartPoint::TransportLost
-        } else {
-            StartPoint::BeforeSpawn
-        };
-        start_failure(params, "muse", "prepare", point, error, None)
+        start_failure(
+            params,
+            "muse",
+            phase,
+            StartPoint::BeforeSpawn,
+            error,
+            None,
+            native_pid,
+        )
     }
 
     async fn start(&mut self, raw: &Value, peer: &PeerClient) -> Result<Value> {
@@ -523,25 +520,24 @@ impl MusePlugin {
         } = match start::prepare_profile(&params, initialized) {
             Ok(prepared) => prepared,
             Err(error) => {
-                return self.fail_start_preparation(&params, error);
+                return self.fail_start_preparation(&params, "prepare", error, None);
             }
         };
         let skill_pointer = match start::skill_pointer(&params) {
             Ok(pointer) => pointer,
-            Err(error) => return self.fail_start_preparation(&params, error),
+            Err(error) => return self.fail_start_preparation(&params, "prepare", error, None),
         };
         let policy = SecretPolicy::new(secrets.iter());
-        let mut host = match catalogue::CatalogueHost::open(
-            &launch,
-            Path::new(&initialized.instance_dir),
-            &policy,
-            true,
-            requested_model.is_none(),
-        )
-        .await
-        {
+        let native = match NativeProcess::spawn(launch, policy.clone()).await {
+            Ok(native) => native,
+            Err(error) => return self.fail_start_preparation(&params, "spawn", error, None),
+        };
+        let native_pid = native.pid();
+        let host = match catalogue::CatalogueHost::from_started_native(native, true).await {
             Ok(host) => host,
-            Err(error) => return self.fail_start_preparation(&params, error),
+            Err(error) => {
+                return self.fail_start_preparation(&params, "catalogue", error, native_pid);
+            }
         };
         let initialized_native = match Self::validate_catalogue(
             &host,
@@ -550,12 +546,7 @@ impl MusePlugin {
         ) {
             Ok(validated) => validated,
             Err(error) => {
-                return match host.close().await {
-                    Ok(()) => self.fail_start_preparation(&params, error),
-                    Err(cleanup) => {
-                        self.fail_start_preparation(&params, cleanup.with_code("unknown"))
-                    }
-                };
+                return self.fail_start_preparation(&params, "catalogue", error, native_pid);
             }
         };
         let resume_route = requested_model
@@ -570,11 +561,9 @@ impl MusePlugin {
             model_hold_settings_path,
             skill_pointer,
             peer,
-        )
-        .await
-        {
+        ) {
             Ok(session) => session,
-            Err(error) => return self.fail_start_preparation(&params, error),
+            Err(error) => return self.fail_start_preparation(&params, "bind", error, native_pid),
         };
         session.contributor_mode_forced =
             requested_model.as_deref().is_some_and(is_contributor_model);
@@ -592,15 +581,13 @@ impl MusePlugin {
         )
         .await
         {
-            return self
-                .fail_session_start(
-                    &params,
-                    session,
-                    StartPoint::NativeRefusalBeforeDispatch,
-                    "register",
-                    error,
-                )
-                .await;
+            return self.fail_session_start(
+                &params,
+                session,
+                StartPoint::NativeRefusalBeforeDispatch,
+                "register",
+                error,
+            );
         }
 
         session.selected_effort = initialized_native.effort.clone();
@@ -608,18 +595,16 @@ impl MusePlugin {
 
         if let Some(subject) = &resume_subject {
             if subject.native_scope != session.native_scope {
-                return self
-                    .fail_session_start(
-                        &params,
-                        session,
-                        StartPoint::NativeRefusalBeforeDispatch,
-                        "resume_preflight",
-                        Error::new(
-                            "profile_error",
-                            "Muse resume subject is outside the authenticated native scope",
-                        ),
-                    )
-                    .await;
+                return self.fail_session_start(
+                    &params,
+                    session,
+                    StartPoint::NativeRefusalBeforeDispatch,
+                    "resume_preflight",
+                    Error::new(
+                        "profile_error",
+                        "Muse resume subject is outside the authenticated native scope",
+                    ),
+                );
             }
             session.session_id = Some(subject.native_ref.clone());
             if let Err(error) = verify_resume_preflight(
@@ -640,15 +625,13 @@ impl MusePlugin {
                     error.with_code("native_readback")
                 }
                 .with_message(message);
-                return self
-                    .fail_session_start(
-                        &params,
-                        session,
-                        StartPoint::NativeRefusalBeforeDispatch,
-                        "resume_preflight",
-                        error,
-                    )
-                    .await;
+                return self.fail_session_start(
+                    &params,
+                    session,
+                    StartPoint::NativeRefusalBeforeDispatch,
+                    "resume_preflight",
+                    error,
+                );
             }
         }
 
@@ -670,15 +653,13 @@ impl MusePlugin {
             match encoded {
                 Ok(value) => ("session/resume", value),
                 Err(error) => {
-                    return self
-                        .fail_session_start(
-                            &params,
-                            session,
-                            StartPoint::NativeRefusalBeforeDispatch,
-                            "encode",
-                            error,
-                        )
-                        .await;
+                    return self.fail_session_start(
+                        &params,
+                        session,
+                        StartPoint::NativeRefusalBeforeDispatch,
+                        "encode",
+                        error,
+                    );
                 }
             }
         } else {
@@ -693,15 +674,13 @@ impl MusePlugin {
             match encoded {
                 Ok(value) => ("session/start", value),
                 Err(error) => {
-                    return self
-                        .fail_session_start(
-                            &params,
-                            session,
-                            StartPoint::NativeRefusalBeforeDispatch,
-                            "encode",
-                            error,
-                        )
-                        .await;
+                    return self.fail_session_start(
+                        &params,
+                        session,
+                        StartPoint::NativeRefusalBeforeDispatch,
+                        "encode",
+                        error,
+                    );
                 }
             }
         };
@@ -718,15 +697,13 @@ impl MusePlugin {
                     StartPoint::TransportLost
                 };
                 let message = format!("Muse {session_method}: {}", error.message);
-                return self
-                    .fail_session_start(
-                        &params,
-                        session,
-                        point,
-                        "session",
-                        error.with_message(message),
-                    )
-                    .await;
+                return self.fail_session_start(
+                    &params,
+                    session,
+                    point,
+                    "session",
+                    error.with_message(message),
+                );
             }
         };
         let configured = async {
@@ -966,23 +943,25 @@ impl MusePlugin {
         let (native_session, effective, resume_pointers) = match configured {
             Ok(configured) => configured,
             Err(error) => {
-                return self
-                    .fail_session_start(
-                        &params,
-                        session,
-                        StartPoint::AfterDispatch,
-                        "settings",
-                        error,
-                    )
-                    .await;
+                return self.fail_session_start(
+                    &params,
+                    session,
+                    StartPoint::AfterDispatch,
+                    "settings",
+                    error,
+                );
             }
         };
         if let Err(error) =
             Self::publish_start_ready(&mut session, &native_session, &effective).await
         {
-            return self
-                .fail_session_start(&params, session, StartPoint::AfterDispatch, "ready", error)
-                .await;
+            return self.fail_session_start(
+                &params,
+                session,
+                StartPoint::AfterDispatch,
+                "ready",
+                error,
+            );
         }
         let mut snapshot_pull: Option<bool> = None;
         // Adoption is best-effort and never fails the resume: entries that
@@ -2281,18 +2260,6 @@ async fn terminate_session(
         SessionPhase::Unknown
     };
     result
-}
-
-async fn discard_unstarted(session: &mut AgentSession) {
-    session.events.close().await;
-    session.phase = match session
-        .native
-        .terminate(true, Instant::now() + RPC_TIMEOUT)
-        .await
-    {
-        Ok(_) => SessionPhase::Stopped,
-        Err(_) => SessionPhase::Unknown,
-    };
 }
 
 /// A `configure` model and/or effort request. Admission already gated the

@@ -142,6 +142,24 @@ impl CatalogueHost {
         Ok(host)
     }
 
+    pub(super) async fn from_started_native(
+        native: NativeProcess,
+        observe_models: bool,
+    ) -> Result<Self> {
+        let (identity, catalogue) = read_snapshot(
+            &native.client(),
+            Instant::now() + QUERY_BUDGET,
+            observe_models,
+        )
+        .await?;
+        Ok(Self {
+            native,
+            identity,
+            catalogue,
+            refresh_error: None,
+        })
+    }
+
     async fn read(
         launch: &NativeLaunch,
         policy: &SecretPolicy,

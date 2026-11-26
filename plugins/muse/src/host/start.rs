@@ -232,7 +232,7 @@ pub(super) fn skill_pointer(params: &AgentStartParams) -> Result<String> {
     ))
 }
 
-pub(super) async fn bind_owned_session(
+pub(super) fn bind_owned_session(
     params: &AgentStartParams,
     initialized: &Initialized,
     mut native: NativeProcess,
@@ -241,13 +241,7 @@ pub(super) async fn bind_owned_session(
     skill_pointer: String,
     peer: &PeerClient,
 ) -> Result<AgentSession> {
-    let frames = match native.take_frames() {
-        Ok(frames) => frames,
-        Err(error) => {
-            native.terminate(true, Instant::now() + RPC_TIMEOUT).await?;
-            return Err(error);
-        }
-    };
+    let frames = native.take_frames()?;
     let stream = native.stream_state();
     let native_client = native.client();
     let events = events::spawn(

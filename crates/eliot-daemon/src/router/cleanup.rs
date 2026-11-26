@@ -3951,9 +3951,15 @@ fn cleanup_tree_root(artifact: &ArtifactView) -> Option<&str> {
 }
 
 fn native_session_artifact(agent: &Agent) -> Option<ArtifactView> {
-    let scope = agent.native_scope.as_ref()?;
-    let reference = agent.native_ref.as_ref()?;
-    Some(ArtifactView {
+    Some(native_session_custody(
+        agent,
+        agent.native_scope.as_deref()?,
+        agent.native_ref.as_deref()?,
+    ))
+}
+
+pub(super) fn native_session_custody(agent: &Agent, scope: &str, reference: &str) -> ArtifactView {
+    ArtifactView {
         reconciliation: None,
         id: ulid::Ulid::new().to_string(),
         agent: agent.id.clone(),
@@ -3963,12 +3969,12 @@ fn native_session_artifact(agent: &Agent) -> Option<ArtifactView> {
         path: format!("native:{scope}:{reference}"),
         kind: ArtifactKind::NativeSession,
         purpose: agent.harness.clone(),
-        identity: scope.clone(),
+        identity: scope.to_owned(),
         created_at: agent.created_at,
         expires_at: None,
         state: "registered".to_owned(),
         git: None,
-    })
+    }
 }
 
 impl Router {

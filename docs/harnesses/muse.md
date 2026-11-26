@@ -277,11 +277,12 @@ With a fresh data root, `serve` returned an empty `bundledCatalog` even
 after `session/start`. The installed `muse exec --help` documents
 `exec --list-models`, which fetches models and populates Muse's cache under
 `XDG_DATA_HOME/muse/model-catalog` without creating a session or running a turn.
-The adapter first reads the host's `model/list` snapshot. An empty snapshot
-triggers one refresh with the resolved executable and environment from the
-private plugin directory. The
-refresh and each host query have separate deadlines. A fresh `serve` reads the
-resulting cache even if the refresh fails. For the picker, Swarm augments the
+The dedicated catalogue reader first reads the host's `model/list` snapshot.
+An empty snapshot triggers one refresh with the resolved executable and
+environment from the private plugin directory. The refresh and each host
+query have separate deadlines. A fresh `serve` reads the resulting cache even
+if the refresh fails. Controlled startup performs one catalogue read before
+session admission. For the picker, Swarm augments the
 Meta/TBH `model/list` snapshot with hidden Contributor rows from the provider's
 version 3 `model-catalog/6d657461__p746268.json` under the host-reported `museHome`.
 Muse 1.4.25 writes those rows during `exec --list-models` while omitting them
@@ -321,14 +322,15 @@ before native dispatch even for an idle Agent without new input. Check
 can enter [automatic handoff](../spec/configuration.md#automatic-handoff-918)
 when the Agent still owes work and a successor is eligible.
 
-Profile, skill, catalogue, process-registration and resume-preflight refusals
-settle failed once the owned host is closed. The same applies when the stdio
-writer proves non-dispatch or Muse proves pre-admission refusal. A lost
-start/resume response, unconfirmed host cleanup, or a settings or readiness
-failure after session admission settles `unknown`. Swarm retains the owned
-host and the exact session ID when reported by the reply or the native
-session-start notification. Start, resume and settings writes are single
-dispatches.
+Muse reports the preparation, registration, session, settings or readiness
+phase, together with dispatch evidence and any exact native identity. The
+daemon retires the generation's process tree and drains its event source.
+A proven refusal before session admission settles `failed` after confirmed
+exit. A lost start/resume response, unconfirmed exit, or settings or readiness
+failure after admission settles `unknown`. The daemon records the exact
+scope and session ID from the reply or native session-start notification as
+an artifact for Owner reconciliation. Start, resume and settings writes are
+single dispatches.
 `projectionUnavailable` is the projection-failed-closed health reason on the
 command plane, independent of view subscription membership. It is distinct from
 `view/gap`, whose opaque `after`/`next` cursors are exclusive bounds on dropped
