@@ -144,11 +144,6 @@ impl DesktopApp {
             placeholder,
             field: self.chat.composer_ref.clone(),
             retry,
-            folder: if home {
-                self.composer_folder_row(context)
-            } else {
-                None
-            },
             attached: self.attached_to(&self.composer_target()).to_vec(),
             chips,
             // Home's bar is the design's (+, the chips, Start task): the
@@ -779,9 +774,6 @@ pub(in crate::ui) struct ComposerInput {
     field: ElementRef<TextBox>,
     /// An unresolved submission: an edit abandons it, in the window.
     retry: bool,
-    /// Home's folder field above the field, for a folder outside the
-    /// projects.
-    folder: Option<View>,
     attached: Vec<String>,
     /// The chip lines, Home's (`composer_chips`) or a conversation's: one
     /// at the card's full width, else two ([`controls::chip_lines`]).
@@ -890,16 +882,38 @@ impl Component for Composer {
                 0.0,
             ))
             .content(field);
-        // The design: + (attach files), then the chips, 6 DIPs apart; each
-        // line of chips trims its first label to the room left.
-        let attach: View = controls::bar_button(false)
-            .style(ButtonStyle::Subtle)
-            .vertical_alignment(VerticalAlignment::Center)
-            .automation_name("Attach files")
-            .on_click(context.message(Message::Launch(LaunchMsg::AttachRequested)))
-            .content(controls::icon(controls::glyph::NEW_TASK))
-            .tooltip("Attach files");
+        // The design: +, then the chips, 6 DIPs apart; each line of chips
+        // trims its first label to the room left. Home's + attaches files
+        // (its Goal is a chip); an open chat's + is a menu of Attach files
+        // and Goal (brand book §9.1: a goal by hand from the composer).
         let home = input.agent.is_none();
+        let plus = controls::bar_button(false)
+            .style(ButtonStyle::Subtle)
+            .vertical_alignment(VerticalAlignment::Center);
+        let attach: View = if home {
+            plus.automation_name("Attach files")
+                .on_click(context.message(Message::Launch(LaunchMsg::AttachRequested)))
+                .content(controls::icon(controls::glyph::NEW_TASK))
+                .tooltip("Attach files")
+        } else {
+            // A button carrying its menu flyout takes no tooltip.
+            plus.automation_name("Attach files or set the goal")
+                .content(controls::icon(controls::glyph::NEW_TASK))
+                .menu(Menu::new(
+                    vec![
+                        MenuItem::item(ATTACH_LABEL, ATTACH_LABEL),
+                        MenuItem::item(GOAL_LABEL, GOAL_LABEL),
+                    ],
+                    // Capture-free: one identity across renders.
+                    crate::views::menu_keys(context.callback(
+                        |label: String| match label.as_str() {
+                            ATTACH_LABEL => Message::Launch(LaunchMsg::AttachRequested),
+                            GOAL_LABEL => Message::Goal(goal_ui::GoalMsg::Composer),
+                            _ => Message::Menu(MenuMsg::Ignored),
+                        },
+                    )),
+                ))
+        };
         // The hint before the action, while Enter steers: the
         // lowest-priority cell, it trims away first.
         let hint: Option<View> = match &input.primary {
@@ -976,13 +990,9 @@ impl Component for Composer {
             .keyed_children(cells)
             .into();
         // Home (`Main.dc.html`): the field first, then + and the project,
-        // place, model and access chips, then Start task; a folder outside
-        // the projects takes its field above. Attached files as chips over
-        // the field.
+        // place, model, access and Goal chips, then Start task. Attached
+        // files as chips over the field.
         let mut rows: Vec<KeyedView> = Vec::new();
-        if let Some(folder) = &input.folder {
-            rows.push(KeyedView::new("folder", folder.clone()));
-        }
         if !input.attached.is_empty() {
             rows.push(KeyedView::new(
                 format!("attached:{}", input.attached.len()),
@@ -1044,6 +1054,10 @@ fn composer_actions(
             ))
             .tooltip("Retry with the same id"),
         Primary::Resume(agent, generation) => {
+            // §9.4 Resume, or Resume with message with text: the button
+            // says Resume either way and names the message in its
+            // accessible name and tooltip, so typing never widens it into
+            // the chips' room (the one-row rule cuts no chip).
             let words = if draft_blank {
                 "Resume"
             } else {
@@ -1060,10 +1074,10 @@ fn composer_actions(
                 ))))
                 .content(controls::command_content(
                     controls::glyph::RESUME,
-                    words,
+                    "Resume",
                     pending,
                 ))
-                .into()
+                .tooltip(words)
         }
         Primary::ReadingResume => controls::bar_button(false)
             .is_enabled(false)
@@ -1219,6 +1233,9 @@ fn composer_actions(
 
 /// The composer menu's one item.
 const NOTE_LABEL: &str = "Add as a note";
+/// An open chat's + menu: attach files, or open the Goal dialog.
+const ATTACH_LABEL: &str = "Attach files…";
+const GOAL_LABEL: &str = "Goal…";
 
 /// Files attached in the composer: one outlined chip each (file glyph,
 /// name, the full path in its tooltip); a click removes it.

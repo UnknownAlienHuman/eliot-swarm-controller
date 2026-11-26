@@ -205,7 +205,6 @@ pub mod layout {
     pub const MOVE_LIST_MAX_HEIGHT: f64 = 320.0;
     pub const ENUM_WIDTH: f64 = 200.0;
     pub const NUMBER_WIDTH: f64 = 120.0;
-    pub const FOLDER_WIDTH: f64 = 280.0;
     pub const LIST_INDENT: f64 = 20.0;
     /// A list item's marker column.
     pub const LIST_MARKER_WIDTH: f64 = 22.0;

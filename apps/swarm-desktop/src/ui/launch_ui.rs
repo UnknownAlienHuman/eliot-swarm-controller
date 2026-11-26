@@ -52,8 +52,12 @@ pub(super) enum Pop {
     Quotas,
 }
 
-/// The project popover's row that shows the folder field.
+/// The project popover's "Other folder…": the native folder picker chooses
+/// a folder outside the projects for the new task.
 pub(super) const OTHER_FOLDER: &str = "other-folder";
+/// The project popover's "Add project…": the native folder picker and the
+/// existing project registration (Settings › Projects' Browse).
+pub(super) const ADD_PROJECT: &str = "add-project";
 /// The project popover's "No project (chat)" row: a chat launch (`chat:
 /// true`, no workspace; the daemon makes its private chat directory).
 pub(super) const CHAT_PROJECT: &str = "no-project-chat";
@@ -68,7 +72,6 @@ const CATALOG_RETRY_MS: u64 = 10_000;
 
 #[derive(Clone, Debug)]
 pub(super) enum LaunchMsg {
-    WorkspaceChanged(String),
     LaunchRequested,
     LaunchSubmitted(MutationResult<LaunchOutcome>),
     ProfilesListed(Fallible<ProfileListResponse>),
@@ -108,7 +111,7 @@ pub(super) enum LaunchMsg {
     AccessHover(Access),
     /// The project search field's text.
     ProjectQuery(String),
-    /// A project row (its checkout) or [`OTHER_FOLDER`].
+    /// A project row (its checkout), [`OTHER_FOLDER`] or [`ADD_PROJECT`].
     ProjectChosen(String),
     /// The picker's Manage models: Settings › Models (§8.3).
     ManageOpened,
@@ -155,6 +158,8 @@ pub(super) struct QueueOffer {
     target: client::LaunchTarget,
     place: client::LaunchPlace,
     text: String,
+    /// The Owner's Goal fields it carries (`args.goal`).
+    goal: Option<client::LaunchGoal>,
     launch_rev: u64,
     /// The intent id of a Queue it whose outcome is not known yet (in
     /// flight, or its reply was lost): the intent may exist, so the draft
@@ -167,8 +172,8 @@ impl QueueOffer {
     /// retry after a lost reply reuses it.
     fn ledger_key(&self) -> String {
         format!(
-            "enqueue:{:?}:{:?}:{}",
-            self.target, self.place, self.launch_rev
+            "enqueue:{:?}:{:?}:{:?}:{}",
+            self.target, self.place, self.goal, self.launch_rev
         )
     }
 }
@@ -191,6 +196,7 @@ pub(super) struct Submission {
     target: client::LaunchTarget,
     place: client::LaunchPlace,
     text: String,
+    goal: Option<client::LaunchGoal>,
     launch_rev: u64,
 }
 
@@ -222,8 +228,17 @@ pub(super) struct LaunchState {
     /// The selected project's profile allowlist (empty: any profile).
     pub(super) profiles: Vec<String>,
     pub(super) workspace: String,
-    /// The folder field is shown (a path outside the registered projects).
+    /// The folder is one the native picker chose outside the registered
+    /// projects ("Other folder…").
     pub(super) custom_workspace: bool,
+    /// A project just registered from "Add project…" (its id) that no
+    /// project list read has listed yet: the new task keeps it meanwhile.
+    pub(super) added_project: Option<String>,
+    /// The Owner's Goal fields for the next task, set in the Goal dialog
+    /// over the project policy's Goal: sent as the launch's `args.goal`
+    /// (only the fields the Owner changed); none takes the policy as it
+    /// is. Kept until a launch or queued intent carrying it is confirmed.
+    pub(super) goal: Option<client::LaunchGoal>,
     /// "No project (chat)": the next task launches as a chat.
     pub(super) chat: bool,
     /// The start being submitted: its text and what it says while the
@@ -548,10 +563,21 @@ impl DesktopApp {
             .collect();
         projects.sort_by(|a, b| a.1.cmp(&b.1));
         rows.extend(projects);
+        let other = if self.launch.custom_workspace && !self.launch.workspace.is_empty() {
+            nav::display_path(&self.launch.workspace).to_owned()
+        } else {
+            "Choose a folder for this task".to_owned()
+        };
         rows.push((
             OTHER_FOLDER.to_owned(),
             "Other folder…".to_owned(),
-            "Type a folder path".to_owned(),
+            other,
+            false,
+        ));
+        rows.push((
+            ADD_PROJECT.to_owned(),
+            "Add project…".to_owned(),
+            "Register a checkout folder as a project".to_owned(),
             false,
         ));
         rows
@@ -559,7 +585,6 @@ impl DesktopApp {
 
     pub(super) fn launch_update(&mut self, msg: LaunchMsg, context: &ComponentContext<Self>) {
         match msg {
-            LaunchMsg::WorkspaceChanged(text) => self.launch.workspace = text,
             LaunchMsg::CatalogLoaded(data_dir, reply) => {
                 self.launch.catalog_loading = false;
                 let _ = self
@@ -759,18 +784,33 @@ impl DesktopApp {
             }
             LaunchMsg::ProjectChosen(checkout) => {
                 self.close_popover();
-                self.launch.chat = checkout == CHAT_PROJECT;
-                if self.launch.chat {
-                    self.launch.custom_workspace = false;
-                    self.launch.profiles.clear();
-                    self.nav.selection.project = None;
-                } else if checkout == OTHER_FOLDER {
-                    self.launch.custom_workspace = true;
-                    self.launch.workspace.clear();
-                    self.launch.profiles.clear();
-                    self.nav.selection.project = None;
-                } else if self.can_launch_here(&checkout) {
-                    self.pick_project(&checkout);
+                if checkout == OTHER_FOLDER {
+                    // The native picker; Cancel changes nothing.
+                    match crate::file_dialog::pick_folder("Choose a folder for the new task") {
+                        Ok(Some(folder)) => self.pick_other_folder(folder),
+                        Ok(None) => {}
+                        Err(error) => self.alert(error),
+                    }
+                } else if checkout == ADD_PROJECT {
+                    // Settings › Projects' Browse: the picker, then the
+                    // folder registered as a project (Cancel adds nothing).
+                    // The new task takes that project at once, not the
+                    // folder as an outside one; the project list read
+                    // after the save fills in its profiles.
+                    match self.add_project_from_picker(context) {
+                        Ok(Some((id, folder))) => self.pick_added_project(id, folder),
+                        Ok(None) => {}
+                        Err(error) => self.alert(error),
+                    }
+                } else {
+                    self.launch.chat = checkout == CHAT_PROJECT;
+                    if self.launch.chat {
+                        self.launch.custom_workspace = false;
+                        self.launch.profiles.clear();
+                        self.nav.selection.project = None;
+                    } else if self.can_launch_here(&checkout) {
+                        self.pick_project(&checkout);
+                    }
                 }
             }
             LaunchMsg::ManageOpened => {
@@ -1393,7 +1433,15 @@ impl DesktopApp {
     /// target, text (with its attachments) and place; `None` after saying
     /// why it cannot go (a submission in flight, a waiting queue offer, no
     /// text, no project).
-    fn launch_draft(&mut self) -> Option<(PathBuf, LaunchTarget, String, client::LaunchPlace)> {
+    fn launch_draft(
+        &mut self,
+    ) -> Option<(
+        PathBuf,
+        LaunchTarget,
+        String,
+        client::LaunchPlace,
+        Option<client::LaunchGoal>,
+    )> {
         if self.submitting() {
             return None;
         }
@@ -1425,6 +1473,15 @@ impl DesktopApp {
             self.alert("Choose a project, a folder, or No project (chat).");
             return None;
         }
+        // The Owner's Goal fields, checked against the Goal they now
+        // override (the project may have changed since they were set).
+        let goal = match self.launch_goal_checked() {
+            Ok(goal) => goal,
+            Err(error) => {
+                self.alert(format!("Cannot start: {error}"));
+                return None;
+            }
+        };
         if !self.launch.chat && self.checkout_paused(&self.launch.workspace) {
             self.alert("This worktree is paused while its Git metadata refreshes.");
             return None;
@@ -1437,7 +1494,7 @@ impl DesktopApp {
         } else {
             client::LaunchPlace::Workspace(self.launch.workspace.clone())
         };
-        Some((data_dir, target, text, place))
+        Some((data_dir, target, text, place, goal))
     }
 
     /// Start task's menu Queue it: the composer's task as a queued intent
@@ -1446,7 +1503,7 @@ impl DesktopApp {
     /// intent keeps one ledger-held id (an unconfirmed reply is queued
     /// again with it from the notice), and a refusal gives the text back.
     fn queue_draft(&mut self, context: &ComponentContext<Self>) {
-        let Some((_, target, text, place)) = self.launch_draft() else {
+        let Some((_, target, text, place, goal)) = self.launch_draft() else {
             return;
         };
         let launch_rev = self.chat.drafts.borrow().launch_rev();
@@ -1455,6 +1512,7 @@ impl DesktopApp {
             target,
             place,
             text,
+            goal,
             launch_rev,
             intent: None,
         });
@@ -1464,7 +1522,7 @@ impl DesktopApp {
     }
 
     fn request_launch(&mut self, context: &ComponentContext<Self>) {
-        let Some((data_dir, target, text, place)) = self.launch_draft() else {
+        let Some((data_dir, target, text, place, goal)) = self.launch_draft() else {
             return;
         };
         // Bound now: the picker stays editable while the launch is in flight.
@@ -1477,7 +1535,7 @@ impl DesktopApp {
             project: self.launch_project_id(),
         };
         let launch_rev = self.chat.drafts.borrow().launch_rev();
-        let key = format!("launch:{target:?}:{place:?}:{launch_rev}");
+        let key = format!("launch:{target:?}:{place:?}:{goal:?}:{launch_rev}");
         let mutation_id = self.ledger.id_for(&key);
         self.in_flight_key = Some(key);
         self.alert = None;
@@ -1486,6 +1544,7 @@ impl DesktopApp {
             target: target.clone(),
             place: place.clone(),
             text: text.clone(),
+            goal: goal.clone(),
             launch_rev,
         });
         // Shown at once: the message and what happens now, until the
@@ -1504,6 +1563,7 @@ impl DesktopApp {
                     target,
                     &place,
                     Some(text.clone()),
+                    goal.clone(),
                 )
                 .await?;
                 Ok(LaunchOutcome {
@@ -1519,6 +1579,7 @@ impl DesktopApp {
                     command_id: reply.command_id.clone(),
                     linked_command: reply.linked_command.clone(),
                     text,
+                    goal,
                     launch_rev,
                     submitted,
                 })
@@ -1550,6 +1611,10 @@ impl DesktopApp {
                     drafts.clear_launch();
                 }
                 drop(drafts);
+                // The Goal fields rode the admission too.
+                if outcome.goal.is_some() && self.launch.goal == outcome.goal {
+                    self.launch.goal = None;
+                }
                 if let Some(linked) = outcome.linked_command.clone() {
                     self.chat.pending_local =
                         Some((outcome.agent.clone(), linked.clone(), outcome.text.clone()));
@@ -1602,6 +1667,7 @@ impl DesktopApp {
                         target: submission.target,
                         place: submission.place,
                         text: submission.text,
+                        goal: submission.goal,
                         launch_rev: submission.launch_rev,
                         intent: None,
                     });
@@ -1650,6 +1716,7 @@ impl DesktopApp {
                 offer.target,
                 &offer.place,
                 Some(offer.text),
+                offer.goal,
             ))))
         });
     }
@@ -1676,6 +1743,9 @@ impl DesktopApp {
                         drafts.clear_launch();
                     }
                     drop(drafts);
+                    if offer.goal.is_some() && self.launch.goal == offer.goal {
+                        self.launch.goal = None;
+                    }
                     self.launch.watched.push((intent.id.clone(), offer.text));
                 }
                 self.alert = None;
@@ -1806,7 +1876,7 @@ impl DesktopApp {
     /// stay unknown until the daemon Agent row arrives. Never the
     /// workspace path: the daemon's project label is a registration ID,
     /// not a directory.
-    fn launch_project_id(&self) -> String {
+    pub(super) fn launch_project_id(&self) -> String {
         if self.launch.chat {
             return String::new();
         }
@@ -2050,6 +2120,42 @@ pub(super) enum WorktreeChip {
 
 impl DesktopApp {
     /// The composer files attach to: the open Agent's, else the new task's.
+    /// A folder the native picker chose for the new task: a registered
+    /// project's checkout picks that project; any other folder is the
+    /// task's own folder outside the projects, named by its chip.
+    pub(super) fn pick_other_folder(&mut self, folder: String) {
+        let key = nav::path_key(&folder);
+        if self
+            .nav
+            .projects
+            .iter()
+            .any(|project| nav::path_key(&project.workspace) == key)
+        {
+            self.pick_project(&folder);
+            return;
+        }
+        self.launch.workspace = folder;
+        self.launch.custom_workspace = true;
+        self.launch.added_project = None;
+        self.launch.chat = false;
+        self.launch.profiles.clear();
+        self.nav.selection.project = None;
+        self.launch.reconcile_choice();
+    }
+
+    /// The project just registered from the picker: the new task's
+    /// project by its id, before the project list read after the save
+    /// lists it (that read then picks it by its checkout).
+    fn pick_added_project(&mut self, id: String, folder: String) {
+        self.launch.workspace = folder;
+        self.launch.custom_workspace = false;
+        self.launch.chat = false;
+        self.launch.profiles.clear();
+        self.launch.added_project = Some(id.clone());
+        self.nav.selection.project = Some(id);
+        self.launch.reconcile_choice();
+    }
+
     pub(super) fn composer_target(&self) -> String {
         self.selected_agent_id()
             .unwrap_or_else(|| NEW_TASK_COMPOSER.to_owned())

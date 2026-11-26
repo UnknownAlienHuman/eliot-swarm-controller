@@ -600,15 +600,19 @@ impl DesktopApp {
                             .nav
                             .projects
                             .iter()
-                            .find(|project| project.workspace == workspace)
+                            .find(|project| {
+                                nav::path_key(&project.workspace) == nav::path_key(&workspace)
+                            })
                             .cloned()
                         {
                             // The opened checkout is a registered project.
                             self.pick_project(&project.workspace);
                         } else if !self.launch.custom_workspace
+                            && self.launch.added_project.is_none()
                             && let Some(first) = self.nav.projects.first().cloned()
                         {
-                            // A new task starts in the first project until one is picked.
+                            // A new task starts in the first project until one is picked
+                            // (a project just added keeps its pick until a read lists it).
                             self.pick_project(&first.workspace);
                         }
                         self.refresh_search();
@@ -1376,7 +1380,7 @@ impl DesktopApp {
             Main::Automations => Location::Place(page_ui::Place::Automations),
             Main::Conversation => match self.selected_agent_id() {
                 Some(agent) => Location::Agent(agent),
-                // A folder being typed is no place yet.
+                // A folder outside the projects is no place in the history.
                 None => Location::Home {
                     checkout: if self.launch.custom_workspace {
                         String::new()
@@ -1598,6 +1602,7 @@ impl DesktopApp {
             .cloned();
         self.launch.workspace = checkout.to_owned();
         self.launch.custom_workspace = false;
+        self.launch.added_project = None;
         self.launch.chat = false;
         match registered {
             Some(project) => {

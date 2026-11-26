@@ -250,6 +250,24 @@ pub struct PolicyFields {
     pub check_inputs: Vec<String>,
 }
 
+/// `policy.budget.max_rounds` when omitted: the Goal default of
+/// `docs/spec/configuration.md` (`[projects.ID.policy]`).
+pub const DEFAULT_POLICY_ROUNDS: i64 = 3;
+
+/// `policy.budget.max_audits` when omitted: the documented default of
+/// audit and continuation cycles for a blocked Goal.
+pub const DEFAULT_POLICY_AUDITS: i64 = 2;
+
+/// A project's audit cycles per blocked Goal (`policy.budget.max_audits`,
+/// else the default), as the projects section reads.
+pub fn policy_max_audits(draft: &Value, id: &str) -> i64 {
+    draft
+        .get(id)
+        .and_then(|project| project.pointer("/policy/budget/max_audits"))
+        .and_then(Value::as_i64)
+        .unwrap_or(DEFAULT_POLICY_AUDITS)
+}
+
 /// The lists of a policy that the editor shows one entry per field.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PolicyList {
@@ -271,6 +289,26 @@ impl PolicyFields {
             cost_unit: self.cost_unit.trim().to_owned(),
             ..self.clone()
         } == Self::default()
+    }
+
+    /// Whether launches in the project install the policy Goal: the
+    /// policy has a check (a budget, scope or check inputs require one).
+    pub fn installs_goal(&self) -> bool {
+        !entries(&self.argv).is_empty()
+    }
+
+    /// The check argv as saved.
+    pub fn check_argv(&self) -> Vec<String> {
+        entries(&self.argv)
+    }
+
+    /// The rounds the policy Goal allows: `budget.max_rounds`, else the
+    /// documented default.
+    pub fn rounds(&self) -> i64 {
+        self.max_rounds
+            .trim()
+            .parse()
+            .unwrap_or(DEFAULT_POLICY_ROUNDS)
     }
 
     pub fn list(&self, list: PolicyList) -> &[String] {

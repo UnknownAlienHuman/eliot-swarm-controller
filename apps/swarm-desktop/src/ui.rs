@@ -197,6 +197,10 @@ struct UiDetail {
     /// The session's context fill, when the harness reports the tokens
     /// used.
     context: Option<ContextFill>,
+    /// With no Eliot Goal installed, the first linked input as the Goal
+    /// objective (`default_goal_objective`, automation.md "Default Goal
+    /// objective"): the header and the Goal dialog show it.
+    default_goal_objective: Option<String>,
 }
 
 /// Admission of one draft submission (Send, Steer or Resume): bound Agent,
@@ -224,6 +228,8 @@ struct LaunchOutcome {
     command_id: String,
     linked_command: Option<String>,
     text: String,
+    /// The Owner's Goal fields the launch carried (`args.goal`).
+    goal: Option<client::LaunchGoal>,
     launch_rev: u64,
     submitted: Submitted,
 }
@@ -794,6 +800,7 @@ fn detail_from(reply: &AgentGetResponse) -> UiDetail {
             };
             (fill.used.is_some() || fill.window.is_some()).then_some(fill)
         }),
+        default_goal_objective: reply.default_goal_objective.clone(),
     }
 }
 

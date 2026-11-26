@@ -241,6 +241,72 @@ fn cursor(item: &OwnerInboxItemRef) -> String {
 }
 
 impl DesktopApp {
+    /// The audit cycles a blocked Goal's project allows: its launch
+    /// policy's `budget.max_audits`, else the default.
+    pub(super) fn agent_max_audits(&self, agent: &str) -> i64 {
+        let project = match self
+            .bound_detail()
+            .ok()
+            .filter(|detail| detail.agent == agent)
+        {
+            Some(detail) => Some(detail.project.clone()),
+            None => self.find_agent(agent).map(|row| row.project_id.clone()),
+        };
+        project.map_or(crate::settings_model::DEFAULT_POLICY_AUDITS, |project| {
+            self.settings.max_audits_of(&project)
+        })
+    }
+
+    /// A blocked Goal's audit and continuation cycles (A10, its inbox
+    /// item's `audit_history`): each cycle's auditor, the successor that
+    /// continued the work and the auditor's text, four lines at most (the
+    /// text stays selectable; the daemon bounds it).
+    pub(super) fn goal_audits(&self, item: &OwnerInboxItem) -> Option<View> {
+        let history = item
+            .audit_history
+            .as_deref()
+            .filter(|history| !history.is_empty())?;
+        let max = subject_agent(&item.subject)
+            .map_or(crate::settings_model::DEFAULT_POLICY_AUDITS, |agent| {
+                self.agent_max_audits(agent)
+            });
+        let rows: Vec<KeyedView> = history
+            .iter()
+            .map(|entry| {
+                let mut head = format!(
+                    "Audit {} of {max} \u{b7} {}",
+                    entry.cycle,
+                    self.agent_title(&entry.auditor)
+                );
+                if let Some(successor) = &entry.successor {
+                    head.push_str(&format!(
+                        " \u{b7} continued by {}",
+                        self.agent_title(successor)
+                    ));
+                }
+                KeyedView::new(
+                    format!("audit:{}:{}", entry.cycle, entry.auditor),
+                    StackPanel::new().spacing(tokens::spacing::XS).children((
+                        controls::secondary(head.clone())
+                            .text_trimming(TextTrimming::CharacterEllipsis),
+                        controls::body(entry.text.clone())
+                            .text_wrapping(TextWrapping::Wrap)
+                            .text_trimming(TextTrimming::CharacterEllipsis)
+                            .max_lines(4)
+                            .is_text_selection_enabled(true)
+                            .automation_name(format!("{head}: {}", entry.text)),
+                    )),
+                )
+            })
+            .collect();
+        Some(
+            StackPanel::new()
+                .spacing(tokens::spacing::SM)
+                .keyed_children(rows)
+                .into(),
+        )
+    }
+
     pub(super) fn inbox_update(&mut self, msg: InboxMsg, context: &ComponentContext<Self>) {
         match msg {
             InboxMsg::Status(Ok(status)) => {
@@ -1218,6 +1284,9 @@ impl DesktopApp {
                     }),
             ),
         ];
+        if let Some(audits) = self.goal_audits(item) {
+            text.push(KeyedView::new("audits", audits));
+        }
         if let Some(commands) = &item.instructions {
             text.push(KeyedView::new(
                 "commands",

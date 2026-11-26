@@ -1,5 +1,6 @@
 //! The new-task composer's chips and the popovers they open: the project
-//! list, the model picker and the access menu (see [`super::launch_ui`]
+//! list, the model picker and the access menu, and the Goal chip, which
+//! opens the Goal dialog for the new task (see [`super::launch_ui`]
 //! for their state and keys). The open Agent's effort and usage popovers
 //! are built by the conversation's composer. Every popover is a real
 //! WinUI `Flyout` on its chip ([`DesktopApp::popover_chip`]): its presenter
@@ -11,7 +12,8 @@
 use eliot_core::api::native_profile::SandboxPermissions;
 use std::collections::HashMap;
 
-use super::launch_ui::{CHAT_PROJECT, OTHER_FOLDER, Pop};
+use super::goal_ui::GoalMsg;
+use super::launch_ui::{ADD_PROJECT, CHAT_PROJECT, OTHER_FOLDER, Pop};
 use super::*;
 use crate::picker::{self, Choice, Item, ItemKind, ManageGroup, Row};
 use crate::settings::Access;
@@ -41,27 +43,6 @@ impl DesktopApp {
                 project.missing
                     && nav::path_key(&project.workspace) == nav::path_key(&self.launch.workspace)
             })
-    }
-
-    /// The new task's folder field, above the composer's field, for a
-    /// folder outside the projects (none otherwise).
-    pub(super) fn composer_folder_row(&self, context: &mut ViewContext<Self>) -> Option<View> {
-        (!self.launch.chat && (self.launch.custom_workspace || self.nav.projects.is_empty())).then(
-            || {
-                controls::field()
-                    .text(self.launch.workspace.clone())
-                    .placeholder_text("Folder path")
-                    .automation_name("Folder")
-                    .width(tokens::layout::FOLDER_WIDTH)
-                    .horizontal_alignment(HorizontalAlignment::Left)
-                    .vertical_alignment(VerticalAlignment::Center)
-                    .on_text_changed(crate::views::text_edits(
-                        context
-                            .callback(|value| Message::Launch(LaunchMsg::WorkspaceChanged(value))),
-                    ))
-                    .into()
-            },
-        )
     }
 
     /// The new task's project chip (it opens the project list).
@@ -207,14 +188,29 @@ impl DesktopApp {
                 .tooltip("Set by the preset.")
             }
         };
-        // The design: project, place, model, access, 6 DIPs apart, on one
-        // line with Start task; below the full Home width they wrap two to
-        // a line ([`controls::chip_lines`]), so no chip is cut.
+        // The Goal the new task starts with: the project's launch policy
+        // Goal ("Goal · 3 rounds") with the owner's fields over it, or
+        // "Goal" with none; it opens the Goal dialog (brand book §9.1).
+        let goal_label = self.launch_goal_label();
+        let goal: View = controls::chip()
+            .automation_name(format!("{goal_label}: the goal the new task starts with"))
+            .on_click(context.callback(|()| Message::Goal(GoalMsg::Composer)))
+            .content(controls::chip_content(
+                Some(controls::glyph::GOAL),
+                &goal_label,
+                false,
+            ))
+            .tooltip("The goal the new task starts with");
+        // The design: project, place, model, access and Goal, 6 DIPs
+        // apart, on one line with Start task; below the full Home width
+        // they wrap to a second line ([`controls::chip_lines`]), so no chip
+        // is cut.
         let chips: Vec<View> = [
             Some(self.project_chip(context)),
             self.place_chip(context),
             Some(model),
             Some(access),
+            Some(goal),
         ]
         .into_iter()
         .flatten()
@@ -742,7 +738,8 @@ impl DesktopApp {
     }
 
     /// The project list: a search field, the registered projects (name and
-    /// folder) and "Other folder…".
+    /// folder), "Other folder…" and "Add project…" (both open the native
+    /// folder picker).
     fn project_popover(&self, context: &mut ViewContext<Self>) -> View {
         let current = self
             .selected_project()
@@ -761,6 +758,7 @@ impl DesktopApp {
                 };
                 let glyph = match checkout.as_str() {
                     OTHER_FOLDER => controls::glyph::OPEN_FOLDER,
+                    ADD_PROJECT => controls::glyph::NEW_TASK,
                     CHAT_PROJECT => controls::glyph::CHAT,
                     _ => controls::glyph::FOLDER,
                 };

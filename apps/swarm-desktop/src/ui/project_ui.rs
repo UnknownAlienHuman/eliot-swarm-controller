@@ -162,10 +162,7 @@ impl DesktopApp {
             ProjectMsg::Retry => self.read_project(context),
             ProjectMsg::EditCheck => {
                 let id = self.project.id.clone();
-                self.shell_update(ShellMsg::SettingsPage(Page::Projects), context);
-                if self.settings.project_open.as_deref() != Some(id.as_str()) {
-                    self.settings_update(SettingsMsg::ProjectOpened(id), context);
-                }
+                self.open_policy_editor(id, context);
             }
         }
     }
@@ -492,11 +489,7 @@ impl DesktopApp {
         let check = (!fields.argv.is_empty()).then(|| CheckView {
             command: fields.argv.join(" "),
             runs: {
-                let rounds = if fields.max_rounds.trim().is_empty() {
-                    "3 rounds".to_owned()
-                } else {
-                    format!("{} rounds", fields.max_rounds.trim())
-                };
+                let rounds = format!("{} rounds", fields.rounds());
                 if fields.at_turn_end {
                     format!("When a turn ends · {rounds}")
                 } else {
