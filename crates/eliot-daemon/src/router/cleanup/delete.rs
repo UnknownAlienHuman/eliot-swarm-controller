@@ -1,3 +1,4 @@
+use super::ownership::require_native_cleanup_ownership;
 use super::*;
 
 impl Router {
@@ -115,7 +116,6 @@ impl Router {
         let mut items = Vec::new();
         for agent in agents {
             if let Some(artifact) = self.agent_delete_session(agent).await? {
-                self.require_cleanup_ownership(&artifact).await?;
                 items.push(CleanupCandidate {
                     artifact,
                     bytes: None,
@@ -224,13 +224,19 @@ impl Router {
         })?;
         let path = expected.path.clone();
         let mut store = self.inner.store.lock().await;
+        if store
+            .known_native_session_artifact(&agent.id, &path)?
+            .is_some_and(|artifact| matches!(artifact.state.as_str(), "removed" | "released"))
+        {
+            return Ok(None);
+        }
+        // A copied Store can still record an earlier generation for this session.
+        // Check custody before recording or advancing its artifact binding.
+        require_native_cleanup_ownership(&store, &expected)?;
         store.record_known_artifact(expected)?;
         let artifact = store
             .known_native_session_artifact(&agent.id, &path)?
             .ok_or_else(|| Error::new("source_integrity", "native session custody is absent"))?;
-        if matches!(artifact.state.as_str(), "removed" | "released") {
-            return Ok(None);
-        }
         frozen_archive_profile(agent, &artifact)?;
         Ok(Some(artifact))
     }

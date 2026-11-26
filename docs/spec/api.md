@@ -1372,6 +1372,11 @@ eligible Swarm-created worktrees. It uses the same worktree ownership and cleanl
 checks as `cleanup.apply`. Ordinary checkouts, Git branches, external sessions and
 Claude Code, Muse and Antigravity chat history stay in place. The desktop confirms
 the scope and offers Delete only for eligible stopped or failed task trees.
+For `native_session_foreign` or `worktree_root_foreign`, run
+`swarm delete <selected-agent> --data-dir <owning-data-dir>` against the original
+daemon that owns the generation or managed worktree. A Store copy gets a new
+namespace and cannot perform cleanup on the original daemon's behalf. An already
+removed or explicitly released native session needs no cleanup.
 Preflight can defer a settled managed workspace's process source to worktree
 removal. Open or uncertain processes still block preflight, and the source must
 close before the task records are removed.
