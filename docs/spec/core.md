@@ -1158,8 +1158,10 @@ oldest `gap_seq` of an open current-generation source whose `gap_from` still
 equals its cursor, so the Git coverage check can still re-read its gap event
 afterwards; a superseded gap pins nothing. A lagging rule
 releases its pin only through the ordinary atomic backlog skip/pause transition. Advance
-`rule_history_coverage.pruned_through` in the same transaction as deletion, so replay and
-explicit catch-up return `history_gap` instead of silently omitting events. Never reset
+`rule_history_coverage.pruned_through` and record the maximum removed sequence per
+replay filter key in the same transaction as event retention or Agent deletion.
+Filtered replay reports gaps only within its effective filter coverage, and rule
+catch-up uses the journal floor. Never reset
 the event id allocator or reconstruct old subjects from current Agent state.
 
 Current projections and source recovery state outlive ordinary event retention. A new

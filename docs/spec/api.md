@@ -3166,10 +3166,19 @@ Event requests, responses and `EventsFilter` are defined in the canonical Core A
 
 `events.bounds` accepts `EventsBoundsRequest` and returns `EventsBoundsResponse`
 ([Core DTOs](../../crates/eliot-core/src/api.rs)). Its optional `filter` has the same
-grammar and caller-scope checks as replay. The numeric bounds describe the journal,
-as does replay's `high_water`: `pruned_through` is the exclusive pruning floor and
-`hi` is the allocated sequence high-water mark, including when every event row has
-been pruned. This bounded metadata query reads no event page and requires no cursor.
+grammar and caller-scope checks as replay. `hi` is the journal's allocated sequence
+high-water mark, including when every event row has been pruned. Unfiltered reads
+use the journal's exclusive pruning floor. For a filter, `pruned_through` is the
+highest removed sequence matching the effective authorized filter, or zero when
+no matching events were removed. `events.read` and `events.subscribe` use that
+same floor to check their exclusive cursor.
+
+Stores upgraded from journal-wide coverage have no filter keys for prior deletions.
+A surviving Agent with its creation event has no legacy gap. For a surviving Agent
+whose creation is missing, the legacy floor is capped at the cursor immediately
+before its first surviving event, if one exists. The legacy journal watermark
+also covers kind/source-only filters, Agents already deleted before upgrade, and
+variable events included by an Agent's authorization scope.
 
 CLI `watch [AGENT]` reads these bounds once and starts at `hi`, delivering new events.
 `watch [AGENT] --after SEQ` instead uses that exact exclusive replay cursor. A lost
