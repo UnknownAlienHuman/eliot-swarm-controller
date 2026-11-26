@@ -222,7 +222,8 @@ pub(super) enum ShellMsg {
     PanelToggled(Panel),
     /// The size class or the docking result changed (`split_ui`).
     Layout(split_ui::Layout),
-    /// A panel handle was released at these widths.
+    /// A panel handle was released, or a Settings › Panel widths slider
+    /// moved, at these widths.
     PanelsResized(split_ui::PanelWidths),
     /// Settings › Appearance: the default panel widths again.
     PanelsReset,
@@ -978,7 +979,11 @@ impl DesktopApp {
                 }
                 self.layout = layout;
             }
-            ShellMsg::PanelsResized(widths) => {
+            // A Settings slider reports the width it shows too: only a
+            // change is saved.
+            ShellMsg::PanelsResized(widths)
+                if widths != split_ui::PanelWidths::of(self.prefs.panels) =>
+            {
                 self.prefs.panels = Some(widths.saved());
                 self.prefs_rev += 1;
                 self.save_preferences(context);
@@ -988,7 +993,7 @@ impl DesktopApp {
                 self.prefs_rev += 1;
                 self.save_preferences(context);
             }
-            ShellMsg::PanelsReset => {}
+            ShellMsg::PanelsResized(_) | ShellMsg::PanelsReset => {}
             ShellMsg::OverlayClosed => self.nav.overlay_open = false,
             // The list reports the value it shows when it is built: only a
             // change saves. WinUI redraws in the new theme by itself.
@@ -2415,19 +2420,31 @@ impl DesktopApp {
     pub(super) fn shell_view(&self, context: &mut ViewContext<Self>) -> View {
         context.window_title("Eliot Swarm");
         // A bounded first window instead of WinUI's share of the monitor
-        // (3826 px wide on a 5120 px display). Reactor applies only visuals
-        // that differ from the default, so this declaration also carries the
-        // title-bar theme.
-        context.window_visuals(
-            WindowVisuals::new()
-                .client_size(
-                    self.preferred_window
-                        .map_or(tokens::layout::WINDOW_WIDTH, |w| f64::from(w.0)),
-                    self.preferred_window
-                        .map_or(tokens::layout::WINDOW_HEIGHT, |w| f64::from(w.1)),
-                )
-                .theme(window_theme(self.prefs.theme)),
-        );
+        // (3826 px wide on a 5120 px display), resizable down to the
+        // supported minimum client size (`[desktop] window`'s lower bound,
+        // §6.2) and no further: Windows enforces it in every resize, drag or
+        // programmatic. Reactor applies only visuals that differ from the
+        // default, so this declaration also carries the title-bar theme.
+        let (min_width, min_height) = eliot_daemon::DESKTOP_WINDOW_MIN;
+        let visuals = WindowVisuals::new()
+            .client_size(
+                self.preferred_window
+                    .map_or(tokens::layout::WINDOW_WIDTH, |w| f64::from(w.0)),
+                self.preferred_window
+                    .map_or(tokens::layout::WINDOW_HEIGHT, |w| f64::from(w.1)),
+            )
+            .constraints(WindowConstraints {
+                min_width: Some(f64::from(min_width)),
+                min_height: Some(f64::from(min_height)),
+                ..WindowConstraints::default()
+            })
+            .theme(window_theme(self.prefs.theme));
+        // The saved place and size, restored by Reactor before the first
+        // show (`window_place`).
+        context.window_visuals(match self.initial_bounds {
+            Some(bounds) => visuals.initial_placement(bounds),
+            None => visuals,
+        });
         let main: View = match self.main {
             main if main != Main::Settings && self.link_view_shown() => {
                 self.startup_error_view(context)

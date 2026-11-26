@@ -41,12 +41,10 @@ mod work_truth_repo;
 mod workspace_git;
 mod workspaces;
 
-/// The closed Claude Code `--effort` vocabulary (ad-hoc launches and the
-/// desktop picker; Claude Code has no live model catalogue).
-pub use config::desktop_window_in_bounds;
 pub use config::load_cloud_access_config;
 pub use config::recovery::{read_settings_for_repair, save_settings_for_repair};
 pub use config::settings::stored_section as stored_settings_section;
+pub use config::{DESKTOP_WINDOW_MIN, desktop_window_in_bounds};
 pub use config::{
     load_cloud_access_audiences, load_cloud_access_snapshot, load_remote_manager_grants,
     review_pin_refusal,

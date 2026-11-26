@@ -72,6 +72,7 @@ impl DesktopApp {
                     context.callback(|index| Message::Settings(SettingsMsg::AccessChosen(index))),
                 ),
         )]);
+        let widths = split_ui::PanelWidths::of(self.prefs.panels);
         StackPanel::new()
             .spacing(tokens::spacing::SM)
             .children((
@@ -89,15 +90,23 @@ impl DesktopApp {
                         "panels",
                         controls::setting_row(
                             "Panel widths",
-                            "Drag a panel's edge to resize it",
+                            "Drag a panel's edge, or set its width here",
                             View::from(
-                                controls::outlined()
-                                    .is_enabled(self.prefs.panels.is_some())
-                                    .automation_name("Reset panel widths")
-                                    .on_click(
-                                        context.message(Message::Shell(ShellMsg::PanelsReset)),
-                                    )
-                                    .content(controls::label("Reset panel widths")),
+                                StackPanel::new()
+                                    .spacing(tokens::spacing::SM)
+                                    .width(tokens::page::SETTINGS_CONTROL)
+                                    .children((
+                                        width_slider(context, widths, split_ui::Edge::Sidebar),
+                                        width_slider(context, widths, split_ui::Edge::Pane),
+                                        controls::outlined()
+                                            .is_enabled(self.prefs.panels.is_some())
+                                            .automation_name("Reset panel widths")
+                                            .on_click(
+                                                context
+                                                    .message(Message::Shell(ShellMsg::PanelsReset)),
+                                            )
+                                            .content(controls::label("Reset panel widths")),
+                                    )),
                             ),
                         ),
                     ),
@@ -124,4 +133,39 @@ impl DesktopApp {
             ))
             .into()
     }
+}
+
+/// One panel's width as a native slider beside the handle on its edge:
+/// UI Automation sets it through its RangeValue pattern and the keyboard
+/// through the slider's own keys, where the handle offers neither a pattern
+/// nor discoverable keys. It moves the panel live and saves like a handle.
+fn width_slider(
+    context: &mut ViewContext<DesktopApp>,
+    widths: split_ui::PanelWidths,
+    edge: split_ui::Edge,
+) -> View {
+    let (name, minimum, maximum, value) = match edge {
+        split_ui::Edge::Sidebar => (
+            "Sidebar width",
+            tokens::layout::SIDEBAR_MIN_WIDTH,
+            tokens::layout::SIDEBAR_MAX_WIDTH,
+            widths.sidebar,
+        ),
+        split_ui::Edge::Pane => (
+            "Pane width",
+            tokens::layout::PANEL_MIN_WIDTH,
+            tokens::layout::PANEL_MAX_WIDTH,
+            widths.pane,
+        ),
+    };
+    Slider::new()
+        .minimum(minimum)
+        .maximum(maximum)
+        .value(value)
+        .header(controls::label(name))
+        .automation_name(name)
+        .on_value_changed(context.callback(move |width: f64| {
+            Message::Shell(ShellMsg::PanelsResized(widths.with(edge, width)))
+        }))
+        .into()
 }

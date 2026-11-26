@@ -1,20 +1,23 @@
 //! The window opens where the owner left it (`[desktop] window`).
 //!
-//! windows-reactor 0.100.0 sets only the client size and offers no window
-//! position, maximized state or close hook, so Windows cascades every new
-//! window. A CBT hook scoped to the UI thread (Microsoft Learn:
-//! `SetWindowsHookExW` with `WH_CBT` and that thread's id, `CBTProc`) sees
-//! the WinUI window as it is created and as it is destroyed:
-//! - `HCBT_CREATEWND`: the saved outer top-left, clamped into the work area
-//!   of the nearest attached monitor, goes into its `CREATESTRUCTW` (the
-//!   documented way to change a window's place before it exists); the
-//!   window is never moved after its first frame. Without a saved place
-//!   Windows chooses it.
+//! The saved place and size become the outer bounds Reactor restores
+//! before the window is first shown ([`initial_bounds`], Reactor's
+//! `WindowVisuals::initial_placement`): the saved client size plus the
+//! frame, kept inside the work area of the nearest attached monitor; the
+//! window is never moved after its first frame. Without a saved place
+//! Windows chooses it. Reactor sizes the window through its own
+//! `AppWindow`, so the minimum client size it converts to pixels from that
+//! window's frame holds after a restored start as after a first one.
+//!
+//! A CBT hook scoped to the UI thread (Microsoft Learn: `SetWindowsHookExW`
+//! with `WH_CBT` and that thread's id, `CBTProc`) sees the WinUI window as
+//! it is created, first activated and destroyed:
+//! - `HCBT_CREATEWND`: the window is noted, unchanged.
 //! - `HCBT_ACTIVATE`, the first one (inside WinUI's first show, before
 //!   XAML draws): a window closed maximized is maximized. `WS_MAXIMIZE`
 //!   at creation does not survive WinUI's first `ShowWindow` (observed
 //!   live); a window still minimized by its start-up show restores
-//!   maximized.
+//!   maximized, which Reactor's own maximized placement would not keep.
 //! - `HCBT_DESTROYWND`: its placement (`GetWindowPlacement`) is read once
 //!   for the one `[desktop]` write after the window closes: the normal
 //!   place, the normal client size (the inverse of the creation's frame
@@ -56,6 +59,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     IsIconic, IsWindowVisible, SW_HIDE, SW_MINIMIZE, SW_SHOWMAXIMIZED, SW_SHOWMINIMIZED,
     SW_SHOWMINNOACTIVE, SW_SHOWNA, SW_SHOWNOACTIVATE, SetWindowPlacement, SetWindowsHookExW,
     UnhookWindowsHookEx, WH_CBT, WINDOWPLACEMENT, WPF_RESTORETOMAXIMIZED, WS_CHILD,
+    WS_EX_WINDOWEDGE, WS_OVERLAPPEDWINDOW,
 };
 
 /// Where the window was when it closed.
@@ -71,17 +75,29 @@ pub struct Closed {
     pub maximized: bool,
 }
 
-/// The saved place applied when the window is created.
-#[derive(Clone, Copy)]
-struct Wanted {
-    position: Option<(i32, i32)>,
-    /// The saved client size in DIPs, to keep the window inside the work area.
-    size: (u32, u32),
-    maximized: bool,
+/// The frame styles of WinUI's desktop window (`WS_OVERLAPPEDWINDOW` with
+/// `WS_EX_WINDOWEDGE`, read from the live window), for its outer size
+/// before it exists.
+const WINUI_FRAME: (u32, u32) = (WS_OVERLAPPEDWINDOW, WS_EX_WINDOWEDGE);
+
+/// The outer bounds the window opens at: the saved top-left and client size
+/// placed by [`place`] (none without a saved top-left: Windows chooses the
+/// place). The maximized state is applied by the hook's first activation.
+pub fn initial_bounds(
+    saved: Option<crate::settings::WindowPlacement>,
+) -> Option<windows_reactor::WindowPlacement> {
+    let saved = saved?;
+    let (x, y, width, height) = place(saved.position()?, (saved.width, saved.height), WINUI_FRAME);
+    Some(windows_reactor::WindowPlacement {
+        x,
+        y,
+        width,
+        height,
+        maximized: false,
+    })
 }
 
 thread_local! {
-    static WANTED: Cell<Option<Wanted>> = const { Cell::new(None) };
     static WINDOW: Cell<HWND> = const { Cell::new(std::ptr::null_mut()) };
     static CLOSED: Cell<Option<Closed>> = const { Cell::new(None) };
     /// The window opens maximized at its first activation.
@@ -99,13 +115,9 @@ static FOCUS_HELD: AtomicBool = AtomicBool::new(false);
 pub struct Hook(HHOOK);
 
 /// Install the hook on the UI thread before the window exists, with the
-/// saved placement (none: Windows chooses the place).
+/// saved placement's maximized state.
 pub fn install(saved: Option<crate::settings::WindowPlacement>) -> Result<Hook, String> {
-    WANTED.set(saved.map(|saved| Wanted {
-        position: saved.position(),
-        size: (saved.width, saved.height),
-        maximized: saved.maximized,
-    }));
+    MAXIMIZE.set(saved.is_some_and(|saved| saved.maximized));
     ACTIVATE.set(started_to_activate());
     // SAFETY: `cbt` has the HOOKPROC signature; a null module with the
     // current thread's id installs a thread-local hook.
@@ -132,28 +144,18 @@ impl Hook {
     }
 }
 
-/// `CBTProc`: place the WinUI window as it is created, read its placement
-/// as it is destroyed; every event passes on.
+/// `CBTProc`: note the WinUI window as it is created, maximize it at its
+/// first activation when it closed maximized, read its placement as it is
+/// destroyed; every event passes on unchanged.
 unsafe extern "system" fn cbt(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     let window = wparam as HWND;
     if code == HCBT_CREATEWND as i32 && WINDOW.get().is_null() && is_winui(window) {
-        // SAFETY: for HCBT_CREATEWND lParam is a valid CBT_CREATEWNDW whose
-        // CREATESTRUCTW the hook may change.
-        let create = unsafe { &mut *(*(lparam as *mut CBT_CREATEWNDW)).lpcs };
+        // SAFETY: for HCBT_CREATEWND lParam is a valid CBT_CREATEWNDW; it
+        // is only read.
+        let create = unsafe { &*(*(lparam as *const CBT_CREATEWNDW)).lpcs };
         if create.style & WS_CHILD as i32 == 0 {
             WINDOW.set(window);
             WINDOW_ID.store(window as isize, Ordering::Relaxed);
-            if let Some(wanted) = WANTED.get() {
-                // A window created at an explicit place keeps its created
-                // size (Reactor's ResizeClient does not change it: observed
-                // live), so it is created at the saved client size plus
-                // its frame.
-                if let Some(at) = wanted.position {
-                    let frame = (create.style as u32, create.dwExStyle);
-                    (create.x, create.y, create.cx, create.cy) = place(at, wanted.size, frame);
-                }
-                MAXIMIZE.set(wanted.maximized);
-            }
         }
     } else if code == HCBT_ACTIVATE as i32 && window == WINDOW.get() && MAXIMIZE.take() {
         maximize(window);

@@ -1633,12 +1633,12 @@ impl DesktopApp {
 
     /// The Home screen (§8.1): one centred column at the Home width, its
     /// parts apart by the Home gap: the question ("What should we build?",
-    /// Title), the selected project on the line under it (or the §8.2
-    /// state that stands in its place: no projects, a missing folder), a
-    /// refusal notice when there is one, the composer (Project, Workspace,
-    /// Model, Access, Start task), then at most three quick actions, none
+    /// Title), a §8.2 state under it when there is one (no projects, a
+    /// missing folder), a refusal notice when there is one, the composer
+    /// (Project, Workspace, Model, Access, Start task: the project chip
+    /// names the selected project), then at most three quick actions, none
     /// of which sends anything: Review the open PRs (fills the composer),
-    /// Schedule an automation, and Continue {the last task} when there is
+    /// Schedule an automation, and Continue · {the last task} when there is
     /// one. No hero, no metric cards.
     fn home_view(
         &self,
@@ -1648,6 +1648,7 @@ impl DesktopApp {
     ) -> View {
         const REVIEW: &str =
             "Review the open pull requests in this repository and summarize what needs attention.";
+        let narrow = self.narrow_main();
         let last = self
             .nav
             .agents
@@ -1655,8 +1656,9 @@ impl DesktopApp {
             .filter(|agent| !agent.native_child && !agent.archived)
             .max_by_key(|agent| agent.updated_at)
             .cloned();
-        // The row rule: the icon, then the label in the star cell, on up
-        // to two lines in a narrow window (a longer one ends in "…").
+        // The row rule: the icon, then the label on one line in the star
+        // cell, ending in "…" when it is longer than the card (the card's
+        // name and tooltip carry it whole), so every card has one height.
         let card = |glyph: &str, label: &str| {
             Border::new()
                 .margin(Thickness::xy(
@@ -1666,15 +1668,14 @@ impl DesktopApp {
                 .content(controls::row_grid(
                     Some(controls::icon(glyph)),
                     controls::body(label.to_owned())
-                        .text_wrapping(TextWrapping::Wrap)
-                        .max_lines(2)
                         .text_trimming(TextTrimming::CharacterEllipsis)
                         .into(),
                     None,
                     tokens::spacing::ROW,
                 ))
         };
-        let mut cards: Vec<(String, Button)> = vec![
+        // Each card with its label, whole in its tooltip where it trims.
+        let mut cards: Vec<(String, Button, String)> = vec![
             (
                 "review".to_owned(),
                 controls::suggestion()
@@ -1683,6 +1684,7 @@ impl DesktopApp {
                         context.message(Message::Chat(ChatMsg::ComposerChanged(REVIEW.to_owned()))),
                     )
                     .content(card(controls::glyph::DIFF, "Review the open PRs")),
+                "Review the open PRs".to_owned(),
             ),
             (
                 "automation".to_owned(),
@@ -1692,16 +1694,18 @@ impl DesktopApp {
                         page_ui::Place::Automations,
                     ))))
                     .content(card(controls::glyph::SCHEDULE, "Schedule an automation")),
+                "Schedule an automation".to_owned(),
             ),
         ];
         if let Some(agent) = last {
-            let label = format!("Continue {}", self.agent_label(&agent));
+            let label = format!("Continue \u{b7} {}", self.agent_label(&agent));
             cards.push((
                 format!("continue:{}", agent.id),
                 controls::suggestion()
                     .automation_name(label.clone())
                     .on_click(context.message(Message::Shell(ShellMsg::AgentOpened(agent))))
                     .content(card(controls::glyph::HISTORY, &label)),
+                label,
             ));
         }
         let title: View = controls::page_title(if self.launch.chat {
@@ -1712,8 +1716,8 @@ impl DesktopApp {
         .horizontal_alignment(HorizontalAlignment::Center)
         .text_wrapping(TextWrapping::Wrap)
         .into();
-        // The selected project under the question, or the §8.2 state that
-        // stands in its place, in its stated words.
+        // A §8.2 state under the question, in its stated words; otherwise
+        // nothing: the composer's project chip names the project.
         let place: Option<View> = if self.launch.chat {
             None
         } else if self.nav.projects.is_empty() && self.launch.workspace.is_empty() {
@@ -1734,22 +1738,7 @@ impl DesktopApp {
                 .into(),
             )
         } else {
-            let label = self.launch_project_label();
-            Some(
-                Border::new()
-                    .horizontal_alignment(HorizontalAlignment::Center)
-                    .automation_name(format!("Project: {label}"))
-                    .content(controls::row_grid(
-                        Some(controls::icon(controls::glyph::OPEN_FOLDER)),
-                        controls::body(label)
-                            .vertical_alignment(VerticalAlignment::Center)
-                            .text_trimming(TextTrimming::CharacterEllipsis)
-                            .into(),
-                        None,
-                        tokens::spacing::SM,
-                    ))
-                    .into(),
-            )
+            None
         };
         // The title names the project by its origin: the last known while
         // its Git metadata refreshes, and it says so.
@@ -1785,18 +1774,24 @@ impl DesktopApp {
                             alert,
                             Some(composer),
                             Some(
-                                // The cards share the column in equal cells.
-                                Grid::new()
-                                    .columns(vec![GridLength::STAR; cards.len()])
-                                    .column_spacing(tokens::spacing::SM)
+                                // The cards share the column in equal cells
+                                // of one height; a narrow main area stacks
+                                // them, one full-width card per line, so no
+                                // label is cut.
+                                cards_grid(narrow, cards.len())
                                     .keyed_children(cards.into_iter().enumerate().map(
-                                        |(index, (key, card))| {
+                                        |(index, (key, card, label))| {
+                                            let (row, column) =
+                                                if narrow { (index, 0) } else { (0, index) };
                                             KeyedView::new(
                                                 key,
-                                                card.grid_column(index as i32)
+                                                card.grid_row(row as i32)
+                                                    .grid_column(column as i32)
                                                     .horizontal_alignment(
                                                         HorizontalAlignment::Stretch,
-                                                    ),
+                                                    )
+                                                    .vertical_alignment(VerticalAlignment::Stretch)
+                                                    .tooltip(label),
                                             )
                                         },
                                     ))
@@ -2057,5 +2052,19 @@ impl DesktopApp {
                 .flatten(),
             )
             .into()
+    }
+}
+
+/// The Home cards' grid: equal columns of one height, or one full-width
+/// card per line in a narrow main area.
+fn cards_grid(narrow: bool, count: usize) -> Grid {
+    if narrow {
+        Grid::new()
+            .rows(vec![GridLength::Auto; count])
+            .row_spacing(tokens::spacing::SM)
+    } else {
+        Grid::new()
+            .columns(vec![GridLength::STAR; count])
+            .column_spacing(tokens::spacing::SM)
     }
 }

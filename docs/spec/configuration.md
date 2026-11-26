@@ -1575,7 +1575,7 @@ between light and dark; High Contrast always follows Windows; the retired
 palettes `amoled`, `purple`, `neon` and `matrix` are still accepted, the
 desktop shows `purple` as light and the others as dark and writes the normalized
 value at its next preference save), `window` (`width`/`height`: the normal client size in DIPs, from
-640 by 480 to 32768 by 32768; optional `x`/`y`: the normal outer top-left in physical
+640 by 480 to 32768 by 32768, and the window cannot be resized below 640 by 480; optional `x`/`y`: the normal outer top-left in physical
 screen pixels, from -32768 to 32768; optional `maximized`; out of these bounds the
 settings are refused and the desktop opens at its defaults), `startup` (`new_task`, or `last_conversation` to reopen the most
 recently active Agent's conversation), `last_access` (`ask`, `auto` or `full`), and
@@ -1603,9 +1603,10 @@ area, and without `x`/`y` Windows chooses the place. `panels` (`{sidebar, pane}`
 sidebar's width from 200 to 360 DIPs and the context pane's from 320 to 720, in whole DIPs
 as their drag handles left them) is read with `window`, so the first frame lays out at those
 widths. It is written once when a drag on a handle ends, when an arrow key on a handle is
-released (one write per press or hold), or when the keyboard focus leaves a handle the arrow
-keys moved. Settings › Appearance › Reset panel widths removes it, and
-without it the desktop uses its default widths.
+released (one write per press or hold), when the keyboard focus leaves a handle the arrow
+keys moved, or when a Settings › Appearance › Panel widths slider changes a width (the
+sliders give UI Automation a RangeValue path to both widths). Reset panel widths in the same
+row removes it, and without it the desktop uses its default widths.
 When the daemon cannot start, the local Owner can open Settings (Repair
 settings) from the startup failure view. Repair uses the daemon's settings reader and
 revision-checked writer under the private daemon lock. After a repair save

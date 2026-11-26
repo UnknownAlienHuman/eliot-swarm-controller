@@ -297,6 +297,8 @@ struct DesktopInput {
     workspace: Option<PathBuf>,
     /// `[desktop] window`, read before the window exists.
     window: Option<crate::settings::WindowPlacement>,
+    /// The outer bounds `window` opens at ([`crate::window_place::initial_bounds`]).
+    bounds: Option<windows_reactor::WindowPlacement>,
     /// `[desktop] panels`, read with `window`.
     panels: Option<crate::settings::Panels>,
     close_note: CloseNote,
@@ -359,6 +361,9 @@ struct DesktopApp {
     /// The saved window size the first frame declares (constant: a later
     /// declaration would resize the window after it is shown).
     preferred_window: Option<(u32, u32)>,
+    /// The saved outer bounds Reactor restores before the first show
+    /// (constant; Reactor reads only the first declaration).
+    initial_bounds: Option<windows_reactor::WindowPlacement>,
     /// Where the window's close write goes (see [`CloseNote`]).
     close_note: CloseNote,
     /// The size class and docking result the size observer last posted.
@@ -957,6 +962,7 @@ impl Component for DesktopApp {
             focus_held: None,
             close_note: input.close_note.clone(),
             preferred_window: input.window.map(|window| (window.width, window.height)),
+            initial_bounds: input.bounds,
             // The first frame's guess from the saved size and panel widths,
             // until the size observer posts.
             layout: {
@@ -1178,6 +1184,7 @@ pub fn run(workspace: Option<PathBuf>) -> Result<(), String> {
     let result = App::run_component::<DesktopApp>(DesktopInput {
         workspace,
         window,
+        bounds: crate::window_place::initial_bounds(window),
         panels: saved.panels,
         close_note: close_note.clone(),
     })
