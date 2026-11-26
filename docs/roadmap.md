@@ -1244,17 +1244,19 @@ of the explicitly selected release scope.
       the 720 reading column centred by MaxWidth); resizable sidebar and
       context pane (pointer, arrow keys, persisted in `[desktop] panels`,
       Reset panel widths in Settings); the compact sidebar in the native
-      navigation pane; the pane over the main area with Back to
-      conversation when it cannot dock; one row rule for rows and chips.
+      navigation pane; the pane over the main area, its Close returning
+      to the conversation, when it cannot dock; one row rule for rows and
+      chips.
   - [ ] **M2 Main working path.** Home, conversation, composer, decisions,
     native menus and long history: launch, read, send, steer, stop and decide
     with draft, focus and scroll kept.
     - [ ] **M2a Home, header, status marks, composer, turn blocks.** The
-      §9.1 header (title in the star cell over project · branch, a readable
-      state and the Goal when there is one; Changes, Agents, Details and
-      More as same-height stock buttons, the pane commands checked while
-      their tab is open, secondary ones in More at the narrowest main
-      area); §4.2 static status marks with no progress ring in rows and at
+      §9.1 header (title in the star cell over project · branch and a
+      readable state; Goal (the goal's state once set), Changes, Agents,
+      Details and More as same-height stock buttons, the pane commands
+      pressed while their panel is open, secondary ones in More at the
+      narrowest main area, each tooltip one line with its shortcut; the
+      pane one panel with its title, Full view and Close); §4.2 static status marks with no progress ring in rows and at
       most one activity indicator per region; the §9.4 composer with Send,
       Steer, Stop turn and Resume named in words, the pending ring on the
       action being confirmed, one bar height and the parameters on their
@@ -1285,8 +1287,9 @@ of the explicitly selected release scope.
       project menus dispatch by each action's stable MenuItem key, in the
       table's groups, with an often-needed action that cannot run now
       disabled with its reason and no unsupported feature shown; the
-      header's "…" is the same task menu. §18.1 one Goal ContentDialog from
-      the task menu's Goal… and Details › Goal: text, the check argv and
+      header's "…" is the same task menu (Goal is the header's own
+      button). §18.1 one Goal ContentDialog from the header's Goal, the
+      task menu's Goal… and Details › Goal…: text, the check argv and
       round/turn limits in their source units, Save/Pause/Resume/Clear by
       the goal's status over the existing `goal.*` calls, errors in the
       dialog, Save named and never the Enter default. §8.3 the model

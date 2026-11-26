@@ -145,8 +145,8 @@ pub mod glyph {
     pub const WRAP: &str = "\u{E8E4}";
     /// FullScreen.
     pub const FULL_VIEW: &str = "\u{E740}";
-    /// ResizeMouseLarge.
-    pub const WIDTH: &str = "\u{E747}";
+    /// BackToWindow.
+    pub const EXIT_FULL_VIEW: &str = "\u{E73F}";
     /// PageAdd.
     pub const NEW_FILE: &str = "\u{EA1A}";
     /// Library.
@@ -436,16 +436,6 @@ pub fn inline_button() -> Button {
         .min_width(0.0)
         .min_height(0.0)
         .horizontal_alignment(HorizontalAlignment::Left)
-}
-
-/// An icon action that stays on (Wide pane, an open pane): the accent
-/// button while `on`, else the subtle icon button.
-pub fn toggle_icon_button(on: bool) -> Button {
-    if on {
-        icon_button().style(ButtonStyle::Accent)
-    } else {
-        icon_button()
-    }
 }
 
 /// A command in a bar (the conversation header, the composer row): a

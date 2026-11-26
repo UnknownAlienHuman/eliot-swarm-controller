@@ -159,8 +159,9 @@ pub mod layout {
     /// The sidebar's side gutter.
     pub const SIDEBAR_GUTTER: f64 = 8.0;
     pub const SIDEBAR_PADDING: f64 = 12.0;
-    /// The right pane at its default and Wide widths; its handle keeps it
-    /// between the bounds.
+    /// The right pane at its default width; its handle keeps it between the
+    /// bounds, and at the wide width (its maximum) its content takes the
+    /// wide layout, as in Full view.
     pub const PANEL_WIDTH: f64 = 480.0;
     pub const PANEL_WIDE_WIDTH: f64 = READING_WIDTH;
     pub const PANEL_MIN_WIDTH: f64 = 320.0;
@@ -178,8 +179,6 @@ pub mod layout {
     pub const MAIN_REQUIRED_WIDTH: f64 = 520.0;
     pub const DOCK_GAP: f64 = 16.0;
     pub const FILTER_WIDTH: f64 = 168.0;
-    /// The selected pane tab's underline.
-    pub const TAB_INDICATOR: f64 = 3.0;
     /// The conversation and composer column.
     pub const READING_WIDTH: f64 = 720.0;
     pub const HOME_WIDTH: f64 = 760.0;

@@ -143,12 +143,10 @@ pub(super) struct TerminalState {
 /// Details sections closed until the owner opens them.
 const CLOSED_AT_FIRST: [&str; 2] = ["task", "technical"];
 
-/// The pane's width, its tabs' reads and the owner's choices in it.
+/// Full view, the panels' reads and the owner's choices in them.
 #[derive(Default)]
 pub(super) struct PaneState {
-    /// Wide (`size-reading`) instead of `size-pane`.
-    pub(super) wide: bool,
-    /// Full view: the open tab over the whole main card.
+    /// Full view: the open panel over the whole main card.
     pub(super) full: bool,
     changes: ChangesState,
     terminal: TerminalState,
@@ -166,14 +164,9 @@ impl PaneState {
 
 #[derive(Clone, Debug)]
 pub(super) enum PaneMsg {
-    /// A tab of the strip.
-    Tab(Panel),
-    /// The Wide toggle.
-    Wide,
-    /// The Full view toggle.
+    /// The Full view toggle: the panel over the whole main card, or back
+    /// beside the conversation.
     Full,
-    /// Back to conversation: the pane over the main area closes.
-    Back,
     /// The open tab's Refresh (and Retry).
     Refresh,
     /// A Changes read landed (its epoch), or was dropped (`None`).
@@ -206,13 +199,7 @@ pub(super) enum PaneMsg {
 impl DesktopApp {
     pub(super) fn pane_update(&mut self, msg: PaneMsg, context: &ComponentContext<Self>) {
         match msg {
-            PaneMsg::Tab(panel) => self.choose_panel(panel, context),
-            PaneMsg::Wide => self.pane.wide = !self.pane.wide,
             PaneMsg::Full => self.pane.full = !self.pane.full,
-            PaneMsg::Back => {
-                self.pane.full = false;
-                self.close_panel();
-            }
             PaneMsg::Refresh => match self.panel {
                 Panel::Changes => self.read_changes(context),
                 Panel::Terminal => self.read_processes(context),
@@ -608,7 +595,8 @@ impl DesktopApp {
         });
     }
 
-    /// The pane: its tab strip over the open tab.
+    /// The pane: its bar over the open panel. One panel at a time; the
+    /// header's toggles choose it.
     pub(super) fn pane_view(&self, context: &mut ViewContext<Self>) -> View {
         let body: Option<View> = match self.panel {
             Panel::Changes => Some(self.changes_view(context)),
@@ -620,110 +608,75 @@ impl DesktopApp {
         Grid::new()
             .rows([GridLength::Auto, GridLength::STAR])
             .children((
-                self.tab_strip(context),
+                self.pane_bar(context),
                 Border::new().grid_row(1).maybe_content(body),
             ))
             .into()
     }
 
-    /// The strip (`.tabs`): Back to conversation when the pane lies over
-    /// the main area, the four tabs, then Wide and Full view, over a
-    /// hairline.
-    fn tab_strip(&self, context: &mut ViewContext<Self>) -> View {
-        let mut cells: Vec<KeyedView> = Vec::new();
-        let mut columns = Vec::new();
-        if !self.pane_docked() {
-            columns.push(GridLength::Auto);
-            cells.push(KeyedView::new(
-                "back",
-                controls::icon_button()
-                    .automation_name("Back to conversation")
-                    .on_click(context.message(Message::Pane(PaneMsg::Back)))
-                    .content(controls::icon(controls::glyph::BACK))
-                    .tooltip("Back to conversation"),
-            ));
-        }
-        for panel in Panel::TABS {
-            let selected = self.panel == panel;
-            let column = cells.len() as i32;
-            columns.push(GridLength::Auto);
-            let indicator: Option<View> = selected.then(|| {
-                Border::new()
-                    .height(tokens::layout::TAB_INDICATOR)
-                    .margin(Thickness::xy(tokens::spacing::SM, 0.0))
-                    .vertical_alignment(VerticalAlignment::Bottom)
-                    .corner_radius(CornerRadius::new(
-                        tokens::layout::TAB_INDICATOR,
-                        tokens::layout::TAB_INDICATOR,
-                        0.0,
-                        0.0,
-                    ))
-                    .background(ThemeBrush::Accent)
-                    .into()
-            });
-            cells.push(KeyedView::new(
-                format!("tab:{}:{selected}", panel.label()),
-                Grid::new()
-                    .grid_column(column)
-                    .keyed_children(crate::views::slots([
-                        Some(
-                            Button::new()
-                                .style(ButtonStyle::Subtle)
-                                .height(tokens::height::CONTROL)
-                                .min_height(tokens::height::CONTROL)
-                                .automation_name(if selected {
-                                    format!("{} (shown)", panel.label())
-                                } else {
-                                    panel.label().to_owned()
-                                })
-                                .on_click(context.message(Message::Pane(PaneMsg::Tab(panel))))
-                                .content(
-                                    controls::text(panel.label(), tokens::text::BUTTON)
-                                        .margin(Thickness::xy(
-                                            tokens::spacing::TEXT_INSET - tokens::spacing::ROW,
-                                            0.0,
-                                        ))
-                                        .vertical_alignment(VerticalAlignment::Center),
-                                )
-                                .into(),
-                        ),
-                        indicator,
-                    ])),
-            ));
-        }
-        columns.push(GridLength::STAR);
-        columns.push(GridLength::Auto);
-        columns.push(GridLength::Auto);
-        let wide = self.pane.wide;
+    /// The pane's content takes its wide layout: Full view, or the pane at
+    /// its widest (`[desktop] panels`).
+    fn pane_wide(&self) -> bool {
+        self.pane.full
+            || split_ui::PanelWidths::of(self.prefs.panels).pane >= tokens::layout::PANEL_WIDE_WIDTH
+    }
+
+    /// The pane's bar, over a hairline: the open panel's title, then Full
+    /// view (expand over the conversation, or back beside it; only where
+    /// the pane can dock, since otherwise it already fills the main area)
+    /// and Close, always at the bar's end. Close is Back to conversation
+    /// when the pane lies over it.
+    fn pane_bar(&self, context: &mut ViewContext<Self>) -> View {
+        let panel = self.panel;
+        let title = panel.label();
         let full = self.pane.full;
-        let at = cells.len() as i32 + 1;
-        cells.push(KeyedView::new(
-            format!("wide:{wide}"),
-            controls::toggle_icon_button(wide)
-                .grid_column(at)
-                .automation_name(if wide { "Wide pane (on)" } else { "Wide pane" })
-                .on_click(context.message(Message::Pane(PaneMsg::Wide)))
-                .content(controls::icon(controls::glyph::WIDTH))
-                .tooltip("Wide pane"),
-        ));
-        cells.push(KeyedView::new(
-            format!("full:{full}"),
-            controls::toggle_icon_button(full)
-                .grid_column(at + 1)
-                .automation_name(if full { "Full view (on)" } else { "Full view" })
+        let expand: Option<View> = self.layout.docks.then(|| {
+            let (glyph, words) = if full {
+                (controls::glyph::EXIT_FULL_VIEW, "Exit full view")
+            } else {
+                (controls::glyph::FULL_VIEW, "Full view")
+            };
+            controls::icon_button()
+                .grid_column(1)
+                .automation_name(words)
                 .on_click(context.message(Message::Pane(PaneMsg::Full)))
-                .content(controls::icon(controls::glyph::FULL_VIEW))
-                .tooltip(if full { "Leave Full view" } else { "Full view" }),
-        ));
+                .content(controls::icon(glyph))
+                .tooltip(if full {
+                    format!("Put {title} back beside the conversation")
+                } else {
+                    format!("Show {title} over the whole conversation")
+                })
+        });
+        let close: View = controls::icon_button()
+            .grid_column(2)
+            .automation_name(format!("Close {title}"))
+            .on_click(context.message(Message::Shell(ShellMsg::PanelToggled(Panel::Closed))))
+            .content(controls::icon(controls::glyph::CLOSE))
+            .tooltip(if self.pane_docked() {
+                panel.with_shortcut(&format!("Close {title}"))
+            } else {
+                panel.with_shortcut(&format!("Close {title} and go back to the conversation"))
+            });
         Border::new()
+            .min_height(tokens::height::HEADER)
             .border_brush(ThemeBrush::CardStroke)
             .border_thickness(Thickness::new(0.0, 0.0, 0.0, tokens::layout::HAIRLINE))
-            .padding(Thickness::xy(tokens::spacing::SM, 0.0))
+            .padding(Thickness::xy(tokens::spacing::MD, tokens::spacing::XS))
             .content(
                 Grid::new()
-                    .columns(columns)
-                    .column_spacing(tokens::spacing::ROW_GAP)
-                    .keyed_children(cells),
+                    .columns([GridLength::STAR, GridLength::Auto, GridLength::Auto])
+                    .column_spacing(tokens::spacing::XS)
+                    .keyed_children(crate::views::slots([
+                        Some(
+                            controls::text(title, tokens::text::HEADER)
+                                .automation_heading_level(AutomationHeadingLevel::Level2)
+                                .vertical_alignment(VerticalAlignment::Center)
+                                .text_trimming(TextTrimming::CharacterEllipsis)
+                                .into(),
+                        ),
+                        expand,
+                        Some(close),
+                    ])),
             )
             .into()
     }
@@ -1142,11 +1095,7 @@ impl DesktopApp {
                 controls::secondary("Nothing stands out in this patch."),
             ));
         } else {
-            let per_row = if self.pane.wide || self.pane.full {
-                4
-            } else {
-                2
-            };
+            let per_row = if self.pane_wide() { 4 } else { 2 };
             parts.push(KeyedView::new(
                 "chips",
                 super::page_ui::chip_rows(chips, per_row),
@@ -1359,7 +1308,7 @@ impl DesktopApp {
         }
         let now = tree.read_at_ms.unwrap_or_else(crate::handoff::now_ms);
         let selected = self.selected_agent_id();
-        let one_line = self.pane.wide || self.pane.full;
+        let one_line = self.pane_wide();
         let mut rows: Vec<KeyedView> = Vec::new();
         if let Some(top) = root
             .as_ref()
@@ -1622,9 +1571,9 @@ impl DesktopApp {
                             .grid_column(1)
                             .vertical_alignment(VerticalAlignment::Center)
                             .content(controls::muted_icon(if open {
-                                controls::glyph::CHEVRON_UP
-                            } else {
                                 controls::glyph::CHEVRON_DOWN
+                            } else {
+                                controls::glyph::CHEVRON_RIGHT
                             })),
                     )),
             );
@@ -1651,31 +1600,31 @@ impl DesktopApp {
             .into()
     }
 
-    /// Details › Goal's one action: Set goal… or Edit goal…, which opens
-    /// the Goal dialog ([`super::goal_ui`]) with Save, Pause, Resume and
-    /// Clear as the daemon allows them.
+    /// Details › Goal's one action, Goal… (the name the header and the
+    /// task menu use), which opens the Goal dialog ([`super::goal_ui`])
+    /// with Save, Pause, Resume and Clear as the daemon allows them.
     pub(super) fn goal_action(
         &self,
         agent: &str,
         has_goal: bool,
         context: &mut ViewContext<Self>,
     ) -> KeyedView {
-        let words = if has_goal {
-            "Edit goal…"
-        } else {
-            "Set goal…"
-        };
         KeyedView::new(
-            words,
+            "goal-action",
             Border::new()
                 .horizontal_alignment(HorizontalAlignment::Left)
                 .content(
                     controls::outlined()
-                        .automation_name(words.trim_end_matches('…'))
+                        .automation_name("Goal")
                         .on_click(context.message(Message::Goal(super::goal_ui::GoalMsg::Open(
                             agent.to_owned(),
                         ))))
-                        .content(controls::label(words)),
+                        .content(controls::label("Goal…"))
+                        .tooltip(if has_goal {
+                            "Edit, pause or clear this task's goal"
+                        } else {
+                            "Set a goal this task keeps working toward"
+                        }),
                 ),
         )
     }

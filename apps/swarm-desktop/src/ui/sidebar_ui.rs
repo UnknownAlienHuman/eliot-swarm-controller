@@ -420,7 +420,7 @@ fn title_row(input: &SidebarInput, context: &mut ViewContext<Sidebar>) -> View {
                 .automation_name("Hide sidebar (Ctrl+B)")
                 .on_click(context.message(Message::Shell(ShellMsg::SidebarToggled)))
                 .content(controls::icon(controls::glyph::HIDE_SIDEBAR))
-                .tooltip("Hide sidebar"),
+                .tooltip("Hide sidebar (Ctrl+B)"),
         ))
         .into()
 }

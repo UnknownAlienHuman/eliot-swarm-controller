@@ -1,10 +1,11 @@
 //! The Goal dialog (brand book §18.1 Goal row, §11.3): one native
-//! ContentDialog, opened by a task menu's "Goal…" and Details › Goal's
-//! "Set goal…" or "Edit goal…". It holds the goal text, the check command
-//! (an explicit argv that runs in the task's worktree) and the limits in
-//! their source units (rounds, turns, same-result rounds), and offers Save,
-//! Pause, Resume and Clear as the daemon allows them for the goal's status
-//! (`goal.set`, `goal.pause`, `goal.resume`, `goal.clear`; no other API).
+//! ContentDialog, opened by the conversation header's Goal, a task menu's
+//! "Goal…" and Details › Goal's "Goal…". It holds the goal text, the
+//! check command (an explicit argv that runs in the task's worktree) and
+//! the limits in their source units (rounds, turns, same-result rounds),
+//! and offers Save, Pause, Resume and Clear as the daemon allows them for
+//! the goal's status (`goal.set`, `goal.pause`, `goal.resume`,
+//! `goal.clear`; no other API).
 //!
 //! The goal shown is the open conversation's (`chat.goal`, read with every
 //! detail read); the dialog keeps only the owner's edits, so a goal that

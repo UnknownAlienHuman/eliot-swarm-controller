@@ -59,9 +59,10 @@ pub(super) struct PlaceRead {
     more: u32,
 }
 
-/// The right pane's open tab (skeleton 5.4-5.6), or no pane. The pane
-/// belongs to the open conversation; the header's toggles open a tab, and
-/// the pressed toggle closes the pane.
+/// The right pane's open panel (skeleton 5.4-5.6), or no pane. The pane
+/// belongs to the open conversation and shows one panel at a time: the
+/// header's toggles open a panel, and the pressed toggle, the pane's Close
+/// or the panel's shortcut closes it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Panel {
     Closed,
@@ -77,9 +78,6 @@ pub(super) enum Panel {
 }
 
 impl Panel {
-    /// The tabs in the pane's order.
-    pub(super) const TABS: [Self; 4] = [Self::Changes, Self::Agents, Self::Details, Self::Terminal];
-
     pub(super) fn label(self) -> &'static str {
         match self {
             Self::Closed => "",
@@ -88,6 +86,39 @@ impl Panel {
             Self::Details => "Details",
             Self::Terminal => "Terminal",
         }
+    }
+
+    /// The panel's shortcut (brand book §19.1), which opens and closes it.
+    pub(super) fn shortcut(self) -> Option<&'static str> {
+        match self {
+            Self::Changes => Some("Ctrl+Shift+G"),
+            Self::Details => Some("Ctrl+Shift+D"),
+            Self::Terminal => Some("Ctrl+J"),
+            Self::Agents | Self::Closed => None,
+        }
+    }
+
+    /// `words` and the panel's shortcut after them, as a menu item or a
+    /// tooltip shows it.
+    pub(super) fn with_shortcut(self, words: &str) -> String {
+        match self.shortcut() {
+            Some(keys) => format!("{words} ({keys})"),
+            None => words.to_owned(),
+        }
+    }
+
+    /// What the panel's header toggle does, one line with its shortcut.
+    pub(super) fn tooltip(self, open: bool) -> String {
+        if open {
+            return self.with_shortcut(&format!("Close {}", self.label()));
+        }
+        self.with_shortcut(match self {
+            Self::Changes => "Show this task's changes",
+            Self::Agents => "Show this task's manager and workers",
+            Self::Details => "Show this task's Agent details",
+            Self::Terminal => "Show the worktree terminal and processes",
+            Self::Closed => "",
+        })
     }
 }
 
@@ -968,9 +999,13 @@ impl DesktopApp {
                     self.reprime_fields(context);
                 }
             }
-            // The pane's X closes the pane.
+            // The pressed header toggle, the pane's Close and a panel's
+            // shortcut close the pane, leaving Full view.
             ShellMsg::PanelToggled(panel) => match panel {
-                Panel::Closed => self.close_panel(),
+                Panel::Closed => {
+                    self.pane.full = false;
+                    self.close_panel();
+                }
                 panel => self.choose_panel(panel, context),
             },
             ShellMsg::Layout(layout) => {
@@ -979,8 +1014,11 @@ impl DesktopApp {
                 }
                 self.layout = layout;
             }
-            // A Settings slider reports the width it shows too: only a
-            // change is saved.
+            // A handle reports once, when its drag or key press ends (its
+            // steps re-render only SplitShell, never the sliders); a
+            // Settings slider reports every value it shows, the one a save
+            // just gave it too. Only a width other than the saved one is
+            // saved.
             ShellMsg::PanelsResized(widths)
                 if widths != split_ui::PanelWidths::of(self.prefs.panels) =>
             {
@@ -1149,11 +1187,16 @@ impl DesktopApp {
                         self.toggle_sidebar()
                     }
                     Shortcut::Sidebar => {}
-                    Shortcut::Terminal => {
-                        let panel = if self.panel == Panel::Terminal && self.panel_shown() {
+                    found @ (Shortcut::Terminal | Shortcut::Changes | Shortcut::Details) => {
+                        let wanted = match found {
+                            Shortcut::Changes => Panel::Changes,
+                            Shortcut::Details => Panel::Details,
+                            _ => Panel::Terminal,
+                        };
+                        let panel = if self.panel == wanted && self.panel_shown() {
                             Panel::Closed
                         } else {
-                            Panel::Terminal
+                            wanted
                         };
                         self.shell_update(ShellMsg::PanelToggled(panel), context);
                     }
@@ -2500,7 +2543,6 @@ impl DesktopApp {
             main: split_ui::Built::new(main),
             pane: pane.map(split_ui::Built::new),
             over: !self.pane_docked(),
-            wide: self.pane.wide,
             widths: split_ui::PanelWidths::of(self.prefs.panels),
             on_layout: context.callback(|layout| Message::Shell(ShellMsg::Layout(layout))),
             on_widths: context.callback(|widths| Message::Shell(ShellMsg::PanelsResized(widths))),
@@ -2823,9 +2865,10 @@ impl DesktopApp {
             .children((
                 button(
                     controls::glyph::SHOW_SIDEBAR,
-                    "Show sidebar".to_owned(),
+                    "Show sidebar (Ctrl+B)".to_owned(),
                     Message::Shell(ShellMsg::SidebarToggled),
-                ),
+                )
+                .tooltip("Show sidebar (Ctrl+B)"),
                 button(
                     controls::glyph::NEW_TASK,
                     "New task (Ctrl+N)".to_owned(),

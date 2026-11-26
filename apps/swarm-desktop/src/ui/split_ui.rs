@@ -10,8 +10,8 @@
 
 use super::*;
 use tokens::layout::{
-    DOCK_GAP, MAIN_REQUIRED_WIDTH, PANEL_MAX_WIDTH, PANEL_MIN_WIDTH, PANEL_WIDE_WIDTH, PANEL_WIDTH,
-    RAIL_WIDTH, SIDEBAR_MAX_WIDTH, SIDEBAR_MIN_WIDTH, SIDEBAR_WIDTH, SPLIT_STEP, SPLITTER,
+    DOCK_GAP, MAIN_REQUIRED_WIDTH, PANEL_MAX_WIDTH, PANEL_MIN_WIDTH, PANEL_WIDTH, RAIL_WIDTH,
+    SIDEBAR_MAX_WIDTH, SIDEBAR_MIN_WIDTH, SIDEBAR_WIDTH, SPLIT_STEP, SPLITTER,
 };
 
 /// The §6.2 size class of the client width in DIPs.
@@ -196,8 +196,6 @@ pub(super) struct SplitInput {
     /// The pane lies over the main area (Full view, or a window too narrow
     /// to dock it) instead of docking beside it.
     pub(super) over: bool,
-    /// The pane at its Wide preset (no handle).
-    pub(super) wide: bool,
     /// The widths saved in `[desktop]` (defaults when absent).
     pub(super) widths: PanelWidths,
     pub(super) on_layout: Callback<Layout>,
@@ -245,8 +243,6 @@ pub(super) struct SplitShell {
     hover: Option<Edge>,
     mode: Side,
     docked: bool,
-    /// The pane is requested at its Wide preset.
-    wide: bool,
     /// The layout last posted to the window.
     posted: Option<Layout>,
     /// The window has its icon (set once it is shown).
@@ -256,16 +252,6 @@ pub(super) struct SplitShell {
 }
 
 impl SplitShell {
-    /// The requested pane width, which decides docking: the Wide preset's,
-    /// or the handle's.
-    fn requested_pane(&self) -> f64 {
-        if self.wide {
-            PANEL_WIDE_WIDTH
-        } else {
-            self.widths.pane
-        }
-    }
-
     /// Posts the layout of the observed width when it changed.
     fn post_layout(&mut self) {
         let Some(window) = self.window else {
@@ -275,7 +261,7 @@ impl SplitShell {
             window,
             self.widths.sidebar,
             self.mode == Side::Rail,
-            self.requested_pane(),
+            self.widths.pane,
         );
         if self.posted != Some(layout) {
             self.posted = Some(layout);
@@ -300,11 +286,7 @@ impl SplitShell {
         let Some(window) = self.window else {
             return;
         };
-        let pane = if self.docked {
-            self.requested_pane()
-        } else {
-            0.0
-        };
+        let pane = if self.docked { self.widths.pane } else { 0.0 };
         let current = self.width(edge);
         let most = (current + spare(window, self.sidebar_beside(), pane))
             .floor()
@@ -408,7 +390,6 @@ impl Component for SplitShell {
             hover: None,
             mode: input.mode,
             docked: input.pane.is_some() && !input.over,
-            wide: input.wide,
             posted: None,
             icon_set: false,
             on_layout: input.on_layout.clone(),
@@ -419,7 +400,6 @@ impl Component for SplitShell {
     fn input_changed(&mut self, input: &SplitInput, _context: &ComponentContext<Self>) {
         self.mode = input.mode;
         self.docked = input.pane.is_some() && !input.over;
-        self.wide = input.wide;
         self.on_layout = input.on_layout.clone();
         self.on_widths = input.on_widths.clone();
         if input.widths != self.adopted {
@@ -517,11 +497,7 @@ impl Component for SplitShell {
                     )
             } else {
                 Border::new()
-                    .width(if input.wide {
-                        PANEL_WIDE_WIDTH
-                    } else {
-                        self.widths.pane
-                    })
+                    .width(self.widths.pane)
                     .corner_radius(CornerRadius::new(0.0, radius, radius, 0.0))
                     .border_brush(ThemeBrush::CardStroke)
                     .border_thickness(Thickness::new(tokens::layout::HAIRLINE, 0.0, 0.0, 0.0))
@@ -532,7 +508,7 @@ impl Component for SplitShell {
             } else {
                 Grid::new().grid_column(1)
             };
-            let handle = (!input.over && !input.wide).then(|| self.handle(Edge::Pane, context));
+            let handle = (!input.over).then(|| self.handle(Edge::Pane, context));
             cell.keyed_children(crate::views::slots([Some(border.into()), handle]))
                 .into()
         });

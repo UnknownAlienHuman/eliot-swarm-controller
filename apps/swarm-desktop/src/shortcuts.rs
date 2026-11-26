@@ -37,8 +37,8 @@ use windows_sys::Win32::System::Threading::{GetCurrentProcessId, GetCurrentThrea
 use windows_sys::Win32::UI::HiDpi::GetDpiForWindow;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     GetActiveWindow, GetKeyState, VK_APPS, VK_B, VK_BROWSER_BACK, VK_BROWSER_FORWARD, VK_CONTROL,
-    VK_DOWN, VK_ESCAPE, VK_F, VK_F10, VK_J, VK_K, VK_LEFT, VK_M, VK_N, VK_OEM_COMMA, VK_RETURN,
-    VK_RIGHT, VK_SHIFT, VK_TAB, VK_UP,
+    VK_D, VK_DOWN, VK_ESCAPE, VK_F, VK_F10, VK_G, VK_J, VK_K, VK_LEFT, VK_M, VK_N, VK_OEM_COMMA,
+    VK_RETURN, VK_RIGHT, VK_SHIFT, VK_TAB, VK_UP,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, GetCursorPos, GetForegroundWindow, GetWindowThreadProcessId, HC_ACTION, MSG,
@@ -75,8 +75,12 @@ pub enum Shortcut {
     Settings,
     /// Ctrl+B: hide or show the sidebar.
     Sidebar,
-    /// Ctrl+J: open or close the right pane's Terminal tab.
+    /// Ctrl+J: open or close the right pane's Terminal panel.
     Terminal,
+    /// Ctrl+Shift+G: open or close the right pane's Changes panel.
+    Changes,
+    /// Ctrl+Shift+D: open or close the right pane's Details panel.
+    Details,
     /// Alt+←, the keyboard's Back key or the mouse's back button.
     Back,
     /// Alt+→, the keyboard's Forward key or the mouse's forward button.
@@ -292,6 +296,9 @@ fn chord(key: u16, ctrl: bool, shift: bool, alt: bool) -> Option<Shortcut> {
         (VK_RIGHT, false, false, true) | (VK_BROWSER_FORWARD, false, false, false) => {
             return Some(Shortcut::Forward);
         }
+        // The right pane's panels (brand book §19.1).
+        (VK_G, true, true, false) => return Some(Shortcut::Changes),
+        (VK_D, true, true, false) => return Some(Shortcut::Details),
         _ => {}
     }
     if !ctrl || shift || alt {
