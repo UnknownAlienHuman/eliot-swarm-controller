@@ -1006,8 +1006,10 @@ Goal scope notes deduplicate each path across the generation. Up to four edit
 notes can be admitted for a turn.
 The note worker logs individual fact errors and advances its persisted cursor
 after processing each event. A task card summarizes the retained task brief, branch and Goal in
-at most 700 bytes. Swarm sends it after native compaction, resume, switch or handoff,
-at most once per turn. Lifecycle notes can queue before the first linked input.
+at most 700 bytes. With no Goal set, it names the first linked input as the objective
+([Default Goal objective](#default-goal-objective)). Swarm sends it after native
+compaction (manual or automatic, on every harness that reports one), resume, switch or
+handoff, at most once per turn. Lifecycle notes can queue before the first linked input.
 
 A completed fast project check records a daemon event in the `project` family
 with kind `project.check.finished`, its triggering edit sequence and exit code.
@@ -2173,6 +2175,45 @@ replay: an `unknown` configure holds the lane as usual. The Router derives the s
 from the counters bound to the claimed revision, and the commit re-derives it,
 refusing a mismatch as `stale_round`. The output digest is the stage's notion of "the
 same failure": a check that prints a changing value, such as a timestamp, never repeats.
+
+### Goal audit and continuation
+
+Owner decision, 2026-11-26 ([vision](../vision.md#owner-statement-source-of-truth)):
+a Goal that fails is audited and handed back to work. A Goal that blocks with
+`round_budget`, `turn_limit`, `no_progress` or `escalation_refused` starts one
+audit cycle instead of waiting for the Owner:
+
+1. **Audit.** Swarm admits one audit turn on a different model, chosen by the
+   `[routing]` role `audit`, in the Goal's managed worktree with read-only access.
+   Its brief carries the Goal, the check, the last bounded check observations, the
+   attempt digests, the branch and the change summary as data. The auditor's final
+   text is its diagnosis and the next approach. A model reads it; code never parses
+   a verdict out of it.
+2. **Continuation.** Swarm hands the work off ([Coordination](coordination.md#handoff))
+   to a successor that routing chooses for the Agent's role, in the same worktree.
+   The handoff brief carries the auditor's text as data. The successor gets the same
+   Goal definition at a new revision with a fresh budget, and its rounds continue as
+   usual.
+3. **Bound.** A Goal allows `policy.budget.max_audits` audit cycles
+   ([configuration](configuration.md#project-registration-and-rule-authority)). When the last cycle blocks, or with
+   `max_audits = 0`, the Goal stays blocked for the Owner as before. The Owner
+   inbox then lists the audit history with each auditor's text.
+
+The audit only reads: it never writes, reverts or deletes. Scope findings
+(`scope_violation`, `check_input_changed`, `scope_unverified`) are safety stops and
+still wait for the Owner. `check_unrunnable` waits for a corrected check. An unknown
+audit or handoff outcome holds the cycle and is never replayed. A missing `audit`
+role, or a successor that routing cannot admit, leaves the Goal blocked with that
+reason. An Owner pause or clear ends the cycle.
+
+### Default Goal objective
+
+Owner decision, 2026-11-26: when an admitted launch installs no Goal (no project
+policy Goal and no explicit Goal), the first linked input becomes the Agent's Goal
+objective. It is bounded to the Goal text limit. It has no check and drives no
+automatic rounds. It is carried in the task card, shown in the chat, and replaced
+when the Owner sets a Goal by hand. A project policy Goal or an explicit Goal always
+takes precedence.
 
 `goal show` reports the exact status, counters (with a live turn count and the spent
 cost), budgets, limits and the unresolved round marker if any. `cost_status` is
