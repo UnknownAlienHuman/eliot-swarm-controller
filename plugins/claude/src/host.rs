@@ -32,6 +32,9 @@ use tokio::{
 };
 
 const RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+// The daemon allows 180 s for a compact RPC. Share that budget across the
+// `/compact` input association and the native compaction lifecycle.
+const COMPACTION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 // The daemon gives agent.command 30 s. Share one shorter budget across the
 // input write and association, leaving time to return the actual native cause.
 const SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(25);
@@ -1195,6 +1198,7 @@ impl ClaudePlugin {
         match &params.verb {
             AgentCommandVerb::Send => self.send_command(params).await,
             AgentCommandVerb::Configure => self.configure_command(params).await,
+            AgentCommandVerb::Compact => self.compact_command(params).await,
             AgentCommandVerb::Steer => Err(Error::new(
                 "native_not_dispatched",
                 "Claude steer is delivered through turn_safe_point tool hooks",
@@ -1366,6 +1370,112 @@ impl ClaudePlugin {
             Some(model) if !model.trim().is_empty() => Ok(model.to_owned()),
             _ => Err(Error::new("invalid", "Claude configure needs a model")),
         }
+    }
+
+    /// Pure manual compaction: on the idle boundary, write the native
+    /// `/compact` input and report only the exact committed
+    /// `compact_boundary` through the existing compaction fact mapping;
+    /// nothing is inferred. The input identity is tracked in memory like
+    /// Codex compaction progress: its lifecycle echo and terminal match
+    /// there and start no turn, so only the boundary evidences compaction.
+    /// A mid-turn attempt is refused with the existing send-readiness
+    /// error, and a second compact while one owns the gate is refused.
+    async fn compact_command(&mut self, params: AgentCommandParams) -> Result<Value> {
+        if params.turn_id.is_some() || params.request_id.is_some() {
+            return Err(Error::new(
+                "native_not_dispatched",
+                "compact requires an idle session binding",
+            ));
+        }
+        let session = self
+            .session
+            .as_mut()
+            .ok_or_else(|| Error::new("bad_state", "Claude Agent session has not started"))?;
+        validate_binding(
+            &session.agent_id,
+            session.generation,
+            &params.agent_id,
+            params.generation,
+            "Claude",
+        )?;
+        let command_id = params.command_id.clone();
+        session.pending_turn.reconcile();
+        if let Err(error) = check_send_ready(session) {
+            return Ok(json!({
+                "state": "rejected",
+                "command_id": command_id,
+                "reason": error.message,
+            }));
+        }
+        let uuid = new_uuid();
+        if let Err(error) = session.events.begin_compact(uuid.clone()).await {
+            return Ok(json!({
+                "state": "rejected",
+                "command_id": command_id,
+                "reason": error.message,
+            }));
+        }
+        let previous = session
+            .events
+            .status()
+            .last_compaction
+            .map(|evidence| evidence.native_event_id);
+        let input = OutboundUserInput {
+            kind: "user",
+            uuid: uuid.clone(),
+            session_id: session
+                .session_id
+                .clone()
+                .ok_or_else(|| Error::new("unknown", "Claude session identity is unresolved"))?,
+            parent_tool_use_id: None,
+            message: OutboundUserMessage {
+                role: "user",
+                content: "/compact".to_owned(),
+            },
+        };
+        let mut write_error = None;
+        match session
+            .native_client
+            .send_user(input, Instant::now() + SEND_TIMEOUT)
+            .await
+        {
+            Ok(()) => {}
+            Err(error) if native_no_write(&error.code) => {
+                session.events.end_compact(uuid, false).await;
+                return Ok(json!({
+                    "state": "rejected",
+                    "command_id": command_id,
+                    "reason": error.message,
+                }));
+            }
+            Err(error) => {
+                // An ambiguous write may still have dispatched: keep the
+                // tracked identity and let the boundary wait decide.
+                write_error = Some(error.message);
+            }
+        }
+        let outcome = match session
+            .events
+            .wait_compaction(previous, Instant::now() + COMPACTION_TIMEOUT)
+            .await
+        {
+            Ok(native_event_id) => Ok(json!({
+                "state": "applied",
+                "command_id": command_id,
+                "compaction": {"completed": true, "receipt_id": native_event_id},
+            })),
+            Err(error) => {
+                session.phase = SessionPhase::Unknown;
+                Ok(json!({
+                    "state": "unknown",
+                    "command_id": command_id,
+                    "reason": write_error.unwrap_or(error.message),
+                    "compaction": {"completed": false},
+                }))
+            }
+        };
+        session.events.end_compact(uuid, true).await;
+        outcome
     }
 
     async fn interrupt_command(&mut self, params: AgentCommandParams) -> Result<Value> {
@@ -2382,6 +2492,7 @@ fn claude_manifest() -> PluginManifest {
             "resume",
             "send",
             "configure",
+            "compact",
             "steer",
             "interrupt",
             "approve",
