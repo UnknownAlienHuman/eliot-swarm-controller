@@ -194,8 +194,6 @@ pub mod layout {
     /// A row's state-mark slot.
     pub const MARK_SLOT: f64 = 16.0;
     pub const DOT_WAIT: f64 = 8.0;
-    pub const DOT_IDLE: f64 = 6.0;
-    pub const LOADER_SMALL: f64 = 12.0;
     /// A worker row's indent past its manager's mark.
     pub const KID_INDENT: f64 = MARK_SLOT + super::spacing::SM;
     pub const LABEL_WIDTH: f64 = 200.0;
@@ -231,7 +229,7 @@ pub mod layout {
     /// A status dot in a row.
     pub const DOT: f64 = DOT_WAIT;
     /// The dot of a status pill.
-    pub const BADGE_DOT: f64 = DOT_IDLE;
+    pub const BADGE_DOT: f64 = 6.0;
     /// Dividers and the app's own strokes (§4.4 `content.stroke`).
     pub const HAIRLINE: f64 = 1.0;
     /// The decision panel's outline.
@@ -240,7 +238,6 @@ pub mod layout {
     pub const DECISION_LEADING: f64 = 16.0;
     /// The attention strip's inset around its buttons.
     pub const STRIP_INSET: f64 = 6.0;
-    pub const STATUS_STROKE: f64 = 1.5;
     /// The indeterminate progress bar of a running turn.
     pub const PROGRESS_WIDTH: f64 = 160.0;
     /// A monitor chart's plot, and the stub of an unknown sample.
@@ -271,10 +268,6 @@ pub mod layout {
     pub const POPOVER_LIST_HEIGHT: f64 = 360.0;
     /// The check column of a popover row.
     pub const CHECK_COLUMN: f64 = 16.0;
-    /// A quota ring (Models & Usage).
-    pub const RING: f64 = 16.0;
-    /// A quota ring's stroke.
-    pub const USAGE_RING_STROKE: f64 = 2.0;
 }
 
 /// The pages in the main card: Project, Inbox, Agents, Automations and

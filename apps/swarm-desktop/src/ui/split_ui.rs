@@ -10,8 +10,8 @@
 
 use super::*;
 use tokens::layout::{
-    DOCK_GAP, MAIN_REQUIRED_WIDTH, PANEL_MAX_WIDTH, PANEL_MIN_WIDTH, PANEL_WIDTH, RAIL_WIDTH,
-    SIDEBAR_MAX_WIDTH, SIDEBAR_MIN_WIDTH, SIDEBAR_WIDTH, SPLIT_STEP, SPLITTER,
+    DOCK_GAP, MAIN_REQUIRED_WIDTH, PANEL_MAX_WIDTH, PANEL_MIN_WIDTH, PANEL_WIDE_WIDTH, PANEL_WIDTH,
+    RAIL_WIDTH, SIDEBAR_MAX_WIDTH, SIDEBAR_MIN_WIDTH, SIDEBAR_WIDTH, SPLIT_STEP, SPLITTER,
 };
 
 /// The §6.2 size class of the client width in DIPs.
@@ -53,11 +53,21 @@ pub(super) struct Layout {
     /// pane would render the opening once with a stale answer and lay it
     /// out again after this component observed the pane.
     pub(super) docks: bool,
+    /// The pane at its wide width (720) would dock: the pane's Wide toggle
+    /// shows only then (§6.2).
+    pub(super) wide_docks: bool,
     /// The main card holds the Home column at its full width
     /// (`HOME_WIDTH` inside its side gutters): Home's composer then keeps
     /// its parameters and Start task on one line, and wraps them below it
     /// (§8.1).
     pub(super) full_home: bool,
+    /// The main card holds the reading column at its full width
+    /// (`READING_WIDTH` inside its side gutters), with no pane beside it /
+    /// beside the requested pane docked: a conversation's composer then
+    /// keeps its chips and its action on one line, and wraps the chips
+    /// below it (§9.4).
+    pub(super) full_reading: bool,
+    pub(super) full_reading_docked: bool,
 }
 
 impl Layout {
@@ -74,10 +84,14 @@ impl Layout {
         // The main card: the window less the sidebar, the card's right
         // gap and its two hairlines.
         let main = width - sidebar - tokens::layout::CARD_GAP - 2.0 * tokens::layout::HAIRLINE;
+        let reading = tokens::layout::READING_WIDTH + 2.0 * tokens::spacing::XL;
         Self {
             class,
             docks: spare(width, sidebar, pane) >= 0.0,
+            wide_docks: spare(width, sidebar, PANEL_WIDE_WIDTH) >= 0.0,
             full_home: main >= tokens::layout::HOME_WIDTH + 2.0 * tokens::spacing::XL,
+            full_reading: main >= reading,
+            full_reading_docked: main - pane - DOCK_GAP >= reading,
         }
     }
 }

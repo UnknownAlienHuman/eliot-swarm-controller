@@ -246,13 +246,23 @@ impl DesktopApp {
             Some(branch) => format!("{place} \u{b7} {branch}"),
             None => place,
         };
-        let goal = self
-            .chat
-            .goal
-            .as_ref()
-            .filter(|(read, _)| read == agent)
+        let goal_read = self.chat.goal.as_ref().filter(|(read, _)| read == agent);
+        let goal = goal_read
             .and_then(|(_, goal)| goal.as_ref())
             .and_then(goal_words);
+        // Unknown until a read succeeds: shown as unknown, never as "no goal".
+        let goal_unknown = goal_read.is_none().then(|| {
+            if self
+                .chat
+                .goal_error
+                .as_ref()
+                .is_some_and(|(id, _)| id == agent)
+            {
+                GoalUnknown::Failed
+            } else {
+                GoalUnknown::NotRead
+            }
+        });
         let changes = row
             .and_then(|row| row.work.as_deref())
             .and_then(|work| work.insertions.zip(work.deletions));
@@ -262,9 +272,11 @@ impl DesktopApp {
             .iter()
             .filter(|kid| kid.parent.as_deref() == Some(agent) && !kid.archived)
             .count();
+        // Without the detail, whether the task offers Goal is unknown too:
+        // the button shows, and its dialog reads the goal itself.
         let (menu, goal_offered) = match detail.map(|detail| self.header_menu(agent, detail)) {
             Some((menu, offered)) => (Some(menu), offered),
-            None => (None, false),
+            None => (None, true),
         };
         let running = detail
             .is_some_and(|detail| detail.active_turn.is_some() && !detail.observe_only)
@@ -275,6 +287,7 @@ impl DesktopApp {
             state: shown,
             goal,
             goal_offered,
+            goal_unknown,
             changes,
             workers,
             open: if self.panel_shown() {
@@ -378,6 +391,15 @@ fn goal_words(goal: &eliot_core::api::GoalView) -> Option<String> {
     })
 }
 
+/// Why the header does not know the task's goal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum GoalUnknown {
+    /// No read has answered yet (the detail is still read, or it failed).
+    NotRead,
+    /// The last read failed.
+    Failed,
+}
+
 /// The header's readable state (§4.2): a static mark and its words.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum State {
@@ -401,17 +423,16 @@ impl State {
     }
 
     /// The mark: the sidebar row's static mark in its slot (the hold icon
-    /// for a hold); none for a stopped task, whose word says it.
+    /// for a hold); none for an idle or stopped task, whose word says it.
     fn mark(self) -> Option<View> {
         use controls::RowMark;
         let word = self.word();
         match self {
             Self::Working(_) => Some(controls::row_mark(RowMark::Working, word)),
             Self::Waiting => Some(controls::row_mark(RowMark::Waiting, word)),
-            Self::Idle => Some(controls::row_mark(RowMark::Idle, word)),
             Self::Failed(_) => Some(controls::row_mark(RowMark::Failed, word)),
             Self::Hold => Some(controls::icon(controls::glyph::HOLD)),
-            Self::Stopped => None,
+            Self::Idle | Self::Stopped => None,
         }
     }
 }
@@ -426,9 +447,12 @@ pub(super) struct HeaderInput {
     state: State,
     /// The goal's words, when the Agent has a goal.
     goal: Option<String>,
-    /// The task menu offers Goal: the Goal button shows (it also shows
-    /// while a goal exists).
+    /// The task menu offers Goal, or its detail is not read: the Goal
+    /// button shows (it also shows while a goal exists).
     goal_offered: bool,
+    /// The goal's state is not known yet: the button says so, and its
+    /// dialog reads the goal or says why it could not.
+    goal_unknown: Option<GoalUnknown>,
     /// The worktree's `+N −M`, when read.
     changes: Option<(u64, u64)>,
     /// The task's workers.
@@ -512,20 +536,33 @@ impl Component for Header {
         // Goal: always where the owner looks first; its words are the
         // goal's state once one is set.
         let goal: Option<View> = (input.goal_offered || input.goal.is_some()).then(|| {
-            let words = input.goal.clone().unwrap_or_else(|| "Goal".to_owned());
+            // An unknown state is said on the button itself, not only in
+            // its name (§4.2: never hidden, never colour alone).
+            let (words, tooltip) = match (&input.goal, input.goal_unknown) {
+                (Some(goal), _) => (goal.clone(), "Edit, pause or clear this task's goal"),
+                (None, Some(GoalUnknown::NotRead)) => (
+                    "Goal · not read yet".to_owned(),
+                    "This task's goal is not read yet: open Goal to read it",
+                ),
+                (None, Some(GoalUnknown::Failed)) => (
+                    "Goal · not readable".to_owned(),
+                    "This task's goal could not be read: open Goal to try again",
+                ),
+                (None, None) => (
+                    "Goal".to_owned(),
+                    "Set a goal this task keeps working toward",
+                ),
+            };
+            let name = words.clone();
             controls::bar_button(false)
-                .automation_name(words.clone())
+                .automation_name(name)
                 .on_click(context.message(Message::Chat(ChatMsg::AgentMenu(Action::Goal))))
                 .content(controls::command_content(
                     controls::glyph::GOAL,
                     &words,
                     false,
                 ))
-                .tooltip(if input.goal.is_some() {
-                    "Edit, pause or clear this task's goal"
-                } else {
-                    "Set a goal this task keeps working toward"
-                })
+                .tooltip(tooltip)
         });
         let changes = toggle(
             Panel::Changes,

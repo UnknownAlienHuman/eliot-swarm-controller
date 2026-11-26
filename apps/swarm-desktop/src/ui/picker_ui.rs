@@ -209,7 +209,7 @@ impl DesktopApp {
         };
         // The design: project, place, model, access, 6 DIPs apart, on one
         // line with Start task; below the full Home width they wrap two to
-        // a line (Reactor 0.101 has no wrap panel), so no chip is cut.
+        // a line ([`controls::chip_lines`]), so no chip is cut.
         let chips: Vec<View> = [
             Some(self.project_chip(context)),
             self.place_chip(context),
@@ -219,16 +219,7 @@ impl DesktopApp {
         .into_iter()
         .flatten()
         .collect();
-        if self.layout.full_home {
-            vec![controls::chip_row(chips)]
-        } else {
-            let mut chips = chips.into_iter();
-            std::iter::from_fn(|| {
-                let line: Vec<View> = chips.by_ref().take(2).collect();
-                (!line.is_empty()).then(|| controls::chip_row(line))
-            })
-            .collect()
-        }
+        controls::chip_lines(chips, self.layout.full_home)
     }
 
     /// `chip`, which opens `pops`: while one of them is open (and not for a

@@ -263,7 +263,8 @@ fn resets_detail(window: &crate::quota::Window, now: i64) -> String {
 }
 
 /// A hold's row: its few words ("On hold until 19:27") or the scope it
-/// holds, why it holds and when Swarm checks again, with a critical ring.
+/// holds, why it holds and when Swarm checks again. The words say it is
+/// held; no mark beside them.
 fn hold_row(hold: &eliot_core::ProviderHold, title: &str, now: i64) -> KeyedView {
     use eliot_core::{ProviderHoldState, ProviderRestrictionKind as Kind};
     let why = match hold.kind {
@@ -280,30 +281,22 @@ fn hold_row(hold: &eliot_core::ProviderHold, title: &str, now: i64) -> KeyedView
     };
     KeyedView::new(
         format!("hold:{}:{title}:{note}", hold.scope),
-        controls::setting_row(
-            title,
-            &note,
-            controls::status_ring(ThemeBrush::SystemCritical),
-        ),
+        controls::setting_row(title, &note, None),
     )
 }
 
-/// A limit's share left and its status ring.
+/// A limit's share left in words ("21% left"), in the critical color
+/// under [`controls::QUOTA_LOW`]; the words say the share, so no mark
+/// beside them.
 fn limit_value(remaining: i64) -> View {
-    let status = if (remaining as f64) < controls::QUOTA_LOW {
-        ThemeBrush::SystemCritical
+    // A low share says so in words too, never by colour alone (§4.2).
+    if (remaining as f64) < controls::QUOTA_LOW {
+        controls::body(format!("{remaining}% left · low"))
+            .foreground(ThemeBrush::SystemCritical)
+            .into()
     } else {
-        ThemeBrush::Accent
-    };
-    StackPanel::new()
-        .orientation(Orientation::Horizontal)
-        .spacing(tokens::spacing::SM)
-        .children((
-            controls::body(format!("{remaining}% left"))
-                .vertical_alignment(VerticalAlignment::Center),
-            controls::status_ring(status),
-        ))
-        .into()
+        controls::body(format!("{remaining}% left")).into()
+    }
 }
 
 /// `1234567` as `1,234,567`.

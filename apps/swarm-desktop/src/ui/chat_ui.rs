@@ -1341,7 +1341,14 @@ impl DesktopApp {
                         };
                         self.agent_menu(action, binding, context);
                     }
-                    Err(reason) => self.alert(reason),
+                    // The goal reads apart from the detail: the dialog
+                    // opens and reads it, or says why it could not.
+                    Err(reason) => match (action, self.selected_agent_id()) {
+                        (menu_ui::Action::Goal, Some(agent)) => {
+                            self.goal_update(goal_ui::GoalMsg::Open(agent), context);
+                        }
+                        _ => self.alert(reason),
+                    },
                 }
             }
             ChatMsg::ForceStopAnswered(confirmed) => {
@@ -1930,7 +1937,7 @@ impl DesktopApp {
                                     Some(
                                         Border::new()
                                             .vertical_alignment(VerticalAlignment::Center)
-                                            .content(controls::status_mark(
+                                            .maybe_content(controls::status_mark(
                                                 crate::controls::StatusTone::Attention,
                                                 tokens::layout::DOT,
                                             ))

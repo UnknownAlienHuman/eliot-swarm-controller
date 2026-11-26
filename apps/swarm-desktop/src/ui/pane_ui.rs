@@ -1,7 +1,7 @@
 //! The right pane (skeleton 3 and 5.4-5.6; `Decision.dc.html` for Changes,
-//! `Finished.dc.html` for Details): one tab strip (Changes, Agents,
-//! Details, Terminal) with the Wide and Full view toggles (component 55)
-//! over the open tab, inside the main card.
+//! `Finished.dc.html` for Details): the open panel (Changes, Agents,
+//! Details, Terminal) under its bar of the title, the Wide and Full view
+//! toggles and Close, inside the main card.
 //!
 //! Reads (the Owner watches daemon load): a tab reads only while the pane
 //! shows it, and nothing reads on render. Changes reads `agent.git` and
@@ -148,6 +148,8 @@ const CLOSED_AT_FIRST: [&str; 2] = ["task", "technical"];
 pub(super) struct PaneState {
     /// Full view: the open panel over the whole main card.
     pub(super) full: bool,
+    /// The pane's width before Wide, which unpressing Wide returns to.
+    before_wide: Option<f64>,
     changes: ChangesState,
     terminal: TerminalState,
     /// Agents tab rows whose workers are folded away.
@@ -166,7 +168,11 @@ impl PaneState {
 pub(super) enum PaneMsg {
     /// The Full view toggle: the panel over the whole main card, or back
     /// beside the conversation.
-    Full,
+    Full(bool),
+    /// The Wide toggle: the pane at its wide width (720), or back to the
+    /// width it had before (its default after a restart). The width is
+    /// saved as a handle's is.
+    Wide(bool),
     /// The open tab's Refresh (and Retry).
     Refresh,
     /// A Changes read landed (its epoch), or was dropped (`None`).
@@ -199,7 +205,26 @@ pub(super) enum PaneMsg {
 impl DesktopApp {
     pub(super) fn pane_update(&mut self, msg: PaneMsg, context: &ComponentContext<Self>) {
         match msg {
-            PaneMsg::Full => self.pane.full = !self.pane.full,
+            PaneMsg::Full(on) => self.pane.full = on,
+            PaneMsg::Wide(on) => {
+                let widths = split_ui::PanelWidths::of(self.prefs.panels);
+                let wide = tokens::layout::PANEL_WIDE_WIDTH;
+                let pane = if on {
+                    if widths.pane < wide {
+                        self.pane.before_wide = Some(widths.pane);
+                    }
+                    wide
+                } else {
+                    self.pane
+                        .before_wide
+                        .take()
+                        .unwrap_or(tokens::layout::PANEL_WIDTH)
+                };
+                self.shell_update(
+                    ShellMsg::PanelsResized(widths.with(split_ui::Edge::Pane, pane)),
+                    context,
+                );
+            }
             PaneMsg::Refresh => match self.panel {
                 Panel::Changes => self.read_changes(context),
                 Panel::Terminal => self.read_processes(context),
@@ -621,34 +646,57 @@ impl DesktopApp {
             || split_ui::PanelWidths::of(self.prefs.panels).pane >= tokens::layout::PANEL_WIDE_WIDTH
     }
 
-    /// The pane's bar, over a hairline: the open panel's title, then Full
-    /// view (expand over the conversation, or back beside it; only where
-    /// the pane can dock, since otherwise it already fills the main area)
-    /// and Close, always at the bar's end. Close is Back to conversation
-    /// when the pane lies over it.
+    /// The pane's bar, over a hairline: the open panel's title, then Wide
+    /// (the pane at 720 and back, in one step; only where the wide pane
+    /// docks beside the main area), Full view (expand over the
+    /// conversation, or back beside it; only where the pane can dock, since
+    /// otherwise it already fills the main area), both toggles, and Close,
+    /// always at the bar's end, all stock bar commands of one size. Close
+    /// is Back to conversation when the pane lies over it.
     fn pane_bar(&self, context: &mut ViewContext<Self>) -> View {
         let panel = self.panel;
         let title = panel.label();
         let full = self.pane.full;
-        let expand: Option<View> = self.layout.docks.then(|| {
-            let (glyph, words) = if full {
-                (controls::glyph::EXIT_FULL_VIEW, "Exit full view")
-            } else {
-                (controls::glyph::FULL_VIEW, "Full view")
-            };
-            controls::icon_button()
+        // Wide and Full view are toggles: UIA reads their pressed state.
+        let wide =
+            split_ui::PanelWidths::of(self.prefs.panels).pane >= tokens::layout::PANEL_WIDE_WIDTH;
+        let widen: Option<View> = (self.layout.wide_docks && !full).then(|| {
+            controls::bar_toggle(wide)
                 .grid_column(1)
-                .automation_name(words)
-                .on_click(context.message(Message::Pane(PaneMsg::Full)))
-                .content(controls::icon(glyph))
+                .vertical_alignment(VerticalAlignment::Center)
+                .automation_name("Wide pane")
+                .on_is_checked_changed(crate::views::check_changes(
+                    context.callback(|on: bool| Message::Pane(PaneMsg::Wide(on))),
+                ))
+                .content(controls::icon(controls::glyph::WIDE_PANE))
+                .tooltip(if wide {
+                    "Put the pane back to its earlier width"
+                } else {
+                    "Widen the pane to 720"
+                })
+        });
+        let expand: Option<View> = self.layout.docks.then(|| {
+            controls::bar_toggle(full)
+                .grid_column(2)
+                .vertical_alignment(VerticalAlignment::Center)
+                .automation_name("Full view")
+                .on_is_checked_changed(crate::views::check_changes(
+                    context.callback(|on: bool| Message::Pane(PaneMsg::Full(on))),
+                ))
+                .content(controls::icon(if full {
+                    controls::glyph::EXIT_FULL_VIEW
+                } else {
+                    controls::glyph::FULL_VIEW
+                }))
                 .tooltip(if full {
                     format!("Put {title} back beside the conversation")
                 } else {
                     format!("Show {title} over the whole conversation")
                 })
         });
-        let close: View = controls::icon_button()
-            .grid_column(2)
+        let close: View = controls::bar_button(false)
+            .grid_column(3)
+            .vertical_alignment(VerticalAlignment::Center)
             .automation_name(format!("Close {title}"))
             .on_click(context.message(Message::Shell(ShellMsg::PanelToggled(Panel::Closed))))
             .content(controls::icon(controls::glyph::CLOSE))
@@ -664,7 +712,12 @@ impl DesktopApp {
             .padding(Thickness::xy(tokens::spacing::MD, tokens::spacing::XS))
             .content(
                 Grid::new()
-                    .columns([GridLength::STAR, GridLength::Auto, GridLength::Auto])
+                    .columns([
+                        GridLength::STAR,
+                        GridLength::Auto,
+                        GridLength::Auto,
+                        GridLength::Auto,
+                    ])
                     .column_spacing(tokens::spacing::XS)
                     .keyed_children(crate::views::slots([
                         Some(
@@ -674,6 +727,7 @@ impl DesktopApp {
                                 .text_trimming(TextTrimming::CharacterEllipsis)
                                 .into(),
                         ),
+                        widen,
                         expand,
                         Some(close),
                     ])),
@@ -1204,11 +1258,7 @@ impl DesktopApp {
                         .orientation(Orientation::Horizontal)
                         .spacing(tokens::spacing::SM)
                         .children((
-                            ProgressRing::new()
-                                .is_indeterminate(true)
-                                .width(tokens::layout::LOADER_SMALL)
-                                .height(tokens::layout::LOADER_SMALL)
-                                .vertical_alignment(VerticalAlignment::Center),
+                            controls::spinner(),
                             controls::body("Merging and running the project check…"),
                         )),
                 )
