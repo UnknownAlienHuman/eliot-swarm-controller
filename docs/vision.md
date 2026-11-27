@@ -1,5 +1,7 @@
 # Vision
 
+> **Текущий продукт, не целевая архитектура.** Этот документ описывает код до миграции. Целевая архитектура — [docs/swarm/ARCHITECTURE.md](swarm/ARCHITECTURE.md) (v2.6, 27.11.2026); где они расходятся, права она. Заявление владельца ниже остаётся дословным.
+
 ## Owner statement (source of truth)
 
 Original product statement, given on 2026-10-25, preserved verbatim. The requirements

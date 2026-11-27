@@ -1,5 +1,7 @@
 # Roadmap
 
+> **Заменён.** Порядок работ и критерии приёмки теперь в [docs/swarm/backlog.md](swarm/backlog.md) (этапы 0–12 по v2.6, 27.11.2026). Чекбоксы ниже — история и описание текущего кода, не список статуса.
+
 Build order: **L0 workspace → L1 core/Store/bus → L2 direct Codex → L3 monitoring and
 workspaces → L4 automation/scripts → L5 agent communication → L6 more harnesses →
 L7 qualification**. Codex alone must already be useful at L2; another vendor, proxy,

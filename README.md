@@ -1,5 +1,7 @@
 # Eliot
 
+> Целевая архитектура и план миграции: [docs/swarm/ARCHITECTURE.md](docs/swarm/ARCHITECTURE.md), [docs/swarm/backlog.md](docs/swarm/backlog.md). Ниже — описание текущего кода.
+
 Eliot is a local Rust controller for coding-agent harnesses.
 
 ## Current slice
