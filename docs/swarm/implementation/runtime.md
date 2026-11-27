@@ -1,6 +1,6 @@
 # Runtime агента и eliot-plugin
 
-> Источник фактов: целевая архитектура v2.6 (27.11.2026). Текст ниже шапки перенесён из неё дословно; «раздел N» и «приложение X» — номера v2.6, ссылка ↗ ведёт туда, где он теперь. Общая суть — [ARCHITECTURE.md](../ARCHITECTURE.md), связи — [GRAPH.md](../GRAPH.md), навигация — [INDEX.md](../INDEX.md).
+> Источник фактов: целевая архитектура v2.6 (27.11.2026). Живой контракт; исходная версия сохранена в archive/spec-v2.6.md; «раздел N» и «приложение X» — номера v2.6, ссылка ↗ ведёт туда, где он теперь. Общая суть — [ARCHITECTURE.md](../ARCHITECTURE.md), связи — [GRAPH.md](../GRAPH.md), навигация — [INDEX.md](../INDEX.md).
 
 **Зачем.** Рестарт демона сейчас убивает агентов: харнесс — ребёнок плагина, плагин выходит по EOF pipe хоста (в прототипе ребёнок умер через 1 с после kill -9 родителя). Runtime агента — отсоединённый процесс на агента, который переживает рестарт демона (контракт A).
 
@@ -32,10 +32,12 @@
 
 | Контракт | Форма | Цена |
 | --- | --- | --- |
-| A. Пережить рестарт демона; при смерти runtime продолжить из нативной сессии и Git | один отсоединённый процесс на агента: нынешний per-agent плагин, вынесенный из-под демона; держит адаптер, stdio, сокет, журнал доставки и custody | отдельного моста shim ↔ плагин нет; смерть runtime = смерть харнесса, ход прерывается, задача продолжается через resume |
+| A. Пережить рестарт демона; при смерти runtime продолжить из нативной сессии и Git | один отсоединённый процесс на агента: нынешний per-agent плагин, вынесенный из-под демона; держит адаптер, stdio, сокет, журнал доставки и custody | отдельного моста shim ↔ плагин нет; смерть runtime = смерть харнесса, ход прерывается, задача продолжается через native resume |
 | B. Пережить ещё и смерть адаптера без остановки харнесса | независимый владелец процесса и транспорта плюс заменяемый адаптер | второй процесс — настоящая граница отказа: нужно восстановить незавершённые RPC и привязки ходов, обработать поздние ответы, определить unknown; сырых байтов stdio и PID для этого мало |
 
 Первая волна — контракт A. Он закрывает найденный отказ (рестарт демона убивает агентов) и не требует второй границы. Контракт B откладывается, пока данные не покажут, что смерть адаптера при живом харнессе случается достаточно часто, чтобы окупить восстановление RPC. Требование v2.3 «kill плагина — харнесс жив» поэтому снято с критериев первой волны.
+
+Термины различаются. **Reattach** — демон после своего рестарта снова подключается к тому же живому Runtime: сохраняются `runtime_id`, native `Agent.generation` и его журнал; демон сверяет новые факты и незавершённые доставки из журнала. **Native resume** — прежний Runtime остановлен, а тот же Attempt продолжает ту же нативную сессию в новом Runtime и новом native `Agent.generation`; `Task.gen` и Attempt не меняются. Новый Runtime получает собственную неизменную generation-привязку. Reattach не создаёт новое поколение.
 
 Runtime собирается из существующего платформенного кода: отсоединённый запуск (windows.rs:201-237), запасной путь без breakaway (windows.rs:476-491), suspend-assign-resume (custody.rs:567-612), остановка дерева через TerminateJobObject. Демон поднимается и переподключается к живым runtime по PID плюс время старта процесса (Windows creation FILETIME, windows.rs:824-852; Linux /proc starttime плюс boot id, unix.rs:358-374). Команды агента, пока демон лежит (done, note, send, blocked), runtime пишет в свой журнал с fsync на каждую запись.
 
@@ -45,13 +47,15 @@ Windows: владение Job переносится, KILL\_ON\_JOB\_CLOSE не 
 
 ### Протокол runtime агента (NDJSON по stdio и сокет)
 
+Здесь `gen` — `Task.gen`, номер executor Attempt. Для local запуска Store при dispatch сохраняет в Runtime отдельную неизменную пару `agent_id + agent_generation`; адаптер получает её из принятой команды. Resume создаёт новый Runtime и native generation того же Attempt, сохраняя `Task.gen`. Remote использует `external_ref`. Эти значения нельзя взаимозаменять; [канонический контракт](automata.md#жизненные-циклы-остальных-сущностей).
+
 - describe → имя, тип, версия харнесса, kind (local | remote), операции для реестра, согласованные возможности (resume, steer, approval, hooks, mask; для remote — cancel, follow\_up, webhook, max\_session\_min).
 - start {task, rev, gen, route, worktree, env\_allowlist, deadlines} → {runtime\_id, session\_id | external\_ref}. deadlines = {turn\_max\_s, tool\_max\_s, wall\_left\_s, daemon\_lost\_s}: runtime сам держит дедлайны хода и инструмента и остаток wall-бюджета по монотонным часам и прерывает ход по истечении, даже если демон лежит (сессия сохраняется для resume). Демон недоступен дольше daemon\_lost\_s (по умолчанию 10 минут) — runtime даёт доиграть текущий ход и останавливает харнесс до возвращения демона.
-- send {конверт} → stored; дальше Delivery: stored → sending → applied | unknown (раздел 14 [↗](../INDEX.md#карта-разделов), переходы Delivery). Runtime сообщает исход событиями delivery.applied {id, turn} и delivery.unknown {id}.
+- send {конверт} → stored; дальше [Delivery](automata.md#переходы-delivery): stored → sending → applied | unknown. Каждая попытка имеет свой `delivery_id` и неизменные `envelope_id`, recipient и `runtime_id`. Envelope.id остаётся native idempotency key; адаптер сопоставляет ACK с `delivery_id`/Runtime без изменения vendor wire. Поздний ACK относится только к исходной отправке; после native resume source batch старого поколения отклоняется. Исход unknown подтверждает доверенная сверка по точной native binding; без доказательства он остаётся unknown. Повтор при native idempotency — новая Delivery с тем же Envelope.id, прежняя запись сохраняется.
 - cancel {mode: interrupt | stop} → запрос; подтверждение остановки — отдельное событие stopped {turn, processes\_exited, stream\_drained}.
 - status → {alive, session\_id | external\_ref, last\_event\_at}.
-- events.put {пачка} → ACK только после COMMIT в Store; квитанция источника в source\_state.
-- События: turn\_start, turn\_end {usage, outcome}, tool\_start, tool\_end, commit, delivery.applied, delivery.unknown, error {class, retry\_after, structured}, stopped, exit {code, stderr\_tail}. Класс ошибки — из общей таблицы: transient, permanent, quality, network, process\_died; отдельно поле effect: none | applied | unknown; structured = true, только если класс взят из кода или поля протокола, а не из текста.
+- events.put {пачка} → ACK только после COMMIT в Store; квитанция источника в source\_state, привязанном к native `Agent.generation` Runtime. Reattach продолжает ту же квитанцию и generation. При native resume cursor остаётся у прежней generation; source batch старой generation, включая точный повтор уже committed batch, после перехода получает `stale_generation`. Факты и их provenance сохраняются для сверки, но не перетегируются в новое поколение.
+- События: turn\_start, turn\_end {usage, outcome}, tool\_start, tool\_end, commit, delivery.applied {delivery\_id, turn}, delivery.unknown {delivery\_id}, error {class, retry\_after, structured}, stopped, exit {code, stderr\_tail}. Класс ошибки — из общей таблицы: transient, permanent, quality, network, process\_died; отдельно поле effect: none | applied | unknown; structured = true, только если класс взят из кода или поля протокола, а не из текста.
 - Сокет (unix socket или named pipe): attach (поток событий с курсора), write (stdin харнесса), signal (interrupt, stop), hook (запрос swarm hook), console.
 - Журнал: сигналы агента, пока демон мёртв, fsync на каждую запись, предел по байтам; демон дочитывает после переподключения и подтверждает курсором. Запись не удалась (диск полон, предел журнала) — CLI агента получает ошибку, а swarm done не считается принятым; ложного успеха нет.
 - Хуки отвечает runtime из своего журнала и кэша, не дожидаясь демона: непрочитанные durable-сообщения лежат в журнале runtime, поэтому Stop hook укладывается в свой таймаут и под нагрузкой. Таймаут хука записывается как Event hook\_timeout; сообщение уходит первым входом следующего хода.
@@ -83,33 +87,13 @@ Windows: владение Job переносится, KILL\_ON\_JOB\_CLOSE не 
 
 Граница с харнессом: Swarm владеет задачей, назначением и допуском внешнего результата; харнесс — диалогом, циклом инструментов и компакцией. Его собственный retry не дублируется повторной отправкой Swarm.
 
-## Переходы Attempt (копия из раздела 14)
+## Переходы Attempt
 
-### Жизненные циклы остальных сущностей
+Состояния, native generation и условия resume — [automata.md](automata.md#жизненные-циклы-остальных-сущностей).
 
-Живой Attempt — в состоянии starting или running. stopping не живой: он не мешает создать gen+1, но Workspace не отдаётся новому Attempt, пока старый не stopped или Workspace не ушёл в quarantine. Инвариант: не больше одного Runtime в running на Workspace.
+## Этапы миграции
 
-#### Переходы Attempt
-
-| Из | Событие | Условие | В | Gate | Что пишется |
-| --- | --- | --- | --- | --- | --- |
-| starting | `launch_ok` | — | running | — | Runtime {kind, pid или external\_ref} |
-| starting | `launch_failed` | — | lost | — | причина запуска |
-| starting | `stop_requested` | — | stopping | — | отмена во время запуска; runtime, поднявшийся позже, получает отказ по gen |
-| running | `runtime_restarted` | — | = | — | новый Runtime того же Attempt после resume |
-| running | `stop_requested` | — | stopping | — | отзыв разрешения записан до запроса |
-| running | `runtime_unreachable` | — | lost | — | local: runtime не отвечает; remote: опрос провайдера не удаётся N раз |
-| stopping | `stop_confirmed` | — | stopped | — | ход закончен, процессы вышли, поток дочитан; remote: провайдер вернул терминальное состояние |
-| stopping | `stop_timeout` | — | lost | — | Workspace → quarantine; remote без отмены — сессия помечена orphan |
-| lost | `resumed` | старые процессы подтверждённо вышли, сессия та же, gen не отозван | running | — | новый Runtime, тот же n |
-| lost | `confirmed_gone` | — | stopped | — | сверка: процессов нет (local) или провайдер вернул терминальное состояние (remote) |
-
-## Этапы миграции (раздел 12)
-
-| Этап | Что делаем | Что удаляется в том же этапе | Критерий приёмки |
-| --- | --- | --- | --- |
-
-| 6. Runtime агента и служба ОС | отсоединённый runtime по контракту A; KillMode=process в юните systemd; дедлайны хода и остаток wall-бюджета в runtime; владение Windows Job в runtime; переподключение по PID и времени старта; остановка поколения: отзыв, запрос, подтверждение, карантин; второй харнесс | убийство групп при рестарте демона, пометка агентов lost до проверки, loss\_recovery в нынешнем виде | kill -9 демона и systemctl restart при 3 живых агентах на Linux и Windows: все 3 подхвачены, ни один не заменён; при остановленном на час демоне зависший ход прерван runtime; смерть runtime гасит потомков; смена поколения не теряет незакоммиченное и не пишет WIP поверх живого процесса |
+Порядок и критерии — [migration.md](migration.md); отметки выполнения — [backlog.md](../backlog.md).
 
 ## Модули (раздел 14)
 

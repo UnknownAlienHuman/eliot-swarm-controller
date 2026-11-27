@@ -1,91 +1,91 @@
 # Индекс и навигация
 
-> Документация Swarm собрана из целевой архитектуры v2.6 (27.11.2026). Этот файл генерируется скриптом [tools/build_index.py](tools/build_index.py); правь скрипт, а не файл.
+> Живая навигация по архитектуре на основе v2.6 (27.11.2026). Правь этот файл напрямую. Исторические экспортёры работают только во внешнем staging; текущие контракты и отметки бэклога ими не пересобираются.
 
 ## Как пользоваться
 
 1. Всегда читай [ARCHITECTURE.md](ARCHITECTURE.md): суть, роли, правила, модель. Это минимум контекста.
-2. Возьми рецепт для своего типа задачи ниже: 1–3 файла блока. Каждый файл начинается со шапки (зачем, владеет, вход, выход, инварианты, зависит от, статус) и дальше содержит дословный текст v2.6.
+2. Найди вход своего блока ниже. Читай необходимые разделы и фактическую цепочку в коде: caller → владелец состояния → эффект → потребитель результата. Остальные ссылки открывай по зависимости задачи. Рецепт не требует каждый раз загружать целиком все перечисленные документы.
 3. Ссылка «раздел N» в тексте — номер раздела v2.6; стрелка ↗ рядом ведёт туда, где он теперь. Раздел, разнесённый по нескольким файлам, — в карте разделов ниже.
 4. Добавляешь зависимость, таблицу или модуль — [GRAPH.md](GRAPH.md). Опираешься на механизм — метка в [STATUS.md](STATUS.md). Старое слово из кода или разговора — словарь в [core.md](implementation/core.md#словарь-старое-слово--имя-в-спецификации).
-5. Следующая задача — первый неотмеченный пункт [backlog.md](backlog.md); там же контекст этапа и открытые вопросы.
+5. Явная задача владельца определяет срез; иначе бери готовый пункт [backlog.md](backlog.md). Незакрытый вопрос контракта блокирует затронутое поведение. Статус — в бэклоге, границы переноса и существующие функции — в [migration.md](implementation/migration.md).
 6. [archive/](archive/HISTORY.md) — история версий, доноры, инвентаризация старой документации, полный текст спецификации v2.6 ([archive/spec-v2.6.md](archive/spec-v2.6.md)). Исполнителю не нужен.
 7. Остальное в `docs/` вне `docs/swarm/` (vision, architecture, roadmap, decisions, spec, harnesses, reference) описывает **текущий** код до миграции. Где оно расходится с этими документами, правы эти документы; отменённые решения отмечены в `docs/decisions.md`. Контракт desktop — `docs/design/fluent-design-system.md`, он действует.
 
 ## Рецепт контекста задачи
 
-Всегда плюс ARCHITECTURE.md (10 КБ). Размер — сумма с ним; файлы с «+» и «<X>» не считаются.
+Начни с ARCHITECTURE.md и одного входного файла ниже. Список задаёт маршруты чтения, не пакет для обязательной загрузки. Таблицы переходов принадлежат automata.md; план и критерии — backlog.md. Их копии в других блоках не поддерживаются.
 
-| Задача | Файлы | КБ |
-| --- | --- | --- |
-| Store: таблица, схема, admission, транзакция | [implementation/store.md](implementation/store.md), [implementation/core.md](implementation/core.md), [GRAPH.md](GRAPH.md) | 75 |
-| Переход задачи, детектор, разбор, бюджет, gate | [implementation/task-controller.md](implementation/task-controller.md), [implementation/automata.md](implementation/automata.md), [implementation/config.md](implementation/config.md) | 90 |
-| Супервизия, захват, поколения, сверка | [implementation/daemon.md](implementation/daemon.md), [implementation/store.md](implementation/store.md) | 53 |
-| Runtime агента, доставка сообщений | [implementation/runtime.md](implementation/runtime.md), [implementation/core.md](implementation/core.md) | 58 |
-| Интегратор: merge, проверки, push, чистка | [implementation/integrator.md](implementation/integrator.md), [implementation/plugins/checks.md](implementation/plugins/checks.md), [implementation/plugins/github.md](implementation/plugins/github.md) | 49 |
-| Хуки и доставка в ход | [implementation/hooks.md](implementation/hooks.md), [implementation/runtime.md](implementation/runtime.md), + плагин харнесса | 46 |
-| Плагин харнесса X (новый или правка) | [implementation/plugins/README.md](implementation/plugins/README.md), implementation/plugins/<X>.md, [implementation/runtime.md](implementation/runtime.md) | 42 |
-| Маршруты, квоты, ошибки провайдера, Hold | [implementation/routing.md](implementation/routing.md), + плагин харнесса | 19 |
-| Облачный исполнитель | [implementation/plugins/cloud-agents.md](implementation/plugins/cloud-agents.md), [implementation/integrator.md](implementation/integrator.md), [implementation/plugins/github.md](implementation/plugins/github.md) | 62 |
-| Удалённый MCP | [implementation/remote-mcp.md](implementation/remote-mcp.md), [implementation/cli-mcp.md](implementation/cli-mcp.md), [implementation/security.md](implementation/security.md) | 48 |
-| Команда CLI или MCP, реестр | [implementation/cli-mcp.md](implementation/cli-mcp.md), [GRAPH.md](GRAPH.md) | 38 |
-| Секреты и права агентов | [implementation/security.md](implementation/security.md), [implementation/integrator.md](implementation/integrator.md) | 52 |
-| Конфигурация конвейера (workflow, routes, triggers) | [implementation/config.md](implementation/config.md), [implementation/task-controller.md](implementation/task-controller.md) | 55 |
-| Эксплуатация: наблюдение, учёт, диск, обновление | [implementation/operations.md](implementation/operations.md), [implementation/daemon.md](implementation/daemon.md) | 36 |
-| Этап миграции N | [implementation/migration.md](implementation/migration.md), [STATUS.md](STATUS.md), + файлы блоков этапа | 46 |
-| Сквозной тест или поведение при сбое | [implementation/scenarios.md](implementation/scenarios.md), + файл блока | 24 |
-| Решение по архитектуре, новый модуль или сущность | [GRAPH.md](GRAPH.md), [implementation/decisions.md](implementation/decisions.md), [STATUS.md](STATUS.md) | 63 |
+| Задача | Файлы |
+| --- | --- |
+| Store: таблица, схема, admission, транзакция | [implementation/store.md](implementation/store.md), [implementation/core.md](implementation/core.md), [GRAPH.md](GRAPH.md) |
+| Переход задачи, детектор, разбор, бюджет, gate | [implementation/task-controller.md](implementation/task-controller.md), [implementation/automata.md](implementation/automata.md), [implementation/config.md](implementation/config.md) |
+| Супервизия, захват, поколения, сверка | [implementation/daemon.md](implementation/daemon.md), [implementation/store.md](implementation/store.md) |
+| Runtime агента, доставка сообщений | [implementation/runtime.md](implementation/runtime.md), [implementation/core.md](implementation/core.md) |
+| Интегратор: merge, проверки, push, чистка | [implementation/integrator.md](implementation/integrator.md), [implementation/plugins/checks.md](implementation/plugins/checks.md), [implementation/plugins/github.md](implementation/plugins/github.md) |
+| Хуки и доставка в ход | [implementation/hooks.md](implementation/hooks.md), [implementation/runtime.md](implementation/runtime.md), + плагин харнесса |
+| Плагин харнесса X (новый или правка) | [implementation/plugins/README.md](implementation/plugins/README.md), implementation/plugins/<X>.md, [implementation/runtime.md](implementation/runtime.md) |
+| Маршруты, квоты, ошибки провайдера, Hold | [implementation/routing.md](implementation/routing.md), + плагин харнесса |
+| Облачный исполнитель | [implementation/plugins/cloud-agents.md](implementation/plugins/cloud-agents.md), [implementation/integrator.md](implementation/integrator.md), [implementation/plugins/github.md](implementation/plugins/github.md) |
+| Удалённый MCP | [implementation/remote-mcp.md](implementation/remote-mcp.md), [implementation/cli-mcp.md](implementation/cli-mcp.md), [implementation/security.md](implementation/security.md) |
+| Команда CLI или MCP, реестр | [implementation/cli-mcp.md](implementation/cli-mcp.md), [GRAPH.md](GRAPH.md) |
+| Секреты и права агентов | [implementation/security.md](implementation/security.md), [implementation/integrator.md](implementation/integrator.md) |
+| Конфигурация конвейера (workflow, routes, triggers) | [implementation/config.md](implementation/config.md), [implementation/task-controller.md](implementation/task-controller.md) |
+| Эксплуатация: наблюдение, учёт, диск, обновление | [implementation/operations.md](implementation/operations.md), [implementation/daemon.md](implementation/daemon.md) |
+| Этап миграции N | [implementation/migration.md](implementation/migration.md), [STATUS.md](STATUS.md), + файлы блоков этапа |
+| Сквозной тест или поведение при сбое | [implementation/scenarios.md](implementation/scenarios.md), + файл блока |
+| Решение по архитектуре, новый модуль или сущность | [GRAPH.md](GRAPH.md), [implementation/decisions.md](implementation/decisions.md), [STATUS.md](STATUS.md) |
 
 ## Файлы
 
-| Файл | Что внутри | КБ |
-| --- | --- | --- |
-| [ARCHITECTURE.md](ARCHITECTURE.md) | Swarm: суть и правила | 10 |
-| [GRAPH.md](GRAPH.md) | Граф: сущности, модули, кто что пишет | 15 |
-| [STATUS.md](STATUS.md) | Что проверено и что гипотеза | 20 |
-| [backlog.md](backlog.md) | Бэклог реализации | 17 |
-| [implementation/automata.md](implementation/automata.md) | Контракты задачи и автоматы | 35 |
-| [implementation/cli-mcp.md](implementation/cli-mcp.md) | CLI-маршрутизатор, реестр, малый MCP, eliot-client | 13 |
-| [implementation/config.md](implementation/config.md) | Конфигурация конвейера: workflow.toml, routes.toml, triggers.toml | 8 |
-| [implementation/core.md](implementation/core.md) | Ядро: модель и сообщения (eliot-core) | 26 |
-| [implementation/daemon.md](implementation/daemon.md) | Демон: супервизия, захват, сверка (eliot-daemon) | 19 |
-| [implementation/decisions.md](implementation/decisions.md) | Правила и решения полностью | 18 |
-| [implementation/hooks.md](implementation/hooks.md) | Hooks и injects: доставка, даже если агент не хочет | 14 |
-| [implementation/integrator.md](implementation/integrator.md) | Интегратор: очередь merge, squash, push, чистка | 24 |
-| [implementation/migration.md](implementation/migration.md) | Путь из текущего кода: этапы и удаления | 16 |
-| [implementation/operations.md](implementation/operations.md) | Эксплуатация: наблюдение, учёт, диск, обновление | 6 |
-| [implementation/plugins/README.md](implementation/plugins/README.md) | Плагины: общий контракт | 10 |
-| [implementation/plugins/acp.md](implementation/plugins/acp.md) | Общий ACP-плагин (Gemini CLI, Goose и другие, первая волна) | 5 |
-| [implementation/plugins/antigravity.md](implementation/plugins/antigravity.md) | Плагин Antigravity CLI (вторая волна) | 3 |
-| [implementation/plugins/checks.md](implementation/plugins/checks.md) | Проверки и линтеры (cargo, clippy, тесты, любой CLI) | 6 |
-| [implementation/plugins/claude-code.md](implementation/plugins/claude-code.md) | Плагин Claude Code (нативный, первая волна) | 15 |
-| [implementation/plugins/cloud-agents.md](implementation/plugins/cloud-agents.md) | Облачные исполнители (cloud agent, вторая волна) | 19 |
-| [implementation/plugins/codex.md](implementation/plugins/codex.md) | Плагин Codex (нативный, app-server, первая волна) | 8 |
-| [implementation/plugins/github.md](implementation/plugins/github.md) | Forge-плагин GitHub | 7 |
-| [implementation/plugins/muse-code.md](implementation/plugins/muse-code.md) | Плагин Muse Code (локальный харнесс, вторая волна) | 5 |
-| [implementation/plugins/notify.md](implementation/plugins/notify.md) | Плагин notify (уведомления владельцу) | 2 |
-| [implementation/plugins/opencode.md](implementation/plugins/opencode.md) | Плагин OpenCode (нативный, первая волна) | 5 |
-| [implementation/remote-mcp.md](implementation/remote-mcp.md) | Удалённый MCP: внешний агент вызывает Swarm | 7 |
-| [implementation/routing.md](implementation/routing.md) | Маршруты, провайдеры, квоты и Hold | 9 |
-| [implementation/runtime.md](implementation/runtime.md) | Runtime агента и eliot-plugin | 22 |
-| [implementation/scenarios.md](implementation/scenarios.md) | Сквозные сценарии отказов | 13 |
-| [implementation/security.md](implementation/security.md) | Секреты, права агентов и полномочия | 17 |
-| [implementation/store.md](implementation/store.md) | Store: единственная правда (eliot-store) | 23 |
-| [implementation/task-controller.md](implementation/task-controller.md) | Task controller: цикл задачи до готовности | 37 |
-| [tools/README.md](tools/README.md) | Скрипты проверок | 3 |
-| [tools/build_backlog.py](tools/build_backlog.py) | генерация backlog.md из таблицы этапов | 7 |
-| [tools/build_index.py](tools/build_index.py) | генерация этого файла | 10 |
-| [tools/check.py](tools/check.py) | проверка автоматов по таблицам | 5 |
-| [tools/coverage.py](tools/coverage.py) | проверка, что каждая строка v2.6 есть в документах | 3 |
-| [tools/deps.py](tools/deps.py) | запрещённые рёбра крейтов (храповик) | 2 |
-| [tools/ratchet.py](tools/ratchet.py) | храповик для CI: deps, scc, check с порогами | 2 |
-| [tools/ratchet.toml](tools/ratchet.toml) | пороги храповика (текущие числа main) | 1 |
-| [tools/scc.py](tools/scc.py) | самый большой цикл модулей (храповик) | 3 |
-| [tools/split_v26.py](tools/split_v26.py) | сборка этой документации из v2.6 | 77 |
-| [archive/DONORS.md](archive/DONORS.md) | Архив: доноры, проверенные по коду | 22 |
-| [archive/HISTORY.md](archive/HISTORY.md) | Архив: история версий архитектуры | 47 |
-| [archive/INVENTORY.md](archive/INVENTORY.md) | Архив: инвентаризация старых возможностей | 9 |
-| [archive/spec-v2.6.md](archive/spec-v2.6.md) | Eliot Swarm Controller: целевая архитектура v2.6 | 355 |
+| Файл | Что внутри |
+| --- | --- |
+| [ARCHITECTURE.md](ARCHITECTURE.md) | Swarm: суть и правила |
+| [GRAPH.md](GRAPH.md) | Граф: сущности, модули, кто что пишет |
+| [STATUS.md](STATUS.md) | Что проверено и что гипотеза |
+| [backlog.md](backlog.md) | Бэклог реализации |
+| [implementation/automata.md](implementation/automata.md) | Контракты задачи и автоматы |
+| [implementation/cli-mcp.md](implementation/cli-mcp.md) | CLI-маршрутизатор, реестр, малый MCP, eliot-client |
+| [implementation/config.md](implementation/config.md) | Конфигурация конвейера: workflow.toml, routes.toml, triggers.toml |
+| [implementation/core.md](implementation/core.md) | Ядро: модель и сообщения (eliot-core) |
+| [implementation/daemon.md](implementation/daemon.md) | Демон: супервизия, захват, сверка (eliot-daemon) |
+| [implementation/decisions.md](implementation/decisions.md) | Правила и решения полностью |
+| [implementation/hooks.md](implementation/hooks.md) | Hooks и injects: доставка, даже если агент не хочет |
+| [implementation/integrator.md](implementation/integrator.md) | Интегратор: очередь merge, squash, push, чистка |
+| [implementation/migration.md](implementation/migration.md) | Путь из текущего кода: этапы и удаления |
+| [implementation/operations.md](implementation/operations.md) | Эксплуатация: наблюдение, учёт, диск, обновление |
+| [implementation/plugins/README.md](implementation/plugins/README.md) | Плагины: общий контракт |
+| [implementation/plugins/acp.md](implementation/plugins/acp.md) | Общий ACP-плагин (Gemini CLI, Goose и другие, первая волна) |
+| [implementation/plugins/antigravity.md](implementation/plugins/antigravity.md) | Плагин Antigravity CLI (вторая волна) |
+| [implementation/plugins/checks.md](implementation/plugins/checks.md) | Проверки и линтеры (cargo, clippy, тесты, любой CLI) |
+| [implementation/plugins/claude-code.md](implementation/plugins/claude-code.md) | Плагин Claude Code (нативный, первая волна) |
+| [implementation/plugins/cloud-agents.md](implementation/plugins/cloud-agents.md) | Облачные исполнители (cloud agent, вторая волна) |
+| [implementation/plugins/codex.md](implementation/plugins/codex.md) | Плагин Codex (нативный, app-server, первая волна) |
+| [implementation/plugins/github.md](implementation/plugins/github.md) | Forge-плагин GitHub |
+| [implementation/plugins/muse-code.md](implementation/plugins/muse-code.md) | Плагин Muse Code (локальный харнесс, вторая волна) |
+| [implementation/plugins/notify.md](implementation/plugins/notify.md) | Плагин notify (уведомления владельцу) |
+| [implementation/plugins/opencode.md](implementation/plugins/opencode.md) | Плагин OpenCode (нативный, первая волна) |
+| [implementation/remote-mcp.md](implementation/remote-mcp.md) | Удалённый MCP: внешний агент вызывает Swarm |
+| [implementation/routing.md](implementation/routing.md) | Маршруты, провайдеры, квоты и Hold |
+| [implementation/runtime.md](implementation/runtime.md) | Runtime агента и eliot-plugin |
+| [implementation/scenarios.md](implementation/scenarios.md) | Сквозные сценарии отказов |
+| [implementation/security.md](implementation/security.md) | Секреты, права агентов и полномочия |
+| [implementation/store.md](implementation/store.md) | Store: единственная правда (eliot-store) |
+| [implementation/task-controller.md](implementation/task-controller.md) | Task controller: цикл задачи до готовности |
+| [tools/README.md](tools/README.md) | Скрипты проверок |
+| [tools/build_backlog.py](tools/build_backlog.py) | исторический экспорт бэклога во внешний staging |
+| [tools/build_index.py](tools/build_index.py) | исторический экспорт индекса во внешний staging |
+| [tools/check.py](tools/check.py) | проверка автоматов по таблицам |
+| [tools/coverage.py](tools/coverage.py) | проверка полноты исторического импорта, не актуальности |
+| [tools/deps.py](tools/deps.py) | запрещённые рёбра крейтов (храповик) |
+| [tools/ratchet.py](tools/ratchet.py) | храповик для CI: deps, scc, check с порогами |
+| [tools/ratchet.toml](tools/ratchet.toml) | пороги храповика (текущие числа main) |
+| [tools/scc.py](tools/scc.py) | самый большой цикл модулей (храповик) |
+| [tools/split_v26.py](tools/split_v26.py) | историческая реконструкция v2.6 во внешний staging |
+| [archive/DONORS.md](archive/DONORS.md) | Архив: доноры, проверенные по коду |
+| [archive/HISTORY.md](archive/HISTORY.md) | Архив: история версий архитектуры |
+| [archive/INVENTORY.md](archive/INVENTORY.md) | Архив: инвентаризация старых возможностей |
+| [archive/spec-v2.6.md](archive/spec-v2.6.md) | Eliot Swarm Controller: целевая архитектура v2.6 |
 
 ## Карта разделов
 

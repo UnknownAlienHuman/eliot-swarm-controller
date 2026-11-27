@@ -1,6 +1,6 @@
 # Интегратор: очередь merge, squash, push, чистка
 
-> Источник фактов: целевая архитектура v2.6 (27.11.2026). Текст ниже шапки перенесён из неё дословно; «раздел N» и «приложение X» — номера v2.6, ссылка ↗ ведёт туда, где он теперь. Общая суть — [ARCHITECTURE.md](../ARCHITECTURE.md), связи — [GRAPH.md](../GRAPH.md), навигация — [INDEX.md](../INDEX.md).
+> Источник фактов: целевая архитектура v2.6 (27.11.2026). Живой контракт; исходная версия сохранена в archive/spec-v2.6.md; «раздел N» и «приложение X» — номера v2.6, ссылка ↗ ведёт туда, где он теперь. Общая суть — [ARCHITECTURE.md](../ARCHITECTURE.md), связи — [GRAPH.md](../GRAPH.md), навигация — [INDEX.md](../INDEX.md).
 
 **Зачем.** Единственный, кто меняет main. Детерминированный актор демона (не LLM), по одному на репозиторий, собирается из существующего git_integration.rs и publication.rs. Плохой merge не пускают предусловия на кандидате, а не доверие агенту.
 
@@ -11,11 +11,11 @@
 **Выход.** События Task: step_merged, step_rejected, step_lease_lost, step_cancelled, step_unknown, step_unexpected; CheckRun; push ветки и main через forge-push; чистка.
 
 **Инварианты.**
-- Шаг пишется в Store до эффекта, sending — до вызова remote; в одной транзакции с переходом Task.
-- Доказательство merge — достижимость OID кандидата из origin/main (merge-base --is-ancestor); трейлеры Swarm-Task/Swarm-Gen — только индекс.
+- Planned-шаг и переход Task в integrating фиксируются одной транзакцией Store. Перед внешним эффектом отдельная транзакция проверяет актуальные Task rev/gen, Candidate, Gate и отсутствие pending edit/cancel, затем переводит шаг planned → sending. Edit/cancel, принятые до этого перехода, не отправляют эффект; принятые после него становятся pending и разрешаются после результата шага и сверки. SQLite и Git не атомарны; журнал связывает их исходы.
+- Доказательство merge — достижимость итогового `IntegrationStep.new_oid` из origin/main (merge-base --is-ancestor), а не обязательно исходного Candidate.commit. При подтверждении шага `Task.merged_oid = new_oid`; трейлеры Swarm-Task/Swarm-Gen — только индекс.
 - Push main — только fast-forward на проверенный OID, без force; rev, gen и запрет владельца перепроверяются непосредственно перед push main.
 - Непроверенное дерево в main не уходит; пересборка на свежий main — проверки заново.
-- Unknown решается только чтением origin; remote не читается — очередь встаёт, агенты работают.
+- Unknown разрешается только после сверки origin и quiescence sender; remote или состояние sender неизвестны — очередь встаёт, агенты работают.
 - Один пишущий Attempt на worktree; карантин не удаляется до сверки.
 - Команды проверок берутся из main и work-truth.git, а не из ветки агента.
 
@@ -29,11 +29,13 @@
 
 ### Устройство
 
-Детерминированный актор демона, по одному на репозиторий. Собирается из существующего, а не пишется заново. git\_integration.rs уже держит замороженные регистрацию, базу и OID ветки (FrozenGitIntegrate, git\_integration.rs:88-100, перепроверка перед исполнением 845-935), скретч-worktree с приватным индексом (1054), проверку итогового дерева после проверок (1218-1229) и условный fast-forward через update-ref с ожидаемым старым значением (707-750). Барьер писателей по common\_dir репозитория уже есть: repo\_git\_write\_conflicts\_tx (store lib.rs:5169) не пускает второго Git-писателя в linked worktree того же репозитория; независимые репозитории общей блокировки не требуют. Проверки идут через общий раннер: run\_policy\_check → project\_checks::run\_argv\_with\_index → run\_integration\_process или run\_owned\_process (git\_integration.rs:527, project\_checks.rs:1659, scripts/process.rs:173-216). Второй process runner и check-плагин не нужны. Добавки: Task-ревизия в кандидате, долговечные шаги, проверка секретов перед add --all (publication.rs:405), восстановленный обход first-parent для squash (удалён в f39dd4ef), Unix-вариант удаления worktree и стража записи (сейчас только Windows, cleanup.rs:2068-2072).
+Детерминированный актор демона, по одному на репозиторий. Собирается из существующего, а не пишется заново. git\_integration.rs уже держит замороженные регистрацию, базу и OID ветки (FrozenGitIntegrate, git\_integration.rs:88-100, перепроверка перед исполнением 845-935), скретч-worktree с приватным индексом (1054), проверку итогового дерева после проверок (1218-1229) и условный fast-forward через update-ref с ожидаемым старым значением (707-750). Барьер писателей по common\_dir репозитория уже есть: repo\_git\_write\_conflicts\_tx (store lib.rs:5169) не пускает второго Git-писателя в linked worktree того же репозитория; независимые репозитории общей блокировки не требуют. Проверки идут через общий раннер: run\_policy\_check → project\_checks::run\_argv\_with\_index → run\_integration\_process или run\_owned\_process (git\_integration.rs:527, project\_checks.rs:1659, scripts/process.rs:173-216). Второй process runner и check-плагин не нужны. Однако git\_integrate и project\_checks не реализуют Task/Candidate admission, gate binding, durable CheckRun или remote queue/reconcile; переиспользуются их функции, не готовый Task controller. Добавки: Task-ревизия в кандидате, долговечные шаги, проверка секретов перед add --all (publication.rs:405), восстановленный обход first-parent для squash (удалён в f39dd4ef), Unix-вариант удаления worktree и стража записи (сейчас только Windows, cleanup.rs:2068-2072).
 
 ### Кандидат интеграции
 
-Один замороженный кандидат связывает ревизию Task, поколение, базовый OID и итоговое дерево и коммит. Проверки, ревью и одобрение владельца относятся к кандидату, а не к ветке вообще. Правка задачи (новая ревизия) или включённый ручной gate снимают затронутые допуски. Текущий запрет владельца проверяется непосредственно перед эффектом. Правило эквивалентности явное: squash меняет SHA, но если дерево и база те же, а ревизия задачи и gate не менялись, повторять проверки и ревью не нужно. Пересборка на свежий main меняет дерево, и проверки идут заново (ADA AUT-H20); ревью повторяется, если изменились затронутые им файлы.
+Candidate связывает `(rev, gen, base, tree, commit, source)`: `commit` — исходный OID агента и provenance; squash создаёт другой OID. Проверки и ревью допускаются для проверяемого tuple `(rev, gen, base, tree, check_recipe)`; `check_recipe` — точная версия команд и входов из main и work-truth.git. Gate и Verdict также относятся к этой ревизии и кандидату; одобрение ревью повторяется, если изменились затронутые им файлы. Правка Task, смена gen или затронутого Gate снимает соответствующие допуски. Перед каждым эффектом интегратор перепроверяет актуальные rev/gen и запрет владельца.
+
+Итоговый squash OID записывается в `IntegrationStep.new_oid`, отдельно от `Candidate.commit`. Только `new_oid` является OID результата интеграции и после доказательства достижимости становится `Task.merged_oid`. Повтор squash может иметь другой commit SHA: допуск переиспользуется только для того же проверенного tuple. Если новая база меняет итоговое дерево, проверки выполняются заново.
 
 swarm merge только ставит кандидата в очередь. Интегратор сам проверяет предусловия на кандидате: gitleaks чист, проверки зелёные на этом дереве, ревью приняло этот кандидат той же ревизии, gen совпадает со Store, дифф в пределах области и не ослабляет проверки, запрета владельца нет. Чего-то нет — отказ с причиной, задача возвращается.
 
@@ -41,17 +43,19 @@ swarm merge только ставит кандидата в очередь. Ин
 
 ### Журнал шагов
 
-Каждый внешний шаг (rebase, проверки, squash, push ветки, push main, PR, чистка) пишется в Store до выполнения, в одной транзакции с переходом задачи: задача, ревизия, gen, шаг, remote, ref, ожидаемый старый OID, новый OID кандидата, состояние planned, done, unknown, failed. После рестарта незавершённый шаг не повторяется вслепую.
+Каждый внешний шаг (rebase, проверки, squash, push ветки, push main, PR, чистка) пишется в Store до выполнения: Task, ревизия, gen, шаг, remote, ref, замороженные `expected_old_oid` и `new_oid`, состояние planned, sending, done, unknown, failed. Planned-шаг и переход Task фиксируются вместе; sending фиксируется до внешнего вызова, но атомарности SQLite и Git нет. После рестарта незавершённый шаг сверяется, не повторяется с новым payload.
 
 Классы исхода шага вместо счётчика попыток:
 
-- Сеть, 5xx, занятый GitHub — повтор с backoff и jitter.
+- Сеть до записи sending — безопасный повтор с backoff и jitter. После sending любой сетевой сбой или потеря ответа — unknown до сверки. Старый ref доказывает известный отказ только когда локальный sender quiescent, его ответ не прерван и exit code ненулевой, а remote readback совпадает с frozen expected_old_oid (как в git_actions.rs:888-945); один readback недостаточен.
 - Красная проверка — один повтор от нестабильного теста, затем задача возвращается исполнителю.
 - Push не fast-forward — не ошибка, а новый круг от свежего main.
-- Исход неизвестен — интегратор читает origin и проверяет достижимость нового OID из целевой ветки (git merge-base --is-ancestor). Вершина ветки не годится: следующая задача могла уже продвинуть main. Достижим — шаг выполнен, отметить done. Целевая ветка всё ещё на ожидаемом старом OID — шаг не выполнен, повторить. Иначе — задача уходит в held(integration\_unknown). Трейлеры Swarm-Task и Swarm-Gen помогают найти коммит, но доказательством не считаются.
+- Исход неизвестен — интегратор читает origin и проверяет достижимость замороженного `new_oid` из целевой ветки (git merge-base --is-ancestor). Достижим — шаг выполнен; записать `Task.merged_oid = new_oid` и done. Readback старого OID сам по себе не является неуспехом и не разрешает requeue. Повтор допустим только после подтверждения quiescence локального sender, успешного remote readback и перепроверки Task/Gate; он использует те же ref, expected_old_oid и new_oid, с обычным fast-forward/CAS. Main никогда не force-push. До разрешения шага очередь стоит; неизвестны quiescence или remote — held(integration\_unknown) с блокировкой очереди. Трейлеры Swarm-Task и Swarm-Gen — индекс, не доказательство.
 - Неожиданное (исключение, непонятный ответ) — задача уходит в held(integration\_unexpected) без повтора.
 
-Задача в held(integration\_\*) выходит из очереди и идёт на разбор с указанием шага; следующая задача пересчитывается от фактического origin/main. Это работает, только когда remote доступен и прочитан. Если remote недоступен или неизвестно, какой внешний эффект ещё выполняется, очередь merge встаёт до сверки: удаление записи из очереди не даёт следующей задаче безопасной базы. Агенты при этом работают.
+Задача в held(integration_*) идёт на разбор с указанием шага. Новая задача не получает следующую базу, пока шаг не разрешён: readback expected_old_oid сам по себе не означает, что прежний sender не сможет продвинуть ref. После подтверждения quiescence, readback и revalidation допустим только повтор того же frozen шага/OID; новый candidate строится лишь после завершения или отмены прежнего шага. Если remote или quiescence неизвестны, очередь стоит, агенты работают.
+
+Pending budget не прекращает сверку: readback и допустимый `retry_same` уже зафиксированного Git push относятся к восстановлению исхода и не запускают LLM. После разрешения шага budget удерживает любой нефинальный результат. Это исключение не разрешает новые проверки, rebase, paid/vendor вызовы или новый candidate за пределами бюджета.
 
 В прототипе (локальный bare-репозиторий, без сетевых сбоев) слепой повтор не завершил 29 из 100 merge: после падения сразу за push повтор давал пустой squash, запись застревала и блокировала очередь. Это потерянные merge и заблокированная очередь, а не потеря данных Git; дублей не было, потому что squash того же содержимого пуст, а у GitHub merge API или деплоя такой защиты нет. Журнал плюс чтение origin: 0 потерь и 0 дублей.
 
@@ -66,15 +70,17 @@ swarm merge только ставит кандидата в очередь. Ин
 - push ветки: --force-with-lease=<ветка>:<ожидаемый SHA>; перед повтором ls-remote.
 - push main: только fast-forward на проверенный OID; после потери ответа — проверка достижимости.
 - PR: перед созданием ищем PR по head-ветке (так уже делает publication.rs:1455 перед 826).
-- merge: доказательство — достижимость OID кандидата из origin/main.
+- merge: доказательство — достижимость итогового IntegrationStep.new_oid из origin/main; Candidate.commit остаётся исходным OID.
 - deploy: только через плагин с ключом (задача, OID); плагин сначала читает версию на цели; компенсация — предыдущая версия.
 - API без ключа идемпотентности: маркер в теле объекта, поиск по маркеру перед повтором (предложение, поведение поиска GitHub под нагрузкой не проверено).
 
 ### Публикация: переписать вход, сохранить эффекты
 
-Нынешняя публикация собирает результат заново из агента, события проверки и рабочего каталога: FrozenGitPublish привязан к агенту и поколению, к прошедшей проверке и к отпечатку грязного worktree (publication.rs:126-229, 1103), и push\_project\_publish принимает именно его (git\_actions.rs:630-633). Когда интегратор выдаёт один проверенный кандидат, вход публикации меняется на Task и ревизию, OID кандидата, цель, ref и ожидаемый старый OID, ревизию регистрации и одобренный endpoint. Переиспользуются проверки endpoint и одобрения владельца, push с чтением remote (git\_actions.rs:804, 921), поиск PR перед созданием и классификация неизвестного исхода; меняется их привязка. FrozenGitPublish, freeze и execute как готовую универсальную реализацию не переносим. После переноса вызывающих удаляются публикация из грязного worktree, её GitPublishTrigger и авто-правило. Это обычные функции в существующих модулях, без нового сервиса публикации.
+Нынешняя публикация собирает результат заново из агента, события проверки и рабочего каталога: FrozenGitPublish привязан к агенту и поколению, к прошедшей проверке и к отпечатку грязного worktree (publication.rs:126-229, 1103), и push\_project\_publish принимает именно его (git\_actions.rs:630-633). Когда интегратор выдаёт один проверенный кандидат, вход публикации меняется на Task/rev/gen, проверенный tuple, итоговый OID `new_oid`, цель/ref и frozen expected old OID, ревизию регистрации и одобренный endpoint. Переиспользуются проверки endpoint и одобрения владельца, push с чтением remote (git\_actions.rs:804, 921), поиск PR перед созданием и классификация неизвестного исхода; меняется их привязка. FrozenGitPublish, freeze и execute как готовую универсальную реализацию не переносим. После переноса вызывающих удаляются публикация из грязного worktree, её GitPublishTrigger и авто-правило. Это обычные функции в существующих модулях, без нового сервиса публикации.
 
-Squash: принятый кандидат пересобирается на свежий main, проверки идут ещё раз, затем squash с сообщением из заголовка task.md и трейлерами, push через forge-push. Конфликт уходит исполнителю задачей «перебазируй» (у агентных PR текстовые конфликты в 27,67% случаев, ADA ORG-E99).
+Squash: принятый кандидат пересобирается на свежий main, проверки идут ещё раз, затем squash с сообщением из заголовка task.md и трейлерами. Новый OID заморожен в шаге как `new_oid`; forge-push получает этот OID и frozen ref/expected_old_oid. Конфликт уходит исполнителю задачей «перебазируй» (у агентных PR текстовые конфликты в 27,67% случаев, ADA ORG-E99).
+
+Повторно используемая recovery-логика `git_actions` требует pre-push ref и проверяет post-push readback. Известный отказ — только quiescent sender, непрерванный ненулевой exit и неизменившийся remote ref; interrupted/unknown sender с прежним ref остаётся unknown. Новая очередь сохраняет это правило, но повторяет только тот же frozen OID обычным fast-forward/CAS. Никакая транзакция Store не может сделать внешний Git push атомарным.
 
 ### Если агент обошёл правила
 
@@ -101,68 +107,28 @@ step = "push_main"     # merge_test | checks | squash | push_branch | push_main 
 remote = "origin"
 ref = "refs/heads/main"
 expected_old_oid = "c3d4..."
-new_oid = "a1b2..."
-candidate = { base = "c3d4...", tree = "e5f6...", commit = "a1b2..." }
+new_oid = "f7e8..."       # конечный squash OID; после подтверждения = Task.merged_oid
+candidate = { base = "c3d4...", tree = "e5f6...", commit = "a1b2..." } # исходный OID, provenance
 state = "planned"      # planned | sending | done | failed | unknown | cancelled
 outcome = ""           # ok | conflict | red | lease_lost | auth | network | unexpected
 attempt = 1
 ```
 
-squash строит коммит из candidate.tree поверх origin/main только если candidate.base = origin/main. Если main сдвинулся, шаг merge\_test считает git merge-tree кандидата и нового main: конфликт — outcome conflict; без конфликта новое дерево проходит обязательные проверки в той же задаче, и только оно отправляется. Непроверенное дерево в main не уходит. Отказ push --force-with-lease — outcome lease\_lost: задача в конец очереди.
+squash строит коммит из candidate.tree поверх origin/main только если candidate.base = origin/main. Если main сдвинулся, шаг merge\_test считает git merge-tree кандидата и нового main: конфликт — outcome conflict; без конфликта новое дерево проходит обязательные проверки в той же задаче, и только оно отправляется. Непроверенное дерево в main не уходит. Отказ обычного fast-forward/CAS push из-за сдвига ref — outcome lease\_lost: после разрешения старого шага задача уходит в конец очереди для нового base и проверенного OID.
 
 Main защищён ruleset: прямой push в main может делать только GitHub App Swarm как bypass actor; force-push и удаление main запрещены всем. Это пункт этапа 5 с критерием «push в main чужим токеном отклонён».
 
-## Переходы IntegrationStep (копия из раздела 14)
+## Переходы IntegrationStep
 
-#### Переходы IntegrationStep
+Каноническая таблица — [automata.md](automata.md#переходы-integrationstep).
 
-| Из | Событие | Условие | В | Gate | Что пишется |
-| --- | --- | --- | --- | --- | --- |
-| planned | `send` | — | sending | — | маркер sending с fsync до сетевого вызова |
-| planned | `pending_cancel` | в Task pending есть cancel или edit | cancelled | — | шаг не начат |
-| sending | `ok` | — | done | — | новый OID |
-| sending | `rejected_known` | конфликт, красная проверка, lease\_lost | failed | — | класс исхода |
-| sending | `no_answer` | — | unknown | — | — |
-| unknown | `origin_reachable` | — | done | — | OID достижим из origin/main |
-| unknown | `origin_at_old` | ref на ожидаемом старом OID | failed | — | шаг не дошёл до remote |
-| unknown | `remote_unreadable` | — | = | — | очередь стоит |
+## Переходы Task в queued и integrating
 
-Классы исхода шага и переход Task: ok — step\_merged; conflict и red — step\_rejected; lease\_lost — step\_lease\_lost; auth и network без ответа — step\_unknown после сверки; всё прочее — step\_unexpected.
+Канонические переходы — [automata.md](automata.md#переходы-task); открытые вопросы шага — [backlog.md](../backlog.md#этап-4-кандидат-и-журнал-интегратора).
 
-## Переходы Task в queued и integrating (копия из раздела 14)
+## Этапы миграции
 
-| Из | Событие | Условие | В | Gate | Что пишется |
-| --- | --- | --- | --- | --- | --- |
-
-| queued | `queue_turn` | candidate.base = origin/main или merge-tree без конфликта и проверки результата зелёные | integrating | merge | IntegrationStep planned |
-| integrating | `step_merged` | pending пуст | done | — | merged\_oid |
-| integrating | `step_merged` | в pending есть edit | done | — | merged\_oid; правка становится новой задачей с parent; владелец получает уведомление |
-| integrating | `step_merged` | в pending есть cancel | done | — | merged\_oid; отмена не применяется (main не откатываем); уведомление |
-| integrating | `step_rejected` | pending пуст | running | — | причина агенту; Candidate снят |
-| integrating | `step_rejected` | в pending есть cancel | cancelled | — | ветка в archive-ref |
-| integrating | `step_rejected` | в pending есть edit (без cancel) | running | — | rev+1 |
-| integrating | `step_lease_lost` | pending пуст | queued | — | в конец очереди; кандидат перепроверяется на новом main |
-| integrating | `step_lease_lost` | в pending есть cancel | cancelled | — | ветка в archive-ref |
-| integrating | `step_lease_lost` | в pending есть edit (без cancel) | running | — | rev+1 |
-| integrating | `step_cancelled` | в pending есть cancel | cancelled | — | шаг до sending снят |
-| integrating | `step_cancelled` | в pending только edit | running | — | rev+1 |
-| integrating | `step_unknown` | — | held(integration\_unknown) | — | задача выходит из очереди |
-| integrating | `step_unexpected` | — | held(integration\_unexpected) | — | задача выходит из очереди |
-| integrating | `integrate_ttl` | — | = | — | сверка шага с origin |
-
-| integrating | `edit` | — | = | — | pending += edit; применяется после исхода шага |
-
-| integrating | `cancel` | — | = | — | pending += cancel; применяется после исхода шага |
-
-| integrating | `budget_exhausted` | — | = | — | pending += budget; после исхода шага, если задача не в финале, — held(budget) |
-
-## Этапы миграции (раздел 12)
-
-| Этап | Что делаем | Что удаляется в том же этапе | Критерий приёмки |
-| --- | --- | --- | --- |
-
-| 4. Кандидат и журнал интегратора | кандидат (ревизия, gen, база, дерево и коммит) с правилом эквивалентности; журнал шагов с remote, ref, ожидаемым старым и новым OID; доказательство merge-base --is-ancestor; очередь встаёт, если remote не читается | ветвь интеграции по трейлерам как доказательство | 10 merge подряд без ручного шага; kill -9 интегратора на каждом шаге — 0 потерь и 0 дублей; правка критериев после ревью снимает допуск |
-| 5. Публикация и проверки | вход публикации — кандидат; forge-push с токеном GitHub App, ключ App у отдельной учётной записи; ruleset на main с обходом только для App; пустой GIT\_CONFIG\_GLOBAL в раннере интегратора; gitleaks на каждом новом коммите агента; сеть check runner отрезана на Linux, способ для macOS и Windows выбран | публикация из грязного worktree, её GitPublishTrigger и авто-правило; выдача токенов forge агентам | против настоящего GitHub: потеря ответа после push закрывается проверкой достижимости; канарейка с ключом не доходит ни до ревьюера, ни до remote; push в main с токеном пользователя отклонён ruleset |
+Порядок и критерии — [migration.md](migration.md); отметки выполнения — [backlog.md](../backlog.md).
 
 ## Модули (раздел 14)
 

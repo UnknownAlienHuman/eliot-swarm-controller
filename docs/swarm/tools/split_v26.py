@@ -8,8 +8,18 @@
 Скрипт привязан к номерам строк v2.6; для другой версии диапазоны надо пересчитать.
 """
 import os, re, sys
+from pathlib import Path
 
+if len(sys.argv) != 3:
+    raise SystemExit("Usage: python3 -I split_v26.py <archive/spec-v2.6.md> <external-staging-directory>")
 SRC, OUT = sys.argv[1], sys.argv[2]
+# Historical reconstruction must never overwrite live contracts or backlog progress.
+output_path = Path(OUT).resolve()
+repository = Path(__file__).resolve().parents[3]
+if output_path == repository or repository in output_path.parents:
+    raise SystemExit("Historical exporter: choose a staging directory outside the repository; edit active docs directly.")
+if any(p.is_symlink() for p in output_path.rglob("*")):
+    raise SystemExit("Historical exporter: staging must not contain symlinks.")
 LINES = open(SRC, encoding="utf-8").read().split("\n")
 
 def L(a, b=None):

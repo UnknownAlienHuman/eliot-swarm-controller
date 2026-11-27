@@ -11,7 +11,7 @@ GROUPS["НЕФИНАЛЬНЫЕ"] = ["ready"] + GROUPS["РАБОЧИЕ"] + ["held
 MACHINES = {  # имя: (начальное, финальные)
     "Task": ("ready", {"done", "cancelled"}),
     "Attempt": ("starting", {"stopped"}),
-    "Delivery": ("stored", {"applied", "unknown", "expired", "rejected"}),
+    "Delivery": ("stored", {"applied", "expired", "rejected"}),
     "IntegrationStep": ("planned", {"done", "failed", "cancelled"}),
     "Gate": ("open", {"approved", "rejected", "superseded"}),
 }
@@ -37,8 +37,10 @@ def tables(md):
         if line.startswith("|") and head:
             cells = [c.strip() for c in line.strip().strip("|").split("|")]
             if rows is None:
+                if head in res:
+                    raise ValueError(f"повторная таблица: {head}")
                 rows = []
-                res.setdefault(head, rows)
+                res[head] = rows
                 continue  # строка заголовка таблицы
             if set("".join(cells)) <= set("-: "):
                 continue
@@ -48,7 +50,7 @@ def tables(md):
             rows = None
     return res
 
-def analyse(name, rows, events=None):
+def analyse(name, rows, events=None, declared=None):
     init, finals = MACHINES[name]
     expanded = []  # (из, событие, условие, в, gate)
     for frm, ev, guard, to, gate, *_ in rows:
@@ -85,6 +87,8 @@ def analyse(name, rows, events=None):
             edges[s].add("held")
     states = {init} | set(finals) | set(edges) | {t for v in edges.values() for t in v}
     probs = []
+    if declared is not None and states != declared:
+        probs.append(f"состояния не совпадают с объявлением: отсутствуют {sorted(declared - states)}, лишние {sorted(states - declared)}")
     seen, q = {init}, deque([init])
     while q:
         for n in edges[q.popleft()]:
@@ -126,10 +130,15 @@ def analyse(name, rows, events=None):
 def main(path):
     md = open(path, encoding="utf-8").read()
     t = tables(md)
+    status = re.search(r'^status\s*=\s*"[^"]+"\s+#\s*(.+)$', md, re.M)
+    if not status:
+        raise ValueError("не найдено объявление состояний Task в поле status")
+    declared_task = set(states_of(status.group(1).replace("|", ",")))
     events = [(clean(r[0]), states_of(r[2])) for r in t["События Task"]]
     rc = 0
     for name in MACHINES:
-        rc += analyse(name, t[f"Переходы {name}"], events if name == "Task" else None)
+        rc += analyse(name, t[f"Переходы {name}"], events if name == "Task" else None,
+                      declared_task if name == "Task" else None)
     return rc
 
 if __name__ == "__main__":

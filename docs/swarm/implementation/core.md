@@ -1,6 +1,6 @@
 # Ядро: модель и сообщения (eliot-core)
 
-> Источник фактов: целевая архитектура v2.6 (27.11.2026). Текст ниже шапки перенесён из неё дословно; «раздел N» и «приложение X» — номера v2.6, ссылка ↗ ведёт туда, где он теперь. Общая суть — [ARCHITECTURE.md](../ARCHITECTURE.md), связи — [GRAPH.md](../GRAPH.md), навигация — [INDEX.md](../INDEX.md).
+> Источник фактов: целевая архитектура v2.6 (27.11.2026). Живой контракт; исходная версия сохранена в archive/spec-v2.6.md; «раздел N» и «приложение X» — номера v2.6, ссылка ↗ ведёт туда, где он теперь. Общая суть — [ARCHITECTURE.md](../ARCHITECTURE.md), связи — [GRAPH.md](../GRAPH.md), навигация — [INDEX.md](../INDEX.md).
 
 **Зачем.** Одна модель и один язык для всего Swarm: шестнадцать сущностей с одним именем и одним модулем-писателем, один конверт сообщения, одна семантика доставки. Без этого понятия снова расползаются по модулям (сейчас 41 таблицу Store пишут 2+ модулей).
 
@@ -33,17 +33,17 @@
 | Сущность | Ключ | Пишет | Жизненный цикл | Главные инварианты | Что заменяет |
 | --- | --- | --- | --- | --- | --- |
 | Task | id, rev | task controller | ready → claimed → running → checking → review → queued → integrating → done; held; cancelled (раздел 14 [↗](../INDEX.md#карта-разделов)) | переход условный по (rev, gen); kind (change или report) и review — поля; parent и children дают дерево; depends без циклов; gate\_wait — какой переход ждёт Gate; pending — намерения во время шага интегратора; бюджет и счётчики — поля Task | Goal (цель = Task верхнего уровня), назначение и brief из папки (origin = folder), индекс git\_work\_tasks, manager\_budgets |
-| Attempt | task, role, n | task controller | starting → running → stopping → stopped; lost → running при resume (раздел 14 [↗](../INDEX.md#карта-разделов)) | живой — starting или running; у Task не больше одного живого Attempt роли executor; смена харнесса — новый Attempt (gen+1); n роли executor — это поколение (gen); credential выдаётся на Attempt; ветка swarm/\<task>-g\<n> | рабочий агент и его поколения, отдельный счётчик attempt, сессия как сущность (теперь поле session\_ref), launch и resume intents |
-| Runtime | runtime\_id | harness supervisor | alive → exited или unreachable | kind = local (процесс) или remote (сессия облачного провайдера, external\_ref, живость опросом); служит ровно одному Attempt; local переподключается по PID, времени старта и boot id | processes, custody\_binding, owned\_exits (часть) |
+| Attempt | task, role, n | task controller | starting → running → stopping → stopped; lost → running при resume (раздел 14 [↗](../INDEX.md#карта-разделов)) | живой — starting или running; у Task не больше одного живого Attempt роли executor; смена исполнителя/харнесса — новый Attempt (executor `Task.gen` = его `n`); credential выдаётся на Attempt; ветка swarm/\<task>-g\<n> | рабочий агент и попытки задачи, сессия как сущность (теперь поле session\_ref), launch intents |
+| Runtime | runtime\_id | harness supervisor | alive → exited или unreachable | служит ровно одному Attempt; local хранит неизменную привязку `agent_id + agent_generation`, поставленную при dispatch; remote хранит `external_ref` без фиктивного локального поколения; resume того же Attempt создаёт новый Runtime | processes, custody\_binding, owned\_exits (часть) |
 | Envelope | id (ULID) | Store, admission | один раз записан, дальше неизменен | kind = message или command; дедупликация по семантическому digest; полномочия из соединения | commands, messages; сигналы агента done, blocked, note становятся командами |
-| Delivery | envelope, получатель | Store; runtime сообщает исход | stored → sending → applied; unknown; expired; rejected (раздел 14 [↗](../INDEX.md#карта-разделов)) | рестарт при sending — всегда unknown; повтор после unknown только у идемпотентного по id харнесса; ephemeral в Delivery не попадает | флаги доставки в messages и commands, restart\_deferred\_sends |
+| Delivery | delivery\_id | Store; Runtime сообщает исход | stored → sending → applied; unknown; expired; rejected (раздел 14 [↗](../INDEX.md#карта-разделов)) | один `delivery_id` обозначает одну попытку отправки; хранит `envelope_id`, получателя и неизменную привязку к Runtime; unknown не перезаписывается новой попыткой; native idempotency использует `Envelope.id`; ephemeral в Delivery не попадает | флаги доставки в messages и commands, restart\_deferred\_sends |
 | Event | seq | только писатель Store | дописывается, не меняется | каждый переход Task и каждая пачка events.put — Event в той же транзакции | events и пачки источников (схема остаётся) |
 | Candidate | task, rev, gen, base, tree | task controller создаёт, интегратор читает | неизменен; новый при новой ревизии, поколении или дереве | хранит commit и source (local или vendor); все допуски (проверки, ревью, gate) привязаны к кандидату; правило эквивалентности (раздел 6 [↗](integrator.md)) | — (новое в 2.4) |
-| CheckRun | tree, check, n | интегратор через check runner | queued → running → passed, failed или error | результат действует только для этого дерева | project\_check\_obligations, goal\_check\_history |
+| CheckRun | candidate, frozen check identity, n | интегратор через check runner | queued → running → passed, failed или error | результат относится к Candidate и неизменной идентичности проверки; source commit — provenance, не единственный ключ допуска | project\_check\_obligations, goal\_check\_history |
 | Verdict | id | task controller | неизменен | kind = review или analysis; review — по каждому критерию для одного кандидата; analysis — один исход из списка (раздел 14 [↗](../INDEX.md#карта-разделов)) | результаты ревью, аудит через switch (store goals/audit.rs) |
-| Gate | task, rev, kind | task controller | open → approved, rejected или superseded | auto тоже пишет Gate (decided\_by = auto): одна история решений; новая ревизия или кандидат делает открытый Gate superseded | owner inbox, решения владельца, snooze, флаг awaiting\_owner |
+| Gate | id; привязка task/rev/gen/kind/действие | task controller | open → approved, rejected или superseded | решение относится к конкретному действию и Candidate/политике; новый gate имеет новый id; старое approved не переносится; открытый устаревший Gate — superseded; auto тоже сохраняется в истории | owner inbox, решения владельца, snooze, флаг awaiting\_owner |
 | Stop | id | task controller | неизменен | одна причина (reason) из закрытого списка раздела 14 [↗](../INDEX.md#карта-разделов) и действие ping, steer, interrupt, resume, analysis или hold; origin — кто поставил | событие детектора, stop\_reasons, тип blocked, причины смены поколения |
-| IntegrationStep | task, rev, gen, step, n | интегратор | planned → sending → done или failed; unknown; cancelled (раздел 14 [↗](../INDEX.md#карта-разделов)) | пишется до эффекта, sending — до вызова remote; в одной транзакции с переходом Task; unknown решается только чтением origin | git\_integration\_custody, намерения публикации, cleanup\_plans |
+| IntegrationStep | task, rev, gen, step, n | интегратор | planned → sending → done или failed; unknown; cancelled (раздел 14 [↗](../INDEX.md#карта-разделов)) | пишется до эффекта, sending — до вызова remote; в одной транзакции с переходом Task; unknown разрешается по remote и состоянию sender, не по одному старому ref | git\_integration\_custody, намерения публикации, cleanup\_plans |
 | Workspace | путь | интегратор; sweeper удаляет | active → archived → removed; quarantine | один пишущий Attempt на worktree; quarantine не удаляется до сверки; archive-ref до удаления | workspaces, git\_workspaces, git\_work\_state |
 | Hold | route, reason | harness supervisor | действует до until или до снятия | route с Hold не выбирается для claim; причины quota, cooldown, breaker, auth; только по структурному сигналу харнесса, текст ошибки — подсказка; хранит версию харнесса | provider\_holds, harness\_auth\_holds и их \_new, \_next копии |
 | Grant | principal | владелец через CLI | действует до expires или отзыва; rev растёт при правке | права удалённого принципала: projects и methods; только методы с флагом remote (раздел 10а [↗](plugins/cloud-agents.md)) | общий токен cloud\_mcp.rs, который открывал весь реестр |
@@ -57,7 +57,7 @@
 
 - Состояния auditing, blocked, paused, unknown, stuck. Ревью теперь состояние review; всё ожидание не агента — одно состояние held с причиной (Stop) и prev\_status. Было 13 состояний, стало 10.
 - Вид конверта signal. Сигналы агента — команды с той же проверкой полномочий.
-- Отдельный счётчик attempt рядом с gen. Номер Attempt роли executor и есть поколение; восстановление через resume — новый Runtime того же Attempt, бюджет попыток считает Attempt.
+- `Task.gen` — номер executor Attempt (`n`) для fencing кандидата и переходов Task. Это не `Agent.generation`: Runtime хранит неизменную пару локальной привязки `agent_id + agent_generation`, полученную при dispatch. Resume создаёт новый Runtime того же Attempt; remote Runtime использует `external_ref` без `Agent.generation`.
 - Флаги awaiting\_owner и quarantine на Task. Первое — held(gate), второе — состояние Workspace. На Task остаётся один флаг hard.
 - Goal как отдельный механизм. Цель — Task верхнего уровня; менеджер — Attempt роли manager на ней.
 - Session как сущность, хранимый пакет передачи, GitPublishTrigger.
@@ -67,7 +67,8 @@
 | Слово в коде, CLI или разговоре | Имя |
 | --- | --- |
 | агент, исполнитель, сессия | Attempt (роль executor, reviewer, analyst или manager); session\_ref — поле Attempt |
-| поколение, gen | n у Attempt роли executor |
+| `Task.gen`, `gen` | номер (`n`) текущего executor Attempt; не `Agent.generation` |
+| `Agent.generation` | локальное поколение процесса Agent; хранится в binding Runtime |
 | процесс харнесса, плагин агента | Runtime |
 | сигнал, done, blocked, note | Envelope kind = command |
 | ревью, аудит, разбор | Verdict kind = review или analysis |
@@ -99,7 +100,7 @@ id (ULID) создаёт клиент и записывает в локальн�
 
 ### Доставка в харнесс: граница эффекта
 
-Дедупликация очереди не делает вход харнесса идемпотентным. Между долговечной записью и вставкой в stdin или RPC харнесса два окна отказа: «записали доставлено, упали до передачи» теряет сообщение; «передали, упали до записи» может начать второй ход с тем же поручением. Поэтому у доставки шесть состояний, общие для всех адаптеров: stored → sending (записано до передачи) → applied (харнесс подтвердил: id хода или ответ RPC) или unknown; ещё expired и rejected. Рестарт runtime или демона при sending всегда даёт unknown, а не возврат в stored: иначе подтверждённое харнессом сообщение уйдёт вторым ходом. Runtime агента пишет sending в свой журнал с fsync до записи в харнесс и applied после нативного подтверждения; демон подтверждает курсор только после своего COMMIT (commit-before-ack, как сейчас для events.put, plugin-protocol.md:687-693). В unknown сначала читается нативное состояние (список ходов сессии, история треда), если харнесс это умеет; иначе автоматического повтора нет, решает супервизор задачи или разбор. Адресат task:\<id> или role:\<роль> фиксируется при первой попытке: повтор той же доставки не уходит молча другому исполнителю.
+Дедупликация очереди не делает вход харнесса идемпотентным. Между долговечной записью и вставкой в stdin или RPC харнесса два окна отказа: «записали доставлено, упали до передачи» теряет сообщение; «передали, упали до записи» может начать второй ход с тем же поручением. Delivery хранит отдельный `delivery_id` для каждой попытки и состояния stored → sending (записано до передачи) → applied (харнесс подтвердил: id хода или ответ RPC) или unknown; ещё expired и rejected. Повтор после unknown — новая Delivery с тем же `Envelope.id` и новым `delivery_id`, только если сверка или идемпотентность харнесса по native id позволяет повтор. Старая запись unknown не заменяется новой; обе относятся к одной сущности Delivery, не к отдельному сервису очереди. Каждая попытка сохраняет `envelope_id`, адресата и неизменную Runtime-привязку. ACK коррелируется по `delivery_id` и Runtime; адаптер связывает его с локальным envelope id и при необходимости передаёт native id харнессу, не требуя менять vendor wire. Рестарт демона при sending даёт unknown, если Runtime не переподключился и не сверил свой журнал. Runtime агента пишет sending в свой журнал с fsync до записи в харнесс и applied после нативного подтверждения; демон подтверждает курсор только после своего COMMIT (commit-before-ack, как сейчас для events.put, plugin-protocol.md:687-693). В unknown сначала читается нативное состояние (список ходов сессии, история треда), если харнесс это умеет; иначе автоматического повтора нет, решает супервизор задачи или разбор. Адресат task:\<id> или role:\<роль> фиксируется при первой попытке: повтор той же доставки не уходит молча другому исполнителю.
 
 ### Почтовые ящики и обратное давление
 
@@ -134,20 +135,9 @@ body = "текст на естественном языке"
 
 Адрес разрешается в момент доставки: task:\<id> — текущий владелец из Store, role:<роль> — свободный агент роли или новый по workflow.toml. Отпечаток команды — семантический digest существующей admission (command\_payload\_digest, admission.rs:52-107), а не sha256 сырых байтов: повтор с тем же id и тем же смыслом — exists, с другим — id\_conflict (admission.rs:116-123). Ephemeral не пишется на диск, не создаёт Delivery и теряется при рестарте. Текст из внешних источников (issue, письмо, вывод инструмента) runtime передаёт харнессу в ограждении «цитируемые данные»: это данные, а не поручение. Полномочия отправителя берутся из аутентифицированного соединения, а не из полей from, task и gen.
 
-## Контракт: переходы Delivery (копия из раздела 14)
+## Контракт: переходы Delivery
 
-#### Переходы Delivery
-
-| Из | Событие | Условие | В | Gate | Что пишется |
-| --- | --- | --- | --- | --- | --- |
-| stored | `pick` | — | sending | — | runtime пишет sending в свой журнал с fsync до записи в харнесс |
-| stored | `stale` | старый gen или ревизия | rejected | — | — |
-| stored | `deadline` | у сообщения есть deadline, и он прошёл | expired | — | — |
-| sending | `harness_ack` | — | applied | — | id хода или ответ RPC; для облака — «провайдер принял» |
-| sending | `ack_lost` | — | unknown | — | — |
-| sending | `runtime_restarted` | — | unknown | — | после рестарта нельзя знать, ушла ли запись; повтор — новая Delivery с тем же id envelope, и только если протокол харнесса идемпотентен по id |
-
-Ephemeral-сообщения (прогресс, подсказки) в Delivery не входят: они живут в памяти runtime, при переполнении отбрасываются, в Store не пишутся.
+Каноническая таблица и привязка ACK к Runtime — [automata.md](automata.md#переходы-delivery).
 
 ## eliot-core в графе модулей (раздел 14)
 
