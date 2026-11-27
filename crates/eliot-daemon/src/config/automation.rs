@@ -15,32 +15,24 @@ use std::{
 /// Owner-approved interpreter and action-environment grant shared by project
 /// registrations and owner-global automation Run.
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
+#[serde(default, deny_unknown_fields)]
 pub(crate) struct RunGrantConfig {
-    #[serde(default)]
     pub(crate) interpreters: BTreeMap<String, core::api::ScriptInterpreter>,
-    #[serde(default)]
     pub(crate) run_env: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
+#[serde(default, deny_unknown_fields)]
 pub(crate) struct AutomationConfig {
-    #[serde(default = "default_max_event_backlog")]
     pub(crate) max_event_backlog: i64,
     /// Omission enables guarded child completion cleanup and previews age-based cleanup.
     /// Explicit `true` also permits age-based removal. Explicit `false` pauses both.
-    #[serde(default)]
     pub(crate) auto_cleanup: Option<bool>,
     /// Minimum age before automatic cleanup, measured from the later of the
     /// artifact creation and the exact terminal generation end.
-    #[serde(default = "default_auto_cleanup_after")]
     pub(crate) auto_cleanup_after: String,
-    #[serde(default)]
     pub(crate) git_base_notices: GitBaseNoticeConfig,
-    #[serde(default)]
     pub(crate) run: RunGrantConfig,
-    #[serde(default)]
     pub(crate) assignments: BTreeMap<String, AssignmentConfig>,
 }
 
@@ -89,9 +81,9 @@ pub(crate) struct AssignmentConfig {
 impl Default for AutomationConfig {
     fn default() -> Self {
         Self {
-            max_event_backlog: default_max_event_backlog(),
+            max_event_backlog: 100_000,
             auto_cleanup: None,
-            auto_cleanup_after: default_auto_cleanup_after(),
+            auto_cleanup_after: "7d".to_owned(),
             git_base_notices: GitBaseNoticeConfig::default(),
             run: RunGrantConfig::default(),
             assignments: BTreeMap::new(),
@@ -164,14 +156,6 @@ impl AutomationConfig {
         )?;
         Ok(self)
     }
-}
-
-fn default_max_event_backlog() -> i64 {
-    100_000
-}
-
-fn default_auto_cleanup_after() -> String {
-    "7d".to_owned()
 }
 
 fn default_assignment_enabled() -> bool {
