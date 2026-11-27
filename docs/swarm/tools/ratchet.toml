@@ -1,0 +1,22 @@
+# Храповик архитектуры (раздел 14а v2.6, «Как граф держится в CI»).
+# Числа — состояние main на 27.11.2026 (541507c). CI падает, только если стало хуже.
+# Стало лучше — уменьшите число здесь в том же PR, чтобы откат не прошёл незаметно.
+
+# Запрещённые рёбра крейтов, которые пока терпим (строки как печатает deps.py).
+# Новое запрещённое ребро — ошибка; убранное — удалите строку.
+allowed_violations = [
+  "запрещено: eliot-daemon -> rusqlite (разрешено только eliot-store)",
+  "запрещено: swarm-desktop -> eliot",
+  "запрещено: swarm-desktop -> eliot-daemon",
+]
+
+# Самый большой цикл модулей верхнего уровня на крейт (scc.py). Не больше этого.
+[max_cycle]
+"crates/eliot-core/src" = 4
+"crates/eliot-daemon/src" = 32
+"crates/eliot-plugin/src" = 5
+"crates/eliot-store/src" = 4
+
+# Автоматы (check.py) должны давать 0 проблем.
+[automata]
+spec = "docs/swarm/implementation/automata.md"

@@ -1,103 +1,77 @@
-# Working on Eliot
+# Работа над Eliot Swarm
 
-Build the next useful path in [roadmap](docs/roadmap.md), not the entire final design.
-Read [vision](docs/vision.md) and [architecture](docs/architecture.md) once, then only
-that task's owning spec, touched code and donor entry. Later-layer sections are not
-prerequisites. v1 is archived at `dc6f70aa` on `archive/v1-final`; do not restore its
-runtime or tooling. Select the next unchecked increment in the roadmap. Desktop work
-follows the [native Fluent contract](docs/design/fluent-design-system.md) and roadmap D12;
-the frozen Material direction is outside current work.
+Целевая архитектура — [docs/swarm/ARCHITECTURE.md](docs/swarm/ARCHITECTURE.md) (v2.6, 27.11.2026). Прочитай её первой при любой задаче: суть, роли, двенадцать правил, модель из 16 сущностей.
 
-## Work loop
+Дальше бери только нужное:
 
-1. One manager owns each coherent increment, its branch/worktree and pull request. One
-   PR may cover several tightly coupled roadmap checkboxes. Never push directly to `main`.
-   The manager integrates and merges only after scoped checks and independent review;
-   delegate disjoint work and keep integration with that manager.
-2. Select the next unchecked task. Read its donor entry: **dependency**, **extract** or
-   **pattern**. Use existing code where it fits; do not import the donor's application.
-3. Implement a connected caller-to-result path. Add only the schema, commands and
-   modules used by that path. Unsupported later features return `unsupported`.
-4. Run `cargo fmt --check`, `cargo build --locked -p <changed-package> --all-targets`, and
-   `cargo clippy -p <changed-package> --all-targets -- -D warnings`. Repeat for other
-   changed packages only. This works for library-only and binary-only packages; no
-   unconditional `--lib`.
-5. Runtime qualification uses actual installed vendor agents through Swarm on real tasks,
-   not synthetic/fake execution, test harness loops, or test edits. **Prove each change
-   live** on a private daemon; that live proof is the priority evidence.
-   - The repository has no test suite (owner decision, 2026-11-19): Cargo, Clippy and
-     the live project are the checks. Do not add tests back.
-   - Do not build test frameworks or fake harnesses as detours.
-   - CI enforces static validation only (formatting, warnings-denied Clippy, locked
-     all-targets compilation). It runs on Linux **on demand** after a major stage, such as
-     a new plugin, and not on every PR or push.
-   - CI does not execute tests, call models, or provide runtime proof.
-   - Record the exact binary hash, model, principal, outcomes, and owned cleanup in the PR.
-6. Tick completed work and record the actual static checks and real runtime evidence in
-   the PR. Roadmap checkboxes are the only project status list; do not add permanent
-   test/readiness reports or a readiness engine. Do not claim a runtime property from
-   compilation or source review alone.
+1. Задача — первый неотмеченный пункт [docs/swarm/backlog.md](docs/swarm/backlog.md); у этапа указан контекст, критерий приёмки и открытые вопросы.
+2. Контекст — рецепт для типа задачи в [docs/swarm/INDEX.md](docs/swarm/INDEX.md#рецепт-контекста-задачи): 1–3 файла из `docs/swarm/implementation/`. В шапке каждого: зачем, чем владеет, вход, выход, инварианты, зависимости, статус проверки.
+3. Опираешься на механизм — посмотри метку в [docs/swarm/STATUS.md](docs/swarm/STATUS.md): «измерено» и «гипотеза» — разные вещи; гипотезу за факт не выдавать.
+4. Добавляешь зависимость, таблицу, модуль или сущность — сверься с [docs/swarm/GRAPH.md](docs/swarm/GRAPH.md).
 
-## Keep the implementation small
+Остальное в `docs/` вне `docs/swarm/` (vision, architecture, roadmap, decisions, spec, harnesses, reference) описывает текущий код до миграции. Им можно пользоваться, чтобы понять нынешнее поведение; где оно расходится с `docs/swarm/`, права `docs/swarm/`. Отменённые решения помечены в [docs/decisions.md](docs/decisions.md). Контракт desktop — [Fluent](docs/design/fluent-design-system.md), он действует.
 
-- [Work truth lives in Git and the file system](docs/architecture.md#work-truth-lives-in-git-and-the-file-system),
-  not in any harness. Commit progress on your branch at checkpoints; a session is
-  disposable. Any model takes work over from the worktree. Handoffs are built from Git,
-  file-system and Store facts, never from a vendor transcript.
-- Core types/reducer contain no I/O. Store owns SQLite; plugins own vendor protocols.
-  Automation and coordination call the router, never another harness executor.
-- Use one serializable DTO per implemented wire message. Validate syntax at its owning
-  boundary; retain live generation, authority and state checks at transaction/effect boundaries.
-- Factor repeated current behavior. Specs own semantics and link code DTOs/constants
-  instead of copying field catalogs.
-- Preserve generation/turn/request binding, commit-before-ack and explicit unknown
-  outcomes from the owning specs. Do not replay an uncertain external effect.
-- Add a crate or trait for a real boundary, not a future caller or a line-count target.
-  A simple internal module is enough for most later features.
-- Replace obsolete code in place. No hidden fallback, compatibility executor, proof
-  packets, audit/readiness documents, task-acceptance engine or generated status registry.
-- Change an incorrect owning spec in the same PR; remove contradictory text rather
-  than adding another exception. Roadmap checkboxes are the only project status list.
-- Keep secrets out of persisted semantic data, fixtures and logs. Use explicit argv
-  and scoped process ownership; Windows is a first-class platform.
+## Цикл работы
 
-## Static architecture boundaries
+1. Один пункт бэклога — одна ветка и один PR. В `main` напрямую не пушить; force-push и переписывание истории `main` запрещены.
+2. Вертикальный срез: новая функция заменяет старую целиком, вызывающие переносятся, старый путь удаляется в том же этапе. Старое не удаляется раньше, чем подключена замена.
+3. Каждый срез уменьшает хотя бы одно число храповика или не трогает его (см. ниже). Меряй чистую разницу строк, а не «процент удалённого».
+4. Проверки перед PR:
+   - `cargo fmt --check`;
+   - `cargo build --locked -p <изменённый пакет> --all-targets` и `cargo clippy -p <изменённый пакет> --all-targets -- -D warnings` для каждого изменённого пакета;
+   - `cargo test -p <пакет>`, если в пакете есть тесты;
+   - `python3 -I docs/swarm/tools/ratchet.py` из корня репозитория.
+5. Неверная спецификация правится в том же PR (файл блока в `docs/swarm/implementation/`), противоречивый текст удаляется, а не обрастает исключениями. Отчётов, приложений и второго списка статуса не заводить: статус — только чекбоксы `docs/swarm/backlog.md`.
+6. В PR записать, какие проверки реально запускались, а для поведения в работе — что проверено запуском (бинарник, модель, исход). Свойство времени выполнения по компиляции или чтению кода не заявлять.
 
-The workspace Clippy lints enforce these boundaries during the required `cargo clippy ... -- -D warnings` command:
+## Тесты
 
-- Each process constructor has a statement-level `#[expect(clippy::disallowed_methods, reason = "...")]`, or the smallest existing function when construction is a returned expression. Do not scope this expectation over a module.
-- Each listed process type has a site-specific `#[expect(clippy::disallowed_types, reason = "...")]` on its exact mention or the smallest owning function. Do not scope this expectation over a module.
-- Vendor plugins must use `eliot_plugin::retry` for retry delays and must not call `tokio::time::sleep` directly.
-- Recursive directory removal goes through the CLI or daemon cleanup module.
-- The daemon plugin host is visible only inside `router` and its descendants; automation reaches native effects through Router.
-- Every `#[allow]` attribute carries a non-empty `reason`.
+Запрет тестов (решение 2026-11-19) отменён этапом 0 v2.6. Разрешены узкие тесты:
 
-## Donor use
+- reducer переходов `eliot-core` (таблица переходов — контракт в [automata.md](docs/swarm/implementation/automata.md));
+- Store на временном SQLite (`eliot-store`), в том числе тест «один писатель»;
+- то, что прямо требует критерий приёмки этапа в бэклоге.
 
-[donors.md](docs/reference/donors.md) names source, target and extraction boundary.
-Use the listed reference revision to understand the mechanism. At the first actual
-code import/dependency addition, check that revision's license, retain required notices,
-record the source in the code/PR, and verify toolchain compatibility. This is a one-time
-import check, not a gate on every operation or PR. Pattern-only sources are not copied.
+Не строить фальшивые харнессы, синтетический runtime и фреймворки тестов. Поведение с настоящими харнессами проверяется запуском на приватном стенде (ниже).
 
-The complete API/spec is the target contract, not permission to build everything before
-Codex works. Completed history: L1 bootstrapped the command path with a
-temporary fake harness; L2 replaced it with direct Codex/Luna. The current
-product uses the five native adapters (Codex, Claude, OpenCode, Muse,
-Antigravity) with explicit profiles and frozen captured selectors. Do not
-restore the fake path or any synthetic runtime. The roadmap owns the remaining work
-and qualification; do not restart completed layers from this historical sequence.
+## Правила зависимостей
 
-## Private QA, desktop and live proof
+Целевой граф крейтов (проверяет `docs/swarm/tools/deps.py`):
 
-- Start a fresh [private stand](docs/spec/api.md#cli) with
-  `swarm stand up --root <qa-directory> --profile <private-config>`. Clear inherited
-  `ELIOT_*` variables first and use private app-data paths on Windows. Use the printed
-  directory for every daemon command and keep production data, harness sessions and
-  global harness configuration outside the stand.
-- Use plain repository names under one QA directory. Run the QA desktop minimized
-  without activation and drive its PID through UI Automation. If a screenshot is
-  black, check whether the console display is off. Close the QA desktop after capture.
-- Register owned proof artifacts under the bound `ELIOT_ARTIFACT_ROOT`. Drain and
-  remove the stand with `swarm stand down <qa-directory>` in the same turn. Clean up
-  only the files and processes the proof owns.
+- `eliot-core` ни от чего внутреннего не зависит и не делает IO (типы, reducer, `Checked`, `METHODS`, таблица ошибок провайдера);
+- `eliot-store` → `eliot-core`; `rusqlite` есть только в `eliot-store`;
+- `eliot-plugin` → `eliot-core`; плагин → `eliot-core`, `eliot-plugin`; плагин → плагин запрещено;
+- `eliot-daemon` → `eliot-core`, `eliot-store`, `eliot-plugin`;
+- `eliot-client` → `eliot-core`; `swarm-desktop` → `eliot-core`, `eliot-client`; CLI, MCP и desktop ходят в демон только через `eliot-client`;
+- бинарник `eliot` (CLI `swarm`) — корень сборки.
+
+Внутри демона слои только вниз: api → контроллеры → порты → основание; контроллеры не вызывают друг друга напрямую, общаются через Store и события. У каждой таблицы Store один модуль-владелец.
+
+### Храповик
+
+CI (`.github/workflows/architecture.yml`) запускает `docs/swarm/tools/ratchet.py` на каждый PR и push в `main`. Пороги — в [ratchet.toml](docs/swarm/tools/ratchet.toml), сейчас: 3 терпимых запрещённых ребра (`eliot-daemon → rusqlite`, `swarm-desktop → eliot`, `swarm-desktop → eliot-daemon`), самый большой цикл модулей: daemon 32, core 4, plugin 5, store 4; автоматы — 0 проблем. CI падает, только если стало хуже. Стало лучше — уменьши порог в `ratchet.toml` в том же PR.
+
+## Секреты
+
+Swarm не читает файлы учётных данных харнессов. Агент не держит ни ключа провайдера, ни токена forge; код агента и его проверки не исполняются в процессе с токеном. Секреты не попадают в сохраняемые данные, фикстуры и логи. Подробно — [security.md](docs/swarm/implementation/security.md).
+
+## Статические границы в коде
+
+Lint-правила workspace проверяются обязательным `cargo clippy ... -- -D warnings`:
+
+- У каждого конструктора процесса — `#[expect(clippy::disallowed_methods, reason = "...")]` на уровне оператора или наименьшей функции, если конструкция — возвращаемое выражение. Не на модуль.
+- Каждое упоминание запрещённого типа процесса — `#[expect(clippy::disallowed_types, reason = "...")]` на точном месте или наименьшей владеющей функции. Не на модуль.
+- Плагины вендоров используют `eliot_plugin::retry` для задержек и не вызывают `tokio::time::sleep` напрямую.
+- Рекурсивное удаление каталогов — только через модуль очистки CLI или демона.
+- Хост плагинов демона виден только внутри `router` и его потомков.
+- У каждого `#[allow]` непустой `reason`.
+
+## Доноры
+
+Доноры, проверенные по коду, — [docs/swarm/archive/DONORS.md](docs/swarm/archive/DONORS.md); нынешняя карта извлечения — [docs/reference/donors.md](docs/reference/donors.md). При первом реальном импорте кода или новой зависимости проверить лицензию ревизии, сохранить уведомления, записать источник в коде и PR. Источники «только образец» не копируются. v1 в архиве: ветка `archive/v1-final`, коммит `dc6f70aa`; его runtime и инструменты не возвращать.
+
+## Приватный стенд и desktop
+
+- Свежий стенд: `swarm stand up --root <qa-directory> --profile <private-config>`. Перед этим очистить унаследованные `ELIOT_*`, на Windows — приватные пути app-data. Для всех команд демона использовать напечатанный каталог; боевые данные, сессии и глобальная настройка харнессов остаются вне стенда.
+- Простые имена репозиториев в одном каталоге QA. QA-desktop запускать свёрнутым без активации, управлять его PID через UI Automation; чёрный скриншот — проверить, не выключен ли дисплей консоли. Закрыть QA-desktop после снимка.
+- Артефакты регистрировать под `ELIOT_ARTIFACT_ROOT`. Стенд разобрать `swarm stand down <qa-directory>` в том же ходе; убирать только свои файлы и процессы.

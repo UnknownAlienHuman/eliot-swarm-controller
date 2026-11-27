@@ -1,0 +1,29 @@
+name: Architecture ratchet
+
+# Храповик архитектуры (docs/swarm/tools/ratchet.py): запрещённые рёбра крейтов,
+# циклы модулей и автоматы. Без сборки Rust, секунды. Падает только при ухудшении
+# относительно порогов в docs/swarm/tools/ratchet.toml.
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: architecture-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ratchet:
+    name: Architecture ratchet
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Ratchet (deps, scc, check)
+        run: python3 -I docs/swarm/tools/ratchet.py

@@ -1,5 +1,7 @@
 # Architecture
 
+> **Текущий продукт, не целевая архитектура.** Этот документ описывает код до миграции. Целевая архитектура — [docs/swarm/ARCHITECTURE.md](swarm/ARCHITECTURE.md) (v2.6, 27.11.2026); где они расходятся, права она.
+
 Eliot is a local controller around existing coding-agent harnesses, not another harness
 or workflow platform. [Vision](vision.md) owns requirements; [roadmap](roadmap.md) owns
 build order. Specs describe the final contract, but a layer implements only what it uses.

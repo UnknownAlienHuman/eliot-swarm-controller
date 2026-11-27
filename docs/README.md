@@ -1,5 +1,9 @@
 # Documentation
 
+**Целевая архитектура (v2.6, 27.11.2026) — [swarm/](swarm/INDEX.md).** Начинать с [swarm/ARCHITECTURE.md](swarm/ARCHITECTURE.md), затем рецепт контекста в [swarm/INDEX.md](swarm/INDEX.md) и следующий пункт [swarm/backlog.md](swarm/backlog.md). Где документы ниже расходятся с `swarm/`, права `swarm/`.
+
+Документы ниже описывают текущий код до миграции.
+
 Start with [vision](vision.md), [architecture](architecture.md) and the next task in
 [roadmap](roadmap.md). Then read only its owning spec and donor entry. The final product
 contract is not a requirement to implement every feature in the first layer.
