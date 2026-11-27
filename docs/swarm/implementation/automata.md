@@ -1,6 +1,6 @@
 # Контракты задачи и автоматы
 
-> Источник фактов: целевая архитектура v2.6 (27.11.2026). Текст ниже шапки перенесён из неё дословно; «раздел N» и «приложение X» — номера v2.6, ссылка ↗ ведёт туда, где он теперь. Общая суть — [ARCHITECTURE.md](../ARCHITECTURE.md), связи — [GRAPH.md](../GRAPH.md), навигация — [INDEX.md](../INDEX.md).
+> Источник фактов: целевая архитектура v2.6 (27.11.2026). Живой контракт; исходная версия сохранена в archive/spec-v2.6.md; «раздел N» и «приложение X» — номера v2.6, ссылка ↗ ведёт туда, где он теперь. Общая суть — [ARCHITECTURE.md](../ARCHITECTURE.md), связи — [GRAPH.md](../GRAPH.md), навигация — [INDEX.md](../INDEX.md).
 
 **Зачем.** Точные форматы и переходы, на которые опираются контроллеры, runtime и интегратор. Это единственное место, где перечислены события Task, все переходы и причины остановок. Скрипт [check.py](../tools/check.py) читает таблицы прямо из этого файла.
 
@@ -59,14 +59,14 @@ prev_status = "running"       # куда вернуться из held
 held_reason = ""              # причина из списка Stop, если status = held
 gate_wait = { kind = "", to = "", gen = 0 }   # переход, который ждёт решения Gate
 pending = []                  # отложенные намерения во время шага интегратора: cancel | edit | budget
-gen = 3                       # n текущего Attempt роли executor
+gen = 3                       # n текущего Attempt роли executor; не Agent.generation
 parent = "T-7"                # родитель: цель или задача, которую разделили
 children = []                 # дочерние задачи после split
 depends = ["T-40"]
 workflow_rev = 12             # ревизия workflow.toml, зафиксированная при claim
 route = "codex/gpt-x/acct-1"
 branch = "swarm/T-42-g3"
-candidate = { rev = 5, gen = 3, base = "c3d4...", tree = "e5f6...", commit = "a1b2...", source = "local" }
+candidate = { rev = 5, gen = 3, base = "c3d4...", tree = "e5f6...", commit = "a1b2...", source = "local" } # gen = Task.gen / Attempt.n
 hard = false
 budget = { attempts_left = 2, wall_left_min = 180, usd_left = "unknown" }   # usd_left = число или "unknown" (подписка)
 counters = { false_done = 0, review_rejects = 0, stop_blocks = 0, replacements = 0, no_progress = 0, silence = 0, restarts_10min = 0, cant = 0 }
@@ -231,11 +231,13 @@ Verdict → переход (одна таблица вместо двух сло
 
 Живой Attempt — в состоянии starting или running. stopping не живой: он не мешает создать gen+1, но Workspace не отдаётся новому Attempt, пока старый не stopped или Workspace не ушёл в quarantine. Инвариант: не больше одного Runtime в running на Workspace.
 
+`Task.gen` — номер (`n`) executor Attempt, используется в Task transition guard, ветке и Candidate. Он не равен локальному `Agent.generation`, которое относится к жизненному циклу существующего Agent и увеличивается при его запуске/resume ([`../../../crates/eliot-store/src/dispatch.rs`](../../../crates/eliot-store/src/dispatch.rs)). У каждого local Runtime есть неизменное `agent_id + agent_generation`, впервые записываемое в транзакции dispatch; возобновление того же Attempt создаёт новый Runtime и новую привязку. У remote Runtime есть `external_ref`, а локальной пары нет. Сигналы Agent валидируются по Runtime binding, сигналы Task/Candidate — по `Task.gen` и `rev`.
+
 #### Переходы Attempt
 
 | Из | Событие | Условие | В | Gate | Что пишется |
 | --- | --- | --- | --- | --- | --- |
-| starting | `launch_ok` | — | running | — | Runtime {kind, pid или external\_ref} |
+| starting | `launch_ok` | — | running | — | Runtime {kind; local: agent\_id, agent\_generation, pid/boot id; remote: external\_ref} |
 | starting | `launch_failed` | — | lost | — | причина запуска |
 | starting | `stop_requested` | — | stopping | — | отмена во время запуска; runtime, поднявшийся позже, получает отказ по gen |
 | running | `runtime_restarted` | — | = | — | новый Runtime того же Attempt после resume |
@@ -243,19 +245,21 @@ Verdict → переход (одна таблица вместо двух сло
 | running | `runtime_unreachable` | — | lost | — | local: runtime не отвечает; remote: опрос провайдера не удаётся N раз |
 | stopping | `stop_confirmed` | — | stopped | — | ход закончен, процессы вышли, поток дочитан; remote: провайдер вернул терминальное состояние |
 | stopping | `stop_timeout` | — | lost | — | Workspace → quarantine; remote без отмены — сессия помечена orphan |
-| lost | `resumed` | старые процессы подтверждённо вышли, сессия та же, gen не отозван | running | — | новый Runtime, тот же n |
+| lost | `resumed` | старые процессы подтверждённо вышли, сессия та же, Task.gen не отозван | running | — | новый Runtime того же Attempt/n; local Agent binding отражает его тогдашний Agent.generation |
 | lost | `confirmed_gone` | — | stopped | — | сверка: процессов нет (local) или провайдер вернул терминальное состояние (remote) |
 
 #### Переходы Delivery
 
 | Из | Событие | Условие | В | Gate | Что пишется |
 | --- | --- | --- | --- | --- | --- |
-| stored | `pick` | — | sending | — | runtime пишет sending в свой журнал с fsync до записи в харнесс |
+| stored | `pick` | — | sending | — | привязка к runtime_id; runtime пишет sending с fsync до записи в харнесс |
 | stored | `stale` | старый gen или ревизия | rejected | — | — |
 | stored | `deadline` | у сообщения есть deadline, и он прошёл | expired | — | — |
-| sending | `harness_ack` | — | applied | — | id хода или ответ RPC; для облака — «провайдер принял» |
+| sending | `harness_ack` | ACK от Runtime, начавшего эту доставку | applied | — | id хода или ответ RPC; для облака — «провайдер принял» |
 | sending | `ack_lost` | — | unknown | — | — |
 | sending | `runtime_restarted` | — | unknown | — | после рестарта нельзя знать, ушла ли запись; повтор — новая Delivery с тем же id envelope, и только если протокол харнесса идемпотентен по id |
+
+Поздний ACK старого Runtime не применяется к новой Delivery с тем же Envelope id: отправляющий Runtime определяется из сохранённой привязки и канала, а не из произвольного поля агента. Unknown остаётся неизвестным до сверки; это не разрешение повторить неидемпотентный эффект.
 
 Ephemeral-сообщения (прогресс, подсказки) в Delivery не входят: они живут в памяти runtime, при переполнении отбрасываются, в Store не пишутся.
 

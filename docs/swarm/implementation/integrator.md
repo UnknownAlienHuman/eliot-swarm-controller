@@ -1,6 +1,6 @@
 # Интегратор: очередь merge, squash, push, чистка
 
-> Источник фактов: целевая архитектура v2.6 (27.11.2026). Текст ниже шапки перенесён из неё дословно; «раздел N» и «приложение X» — номера v2.6, ссылка ↗ ведёт туда, где он теперь. Общая суть — [ARCHITECTURE.md](../ARCHITECTURE.md), связи — [GRAPH.md](../GRAPH.md), навигация — [INDEX.md](../INDEX.md).
+> Источник фактов: целевая архитектура v2.6 (27.11.2026). Живой контракт; исходная версия сохранена в archive/spec-v2.6.md; «раздел N» и «приложение X» — номера v2.6, ссылка ↗ ведёт туда, где он теперь. Общая суть — [ARCHITECTURE.md](../ARCHITECTURE.md), связи — [GRAPH.md](../GRAPH.md), навигация — [INDEX.md](../INDEX.md).
 
 **Зачем.** Единственный, кто меняет main. Детерминированный актор демона (не LLM), по одному на репозиторий, собирается из существующего git_integration.rs и publication.rs. Плохой merge не пускают предусловия на кандидате, а не доверие агенту.
 
@@ -112,57 +112,17 @@ squash строит коммит из candidate.tree поверх origin/main т
 
 Main защищён ruleset: прямой push в main может делать только GitHub App Swarm как bypass actor; force-push и удаление main запрещены всем. Это пункт этапа 5 с критерием «push в main чужим токеном отклонён».
 
-## Переходы IntegrationStep (копия из раздела 14)
+## Переходы IntegrationStep
 
-#### Переходы IntegrationStep
+Каноническая таблица — [automata.md](automata.md#переходы-integrationstep).
 
-| Из | Событие | Условие | В | Gate | Что пишется |
-| --- | --- | --- | --- | --- | --- |
-| planned | `send` | — | sending | — | маркер sending с fsync до сетевого вызова |
-| planned | `pending_cancel` | в Task pending есть cancel или edit | cancelled | — | шаг не начат |
-| sending | `ok` | — | done | — | новый OID |
-| sending | `rejected_known` | конфликт, красная проверка, lease\_lost | failed | — | класс исхода |
-| sending | `no_answer` | — | unknown | — | — |
-| unknown | `origin_reachable` | — | done | — | OID достижим из origin/main |
-| unknown | `origin_at_old` | ref на ожидаемом старом OID | failed | — | шаг не дошёл до remote |
-| unknown | `remote_unreadable` | — | = | — | очередь стоит |
+## Переходы Task в queued и integrating
 
-Классы исхода шага и переход Task: ok — step\_merged; conflict и red — step\_rejected; lease\_lost — step\_lease\_lost; auth и network без ответа — step\_unknown после сверки; всё прочее — step\_unexpected.
+Канонические переходы — [automata.md](automata.md#переходы-task); открытые вопросы шага — [backlog.md](../backlog.md#этап-4-кандидат-и-журнал-интегратора).
 
-## Переходы Task в queued и integrating (копия из раздела 14)
+## Этапы миграции
 
-| Из | Событие | Условие | В | Gate | Что пишется |
-| --- | --- | --- | --- | --- | --- |
-
-| queued | `queue_turn` | candidate.base = origin/main или merge-tree без конфликта и проверки результата зелёные | integrating | merge | IntegrationStep planned |
-| integrating | `step_merged` | pending пуст | done | — | merged\_oid |
-| integrating | `step_merged` | в pending есть edit | done | — | merged\_oid; правка становится новой задачей с parent; владелец получает уведомление |
-| integrating | `step_merged` | в pending есть cancel | done | — | merged\_oid; отмена не применяется (main не откатываем); уведомление |
-| integrating | `step_rejected` | pending пуст | running | — | причина агенту; Candidate снят |
-| integrating | `step_rejected` | в pending есть cancel | cancelled | — | ветка в archive-ref |
-| integrating | `step_rejected` | в pending есть edit (без cancel) | running | — | rev+1 |
-| integrating | `step_lease_lost` | pending пуст | queued | — | в конец очереди; кандидат перепроверяется на новом main |
-| integrating | `step_lease_lost` | в pending есть cancel | cancelled | — | ветка в archive-ref |
-| integrating | `step_lease_lost` | в pending есть edit (без cancel) | running | — | rev+1 |
-| integrating | `step_cancelled` | в pending есть cancel | cancelled | — | шаг до sending снят |
-| integrating | `step_cancelled` | в pending только edit | running | — | rev+1 |
-| integrating | `step_unknown` | — | held(integration\_unknown) | — | задача выходит из очереди |
-| integrating | `step_unexpected` | — | held(integration\_unexpected) | — | задача выходит из очереди |
-| integrating | `integrate_ttl` | — | = | — | сверка шага с origin |
-
-| integrating | `edit` | — | = | — | pending += edit; применяется после исхода шага |
-
-| integrating | `cancel` | — | = | — | pending += cancel; применяется после исхода шага |
-
-| integrating | `budget_exhausted` | — | = | — | pending += budget; после исхода шага, если задача не в финале, — held(budget) |
-
-## Этапы миграции (раздел 12)
-
-| Этап | Что делаем | Что удаляется в том же этапе | Критерий приёмки |
-| --- | --- | --- | --- |
-
-| 4. Кандидат и журнал интегратора | кандидат (ревизия, gen, база, дерево и коммит) с правилом эквивалентности; журнал шагов с remote, ref, ожидаемым старым и новым OID; доказательство merge-base --is-ancestor; очередь встаёт, если remote не читается | ветвь интеграции по трейлерам как доказательство | 10 merge подряд без ручного шага; kill -9 интегратора на каждом шаге — 0 потерь и 0 дублей; правка критериев после ревью снимает допуск |
-| 5. Публикация и проверки | вход публикации — кандидат; forge-push с токеном GitHub App, ключ App у отдельной учётной записи; ruleset на main с обходом только для App; пустой GIT\_CONFIG\_GLOBAL в раннере интегратора; gitleaks на каждом новом коммите агента; сеть check runner отрезана на Linux, способ для macOS и Windows выбран | публикация из грязного worktree, её GitPublishTrigger и авто-правило; выдача токенов forge агентам | против настоящего GitHub: потеря ответа после push закрывается проверкой достижимости; канарейка с ключом не доходит ни до ревьюера, ни до remote; push в main с токеном пользователя отклонён ruleset |
+Порядок и критерии — [migration.md](migration.md); отметки выполнения — [backlog.md](../backlog.md).
 
 ## Модули (раздел 14)
 

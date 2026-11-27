@@ -35,9 +35,11 @@ def targets(text, path):
         for item in braced(text, m.end() - 1):
             name = re.match(r"\s*([a-z_0-9]+)", item)
             if name: found.add(name.group(1))
-    if len(path) == 1:   # super:: из модуля верхнего уровня указывает на корень крейта
-        found |= set(re.findall(r"super::([a-z_0-9]+)", text))
-        for m in re.finditer(r"super::\{", text):
+    for m in re.finditer(r"((?:super::)+)([a-z_0-9]+)", text):
+        if m.group(1).count("super::") == len(path):
+            found.add(m.group(2))
+    for m in re.finditer(r"((?:super::)+)\{", text):
+        if m.group(1).count("super::") == len(path):
             for item in braced(text, m.end() - 1):
                 name = re.match(r"\s*([a-z_0-9]+)", item)
                 if name: found.add(name.group(1))

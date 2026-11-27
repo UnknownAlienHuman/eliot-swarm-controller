@@ -1,6 +1,6 @@
 # Облачные исполнители (cloud agent, вторая волна)
 
-> Источник фактов: целевая архитектура v2.6 (27.11.2026). Текст ниже шапки перенесён из неё дословно; «раздел N» и «приложение X» — номера v2.6, ссылка ↗ ведёт туда, где он теперь. Общая суть — [ARCHITECTURE.md](../../ARCHITECTURE.md), связи — [GRAPH.md](../../GRAPH.md), навигация — [INDEX.md](../../INDEX.md).
+> Источник фактов: целевая архитектура v2.6 (27.11.2026). Живой контракт; исходная версия сохранена в archive/spec-v2.6.md; «раздел N» и «приложение X» — номера v2.6, ссылка ↗ ведёт туда, где он теперь. Общая суть — [ARCHITECTURE.md](../../ARCHITECTURE.md), связи — [GRAPH.md](../../GRAPH.md), навигация — [INDEX.md](../../INDEX.md).
 
 **Зачем.** Отдать задачу облачному агенту провайдера и принять результат как ветку, не доверяя его заявлениям. Модель та же (Task, Attempt, Candidate, IntegrationStep), меняется только Runtime: kind = remote, без процесса на нашей машине.
 
@@ -104,23 +104,6 @@
 
 | Облачные исполнители | только документация | Claude Code on the web, Jules, Copilot coding agent, Codex cloud по официальным страницам на 27.11; ни один не запускался; критерий этапа 11 |
 
-## Переходы Attempt (копия из раздела 14)
+## Переходы Attempt
 
-### Жизненные циклы остальных сущностей
-
-Живой Attempt — в состоянии starting или running. stopping не живой: он не мешает создать gen+1, но Workspace не отдаётся новому Attempt, пока старый не stopped или Workspace не ушёл в quarantine. Инвариант: не больше одного Runtime в running на Workspace.
-
-#### Переходы Attempt
-
-| Из | Событие | Условие | В | Gate | Что пишется |
-| --- | --- | --- | --- | --- | --- |
-| starting | `launch_ok` | — | running | — | Runtime {kind, pid или external\_ref} |
-| starting | `launch_failed` | — | lost | — | причина запуска |
-| starting | `stop_requested` | — | stopping | — | отмена во время запуска; runtime, поднявшийся позже, получает отказ по gen |
-| running | `runtime_restarted` | — | = | — | новый Runtime того же Attempt после resume |
-| running | `stop_requested` | — | stopping | — | отзыв разрешения записан до запроса |
-| running | `runtime_unreachable` | — | lost | — | local: runtime не отвечает; remote: опрос провайдера не удаётся N раз |
-| stopping | `stop_confirmed` | — | stopped | — | ход закончен, процессы вышли, поток дочитан; remote: провайдер вернул терминальное состояние |
-| stopping | `stop_timeout` | — | lost | — | Workspace → quarantine; remote без отмены — сессия помечена orphan |
-| lost | `resumed` | старые процессы подтверждённо вышли, сессия та же, gen не отозван | running | — | новый Runtime, тот же n |
-| lost | `confirmed_gone` | — | stopped | — | сверка: процессов нет (local) или провайдер вернул терминальное состояние (remote) |
+Единый автомат local и remote, с отличающимися фактами остановки — [automata.md](../automata.md#жизненные-циклы-остальных-сущностей).

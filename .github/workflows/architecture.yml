@@ -1,8 +1,8 @@
 name: Architecture ratchet
 
 # Храповик архитектуры (docs/swarm/tools/ratchet.py): запрещённые рёбра крейтов,
-# циклы модулей и автоматы. Без сборки Rust, секунды. Падает только при ухудшении
-# относительно порогов в docs/swarm/tools/ratchet.toml.
+# часть циклов модулей и структура таблиц автоматов. Без сборки Rust.
+# Ошибка сканера или ослабление порогов относительно base SHA — отказ проверки.
 on:
   pull_request:
   push:
@@ -25,5 +25,22 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Read thresholds from base revision
+        if: github.event_name != 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          [[ "$BASE_SHA" =~ ^[0-9a-f]{40}$ && "$BASE_SHA" != 0000000000000000000000000000000000000000 ]]
+          gh api --header 'Accept: application/vnd.github.raw+json' \
+            "repos/$GITHUB_REPOSITORY/contents/docs/swarm/tools/ratchet.toml?ref=$BASE_SHA" \
+            > "$RUNNER_TEMP/swarm-ratchet-baseline.toml"
       - name: Ratchet (deps, scc, check)
-        run: python3 -I docs/swarm/tools/ratchet.py
+        env:
+          BASELINE_REQUIRED: ${{ github.event_name != 'workflow_dispatch' }}
+        run: |
+          args=()
+          if [[ "$BASELINE_REQUIRED" == true ]]; then
+            args=(--baseline "$RUNNER_TEMP/swarm-ratchet-baseline.toml")
+          fi
+          python3 -I docs/swarm/tools/ratchet.py "${args[@]}"

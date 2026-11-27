@@ -1,6 +1,6 @@
 # Runtime агента и eliot-plugin
 
-> Источник фактов: целевая архитектура v2.6 (27.11.2026). Текст ниже шапки перенесён из неё дословно; «раздел N» и «приложение X» — номера v2.6, ссылка ↗ ведёт туда, где он теперь. Общая суть — [ARCHITECTURE.md](../ARCHITECTURE.md), связи — [GRAPH.md](../GRAPH.md), навигация — [INDEX.md](../INDEX.md).
+> Источник фактов: целевая архитектура v2.6 (27.11.2026). Живой контракт; исходная версия сохранена в archive/spec-v2.6.md; «раздел N» и «приложение X» — номера v2.6, ссылка ↗ ведёт туда, где он теперь. Общая суть — [ARCHITECTURE.md](../ARCHITECTURE.md), связи — [GRAPH.md](../GRAPH.md), навигация — [INDEX.md](../INDEX.md).
 
 **Зачем.** Рестарт демона сейчас убивает агентов: харнесс — ребёнок плагина, плагин выходит по EOF pipe хоста (в прототипе ребёнок умер через 1 с после kill -9 родителя). Runtime агента — отсоединённый процесс на агента, который переживает рестарт демона (контракт A).
 
@@ -45,9 +45,11 @@ Windows: владение Job переносится, KILL\_ON\_JOB\_CLOSE не 
 
 ### Протокол runtime агента (NDJSON по stdio и сокет)
 
+Здесь `gen` — `Task.gen`, номер executor Attempt. Для local запуска Store при dispatch сохраняет в Runtime отдельную неизменную пару `agent_id + agent_generation`; адаптер получает её из принятой команды. Resume создаёт новый Runtime и native generation того же Attempt, сохраняя `Task.gen`. Remote использует `external_ref`. Эти значения нельзя взаимозаменять; [канонический контракт](automata.md#жизненные-циклы-остальных-сущностей).
+
 - describe → имя, тип, версия харнесса, kind (local | remote), операции для реестра, согласованные возможности (resume, steer, approval, hooks, mask; для remote — cancel, follow\_up, webhook, max\_session\_min).
 - start {task, rev, gen, route, worktree, env\_allowlist, deadlines} → {runtime\_id, session\_id | external\_ref}. deadlines = {turn\_max\_s, tool\_max\_s, wall\_left\_s, daemon\_lost\_s}: runtime сам держит дедлайны хода и инструмента и остаток wall-бюджета по монотонным часам и прерывает ход по истечении, даже если демон лежит (сессия сохраняется для resume). Демон недоступен дольше daemon\_lost\_s (по умолчанию 10 минут) — runtime даёт доиграть текущий ход и останавливает харнесс до возвращения демона.
-- send {конверт} → stored; дальше Delivery: stored → sending → applied | unknown (раздел 14 [↗](../INDEX.md#карта-разделов), переходы Delivery). Runtime сообщает исход событиями delivery.applied {id, turn} и delivery.unknown {id}.
+- send {конверт} → stored; дальше [Delivery](automata.md#переходы-delivery): stored → sending → applied | unknown. При sending сохраняется `runtime_id`; delivery.applied {id, turn} и delivery.unknown {id} получают эту привязку от аутентифицированного канала адаптера. ACK старого Runtime не закрывает отправку нового Runtime с тем же Envelope id; старый unknown разрешается сверкой, без слепого повтора.
 - cancel {mode: interrupt | stop} → запрос; подтверждение остановки — отдельное событие stopped {turn, processes\_exited, stream\_drained}.
 - status → {alive, session\_id | external\_ref, last\_event\_at}.
 - events.put {пачка} → ACK только после COMMIT в Store; квитанция источника в source\_state.
@@ -83,33 +85,13 @@ Windows: владение Job переносится, KILL\_ON\_JOB\_CLOSE не 
 
 Граница с харнессом: Swarm владеет задачей, назначением и допуском внешнего результата; харнесс — диалогом, циклом инструментов и компакцией. Его собственный retry не дублируется повторной отправкой Swarm.
 
-## Переходы Attempt (копия из раздела 14)
+## Переходы Attempt
 
-### Жизненные циклы остальных сущностей
+Состояния, native generation и условия resume — [automata.md](automata.md#жизненные-циклы-остальных-сущностей).
 
-Живой Attempt — в состоянии starting или running. stopping не живой: он не мешает создать gen+1, но Workspace не отдаётся новому Attempt, пока старый не stopped или Workspace не ушёл в quarantine. Инвариант: не больше одного Runtime в running на Workspace.
+## Этапы миграции
 
-#### Переходы Attempt
-
-| Из | Событие | Условие | В | Gate | Что пишется |
-| --- | --- | --- | --- | --- | --- |
-| starting | `launch_ok` | — | running | — | Runtime {kind, pid или external\_ref} |
-| starting | `launch_failed` | — | lost | — | причина запуска |
-| starting | `stop_requested` | — | stopping | — | отмена во время запуска; runtime, поднявшийся позже, получает отказ по gen |
-| running | `runtime_restarted` | — | = | — | новый Runtime того же Attempt после resume |
-| running | `stop_requested` | — | stopping | — | отзыв разрешения записан до запроса |
-| running | `runtime_unreachable` | — | lost | — | local: runtime не отвечает; remote: опрос провайдера не удаётся N раз |
-| stopping | `stop_confirmed` | — | stopped | — | ход закончен, процессы вышли, поток дочитан; remote: провайдер вернул терминальное состояние |
-| stopping | `stop_timeout` | — | lost | — | Workspace → quarantine; remote без отмены — сессия помечена orphan |
-| lost | `resumed` | старые процессы подтверждённо вышли, сессия та же, gen не отозван | running | — | новый Runtime, тот же n |
-| lost | `confirmed_gone` | — | stopped | — | сверка: процессов нет (local) или провайдер вернул терминальное состояние (remote) |
-
-## Этапы миграции (раздел 12)
-
-| Этап | Что делаем | Что удаляется в том же этапе | Критерий приёмки |
-| --- | --- | --- | --- |
-
-| 6. Runtime агента и служба ОС | отсоединённый runtime по контракту A; KillMode=process в юните systemd; дедлайны хода и остаток wall-бюджета в runtime; владение Windows Job в runtime; переподключение по PID и времени старта; остановка поколения: отзыв, запрос, подтверждение, карантин; второй харнесс | убийство групп при рестарте демона, пометка агентов lost до проверки, loss\_recovery в нынешнем виде | kill -9 демона и systemctl restart при 3 живых агентах на Linux и Windows: все 3 подхвачены, ни один не заменён; при остановленном на час демоне зависший ход прерван runtime; смерть runtime гасит потомков; смена поколения не теряет незакоммиченное и не пишет WIP поверх живого процесса |
+Порядок и критерии — [migration.md](migration.md); отметки выполнения — [backlog.md](../backlog.md).
 
 ## Модули (раздел 14)
 
