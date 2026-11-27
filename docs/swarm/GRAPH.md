@@ -105,7 +105,7 @@ graph LR
 | Attempt → Workspace | один пишущий Attempt на worktree; quarantine не отдаётся другому | интегратор, sweeper |
 | Candidate → CheckRun, Verdict | допуск действует только для своего (rev, gen, base, tree) | интегратор перед эффектом |
 | Candidate → IntegrationStep | шаг записан до эффекта; unknown решается чтением origin | интегратор, сверка |
-| Task → Gate | открытый Gate старой ревизии или кандидата становится superseded | task controller |
+| Task → Gate | у каждого решения свой id и привязка к действию/кандидату; старое approved не переносится на новый переход; открытый устаревший Gate — superseded | task controller |
 | Envelope → Delivery → Attempt | `Task.gen/rev` адресуют исполнение; ACK относится к Runtime, который начал эту доставку; поздний ACK не закрывает доставку нового Runtime; полномочия из соединения | Store, runtime |
 | Hold → Route | route с действующим Hold не выбирается | планировщик |
 
@@ -163,7 +163,7 @@ graph TD
 | Крейты только по целевому графу | deps.py по Cargo.toml (приложение В [↗](tools/README.md)) в CI; при желании дублируется cargo-deny bans с wrappers (синтаксис сверить с версией cargo-deny) | 0 | 2 нарушения: desktop → daemon, desktop → eliot (Windows) |
 | rusqlite только в eliot-store | то же правило deps.py для внешнего крейта | 0 | 1: dev-зависимость в eliot-daemon |
 | Циклы модулей не растут | scc.py с порогом: порог = текущему размеру, при уменьшении порог в CI тоже уменьшается | 0 | daemon 32, core 4, plugin 5, store 4 |
-| Автоматы без тупиков | check.py по таблице переходов, которую генерирует reducer | 1 | v2.6: 0 проблем по таблицам раздела 14 [↗](INDEX.md#карта-разделов) |
+| Структура автоматов | сейчас check.py читает Markdown; экспорт из reducer и независимое сравнение ещё предстоит реализовать | 1 | актуальная сводка и ограничения — [automata.md](implementation/automata.md#проверка-автоматов); смысл guards не доказан |
 | Таблицу пишет один модуль | тест в eliot-store: INSERT, UPDATE и DELETE по таблице встречаются только в модуле-владельце; список исключений только сокращается | 1 | 41 таблица |
 | Процессы запускают только runtime и раннеры | clippy disallowed-methods на std::process::Command::new и tokio::process::Command::new; разрешение через allow только в модулях runtime, check runner, forge-push и git-раннера | 1 | не мерили |
 | Старые имена не возвращаются | grep в CI по новому коду: auditing, paused, stuck, accepted, awaiting\_owner, blocked\_ttl, swarm-cloud, kind = signal, Goal как тип | 2 | — |

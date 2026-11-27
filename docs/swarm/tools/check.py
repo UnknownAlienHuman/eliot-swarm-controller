@@ -11,7 +11,7 @@ GROUPS["НЕФИНАЛЬНЫЕ"] = ["ready"] + GROUPS["РАБОЧИЕ"] + ["held
 MACHINES = {  # имя: (начальное, финальные)
     "Task": ("ready", {"done", "cancelled"}),
     "Attempt": ("starting", {"stopped"}),
-    "Delivery": ("stored", {"applied", "unknown", "expired", "rejected"}),
+    "Delivery": ("stored", {"applied", "expired", "rejected"}),
     "IntegrationStep": ("planned", {"done", "failed", "cancelled"}),
     "Gate": ("open", {"approved", "rejected", "superseded"}),
 }
@@ -37,8 +37,10 @@ def tables(md):
         if line.startswith("|") and head:
             cells = [c.strip() for c in line.strip().strip("|").split("|")]
             if rows is None:
+                if head in res:
+                    raise ValueError(f"повторная таблица: {head}")
                 rows = []
-                res.setdefault(head, rows)
+                res[head] = rows
                 continue  # строка заголовка таблицы
             if set("".join(cells)) <= set("-: "):
                 continue

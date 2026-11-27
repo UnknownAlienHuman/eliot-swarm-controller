@@ -28,7 +28,7 @@
 
 В `plugins/claude/src/` удаляется связанный путь целиком: `quota.rs`, `lib.rs::mod quota`, обработчик `host.rs` для `quota.read`, регистрация `capabilities.rs::quota_readback` и её callback `external_quota_route`. Последний тоже вызывает `crate::quota::uses_external_route`; удаление только модуля оставляет caller. Общий `eliot_plugin::quota` используется другими харнессами и Claude event parser, он сохраняется.
 
-При отсутствии официального readback capability квота отображается как недоступная/unknown. Не подставлять ноль, не добавлять чтение credentials или скрытый HTTP fallback. Существующий `events.rs::observe_rate_limit_event` остаётся источником полученных ограничений и retry-after; событие ограничения не доказывает полный остаток подписки. При прямом устаревшем `quota.read` возвращается согласованный unsupported/method-not-found, без запуска OAuth reader. Проверка сейчас: поиск всех callers, просмотр capability/caller path и минимальный Clippy плагина; реальное отображение квоты до запуска продукта остаётся непроверенным; изменение общего routing/cache в эту задачу не входит.
+При отсутствии официального readback capability квота отображается как недоступная/unknown. Не подставлять ноль, не добавлять чтение credentials или скрытый HTTP fallback. Существующий `events.rs::observe_rate_limit_event` остаётся источником полученных ограничений и retry-after; событие ограничения не доказывает полный остаток подписки. Одного `quota_readback = None` недостаточно: `plugin_host/host/discovery.rs::read_quota` сейчас выбирает fallback `quota.read` и всё равно поднимает metadata reader. В этом же срезе общий preflight `Host::quota` возвращает типизированный `unsupported` для явно отсутствующей quota capability до получения reader slot/spawn; действующие readback/retained-capabilities других харнессов сохраняются. `router/catalog.rs::quota_read_error` уже проецирует именно код `unsupported` в корректный ответ; при прямом устаревшем вызове Claude host также возвращает `unsupported`, не выдуманный method-not-found. Проверка сейчас: поиск всех callers, просмотр capability/caller path и минимальный Clippy плагина; реальное отображение квоты до запуска продукта остаётся непроверенным; перестройка routing/cache в эту задачу не входит; исключение — названный preflight существующего вызова.
 
 ### Пилот папки: одна граница переключения этапов 2–3
 
@@ -60,7 +60,7 @@ Canonical JSON и sha256 команд не удаляются: на них ст�
 | Нативные approval и настройки харнессов | сохраняются | в адаптерах, через согласованные возможности |
 | Справедливость между проектами | сохраняется | модуль scheduler в eliot-daemon |
 | Экраны Fluent | переносятся на этапе 7 | desktop через реестр |
-| Экраны Material | заморожены | удаляются, когда Fluent покрыл их функции |
+| Экраны Material | заморожены до обновления Reactor и полноценной поддержки | текущая реализация — Windows Fluent; удаление или возобновление Material требует отдельного решения владельца |
 | Memory API (D-38) | сохраняется вне ядра | внешний сервис |
 | Перенос задачи между машинами, несколько демонов, outbox, cache.db | отложено | после конкретного потребителя |
 | Контракт B runtime (пережить смерть адаптера) | отложено | после данных о частоте |

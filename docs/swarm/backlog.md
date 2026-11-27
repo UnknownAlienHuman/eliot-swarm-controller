@@ -10,7 +10,7 @@
 
 Контекст: [security.md](implementation/security.md), [claude-code.md](implementation/plugins/claude-code.md), [migration.md](implementation/migration.md), [GRAPH.md](GRAPH.md).
 
-- [ ] убрать Claude OAuth readback целиком: `quota.rs`, `lib.rs::mod quota`, `host.rs::quota.read`, `capabilities.rs::quota_readback` и `external_quota_route`; unknown при отсутствии capability, существующие rate-limit events сохраняются. Граница и callers — [первый срез](implementation/migration.md#первый-срез-убрать-чтение-claude-oauth-сохранить-честную-квоту)
+- [ ] убрать Claude OAuth readback целиком: `quota.rs`, `lib.rs::mod quota`, `host.rs::quota.read`, `capabilities.rs::quota_readback` и `external_quota_route`; общий preflight quota возвращает unsupported до запуска reader при отсутствии capability, rate-limit events сохраняются. Граница и callers — [первый срез](implementation/migration.md#первый-срез-убрать-чтение-claude-oauth-сохранить-честную-квоту)
 - [x] AGENTS.md под правила раздела 1
 - [ ] desktop перестаёт запускать и держать демон
 - [x] в CI — deps.py, scc.py и check.py из приложения В с порогами по текущим числам (храповик)
@@ -57,7 +57,7 @@
 - [ ] детектор no\_progress
 - [ ] разбор
 - [ ] blocked возвращает к прежнему этапу
-- [ ] бюджет порциями и held(budget)
+- [ ] общий конечный бюджет и held(budget); увеличение только по конкретному решению владельца, без автопополнения
 
 **Удаляется в этом этапе.** Для ключа пилота: прежние правила таймера/завершения, policy Goal и audit. Общий `assignment_busy` и старые API/таблицы остаются до переноса остальных callers; удаления по имени файла недостаточно.
 
@@ -65,9 +65,8 @@
 
 **До реализации затронутого поведения определить в контракте; до этого этап не готов к включению.**
 
-- Какой из лимитов порции (attempts_left, wall_left_min, usd_left) вызывает budget_exhausted и как списывается расход при usd_left = unknown: инвариант запрещает считать неизвестное нулём, но правило списания не записано.
+- Определить моменты резервирования/списания attempts_left и учёта wall по всем ролям/дочерним, включая resume и сбой до первого хода. usd_left = unknown не участвует в числовом сравнении; auto budget_extend запрещён, это не заменяет правило списания.
 - Как продолжается работа после budget_extended из running: в переходах Attempt нет stopped → running; записать, что это новый Runtime того же Attempt через resume (как при lost) или новый Attempt.
-- Куда возвращается held(budget), пришедший из integrating через pending: prev после исхода шага не определён.
 
 ## Этап 4. Кандидат и журнал интегратора
 
@@ -82,10 +81,9 @@
 
 **Критерий приёмки.** 10 merge подряд без ручного шага; kill -9 интегратора на каждом шаге — 0 потерь и 0 дублей; правка критериев после ревью снимает допуск
 
-**Открытые вопросы спецификации (найдены прогоном задач на свежих агентах).**
+**Контракт перед реализацией.**
 
-- origin_at_old: таблица IntegrationStep ведёт шаг в failed; записать, что дальше — новый шаг той же очереди или возврат Task в queued.
-- Сеть без ответа после sending: классы исхода говорят «повтор с backoff», таблица — unknown; записать, что после sending всегда unknown и чтение origin, а backoff — только до sending.
+Контракт уточнён: new_oid — фактический squash; старый remote ref не доказывает отказ. До sending допустим retry без эффекта, после — unknown и сверка; повтор только того же frozen шага. Реализовать эту границу вместе с журналом, не переиспользовать готовые `git.integrate`/`project_checks` как Task controller.
 
 ## Этап 5. Публикация и проверки
 
@@ -114,7 +112,7 @@
 - [ ] остановка поколения: отзыв, запрос, подтверждение, карантин
 - [ ] второй харнесс
 
-**До реализации доставки:** определить ключ повторной Delivery при том же Envelope/Attempt, сохранённый Runtime binding и обработку позднего ACK после resume; новая отправка не должна наследовать ACK прежней. Контракт — [automata.md](implementation/automata.md#переходы-delivery).
+**Контракт доставки:** отдельный delivery_id при стабильном Envelope.id; immutable Runtime binding. Reattach сохраняет identity, native resume меняет Runtime/native generation, старые source batches отклоняются. Позднее подтверждение разрешает только исходную доставку через доверенную сверку. Контракт — [automata.md](implementation/automata.md#переходы-delivery).
 
 **Удаляется в этом этапе.** убийство групп при рестарте демона, пометка агентов lost до проверки, loss\_recovery в нынешнем виде
 
